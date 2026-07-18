@@ -731,3 +731,19 @@ puts missing&.fetch(:address)&.fetch(:city).inspect
 config = {timeout: 30}
 puts config&.fetch(:timeout)
 puts config[:retries]&.to_s.inspect
+#==#
+def greet(name:, greeting: "hi")
+  "#{greeting}, #{name}"
+end
+puts greet name: "Ann"
+puts greet greeting: "yo", name: "Bob"
+def opts(x, **rest)
+  "#{x} #{rest.inspect}"
+end
+puts opts 5, a: 1, b: 2
+defaults = {color: "red", size: 10}
+puts opts 9, **defaults
+def total(*nums)
+  nums.sum
+end
+puts total *[4, 5, 6]

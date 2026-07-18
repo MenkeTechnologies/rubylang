@@ -524,22 +524,28 @@ impl Parser {
             }
             self.expect_op(")")?;
         }
-        if !kwargs.is_empty() || !kwsplats.is_empty() {
-            // The trailing keyword hash: the literal pairs, then each `**hash`
-            // merged in (last-wins), matching Ruby's keyword-splat semantics.
-            let mut trailing = Expr::Hash(kwargs);
-            for s in kwsplats {
-                trailing = Expr::Call {
-                    recv: Some(Box::new(trailing)),
-                    name: "merge".into(),
-                    args: vec![s],
-                    block: None,
-                };
-            }
-            args.push(trailing);
-        }
+        Self::push_trailing_kwargs(&mut args, kwargs, kwsplats);
         let block = self.maybe_block()?.or(amp_block);
         Ok((args, block))
+    }
+
+    /// Append the trailing keyword hash to `args`: the literal `key: value` pairs,
+    /// then each `**hash` merged in (last-wins), matching Ruby's keyword-splat
+    /// semantics.
+    fn push_trailing_kwargs(args: &mut Vec<Expr>, kwargs: Vec<(Expr, Expr)>, kwsplats: Vec<Expr>) {
+        if kwargs.is_empty() && kwsplats.is_empty() {
+            return;
+        }
+        let mut trailing = Expr::Hash(kwargs);
+        for s in kwsplats {
+            trailing = Expr::Call {
+                recv: Some(Box::new(trailing)),
+                name: "merge".into(),
+                args: vec![s],
+                block: None,
+            };
+        }
+        args.push(trailing);
     }
 
     /// Parse one call argument, recognizing a `key: value` keyword argument, a
@@ -802,13 +808,18 @@ impl Parser {
             });
         }
         // command call: a space, then a token that starts an argument
-        // (`puts x`, `puts (a).b`, `puts [1,2]`).
+        // (`puts x`, `puts (a).b`, `greet name: "x"`).
         if self.cur_space() && self.starts_command_arg() {
-            let mut args = vec![self.arg()?];
+            let mut args = Vec::new();
+            let mut amp_block = None;
+            let mut kwargs: Vec<(Expr, Expr)> = Vec::new();
+            let mut kwsplats: Vec<Expr> = Vec::new();
+            self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
             while self.eat_op(",") {
-                args.push(self.arg()?);
+                self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
             }
-            let block = self.maybe_block()?;
+            Self::push_trailing_kwargs(&mut args, kwargs, kwsplats);
+            let block = self.maybe_block()?.or(amp_block);
             return Ok(Expr::Call {
                 recv: None,
                 name,
@@ -848,6 +859,11 @@ impl Parser {
             // command argument; a spaced `x - 7` stays a binary operator (the
             // caller only reaches here when a space already precedes the token).
             Tok::Op(o) if o == "-" || o == "+" => {
+                !self.toks.get(self.pos + 1).map(|t| t.space).unwrap_or(true)
+            }
+            // A tight `*args` / `**opts` / `&blk` (space before, none after) is a
+            // splat/block-pass command argument, not a binary operator.
+            Tok::Op(o) if o == "*" || o == "**" || o == "&" => {
                 !self.toks.get(self.pos + 1).map(|t| t.space).unwrap_or(true)
             }
             Tok::Op(o) => o == "[" || o == "(",

@@ -367,6 +367,28 @@ fn keyword_arguments() {
 }
 
 #[test]
+fn parenless_keyword_args() {
+    // Paren-less command call carrying keyword args.
+    eq(
+        "def g(name:, greeting: \"hi\"); \"#{greeting}, #{name}\"; end; g name: \"Ann\"",
+        "\"hi, Ann\"",
+    );
+    eq(
+        "def g(name:, greeting: \"hi\"); \"#{greeting}, #{name}\"; end; g greeting: \"yo\", name: \"Bob\"",
+        "\"yo, Bob\"",
+    );
+    // Mixed positional + keyword, no parens.
+    eq("def f(x, k:); \"#{x}-#{k}\"; end; f 10, k: 20", "\"10-20\"");
+    // `**hash` splat as a paren-less command arg.
+    eq(
+        "h = {x: 1, y: 2}; def m(**o); o; end; m **h",
+        "{x: 1, y: 2}",
+    );
+    // Tight `**` is a splat here, but a spaced `**` stays exponentiation.
+    eq("x = 2; y = 3; x ** y", "8");
+}
+
+#[test]
 fn word_and_symbol_arrays() {
     eq(
         "%w[apple banana cherry]",

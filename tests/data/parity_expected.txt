@@ -388,3 +388,9 @@ nil
 nil
 30
 nil
+#==#
+hi, Ann
+yo, Bob
+5 {a: 1, b: 2}
+9 {color: "red", size: 10}
+15
