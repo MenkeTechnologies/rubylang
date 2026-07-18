@@ -10,8 +10,8 @@
 use crate::host::ops;
 use crate::host::{
     call_instance_method, call_method, call_proc, current_block, has_pending_signal,
-    raise_signal_break, raise_signal_next, raise_signal_retry, raise_signal_return, take_break,
-    with_host, RKey, RubyHost,
+    raise_signal_break, raise_signal_next, raise_signal_retry, raise_signal_return,
+    raise_signal_throw, take_break, take_throw, with_host, RKey, RubyHost,
 };
 use fusevm::{Value, VM};
 use indexmap::IndexMap;
@@ -4155,6 +4155,32 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
                     }
                 }
             }
+            Ok(Value::Undef)
+        }
+        "catch" => {
+            // `catch(tag) { |tag| … }` runs the block, yielding the tag to it, and
+            // returns the block's value — unless a `throw` for this exact tag
+            // unwound into it, in which case the thrown value is returned. With no
+            // argument a fresh unique object serves as the tag.
+            let tag = match args.first() {
+                Some(t) => t.clone(),
+                None => with_host(|h| h.new_object("Object")),
+            };
+            let b = block.ok_or_else(|| raise_exc("LocalJumpError", "no block given (yield)"))?;
+            let r = call_proc(&b, std::slice::from_ref(&tag))?;
+            // A `throw` for our tag stops here; a non-matching throw (or any other
+            // pending signal) is left in place to keep unwinding.
+            match take_throw(&tag) {
+                Some(v) => Ok(v),
+                None => Ok(r),
+            }
+        }
+        "throw" => {
+            // `throw(tag)` / `throw(tag, value)` — unwind to the matching
+            // `catch(tag)`; a bare `throw tag` carries `nil`.
+            let tag = args.first().cloned().unwrap_or(Value::Undef);
+            let value = args.get(1).cloned().unwrap_or(Value::Undef);
+            raise_signal_throw(tag, value);
             Ok(Value::Undef)
         }
         "block_given?" => Ok(Value::Bool(current_block().is_some())),

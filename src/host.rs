@@ -265,6 +265,10 @@ enum Signal {
     Return(Value),
     /// `retry` inside a `rescue` clause — restarts the enclosing `begin` body.
     Retry,
+    /// `throw(tag, value)` — unwinds to the matching `catch(tag)`. The first
+    /// field is the tag (matched by object identity, like Ruby), the second the
+    /// thrown value (`nil` for a bare `throw tag`).
+    Throw(Value, Value),
 }
 
 /// The Ruby runtime.
@@ -1468,7 +1472,15 @@ fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
 /// top-level `return` just halts the program).
 pub fn run_main(chunk: Chunk) -> Result<Value, String> {
     let r = run_chunk_on(chunk);
-    with_host(|h| h.signal = None);
+    // A `throw` that escaped every `catch` is an error, mirroring Ruby's
+    // `uncaught throw :tag (UncaughtThrowError)`.
+    let uncaught = with_host(|h| match h.signal.take() {
+        Some(Signal::Throw(tag, _)) => Some(h.inspect(&tag)),
+        _ => None,
+    });
+    if let Some(tag) = uncaught {
+        return Err(format!("uncaught throw {tag} (UncaughtThrowError)"));
+    }
     r
 }
 
@@ -1517,6 +1529,12 @@ fn run_method(
     });
     match sig {
         Some(Signal::Return(v)) => Ok(v),
+        // A `throw` must keep unwinding past this method boundary to reach its
+        // `catch`; re-arm the signal so the caller's chunk halts too.
+        Some(other @ Signal::Throw(..)) => {
+            with_host(|h| h.signal = Some(other));
+            r
+        }
         _ => r,
     }
 }
@@ -1799,6 +1817,26 @@ pub fn raise_signal_return(v: Value) {
 }
 pub fn raise_signal_retry() {
     with_host(|h| h.signal = Some(Signal::Retry));
+}
+/// Raise a `throw(tag, value)` control signal, unwinding to the matching
+/// `catch(tag)` above (see `take_throw`).
+pub fn raise_signal_throw(tag: Value, value: Value) {
+    with_host(|h| h.signal = Some(Signal::Throw(tag, value)));
+}
+/// If a pending `throw` signal carries a tag equal (by object identity, like
+/// Ruby) to `tag`, consume it and return its thrown value. A non-matching throw
+/// (or any other signal) is left in place so it keeps unwinding.
+pub fn take_throw(tag: &Value) -> Option<Value> {
+    with_host(|h| {
+        if let Some(Signal::Throw(t, _)) = &h.signal {
+            if t == tag {
+                if let Some(Signal::Throw(_, v)) = h.signal.take() {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    })
 }
 /// Consume a pending `retry` signal, returning whether one was set.
 pub fn take_retry_signal() -> bool {

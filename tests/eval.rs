@@ -1410,6 +1410,35 @@ fn comparable_range_batch() {
 }
 
 #[test]
+fn catch_throw_batch() {
+    // `throw(tag, val)` unwinds to the matching `catch(tag)`, which returns `val`.
+    eq(
+        "catch(:done) { 10.times { |i| throw(:done, i) if i == 3 }; :never }",
+        "3",
+    );
+    // A bare `throw tag` carries nil.
+    eq("catch(:x) { throw :x }", "nil");
+    // The block value is returned when no throw fires.
+    eq("catch(:z) { 42 }", "42");
+    // A throw unwinds past an inner catch to the one whose tag it names.
+    eq("catch(:a) { catch(:b) { throw :a, 1 } }", "1");
+    // A throw caught by the inner catch lets the outer catch body continue.
+    eq("catch(:a) { catch(:b) { throw :b, 7 }; :a_body }", ":a_body");
+    // `catch { |tag| … }` yields a fresh unique tag to the block.
+    eq("catch { |t| throw t, 99 }", "99");
+    // Throw unwinds through a method boundary to reach the catch.
+    eq(
+        "def go(t); throw t, :from_method; end; catch(:m) { go(:m) }",
+        ":from_method",
+    );
+    // A throw from inside `each` returns its value from the enclosing catch.
+    eq(
+        "catch(:f) { [1, 2, 3, 4].each { |x| throw(:f, x * 10) if x == 2 }; :nope }",
+        "20",
+    );
+}
+
+#[test]
 fn hash_more_batch() {
     // except / slice preserve MRI ordering semantics.
     eq("{a: 1, b: 2, c: 3}.except(:b)", "{a: 1, c: 3}");
