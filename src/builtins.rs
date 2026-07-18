@@ -3915,8 +3915,27 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             Ok(Value::Undef)
         }
         "print" => {
-            for a in args {
+            // `$,` (output field separator) is inserted between arguments and
+            // `$\` (output record separator) is appended after the last one;
+            // both default to nil (no separator/terminator).
+            let sep = with_host(|h| match h.get_global(",") {
+                Value::Undef => None,
+                v => Some(h.to_s(&v)),
+            });
+            let term = with_host(|h| match h.get_global("\\") {
+                Value::Undef => None,
+                v => Some(h.to_s(&v)),
+            });
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    if let Some(s) = &sep {
+                        print!("{s}");
+                    }
+                }
                 print!("{}", display(a));
+            }
+            if let Some(t) = &term {
+                print!("{t}");
             }
             Ok(Value::Undef)
         }
@@ -4035,8 +4054,22 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
         })),
         "Array" => Ok(match with_host(|h| h.as_array(&args[0])) {
             Some(a) => with_host(|h| h.new_array(a)),
-            None if matches!(args[0], Value::Undef) => with_host(|h| h.new_array(vec![])),
-            None => with_host(|h| h.new_array(vec![args[0].clone()])),
+            // A hash converts to its `to_a` form: an array of `[key, value]`
+            // pairs (`Array({a: 1}) # => [[:a, 1]]`).
+            None => match with_host(|h| h.as_hash(&args[0])) {
+                Some(map) => with_host(|h| {
+                    let rows: Vec<Value> = map
+                        .iter()
+                        .map(|(k, v)| {
+                            let kv = h.key_value(k);
+                            h.new_array(vec![kv, v.clone()])
+                        })
+                        .collect();
+                    h.new_array(rows)
+                }),
+                None if matches!(args[0], Value::Undef) => with_host(|h| h.new_array(vec![])),
+                None => with_host(|h| h.new_array(vec![args[0].clone()])),
+            },
         }),
         "format" | "sprintf" => Ok(new_str(sprintf(&arg_str(&args[0]), &args[1..]))),
         "gets" => Ok(read_line()),
@@ -4059,9 +4092,22 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             Ok(Value::Undef)
         }
         "block_given?" => Ok(Value::Bool(current_block().is_some())),
-        "exit" | "exit!" | "abort" => {
-            let code = args.first().map(as_i).unwrap_or(0);
-            std::process::exit(code as i32);
+        "exit" | "exit!" => {
+            // `exit`/`exit(true)` → 0, `exit(false)` → 1, `exit(n)` → n.
+            let code = match args.first() {
+                None | Some(Value::Bool(true)) => 0,
+                Some(Value::Bool(false)) => 1,
+                Some(v) => as_i(v) as i32,
+            };
+            std::process::exit(code);
+        }
+        "abort" => {
+            // `abort(msg)` writes `msg` to stderr; either form exits with 1.
+            if let Some(v) = args.first() {
+                let msg = with_host(|h| h.to_s(v));
+                eprintln!("{msg}");
+            }
+            std::process::exit(1);
         }
         _ => Err(format!("undefined method '{name}'")),
     }

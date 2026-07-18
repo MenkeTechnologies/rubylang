@@ -292,8 +292,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 let start = i;
                 // Special single-punctuation globals: `$~` (last MatchData),
                 // `$&` (whole match), `` $` `` (pre-match), `$'` (post-match),
-                // `$+` (last group). Otherwise an alphanumeric/underscore name.
-                if i < b.len() && matches!(b[i], b'~' | b'&' | b'`' | b'\'' | b'+') {
+                // `$+` (last group), `$,` (output field separator), `$\` (output
+                // record separator), `$;` (input field separator), `$/` (input
+                // record separator), `$!` (last error). Otherwise an
+                // alphanumeric/underscore name.
+                if i < b.len()
+                    && matches!(
+                        b[i],
+                        b'~' | b'&' | b'`' | b'\'' | b'+' | b',' | b'\\' | b';' | b'/' | b'!'
+                    )
+                {
                     i += 1;
                 } else {
                     while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {

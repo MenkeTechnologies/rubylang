@@ -1474,6 +1474,32 @@ fn object_dup_freeze_batch() {
 }
 
 #[test]
+fn kernel_more_batch() {
+    // `pp` behaves like `p`: prints inspect and returns its argument(s).
+    eq("pp(1, 2, 3)", "[1, 2, 3]");
+    eq("pp([1, 2, 3])", "[1, 2, 3]");
+    // Kernel conversion functions and their edge cases.
+    eq("Array({a: 1})", "[[:a, 1]]"); // hash → array of [k, v] pairs
+    eq("Array({a: 1, b: 2})", "[[:a, 1], [:b, 2]]");
+    eq("Array(nil)", "[]");
+    eq("Array(\"x\")", "[\"x\"]");
+    eq("Array([1, 2])", "[1, 2]");
+    eq("String(:sym)", "\"sym\"");
+    eq("String(nil)", "\"\"");
+    eq("Integer(\"0b101\", 2)", "5"); // radix prefix honoured under explicit base
+    eq("Integer(\"101\", 2)", "5");
+    eq("Integer(3.9)", "3");
+    eq("Float(\"1.5e3\")", "1500.0");
+    // `format` is an alias of `sprintf`.
+    eq("format(\"%05.2f\", 3.14159)", "\"03.14\"");
+    // `__method__` names the enclosing def.
+    eq("def foo; __method__; end; foo", ":foo");
+    // `$,` (output field separator) parses, stores, and reads back.
+    eq("$, = \"-\"; $,", "\"-\"");
+    eq("$\\ = \"!\"; $\\", "\"!\"");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
