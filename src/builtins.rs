@@ -1379,6 +1379,10 @@ fn dispatch_string(
         }
         "[]" => Ok(str_index(&s, args)),
         "slice" => Ok(str_index(&s, args)),
+        "ord" => match s.chars().next() {
+            Some(c) => Ok(Value::Int(c as i64)),
+            None => Err(raise_exc("ArgumentError", "empty string")),
+        },
         "chr" => Ok(new_str(s.chars().next().map(|c| c.to_string()).unwrap_or_default())),
         "succ" | "next" => Ok(new_str(str_succ(&s))),
         "insert" => {
