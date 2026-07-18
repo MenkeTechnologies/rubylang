@@ -1261,6 +1261,45 @@ fn dispatch_string(
         }
         "chars" => Ok(new_arr(s.chars().map(|c| new_str(c.to_string())).collect())),
         "bytes" => Ok(new_arr(s.bytes().map(|b| Value::Int(b as i64)).collect())),
+        // Number of bytes in the UTF-8 encoding (not the character count).
+        "bytesize" => Ok(Value::Int(s.len() as i64)),
+        // With a block, yield each byte and return self; without a block, yield
+        // the bytes array so `.each_byte.to_a` works without a real Enumerator.
+        "each_byte" => match &block {
+            Some(bl) => {
+                for b in s.bytes() {
+                    call_proc(bl, &[Value::Int(b as i64)])?;
+                    if has_pending_signal() {
+                        take_break();
+                        break;
+                    }
+                }
+                Ok(recv.clone())
+            }
+            None => Ok(new_arr(s.bytes().map(|b| Value::Int(b as i64)).collect())),
+        },
+        // Byte at index `i` (supports negatives); nil when out of range.
+        "getbyte" => {
+            let bytes = s.as_bytes();
+            let raw = as_i(&args[0]);
+            let idx = if raw < 0 { raw + bytes.len() as i64 } else { raw };
+            if idx < 0 || idx >= bytes.len() as i64 {
+                Ok(Value::Undef)
+            } else {
+                Ok(Value::Int(bytes[idx as usize] as i64))
+            }
+        }
+        // `b` returns a copy as ASCII-8BIT in real Ruby; we have no separate
+        // encoding, so it returns an equivalent String (byte content unchanged).
+        "b" => Ok(new_str(s.clone())),
+        // True when every byte is 7-bit ASCII.
+        "ascii_only?" => Ok(Value::Bool(s.is_ascii())),
+        // We only carry valid UTF-8 Strings, so this is always true.
+        "valid_encoding?" => Ok(Value::Bool(true)),
+        // No real multi-encoding: these are self-returning / string-identity
+        // shims so `force_encoding`/`encode` chains don't break.
+        "force_encoding" => Ok(recv.clone()),
+        "encode" => Ok(new_str(s.clone())),
         "lines" => Ok(new_arr(split_lines(&s).into_iter().map(new_str).collect())),
         "each_line" => {
             // With a block, iterate the lines; without one, yield the lines

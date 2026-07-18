@@ -1317,6 +1317,29 @@ fn integer_bits_batch() {
 }
 
 #[test]
+fn string_bytes_batch() {
+    eq("\"abc\".bytes", "[97, 98, 99]");
+    eq("\"abc\".bytesize", "3");
+    eq("\"héllo\".bytesize", "6");
+    eq("\"abc\".getbyte(0)", "97");
+    eq("\"abc\".getbyte(-1)", "99");
+    eq("\"abc\".getbyte(10)", "nil");
+    eq("\"\".getbyte(0)", "nil");
+    eq("\"abc\".ascii_only?", "true");
+    eq("\"héllo\".ascii_only?", "false");
+    eq("\"\".ascii_only?", "true");
+    eq("\"abc\".valid_encoding?", "true");
+    eq("\"abc\".b", "\"abc\"");
+    eq("\"abc\".each_byte.to_a", "[97, 98, 99]");
+    eq("a = []; \"abc\".each_byte { |b| a << b }; a", "[97, 98, 99]");
+    eq("\"héllo\".bytes", "[104, 195, 169, 108, 108, 111]");
+    eq("\"\".bytes", "[]");
+    eq("\"\".bytesize", "0");
+    eq("\"abc\".force_encoding(\"UTF-8\")", "\"abc\"");
+    eq("\"abc\".encode(\"UTF-8\")", "\"abc\"");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
