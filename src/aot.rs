@@ -3,7 +3,7 @@
 //! Today this precompiles the script to fusevm bytecode and warms the on-disk
 //! cache (`cache.rs`), so subsequent runs skip lex/parse/lower entirely. The
 //! `fusevm` crate's `aot` feature (a native-object emitter linked against the
-//! rubyrs `staticlib`) is the next wave — emitting a standalone executable — and
+//! rubylang `staticlib`) is the next wave — emitting a standalone executable — and
 //! the `staticlib` crate-type + feature are wired now so that lands without a
 //! build-graph change. The report below is explicit user-requested output.
 
@@ -15,6 +15,6 @@ pub fn build(file: &str) -> Result<String, String> {
     let (nmethods, nprocs, nops) = (prog.methods.len(), prog.procs.len(), prog.main.ops.len());
     crate::cache::store(&src, &prog)?;
     Ok(format!(
-        "built {file}: {nops} top-level ops, {nmethods} methods, {nprocs} blocks -> ~/.rubyrs/scripts.rkyv"
+        "built {file}: {nops} top-level ops, {nmethods} methods, {nprocs} blocks -> ~/.rubylang/scripts.rkyv"
     ))
 }

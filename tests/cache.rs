@@ -2,7 +2,7 @@
 //! load must reproduce a program that runs identically. Uses an isolated HOME so
 //! a developer's real `~/.rubyrs` shard is untouched.
 
-use rubyrs::{cache, compiler, host};
+use rubylang::{cache, compiler, host};
 
 #[test]
 fn store_then_load_reproduces_the_program() {
@@ -12,7 +12,7 @@ fn store_then_load_reproduces_the_program() {
     std::env::set_var("HOME", tmp.path());
 
     let src = "def double(x); x * 2; end; double(21)";
-    let prog = rubyrs::compile(src).expect("compile");
+    let prog = rubylang::compile(src).expect("compile");
     cache::store(src, &prog).expect("store");
 
     let loaded = cache::load(src).expect("cached program present");

@@ -2,7 +2,7 @@
 //! zshrs/elisprs/vimlrs). Versioned from day one so a `.rb` that compiled once
 //! never breaks on a later run.
 //!
-//! Layout: a single shard at `~/.rubyrs/scripts.rkyv`. The *outer* container is
+//! Layout: a single shard at `~/.rubylang/scripts.rkyv`. The *outer* container is
 //! a zero-copy rkyv archive (`Shard`), validated on load; each *inner* entry
 //! blob is a bincode-encoded `CProg` (the compiled `fusevm::Chunk`s), because
 //! `fusevm::Chunk` is serde-owned, not `rkyv::Archive`. The key is a 64-bit hash
@@ -71,7 +71,7 @@ pub fn key_for(src: &str) -> u64 {
 }
 
 fn shard_path() -> Option<PathBuf> {
-    let dir = dirs::home_dir()?.join(".rubyrs");
+    let dir = dirs::home_dir()?.join(".rubylang");
     let _ = std::fs::create_dir_all(&dir);
     Some(dir.join("scripts.rkyv"))
 }

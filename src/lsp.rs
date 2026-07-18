@@ -38,7 +38,7 @@ const CORPUS: &[(&str, &str)] = &[
     ),
     (
         "require",
-        "Kernel#require — no-op in rubyrs (returns true).",
+        "Kernel#require — no-op in rubylang (returns true).",
     ),
     (
         "raise",
@@ -101,7 +101,7 @@ pub fn run() -> Result<(), String> {
         .map_err(|e| format!("lsp initialize: {e}"))?;
     let init_result = serde_json::json!({
         "capabilities": server_capabilities(),
-        "serverInfo": { "name": "rubyrs", "version": env!("CARGO_PKG_VERSION") },
+        "serverInfo": { "name": "rubylang", "version": env!("CARGO_PKG_VERSION") },
     });
     conn.sender
         .send(Response::new_ok(init_id, init_result).into())
@@ -223,7 +223,7 @@ fn completions() -> CompletionResponse {
 }
 
 fn hover() -> Hover {
-    let body = "**rubyrs** — Ruby on the fusevm bytecode VM + Cranelift JIT.".to_string();
+    let body = "**rubylang** — Ruby on the fusevm bytecode VM + Cranelift JIT.".to_string();
     Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,

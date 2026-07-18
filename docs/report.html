@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="rubyrs — Engineering report. A compiled Ruby runtime in Rust, hosted on the fusevm bytecode VM with a three-tier Cranelift JIT. Architecture, value model, roadmap, and dependency posture. MIT licensed.">
-  <title>rubyrs &mdash; Engineering Report</title>
+  <meta name="description" content="rubylang — Engineering report. A compiled Ruby runtime in Rust, hosted on the fusevm bytecode VM with a three-tier Cranelift JIT. Architecture, value model, roadmap, and dependency posture. MIT licensed.">
+  <title>rubylang &mdash; Engineering Report</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
@@ -46,22 +46,22 @@
     <header class="tutorial-header">
       <div class="tutorial-header-inner">
         <div>
-          <h1 class="tutorial-brand">// RUBYRS — ENGINEERING REPORT</h1>
+          <h1 class="tutorial-brand">// RUBYLANG — ENGINEERING REPORT</h1>
           <nav class="tutorial-crumbs" aria-label="Breadcrumb">
             <a href="index.html">Docs</a>
             <span class="sep">/</span>
             <span class="current">Engineering Report</span>
             <span class="sep">/</span>
-            <a href="https://github.com/MenkeTechnologies/rubyrs" target="_blank" rel="noopener noreferrer">GitHub</a>
+            <a href="https://github.com/MenkeTechnologies/rubylang" target="_blank" rel="noopener noreferrer">GitHub</a>
           </nav>
-          <p class="docs-build-line">rubyrs v0.1.0 · Ruby on fusevm · lex/parse → AST → bytecode → Cranelift JIT · MIT · in active development</p>
+          <p class="docs-build-line">rubylang v0.1.0 · Ruby on fusevm · lex/parse → AST → bytecode → Cranelift JIT · MIT · in active development</p>
         </div>
         <div class="tutorial-toolbar">
           <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
           <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
           <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
           <a class="btn btn-secondary" href="index.html">Docs</a>
-          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/rubyrs" target="_blank" rel="noopener noreferrer">GitHub</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/rubylang" target="_blank" rel="noopener noreferrer">GitHub</a>
         </div>
       </div>
     </header>
@@ -75,7 +75,7 @@
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>ENGINEERING REPORT</h2>
-      <p class="tutorial-subtitle">rubyrs is a compiled Ruby runtime in Rust, hosted on the <code>fusevm</code> bytecode VM and its three-tier Cranelift JIT. This report describes the architecture, the value model, the current state of the tree, and the dependency posture. The statements below are facts about the design and the manifest, not aspirational metrics.</p>
+      <p class="tutorial-subtitle">rubylang is a compiled Ruby runtime in Rust, hosted on the <code>fusevm</code> bytecode VM and its three-tier Cranelift JIT. This report describes the architecture, the value model, the current state of the tree, and the dependency posture. The statements below are facts about the design and the manifest, not aspirational metrics.</p>
 
       <div class="stat-grid">
         <div class="stat-card"><div class="stat-val accent">Ruby</div><div class="stat-label">fusevm language host</div></div>
@@ -86,7 +86,7 @@
 
       <section class="tutorial-section">
         <h2>Summary</h2>
-        <p>MRI runs Ruby by walking an AST in C. rubyrs takes a different path: it lexes and parses Ruby to an AST, lowers that to <code>fusevm</code> bytecode, and runs it on a compiled VM with a Cranelift JIT. Arithmetic and comparison operators lower to native VM ops so the JIT can trace hot loops; Ruby-specific behaviour is served by a thread-local runtime host. It joins <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a> alongside <code>zshrs</code>, <code>stryke</code>, <code>awkrs</code>, and <code>elisp</code>, and reuses that shared bytecode VM and JIT rather than shipping its own.</p>
+        <p>MRI runs Ruby by walking an AST in C. rubylang takes a different path: it lexes and parses Ruby to an AST, lowers that to <code>fusevm</code> bytecode, and runs it on a compiled VM with a Cranelift JIT. Arithmetic and comparison operators lower to native VM ops so the JIT can trace hot loops; Ruby-specific behaviour is served by a thread-local runtime host. It joins <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a> alongside <code>zshrs</code>, <code>stryke</code>, <code>awkrs</code>, and <code>elisp</code>, and reuses that shared bytecode VM and JIT rather than shipping its own.</p>
         <p>The current tree implements the lexer/parser, AST-to-bytecode lowering, the object heap and method dispatch (Integer, Float, String, Array, Hash, Symbol, Range, Proc), a growing core-method and Kernel surface, blocks/<code>yield</code>/closures, user-defined classes with single inheritance / <code>super</code> / <code>attr_*</code>, <code>module</code>+<code>include</code> mixins and <code>def self.m</code> class methods, exceptions (<code>begin</code>/<code>rescue</code>/<code>ensure</code>, typed classes), splat parameters, <code>&amp;:sym</code> block-pass, parallel assignment and default arguments, the standalone <code>ruby</code> binary and REPL, the rkyv bytecode cache, an LSP server, and a partial DAP adapter. Behaviour is checked against the reference <code>ruby</code> by a 35-snippet differential parity harness. <code>extend</code>/<code>prepend</code>, keyword parameters, and regex are planned.</p>
       </section>
 
@@ -94,12 +94,12 @@
 
       <section class="tutorial-section">
         <h2>Hosting on fusevm</h2>
-        <p>rubyrs contains no virtual machine or JIT of its own. The execution path is:</p>
+        <p>rubylang contains no virtual machine or JIT of its own. The execution path is:</p>
 <pre>Ruby source  →  lexer  →  parser → AST  →  lower to fusevm bytecode  →  fusevm VM + Cranelift JIT
                                                     │
                                        RubyHost heap (methods, blocks, String/Array/Hash)</pre>
         <div class="feature-grid">
-          <div class="feature-card"><h4>Shared engine</h4><p>fusevm is pulled from crates.io with the <code>jit</code>, <code>jit-disk-cache</code>, and <code>aot</code> features. JIT and VM improvements land once and benefit zshrs, stryke, awkrs, elisp, and rubyrs together.</p></div>
+          <div class="feature-card"><h4>Shared engine</h4><p>fusevm is pulled from crates.io with the <code>jit</code>, <code>jit-disk-cache</code>, and <code>aot</code> features. JIT and VM improvements land once and benefit zshrs, stryke, awkrs, elisp, and rubylang together.</p></div>
           <div class="feature-card"><h4>Native arithmetic</h4><p>Operators lower to native fusevm ops; a strict numeric hook supplies Ruby semantics (String/Array <code>+</code>, floored integer division, cross-type <code>==</code>) only for the non-numeric operand cases the VM can't compute natively.</p></div>
           <div class="feature-card"><h4>Persistent native code</h4><p><code>jit-disk-cache</code> persists compiled machine code across runs, so warm starts skip recompilation.</p></div>
           <div class="feature-card"><h4>Scope-sharing blocks</h4><p>Every variable access routes through the thread-local host, so a block body run as a nested VM captures and mutates its enclosing locals — Ruby's block semantics without a bespoke closure machine.</p></div>
@@ -168,7 +168,7 @@
           <div class="feature-card"><h4>Versioned caches</h4><p>The rkyv script-cache format carries a schema version from the first release, so an old cached <code>.rb</code> rebuilds silently rather than breaking.</p></div>
           <div class="feature-card"><h4>Reference semantics</h4><p>Behaviour tracks MRI Ruby — Integer division floors, <code>**</code> keeps integer results, blocks mutate enclosing scope — as the compatibility target.</p></div>
           <div class="feature-card"><h4>Cross-architecture</h4><p>macOS aarch64 and Linux x86_64 / aarch64 via the Cranelift JIT; portable bytecode underneath.</p></div>
-          <div class="feature-card"><h4>Standalone crate</h4><p>An explicit empty <code>[workspace]</code> keeps rubyrs buildable on its own, independent of the meta repo.</p></div>
+          <div class="feature-card"><h4>Standalone crate</h4><p>An explicit empty <code>[workspace]</code> keeps rubylang buildable on its own, independent of the meta repo.</p></div>
         </div>
       </section>
 
@@ -178,10 +178,10 @@
         <h2>Links</h2>
         <ul>
           <li><strong>Docs</strong> — <a href="index.html">index.html</a></li>
-          <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/rubyrs">github.com/MenkeTechnologies/rubyrs</a></li>
-          <li><strong>Issues</strong> — <a href="https://github.com/MenkeTechnologies/rubyrs/issues">github.com/MenkeTechnologies/rubyrs/issues</a></li>
+          <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/rubylang">github.com/MenkeTechnologies/rubylang</a></li>
+          <li><strong>Issues</strong> — <a href="https://github.com/MenkeTechnologies/rubylang/issues">github.com/MenkeTechnologies/rubylang/issues</a></li>
           <li><strong>fusevm</strong> — <a href="https://github.com/MenkeTechnologies/fusevm">github.com/MenkeTechnologies/fusevm</a> (the shared VM)</li>
-          <li><strong>License</strong> — MIT (<a href="https://github.com/MenkeTechnologies/rubyrs/blob/main/LICENSE">LICENSE</a>)</li>
+          <li><strong>License</strong> — MIT (<a href="https://github.com/MenkeTechnologies/rubylang/blob/main/LICENSE">LICENSE</a>)</li>
         </ul>
       </section>
     </main>

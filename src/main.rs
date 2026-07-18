@@ -9,16 +9,16 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let cli = rubyrs::cli::parse();
+    let cli = rubylang::cli::parse();
 
     if cli.lsp {
-        return match rubyrs::lsp::run() {
+        return match rubylang::lsp::run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e),
         };
     }
     if cli.dap {
-        return match rubyrs::dap::run() {
+        return match rubylang::dap::run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e),
         };
@@ -36,7 +36,7 @@ fn main() -> ExitCode {
             };
         }
         if cli.build {
-            return match rubyrs::aot::build(&file) {
+            return match rubylang::aot::build(&file) {
                 Ok(msg) => {
                     // A build report is explicit user-requested output.
                     println!("{msg}");
@@ -45,14 +45,14 @@ fn main() -> ExitCode {
                 Err(e) => fail(&e),
             };
         }
-        return match rubyrs::eval_file(&file) {
+        return match rubylang::eval_file(&file) {
             Ok(_) => ExitCode::SUCCESS,
             Err(e) => fail(&e),
         };
     }
 
     if cli.repl || atty_stdin() {
-        rubyrs::repl::run();
+        rubylang::repl::run();
         return ExitCode::SUCCESS;
     }
 
@@ -62,7 +62,7 @@ fn main() -> ExitCode {
 }
 
 fn run_source(src: &str, _label: &str) -> ExitCode {
-    match rubyrs::eval_str(src) {
+    match rubylang::eval_str(src) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => fail(&e),
     }
@@ -70,7 +70,7 @@ fn run_source(src: &str, _label: &str) -> ExitCode {
 
 fn dump(file: &str) -> Result<(), String> {
     let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
-    let prog = rubyrs::compile(&src)?;
+    let prog = rubylang::compile(&src)?;
     println!("== main ==\n{:#?}", prog.main.ops);
     for (name, m) in &prog.methods {
         println!(

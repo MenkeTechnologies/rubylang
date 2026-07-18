@@ -3,7 +3,7 @@
 //! mocking), so a regression in the lexer, parser, compiler, host, or fusevm
 //! lowering surfaces here.
 
-use rubyrs::eval_to_string as ev;
+use rubylang::eval_to_string as ev;
 
 /// Assert that `src` evaluates to `expected` (its inspect form).
 fn eq(src: &str, expected: &str) {

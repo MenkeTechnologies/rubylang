@@ -1,12 +1,12 @@
 //! Offline generator for `docs/reference.html` — the builtin method/kernel
 //! reference page. Run before publishing GitHub Pages; keeps the reference in
-//! sync with the LSP corpus (`rubyrs::lsp::corpus`) so the two never drift.
+//! sync with the LSP corpus (`rubylang::lsp::corpus`) so the two never drift.
 
 use std::fmt::Write as _;
 
 fn main() {
     let mut rows = String::new();
-    for (name, doc) in rubyrs::lsp::corpus() {
+    for (name, doc) in rubylang::lsp::corpus() {
         let _ = writeln!(
             rows,
             "<tr><td><code>{}</code></td><td>{}</td></tr>",
@@ -17,8 +17,8 @@ fn main() {
 
     let page = format!(
         r#"<main class="wrap">
-  <h1>rubyrs builtin reference</h1>
-  <p>Kernel functions and core methods available in the current rubyrs build.
+  <h1>rubylang builtin reference</h1>
+  <p>Kernel functions and core methods available in the current rubylang build.
   Generated from the language-server corpus — run <code>gen-docs</code> to refresh.</p>
   <table>
     <thead><tr><th>method</th><th>description</th></tr></thead>
@@ -34,7 +34,7 @@ fn main() {
         eprintln!("gen-docs: cannot write {out}: {e}");
         std::process::exit(1);
     }
-    println!("wrote {out} ({} entries)", rubyrs::lsp::corpus().len());
+    println!("wrote {out} ({} entries)", rubylang::lsp::corpus().len());
 }
 
 fn html_escape(s: &str) -> String {

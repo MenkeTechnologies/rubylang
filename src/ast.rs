@@ -1,6 +1,6 @@
 //! Ruby abstract syntax tree.
 //!
-//! Faithful to Ruby's surface grammar as far as rubyrs lowers it today: every
+//! Faithful to Ruby's surface grammar as far as rubylang lowers it today: every
 //! node here has a direct lowering in `compiler.rs`. The tree is deliberately
 //! expression-oriented — in Ruby nearly everything (`if`, `while`, `begin`,
 //! assignment) yields a value — so `Stmt` is a thin wrapper and most of the

@@ -19,7 +19,7 @@ pub fn print_banner() {
     println!("{}", Color::Cyan.bold().paint(WORDMARK));
     println!(
         "{} {}  {}",
-        Color::Purple.bold().paint("rubyrs"),
+        Color::Purple.bold().paint("rubylang"),
         Color::White.paint(format!("v{v}")),
         Color::DarkGray.paint("Ruby on fusevm — bytecode VM + Cranelift JIT")
     );

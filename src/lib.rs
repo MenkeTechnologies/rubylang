@@ -1,4 +1,4 @@
-//! rubyrs — Ruby as a fusevm frontend.
+//! rubylang — Ruby as a fusevm frontend.
 //!
 //! Pipeline: `lexer` → `parser` builds a Ruby AST → `compiler` lowers it to a
 //! `fusevm::Chunk` (plus a table of method/block sub-chunks) → fusevm executes

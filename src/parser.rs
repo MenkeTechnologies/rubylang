@@ -1,4 +1,4 @@
-//! Recursive-descent / precedence-climbing parser for the Ruby subset rubyrs
+//! Recursive-descent / precedence-climbing parser for the Ruby subset rubylang
 //! lowers. Produces `Vec<Stmt>`. Binary operators use a binding-power table
 //! (`bp`); `**` and assignment are right-associative. Command (paren-less) calls
 //! are recognized when a bare identifier is immediately followed by a token that

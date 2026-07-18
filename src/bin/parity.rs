@@ -1,8 +1,8 @@
-//! `parity` — differential harness: rubyrs vs. the reference `ruby`.
+//! `parity` — differential harness: rubylang vs. the reference `ruby`.
 //!
 //! Development tool, not part of the runtime. It runs every snippet in
 //! `tests/data/parity_corpus.rb` (separated by a `#==#` line) through both the
-//! system `ruby` (the oracle) and rubyrs in-process, and compares stdout.
+//! system `ruby` (the oracle) and rubylang in-process, and compares stdout.
 //!
 //! * default: print a parity report (parity / gap / panic counts, and each
 //!   gap's expected-vs-got). Needs `ruby` on PATH.
@@ -10,7 +10,7 @@
 //!   `tests/data/parity_expected.txt`, which the CI-safe `tests/parity.rs`
 //!   replays with no `ruby` installed.
 //!
-//! Errors compare loosely: if the oracle exits non-zero and rubyrs also errors,
+//! Errors compare loosely: if the oracle exits non-zero and rubylang also errors,
 //! that snippet is parity (both reject it); the corpus is otherwise all valid
 //! programs whose stdout must match byte-for-byte.
 
@@ -95,11 +95,11 @@ fn oracle(snippet: &str) -> String {
     }
 }
 
-/// Evaluate a snippet in rubyrs, capturing stdout and turning a runtime error or
+/// Evaluate a snippet in rubylang, capturing stdout and turning a runtime error or
 /// panic into `Err`.
 fn rubyrs_run(snippet: &str) -> Result<String, String> {
     let snippet = snippet.to_string();
-    let res = std::panic::catch_unwind(move || capture_stdout(|| rubyrs::eval_str(&snippet)));
+    let res = std::panic::catch_unwind(move || capture_stdout(|| rubylang::eval_str(&snippet)));
     match res {
         Ok((Ok(_), out)) => Ok(out),
         Ok((Err(_), _)) => Ok("<error>".to_string()),

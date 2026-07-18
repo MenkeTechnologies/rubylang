@@ -1,7 +1,7 @@
 //! Method-call intercepts (aspect-oriented advice) — a glob-matched registry of
 //! before/after/around hooks keyed by method-name pattern.
 //!
-//! This is the substrate for rubyrs's AOP layer (the same design as zshrs's
+//! This is the substrate for rubylang's AOP layer (the same design as zshrs's
 //! function intercepts): register a pattern like `"user_*"` or `"*!"` with an
 //! advice kind, and the dispatcher can consult `matches()` to weave advice
 //! around a call. The registry and glob matching are live and tested here; the

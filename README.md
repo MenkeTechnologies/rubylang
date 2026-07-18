@@ -7,7 +7,7 @@
 ╚═╝  ╚═╝ ╚═════╝ ╚═════╝    ╚═╝   ╚═╝  ╚═╝╚══════╝
 ```
 
-[![CI](https://github.com/MenkeTechnologies/rubyrs/actions/workflows/ci.yml/badge.svg)](https://github.com/MenkeTechnologies/rubyrs/actions/workflows/ci.yml)
+[![CI](https://github.com/MenkeTechnologies/rubylang/actions/workflows/ci.yml/badge.svg)](https://github.com/MenkeTechnologies/rubylang/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/Rust-2021-05d9e8?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-ff2a6d?style=flat-square)
 ![status](https://img.shields.io/badge/status-active%20%C2%B7%20in%20development-9b5de5?style=flat-square)
@@ -19,11 +19,11 @@ and `elisp`.
 
 ## What it is
 
-MRI runs Ruby by walking an AST in C. `rubyrs` lexes and parses Ruby to an AST,
+MRI runs Ruby by walking an AST in C. `rubylang` lexes and parses Ruby to an AST,
 lowers it to `fusevm` bytecode, and runs it on a compiled VM with a Cranelift
 JIT. Arithmetic and comparison operators lower to native VM ops so the JIT can
 trace hot loops; Ruby-specific behaviour (method dispatch, blocks, object
-construction, `yield`) is served by a thread-local runtime host. rubyrs carries
+construction, `yield`) is served by a thread-local runtime host. rubylang carries
 no VM or JIT of its own.
 
 ```
@@ -102,7 +102,7 @@ The DAP adapter is partial (handshake + run-to-completion; stepping pending).
 
 ## Building
 
-rubyrs is a standalone Rust crate (an explicit empty `[workspace]` keeps it
+rubylang is a standalone Rust crate (an explicit empty `[workspace]` keeps it
 independent of the meta repo). `fusevm` is pulled from crates.io with the `jit`,
 `jit-disk-cache`, and `aot` features. Run the tests with `cargo test`.
 

@@ -1,14 +1,14 @@
 [package]
-name = "rubyrs"
+name = "rubylang"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["MenkeTechnologies <linux.dev25@gmail.com>"]
 description = "Ruby as a fusevm frontend: a lexer/parser and compiler to fusevm::Chunk on a RubyHost object heap, with no bespoke VM or JIT — the first compiled standalone Ruby runtime"
 license = "MIT"
-repository = "https://github.com/MenkeTechnologies/rubyrs"
-homepage = "https://menketechnologies.github.io/rubyrs/"
-documentation = "https://docs.rs/rubyrs"
+repository = "https://github.com/MenkeTechnologies/rubylang"
+homepage = "https://menketechnologies.github.io/rubylang/"
+documentation = "https://docs.rs/rubylang"
 readme = "README.md"
 keywords = ["ruby", "interpreter", "compiler", "jit", "fusevm"]
 categories = ["command-line-utilities", "compilers"]
@@ -16,14 +16,14 @@ publish = true
 # `docs/` is the published HUD site; not part of the crate build.
 exclude = ["/docs/"]
 
-# rubyrs is a standalone crate, not a workspace member. An explicit empty
+# rubylang is a standalone crate, not a workspace member. An explicit empty
 # `[workspace]` stops cargo walking up to the MenkeTechnologiesMeta parent.
 [workspace]
 
 [lib]
-name = "rubyrs"
+name = "rubylang"
 path = "src/lib.rs"
-# staticlib so an AOT object can be linked against the rubyrs runtime (the
+# staticlib so an AOT object can be linked against the rubylang runtime (the
 # extension-op dispatch + the fusevm AOT runtime) into a standalone native
 # executable via `ruby --build`.
 crate-type = ["rlib", "staticlib"]

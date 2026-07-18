@@ -1,7 +1,7 @@
 //! The Ruby object heap and runtime, reached from fusevm through registered
 //! builtins (`register_builtin`) and the strict numeric hook.
 //!
-//! rubyrs owns no VM and no JIT: the compiler lowers Ruby to `fusevm::Chunk`,
+//! rubylang owns no VM and no JIT: the compiler lowers Ruby to `fusevm::Chunk`,
 //! and every Ruby-specific operation the VM can't do natively is a builtin call
 //! that lands here. Because the host is a thread-local, a method or block body
 //! run as a *nested* fusevm VM automatically shares the caller's lexical scope
@@ -992,7 +992,7 @@ fn num_op_name(op: NumOp) -> &'static str {
 // Running chunks: method calls, block invocation, top-level program.
 // ===========================================================================
 
-/// Register every rubyrs builtin + the numeric hook on a VM, then run it.
+/// Register every rubylang builtin + the numeric hook on a VM, then run it.
 fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
     let mut vm = VM::new(chunk);
     crate::builtins::install(&mut vm);

@@ -1,6 +1,6 @@
 # Known gaps
 
-rubyrs is in active development. The pipeline (lex → parse → lower to fusevm
+rubylang is in active development. The pipeline (lex → parse → lower to fusevm
 bytecode → run) is solid for the implemented surface, verified against the
 reference `ruby` by the parity harness (`cargo run --bin parity`, replayed in CI
 by `tests/parity.rs`). This file tracks what is deliberately not done yet, so the

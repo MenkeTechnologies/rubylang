@@ -15,7 +15,7 @@ use crate::host::{
 use fusevm::{Value, VM};
 use indexmap::IndexMap;
 
-/// Register every rubyrs builtin on `vm`.
+/// Register every rubylang builtin on `vm`.
 pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::GETLOCAL, b_getlocal);
     vm.register_builtin(ops::SETLOCAL, b_setlocal);
@@ -1953,13 +1953,13 @@ pub fn numeric_hook(op: fusevm::NumOp, a: &Value, b: &Value) -> Result<Value, St
     if let Some(cls) = with_host(|h| h.object_class(a)) {
         let name = num_op_method(op);
         if !name.is_empty() && with_host(|h| h.find_method_owner(&cls, name)).is_some() {
-            return call_instance_method(a.clone(), &cls, name, &[b.clone()], None);
+            return call_instance_method(a.clone(), &cls, name, std::slice::from_ref(b), None);
         }
         // Comparable: derive `< > <= >= == !=` from a `<=>` method.
         if matches!(op, Lt | Gt | Le | Ge | Eq | Ne)
             && with_host(|h| h.find_method_owner(&cls, "<=>")).is_some()
         {
-            let cmp = call_instance_method(a.clone(), &cls, "<=>", &[b.clone()], None)?;
+            let cmp = call_instance_method(a.clone(), &cls, "<=>", std::slice::from_ref(b), None)?;
             let c = as_i(&cmp);
             return Ok(Value::Bool(match op {
                 Lt => c < 0,
