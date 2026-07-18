@@ -1179,6 +1179,12 @@ fn dispatch_number(
             let c = (as_i(recv) as u8) as char;
             h.new_string(c.to_string())
         })),
+        // These require exactly one argument; Ruby raises ArgumentError rather
+        // than crashing when it is omitted.
+        "gcd" | "lcm" | "gcdlcm" | "ceildiv" if args.is_empty() => Err(raise_exc(
+            "ArgumentError",
+            "wrong number of arguments (given 0, expected 1)",
+        )),
         "gcd" => Ok(Value::Int(gcd(as_i(recv), as_i(&args[0])))),
         "lcm" => {
             let (a, b) = (as_i(recv), as_i(&args[0]));
@@ -1799,13 +1805,13 @@ fn dispatch_string(
         }
         "ljust" => Ok(new_str(pad(
             &s,
-            as_i(&args[0]) as usize,
+            as_i(&args[0]).max(0) as usize,
             pad_str(args),
             true,
         ))),
         "rjust" => Ok(new_str(pad(
             &s,
-            as_i(&args[0]) as usize,
+            as_i(&args[0]).max(0) as usize,
             pad_str(args),
             false,
         ))),
@@ -3683,9 +3689,13 @@ fn dispatch_hash(
             Ok(v)
         }
         "merge" => {
+            // `merge` with no argument returns a copy; each hash argument is
+            // merged in left-to-right.
             let mut m = map;
-            if let Some(other) = with_host(|h| h.as_hash(&args[0])) {
-                m.extend(other);
+            for a in args {
+                if let Some(other) = with_host(|h| h.as_hash(a)) {
+                    m.extend(other);
+                }
             }
             Ok(with_host(|h| h.new_hash(m)))
         }

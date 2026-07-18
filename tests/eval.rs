@@ -1803,6 +1803,24 @@ fn method_objects_batch() {
 }
 
 #[test]
+fn no_panic_on_edge_inputs() {
+    // These all used to panic (abort the process); they must degrade gracefully.
+    // Multibyte string content near operators (was a lexer char-boundary panic).
+    eq("\"café\".count(\"é\")", "1");
+    eq("\"café\".index(\"é\")", "3");
+    // Negative justify width returns the string unchanged (was a capacity overflow).
+    eq("\"hi\".ljust(-3, \"x\")", "\"hi\"");
+    eq("\"hi\".rjust(-3)", "\"hi\"");
+    // merge with no args returns a copy; multiple hash args merge left-to-right.
+    eq("{a: 1, b: 2}.merge", "{a: 1, b: 2}");
+    eq("{a: 1}.merge({b: 2}, {c: 3})", "{a: 1, b: 2, c: 3}");
+    // A required argument omitted raises ArgumentError instead of panicking.
+    assert!(ev("10.gcd").is_err());
+    assert!(ev("10.ceildiv").is_err());
+    eq("begin; 10.gcd; rescue ArgumentError; :caught; end", ":caught");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

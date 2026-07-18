@@ -512,9 +512,20 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 });
             }
             _ => {
-                // operators / punctuation, longest match first
-                let three = if i + 3 <= b.len() { &src[i..i + 3] } else { "" };
-                let two = if i + 2 <= b.len() { &src[i..i + 2] } else { "" };
+                // operators / punctuation, longest match first. Guard the string
+                // slices on char boundaries: a multibyte char elsewhere on the
+                // line means `i + n` can land inside a codepoint, and slicing a
+                // `str` off a boundary panics.
+                let three = if i + 3 <= b.len() && src.is_char_boundary(i + 3) {
+                    &src[i..i + 3]
+                } else {
+                    ""
+                };
+                let two = if i + 2 <= b.len() && src.is_char_boundary(i + 2) {
+                    &src[i..i + 2]
+                } else {
+                    ""
+                };
                 let op: &str = if matches!(
                     three,
                     "**=" | "<=>" | "===" | "..." | "&&=" | "||=" | "<<=" | ">>="
