@@ -752,12 +752,33 @@ fn dispatch_number(
         "negative?" => Ok(Value::Bool(as_f(recv) < 0.0)),
         "succ" | "next" => Ok(Value::Int(as_i(recv) + 1)),
         "pred" => Ok(Value::Int(as_i(recv) - 1)),
-        "floor" => Ok(Value::Int(as_f(recv).floor() as i64)),
-        "ceil" => Ok(Value::Int(as_f(recv).ceil() as i64)),
-        "round" => Ok(match recv {
-            Value::Float(f) => Value::Int(f.round() as i64),
-            _ => recv.clone(),
+        "floor" => Ok(round_like(recv, args.first().map(as_i), f64::floor)),
+        "ceil" => Ok(round_like(recv, args.first().map(as_i), f64::ceil)),
+        "round" => Ok(round_like(recv, args.first().map(as_i), f64::round)),
+        "truncate" => Ok(round_like(recv, args.first().map(as_i), f64::trunc)),
+        "nan?" if matches!(recv, Value::Float(_)) => {
+            Ok(Value::Bool(matches!(recv, Value::Float(f) if f.is_nan())))
+        }
+        "infinite?" => Ok(match recv {
+            Value::Float(f) if f.is_infinite() => Value::Int(if *f > 0.0 { 1 } else { -1 }),
+            _ => Value::Undef,
         }),
+        "finite?" => Ok(Value::Bool(match recv {
+            Value::Float(f) => f.is_finite(),
+            _ => true,
+        })),
+        "divmod" => match (recv, &args[0]) {
+            (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
+            (Value::Int(a), Value::Int(b)) => Ok(new_arr(vec![
+                Value::Int(floor_div(*a, *b)),
+                Value::Int(floor_mod(*a, *b)),
+            ])),
+            _ => {
+                let (x, y) = (as_f(recv), as_f(&args[0]));
+                let q = (x / y).floor();
+                Ok(new_arr(vec![Value::Int(q as i64), Value::Float(x - q * y)]))
+            }
+        },
         "chr" => Ok(with_host(|h| {
             let c = (as_i(recv) as u8) as char;
             h.new_string(c.to_string())
@@ -794,23 +815,18 @@ fn dispatch_number(
             let m = if n >= 0 { n as u64 } else { (!n) as u64 };
             Ok(Value::Int((64 - m.leading_zeros()) as i64))
         }
-        "divmod" => match (recv, &args[0]) {
-            (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
-            (Value::Int(a), Value::Int(b)) => Ok(new_arr(vec![
-                Value::Int(floor_div(*a, *b)),
-                Value::Int(floor_mod(*a, *b)),
-            ])),
-            _ => {
-                let (x, y) = (as_f(recv), as_f(&args[0]));
-                let q = (x / y).floor();
-                Ok(new_arr(vec![Value::Float(q), Value::Float(x - q * y)]))
-            }
-        },
         "fdiv" => Ok(Value::Float(as_f(recv) / as_f(&args[0]))),
         "clamp" => {
-            let n = as_i(recv);
-            let (lo, hi) = (as_i(&args[0]), as_i(&args[1]));
-            Ok(Value::Int(n.max(lo).min(hi)))
+            // Ruby returns the receiver when in range, otherwise the bound
+            // itself (preserving its type, so `(-2.7).clamp(-1.0, 1.0)` is a Float).
+            let x = as_f(recv);
+            if x < as_f(&args[0]) {
+                Ok(args[0].clone())
+            } else if x > as_f(&args[1]) {
+                Ok(args[1].clone())
+            } else {
+                Ok(recv.clone())
+            }
         }
         "<=>" => {
             let (x, y) = (as_f(recv), as_f(&args[0]));
@@ -834,6 +850,35 @@ fn dispatch_number(
             "undefined method '{name}' for {}",
             with_host(|h| h.class_of(recv))
         )),
+    }
+}
+
+/// Shared impl for `Float#round/ceil/floor/truncate(ndigits)`.
+///
+/// Ruby returns a `Float` only when `ndigits > 0`; with no argument or a
+/// non-positive count the result is an `Integer`. Integers are returned
+/// unchanged unless `ndigits < 0` (round to a power of ten).
+fn round_like(recv: &Value, ndigits: Option<i64>, op: fn(f64) -> f64) -> Value {
+    match recv {
+        Value::Float(f) => match ndigits {
+            Some(d) if d > 0 => {
+                let m = 10f64.powi(d as i32);
+                Value::Float(op(f * m) / m)
+            }
+            Some(d) if d < 0 => {
+                let m = 10f64.powi((-d) as i32);
+                Value::Int((op(f / m) * m) as i64)
+            }
+            _ => Value::Int(op(*f) as i64),
+        },
+        Value::Int(n) => match ndigits {
+            Some(d) if d < 0 => {
+                let m = 10f64.powi((-d) as i32);
+                Value::Int((op(*n as f64 / m) * m) as i64)
+            }
+            _ => Value::Int(*n),
+        },
+        _ => recv.clone(),
     }
 }
 

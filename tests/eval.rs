@@ -854,6 +854,31 @@ fn string_iter_batch() {
 }
 
 #[test]
+fn float_math_batch() {
+    // round/ceil/floor/truncate with ndigits keep a Float; without, give an Integer.
+    eq("3.14159.round(2)", "3.14");
+    eq("3.14159.floor(1)", "3.1");
+    eq("3.14159.ceil(2)", "3.15");
+    eq("3.99.truncate(1)", "3.9");
+    eq("2.5.round", "3");
+    eq("(-2.5).round", "-3");
+    eq("3.7.to_i", "3");
+    eq("3.7.abs", "3.7");
+    // nan?/infinite?/finite? classification.
+    eq("(1.0/0).infinite?", "1");
+    eq("(-1.0/0).infinite?", "-1");
+    eq("3.infinite?", "nil");
+    eq("(0.0/0).nan?", "true");
+    eq("(0.0/0).finite?", "false");
+    eq("3.finite?", "true");
+    // divmod / modulo / clamp.
+    eq("7.5.divmod(2)", "[3, 1.5]");
+    eq("5.divmod(3)", "[1, 2]");
+    eq("7.5.modulo(2)", "1.5");
+    eq("(-2.7).clamp(-1.0, 1.0)", "-1.0");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
