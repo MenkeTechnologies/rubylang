@@ -679,3 +679,21 @@ calc = Calculator.new
 puts calc.add(3, 4)
 puts calc.sub(10, 3)
 puts calc.mul(6, 7)
+#==#
+class Stack
+  def initialize; @items = []; end
+  def push(x); @items.push(x); self; end
+  def pop; @items.pop; end
+  def size; @items.size; end
+  alias_method :<<, :push
+  alias length size
+  alias count size
+end
+s = Stack.new
+s << 1
+s << 2
+s << 3
+puts s.length
+puts s.count
+puts s.pop
+puts s.size

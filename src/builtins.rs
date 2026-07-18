@@ -535,6 +535,12 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
             with_host(|h| h.add_define_method(&cls, &mname, proc));
             return Ok(with_host(|h| h.new_symbol(&mname)));
         }
+        // `alias_method(:new, :old)` — register an alias on the class.
+        if name == "alias_method" && args.len() >= 2 {
+            let (new_name, old_name) = (name_of(&args[0]), name_of(&args[1]));
+            with_host(|h| h.add_alias(&cls, &new_name, &old_name));
+            return Ok(with_host(|h| h.new_symbol(&new_name)));
+        }
         if name == "new" || with_host(|h| h.find_class_method(&cls, name)).is_some() {
             return dispatch_classref(&cls, name, args, block);
         }
@@ -1063,6 +1069,10 @@ fn dispatch_object(
     // A `define_method` block runs as an instance method with `self` = receiver.
     if let Some(proc) = with_host(|h| h.find_define_method(cls, name)) {
         return crate::host::call_proc_self(&proc, args, Some(recv));
+    }
+    // An `alias_method`/`alias` name forwards to its target method.
+    if let Some(target) = with_host(|h| h.find_alias(cls, name)) {
+        return dispatch(recv, &target, args, block);
     }
     // Struct instance methods (accessors, ==, to_a/to_h, members, [], each, …).
     if let Some((members, _)) = with_host(|h| h.struct_def(cls)) {

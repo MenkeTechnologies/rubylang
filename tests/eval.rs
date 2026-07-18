@@ -2175,6 +2175,26 @@ fn define_method_metaprogramming() {
 }
 
 #[test]
+fn method_aliases() {
+    // alias_method makes a second name for a method.
+    eq(
+        "class C; def greet; \"hi\"; end; alias_method :hi, :greet; end; C.new.hi",
+        "\"hi\"",
+    );
+    // The `alias` keyword form.
+    eq(
+        "class C; def size; 42; end; alias length size; end; C.new.length",
+        "42",
+    );
+    // Aliases carry through arguments and access the receiver's ivars.
+    eq(
+        "class C; def initialize; @b = 100; end; def calc(x); x + @b; end; \
+         alias_method :compute, :calc; end; C.new.compute(5)",
+        "105",
+    );
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).

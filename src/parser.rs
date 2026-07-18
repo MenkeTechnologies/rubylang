@@ -848,6 +848,7 @@ impl Parser {
             "def" => self.def_expr(),
             "class" => self.class_expr(),
             "module" => self.module_expr(),
+            "alias" => self.alias_expr(),
             "return" => {
                 self.advance();
                 Ok(Expr::Return(self.opt_value()?))
@@ -1049,6 +1050,28 @@ impl Parser {
             clauses,
             els,
         })
+    }
+
+    /// `alias new_name old_name` — desugars to `alias_method(:new, :old)`.
+    fn alias_expr(&mut self) -> Result<Expr, String> {
+        self.advance(); // alias
+        let new_name = self.alias_name()?;
+        let old_name = self.alias_name()?;
+        Ok(Expr::Call {
+            recv: None,
+            name: "alias_method".to_string(),
+            args: vec![Expr::Symbol(new_name), Expr::Symbol(old_name)],
+            block: None,
+        })
+    }
+
+    /// A method name in an `alias` clause: a bareword, a `:symbol`, or an operator.
+    fn alias_name(&mut self) -> Result<String, String> {
+        match self.advance() {
+            Tok::Ident(s) | Tok::Const(s) | Tok::Symbol(s) => Ok(s),
+            Tok::Op(o) => Ok(o),
+            other => Err(format!("line {}: bad alias name '{other}'", self.line())),
+        }
     }
 
     /// A full pattern: alternatives joined by `|`, with an optional `=> name`

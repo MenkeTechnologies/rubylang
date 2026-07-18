@@ -70,7 +70,7 @@ impl fmt::Display for Tok {
 const KEYWORDS: &[&str] = &[
     "def", "end", "if", "elsif", "else", "unless", "while", "until", "for", "in", "do", "return",
     "break", "next", "yield", "then", "case", "when", "nil", "true", "false", "and", "or", "not",
-    "class", "module", "begin", "rescue", "ensure", "self", "super", "retry",
+    "class", "module", "begin", "rescue", "ensure", "self", "super", "retry", "alias",
 ];
 
 /// Tokenize `src`. Returns an error string on an unterminated string or an
@@ -580,9 +580,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             }
             // Operator symbols: `:+`, `:<=>`, `:[]`, … only in value position (so
             // `a ? b : c` ternary and `key: v` hash keys are untouched).
+            // An operator symbol (`:+`, `:<<`, `:[]`) — recognized when it can't be
+            // a ternary colon: either at the start of an expression, or as a
+            // spaced command argument (`foo :<<`). Ternary's `:` is followed by a
+            // space, so `op_symbol_at` never matches there.
             b':' if i + 1 < b.len()
                 && op_symbol_at(&src[i + 1..]).is_some()
-                && !prev_is_value(&out) =>
+                && (!prev_is_value(&out) || sp) =>
             {
                 let op = op_symbol_at(&src[i + 1..]).unwrap();
                 i += 1 + op.len();

@@ -348,6 +348,8 @@ pub struct RubyHost {
     class_vars: IndexMap<String, IndexMap<String, Value>>,
     /// `define_method`-created instance methods: class → name → block Proc.
     define_methods: IndexMap<String, IndexMap<String, Value>>,
+    /// `alias_method`/`alias` mappings: class → alias name → target method name.
+    method_aliases: IndexMap<String, IndexMap<String, String>>,
 }
 
 thread_local! {
@@ -401,6 +403,7 @@ impl RubyHost {
             struct_counter: 0,
             class_vars: IndexMap::new(),
             define_methods: IndexMap::new(),
+            method_aliases: IndexMap::new(),
         }
     }
 
@@ -1114,6 +1117,24 @@ impl RubyHost {
         while let Some(c) = cur {
             if let Some(p) = self.define_methods.get(&c).and_then(|m| m.get(name)) {
                 return Some(p.clone());
+            }
+            cur = self.superclass_of(&c);
+        }
+        None
+    }
+    /// Register `alias_name` as an alias of `target` on `class`.
+    pub fn add_alias(&mut self, class: &str, alias_name: &str, target: &str) {
+        self.method_aliases
+            .entry(class.to_string())
+            .or_default()
+            .insert(alias_name.to_string(), target.to_string());
+    }
+    /// The method an alias points to (walking the superclass chain), if any.
+    pub fn find_alias(&self, class: &str, name: &str) -> Option<String> {
+        let mut cur = Some(class.to_string());
+        while let Some(c) = cur {
+            if let Some(t) = self.method_aliases.get(&c).and_then(|m| m.get(name)) {
+                return Some(t.clone());
             }
             cur = self.superclass_of(&c);
         }
