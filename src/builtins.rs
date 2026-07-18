@@ -805,6 +805,7 @@ pub(crate) fn dispatch(
         "MatchData" => dispatch_matchdata(recv, name, args),
         "Set" => dispatch_set(recv, name, args, block),
         "Time" => dispatch_time(recv, name, args),
+        "Date" => dispatch_date(recv, name, args),
         "Enumerator" => dispatch_enumerator(recv, name, args, block),
         "Enumerator::Lazy" => dispatch_lazy(recv, name, args, block),
         "Rational" => dispatch_rational(recv, name, args),
@@ -933,6 +934,40 @@ fn dispatch_classref(
                 return Ok(with_host(|h| h.new_time(secs)));
             }
             "now" => return Ok(with_host(|h| h.new_time(now_epoch_secs()))),
+            _ => {}
+        }
+    }
+    // `Date` constructors (proleptic Gregorian). `Date.new(y, m, d)`,
+    // `Date.today` (from the system clock), `Date.parse(str)` for ISO dates,
+    // and `Date.jd(n)` from a Julian Day Number.
+    if cls == "Date" {
+        match name {
+            "new" | "civil" => {
+                let g = |i: usize, dflt: i64| args.get(i).map(as_i).unwrap_or(dflt);
+                let (y, mo, d) = (g(0, -4712), g(1, 1), g(2, 1));
+                return Ok(with_host(|h| {
+                    let days = crate::host::days_from_civil(y, mo, d);
+                    h.new_date(days)
+                }));
+            }
+            "today" => {
+                let days = (now_epoch_secs() / 86_400.0).floor() as i64;
+                return Ok(with_host(|h| h.new_date(days)));
+            }
+            "jd" => {
+                let jd = args
+                    .first()
+                    .map(as_i)
+                    .unwrap_or(crate::host::UNIX_EPOCH_JDN);
+                return Ok(with_host(|h| h.new_date(jd - crate::host::UNIX_EPOCH_JDN)));
+            }
+            "parse" => {
+                let s = with_host(|h| h.as_str(&args[0]).unwrap_or_default());
+                return match parse_iso_date(&s) {
+                    Some(days) => Ok(with_host(|h| h.new_date(days))),
+                    None => Err(raise_exc("ArgumentError", "invalid date")),
+                };
+            }
             _ => {}
         }
     }
@@ -4995,6 +5030,127 @@ fn dispatch_time(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
     }
 }
 
+/// Parse an ISO-8601-style `YYYY-MM-DD` (or `YYYY/MM/DD`) date into a day count
+/// since the Unix epoch. Ruby's `Date.parse` is far more lenient; this covers
+/// the common machine-readable forms and rejects the rest.
+fn parse_iso_date(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let parts: Vec<&str> = s.splitn(3, ['-', '/']).collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let y: i64 = parts[0].parse().ok()?;
+    let m: i64 = parts[1].parse().ok()?;
+    let d: i64 = parts[2].get(..2).unwrap_or(parts[2]).parse().ok()?;
+    if !(1..=12).contains(&m) || d < 1 || d > crate::host::days_in_month(y, m) {
+        return None;
+    }
+    Some(crate::host::days_from_civil(y, m, d))
+}
+
+/// Shift a day count by `delta` calendar months, clamping the day to the last
+/// valid day of the target month (`Jan 31 >> 1` → `Feb 28`/`29`), matching
+/// `Date#>>` / `#next_month`.
+fn date_add_months(days: i64, delta: i64) -> i64 {
+    let (y, m, d) = crate::host::civil_from_days(days);
+    let total = (y * 12 + (m - 1)) + delta;
+    let ny = total.div_euclid(12);
+    let nm = total.rem_euclid(12) + 1;
+    let nd = d.min(crate::host::days_in_month(ny, nm));
+    crate::host::days_from_civil(ny, nm, nd)
+}
+
+/// `Date` instance methods (proleptic Gregorian, no time-of-day). Field readers
+/// reuse `time_fields`; arithmetic operators also route here (with the native
+/// `+`/`-`/`<`/`>` forms handled in `Host::num_op`).
+fn dispatch_date(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let days = with_host(|h| h.date_days(recv).unwrap_or(0));
+    let (y, mo, d) = crate::host::civil_from_days(days);
+    // Reuse the UTC breakdown for wday/yday (time-of-day is always zero).
+    let (_, _, _, _, _, _, wday, yday, _) = with_host(|h| h.time_fields(days as f64 * 86_400.0));
+    let arg_days = |i: usize, dflt: i64| args.get(i).map(as_i).unwrap_or(dflt);
+    match name {
+        "year" => Ok(Value::Int(y)),
+        "month" | "mon" => Ok(Value::Int(mo)),
+        "day" | "mday" => Ok(Value::Int(d)),
+        "wday" => Ok(Value::Int(wday)),
+        "yday" => Ok(Value::Int(yday)),
+        // ISO weekday: Monday=1..Sunday=7.
+        "cwday" => Ok(Value::Int(if wday == 0 { 7 } else { wday })),
+        "jd" => Ok(Value::Int(days + crate::host::UNIX_EPOCH_JDN)),
+        "leap?" => Ok(Value::Bool(crate::host::is_leap_year(y))),
+        "sunday?" => Ok(Value::Bool(wday == 0)),
+        "monday?" => Ok(Value::Bool(wday == 1)),
+        "tuesday?" => Ok(Value::Bool(wday == 2)),
+        "wednesday?" => Ok(Value::Bool(wday == 3)),
+        "thursday?" => Ok(Value::Bool(wday == 4)),
+        "friday?" => Ok(Value::Bool(wday == 5)),
+        "saturday?" => Ok(Value::Bool(wday == 6)),
+        "to_s" | "iso8601" => Ok(with_host(|h| {
+            let s = h.date_to_s(days);
+            h.new_string(s)
+        })),
+        "inspect" => Ok(with_host(|h| {
+            let s = h.date_inspect(days);
+            h.new_string(s)
+        })),
+        "strftime" => {
+            let fmt = with_host(|h| h.as_str(&args[0]).unwrap_or_default());
+            let f = with_host(|h| h.time_fields(days as f64 * 86_400.0));
+            Ok(with_host(|h| {
+                let s = time_strftime(&fmt, f, days as f64 * 86_400.0);
+                h.new_string(s)
+            }))
+        }
+        "next_day" | "succ" => Ok(with_host(|h| h.new_date(days + arg_days(0, 1)))),
+        "prev_day" => Ok(with_host(|h| h.new_date(days - arg_days(0, 1)))),
+        "next_month" => Ok(with_host(|h| {
+            h.new_date(date_add_months(days, arg_days(0, 1)))
+        })),
+        "prev_month" => Ok(with_host(|h| {
+            h.new_date(date_add_months(days, -arg_days(0, 1)))
+        })),
+        ">>" => Ok(with_host(|h| {
+            h.new_date(date_add_months(days, arg_days(0, 1)))
+        })),
+        "<<" => Ok(with_host(|h| {
+            h.new_date(date_add_months(days, -arg_days(0, 1)))
+        })),
+        "next_year" => Ok(with_host(|h| {
+            h.new_date(date_add_months(days, 12 * arg_days(0, 1)))
+        })),
+        "prev_year" => Ok(with_host(|h| {
+            h.new_date(date_add_months(days, -12 * arg_days(0, 1)))
+        })),
+        "+" => Ok(with_host(|h| h.new_date(days + as_i(&args[0])))),
+        "-" => {
+            if let Some(other) = with_host(|h| h.date_days(&args[0])) {
+                Ok(with_host(|h| {
+                    let r = num_rational::BigRational::from(num_bigint::BigInt::from(days - other));
+                    h.new_rational(r)
+                }))
+            } else {
+                Ok(with_host(|h| h.new_date(days - as_i(&args[0]))))
+            }
+        }
+        "<=>" => {
+            if let Some(other) = with_host(|h| h.date_days(&args[0])) {
+                Ok(Value::Int((days.cmp(&other) as i64).signum()))
+            } else {
+                Ok(Value::Undef)
+            }
+        }
+        "==" => Ok(Value::Bool(
+            with_host(|h| h.date_days(&args[0])) == Some(days),
+        )),
+        "hash" => Ok(Value::Int(days)),
+        _ => Err(raise_exc(
+            "NoMethodError",
+            &format!("undefined method '{name}' for an instance of Date"),
+        )),
+    }
+}
+
 fn dispatch_set(
     recv: &Value,
     name: &str,
@@ -7193,6 +7349,10 @@ fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     // Two Times order by their epoch seconds.
     if let (Some(x), Some(y)) = with_host(|h| (h.time_secs(a), h.time_secs(b))) {
         return x.total_cmp(&y);
+    }
+    // Two Dates order by their day count.
+    if let (Some(x), Some(y)) = with_host(|h| (h.date_days(a), h.date_days(b))) {
+        return x.cmp(&y);
     }
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),

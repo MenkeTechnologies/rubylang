@@ -244,6 +244,30 @@ pub enum RObj {
     Time {
         secs: f64,
     },
+    /// A `Date`, stored as whole days since the Unix epoch (1970-01-01 = 0).
+    /// Uses the same proleptic-Gregorian calendar as `Time`.
+    Date {
+        days: i64,
+    },
+}
+
+/// Julian Day Number of the Unix epoch (1970-01-01), so `jd = days + this`.
+pub const UNIX_EPOCH_JDN: i64 = 2_440_588;
+
+/// Days in month `m` (1..=12) of year `y`, accounting for leap years.
+pub fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(y) => 29,
+        2 => 28,
+        _ => 30,
+    }
+}
+
+/// Whether `y` is a Gregorian leap year.
+pub fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 /// Days from the civil calendar date `(y, m, d)` to the Unix epoch
@@ -752,6 +776,31 @@ impl RubyHost {
         let wday = (days.rem_euclid(7) + 4) % 7;
         let yday = days - days_from_civil(y, 1, 1) + 1;
         (y, m, d, hh, mm, ss, wday, yday, subsec)
+    }
+    /// Build a `Date` from a day count since the Unix epoch.
+    pub fn new_date(&mut self, days: i64) -> Value {
+        self.alloc(RObj::Date { days })
+    }
+    /// The epoch day count of a `Date`, if `v` is one.
+    pub fn date_days(&self, v: &Value) -> Option<i64> {
+        match self.obj(v) {
+            Some(RObj::Date { days }) => Some(*days),
+            _ => None,
+        }
+    }
+    /// `Date#to_s` / `#iso8601`: `YYYY-MM-DD`.
+    pub fn date_to_s(&self, days: i64) -> String {
+        let (y, m, d) = civil_from_days(days);
+        format!("{y:04}-{m:02}-{d:02}")
+    }
+    /// `Date#inspect`: `#<Date: YYYY-MM-DD ((JDNj,0s,0n),+0s,2299161j)>` — the
+    /// Julian Day Number plus the fixed Gregorian-reform day, matching MRI.
+    pub fn date_inspect(&self, days: i64) -> String {
+        format!(
+            "#<Date: {} (({}j,0s,0n),+0s,2299161j)>",
+            self.date_to_s(days),
+            days + UNIX_EPOCH_JDN
+        )
     }
     /// The canonical `Time#to_s` / `#inspect` text: `YYYY-MM-DD HH:MM:SS UTC`.
     /// With `subsec`, a non-zero fractional second is appended (`.5`), matching
@@ -1432,6 +1481,7 @@ impl RubyHost {
                 | "Set"
                 | "Struct"
                 | "Time"
+                | "Date"
         )
     }
     pub fn classref_name(&self, v: &Value) -> Option<String> {
@@ -1681,6 +1731,7 @@ impl RubyHost {
                     format!("Set[{}]", inner.join(", "))
                 }
                 Some(RObj::Time { secs }) => self.time_to_s(secs, false),
+                Some(RObj::Date { days }) => self.date_to_s(days),
                 Some(RObj::Lazy { .. }) => "#<Enumerator::Lazy>".to_string(),
                 Some(RObj::Enumerator { buf, .. }) => {
                     format!("#<Enumerator: {}>", self.inspect_array(&buf))
@@ -1748,6 +1799,7 @@ impl RubyHost {
                 Some(RObj::Regexp { source, .. }) => format!("/{source}/"),
                 // `Time#inspect` shows a fractional second (unlike `#to_s`).
                 Some(RObj::Time { secs }) => self.time_to_s(secs, true),
+                Some(RObj::Date { days }) => self.date_inspect(days),
                 // A String range inspects its endpoints with quotes: `"a".."e"`.
                 Some(RObj::StrRange { lo, hi, exclusive }) => {
                     format!("{lo:?}{}{hi:?}", if exclusive { "..." } else { ".." })
@@ -1817,6 +1869,7 @@ impl RubyHost {
                 Some(RObj::Lazy { .. }) => "Enumerator::Lazy",
                 Some(RObj::Enumerator { .. }) => "Enumerator",
                 Some(RObj::Time { .. }) => "Time",
+                Some(RObj::Date { .. }) => "Date",
                 Some(RObj::Set(_)) => "Set",
                 Some(RObj::Array(_)) => "Array",
                 Some(RObj::Hash { .. }) => "Hash",
@@ -2054,6 +2107,33 @@ impl RubyHost {
                 _ => {}
             }
         }
+        // `Date` arithmetic. `Date - Date` is the Rational number of days between
+        // them (matching MRI, which yields a `Rational`); `Date ± Integer` shifts
+        // by whole days and stays a `Date`. Comparisons order by day count.
+        if let Some(da) = self.date_days(a) {
+            match op {
+                Sub => {
+                    if let Some(db) = self.date_days(b) {
+                        let r = num_rational::BigRational::from(num_bigint::BigInt::from(da - db));
+                        return Ok(self.new_rational(r));
+                    }
+                    if let Some(n) = as_int(b) {
+                        return Ok(self.new_date(da - n));
+                    }
+                }
+                Add => {
+                    if let Some(n) = as_int(b) {
+                        return Ok(self.new_date(da + n));
+                    }
+                }
+                Lt | Gt | Le | Ge => {
+                    if let Some(db) = self.date_days(b) {
+                        return Ok(Value::Bool(cmp_ord(op, da.cmp(&db))));
+                    }
+                }
+                _ => {}
+            }
+        }
         // Set `+` (union) and `-` (difference) arrive as native Add/Sub; the
         // bitwise-named set operators (`|`/`&`/`^`) route through method dispatch.
         if let Some(xs) = self.as_set(a) {
@@ -2134,6 +2214,8 @@ impl RubyHost {
                     }
                     // Two Times are equal when they name the same instant.
                     (Some(RObj::Time { secs: x }), Some(RObj::Time { secs: y })) => x == y,
+                    // Two Dates are equal when they name the same day.
+                    (Some(RObj::Date { days: x }), Some(RObj::Date { days: y })) => x == y,
                     // Two struct instances are equal when they share a class and
                     // all their members compare equal.
                     (

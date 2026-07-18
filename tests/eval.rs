@@ -2358,6 +2358,48 @@ fn time_utc() {
 }
 
 #[test]
+fn date_calendar() {
+    // Construction and field readers.
+    eq(
+        "d = Date.new(2024, 2, 29); [d.year, d.month, d.day, d.wday, d.yday]",
+        "[2024, 2, 29, 4, 60]",
+    );
+    eq("Date.new(2024, 1, 1).leap?", "true");
+    eq("Date.new(2023, 1, 1).leap?", "false");
+    eq("Date.new(2024, 3, 1).jd", "2460371");
+    eq("Date.new(2024, 3, 1).cwday", "5"); // Friday
+                                           // Arithmetic: Date - Date is a Rational day count; Date ± Integer shifts days.
+    eq("Date.new(2024, 3, 1) - Date.new(2024, 2, 1)", "(29/1)");
+    eq("(Date.new(2024, 1, 1) + 40).to_s", "\"2024-02-10\"");
+    eq("Date.new(2024, 2, 29).next_day.to_s", "\"2024-03-01\"");
+    // Month arithmetic clamps the day to the target month's length.
+    eq("Date.new(2024, 1, 31).next_month.to_s", "\"2024-02-29\"");
+    eq("(Date.new(2024, 1, 31) >> 1).to_s", "\"2024-02-29\"");
+    eq("(Date.new(2024, 3, 31) << 1).to_s", "\"2024-02-29\"");
+    eq("Date.new(2024, 2, 29).next_year.to_s", "\"2025-02-28\"");
+    // Formatting and parsing.
+    eq(
+        "Date.new(2024, 7, 4).strftime(\"%A %B %-d, %Y\")",
+        "\"Thursday July 4, 2024\"",
+    );
+    eq("Date.new(2024, 7, 4).to_s", "\"2024-07-04\"");
+    eq("Date.parse(\"2024-07-04\").month", "7");
+    eq("Date.parse(\"2024/12/25\").day", "25");
+    // inspect uses the Julian Day Number form.
+    eq(
+        "Date.new(2024, 7, 4).inspect",
+        "\"#<Date: 2024-07-04 ((2460496j,0s,0n),+0s,2299161j)>\"",
+    );
+    // Comparison and sort.
+    eq("Date.new(2024, 1, 1) < Date.new(2024, 2, 1)", "true");
+    eq("Date.new(2024, 1, 1) <=> Date.new(2024, 2, 1)", "-1");
+    eq(
+        "[Date.new(2024, 3, 1), Date.new(2024, 1, 1), Date.new(2024, 2, 1)].sort.map(&:to_s)",
+        "[\"2024-01-01\", \"2024-02-01\", \"2024-03-01\"]",
+    );
+}
+
+#[test]
 fn float_constants_and_leading_dot_chains() {
     eq("Float::INFINITY", "Infinity");
     eq("5 < Float::INFINITY", "true");

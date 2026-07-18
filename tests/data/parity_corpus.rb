@@ -796,3 +796,20 @@ t = Time.at(0).utc
 puts [t.year, t.month, t.day, t.wday, t.yday].inspect
 newyear = Time.gm(2024, 1, 1, 0, 0, 0)
 puts newyear.strftime("%j %u")
+#==#
+require "date"
+launch = Date.new(2024, 7, 4)
+puts launch.to_s
+puts launch.strftime("%A, %B %-d, %Y")
+puts launch.wday
+puts launch.leap?
+deadline = launch >> 2
+puts deadline.to_s
+puts (deadline - launch).to_i
+eom = Date.new(2024, 1, 31)
+puts eom.next_month.to_s
+puts eom.next_year.to_s
+dates = [Date.new(2024, 3, 15), Date.new(2024, 1, 5), Date.new(2024, 2, 20)]
+puts dates.sort.map(&:iso8601).inspect
+puts Date.parse("2000-02-29").leap?
+puts Date.new(2024, 12, 31).yday

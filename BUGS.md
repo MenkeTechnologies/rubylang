@@ -99,6 +99,16 @@ capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
   `.utc`/`.getutc` are exact and `.localtime`/`Time.local` behave as UTC. `Date`/
   `DateTime` and timezone-aware `strftime` (`%Z` always prints `UTC`, `%z` always
   `+0000`) are not implemented.
+- **`Date`** (available without `require "date"`, which is accepted as a no-op).
+  `Date.new`/`civil`, `Date.today`, `Date.jd`, and `Date.parse` (ISO
+  `YYYY-MM-DD` / `YYYY/MM/DD` only — MRI's lenient free-form parsing is not
+  modeled) construct dates. Field readers (`year`/`month`/`day`/`wday`/`yday`/
+  `cwday`/`jd`/`leap?`), `to_s`/`iso8601`, `inspect` (Julian-day form),
+  `strftime`, day/month/year arithmetic (`+`/`-`/`next_day`/`prev_day`/
+  `next_month`/`prev_month`/`>>`/`<<` with last-day clamping), `Date - Date →
+  Rational`, and comparison/sort all work over the same proleptic-Gregorian
+  calendar as `Time`. `DateTime`, `Date#>>`-with-fractional, and locale-aware
+  formatting are not implemented.
 - **`Array#pack` / `String#unpack`** are not implemented: strings are UTF-8
   (`String`, not a byte buffer), so the binary directives (`N`/`n`/`V`/`v`/`H`,
   high `C` bytes) cannot round-trip. This is a durable encoding limitation, not a
