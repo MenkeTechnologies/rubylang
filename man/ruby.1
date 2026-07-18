@@ -1,0 +1,38 @@
+.TH RUBY 1 "2026" "rubyrs" "User Commands"
+.SH NAME
+ruby \- compiled Ruby runtime on the fusevm bytecode VM
+.SH SYNOPSIS
+.B ruby
+[\fIOPTIONS\fR]
+[\fIFILE\fR]
+.SH DESCRIPTION
+.B rubyrs
+runs Ruby programs by lexing and parsing to an AST, lowering to
+.B fusevm
+bytecode, and executing on a shared bytecode VM with a three-tier Cranelift
+JIT. Arithmetic lowers to native VM ops; Ruby object semantics are served by a
+runtime host.
+.SH OPTIONS
+.TP
+.BR \-e ", " \-\-eval " " \fISRC\fR
+Execute a one-liner instead of a file.
+.TP
+.B \-\-repl
+Start the interactive REPL on a persistent host.
+.TP
+.B \-\-lsp
+Speak the Language Server Protocol over stdio.
+.TP
+.B \-\-dap
+Speak the Debug Adapter Protocol over stdio.
+.TP
+.B \-\-build " " \fIFILE\fR
+Ahead-of-time compile the script's bytecode into the on-disk cache.
+.TP
+.B \-\-dump\-bytecode " " \fIFILE\fR
+Print the lowered fusevm bytecode and exit.
+.SH EXIT STATUS
+0 on success, 1 on a parse or runtime error (reported to stderr as
+.IR "ruby: <reason>" ).
+.SH SEE ALSO
+Project: https://github.com/MenkeTechnologies/rubyrs
