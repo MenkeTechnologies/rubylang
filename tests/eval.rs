@@ -1406,6 +1406,7 @@ fn comparable_range_batch() {
     eq(
         "begin; 5.clamp(1...3); rescue => e; e.message; end",
         "\"cannot clamp with an exclusive range\"",
+    );
 }
 
 #[test]
