@@ -1500,6 +1500,23 @@ fn kernel_more_batch() {
 }
 
 #[test]
+fn string_justify_batch() {
+    // Named references in `String#%` and `Kernel#format`.
+    eq("\"%<name>s is %<age>d\" % {name: \"Al\", age: 3}", "\"Al is 3\"");
+    eq("\"%{greet} world\" % {greet: \"hi\"}", "\"hi world\"");
+    eq("\"%{a}%{b}\" % {a: 1, b: 2}", "\"12\"");
+    eq("\"%<n>05.2f\" % {n: 3.14159}", "\"03.14\"");
+    eq("\"%-10<w>s|\" % {w: \"hi\"}", "\"hi        |\"");
+    eq("format(\"%<name>s=%<n>d\", name: \"x\", n: 42)", "\"x=42\"");
+    eq("sprintf(\"%{a}-%{b}\", a: \"p\", b: \"q\")", "\"p-q\"");
+    // prepend(*strs) and concat(*strs) mutate and return the receiver.
+    eq("\"b\".prepend(\"a\")", "\"ab\"");
+    eq("\"a\".concat(\"b\", \"c\")", "\"abc\"");
+    // `*=` desugars to String#* (repeat).
+    eq("s = \"ab\"; s *= 3; s", "\"ababab\"");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

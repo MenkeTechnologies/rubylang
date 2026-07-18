@@ -1531,7 +1531,7 @@ fn dispatch_string(
             with_host(|h| h.set_str(recv, n));
             Ok(recv.clone())
         }
-        "concat" | "<<" | "+" => {
+        "<<" | "+" => {
             let other = with_host(|h| h.to_s(&args[0]));
             if name == "+" {
                 Ok(new_str(format!("{s}{other}")))
@@ -1539,6 +1539,13 @@ fn dispatch_string(
                 with_host(|h| h.set_str(recv, format!("{s}{other}")));
                 Ok(recv.clone())
             }
+        }
+        // `concat(*strs)` appends every argument in order, mutating and
+        // returning the receiver: `"a".concat("b", "c")` => "abc".
+        "concat" => {
+            let joined: String = args.iter().map(|a| with_host(|h| h.to_s(a))).collect();
+            with_host(|h| h.set_str(recv, format!("{s}{joined}")));
+            Ok(recv.clone())
         }
         "<=>" => match with_host(|h| h.as_str(&args[0])) {
             Some(other) => Ok(Value::Int(match s.cmp(&other) {
@@ -1581,10 +1588,15 @@ fn dispatch_string(
         }
         "*" => Ok(new_str(s.repeat(as_i(&args[0]).max(0) as usize))),
         "%" => {
-            // `"%d-%d" % [1, 2]` or `"%d" % 5`.
-            let fargs =
-                with_host(|h| h.as_array(&args[0])).unwrap_or_else(|| vec![args[0].clone()]);
-            Ok(new_str(sprintf(&s, &fargs)))
+            // `"%d-%d" % [1, 2]` or `"%d" % 5`; a Hash operand feeds named
+            // references `%<name>s` / `%{name}`.
+            if let Some(map) = with_host(|h| h.as_hash(&args[0])) {
+                Ok(new_str(sprintf(&s, &[], Some(&map))))
+            } else {
+                let fargs =
+                    with_host(|h| h.as_array(&args[0])).unwrap_or_else(|| vec![args[0].clone()]);
+                Ok(new_str(sprintf(&s, &fargs, None)))
+            }
         }
         "ljust" => Ok(new_str(pad(
             &s,
@@ -4071,7 +4083,16 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
                 None => with_host(|h| h.new_array(vec![args[0].clone()])),
             },
         }),
-        "format" | "sprintf" => Ok(new_str(sprintf(&arg_str(&args[0]), &args[1..]))),
+        "format" | "sprintf" => {
+            let fmt = arg_str(&args[0]);
+            // A lone trailing Hash supplies named references (`%<name>s`).
+            if args.len() == 2 {
+                if let Some(map) = with_host(|h| h.as_hash(&args[1])) {
+                    return Ok(new_str(sprintf(&fmt, &[], Some(&map))));
+                }
+            }
+            Ok(new_str(sprintf(&fmt, &args[1..], None)))
+        }
         "gets" => Ok(read_line()),
         "proc" => block.ok_or_else(|| "tried to create Proc without a block".into()),
         "lambda" => {
@@ -4260,7 +4281,7 @@ fn fmt_g(f: f64, prec: usize, upper: bool, alt: bool) -> String {
 /// `format`/`sprintf`/`String#%` — handles `%[flags][width][.precision]conv`
 /// with flags `-`, `0`, `+`, ` `, `#`, `*` dynamic width/precision, and
 /// conversions d/i/u/f/e/E/g/G/s/p/x/X/o/b/B/c/%.
-fn sprintf(fmt: &str, args: &[Value]) -> String {
+fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> String {
     let bytes: Vec<char> = fmt.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -4269,6 +4290,12 @@ fn sprintf(fmt: &str, args: &[Value]) -> String {
         let v = args.get(*ai).cloned().unwrap_or(Value::Undef);
         *ai += 1;
         v
+    };
+    // Resolve a named reference (`%<name>` / `%{name}`) from the Hash operand.
+    let named_val = |name: &str| -> Value {
+        named
+            .and_then(|m| m.get(&RKey::Sym(name.to_string())).cloned())
+            .unwrap_or(Value::Undef)
     };
     while i < bytes.len() {
         if bytes[i] != '%' {
@@ -4282,6 +4309,41 @@ fn sprintf(fmt: &str, args: &[Value]) -> String {
             i += 1;
             continue;
         }
+        // `%{name}` shorthand: substitute the named value's `to_s`, no spec.
+        if i < bytes.len() && bytes[i] == '{' {
+            i += 1;
+            let mut nm = String::new();
+            while i < bytes.len() && bytes[i] != '}' {
+                nm.push(bytes[i]);
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1; // consume '}'
+            }
+            out.push_str(&arg_str(&named_val(&nm)));
+            continue;
+        }
+        // `%<name>s` reference: Ruby accepts it anywhere in the spec (before
+        // flags, between flags and width, or after width), so probe at each
+        // stage and let the value flow into the conversion below.
+        let mut named_arg: Option<Value> = None;
+        macro_rules! probe_named {
+            () => {
+                if named_arg.is_none() && i < bytes.len() && bytes[i] == '<' {
+                    i += 1;
+                    let mut nm = String::new();
+                    while i < bytes.len() && bytes[i] != '>' {
+                        nm.push(bytes[i]);
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1; // consume '>'
+                    }
+                    named_arg = Some(named_val(&nm));
+                }
+            };
+        }
+        probe_named!();
         // flags
         let (mut left, mut zero, mut plus, mut space, mut alt) =
             (false, false, false, false, false);
@@ -4296,6 +4358,7 @@ fn sprintf(fmt: &str, args: &[Value]) -> String {
             }
             i += 1;
         }
+        probe_named!();
         // width (`*` = dynamic; a negative dynamic width means left-align)
         let mut width = 0usize;
         if i < bytes.len() && bytes[i] == '*' {
@@ -4313,6 +4376,7 @@ fn sprintf(fmt: &str, args: &[Value]) -> String {
                 i += 1;
             }
         }
+        probe_named!();
         // precision (`.` then digits or `*`; a negative dynamic precision drops it)
         let mut prec: Option<usize> = None;
         if i < bytes.len() && bytes[i] == '.' {
@@ -4338,7 +4402,10 @@ fn sprintf(fmt: &str, args: &[Value]) -> String {
             out.push('%');
             continue;
         }
-        let arg = next_arg(&mut ai);
+        let arg = match named_arg {
+            Some(v) => v,
+            None => next_arg(&mut ai),
+        };
 
         // Per-conversion: (sign, prefix, body, numeric, int_conv, complement fill).
         let mut sign = "";
