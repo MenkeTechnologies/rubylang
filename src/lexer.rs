@@ -399,6 +399,21 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     space: core::mem::take(&mut sp),
                 });
             }
+            // Operator symbols: `:+`, `:<=>`, `:[]`, … only in value position (so
+            // `a ? b : c` ternary and `key: v` hash keys are untouched).
+            b':'
+                if i + 1 < b.len()
+                    && op_symbol_at(&src[i + 1..]).is_some()
+                    && !prev_is_value(&out) =>
+            {
+                let op = op_symbol_at(&src[i + 1..]).unwrap();
+                i += 1 + op.len();
+                out.push(Token {
+                    kind: Tok::Symbol(op.to_string()),
+                    line,
+                    space: core::mem::take(&mut sp),
+                });
+            }
             b':' if i + 1 < b.len()
                 && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_' || b[i + 1] == b'@') =>
             {
@@ -579,6 +594,38 @@ fn regex_start(out: &[Token], sp: bool, next: Option<u8>) -> bool {
     // After a value: a command-argument regex needs a leading space and no space
     // immediately after the `/` (so `foo /re/` is a regex, `a / b` is division).
     sp && !matches!(next, Some(b' ') | Some(b'\t') | None)
+}
+
+/// Operator method-name symbols, longest-first so `starts_with` picks the
+/// longest (`[]=` before `[]`, `<=>` before `<=` before `<`).
+const OP_SYMBOLS: &[&str] = &[
+    "<=>", "===", "[]=", "**", "==", "!=", "<=", ">=", "<<", ">>", "=~", "[]", "+", "-", "*", "/",
+    "%", "<", ">", "&", "|", "^", "~", "!",
+];
+
+/// The operator symbol beginning `s` (text right after `:`), or `None`.
+fn op_symbol_at(s: &str) -> Option<&'static str> {
+    OP_SYMBOLS.iter().find(|op| s.starts_with(**op)).copied()
+}
+
+/// Whether the last significant token is a value (so a following `:op` is a
+/// ternary colon / hash key, not an operator symbol).
+fn prev_is_value(out: &[Token]) -> bool {
+    let prev = out.iter().rev().find(|t| t.kind != Tok::Newline);
+    match prev.map(|t| &t.kind) {
+        Some(Tok::Int(_))
+        | Some(Tok::Float(_))
+        | Some(Tok::Str(_, _))
+        | Some(Tok::Regex(_, _))
+        | Some(Tok::Ident(_))
+        | Some(Tok::Const(_))
+        | Some(Tok::IVar(_))
+        | Some(Tok::GVar(_))
+        | Some(Tok::Symbol(_)) => true,
+        Some(Tok::Op(o)) => o == ")" || o == "]" || o == "}",
+        Some(Tok::Keyword(k)) => matches!(k.as_str(), "self" | "end" | "true" | "false" | "nil"),
+        _ => false,
+    }
 }
 
 fn utf8_len(b: u8) -> usize {

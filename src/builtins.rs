@@ -1824,7 +1824,9 @@ fn dispatch_array(
 ) -> Result<Value, String> {
     let arr = with_host(|h| h.as_array(recv).unwrap_or_default());
     match name {
-        "length" | "size" | "count" if !(name == "count" && !args.is_empty()) => {
+        "length" | "size" | "count"
+            if !(name == "count" && (!args.is_empty() || block.is_some())) =>
+        {
             Ok(Value::Int(arr.len() as i64))
         }
         "push" | "append" | "<<" => {
@@ -2065,8 +2067,17 @@ fn dispatch_array(
                         break;
                     }
                 }
+                Ok(recv.clone())
+            } else {
+                // No Enumerator type yet: return `[elem, index]` pairs so the chain
+                // `each_with_index.map { |x, i| … }` / `.to_a` still works.
+                Ok(new_arr(
+                    arr.iter()
+                        .enumerate()
+                        .map(|(i, x)| new_arr(vec![x.clone(), Value::Int(i as i64)]))
+                        .collect(),
+                ))
             }
-            Ok(recv.clone())
         }
         "map" | "collect" | "flat_map" => {
             let mut out = Vec::with_capacity(arr.len());
@@ -2154,11 +2165,37 @@ fn dispatch_array(
                     }
                 }
                 Ok(Value::Int(n))
+            } else if let Some(target) = args.first() {
+                // `count(obj)` counts elements equal to `obj`.
+                let n = arr
+                    .iter()
+                    .filter(|x| with_host(|h| h.eq_values(x, target)))
+                    .count();
+                Ok(Value::Int(n as i64))
             } else {
                 Ok(Value::Int(arr.len() as i64))
             }
         }
         "reduce" | "inject" => {
+            // Symbol form: `inject(:+)` / `reduce(init, :+)` — send the operator
+            // (or method) symbol between the accumulator and each element.
+            if block.is_none() {
+                if let Some(op) = args.last().and_then(|a| with_host(|h| h.as_symbol(a))) {
+                    let mut items = arr.iter();
+                    let mut acc = if args.len() >= 2 {
+                        args[0].clone()
+                    } else {
+                        match items.next() {
+                            Some(v) => v.clone(),
+                            None => return Ok(Value::Undef),
+                        }
+                    };
+                    for x in items {
+                        acc = reduce_sym(&acc, &op, x)?;
+                    }
+                    return Ok(acc);
+                }
+            }
             let mut acc = args.first().cloned();
             let mut items = arr.iter();
             if acc.is_none() {
@@ -2554,6 +2591,98 @@ fn dispatch_array(
                 }
             }
             Ok(with_host(|h| h.new_hash(m)))
+        }
+        "minmax" => {
+            if arr.is_empty() {
+                return Ok(new_arr(vec![Value::Undef, Value::Undef]));
+            }
+            let cmp = |a: &Value, b: &Value| -> Result<std::cmp::Ordering, String> {
+                match &block {
+                    Some(bl) => Ok(match as_i(&call_proc(bl, &[a.clone(), b.clone()])?) {
+                        n if n < 0 => std::cmp::Ordering::Less,
+                        0 => std::cmp::Ordering::Equal,
+                        _ => std::cmp::Ordering::Greater,
+                    }),
+                    None => Ok(cmp_values(a, b)),
+                }
+            };
+            let mut min = arr[0].clone();
+            let mut max = arr[0].clone();
+            for x in &arr[1..] {
+                if cmp(x, &min)? == std::cmp::Ordering::Less {
+                    min = x.clone();
+                }
+                if cmp(x, &max)? == std::cmp::Ordering::Greater {
+                    max = x.clone();
+                }
+            }
+            Ok(new_arr(vec![min, max]))
+        }
+        "cycle" => {
+            let Some(bl) = &block else {
+                // Without a block MRI returns an Enumerator; no Enumerator type yet.
+                return Ok(Value::Undef);
+            };
+            match args.first() {
+                Some(n) => {
+                    let times = as_i(n).max(0);
+                    for _ in 0..times {
+                        for x in &arr {
+                            call_proc(bl, std::slice::from_ref(x))?;
+                            if has_pending_signal() {
+                                if let Some(bv) = take_break() {
+                                    return Ok(bv);
+                                }
+                                return Ok(Value::Undef);
+                            }
+                        }
+                    }
+                    Ok(Value::Undef)
+                }
+                None => {
+                    // Endless cycle: only `break`/`return` inside the block exits.
+                    if arr.is_empty() {
+                        return Ok(Value::Undef);
+                    }
+                    loop {
+                        for x in &arr {
+                            call_proc(bl, std::slice::from_ref(x))?;
+                            if has_pending_signal() {
+                                if let Some(bv) = take_break() {
+                                    return Ok(bv);
+                                }
+                                return Ok(Value::Undef);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "chunk" => {
+            // MRI returns an Enumerator; with no Enumerator type we return the
+            // `[key, [elems…]]` pairs array (so `.to_a`/`.each`/`.map` still work).
+            let mut out: Vec<Value> = Vec::new();
+            if let Some(bl) = &block {
+                let mut cur_key: Option<Value> = None;
+                let mut group: Vec<Value> = Vec::new();
+                for x in &arr {
+                    let k = call_proc(bl, std::slice::from_ref(x))?;
+                    match &cur_key {
+                        Some(pk) if with_host(|h| h.eq_values(pk, &k)) => group.push(x.clone()),
+                        _ => {
+                            if let Some(pk) = cur_key.take() {
+                                out.push(new_arr(vec![pk, new_arr(std::mem::take(&mut group))]));
+                            }
+                            cur_key = Some(k);
+                            group.push(x.clone());
+                        }
+                    }
+                }
+                if let Some(pk) = cur_key.take() {
+                    out.push(new_arr(vec![pk, new_arr(group)]));
+                }
+            }
+            Ok(new_arr(out))
         }
         _ => Err(raise_exc(
             "NoMethodError",
@@ -4293,6 +4422,61 @@ fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         }
         _ => as_f(a).partial_cmp(&as_f(b)).unwrap_or(Ordering::Equal),
     }
+}
+
+/// Apply an operator/method symbol between the accumulator and an element for
+/// `inject(:sym)` / `reduce(init, :sym)`. Integer/Float arithmetic operators are
+/// evaluated directly (the VM handles these opcodes, not per-type dispatch);
+/// everything else is a normal method send (so string `:+`, `:concat`, … work).
+fn reduce_sym(acc: &Value, op: &str, x: &Value) -> Result<Value, String> {
+    let both_num = matches!(acc, Value::Int(_) | Value::Float(_))
+        && matches!(x, Value::Int(_) | Value::Float(_));
+    if both_num {
+        let int_pair = match (acc, x) {
+            (Value::Int(a), Value::Int(b)) => Some((*a, *b)),
+            _ => None,
+        };
+        match op {
+            "+" => return Ok(add_values(acc, x)),
+            "-" => {
+                return Ok(match int_pair {
+                    Some((a, b)) => Value::Int(a - b),
+                    None => Value::Float(as_f(acc) - as_f(x)),
+                })
+            }
+            "*" => {
+                return Ok(match int_pair {
+                    Some((a, b)) => Value::Int(a * b),
+                    None => Value::Float(as_f(acc) * as_f(x)),
+                })
+            }
+            "/" => {
+                return match int_pair {
+                    Some((_, 0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
+                    Some((a, b)) => Ok(Value::Int(floor_div(a, b))),
+                    None => Ok(Value::Float(as_f(acc) / as_f(x))),
+                }
+            }
+            "%" => {
+                return match int_pair {
+                    Some((_, 0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
+                    Some((a, b)) => Ok(Value::Int(floor_mod(a, b))),
+                    None => {
+                        let (a, b) = (as_f(acc), as_f(x));
+                        Ok(Value::Float(a - (a / b).floor() * b))
+                    }
+                }
+            }
+            "**" => {
+                return Ok(match int_pair {
+                    Some((a, b)) if b >= 0 => Value::Int(a.pow(b as u32)),
+                    _ => Value::Float(as_f(acc).powf(as_f(x))),
+                })
+            }
+            _ => {}
+        }
+    }
+    dispatch(acc, op, std::slice::from_ref(x), None)
 }
 
 /// Insertion sort using a block comparator (returns -1/0/1). Kept simple; block

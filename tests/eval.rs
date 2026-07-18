@@ -813,6 +813,39 @@ fn exceptions_batch() {
 }
 
 #[test]
+fn enumerable_core_batch() {
+    // inject/reduce with an operator symbol.
+    eq("[1, 2, 3, 4].inject(:+)", "10");
+    eq("[1, 2, 3].reduce(10, :+)", "16");
+    eq("[1, 2, 3, 4].inject(:*)", "24");
+    eq("[10, 3].inject(:-)", "7");
+    eq("[10, 3].inject(:/)", "3");
+    eq("[\"a\", \"b\", \"c\"].inject(:+)", "\"abc\"");
+    // each_with_index without a block yields `[elem, index]` pairs.
+    eq("[1, 2, 3].each_with_index.map { |x, i| x * i }", "[0, 2, 6]");
+    eq("[1, 2, 3, 4].each_with_index.to_a", "[[1, 0], [2, 1], [3, 2], [4, 3]]");
+    // minmax, count(&:pred), sum(init).
+    eq("[1, 2, 3, 4].minmax", "[1, 4]");
+    eq("[5, 3, 8, 1].minmax", "[1, 8]");
+    eq("[1, 2, 3, 4].count(&:even?)", "2");
+    eq("[1, 2, 3, 4].count(2)", "1");
+    eq("[1, 2, 3, 4].sum(100)", "110");
+    // find/detect, find_index with a block.
+    eq("[1, 2, 3, 4].find { |x| x.even? }", "2");
+    eq("[1, 2, 3, 4].detect { |x| x > 10 }", "nil");
+    eq("[1, 2, 3, 4].find_index { |x| x > 2 }", "2");
+    eq("[10, 20, 30].find_index(20)", "1");
+    // cycle(n) { … } runs the block n times and returns nil.
+    eq("s = 0; [1, 2, 3].cycle(2) { |x| s += x }; s", "12");
+    eq("[1, 2, 3].cycle(2) { |x| }", "nil");
+    // chunk groups consecutive runs by the block's value.
+    eq(
+        "[1, 1, 2, 3, 3].chunk { |x| x }.to_a",
+        "[[1, [1, 1]], [2, [2]], [3, [3, 3]]]",
+    );
+}
+
+#[test]
 fn kernel_convert_batch() {
     // Kernel conversion functions: Integer/Float/String/Array with the full
     // Ruby radix-prefix, base-argument, underscore, and sign handling.
