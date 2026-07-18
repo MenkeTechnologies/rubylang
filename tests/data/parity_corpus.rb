@@ -813,3 +813,23 @@ dates = [Date.new(2024, 3, 15), Date.new(2024, 1, 5), Date.new(2024, 2, 20)]
 puts dates.sort.map(&:iso8601).inspect
 puts Date.parse("2000-02-29").leap?
 puts Date.new(2024, 12, 31).yday
+#==#
+def try(&blk)
+  blk.call
+rescue NoMethodError => e
+  e.message
+end
+puts try { "hello".no_such_method }
+puts try { 42.no_such_method }
+puts try { [1, 2, 3].no_such_method }
+puts try { {a: 1}.no_such_method }
+puts try { :sym.no_such_method }
+puts try { (1..10).no_such_method }
+puts try { nil.no_such_method }
+puts try { true.no_such_method }
+puts try { Integer.no_such_method }
+begin
+  nil.upcase
+rescue NoMethodError => e
+  puts "#{e.class}: #{e.message}"
+end

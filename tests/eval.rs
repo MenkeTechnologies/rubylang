@@ -2358,6 +2358,51 @@ fn time_utc() {
 }
 
 #[test]
+fn no_method_error_messages() {
+    // Ruby 4.0 message form: instances say "for an instance of <Class>".
+    eq(
+        "begin; \"x\".nope; rescue => e; e.message; end",
+        "\"undefined method 'nope' for an instance of String\"",
+    );
+    eq(
+        "begin; 5.nope; rescue => e; e.message; end",
+        "\"undefined method 'nope' for an instance of Integer\"",
+    );
+    eq(
+        "begin; [].nope; rescue => e; e.message; end",
+        "\"undefined method 'nope' for an instance of Array\"",
+    );
+    // Range/Set/Enumerator name their own class, not the delegated Array.
+    eq(
+        "begin; (1..2).nope; rescue => e; e.message; end",
+        "\"undefined method 'nope' for an instance of Range\"",
+    );
+    eq(
+        "begin; [1].each.nope; rescue => e; e.message; end",
+        "\"undefined method 'nope' for an instance of Enumerator\"",
+    );
+    // nil/true/false use the bare-value form (not "an instance of").
+    eq(
+        "begin; nil.nope; rescue => e; e.message; end",
+        "\"undefined method 'nope' for nil\"",
+    );
+    eq(
+        "begin; true.nope; rescue => e; e.message; end",
+        "\"undefined method 'nope' for true\"",
+    );
+    // A class/module reference says "for class <Name>".
+    eq(
+        "begin; Integer.nope; rescue => e; e.message; end",
+        "\"undefined method 'nope' for class Integer\"",
+    );
+    // The exception class is NoMethodError (rescuable specifically).
+    eq(
+        "begin; 1.nope; rescue NoMethodError; :caught; end",
+        ":caught",
+    );
+}
+
+#[test]
 fn date_calendar() {
     // Construction and field readers.
     eq(

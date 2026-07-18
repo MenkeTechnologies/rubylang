@@ -811,10 +811,7 @@ pub(crate) fn dispatch(
         "Rational" => dispatch_rational(recv, name, args),
         "Complex" => dispatch_complex(recv, name, args),
         "TrueClass" | "FalseClass" | "NilClass" => dispatch_bool(recv, name, args),
-        _ => Err(raise_exc(
-            "NoMethodError",
-            &format!("undefined method '{name}' for {class}"),
-        )),
+        _ => Err(no_method_error(recv, name)),
     }
 }
 
@@ -829,13 +826,7 @@ fn dispatch_bool(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
         "^" => Ok(Value::Bool(this != arg())),
         "!" => Ok(Value::Bool(!this)),
         "to_s" | "inspect" => Ok(new_str(with_host(|h| h.to_s(recv)))),
-        _ => Err(raise_exc(
-            "NoMethodError",
-            &format!(
-                "undefined method '{name}' for {}",
-                if this { "true" } else { "false" }
-            ),
-        )),
+        _ => Err(no_method_error(recv, name)),
     }
 }
 
@@ -1054,7 +1045,10 @@ fn dispatch_classref(
                 let recv = with_host(|h| h.class_ref(cls));
                 return crate::host::call_class_method(recv, &def, name, cls, args, block);
             }
-            Err(format!("undefined method '{name}' for {cls}:Class"))
+            Err(raise_exc(
+                "NoMethodError",
+                &format!("undefined method '{name}' for class {cls}"),
+            ))
         }
     }
 }
@@ -1902,10 +1896,7 @@ fn dispatch_number(
                 })
             }
         },
-        _ => Err(format!(
-            "undefined method '{name}' for {}",
-            with_host(|h| h.class_of(recv))
-        )),
+        _ => Err(no_method_error(recv, name)),
     }
 }
 
@@ -2569,7 +2560,7 @@ fn dispatch_string(
             true,
         )),
         "[]=" => str_index_set(recv, &s, args),
-        _ => Err(format!("undefined method '{name}' for String")),
+        _ => Err(no_method_error(recv, name)),
     }
 }
 
@@ -2740,7 +2731,7 @@ fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value,
         "captures" => Ok(new_arr(groups.iter().skip(1).map(strv).collect())),
         "to_s" => Ok(strv(groups.first().unwrap_or(&None))),
         "size" | "length" => Ok(Value::Int(groups.len() as i64)),
-        _ => Err(format!("undefined method '{name}' for MatchData")),
+        _ => Err(no_method_error(recv, name)),
     }
 }
 
@@ -4304,10 +4295,7 @@ fn dispatch_array(
             }
             Ok(new_arr(out))
         }
-        _ => Err(raise_exc(
-            "NoMethodError",
-            &format!("undefined method '{name}' for Array"),
-        )),
+        _ => Err(no_method_error(recv, name)),
     }
 }
 
@@ -4453,10 +4441,7 @@ fn dispatch_complex(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
                 )),
             }
         }
-        _ => Err(raise_exc(
-            "NoMethodError",
-            &format!("undefined method '{name}' for a Complex"),
-        )),
+        _ => Err(no_method_error(recv, name)),
     }
 }
 
@@ -4528,10 +4513,7 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
             };
             with_host(|h| h.num_op(op, recv, &args[0]))
         }
-        _ => Err(raise_exc(
-            "NoMethodError",
-            &format!("undefined method '{name}' for a Rational"),
-        )),
+        _ => Err(no_method_error(recv, name)),
     }
 }
 
@@ -4591,10 +4573,7 @@ fn dispatch_lazy(
             }
             Ok(recv.clone())
         }
-        _ => Err(raise_exc(
-            "NoMethodError",
-            &format!("undefined method '{name}' for an Enumerator::Lazy"),
-        )),
+        _ => Err(no_method_error(recv, name)),
     }
 }
 
@@ -4843,7 +4822,7 @@ fn dispatch_enumerator(
         // Every non-iteration message is delegated to the buffered values as an
         // Array, preserving the full Enumerable surface (`map`, `to_a`,
         // `select`, …) that block-less calls exposed before Enumerator existed.
-        _ => dispatch_array(&new_arr(buf), name, args, block),
+        _ => remap_array_delegate(dispatch_array(&new_arr(buf), name, args, block), recv, name),
     }
 }
 
@@ -5294,7 +5273,11 @@ fn dispatch_set(
         }
         // Enumerable methods (map/select/reduce/sort/…) run over the element
         // Array. `map`/`select` etc. return an Array, matching Ruby's Set.
-        _ => dispatch_array(&new_arr(items), name, args, block),
+        _ => remap_array_delegate(
+            dispatch_array(&new_arr(items), name, args, block),
+            recv,
+            name,
+        ),
     }
 }
 
@@ -5520,7 +5503,7 @@ fn dispatch_hash(
                     .collect()
             });
             let tmp = with_host(|h| h.new_array(rows));
-            dispatch_array(&tmp, name, args, block)
+            remap_array_delegate(dispatch_array(&tmp, name, args, block), recv, name)
         }
         "invert" => {
             let mut out = IndexMap::new();
@@ -5625,10 +5608,7 @@ fn dispatch_hash(
             Ok(Value::Undef)
         }
         "dig" => Ok(dig(recv, args)),
-        _ => Err(raise_exc(
-            "NoMethodError",
-            &format!("undefined method '{name}' for Hash"),
-        )),
+        _ => Err(no_method_error(recv, name)),
     }
 }
 
@@ -5764,7 +5744,7 @@ fn dispatch_range(
         _ => {
             let arr: Vec<Value> = (lo..end).map(Value::Int).collect();
             let tmp = with_host(|h| h.new_array(arr));
-            dispatch_array(&tmp, name, args, block)
+            remap_array_delegate(dispatch_array(&tmp, name, args, block), recv, name)
         }
     }
 }
@@ -5862,7 +5842,7 @@ fn dispatch_str_range(
         _ => {
             let arr = elems();
             let tmp = with_host(|h| h.new_array(arr));
-            dispatch_array(&tmp, name, args, block)
+            remap_array_delegate(dispatch_array(&tmp, name, args, block), recv, name)
         }
     }
 }
@@ -5927,7 +5907,7 @@ fn dispatch_symbol(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         }),
         // `&:upcase` — a proc that sends the named method to its first argument.
         "to_proc" => Ok(with_host(|h| h.new_sym_proc(&s))),
-        _ => Err(format!("undefined method '{name}' for Symbol")),
+        _ => Err(no_method_error(recv, name)),
     }
 }
 
@@ -5943,7 +5923,7 @@ fn dispatch_proc(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
                 }
             }
             "to_proc" => Ok(recv.clone()),
-            _ => Err(format!("undefined method '{name}' for Proc")),
+            _ => Err(no_method_error(recv, name)),
         };
     }
     match name {
@@ -5966,7 +5946,7 @@ fn dispatch_proc(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
             let is_lambda = with_host(|h| h.proc_is_lambda(recv));
             Ok(with_host(|h| h.new_composed(g, recv.clone(), is_lambda)))
         }
-        _ => Err(format!("undefined method '{name}' for Proc")),
+        _ => Err(no_method_error(recv, name)),
     }
 }
 
@@ -5981,7 +5961,7 @@ fn dispatch_method(
 ) -> Result<Value, String> {
     let (mrecv, mname) = match with_host(|h| h.as_method(recv)) {
         Some(m) => m,
-        None => return Err(format!("undefined method '{name}' for Method")),
+        None => return Err(no_method_error(recv, name)),
     };
     match name {
         "call" | "()" | "[]" | "yield" | "===" => dispatch(&mrecv, &mname, args, block),
@@ -5990,7 +5970,7 @@ fn dispatch_method(
         "receiver" => Ok(mrecv),
         // A `Method` is itself callable via `call_proc`, so `to_proc` is identity.
         "to_proc" => Ok(recv.clone()),
-        _ => Err(format!("undefined method '{name}' for Method")),
+        _ => Err(no_method_error(recv, name)),
     }
 }
 
@@ -6020,7 +6000,7 @@ fn dispatch_regexp(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         }
         "to_s" => Ok(new_str(format!("(?-mix:{source})"))),
         "inspect" => Ok(new_str(format!("/{source}/"))),
-        _ => Err(format!("undefined method '{name}' for Regexp")),
+        _ => Err(no_method_error(recv, name)),
     }
 }
 
@@ -7076,6 +7056,43 @@ fn raise_exc(class: &str, msg: &str) -> String {
     let exc = with_host(|h| h.new_exception(class, msg));
     with_host(|h| h.set_pending_exc(exc));
     msg.to_string()
+}
+
+/// Raise a `NoMethodError` with the ruby-4.0 message form for `recv`:
+/// `for nil` / `for true` / `for false`, `for class C` when the receiver is a
+/// class/module reference, or `for an instance of C` for every other value.
+fn no_method_error(recv: &Value, name: &str) -> String {
+    let target = match recv {
+        Value::Undef => "nil".to_string(),
+        Value::Bool(true) => "true".to_string(),
+        Value::Bool(false) => "false".to_string(),
+        _ => match with_host(|h| h.classref_name(recv)) {
+            Some(c) => format!("class {c}"),
+            None => format!("an instance of {}", with_host(|h| h.class_of(recv))),
+        },
+    };
+    raise_exc(
+        "NoMethodError",
+        &format!("undefined method '{name}' for {target}"),
+    )
+}
+
+/// Range/Set/Enumerator delegate unknown methods to `Array` (a synthesized
+/// buffer). If the method is missing there too, rewrite the resulting
+/// `NoMethodError` so it names the original receiver's class rather than
+/// `Array`.
+fn remap_array_delegate(
+    r: Result<Value, String>,
+    recv: &Value,
+    name: &str,
+) -> Result<Value, String> {
+    r.map_err(|e| {
+        if e.starts_with("undefined method") && e.contains("an instance of Array") {
+            no_method_error(recv, name)
+        } else {
+            e
+        }
+    })
 }
 
 /// The display string of a value — a user object's own `to_s` if it defines one,

@@ -434,3 +434,14 @@ true
 ["2024-01-05", "2024-02-20", "2024-03-15"]
 true
 366
+#==#
+undefined method 'no_such_method' for an instance of String
+undefined method 'no_such_method' for an instance of Integer
+undefined method 'no_such_method' for an instance of Array
+undefined method 'no_such_method' for an instance of Hash
+undefined method 'no_such_method' for an instance of Symbol
+undefined method 'no_such_method' for an instance of Range
+undefined method 'no_such_method' for nil
+undefined method 'no_such_method' for true
+undefined method 'no_such_method' for class Integer
+NoMethodError: undefined method 'upcase' for nil

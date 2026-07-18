@@ -115,7 +115,10 @@ capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
   temporary gap.
 - **`rand`.** Seeded from the system clock (no `srand` determinism yet).
 - **Method surface.** The Enumerable/String/Hash/Range surface is broad but not
-  exhaustive; an unimplemented method raises `undefined method '<name>'`.
+  exhaustive; an unimplemented method raises a `NoMethodError` whose message uses
+  the Ruby-4.0 form — `undefined method '<name>' for an instance of <Class>` for
+  ordinary receivers, `for nil`/`for true`/`for false` for those values, and
+  `for class <Name>` for a class/module reference.
 - **Pattern matching (`case/in`).** Array/hash/find-by-key patterns, class
   patterns (`Integer`, `Point[...]`), variable/`_` binding, `=> name`, `^pin`,
   `|` alternatives, `*rest` splats, and `if`/`unless` guards work. Not yet: the
