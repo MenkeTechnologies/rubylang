@@ -318,6 +318,7 @@ impl Compiler {
         let op = match kind {
             VarKind::Local => ops::GETLOCAL,
             VarKind::Instance => ops::GETIVAR,
+            VarKind::Class => ops::GETCVAR,
             VarKind::Global => ops::GETGVAR,
             VarKind::Const => ops::GETCONST,
         };
@@ -336,6 +337,7 @@ impl Compiler {
                 let op = match kind {
                     VarKind::Local => ops::SETLOCAL,
                     VarKind::Instance => ops::SETIVAR,
+                    VarKind::Class => ops::SETCVAR,
                     VarKind::Global => ops::SETGVAR,
                     VarKind::Const => ops::SETCONST,
                 };
@@ -928,8 +930,8 @@ impl Compiler {
 
     /// Lower a `class`/`module` body: `def`s become instance methods (or class
     /// methods for `def self.m`), `attr_*` generate accessor methods, `include M`
-    /// records a mixin. Other class-body statements are not yet executed
-    /// (constants — tracked in BUGS.md).
+    /// records a mixin. Any remaining statements (class variables, constants, …)
+    /// run once at definition time with `self` bound to the class.
     fn compile_class(
         &mut self,
         b: &mut ChunkBuilder,
@@ -940,6 +942,10 @@ impl Compiler {
         let mut methods: indexmap::IndexMap<String, MethodDef> = indexmap::IndexMap::new();
         let mut class_methods: indexmap::IndexMap<String, MethodDef> = indexmap::IndexMap::new();
         let mut includes: Vec<String> = Vec::new();
+        // Class-body statements that aren't defs/attrs/includes (e.g. `@@x = 0`,
+        // constant assignments) run at class-definition time with `self` bound to
+        // the class.
+        let mut init_body: Vec<Expr> = Vec::new();
         for stmt in body {
             match stmt {
                 Expr::Def {
@@ -985,8 +991,16 @@ impl Compiler {
                         }
                     }
                 }
-                _ => {}
+                other => init_body.push(other.clone()),
             }
+        }
+        // Compile the leftover body as a synthetic class method so it can run with
+        // `self` = the class.
+        if !init_body.is_empty() {
+            class_methods.insert(
+                "__class_body__".to_string(),
+                self.compile_method(&[], &init_body)?,
+            );
         }
         self.classes.push((
             name.to_string(),
@@ -997,6 +1011,13 @@ impl Compiler {
                 class_methods,
             },
         ));
+        // Run the class body (`self` = class) once, at definition time.
+        if !init_body.is_empty() {
+            self.compile_var_read(b, VarKind::Const, name);
+            self.kstr(b, "__class_body__");
+            b.emit(Op::CallBuiltin(ops::CALL_METHOD, 2), 0);
+            b.emit(Op::Pop, 0);
+        }
         // A class/module definition evaluates to nil here.
         b.emit(Op::LoadUndef, 0);
         Ok(())

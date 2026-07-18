@@ -47,6 +47,7 @@ pub enum UnOp {
 pub enum VarKind {
     Local,    // foo
     Instance, // @foo
+    Class,    // @@foo
     Global,   // $foo
     Const,    // Foo
 }

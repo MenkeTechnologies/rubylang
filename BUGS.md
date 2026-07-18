@@ -36,10 +36,11 @@ capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
 - **`extend` / `prepend` / `class << self`.** Only `include` and `def self.m` are
   modeled; other mixin/singleton forms are not. `super` resolves through the
   superclass chain (module-`super` ordering is approximate).
-- **Class-body statements.** Only `def`, `attr_*`, and `include` in a class body
-  take effect; constants and other executable statements are ignored.
-- **Paren-less keyword args** (`greet name: "x"`) are not parsed, and a block
-  cannot be combined with call-site splat (`f(*a) { }`) in one call yet.
+- **Class-body statements** run at definition time with `self` bound to the
+  class, so `def`, `attr_*`, `include`, class variables (`@@x = 0`), constants,
+  and other executable statements all take effect. (Constants are stored
+  globally rather than namespaced under the class.)
+- **Paren-less keyword args** (`greet name: "x"`) are not parsed.
 - **Numeric literal / method binding.** `-7.abs` parses as `-(7.abs)` (operator
   precedence) rather than `(-7).abs`; MRI treats `-7` as a literal. Use
   `(-7).abs`.

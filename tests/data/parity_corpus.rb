@@ -628,3 +628,31 @@ puts c.respond_to?(:anything)
 nums = [3, 1, 2]
 puts nums.send(:sort).inspect
 puts [1, 2, 3].send(:map, *[]) { |x| x + 10 }.inspect
+#==#
+class BankAccount
+  @@total_accounts = 0
+  @@total_balance = 0
+
+  def initialize(balance)
+    @balance = balance
+    @@total_accounts += 1
+    @@total_balance += balance
+  end
+
+  def self.stats
+    "#{@@total_accounts} accounts, $#{@@total_balance} total"
+  end
+end
+BankAccount.new(100)
+BankAccount.new(250)
+BankAccount.new(50)
+puts BankAccount.stats
+
+class Registry
+  ENTRIES = []
+  def self.register(name); ENTRIES << name; end
+  def self.list; ENTRIES.join(", "); end
+end
+Registry.register("alpha")
+Registry.register("beta")
+puts Registry.list

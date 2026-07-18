@@ -22,6 +22,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::SETLOCAL, b_setlocal);
     vm.register_builtin(ops::GETIVAR, b_getivar);
     vm.register_builtin(ops::SETIVAR, b_setivar);
+    vm.register_builtin(ops::GETCVAR, b_getcvar);
+    vm.register_builtin(ops::SETCVAR, b_setcvar);
     vm.register_builtin(ops::GETGVAR, b_getgvar);
     vm.register_builtin(ops::SETGVAR, b_setgvar);
     vm.register_builtin(ops::GETCONST, b_getconst);
@@ -247,6 +249,27 @@ fn b_setivar(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let name = name_of(&vm.pop());
     with_host(|h| h.set_ivar(&name, val.clone()));
+    val
+}
+fn b_getcvar(vm: &mut VM, _: u8) -> Value {
+    let name = name_of(&vm.pop());
+    with_host(|h| {
+        let this = h.current_self();
+        match h.cvar_owner(&this) {
+            Some(cls) => h.get_cvar(&cls, &name),
+            None => Value::Undef,
+        }
+    })
+}
+fn b_setcvar(vm: &mut VM, _: u8) -> Value {
+    let val = vm.pop();
+    let name = name_of(&vm.pop());
+    with_host(|h| {
+        let this = h.current_self();
+        if let Some(cls) = h.cvar_owner(&this) {
+            h.set_cvar(&cls, &name, val.clone());
+        }
+    });
     val
 }
 fn b_getgvar(vm: &mut VM, _: u8) -> Value {

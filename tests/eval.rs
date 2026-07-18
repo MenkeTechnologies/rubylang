@@ -2125,6 +2125,33 @@ fn method_missing_and_respond_to_missing() {
 }
 
 #[test]
+fn class_variables() {
+    // A class variable is shared across all instances of the class.
+    eq(
+        "class C; @@n = 0; def initialize; @@n += 1; end; def self.count; @@n; end; end; \
+         C.new; C.new; C.new; C.count",
+        "3",
+    );
+    // Shared through the superclass chain.
+    eq(
+        "class Base; @@v = \"a\"; def self.get; @@v; end; end; \
+         class Sub < Base; def self.set(x); @@v = x; end; end; Sub.set(\"b\"); Base.get",
+        "\"b\"",
+    );
+    // Mutating a shared collection is visible everywhere.
+    eq(
+        "class L; @@items = []; def add(x); @@items << x; end; def all; @@items; end; end; \
+         a = L.new; a.add(1); L.new.add(2); a.all",
+        "[1, 2]",
+    );
+    // Class-body statements (constant assignment) now run at definition time.
+    eq(
+        "class K; MSG = \"hi\"; def m; MSG; end; end; K.new.m",
+        "\"hi\"",
+    );
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).

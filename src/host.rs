@@ -108,6 +108,8 @@ pub mod ops {
     pub const NO_MATCH: u16 = 38; // [subj] -> raise NoMatchingPatternError
     pub const CALL_ARR_BLK: u16 = 39; // [name, args_array, proc] -> self call + block
     pub const CALL_METHOD_ARR_BLK: u16 = 40; // [recv, name, args_array, proc] -> method + block
+    pub const GETCVAR: u16 = 41; // [name] -> class variable of self's class
+    pub const SETCVAR: u16 = 42; // [name, value] -> set class variable
 }
 
 /// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried
@@ -341,6 +343,9 @@ pub struct RubyHost {
     /// to a constant (`Point = Struct.new(...)`).
     struct_defs: IndexMap<String, (Vec<String>, bool)>,
     struct_counter: u32,
+    /// Class variables (`@@x`): class name → variable name → value. Shared across
+    /// the class hierarchy (looked up by walking the superclass chain).
+    class_vars: IndexMap<String, IndexMap<String, Value>>,
 }
 
 thread_local! {
@@ -392,6 +397,7 @@ impl RubyHost {
             enum_sinks: Vec::new(),
             struct_defs: IndexMap::new(),
             struct_counter: 0,
+            class_vars: IndexMap::new(),
         }
     }
 
@@ -1086,6 +1092,40 @@ impl RubyHost {
     /// The `(members, keyword_init)` of a struct class, if `name` names one.
     pub fn struct_def(&self, name: &str) -> Option<(Vec<String>, bool)> {
         self.struct_defs.get(name).cloned()
+    }
+    /// The class name a class variable read/write resolves against, given `self`:
+    /// an instance's class, or a class-reference's own name.
+    pub fn cvar_owner(&self, this: &Value) -> Option<String> {
+        self.object_class(this).or_else(|| self.classref_name(this))
+    }
+    /// Read a class variable, walking up the superclass chain (class variables
+    /// are shared across the hierarchy). `nil` if never assigned.
+    pub fn get_cvar(&self, class_name: &str, var: &str) -> Value {
+        let mut cur = Some(class_name.to_string());
+        while let Some(c) = cur {
+            if let Some(v) = self.class_vars.get(&c).and_then(|m| m.get(var)) {
+                return v.clone();
+            }
+            cur = self.superclass_of(&c);
+        }
+        Value::Undef
+    }
+    /// Assign a class variable: reuse the ancestor that already defines it,
+    /// otherwise store it on `class_name`.
+    pub fn set_cvar(&mut self, class_name: &str, var: &str, val: Value) {
+        let mut owner = class_name.to_string();
+        let mut cur = Some(class_name.to_string());
+        while let Some(c) = cur {
+            if self.class_vars.get(&c).is_some_and(|m| m.contains_key(var)) {
+                owner = c;
+                break;
+            }
+            cur = self.superclass_of(&c);
+        }
+        self.class_vars
+            .entry(owner)
+            .or_default()
+            .insert(var.to_string(), val);
     }
     /// Rename an anonymous struct (`Struct:N`) to the constant it was assigned to,
     /// the first time that happens — matching how Ruby names an anonymous class.

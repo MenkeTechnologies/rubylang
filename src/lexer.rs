@@ -38,6 +38,7 @@ pub enum Tok {
     Ident(String),
     Const(String), // capitalized identifier
     IVar(String),  // @foo
+    CVar(String),  // @@foo
     GVar(String),  // $foo
     Keyword(String),
     Op(String),
@@ -56,6 +57,7 @@ impl fmt::Display for Tok {
             Tok::Symbol(s) => write!(f, ":{s}"),
             Tok::Ident(s) | Tok::Const(s) | Tok::Keyword(s) => write!(f, "{s}"),
             Tok::IVar(s) => write!(f, "@{s}"),
+            Tok::CVar(s) => write!(f, "@@{s}"),
             Tok::GVar(s) => write!(f, "${s}"),
             Tok::Op(s) => write!(f, "{s}"),
             Tok::Newline => write!(f, "\\n"),
@@ -429,12 +431,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             }
             b'@' => {
                 i += 1;
+                // `@@name` is a class variable; `@name` an instance variable.
+                let class_var = i < b.len() && b[i] == b'@';
+                if class_var {
+                    i += 1;
+                }
                 let start = i;
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                     i += 1;
                 }
+                let name = src[start..i].to_string();
                 out.push(Token {
-                    kind: Tok::IVar(src[start..i].to_string()),
+                    kind: if class_var {
+                        Tok::CVar(name)
+                    } else {
+                        Tok::IVar(name)
+                    },
                     line,
                     space: core::mem::take(&mut sp),
                 });

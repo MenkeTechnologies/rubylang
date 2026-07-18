@@ -697,6 +697,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Var(VarKind::Instance, s))
             }
+            Tok::CVar(s) => {
+                self.advance();
+                Ok(Expr::Var(VarKind::Class, s))
+            }
             Tok::GVar(s) => {
                 self.advance();
                 Ok(Expr::Var(VarKind::Global, s))
@@ -801,6 +805,7 @@ impl Parser {
             | Tok::Str(_, _)
             | Tok::Symbol(_)
             | Tok::IVar(_)
+            | Tok::CVar(_)
             | Tok::GVar(_)
             | Tok::Const(_)
             | Tok::Ident(_) => true,
