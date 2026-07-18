@@ -405,6 +405,43 @@ fn nested_string_interpolation() {
 }
 
 #[test]
+fn block_param_and_block_given() {
+    eq("def f(&b); b.call(20); end; f { |x| x + 1 }", "21");
+    eq(
+        "def m; block_given? ? yield : :none; end; m { :yes }",
+        ":yes",
+    );
+    eq("def m; block_given? ? yield : :none; end; m", ":none");
+    eq("def maybe(&b); b.nil?; end; maybe", "true");
+}
+
+#[test]
+fn lambdas() {
+    eq(
+        "sq = ->(x) { x * x }; [sq.call(5), sq.(6), sq[7]]",
+        "[25, 36, 49]",
+    );
+    eq("add = ->(a, b) { a + b }; add.call(3, 4)", "7");
+    eq("g = -> { :hi }; g.call", ":hi");
+    eq(
+        "d = ->(n) { n * 2 }; [1, 2, 3].map { |n| d.call(n) }",
+        "[2, 4, 6]",
+    );
+}
+
+#[test]
+fn integer_step() {
+    eq(
+        "acc = []; 1.step(10, 3) { |n| acc << n }; acc",
+        "[1, 4, 7, 10]",
+    );
+    eq(
+        "acc = []; 10.step(1, -3) { |n| acc << n }; acc",
+        "[10, 7, 4, 1]",
+    );
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

@@ -153,15 +153,34 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     if defined {
         return v;
     }
-    // A bare name that is not a local is a zero-arg call to a method on `self`
-    // (or a class method / top-level method).
+    // Bare zero-arg Kernel queries that read like variables.
+    match name.as_str() {
+        "block_given?" => return Value::Bool(current_block().is_some()),
+        "__method__" => {
+            return with_host(|h| {
+                let (_, m, _, _) = h.super_context();
+                match m {
+                    Some(name) => h.new_symbol(&name),
+                    None => Value::Undef,
+                }
+            })
+        }
+        _ => {}
+    }
+    // A bare name that is not a local is a zero-arg call: a method on `self` /
+    // top-level method (errors propagate), else a Kernel function (`puts`, …).
+    // An unknown bare name reads as nil, matching rubylang's lenient behaviour.
     if with_host(|h| h.responds_to(&name)) {
         return match dispatch_call(&name, &[], None) {
             Ok(v) => propagate(vm, v),
             Err(e) => abort(vm, e),
         };
     }
-    Value::Undef
+    match kernel(&name, &[], None) {
+        Ok(v) => propagate(vm, v),
+        Err(e) if e.starts_with("undefined method") => Value::Undef,
+        Err(e) => abort(vm, e),
+    }
 }
 
 /// If a non-local control signal (a `return` from inside a block) is pending
@@ -622,6 +641,26 @@ fn dispatch_number(
                 Ok(Value::Float(x - (x / y).floor() * y))
             }
         },
+        "step" => {
+            let limit = as_i(&args[0]);
+            let by = args.get(1).map(as_i).unwrap_or(1);
+            if by != 0 {
+                if let Some(bl) = &block {
+                    let mut i = as_i(recv);
+                    while (by > 0 && i <= limit) || (by < 0 && i >= limit) {
+                        call_proc(bl, &[Value::Int(i)])?;
+                        if has_pending_signal() {
+                            if let Some(bv) = take_break() {
+                                return Ok(bv);
+                            }
+                            break;
+                        }
+                        i += by;
+                    }
+                }
+            }
+            Ok(recv.clone())
+        }
         "upto" => iter_int_range(recv, as_i(&args[0]), 1, &block, recv.clone()),
         "downto" => iter_int_range(recv, as_i(&args[0]), -1, &block, recv.clone()),
         "to_s" => Ok(with_host(|h| {

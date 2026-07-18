@@ -371,7 +371,12 @@ impl Parser {
         let mut e = self.primary()?;
         loop {
             if self.eat_op(".") || self.eat_op("&.") {
-                let name = self.method_name()?;
+                // `recv.(args)` is sugar for `recv.call(args)` (Proc/Method).
+                let name = if self.is_op("(") {
+                    "call".to_string()
+                } else {
+                    self.method_name()?
+                };
                 let (args, block) = self.call_tail()?;
                 e = Expr::Call {
                     recv: Some(Box::new(e)),
@@ -622,6 +627,7 @@ impl Parser {
                 Ok(e)
             }
             Tok::Op(ref o) if o == "[" => self.array_lit(),
+            Tok::Op(ref o) if o == "->" => self.lambda_lit(),
             Tok::Op(ref o) if o == "{" => self.hash_lit(),
             Tok::Op(ref o) if o == "::" => {
                 self.advance();
@@ -1041,6 +1047,18 @@ impl Parser {
     }
 
     fn param(&mut self) -> Result<Param, String> {
+        // `&blk` — capture the passed block as a Proc.
+        if self.eat_op("&") {
+            let name = self.ident_name()?;
+            return Ok(Param {
+                name,
+                default: None,
+                splat: false,
+                keyword: false,
+                kwsplat: false,
+                block: true,
+            });
+        }
         // `**opts` — a keyword-splat collector.
         if self.eat_op("**") {
             let name = self.ident_name()?;
@@ -1050,6 +1068,7 @@ impl Parser {
                 splat: false,
                 keyword: false,
                 kwsplat: true,
+                block: false,
             });
         }
         let splat = self.eat_op("*");
@@ -1071,6 +1090,7 @@ impl Parser {
                 splat: false,
                 keyword: true,
                 kwsplat: false,
+                block: false,
             });
         }
         let default = if !splat && self.eat_op("=") {
@@ -1084,7 +1104,35 @@ impl Parser {
             splat,
             keyword: false,
             kwsplat: false,
+            block: false,
         })
+    }
+
+    /// `->(params) { body }` / `-> { body }` / `->(x) do … end` — a lambda.
+    fn lambda_lit(&mut self) -> Result<Expr, String> {
+        self.expect_op("->")?;
+        let mut params = Vec::new();
+        if self.eat_op("(") {
+            if !self.is_op(")") {
+                params.push(self.ident_name()?);
+                while self.eat_op(",") {
+                    params.push(self.ident_name()?);
+                }
+            }
+            self.expect_op(")")?;
+        }
+        // The body is a `{ … }` or `do … end` block.
+        let block = self
+            .maybe_block()?
+            .ok_or_else(|| format!("line {}: lambda without a body", self.line()))?;
+        Ok(Expr::Lambda(Block {
+            params: if params.is_empty() {
+                block.params
+            } else {
+                params
+            },
+            body: block.body,
+        }))
     }
 
     fn array_lit(&mut self) -> Result<Expr, String> {

@@ -185,3 +185,16 @@ empty:
 #==#
 example.com:8080 ({timeout: 30})
 localhost:80
+#==#
+before / work / after
+42
+-1
+#==#
+36
+49
+64
+[1, 4, 9]
+30
+#==#
+45
+0

@@ -133,6 +133,8 @@ pub struct MethodDef {
     pub kwparams: Vec<String>,
     /// `**opts` collector parameter name, if any.
     pub kwsplat: Option<String>,
+    /// `&blk` block-capture parameter name, if any.
+    pub blockparam: Option<String>,
     pub chunk: Chunk,
 }
 
@@ -1050,13 +1052,17 @@ fn run_method(
     def_class: Option<String>,
 ) -> Result<Value, String> {
     let saved_active = with_host(|h| {
-        let locals = h.bind_params(
+        let mut locals = h.bind_params(
             &def.params,
             def.splat,
             &def.kwparams,
             def.kwsplat.as_deref(),
             args,
         );
+        // `&blk` captures the passed block as a Proc (or nil if none was given).
+        if let Some(bp) = &def.blockparam {
+            locals.insert(bp.clone(), block.clone().unwrap_or(Value::Undef));
+        }
         h.frames.push(Frame {
             locals,
             block,

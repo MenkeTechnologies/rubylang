@@ -163,6 +163,8 @@ pub enum Expr {
     Super(Option<Vec<Expr>>),
     /// A splat argument/element: `*expr` in a call or array literal.
     Splat(Box<Expr>),
+    /// A lambda literal `->(params) { body }` (a Proc value).
+    Lambda(Block),
 }
 
 /// One segment of an interpolated string.
@@ -183,6 +185,8 @@ pub struct Param {
     pub keyword: bool,
     /// `**opts` — collects unmatched keyword arguments into a hash.
     pub kwsplat: bool,
+    /// `&blk` — captures the passed block as a Proc.
+    pub block: bool,
 }
 
 /// One `rescue` clause of a `begin`/`rescue` block.

@@ -34,12 +34,13 @@ struct Entry {
     blob: Vec<u8>,
 }
 
-/// (name, params, splat index, keyword params, kwsplat name, chunk) — serde-flat.
+/// (name, params, splat, kwparams, kwsplat, blockparam, chunk) — serde-flat.
 type CMethod = (
     String,
     Vec<String>,
     Option<usize>,
     Vec<String>,
+    Option<String>,
     Option<String>,
     Chunk,
 );
@@ -125,10 +126,13 @@ fn m_to(name: &str, m: &MethodDef) -> CMethod {
         m.splat,
         m.kwparams.clone(),
         m.kwsplat.clone(),
+        m.blockparam.clone(),
         m.chunk.clone(),
     )
 }
-fn m_from((name, params, splat, kwparams, kwsplat, chunk): CMethod) -> (String, MethodDef) {
+fn m_from(
+    (name, params, splat, kwparams, kwsplat, blockparam, chunk): CMethod,
+) -> (String, MethodDef) {
     (
         name,
         MethodDef {
@@ -136,6 +140,7 @@ fn m_from((name, params, splat, kwparams, kwsplat, chunk): CMethod) -> (String, 
             splat,
             kwparams,
             kwsplat,
+            blockparam,
             chunk,
         },
     )

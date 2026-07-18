@@ -340,3 +340,26 @@ end
 settings = { host: "example.com", port: 8080, timeout: 30 }
 puts connect(**settings)
 puts connect(host: "localhost")
+#==#
+def with_logging(&block)
+  "before / #{block.call} / after"
+end
+puts with_logging { "work" }
+def run
+  block_given? ? yield * 2 : -1
+end
+puts run { 21 }
+puts run
+#==#
+square = ->(x) { x * x }
+puts square.call(6)
+puts square.(7)
+puts square[8]
+adder = ->(a, b) { a + b }
+puts [1, 2, 3].map { |n| square.call(n) }.inspect
+puts adder.call(10, 20)
+#==#
+total = 0
+1.step(20, 4) { |n| total += n }
+puts total
+puts [1, 2, 3, 4].each_with_object(0) { |x, _| }.inspect rescue puts "ok"

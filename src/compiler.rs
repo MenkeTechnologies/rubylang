@@ -97,9 +97,10 @@ impl Compiler {
         // params (bound from the trailing keyword hash).
         let pnames: Vec<String> = params
             .iter()
-            .filter(|p| !p.keyword && !p.kwsplat)
+            .filter(|p| !p.keyword && !p.kwsplat && !p.block)
             .map(|p| p.name.clone())
             .collect();
+        let blockparam = params.iter().find(|p| p.block).map(|p| p.name.clone());
         let kwparams: Vec<String> = params
             .iter()
             .filter(|p| p.keyword)
@@ -108,13 +109,14 @@ impl Compiler {
         let kwsplat = params.iter().find(|p| p.kwsplat).map(|p| p.name.clone());
         let splat = params
             .iter()
-            .filter(|p| !p.keyword && !p.kwsplat)
+            .filter(|p| !p.keyword && !p.kwsplat && !p.block)
             .position(|p| p.splat);
         Ok(MethodDef {
             params: pnames,
             splat,
             kwparams,
             kwsplat,
+            blockparam,
             chunk: b.build(),
         })
     }
@@ -172,6 +174,12 @@ impl Compiler {
             Expr::Splat(e) => {
                 // A bare splat outside a call/array just yields its array.
                 self.compile_expr(b, e)?;
+            }
+            Expr::Lambda(block) => {
+                // A lambda is a Proc value: compile its body as a proc template.
+                let id = self.compile_proc(block)?;
+                b.emit(Op::LoadInt(id as i64), 0);
+                b.emit(Op::CallBuiltin(ops::MKPROC, 1), 0);
             }
             Expr::Hash(pairs) => {
                 for (k, v) in pairs {
@@ -841,6 +849,7 @@ impl Compiler {
             splat: None,
             kwparams: vec![],
             kwsplat: None,
+            blockparam: None,
             chunk: b.build(),
         }
     }
@@ -859,6 +868,7 @@ impl Compiler {
             splat: None,
             kwparams: vec![],
             kwsplat: None,
+            blockparam: None,
             chunk: b.build(),
         }
     }
