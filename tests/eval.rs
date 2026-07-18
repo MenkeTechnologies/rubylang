@@ -2277,6 +2277,36 @@ fn enumerator_external_iteration() {
 }
 
 #[test]
+fn enumerator_with_index_and_object() {
+    // `map.with_index` collects the block's results.
+    eq(
+        "[10, 20, 30].map.with_index { |x, i| [x, i] }",
+        "[[10, 0], [20, 1], [30, 2]]",
+    );
+    // An explicit start offset.
+    eq(
+        "[10, 20, 30].map.with_index(1) { |x, i| \"#{i}:#{x}\" }",
+        "[\"1:10\", \"2:20\", \"3:30\"]",
+    );
+    // `select.with_index` filters by the block's truthiness.
+    eq(
+        "[10, 20, 30].select.with_index { |x, i| i.even? }",
+        "[10, 30]",
+    );
+    // `reject.with_index` keeps the falsy ones.
+    eq("[10, 20, 30].reject.with_index { |x, i| i.even? }", "[20]");
+    // `each.with_index` runs for side effects and returns the elements.
+    eq("[10, 20, 30].each.with_index { |x, i| x }", "[10, 20, 30]");
+    // `with_index` block-less yields `[elem, offset+index]` pairs.
+    eq("[10, 20].map.with_index.to_a", "[[10, 0], [20, 1]]");
+    // `with_object` threads a memo through the block and returns it.
+    eq(
+        "[1, 2, 3].map.with_object([]) { |x, memo| memo << x * 2 }",
+        "[2, 4, 6]",
+    );
+}
+
+#[test]
 fn float_constants_and_leading_dot_chains() {
     eq("Float::INFINITY", "Infinity");
     eq("5 < Float::INFINITY", "true");

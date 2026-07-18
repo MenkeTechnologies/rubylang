@@ -230,6 +230,11 @@ pub enum RObj {
     Enumerator {
         buf: Vec<Value>,
         cursor: usize,
+        /// The method that produced this Enumerator (`each`, `map`, `select`,
+        /// …). It selects the re-attach strategy for `with_index`/`with_object`:
+        /// `map` collects block results, `select`/`reject` filter, `each`
+        /// returns the receiver.
+        method: String,
     },
 }
 
@@ -642,8 +647,12 @@ impl RubyHost {
     /// The cursor starts at 0 (rewound). Used for the block-less form of
     /// `each`/`map`/`each_with_index`/… so the result supports both the
     /// Enumerable surface and external iteration (`next`/`peek`).
-    pub fn new_enumerator(&mut self, buf: Vec<Value>) -> Value {
-        self.alloc(RObj::Enumerator { buf, cursor: 0 })
+    pub fn new_enumerator(&mut self, buf: Vec<Value>, method: &str) -> Value {
+        self.alloc(RObj::Enumerator {
+            buf,
+            cursor: 0,
+            method: method.to_string(),
+        })
     }
     /// The buffered values of an `Enumerator`, if `v` is one.
     pub fn enum_buf(&self, v: &Value) -> Option<Vec<Value>> {
@@ -652,11 +661,18 @@ impl RubyHost {
             _ => None,
         }
     }
+    /// The source method that produced this `Enumerator`, if `v` is one.
+    pub fn enum_method(&self, v: &Value) -> Option<String> {
+        match self.obj(v) {
+            Some(RObj::Enumerator { method, .. }) => Some(method.clone()),
+            _ => None,
+        }
+    }
     /// External iteration: return the element at the cursor and advance it,
     /// or `None` at the end (the caller raises `StopIteration`). `peek` reads
     /// without advancing.
     pub fn enum_next(&mut self, v: &Value, advance: bool) -> Option<Value> {
-        if let Some(RObj::Enumerator { buf, cursor }) = self.obj_mut(v) {
+        if let Some(RObj::Enumerator { buf, cursor, .. }) = self.obj_mut(v) {
             if *cursor >= buf.len() {
                 return None;
             }

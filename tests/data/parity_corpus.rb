@@ -770,3 +770,14 @@ p letters.next
 squares = [1, 2, 3, 4].map
 puts squares.next
 puts squares.each_with_index.map { |x, i| x + i }.inspect
+#==#
+scores = [85, 92, 78, 90]
+labeled = scores.map.with_index(1) { |s, i| "##{i}: #{s}" }
+puts labeled.inspect
+evens_at_even = [10, 20, 30, 40].select.with_index { |x, i| i.even? }
+puts evens_at_even.inspect
+kept = [10, 20, 30, 40].reject.with_index { |x, i| x > 25 }
+puts kept.inspect
+sum = [1, 2, 3, 4].each.with_object({ total: 0 }) { |x, h| h[:total] += x }
+puts sum.inspect
+[100, 200].each.with_index(10) { |v, i| puts "#{i} -> #{v}" }

@@ -3580,7 +3580,7 @@ fn dispatch_array(
             } else {
                 // Block-less: an Enumerator yielding each element, so external
                 // iteration (`next`/`peek`) and chained Enumerable calls work.
-                Ok(with_host(|h| h.new_enumerator(arr)))
+                Ok(with_host(|h| h.new_enumerator(arr, "each")))
             }
         }
         "each_with_index" => {
@@ -3601,14 +3601,14 @@ fn dispatch_array(
                     .enumerate()
                     .map(|(i, x)| new_arr(vec![x.clone(), Value::Int(i as i64)]))
                     .collect();
-                Ok(with_host(|h| h.new_enumerator(pairs)))
+                Ok(with_host(|h| h.new_enumerator(pairs, "each_with_index")))
             }
         }
         "map" | "collect" | "flat_map" => {
             if block.is_none() {
                 // Block-less `map`/`collect` yields the original elements as an
                 // Enumerator (re-attaching a block later maps them).
-                return Ok(with_host(|h| h.new_enumerator(arr)));
+                return Ok(with_host(|h| h.new_enumerator(arr, name)));
             }
             let mut out = Vec::with_capacity(arr.len());
             if let Some(b) = &block {
@@ -3626,6 +3626,11 @@ fn dispatch_array(
             Ok(new_arr(out))
         }
         "select" | "filter" | "reject" => {
+            if block.is_none() {
+                // Block-less: an Enumerator over the elements, tagged with the
+                // filtering method so `select.with_index { … }` filters.
+                return Ok(with_host(|h| h.new_enumerator(arr, name)));
+            }
             let keep_when = name != "reject";
             let mut out = Vec::new();
             if let Some(b) = &block {
@@ -4703,6 +4708,67 @@ fn dispatch_enumerator(
             Ok(recv.clone())
         }
         "size" | "length" if args.is_empty() && block.is_none() => Ok(Value::Int(buf.len() as i64)),
+        // `with_index(offset=0)` re-attaches a block that also receives a running
+        // index. What it returns depends on the method that built this
+        // Enumerator: `map`/`collect`/`flat_map` collect the block's results,
+        // `select`/`filter`/`reject` filter the elements, `each` (and anything
+        // else) runs for side effects and returns the receiver's elements.
+        "with_index" if block.is_some() => {
+            let offset = match args.first() {
+                Some(Value::Int(n)) => *n,
+                _ => 0,
+            };
+            let b = block.unwrap();
+            let method = with_host(|h| h.enum_method(recv).unwrap_or_default());
+            let mut collected: Vec<Value> = Vec::new();
+            for (i, x) in buf.iter().enumerate() {
+                let r = call_proc(&b, &[x.clone(), Value::Int(offset + i as i64)])?;
+                match method.as_str() {
+                    "map" | "collect" => collected.push(r),
+                    "flat_map" | "collect_concat" => match with_host(|h| h.as_array(&r)) {
+                        Some(xs) => collected.extend(xs),
+                        None => collected.push(r),
+                    },
+                    "select" | "filter" => {
+                        if with_host(|h| h.truthy(&r)) {
+                            collected.push(x.clone());
+                        }
+                    }
+                    "reject" => {
+                        if !with_host(|h| h.truthy(&r)) {
+                            collected.push(x.clone());
+                        }
+                    }
+                    // `each` / `each_with_index` / unknown: side effects only,
+                    // return the enumerated elements (MRI returns the receiver).
+                    _ => collected.push(x.clone()),
+                }
+            }
+            Ok(new_arr(collected))
+        }
+        // `with_object(memo)` threads a memo object through the block and
+        // returns it, regardless of the source method.
+        "with_object" | "each_with_object" if block.is_some() && args.len() == 1 => {
+            let memo = args[0].clone();
+            let b = block.unwrap();
+            for x in &buf {
+                call_proc(&b, &[x.clone(), memo.clone()])?;
+            }
+            Ok(memo)
+        }
+        // `with_index` without a block yields `[elem, offset+index]` pairs.
+        "with_index" if block.is_none() => {
+            let offset = match args.first() {
+                Some(Value::Int(n)) => *n,
+                _ => 0,
+            };
+            let pairs: Vec<Value> = buf
+                .iter()
+                .enumerate()
+                .map(|(i, x)| new_arr(vec![x.clone(), Value::Int(offset + i as i64)]))
+                .collect();
+            Ok(with_host(|h| h.new_enumerator(pairs, "each")))
+        }
         // Every non-iteration message is delegated to the buffered values as an
         // Array, preserving the full Enumerable surface (`map`, `to_a`,
         // `select`, …) that block-less calls exposed before Enumerator existed.
