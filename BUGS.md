@@ -41,9 +41,7 @@ capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
   and other executable statements all take effect. (Constants are stored
   globally rather than namespaced under the class.)
 - **Paren-less keyword args** (`greet name: "x"`) are not parsed.
-- **Leading-dot method chains** across lines (`obj\n  .foo\n  .bar`) are not
-  continued; keep the `.` at the end of the previous line instead. `Float::INFINITY`
-  is also not defined yet — use an endless range (`1..`) for lazy sequences.
+- **Safe navigation** (`obj&.foo`) is not parsed yet.
 - **Numeric literal / method binding.** `-7.abs` parses as `-(7.abs)` (operator
   precedence) rather than `(-7).abs`; MRI treats `-7` as a literal. Use
   `(-7).abs`.

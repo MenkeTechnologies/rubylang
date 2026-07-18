@@ -2222,6 +2222,29 @@ fn lazy_enumerators() {
 }
 
 #[test]
+fn float_constants_and_leading_dot_chains() {
+    eq("Float::INFINITY", "Infinity");
+    eq("5 < Float::INFINITY", "true");
+    eq("Float::NAN.nan?", "true");
+    // An infinite Float range is an endless range.
+    eq(
+        "(1..Float::INFINITY).lazy.map { |x| x * x }.first(4)",
+        "[1, 4, 9, 16]",
+    );
+    // A newline before `.method` continues the chain.
+    eq(
+        "[1, 2, 3, 4, 5]\n  .map { |x| x * 2 }\n  .select { |x| x > 4 }\n  .reduce(0) { |a, b| a + b }",
+        "24",
+    );
+    eq(
+        "(1..)\n  .lazy\n  .select(&:even?)\n  .first(3)",
+        "[2, 4, 6]",
+    );
+    // A range `..` on a new line is NOT a leading-dot chain.
+    eq("x = 1\n2\n[x, 2]", "[1, 2]");
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).

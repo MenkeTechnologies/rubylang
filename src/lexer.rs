@@ -146,6 +146,26 @@ fn strip_squiggly(body: &str) -> String {
     out
 }
 
+/// Whether the next non-blank line (skipping whitespace, blank lines, and
+/// comments) begins with a `.method` call — a leading-dot chain continuation.
+/// `..`/`...` (a range) does not count.
+fn next_line_leading_dot(b: &[u8], mut j: usize) -> bool {
+    loop {
+        while j < b.len() && matches!(b[j], b' ' | b'\t' | b'\r' | b'\n') {
+            j += 1;
+        }
+        // Skip a comment line.
+        if j < b.len() && b[j] == b'#' {
+            while j < b.len() && b[j] != b'\n' {
+                j += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    b.get(j) == Some(&b'.') && b.get(j + 1) != Some(&b'.')
+}
+
 /// Whether a `<<` here begins a heredoc rather than a left-shift: true after a
 /// value is NOT on the stack (start of expression, after an operator/`(`/`,`),
 /// or whenever an unambiguous form (`<<~`/`<<-`/`<<"`/`<<'`) is used.
@@ -213,7 +233,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 i += 2;
             }
             b'\n' => {
-                if !continues(&out) {
+                // A newline is swallowed when the previous line clearly continues
+                // (trailing operator) OR the next line starts with `.method` (a
+                // leading-dot method chain).
+                if !continues(&out) && !next_line_leading_dot(b, i + 1) {
                     out.push(Token {
                         kind: Tok::Newline,
                         line,

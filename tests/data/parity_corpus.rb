@@ -704,3 +704,17 @@ primes = (2..).lazy.select { |n| (2...n).none? { |d| n % d == 0 } }.first(8)
 puts primes.inspect
 pipeline = (1..).lazy.select { |n| n % 3 == 0 }.map { |n| n * n }.take_while { |sq| sq < 500 }.to_a
 puts pipeline.inspect
+#==#
+total = (1..100)
+  .select { |n| n.even? }
+  .map { |n| n * n }
+  .reduce(0) { |acc, n| acc + n }
+puts total
+puts Float::INFINITY
+puts(-Float::INFINITY < 0)
+squares = (1..Float::INFINITY)
+  .lazy
+  .map { |n| n * n }
+  .take_while { |sq| sq < 100 }
+  .to_a
+puts squares.inspect

@@ -412,6 +412,21 @@ fn b_mkrange(vm: &mut VM, _: u8) -> Value {
     let hi = vm.pop();
     let lo = vm.pop();
     let excl = matches!(excl, Value::Bool(true));
+    // `1..Float::INFINITY` is an endless integer range; `-Float::INFINITY..n`
+    // is beginless. Map either infinite float bound to the range sentinel.
+    let bound = |v: &Value, endless_sentinel: i64| -> Option<i64> {
+        match v {
+            Value::Int(n) => Some(*n),
+            Value::Float(f) if f.is_infinite() => Some(endless_sentinel),
+            _ => None,
+        }
+    };
+    if let (Some(a), Some(b)) = (
+        bound(&lo, crate::host::RANGE_BEGINLESS),
+        bound(&hi, crate::host::RANGE_ENDLESS),
+    ) {
+        return with_host(|h| h.new_range(a, b, excl));
+    }
     match (&lo, &hi) {
         (Value::Int(a), Value::Int(b)) => with_host(|h| h.new_range(*a, *b, excl)),
         _ => {
@@ -936,6 +951,15 @@ fn dispatch_classref(
             }
         }
         "name" | "to_s" | "inspect" => Ok(new_str(cls.to_string())),
+        // Numeric class constants (`Float::INFINITY`, `Float::NAN`, …), reached
+        // via `::` (which lowers to a method call on the class reference).
+        "INFINITY" if cls == "Float" => Ok(Value::Float(f64::INFINITY)),
+        "NAN" if cls == "Float" => Ok(Value::Float(f64::NAN)),
+        "MAX" if cls == "Float" => Ok(Value::Float(f64::MAX)),
+        "MIN" if cls == "Float" => Ok(Value::Float(f64::MIN_POSITIVE)),
+        "EPSILON" if cls == "Float" => Ok(Value::Float(f64::EPSILON)),
+        "DIG" if cls == "Float" => Ok(Value::Int(15)),
+        "MANT_DIG" if cls == "Float" => Ok(Value::Int(53)),
         // `Class === obj` and `obj.is_a?(Class)` — case/when matching.
         "===" => Ok(Value::Bool(with_host(|h| h.is_a(&args[0], cls)))),
         // `Hash[...]` / `Array[...]` constructors.
