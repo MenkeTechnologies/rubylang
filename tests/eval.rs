@@ -74,6 +74,20 @@ fn hashes() {
 }
 
 #[test]
+fn hash_equality_is_order_independent() {
+    // Hash#== compares contents, not heap identity or insertion order.
+    eq("{a: 1, b: 2} == {a: 1, b: 2}", "true");
+    eq("{a: 1, b: 2} == {b: 2, a: 1}", "true");
+    eq("{a: 1} == {a: 2}", "false");
+    eq("{} == {}", "true");
+    eq("{a: [1, 2]} == {a: [1, 2]}", "true");
+    eq(
+        "[\"a\", \"a\", \"b\"].tally == {\"a\" => 2, \"b\" => 1}",
+        "true",
+    );
+}
+
+#[test]
 fn ranges() {
     eq("(1..5).to_a", "[1, 2, 3, 4, 5]");
     eq("(1...5).to_a", "[1, 2, 3, 4]");
@@ -1331,7 +1345,10 @@ fn string_bytes_batch() {
     eq("\"abc\".valid_encoding?", "true");
     eq("\"abc\".b", "\"abc\"");
     eq("\"abc\".each_byte.to_a", "[97, 98, 99]");
-    eq("a = []; \"abc\".each_byte { |b| a << b }; a", "[97, 98, 99]");
+    eq(
+        "a = []; \"abc\".each_byte { |b| a << b }; a",
+        "[97, 98, 99]",
+    );
     eq("\"héllo\".bytes", "[104, 195, 169, 108, 108, 111]");
     eq("\"\".bytes", "[]");
     eq("\"\".bytesize", "0");
@@ -1423,7 +1440,10 @@ fn catch_throw_batch() {
     // A throw unwinds past an inner catch to the one whose tag it names.
     eq("catch(:a) { catch(:b) { throw :a, 1 } }", "1");
     // A throw caught by the inner catch lets the outer catch body continue.
-    eq("catch(:a) { catch(:b) { throw :b, 7 }; :a_body }", ":a_body");
+    eq(
+        "catch(:a) { catch(:b) { throw :b, 7 }; :a_body }",
+        ":a_body",
+    );
     // `catch { |tag| … }` yields a fresh unique tag to the block.
     eq("catch { |t| throw t, 99 }", "99");
     // Throw unwinds through a method boundary to reach the catch.
@@ -1456,7 +1476,10 @@ fn hash_more_batch() {
     eq("{a: 1, b: 2}.flat_map { |k, v| [k, v] }", "[:a, 1, :b, 2]");
     eq("{a: 1, b: 2}.flat_map { |k, v| v }", "[1, 2]");
     // each_with_index without a block yields [[k, v], index] pairs.
-    eq("{a: 1, b: 2}.each_with_index.to_a", "[[[:a, 1], 0], [[:b, 2], 1]]");
+    eq(
+        "{a: 1, b: 2}.each_with_index.to_a",
+        "[[[:a, 1], 0], [[:b, 2], 1]]",
+    );
     // find / detect return the matching [key, value] pair, else nil.
     eq("{a: 1, b: 2, c: 3}.find { |k, v| v == 2 }", "[:b, 2]");
     eq("{a: 1, b: 2, c: 3}.detect { |k, v| v == 2 }", "[:b, 2]");
@@ -1531,7 +1554,10 @@ fn kernel_more_batch() {
 #[test]
 fn string_justify_batch() {
     // Named references in `String#%` and `Kernel#format`.
-    eq("\"%<name>s is %<age>d\" % {name: \"Al\", age: 3}", "\"Al is 3\"");
+    eq(
+        "\"%<name>s is %<age>d\" % {name: \"Al\", age: 3}",
+        "\"Al is 3\"",
+    );
     eq("\"%{greet} world\" % {greet: \"hi\"}", "\"hi world\"");
     eq("\"%{a}%{b}\" % {a: 1, b: 2}", "\"12\"");
     eq("\"%<n>05.2f\" % {n: 3.14159}", "\"03.14\"");
@@ -1596,12 +1622,18 @@ fn begin_while_batch() {
     // least once, then the condition is checked.
     eq("i=0; begin; i+=1; end while i<3; i", "3");
     eq("n=0; begin; n+=1; end until n>=5; n", "5");
-    eq("r=[]; i=0; begin; r<<i; i+=1; end while i<3; r", "[0, 1, 2]");
+    eq(
+        "r=[]; i=0; begin; r<<i; i+=1; end while i<3; r",
+        "[0, 1, 2]",
+    );
     // The body runs once even when the condition is immediately false/true.
     eq("x=10; begin; x+=1; end while false; x", "11");
     eq("y=10; begin; y+=1; end until true; y", "11");
     // `next` jumps to the condition check; `break` exits the loop.
-    eq("s=0;i=0; begin; i+=1; next if i==2; s+=i; end while i<4; s", "8");
+    eq(
+        "s=0;i=0; begin; i+=1; next if i==2; s+=i; end while i<4; s",
+        "8",
+    );
     eq("c=0; begin; c+=1; break if c==3; end while true; c", "3");
 }
 
@@ -1611,7 +1643,10 @@ fn array_zip_flat_batch() {
     eq("[1,2,4,5].slice_when{|a,b| b-a>1}.to_a", "[[1, 2], [4, 5]]");
     eq("[1,2].product([3,4],[5]).length", "4");
     eq("[[1,2],[3,4]].flat_map{|x| x}", "[1, 2, 3, 4]");
-    eq("r=[]; [1,2,3].zip([4,5,6]){|x| r<<x}; r", "[[1, 4], [2, 5], [3, 6]]");
+    eq(
+        "r=[]; [1,2,3].zip([4,5,6]){|x| r<<x}; r",
+        "[[1, 4], [2, 5], [3, 6]]",
+    );
     eq("[1,2,3].zip([4,5,6]){|x| x}", "nil");
     eq("[1,2,3].each_slice(2).to_a", "[[1, 2], [3]]");
 }
@@ -1680,7 +1715,10 @@ fn enumerable_module_batch() {
     with_l("L.new(1, 2, 3, 3).tally", "{1 => 1, 2 => 1, 3 => 2}");
     with_l("L.new(1, 2, 3).any? { |x| x > 2 }", "true");
     with_l("L.new(1, 2, 3).all? { |x| x > 0 }", "true");
-    with_l("L.new(1, 2, 3).each_with_index.to_a", "[[1, 0], [2, 1], [3, 2]]");
+    with_l(
+        "L.new(1, 2, 3).each_with_index.to_a",
+        "[[1, 0], [2, 1], [3, 2]]",
+    );
 }
 
 #[test]

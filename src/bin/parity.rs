@@ -22,7 +22,14 @@ const SEP: &str = "#==#";
 const CORPUS: &str = "tests/data/parity_corpus.rb";
 const EXPECTED: &str = "tests/data/parity_expected.txt";
 
+const EXAMPLES_DIR: &str = "examples";
+const EXAMPLES_OUT: &str = "tests/data/examples";
+
 fn main() {
+    if std::env::args().any(|a| a == "--freeze-examples") {
+        freeze_examples();
+        return;
+    }
     let freeze = std::env::args().any(|a| a == "--freeze");
     let corpus = std::fs::read_to_string(CORPUS).unwrap_or_else(|e| {
         eprintln!("parity: cannot read {CORPUS}: {e}");
@@ -71,6 +78,34 @@ fn main() {
         std::process::exit(1);
     }
     println!("all snippets at parity");
+}
+
+/// Freeze the reference `ruby` stdout for every `examples/*.rb` into
+/// `tests/data/examples/<name>.out`, which the CI-safe `tests/examples.rs`
+/// replays. A script that the oracle rejects (non-zero exit) is a bug in the
+/// example itself, so we refuse to freeze it.
+fn freeze_examples() {
+    std::fs::create_dir_all(EXAMPLES_OUT).expect("create examples out dir");
+    let mut names: Vec<String> = std::fs::read_dir(EXAMPLES_DIR)
+        .expect("read examples dir")
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+        .filter(|n| n.ends_with(".rb"))
+        .collect();
+    names.sort();
+    for name in &names {
+        let path = format!("{EXAMPLES_DIR}/{name}");
+        let out = Command::new("ruby").arg(&path).output().expect("run ruby");
+        if !out.status.success() {
+            eprintln!(
+                "parity: reference ruby rejected {path}:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            std::process::exit(1);
+        }
+        let stem = name.strip_suffix(".rb").unwrap();
+        std::fs::write(format!("{EXAMPLES_OUT}/{stem}.out"), &out.stdout).expect("write out");
+    }
+    println!("froze {} example outputs -> {EXAMPLES_OUT}/", names.len());
 }
 
 fn split_snippets(corpus: &str) -> Vec<String> {

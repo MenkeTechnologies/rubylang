@@ -185,10 +185,16 @@ Ruby source → lexer → parser (AST) → lower to fusevm bytecode → fusevm V
 ## [0x06] PARITY HARNESS
 
 Behaviour is checked against the reference `ruby` by a **differential parity
-harness** — `cargo run --bin parity` diffs a 35-snippet corpus live against the
-system `ruby`, and `tests/parity.rs` replays the frozen outputs in CI with no
-`ruby` installed. Nothing is faked as working: an unimplemented method raises
-`undefined method`.
+harness** — `cargo run --bin parity` diffs the snippet corpus
+(`tests/data/parity_corpus.rb`) live against the system `ruby`, and
+`tests/parity.rs` replays the frozen outputs in CI with no `ruby` installed.
+Nothing is faked as working: an unimplemented method raises `undefined method`.
+
+The `examples/` directory holds runnable programs that double as tests: the
+`test_*.rb` scripts embed `check` assertions that abort on any divergence from
+Ruby, and `tests/examples.rs` runs every example through the binary in CI,
+asserting a clean exit and stdout matching the frozen reference output
+(`cargo run --bin parity -- --freeze-examples` regenerates it).
 
 ---
 

@@ -150,7 +150,10 @@ pub enum RObj {
     /// A bound `Method` object (`obj.method(:name)`): the captured receiver plus
     /// the method name. `#call(*args)` routes back through dispatch on the stored
     /// receiver; `#to_proc` yields a callable that closes over both.
-    Method { recv: Value, name: String },
+    Method {
+        recv: Value,
+        name: String,
+    },
     /// A user-defined object: its class name and its instance variables.
     Object {
         class: String,
@@ -1471,6 +1474,13 @@ impl RubyHost {
                     (Some(RObj::Symbol(x)), Some(RObj::Symbol(y))) => x == y,
                     (Some(RObj::Array(x)), Some(RObj::Array(y))) => {
                         x.len() == y.len() && x.iter().zip(y).all(|(p, q)| self.eq_values(p, q))
+                    }
+                    // Hash equality is order-independent: same size and every key
+                    // in `x` maps to an equal value in `y`.
+                    (Some(RObj::Hash { map: x, .. }), Some(RObj::Hash { map: y, .. })) => {
+                        x.len() == y.len()
+                            && x.iter()
+                                .all(|(k, v)| y.get(k).is_some_and(|w| self.eq_values(v, w)))
                     }
                     _ => matches!((a, b), (Value::Obj(i), Value::Obj(j)) if i == j),
                 }

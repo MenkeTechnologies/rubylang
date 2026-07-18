@@ -1,0 +1,4 @@
+Circle: circle (area 13)
+Square: square (area 9)
+area = 16
+error: side -1 is negative
