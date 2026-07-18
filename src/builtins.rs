@@ -2254,7 +2254,22 @@ fn dispatch_hash(
 ) -> Result<Value, String> {
     let map = with_host(|h| h.as_hash(recv).unwrap_or_default());
     match name {
-        "size" | "length" | "count" => Ok(Value::Int(map.len() as i64)),
+        "size" | "length" => Ok(Value::Int(map.len() as i64)),
+        "count" => {
+            if let Some(b) = &block {
+                let mut n = 0i64;
+                for (k, v) in &map {
+                    let kv = with_host(|h| h.key_value(k));
+                    let r = call_proc(b, &[kv, v.clone()])?;
+                    if with_host(|h| h.truthy(&r)) {
+                        n += 1;
+                    }
+                }
+                Ok(Value::Int(n))
+            } else {
+                Ok(Value::Int(map.len() as i64))
+            }
+        }
         "empty?" => Ok(Value::Bool(map.is_empty())),
         "keys" => Ok(with_host(|h| {
             let ks: Vec<Value> = map.keys().map(|k| h.key_value(k)).collect();
@@ -2269,13 +2284,23 @@ fn dispatch_hash(
             map.values()
                 .any(|v| with_host(|h| h.eq_values(v, &args[0]))),
         )),
-        "[]" | "fetch" => {
+        "[]" => {
             let k = with_host(|h| h.value_to_key(&args[0]));
-            Ok(map
-                .get(&k)
-                .cloned()
-                .or_else(|| args.get(1).cloned())
-                .unwrap_or(Value::Undef))
+            Ok(map.get(&k).cloned().unwrap_or(Value::Undef))
+        }
+        "fetch" => {
+            let k = with_host(|h| h.value_to_key(&args[0]));
+            if let Some(v) = map.get(&k) {
+                Ok(v.clone())
+            } else if let Some(b) = &block {
+                // fetch(key) { |key| ... } — block is called with the missing key.
+                call_proc(b, std::slice::from_ref(&args[0]))
+            } else if let Some(d) = args.get(1) {
+                Ok(d.clone())
+            } else {
+                let ins = with_host(|h| h.inspect(&args[0]));
+                Err(raise_exc("KeyError", &format!("key not found: {ins}")))
+            }
         }
         "[]=" | "store" => {
             let mut m = map;
@@ -2354,12 +2379,41 @@ fn dispatch_hash(
             }
             Ok(with_host(|h| h.new_hash(out)))
         }
+        "transform_keys" => {
+            let mut out = IndexMap::new();
+            if let Some(b) = &block {
+                for (k, v) in &map {
+                    let kv = with_host(|h| h.key_value(k));
+                    let nk = call_proc(b, std::slice::from_ref(&kv))?;
+                    let nkey = with_host(|h| h.value_to_key(&nk));
+                    out.insert(nkey, v.clone());
+                }
+            }
+            Ok(with_host(|h| h.new_hash(out)))
+        }
+        "filter_map" => {
+            let mut out = Vec::new();
+            if let Some(b) = &block {
+                for (k, v) in &map {
+                    let kv = with_host(|h| h.key_value(k));
+                    let r = call_proc(b, &[kv, v.clone()])?;
+                    if with_host(|h| h.truthy(&r)) {
+                        out.push(r);
+                    }
+                }
+            }
+            Ok(new_arr(out))
+        }
         "each_with_object" => {
             let memo = args[0].clone();
             if let Some(b) = &block {
                 for (k, v) in &map {
-                    let kv = with_host(|h| h.key_value(k));
-                    call_proc(b, &[kv, v.clone(), memo.clone()])?;
+                    // Hash#each_with_object yields the [key, value] pair and the memo.
+                    let pair = with_host(|h| {
+                        let kv = h.key_value(k);
+                        h.new_array(vec![kv, v.clone()])
+                    });
+                    call_proc(b, &[pair, memo.clone()])?;
                 }
             }
             Ok(memo)

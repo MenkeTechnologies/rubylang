@@ -693,6 +693,43 @@ fn symbol_methods_batch() {
 }
 
 #[test]
+fn hash_methods_batch() {
+    // Transforms.
+    eq("{a: 1, b: 2}.transform_values { |v| v * 10 }", "{a: 10, b: 20}");
+    eq(
+        "{a: 1, b: 2}.transform_keys { |k| k.to_s }",
+        "{\"a\" => 1, \"b\" => 2}",
+    );
+    eq("{a: 1, b: 2}.invert", "{1 => :a, 2 => :b}");
+    // Filtering.
+    eq("{a: 1, b: 2}.select { |k, v| v > 1 }", "{b: 2}");
+    eq("{a: 1, b: 2}.reject { |k, v| v > 1 }", "{a: 1}");
+    eq(
+        "{a: 1, b: 2, c: 3}.filter_map { |k, v| v * 2 if v > 1 }",
+        "[4, 6]",
+    );
+    // Ordering.
+    eq("{a: 1, b: 2}.min_by { |k, v| v }", "[:a, 1]");
+    eq("{a: 1, b: 2}.max_by { |k, v| v }", "[:b, 2]");
+    eq("{a: 1, b: 2}.sort_by { |k, v| -v }", "[[:b, 2], [:a, 1]]");
+    // Aggregation / predicates.
+    eq("{a: 1, b: 2}.sum { |k, v| v }", "3");
+    eq("{a: 1, b: 2, c: 3}.count { |k, v| v > 1 }", "2");
+    eq("{a: 1, b: 2}.any? { |k, v| v > 1 }", "true");
+    eq("{a: 1, b: 2}.all? { |k, v| v > 0 }", "true");
+    eq("{a: 1, b: 2}.none? { |k, v| v > 5 }", "true");
+    // fetch: hit, default, and block-on-miss.
+    eq("{a: 1, b: 2}.fetch(:a)", "1");
+    eq("{a: 1, b: 2}.fetch(:z, 99)", "99");
+    eq("{a: 1, b: 2}.fetch(:z) { |k| \"no #{k}\" }", "\"no z\"");
+    // each_with_object yields the [key, value] pair and the memo.
+    eq(
+        "{a: 1, b: 2}.each_with_object([]) { |kv, acc| acc << kv }",
+        "[[:a, 1], [:b, 2]]",
+    );
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
