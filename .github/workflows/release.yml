@@ -180,15 +180,12 @@ jobs:
             printf '  version "%s"\n\n' "$V"
             [ -n "$mac_blocks" ] && printf '  on_macos do\n%s\n  end\n\n' "$mac_blocks"
             [ -n "$linux_blocks" ] && printf '  on_linux do\n%s\n  end\n\n' "$linux_blocks"
-            cat <<'INSTALL'
-  def install
-    bin.install "ruby"
-  end
-
-  test do
-    assert_match "42", shell_output("#{bin}/ruby -e 'puts 6*7'")
-  end
-INSTALL
+            printf '  def install\n'
+            printf '    bin.install "ruby"\n'
+            printf '  end\n\n'
+            printf '  test do\n'
+            printf '    assert_match "42", shell_output("#{bin}/ruby -e '\''puts 6*7'\''")\n'
+            printf '  end\n'
             # musl tarballs as trailing comment — Homebrew has no on_libc
             # gate, so static binaries are referenced by URL for users
             # targeting Alpine / scratch / distroless.
