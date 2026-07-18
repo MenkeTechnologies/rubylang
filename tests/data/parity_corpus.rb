@@ -570,3 +570,13 @@ total = [Rational(1, 2), Rational(1, 3), Rational(1, 6)].reduce(:+)
 puts total.inspect
 puts (3/4r).inspect
 puts Rational(7, 2).to_i
+#==#
+a = Complex(2, 3)
+b = Complex(1, -1)
+puts (a + b).inspect
+puts (a * b).inspect
+puts a.conjugate.inspect
+puts a.abs
+puts (3 + 4i).inspect
+puts (Complex(0, 1) ** 2).inspect
+puts [Complex(1, 0), Complex(0, 1), Complex(1, 1)].reduce(:+).inspect

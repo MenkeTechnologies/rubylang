@@ -641,6 +641,7 @@ pub(crate) fn dispatch(
         "MatchData" => dispatch_matchdata(recv, name, args),
         "Set" => dispatch_set(recv, name, args, block),
         "Rational" => dispatch_rational(recv, name, args),
+        "Complex" => dispatch_complex(recv, name, args),
         "TrueClass" | "FalseClass" | "NilClass" => dispatch_bool(recv, name, args),
         _ => Err(raise_exc(
             "NoMethodError",
@@ -4120,6 +4121,69 @@ fn arr_index(arr: &[Value], args: &[Value]) -> Value {
 
 // ---- Hash -----------------------------------------------------------------
 
+/// `Complex` methods. Arithmetic arrives via the numeric hook; this handles the
+/// queries, conversions, and the operator methods (`reduce(:+)`).
+fn dispatch_complex(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let (re, im) = with_host(|h| h.complex_parts(recv)).unwrap();
+    match name {
+        "real" => Ok(re),
+        "imaginary" | "imag" => Ok(im),
+        "to_s" => Ok(new_str(with_host(|h| h.complex_to_s(&re, &im)))),
+        "abs" | "magnitude" => {
+            // sqrt(re^2 + im^2) as a Float.
+            let rf = as_f(&re);
+            let imf = as_f(&im);
+            Ok(Value::Float((rf * rf + imf * imf).sqrt()))
+        }
+        "abs2" => {
+            let sq = |v: &Value| with_host(|h| h.num_op(fusevm::NumOp::Mul, v, v));
+            let rr = sq(&re)?;
+            let ii = sq(&im)?;
+            with_host(|h| h.num_op(fusevm::NumOp::Add, &rr, &ii))
+        }
+        "conjugate" | "conj" => {
+            let neg_im = with_host(|h| h.num_op(fusevm::NumOp::Sub, &Value::Int(0), &im))?;
+            Ok(with_host(|h| h.new_complex(re.clone(), neg_im)))
+        }
+        "rectangular" | "rect" => Ok(new_arr(vec![re, im])),
+        "-@" => {
+            let nr = with_host(|h| h.num_op(fusevm::NumOp::Sub, &Value::Int(0), &re))?;
+            let ni = with_host(|h| h.num_op(fusevm::NumOp::Sub, &Value::Int(0), &im))?;
+            Ok(with_host(|h| h.new_complex(nr, ni)))
+        }
+        "+@" => Ok(recv.clone()),
+        "==" => Ok(Value::Bool(with_host(|h| h.eq_values(recv, &args[0])))),
+        "+" | "-" | "*" => {
+            let op = match name {
+                "+" => fusevm::NumOp::Add,
+                "-" => fusevm::NumOp::Sub,
+                _ => fusevm::NumOp::Mul,
+            };
+            with_host(|h| h.num_op(op, recv, &args[0]))
+        }
+        "**" | "pow" => {
+            // Non-negative integer exponent by repeated multiplication.
+            match int_arg(&args[0]) {
+                Some(e) if e >= 0 => {
+                    let mut acc = with_host(|h| h.new_complex(Value::Int(1), Value::Int(0)));
+                    for _ in 0..e {
+                        acc = with_host(|h| h.num_op(fusevm::NumOp::Mul, &acc, recv))?;
+                    }
+                    Ok(acc)
+                }
+                _ => Err(raise_exc(
+                    "NotImplementedError",
+                    "Complex ** non-integer is not supported",
+                )),
+            }
+        }
+        _ => Err(raise_exc(
+            "NoMethodError",
+            &format!("undefined method '{name}' for a Complex"),
+        )),
+    }
+}
+
 /// `Rational` methods. Arithmetic (`+`/`-`/`*`) arrives via the numeric hook;
 /// this handles `/`, `**`, queries, and conversions.
 fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
@@ -5392,6 +5456,11 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             }
             let r = num_rational::BigRational::new(num, den);
             Ok(with_host(|h| h.new_rational(r)))
+        }
+        "Complex" => {
+            let re = args.first().cloned().unwrap_or(Value::Int(0));
+            let im = args.get(1).cloned().unwrap_or(Value::Int(0));
+            Ok(with_host(|h| h.new_complex(re, im)))
         }
         "String" => Ok(with_host(|h| {
             let s = h.to_s(&args[0]);

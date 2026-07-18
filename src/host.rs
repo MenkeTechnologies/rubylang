@@ -135,6 +135,12 @@ pub enum RObj {
     BigInt(num_bigint::BigInt),
     /// An exact rational number, always stored in lowest terms.
     Rational(num_rational::BigRational),
+    /// A complex number; the real and imaginary parts keep their own numeric type
+    /// (Integer/Float/Rational), matching Ruby.
+    Complex {
+        re: Value,
+        im: Value,
+    },
     Range {
         lo: i64,
         hi: i64,
@@ -570,6 +576,24 @@ impl RubyHost {
     /// Ruby — `Rational(4, 2)` is `(2/1)`, not `2`).
     pub fn new_rational(&mut self, r: num_rational::BigRational) -> Value {
         self.alloc(RObj::Rational(r))
+    }
+    /// Build a complex number from its parts.
+    pub fn new_complex(&mut self, re: Value, im: Value) -> Value {
+        self.alloc(RObj::Complex { re, im })
+    }
+    /// The `(real, imaginary)` parts of a complex number, if `v` is one.
+    pub fn complex_parts(&self, v: &Value) -> Option<(Value, Value)> {
+        match self.obj(v) {
+            Some(RObj::Complex { re, im }) => Some((re.clone(), im.clone())),
+            _ => None,
+        }
+    }
+    /// Format `re±imi` (the body of `to_s`; `inspect` wraps it in parens).
+    pub fn complex_to_s(&mut self, re: &Value, im: &Value) -> String {
+        let re_s = self.to_s(re);
+        let im_s = self.to_s(im);
+        let sign = if im_s.starts_with('-') { "-" } else { "+" };
+        format!("{re_s}{sign}{}i", im_s.trim_start_matches('-'))
     }
     /// View an integer or rational as a `BigRational`.
     pub fn as_rational(&self, v: &Value) -> Option<num_rational::BigRational> {
@@ -1392,6 +1416,7 @@ impl RubyHost {
                 Some(RObj::Symbol(s)) => s,
                 Some(RObj::BigInt(b)) => b.to_string(),
                 Some(RObj::Rational(r)) => format!("{}/{}", r.numer(), r.denom()),
+                Some(RObj::Complex { re, im }) => self.complex_to_s(&re, &im),
                 Some(RObj::Set(map)) => {
                     let items: Vec<Value> = map.values().cloned().collect();
                     let inner: Vec<String> = items.iter().map(|v| self.inspect(v)).collect();
@@ -1450,6 +1475,7 @@ impl RubyHost {
                 Some(RObj::Symbol(s)) => format!(":{s}"),
                 Some(RObj::BigInt(b)) => b.to_string(),
                 Some(RObj::Rational(r)) => format!("({}/{})", r.numer(), r.denom()),
+                Some(RObj::Complex { re, im }) => format!("({})", self.complex_to_s(&re, &im)),
                 Some(RObj::Set(map)) => {
                     let inner: Vec<String> = map.values().map(|v| self.inspect(v)).collect();
                     format!("Set[{}]", inner.join(", "))
@@ -1522,6 +1548,7 @@ impl RubyHost {
                 Some(RObj::Str(_)) => "String",
                 Some(RObj::BigInt(_)) => "Integer",
                 Some(RObj::Rational(_)) => "Rational",
+                Some(RObj::Complex { .. }) => "Complex",
                 Some(RObj::Set(_)) => "Set",
                 Some(RObj::Array(_)) => "Array",
                 Some(RObj::Hash { .. }) => "Hash",
@@ -1652,6 +1679,37 @@ impl RubyHost {
                 }
             }
         }
+        // Complex arithmetic: `(a+bi) op (c+di)`, promoting a real operand to
+        // `(real, 0)`. Component operations recurse through `num_op` so the parts
+        // keep their own numeric types.
+        if matches!(self.obj(a), Some(RObj::Complex { .. }))
+            || matches!(self.obj(b), Some(RObj::Complex { .. }))
+        {
+            let (ar, ai) = self
+                .complex_parts(a)
+                .unwrap_or_else(|| (a.clone(), Value::Int(0)));
+            let (br, bi) = self
+                .complex_parts(b)
+                .unwrap_or_else(|| (b.clone(), Value::Int(0)));
+            let result = match op {
+                Add => Some((self.num_op(Add, &ar, &br)?, self.num_op(Add, &ai, &bi)?)),
+                Sub => Some((self.num_op(Sub, &ar, &br)?, self.num_op(Sub, &ai, &bi)?)),
+                Mul => {
+                    // (ar*br - ai*bi) + (ar*bi + ai*br)i
+                    let rr1 = self.num_op(Mul, &ar, &br)?;
+                    let rr2 = self.num_op(Mul, &ai, &bi)?;
+                    let re = self.num_op(Sub, &rr1, &rr2)?;
+                    let ii1 = self.num_op(Mul, &ar, &bi)?;
+                    let ii2 = self.num_op(Mul, &ai, &br)?;
+                    let im = self.num_op(Add, &ii1, &ii2)?;
+                    Some((re, im))
+                }
+                _ => None,
+            };
+            if let Some((re, im)) = result {
+                return Ok(self.new_complex(re, im));
+            }
+        }
         // String and Array operators.
         match (self.obj(a).cloned(), op) {
             (Some(RObj::Str(s)), Add) => {
@@ -1760,6 +1818,14 @@ impl RubyHost {
                         x.len() == y.len()
                             && x.iter()
                                 .all(|(k, v)| y.get(k).is_some_and(|w| self.eq_values(v, w)))
+                    }
+                    // Complex equality compares both parts.
+                    (
+                        Some(RObj::Complex { re: xr, im: xi }),
+                        Some(RObj::Complex { re: yr, im: yi }),
+                    ) => {
+                        let (xr, xi, yr, yi) = (xr.clone(), xi.clone(), yr.clone(), yi.clone());
+                        self.eq_values(&xr, &yr) && self.eq_values(&xi, &yi)
                     }
                     // Set equality is order-independent membership equality.
                     (Some(RObj::Set(x)), Some(RObj::Set(y))) => {

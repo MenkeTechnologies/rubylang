@@ -2042,6 +2042,24 @@ fn rational_numbers() {
 }
 
 #[test]
+fn complex_numbers() {
+    eq("Complex(3, 4)", "(3+4i)");
+    eq("Complex(3, -4)", "(3-4i)");
+    eq("Complex(1, 2) + Complex(3, 4)", "(4+6i)");
+    eq("Complex(1, 2) - Complex(2, 3)", "(-1-1i)");
+    eq("Complex(1, 2) * Complex(3, 4)", "(-5+10i)");
+    eq("Complex(3, 4).real", "3");
+    eq("Complex(3, 4).imaginary", "4");
+    eq("Complex(3, 4).abs", "5.0");
+    eq("Complex(3, 4).conjugate", "(3-4i)");
+    eq("Complex(3, 4) == Complex(3, 4)", "true");
+    // Imaginary literal and real-number promotion.
+    eq("1i", "(0+1i)");
+    eq("2 + 3i", "(2+3i)");
+    eq("[Complex(1, 1), Complex(2, 2)].reduce(:+)", "(3+3i)");
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).

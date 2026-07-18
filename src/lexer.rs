@@ -285,36 +285,44 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     });
                 } else {
                     let n: i64 = raw.parse().map_err(|_| format!("bad integer: {raw}"))?;
-                    // A trailing `r` (not part of an identifier) makes a Rational
-                    // literal: `4r` desugars to `Rational(4)`.
-                    let rational = b.get(i) == Some(&b'r')
-                        && !b
-                            .get(i + 1)
-                            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_');
+                    // A trailing `r`/`i` (not part of an identifier) makes a
+                    // Rational (`4r` → `Rational(4)`) or imaginary Complex
+                    // (`3i` → `Complex(0, 3)`) literal, desugared into a call.
+                    let suffix = b
+                        .get(i)
+                        .filter(|c| {
+                            (**c == b'r' || **c == b'i')
+                                && !b
+                                    .get(i + 1)
+                                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                        })
+                        .copied();
                     let this_sp = core::mem::take(&mut sp);
-                    if rational {
-                        i += 1;
-                        for kind in [
+                    let synth: Vec<Tok> = match suffix {
+                        Some(b'r') => vec![
                             Tok::Ident("Rational".into()),
                             Tok::Op("(".into()),
                             Tok::Int(n),
                             Tok::Op(")".into()),
-                        ] {
-                            out.push(Token {
-                                kind,
-                                line,
-                                space: false,
-                            });
-                        }
-                        // The `Rational` identifier carries the number's spacing.
-                        if let Some(first) = out.iter_mut().rev().nth(3) {
-                            first.space = this_sp;
-                        }
-                    } else {
+                        ],
+                        Some(b'i') => vec![
+                            Tok::Ident("Complex".into()),
+                            Tok::Op("(".into()),
+                            Tok::Int(0),
+                            Tok::Op(",".into()),
+                            Tok::Int(n),
+                            Tok::Op(")".into()),
+                        ],
+                        _ => vec![Tok::Int(n)],
+                    };
+                    if suffix.is_some() {
+                        i += 1;
+                    }
+                    for (k, kind) in synth.into_iter().enumerate() {
                         out.push(Token {
-                            kind: Tok::Int(n),
+                            kind,
                             line,
-                            space: this_sp,
+                            space: if k == 0 { this_sp } else { false },
                         });
                     }
                 }
