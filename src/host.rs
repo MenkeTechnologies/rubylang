@@ -171,6 +171,15 @@ pub enum RObj {
         hi: i64,
         exclusive: bool,
     },
+    /// A Range with Float endpoints, e.g. `1.0..2.0`. Ruby forbids iterating a
+    /// Float range directly (`each`/`to_a` raise `TypeError`); it supports
+    /// `step`, `min`/`max`/`begin`/`end`, and the containment predicates
+    /// (`include?`/`cover?`/`===`).
+    FloatRange {
+        lo: f64,
+        hi: f64,
+        exclusive: bool,
+    },
     /// A Range with String endpoints, e.g. `'a'..'e'`. Iterated with
     /// `String#succ` succession semantics.
     StrRange {
@@ -854,6 +863,15 @@ impl RubyHost {
     }
     pub fn new_str_range(&mut self, lo: String, hi: String, exclusive: bool) -> Value {
         self.alloc(RObj::StrRange { lo, hi, exclusive })
+    }
+    pub fn new_float_range(&mut self, lo: f64, hi: f64, exclusive: bool) -> Value {
+        self.alloc(RObj::FloatRange { lo, hi, exclusive })
+    }
+    pub fn as_float_range(&self, v: &Value) -> Option<(f64, f64, bool)> {
+        match self.obj(v) {
+            Some(RObj::FloatRange { lo, hi, exclusive }) => Some((*lo, *hi, *exclusive)),
+            _ => None,
+        }
     }
     pub fn as_str_range(&self, v: &Value) -> Option<(String, String, bool)> {
         match self.obj(v) {
@@ -1739,6 +1757,12 @@ impl RubyHost {
                 Some(RObj::Range { lo, hi, exclusive }) => {
                     format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
                 }
+                Some(RObj::FloatRange { lo, hi, exclusive }) => format!(
+                    "{}{}{}",
+                    fmt_float(lo),
+                    if exclusive { "..." } else { ".." },
+                    fmt_float(hi)
+                ),
                 Some(RObj::StrRange { lo, hi, exclusive }) => {
                     format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
                 }
@@ -1875,6 +1899,7 @@ impl RubyHost {
                 Some(RObj::Hash { .. }) => "Hash",
                 Some(RObj::Symbol(_)) => "Symbol",
                 Some(RObj::Range { .. }) => "Range",
+                Some(RObj::FloatRange { .. }) => "Range",
                 Some(RObj::StrRange { .. }) => "Range",
                 Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) => "Proc",
                 Some(RObj::Method { .. }) => "Method",
@@ -2212,6 +2237,45 @@ impl RubyHost {
                     (Some(RObj::Set(x)), Some(RObj::Set(y))) => {
                         x.len() == y.len() && x.keys().all(|k| y.contains_key(k))
                     }
+                    // Two Ranges are equal when their endpoints and exclusivity
+                    // match (integer, float, and string ranges each compare
+                    // only against the same kind).
+                    (
+                        Some(RObj::Range {
+                            lo: al,
+                            hi: ah,
+                            exclusive: ax,
+                        }),
+                        Some(RObj::Range {
+                            lo: bl,
+                            hi: bh,
+                            exclusive: bx,
+                        }),
+                    ) => al == bl && ah == bh && ax == bx,
+                    (
+                        Some(RObj::FloatRange {
+                            lo: al,
+                            hi: ah,
+                            exclusive: ax,
+                        }),
+                        Some(RObj::FloatRange {
+                            lo: bl,
+                            hi: bh,
+                            exclusive: bx,
+                        }),
+                    ) => al == bl && ah == bh && ax == bx,
+                    (
+                        Some(RObj::StrRange {
+                            lo: al,
+                            hi: ah,
+                            exclusive: ax,
+                        }),
+                        Some(RObj::StrRange {
+                            lo: bl,
+                            hi: bh,
+                            exclusive: bx,
+                        }),
+                    ) => al == bl && ah == bh && ax == bx,
                     // Two Times are equal when they name the same instant.
                     (Some(RObj::Time { secs: x }), Some(RObj::Time { secs: y })) => x == y,
                     // Two Dates are equal when they name the same day.

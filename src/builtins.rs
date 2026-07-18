@@ -429,6 +429,13 @@ fn b_mkrange(vm: &mut VM, _: u8) -> Value {
     }
     match (&lo, &hi) {
         (Value::Int(a), Value::Int(b)) => with_host(|h| h.new_range(*a, *b, excl)),
+        // A Float endpoint (on either side) makes a Float range; a mixed
+        // Int/Float range coerces the Integer bound to Float, matching Ruby.
+        (Value::Float(_) | Value::Int(_), Value::Float(_) | Value::Int(_))
+            if matches!(lo, Value::Float(_)) || matches!(hi, Value::Float(_)) =>
+        {
+            with_host(|h| h.new_float_range(as_f(&lo), as_f(&hi), excl))
+        }
         _ => {
             // String endpoints (`'a'..'e'`) produce a String range.
             let ls = with_host(|h| h.as_str(&lo));
@@ -658,6 +665,14 @@ pub(crate) fn dispatch(
                 let n = as_i(&args[0]);
                 let end = if excl { hi } else { hi + 1 };
                 return Ok(Value::Bool(n >= lo && n < end));
+            }
+            if let Some((lo, hi, excl)) = with_host(|h| h.as_float_range(recv)) {
+                let x = as_f(&args[0]);
+                return Ok(Value::Bool(if excl {
+                    x >= lo && x < hi
+                } else {
+                    x >= lo && x <= hi
+                }));
             }
             return Ok(Value::Bool(with_host(|h| h.eq_values(recv, &args[0]))));
         }
@@ -5641,6 +5656,11 @@ fn dispatch_range(
     if let Some((lo, hi, excl)) = with_host(|h| h.as_str_range(recv)) {
         return dispatch_str_range(recv, name, args, block, lo, hi, excl);
     }
+    // Float ranges (`1.0..2.0`) cannot be iterated directly (Ruby raises), but
+    // support `step`, the endpoints, and the containment predicates.
+    if let Some((lo, hi, excl)) = with_host(|h| h.as_float_range(recv)) {
+        return dispatch_float_range(recv, name, args, block, lo, hi, excl);
+    }
     let (lo, hi, excl) = with_host(|h| h.as_range(recv).unwrap());
     let endless = hi == crate::host::RANGE_ENDLESS;
     let beginless = lo == crate::host::RANGE_BEGINLESS;
@@ -5722,6 +5742,27 @@ fn dispatch_range(
             Ok(Value::Bool(n >= lo && n < end))
         }
         "step" => {
+            // A Float step over an Integer range steps in Float space, matching
+            // Ruby (`(1..2).step(0.5)` → `[1.0, 1.5, 2.0]`).
+            if matches!(args.first(), Some(Value::Float(_))) {
+                let by = as_f(&args[0]);
+                let vals = float_range_step(lo as f64, hi as f64, excl, by);
+                return match block {
+                    Some(b) => {
+                        for v in vals {
+                            call_proc(&b, &[v])?;
+                            if has_pending_signal() {
+                                if let Some(bv) = take_break() {
+                                    return Ok(bv);
+                                }
+                                break;
+                            }
+                        }
+                        Ok(recv.clone())
+                    }
+                    None => Ok(with_host(|h| h.new_enumerator(vals, "each"))),
+                };
+            }
             let n = as_i(&args[0]);
             if n <= 0 {
                 return Err(raise_exc("ArgumentError", "step can't be negative"));
@@ -5791,6 +5832,99 @@ fn str_range_vec(lo: &str, hi: &str, excl: bool) -> Vec<String> {
         }
     }
     out
+}
+
+/// The stepped values of a Float range `(lo..hi)` / `(lo...hi)` by `by`, using
+/// Ruby's float-step count (so accumulation error doesn't lose the last value)
+/// and clamping an inclusive final value exactly to `hi`. An exclusive range
+/// drops any value that reaches `hi`.
+fn float_range_step(lo: f64, hi: f64, excl: bool, by: f64) -> Vec<Value> {
+    if by <= 0.0 || !by.is_finite() {
+        return Vec::new();
+    }
+    let mut err = (lo.abs() + hi.abs() + (hi - lo).abs()) / by.abs() * f64::EPSILON;
+    if err > 0.5 {
+        err = 0.5;
+    }
+    let n = ((hi - lo) / by + err).floor() + 1.0;
+    let mut out = Vec::new();
+    let mut i = 0.0f64;
+    while i < n {
+        let mut v = lo + i * by;
+        if v > hi {
+            v = hi;
+        }
+        if excl && v >= hi {
+            break;
+        }
+        out.push(Value::Float(v));
+        i += 1.0;
+    }
+    out
+}
+
+/// `Float` range methods. Ruby forbids iterating a Float range directly, so
+/// `each`/`to_a`/`map`/… raise `TypeError`; the endpoints, containment
+/// predicates, and `step` are supported.
+fn dispatch_float_range(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+    lo: f64,
+    hi: f64,
+    excl: bool,
+) -> Result<Value, String> {
+    let contains = |x: f64| {
+        if excl {
+            x >= lo && x < hi
+        } else {
+            x >= lo && x <= hi
+        }
+    };
+    match name {
+        "begin" | "first" | "min" if args.is_empty() => Ok(Value::Float(lo)),
+        "end" | "last" if args.is_empty() => Ok(Value::Float(hi)),
+        "max" if args.is_empty() => {
+            if excl {
+                // Ruby raises for `(1.0...2.0).max` — no well-defined float max.
+                Err(raise_exc(
+                    "TypeError",
+                    "cannot exclude non Integer end value",
+                ))
+            } else {
+                Ok(Value::Float(hi))
+            }
+        }
+        "exclude_end?" => Ok(Value::Bool(excl)),
+        "include?" | "member?" | "cover?" | "===" => Ok(Value::Bool(contains(as_f(&args[0])))),
+        "step" | "%" => {
+            let by = args.first().map(as_f).unwrap_or(1.0);
+            let vals = float_range_step(lo, hi, excl, by);
+            match block {
+                Some(b) => {
+                    for v in vals {
+                        call_proc(&b, &[v])?;
+                        if has_pending_signal() {
+                            if let Some(bv) = take_break() {
+                                return Ok(bv);
+                            }
+                            break;
+                        }
+                    }
+                    Ok(recv.clone())
+                }
+                None => Ok(with_host(|h| h.new_enumerator(vals, "each"))),
+            }
+        }
+        "to_s" | "inspect" => Ok(new_str(with_host(|h| h.to_s(recv)))),
+        // Iterating a Float range directly is a TypeError in Ruby.
+        "each" | "to_a" | "to_ary" | "map" | "collect" | "select" | "filter" | "reject" | "sum"
+        | "reduce" | "inject" | "each_with_index" | "each_with_object" | "count" | "size" => {
+            Err(raise_exc("TypeError", "can't iterate from Float"))
+        }
+        _ => Err(no_method_error(recv, name)),
+    }
 }
 
 fn dispatch_str_range(

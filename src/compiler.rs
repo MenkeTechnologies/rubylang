@@ -505,6 +505,7 @@ impl Compiler {
                 | BinOp::Shl
                 | BinOp::Shr
                 | BinOp::Cmp
+                | BinOp::CaseEq
                 | BinOp::Match
                 | BinOp::NMatch
                 | BinOp::BitAnd
@@ -518,6 +519,7 @@ impl Compiler {
                 BinOp::Shl => "<<",
                 BinOp::Shr => ">>",
                 BinOp::Cmp => "<=>",
+                BinOp::CaseEq => "===",
                 // `&`/`|`/`^` are methods (Integer bit ops, Set/Array algebra,
                 // and user operator overloads), so dispatch rather than the
                 // native VM op.
@@ -558,7 +560,7 @@ impl Compiler {
             BinOp::BitXor => Op::BitXor,
             BinOp::Shl => Op::Shl,
             BinOp::Shr => Op::Shr,
-            BinOp::And | BinOp::Or | BinOp::Match | BinOp::NMatch => unreachable!(),
+            BinOp::And | BinOp::Or | BinOp::Match | BinOp::NMatch | BinOp::CaseEq => unreachable!(),
         };
         b.emit(native, 0);
         Ok(())

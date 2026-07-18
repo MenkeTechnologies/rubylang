@@ -23,6 +23,7 @@ pub enum BinOp {
     Le,
     Ge,
     Cmp,    // <=>
+    CaseEq, // ===
     Match,  // =~
     NMatch, // !~
     And,    // &&

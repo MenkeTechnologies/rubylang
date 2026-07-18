@@ -2358,6 +2358,48 @@ fn time_utc() {
 }
 
 #[test]
+fn float_ranges() {
+    // Float ranges support step (with Ruby's drift-free count).
+    eq("(1.0..2.0).step(0.5).to_a", "[1.0, 1.5, 2.0]");
+    eq("(0.0..1.0).step(0.25).to_a", "[0.0, 0.25, 0.5, 0.75, 1.0]");
+    eq("(1.0...2.0).step(0.5).to_a", "[1.0, 1.5]");
+    // An Integer range with a Float step steps in Float space.
+    eq("(1..3).step(0.5).to_a", "[1.0, 1.5, 2.0, 2.5, 3.0]");
+    // Endpoints and containment.
+    eq("(1.0..2.0).min", "1.0");
+    eq("(1.0..2.0).max", "2.0");
+    eq("(1.0..2.0).begin", "1.0");
+    eq("(1.5..4.5).include?(3.2)", "true");
+    eq("(1.0...5.0).include?(5.0)", "false");
+    eq("(1.0..5.0).include?(5.0)", "true");
+    eq("(1.0...2.0).exclude_end?", "true");
+    eq("(1.0..2.0).to_s", "\"1.0..2.0\"");
+    eq("(1.0..2.0).inspect", "\"1.0..2.0\"");
+}
+
+#[test]
+fn case_equality_operator() {
+    // `===` is case-equality, NOT `==`: a Range covers, a Class matches
+    // instances, a Regexp matches a string.
+    eq("(1..5) === 3", "true");
+    eq("(1..5) === 9", "false");
+    eq("(1.5..4.5) === 3.0", "true");
+    eq("Integer === 5", "true");
+    eq("Integer === \"x\"", "false");
+    eq("Numeric === 5", "true");
+    eq("/ab/ === \"xabc\"", "true");
+    // `==` stays structural equality (unaffected by the `===` fix).
+    eq("(1..5) == (1..5)", "true");
+    eq("(1..5) == 3", "false");
+    // case/when uses `===`.
+    eq("case 3.0; when 1.5..4.5 then :in; else :out; end", ":in");
+    eq(
+        "case 42; when Integer then :int; when String then :str; end",
+        ":int",
+    );
+}
+
+#[test]
 fn symproc_over_array_elements() {
     // `&:sym` must send the method to each element as a whole — an array
     // element is the receiver, never auto-splatted into (recv, *args).

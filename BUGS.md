@@ -123,6 +123,13 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   the Ruby-4.0 form — `undefined method '<name>' for an instance of <Class>` for
   ordinary receivers, `for nil`/`for true`/`for false` for those values, and
   `for class <Name>` for a class/module reference.
+- **Ranges.** Integer, Float (`1.0..2.0`), and String (`'a'..'e'`) endpoints are
+  supported, plus endless (`1..`) and beginless (`..5`). A Float range can't be
+  iterated directly (`each`/`to_a`/`map` raise `TypeError` like Ruby) but
+  supports `step`, `min`/`max`/`begin`/`end`, and the containment predicates.
+  `==` compares endpoints and exclusivity; `===` is proper case-equality (Range
+  covers, `Class` matches instances, `Regexp` matches a string) rather than
+  `==`, so `case`/`when` over ranges and classes works.
 - **Pattern matching (`case/in`).** Array/hash/find-by-key patterns, class
   patterns (`Integer`, `Point[...]`), variable/`_` binding, `=> name`, `^pin`,
   `|` alternatives, `*rest` splats, and `if`/`unless` guards work. Not yet: the

@@ -878,3 +878,24 @@ puts [1, 2, 3, 4, 5].reduce(&:+)
 puts [2, 3, 4].reduce(&:*)
 puts [[3, 1], [2, 4], [5, 0]].map(&:min).inspect
 puts [[3, 1], [2, 4]].sort_by(&:first).inspect
+#==#
+puts (1.0..2.0).step(0.5).to_a.inspect
+puts (0.0..1.0).step(0.25).to_a.inspect
+puts (1..3).step(0.5).to_a.inspect
+puts (1.5..4.5).include?(3.2)
+puts (1.0...2.0).exclude_end?
+puts((1.5..4.5) === 3.0)
+puts((1..10) === 5)
+puts(Integer === 42)
+puts(Float === 3.14)
+puts(/\d+/ === "abc123")
+temps = [-5.0, 0.0, 15.0, 25.0, 40.0]
+temps.each do |t|
+  label = case t
+          when -100.0...0.0 then "freezing"
+          when 0.0..20.0 then "cold"
+          when 20.0..30.0 then "mild"
+          else "hot"
+          end
+  puts "#{t}: #{label}"
+end

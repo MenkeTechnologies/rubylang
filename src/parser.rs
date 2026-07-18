@@ -1697,7 +1697,7 @@ fn matchop(op: &str) -> BinOp {
         "<=>" => BinOp::Cmp,
         "=~" => BinOp::Match,
         "!~" => BinOp::NMatch,
-        "===" => BinOp::Eq,
+        "===" => BinOp::CaseEq,
         "<" => BinOp::Lt,
         "<=" => BinOp::Le,
         ">" => BinOp::Gt,
