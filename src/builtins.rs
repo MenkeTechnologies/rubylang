@@ -3334,6 +3334,95 @@ fn dispatch_hash(
             Ok(with_host(|h| h.new_hash(out)))
         }
         "to_h" => Ok(recv.clone()),
+        "except" => {
+            // Return a copy without the given keys (original order preserved).
+            let drop: Vec<_> = args.iter().map(|a| with_host(|h| h.value_to_key(a))).collect();
+            let mut out = IndexMap::new();
+            for (k, v) in &map {
+                if !drop.contains(k) {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+            Ok(with_host(|h| h.new_hash(out)))
+        }
+        "slice" => {
+            // Return a copy with only the given keys, in argument order (MRI).
+            let mut out = IndexMap::new();
+            for a in args {
+                let k = with_host(|h| h.value_to_key(a));
+                if let Some(v) = map.get(&k) {
+                    out.insert(k, v.clone());
+                }
+            }
+            Ok(with_host(|h| h.new_hash(out)))
+        }
+        "compact" => {
+            // Drop pairs whose value is nil.
+            let mut out = IndexMap::new();
+            for (k, v) in &map {
+                if !matches!(v, Value::Undef) {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+            Ok(with_host(|h| h.new_hash(out)))
+        }
+        "flat_map" | "collect_concat" => {
+            let mut out = Vec::new();
+            if let Some(b) = &block {
+                for (k, v) in &map {
+                    let kv = with_host(|h| h.key_value(k));
+                    let r = call_proc(b, &[kv, v.clone()])?;
+                    if let Some(xs) = with_host(|h| h.as_array(&r)) {
+                        out.extend(xs);
+                    } else {
+                        out.push(r);
+                    }
+                }
+            }
+            Ok(new_arr(out))
+        }
+        "each_with_index" => {
+            let pairs: Vec<Value> = with_host(|h| {
+                map.iter()
+                    .map(|(k, v)| {
+                        let kv = h.key_value(k);
+                        h.new_array(vec![kv, v.clone()])
+                    })
+                    .collect()
+            });
+            if let Some(b) = &block {
+                for (i, pair) in pairs.iter().enumerate() {
+                    call_proc(b, &[pair.clone(), Value::Int(i as i64)])?;
+                    if has_pending_signal() {
+                        take_break();
+                        break;
+                    }
+                }
+                Ok(recv.clone())
+            } else {
+                // No Enumerator type yet: return `[[k, v], index]` pairs so the
+                // chain `each_with_index.to_a` / `.map { |kv, i| … }` still works.
+                Ok(new_arr(
+                    pairs
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, pair)| new_arr(vec![pair, Value::Int(i as i64)]))
+                        .collect(),
+                ))
+            }
+        }
+        "find" | "detect" => {
+            if let Some(b) = &block {
+                for (k, v) in &map {
+                    let kv = with_host(|h| h.key_value(k));
+                    let r = call_proc(b, &[kv.clone(), v.clone()])?;
+                    if with_host(|h| h.truthy(&r)) {
+                        return Ok(with_host(|h| h.new_array(vec![kv, v.clone()])));
+                    }
+                }
+            }
+            Ok(Value::Undef)
+        }
         "dig" => Ok(dig(recv, args)),
         _ => Err(raise_exc(
             "NoMethodError",

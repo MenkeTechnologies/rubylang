@@ -1406,6 +1406,35 @@ fn comparable_range_batch() {
     eq(
         "begin; 5.clamp(1...3); rescue => e; e.message; end",
         "\"cannot clamp with an exclusive range\"",
+}
+
+#[test]
+fn hash_more_batch() {
+    // except / slice preserve MRI ordering semantics.
+    eq("{a: 1, b: 2, c: 3}.except(:b)", "{a: 1, c: 3}");
+    eq("{a: 1, b: 2, c: 3}.slice(:a, :c)", "{a: 1, c: 3}");
+    eq("{a: 1, b: 2, c: 3}.slice(:c, :a)", "{c: 3, a: 1}");
+    eq("{a: 1, b: 2}.slice(:a, :z)", "{a: 1}");
+    eq("{a: 1, b: 2}.except(:z)", "{a: 1, b: 2}");
+    // compact drops nil values.
+    eq("{a: 1, b: nil, c: 3}.compact", "{a: 1, c: 3}");
+    // min_by / max_by / sum with a block.
+    eq("{a: 1, b: 2}.min_by { |k, v| v }.inspect", "\"[:a, 1]\"");
+    eq("{a: 1, b: 2}.max_by { |k, v| v }.inspect", "\"[:b, 2]\"");
+    eq("{a: 1, b: 2}.sum { |k, v| v }", "3");
+    // flat_map flattens one level; scalar results are collected.
+    eq("{a: 1, b: 2}.flat_map { |k, v| [k, v] }", "[:a, 1, :b, 2]");
+    eq("{a: 1, b: 2}.flat_map { |k, v| v }", "[1, 2]");
+    // each_with_index without a block yields [[k, v], index] pairs.
+    eq("{a: 1, b: 2}.each_with_index.to_a", "[[[:a, 1], 0], [[:b, 2], 1]]");
+    // find / detect return the matching [key, value] pair, else nil.
+    eq("{a: 1, b: 2, c: 3}.find { |k, v| v == 2 }", "[:b, 2]");
+    eq("{a: 1, b: 2, c: 3}.detect { |k, v| v == 2 }", "[:b, 2]");
+    eq("{a: 1}.find { |k, v| v == 9 }", "nil");
+    // tally-like counts via each_with_object.
+    eq(
+        "%w[a b a c b a].each_with_object(Hash.new(0)) { |w, h| h[w] += 1 }",
+        "{\"a\" => 3, \"b\" => 2, \"c\" => 1}",
     );
 }
 
