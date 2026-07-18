@@ -464,6 +464,22 @@ fn escaping_closures_keep_their_scope() {
 }
 
 #[test]
+fn method_breadth_batch() {
+    eq("\"ab\".center(6, \"*\")", "\"**ab**\"");
+    eq("\"a-b-c\".tr(\"-\", \"_\")", "\"a_b_c\"");
+    eq("\"a\\nb\\nc\".lines", "[\"a\\n\", \"b\\n\", \"c\"]");
+    eq("{ a: { b: 1 } }.dig(:a, :b)", "1");
+    eq("[[1, [2]]].dig(0, 1, 0)", "2");
+    eq("[5, 3, 8, 1].min(2)", "[1, 3]");
+    eq("[5, 3, 8, 1].max(2)", "[8, 5]");
+    eq("[1, 2, 3, 4, 5].first(3)", "[1, 2, 3]");
+    eq("[1, 2, 3].sum { |x| x * 2 }", "12");
+    eq("255.to_s(16)", "\"ff\"");
+    eq("\"1010\".to_i(2)", "10");
+    eq("?A", "\"A\"");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

@@ -434,7 +434,9 @@ fn dispatch(
     }
     // Universal methods available on every object.
     match name {
-        "to_s" => {
+        // Argless `to_s` is the universal default; `to_s(base)` etc. fall through
+        // to the per-class dispatch (e.g. `Integer#to_s(2)`).
+        "to_s" if args.is_empty() => {
             return Ok(with_host(|h| {
                 let s = h.to_s(recv);
                 h.new_string(s)
@@ -663,10 +665,18 @@ fn dispatch_number(
         }
         "upto" => iter_int_range(recv, as_i(&args[0]), 1, &block, recv.clone()),
         "downto" => iter_int_range(recv, as_i(&args[0]), -1, &block, recv.clone()),
-        "to_s" => Ok(with_host(|h| {
-            let s = h.to_s(recv);
-            h.new_string(s)
-        })),
+        "to_s" => {
+            // `Integer#to_s(base)` renders in the given radix (2..=36).
+            if let (Value::Int(n), Some(base)) = (recv, args.first().map(as_i)) {
+                if (2..=36).contains(&base) {
+                    return Ok(new_str(to_radix(*n, base as u32)));
+                }
+            }
+            Ok(with_host(|h| {
+                let s = h.to_s(recv);
+                h.new_string(s)
+            }))
+        }
         "to_i" | "to_int" | "floor" if name != "floor" => Ok(Value::Int(as_i(recv))),
         "to_f" => Ok(Value::Float(as_f(recv))),
         "abs" => Ok(match recv {
@@ -788,6 +798,26 @@ fn floor_mod(a: i64, b: i64) -> i64 {
     }
 }
 
+/// Render an integer in base 2..=36 (Ruby `Integer#to_s(base)`).
+fn to_radix(mut n: i64, base: u32) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    let neg = n < 0;
+    let mut digits = Vec::new();
+    let b = base as i64;
+    n = n.abs();
+    while n > 0 {
+        let d = (n % b) as u32;
+        digits.push(std::char::from_digit(d, base).unwrap());
+        n /= b;
+    }
+    if neg {
+        digits.push('-');
+    }
+    digits.iter().rev().collect()
+}
+
 fn gcd(mut a: i64, mut b: i64) -> i64 {
     a = a.abs();
     b = b.abs();
@@ -824,8 +854,64 @@ fn dispatch_string(
         "rstrip" => Ok(new_str(s.trim_end().to_string())),
         "chomp" => Ok(new_str(s.trim_end_matches(['\n', '\r']).to_string())),
         "chars" => Ok(new_arr(s.chars().map(|c| new_str(c.to_string())).collect())),
+        "bytes" => Ok(new_arr(s.bytes().map(|b| Value::Int(b as i64)).collect())),
+        "lines" => Ok(new_arr(split_lines(&s).into_iter().map(new_str).collect())),
+        "each_line" => {
+            if let Some(bl) = &block {
+                for line in split_lines(&s) {
+                    call_proc(bl, &[new_str(line)])?;
+                    if has_pending_signal() {
+                        take_break();
+                        break;
+                    }
+                }
+            }
+            Ok(recv.clone())
+        }
+        "center" => {
+            let width = as_i(&args[0]).max(0) as usize;
+            let padstr = pad_str(args);
+            let len = s.chars().count();
+            if len >= width || padstr.is_empty() {
+                Ok(new_str(s.clone()))
+            } else {
+                let total = width - len;
+                let left = total / 2;
+                let right = total - left;
+                let lp: String = padstr.chars().cycle().take(left).collect();
+                let rp: String = padstr.chars().cycle().take(right).collect();
+                Ok(new_str(format!("{lp}{s}{rp}")))
+            }
+        }
+        "tr" => {
+            let from: Vec<char> = arg_str(&args[0]).chars().collect();
+            let to: Vec<char> = arg_str(&args[1]).chars().collect();
+            let out: String = s
+                .chars()
+                .map(|c| match from.iter().position(|&f| f == c) {
+                    Some(i) => *to.get(i).or_else(|| to.last()).unwrap_or(&c),
+                    None => c,
+                })
+                .collect();
+            Ok(new_str(out))
+        }
+        "delete" => {
+            let set: Vec<char> = arg_str(&args[0]).chars().collect();
+            Ok(new_str(s.chars().filter(|c| !set.contains(c)).collect()))
+        }
+        "count" => {
+            let set: Vec<char> = arg_str(&args[0]).chars().collect();
+            Ok(Value::Int(
+                s.chars().filter(|c| set.contains(c)).count() as i64
+            ))
+        }
         "empty?" => Ok(Value::Bool(s.is_empty())),
-        "to_i" => Ok(Value::Int(parse_leading_int(&s))),
+        "to_i" => match args.first().map(as_i) {
+            Some(base) if (2..=36).contains(&base) => Ok(Value::Int(
+                i64::from_str_radix(s.trim(), base as u32).unwrap_or(0),
+            )),
+            _ => Ok(Value::Int(parse_leading_int(&s))),
+        },
         "to_f" => Ok(Value::Float(parse_leading_float(&s))),
         "to_s" | "to_str" => Ok(recv.clone()),
         "to_sym" => Ok(with_host(|h| h.new_symbol(&s))),
@@ -907,6 +993,45 @@ fn dispatch_string(
         "[]" => Ok(str_index(&s, args)),
         _ => Err(format!("undefined method '{name}' for String")),
     }
+}
+
+/// Ruby `dig`: index into nested Arrays/Hashes by each key in turn, short-
+/// circuiting to `nil` the moment a step is `nil`.
+fn dig(recv: &Value, keys: &[Value]) -> Value {
+    let mut cur = recv.clone();
+    for k in keys {
+        if matches!(cur, Value::Undef) {
+            return Value::Undef;
+        }
+        cur = if with_host(|h| h.as_array(&cur)).is_some() {
+            arr_index(
+                &with_host(|h| h.as_array(&cur).unwrap()),
+                std::slice::from_ref(k),
+            )
+        } else if let Some(m) = with_host(|h| h.as_hash(&cur)) {
+            let key = with_host(|h| h.value_to_key(k));
+            m.get(&key).cloned().unwrap_or(Value::Undef)
+        } else {
+            return Value::Undef;
+        };
+    }
+    cur
+}
+
+/// Split a string into lines, keeping each trailing `\n` (Ruby `String#lines`).
+fn split_lines(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in s.chars() {
+        cur.push(c);
+        if c == '\n' {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 fn pad_str(args: &[Value]) -> String {
@@ -991,8 +1116,39 @@ fn dispatch_array(
             with_host(|h| h.set_array(recv, a));
             Ok(recv.clone())
         }
-        "first" => Ok(arr.first().cloned().unwrap_or(Value::Undef)),
-        "last" => Ok(arr.last().cloned().unwrap_or(Value::Undef)),
+        "first" => match args.first() {
+            Some(n) => Ok(new_arr(
+                arr.iter().take(as_i(n).max(0) as usize).cloned().collect(),
+            )),
+            None => Ok(arr.first().cloned().unwrap_or(Value::Undef)),
+        },
+        "last" => match args.first() {
+            Some(n) => {
+                let k = as_i(n).max(0) as usize;
+                let start = arr.len().saturating_sub(k);
+                Ok(new_arr(arr[start..].to_vec()))
+            }
+            None => Ok(arr.last().cloned().unwrap_or(Value::Undef)),
+        },
+        "each_cons" => {
+            let n = as_i(&args[0]).max(1) as usize;
+            let windows: Vec<Value> = arr.windows(n).map(|w| new_arr(w.to_vec())).collect();
+            if let Some(bl) = &block {
+                for w in &windows {
+                    call_proc(bl, std::slice::from_ref(w))?;
+                    if has_pending_signal() {
+                        take_break();
+                        break;
+                    }
+                }
+                Ok(recv.clone())
+            } else {
+                // No enumerator type yet: return the windows array (usable with
+                // `.to_a`/`.map`/`.each`, unlike MRI's lazy Enumerator).
+                Ok(new_arr(windows))
+            }
+        }
+        "dig" => Ok(dig(recv, args)),
         "empty?" => Ok(Value::Bool(arr.is_empty())),
         "reverse" => Ok(new_arr(arr.into_iter().rev().collect())),
         "to_a" | "to_ary" | "dup" | "clone" => Ok(new_arr(arr)),
@@ -1023,9 +1179,25 @@ fn dispatch_array(
         }
         "min" | "max" => {
             if arr.is_empty() {
-                return Ok(Value::Undef);
+                return Ok(if args.is_empty() {
+                    Value::Undef
+                } else {
+                    new_arr(vec![])
+                });
             }
             let want_max = name == "max";
+            // `min(n)` / `max(n)` returns the n extremes, sorted.
+            if let Some(n) = args.first().filter(|_| block.is_none()) {
+                let mut sorted = arr.clone();
+                sorted.sort_by(cmp_values);
+                let k = (as_i(n).max(0) as usize).min(sorted.len());
+                let picked: Vec<Value> = if want_max {
+                    sorted.iter().rev().take(k).cloned().collect()
+                } else {
+                    sorted.iter().take(k).cloned().collect()
+                };
+                return Ok(new_arr(picked));
+            }
             let mut best = arr[0].clone();
             for x in &arr[1..] {
                 let c = match &block {
@@ -1045,7 +1217,11 @@ fn dispatch_array(
         "sum" => {
             let mut acc = args.first().cloned().unwrap_or(Value::Int(0));
             for x in &arr {
-                acc = add_values(&acc, x);
+                let v = match &block {
+                    Some(bl) => call_proc(bl, std::slice::from_ref(x))?,
+                    None => x.clone(),
+                };
+                acc = add_values(&acc, &v);
             }
             Ok(acc)
         }
@@ -1617,6 +1793,7 @@ fn dispatch_hash(
             Ok(with_host(|h| h.new_hash(out)))
         }
         "to_h" => Ok(recv.clone()),
+        "dig" => Ok(dig(recv, args)),
         _ => Err(raise_exc(
             "NoMethodError",
             &format!("undefined method '{name}' for Hash"),

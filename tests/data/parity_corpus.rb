@@ -392,3 +392,31 @@ puts n
 running = 0
 [10, 20, 30].each { |v| running += v }
 puts running
+#==#
+puts "ruby".center(10, "-")
+puts "a-b-c-d".tr("-", ".")
+puts "hello".delete("l")
+puts "one\ntwo\nthree".lines.inspect
+puts "mississippi".count("s")
+#==#
+config = { db: { host: "localhost", port: 5432 } }
+puts config.dig(:db, :host)
+puts config.dig(:db, :missing).inspect
+nested = [[1, [2, 3]], [4]]
+puts nested.dig(0, 1, 1)
+#==#
+puts [5, 3, 8, 1, 9, 2].min(3).inspect
+puts [5, 3, 8, 1, 9, 2].max(2).inspect
+puts [1, 2, 3, 4, 5].first(3).inspect
+puts [1, 2, 3, 4, 5].last(2).inspect
+puts [1, 2, 3, 4].sum { |x| x * x }
+result = []
+[1, 2, 3, 4].each_cons(2) { |a, b| result << a + b }
+puts result.inspect
+#==#
+puts 255.to_s(16)
+puts 10.to_s(2)
+puts "ff".to_i(16)
+puts "1010".to_i(2)
+puts ?A
+puts ?z

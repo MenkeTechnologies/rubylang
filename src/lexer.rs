@@ -361,6 +361,41 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     space: false,
                 });
             }
+            // `?c` character literal → a one-char string. Only when `?` is at an
+            // expression start (leading space) and directly followed by an escape
+            // (`?\n`) or a lone alnum char (not `?ab`, and not the `? :` ternary).
+            b'?' if sp
+                && i + 1 < b.len()
+                && (b[i + 1] == b'\\'
+                    || (b[i + 1].is_ascii_alphanumeric()
+                        && (i + 2 >= b.len()
+                            || !(b[i + 2].is_ascii_alphanumeric() || b[i + 2] == b'_')))) =>
+            {
+                i += 1;
+                let ch = if b[i] == b'\\' && i + 1 < b.len() {
+                    i += 1;
+                    let e = b[i];
+                    i += 1;
+                    match e {
+                        b'n' => '\n',
+                        b't' => '\t',
+                        b'r' => '\r',
+                        b's' => ' ',
+                        b'0' => '\0',
+                        b'e' => '\x1b',
+                        other => other as char,
+                    }
+                } else {
+                    let c = b[i] as char;
+                    i += 1;
+                    c
+                };
+                out.push(Token {
+                    kind: Tok::Str(ch.to_string(), false),
+                    line,
+                    space: core::mem::take(&mut sp),
+                });
+            }
             b':' if i + 1 < b.len() && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_') => {
                 i += 1;
                 let start = i;
