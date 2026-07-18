@@ -118,6 +118,20 @@ pub mod ops {
 pub const RANGE_BEGINLESS: i64 = i64::MIN;
 pub const RANGE_ENDLESS: i64 = i64::MAX;
 
+/// One deferred stage in a lazy-enumerator pipeline.
+#[derive(Debug, Clone)]
+pub enum LazyOp {
+    Map(Value),
+    Select(Value),
+    Reject(Value),
+    FilterMap(Value),
+    FlatMap(Value),
+    TakeWhile(Value),
+    DropWhile(Value),
+    Take(i64),
+    Drop(i64),
+}
+
 /// A heap object — the Ruby reference types.
 #[derive(Debug, Clone)]
 pub enum RObj {
@@ -145,6 +159,12 @@ pub enum RObj {
     Complex {
         re: Value,
         im: Value,
+    },
+    /// A lazy enumerator: a source (array or range value) plus a pipeline of
+    /// deferred operations, pulled on demand by `first`/`take`/`force`/`to_a`.
+    Lazy {
+        source: Value,
+        ops: Vec<LazyOp>,
     },
     Range {
         lo: i64,
@@ -595,6 +615,17 @@ impl RubyHost {
     /// Build a complex number from its parts.
     pub fn new_complex(&mut self, re: Value, im: Value) -> Value {
         self.alloc(RObj::Complex { re, im })
+    }
+    /// Build a lazy enumerator from a source value and an operation pipeline.
+    pub fn new_lazy(&mut self, source: Value, ops: Vec<LazyOp>) -> Value {
+        self.alloc(RObj::Lazy { source, ops })
+    }
+    /// The `(source, ops)` of a lazy enumerator, if `v` is one.
+    pub fn lazy_parts(&self, v: &Value) -> Option<(Value, Vec<LazyOp>)> {
+        match self.obj(v) {
+            Some(RObj::Lazy { source, ops }) => Some((source.clone(), ops.clone())),
+            _ => None,
+        }
     }
     /// The `(real, imaginary)` parts of a complex number, if `v` is one.
     pub fn complex_parts(&self, v: &Value) -> Option<(Value, Value)> {
@@ -1507,6 +1538,7 @@ impl RubyHost {
                     let inner: Vec<String> = items.iter().map(|v| self.inspect(v)).collect();
                     format!("Set[{}]", inner.join(", "))
                 }
+                Some(RObj::Lazy { .. }) => "#<Enumerator::Lazy>".to_string(),
                 Some(RObj::Range { lo, hi, exclusive }) => {
                     format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
                 }
@@ -1634,6 +1666,7 @@ impl RubyHost {
                 Some(RObj::BigInt(_)) => "Integer",
                 Some(RObj::Rational(_)) => "Rational",
                 Some(RObj::Complex { .. }) => "Complex",
+                Some(RObj::Lazy { .. }) => "Enumerator::Lazy",
                 Some(RObj::Set(_)) => "Set",
                 Some(RObj::Array(_)) => "Array",
                 Some(RObj::Hash { .. }) => "Hash",

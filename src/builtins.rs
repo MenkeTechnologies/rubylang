@@ -721,6 +721,17 @@ pub(crate) fn dispatch(
             }
             return Ok(recv.clone());
         }
+        // `.lazy` wraps an enumerable in a lazy pipeline. A range (possibly
+        // endless) stays a range source; anything else materializes to an array.
+        "lazy" if with_host(|h| h.lazy_parts(recv)).is_none() => {
+            let source = if with_host(|h| h.as_range(recv).is_some() || h.as_array(recv).is_some())
+            {
+                recv.clone()
+            } else {
+                new_arr(with_host(|h| h.as_array(recv)).unwrap_or_default())
+            };
+            return Ok(with_host(|h| h.new_lazy(source, vec![])));
+        }
         "send" | "__send__" | "public_send" => {
             let m = name_of(&args[0]);
             return dispatch(recv, &m, &args[1..], block);
@@ -778,6 +789,7 @@ pub(crate) fn dispatch(
         "Regexp" => dispatch_regexp(recv, name, args),
         "MatchData" => dispatch_matchdata(recv, name, args),
         "Set" => dispatch_set(recv, name, args, block),
+        "Enumerator::Lazy" => dispatch_lazy(recv, name, args, block),
         "Rational" => dispatch_rational(recv, name, args),
         "Complex" => dispatch_complex(recv, name, args),
         "TrueClass" | "FalseClass" | "NilClass" => dispatch_bool(recv, name, args),
@@ -4416,6 +4428,217 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
 /// `Set` methods. Membership/mutation go through the host `RObj::Set`; set
 /// algebra (`|`, `&`, `-`, subset queries) builds fresh sets. Enumerable methods
 /// fall through to the Array implementation over the element list.
+/// Call `p` with `elem` and return whether the result is truthy.
+fn proc_truthy(p: &Value, elem: &Value) -> Result<bool, String> {
+    let r = call_proc(p, std::slice::from_ref(elem))?;
+    Ok(with_host(|h| h.truthy(&r)))
+}
+
+/// `Enumerator::Lazy` methods. Intermediate operations (`map`, `select`, …)
+/// append to the deferred pipeline and return a new lazy enumerator; terminal
+/// operations (`first`, `force`, `to_a`) pull elements on demand.
+fn dispatch_lazy(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    use crate::host::LazyOp;
+    let (source, ops) = with_host(|h| h.lazy_parts(recv)).unwrap();
+    let extend = |op: LazyOp| -> Value {
+        let mut next = ops.clone();
+        next.push(op);
+        with_host(|h| h.new_lazy(source.clone(), next))
+    };
+    let blk = || block.clone().ok_or_else(|| "no block given".to_string());
+    match name {
+        "map" | "collect" => Ok(extend(LazyOp::Map(blk()?))),
+        "select" | "filter" => Ok(extend(LazyOp::Select(blk()?))),
+        "reject" => Ok(extend(LazyOp::Reject(blk()?))),
+        "filter_map" => Ok(extend(LazyOp::FilterMap(blk()?))),
+        "flat_map" | "collect_concat" => Ok(extend(LazyOp::FlatMap(blk()?))),
+        "take_while" => Ok(extend(LazyOp::TakeWhile(blk()?))),
+        "drop_while" => Ok(extend(LazyOp::DropWhile(blk()?))),
+        "take" => Ok(extend(LazyOp::Take(as_i(&args[0]).max(0)))),
+        "drop" => Ok(extend(LazyOp::Drop(as_i(&args[0]).max(0)))),
+        "lazy" => Ok(recv.clone()),
+        "first" => {
+            let out = lazy_pull(
+                &source,
+                &ops,
+                args.first().map(|v| as_i(v).max(0) as usize).unwrap_or(1),
+            )?;
+            match args.first() {
+                Some(_) => Ok(new_arr(out)),
+                None => Ok(out.into_iter().next().unwrap_or(Value::Undef)),
+            }
+        }
+        "force" | "to_a" | "entries" => Ok(new_arr(lazy_pull(&source, &ops, usize::MAX)?)),
+        "each" if block.is_some() => {
+            let bl = block.unwrap();
+            for v in lazy_pull(&source, &ops, usize::MAX)? {
+                call_proc(&bl, std::slice::from_ref(&v))?;
+            }
+            Ok(recv.clone())
+        }
+        _ => Err(raise_exc(
+            "NoMethodError",
+            &format!("undefined method '{name}' for an Enumerator::Lazy"),
+        )),
+    }
+}
+
+/// Per-op mutable state during a pull.
+enum LazyState {
+    Take(i64),
+    Drop(i64),
+    Dropping(bool),
+    None,
+}
+
+/// Feed one element through `ops[i..]`, appending outputs to `out`; returns
+/// `false` to stop the whole pull (take-while ended, take exhausted, or limit
+/// reached).
+fn lazy_feed(
+    ops: &[crate::host::LazyOp],
+    state: &mut [LazyState],
+    i: usize,
+    elem: Value,
+    out: &mut Vec<Value>,
+    limit: usize,
+) -> Result<bool, String> {
+    use crate::host::LazyOp;
+    if out.len() >= limit {
+        return Ok(false);
+    }
+    if i == ops.len() {
+        out.push(elem);
+        return Ok(out.len() < limit);
+    }
+    match &ops[i] {
+        LazyOp::Map(p) => {
+            let v = call_proc(p, std::slice::from_ref(&elem))?;
+            lazy_feed(ops, state, i + 1, v, out, limit)
+        }
+        LazyOp::Select(p) => {
+            if proc_truthy(p, &elem)? {
+                lazy_feed(ops, state, i + 1, elem, out, limit)
+            } else {
+                Ok(true)
+            }
+        }
+        LazyOp::Reject(p) => {
+            if proc_truthy(p, &elem)? {
+                Ok(true)
+            } else {
+                lazy_feed(ops, state, i + 1, elem, out, limit)
+            }
+        }
+        LazyOp::FilterMap(p) => {
+            let v = call_proc(p, std::slice::from_ref(&elem))?;
+            if with_host(|h| h.truthy(&v)) {
+                lazy_feed(ops, state, i + 1, v, out, limit)
+            } else {
+                Ok(true)
+            }
+        }
+        LazyOp::FlatMap(p) => {
+            let v = call_proc(p, std::slice::from_ref(&elem))?;
+            let items = with_host(|h| h.as_array(&v)).unwrap_or_else(|| vec![v]);
+            for sub in items {
+                if !lazy_feed(ops, state, i + 1, sub, out, limit)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        LazyOp::TakeWhile(p) => {
+            if proc_truthy(p, &elem)? {
+                lazy_feed(ops, state, i + 1, elem, out, limit)
+            } else {
+                Ok(false)
+            }
+        }
+        LazyOp::DropWhile(p) => {
+            let dropping = matches!(state[i], LazyState::Dropping(true));
+            if dropping && proc_truthy(p, &elem)? {
+                Ok(true)
+            } else {
+                state[i] = LazyState::Dropping(false);
+                lazy_feed(ops, state, i + 1, elem, out, limit)
+            }
+        }
+        LazyOp::Take(_) => {
+            let LazyState::Take(rem) = &mut state[i] else {
+                return Ok(false);
+            };
+            if *rem <= 0 {
+                return Ok(false);
+            }
+            *rem -= 1;
+            let last = *rem == 0;
+            let cont = lazy_feed(ops, state, i + 1, elem, out, limit)?;
+            Ok(cont && !last)
+        }
+        LazyOp::Drop(_) => {
+            let LazyState::Drop(rem) = &mut state[i] else {
+                return Ok(true);
+            };
+            if *rem > 0 {
+                *rem -= 1;
+                Ok(true)
+            } else {
+                lazy_feed(ops, state, i + 1, elem, out, limit)
+            }
+        }
+    }
+}
+
+/// Pull up to `limit` values through the lazy pipeline over `source` (an array
+/// or a possibly-endless range).
+fn lazy_pull(
+    source: &Value,
+    ops: &[crate::host::LazyOp],
+    limit: usize,
+) -> Result<Vec<Value>, String> {
+    use crate::host::LazyOp;
+    let mut out: Vec<Value> = Vec::new();
+    let mut state: Vec<LazyState> = ops
+        .iter()
+        .map(|op| match op {
+            LazyOp::Take(n) => LazyState::Take(*n),
+            LazyOp::Drop(n) => LazyState::Drop(*n),
+            LazyOp::DropWhile(_) => LazyState::Dropping(true),
+            _ => LazyState::None,
+        })
+        .collect();
+
+    if let Some(items) = with_host(|h| h.as_array(source)) {
+        for elem in items {
+            if !lazy_feed(ops, &mut state, 0, elem, &mut out, limit)? {
+                break;
+            }
+        }
+    } else if let Some((lo, hi, excl)) = with_host(|h| h.as_range(source)) {
+        let endless = hi == crate::host::RANGE_ENDLESS;
+        let mut n = lo;
+        loop {
+            if endless {
+                if out.len() >= limit {
+                    break;
+                }
+            } else if (excl && n >= hi) || (!excl && n > hi) {
+                break;
+            }
+            if !lazy_feed(ops, &mut state, 0, Value::Int(n), &mut out, limit)? {
+                break;
+            }
+            n += 1;
+        }
+    }
+    Ok(out)
+}
+
 fn dispatch_set(
     recv: &Value,
     name: &str,

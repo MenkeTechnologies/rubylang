@@ -697,3 +697,10 @@ puts s.length
 puts s.count
 puts s.pop
 puts s.size
+#==#
+first_10_squares = (1..).lazy.map { |n| n * n }.first(10)
+puts first_10_squares.inspect
+primes = (2..).lazy.select { |n| (2...n).none? { |d| n % d == 0 } }.first(8)
+puts primes.inspect
+pipeline = (1..).lazy.select { |n| n % 3 == 0 }.map { |n| n * n }.take_while { |sq| sq < 500 }.to_a
+puts pipeline.inspect

@@ -2195,6 +2195,33 @@ fn method_aliases() {
 }
 
 #[test]
+fn lazy_enumerators() {
+    // Infinite ranges are safe: only as many elements as needed are pulled.
+    eq("(1..).lazy.map { |x| x * 2 }.first(5)", "[2, 4, 6, 8, 10]");
+    eq("(1..).lazy.select { |x| x.even? }.first(3)", "[2, 4, 6]");
+    eq(
+        "(1..).lazy.select(&:odd?).map { |x| x * 10 }.first(3)",
+        "[10, 30, 50]",
+    );
+    eq("(1..).lazy.map { |x| x * x }.take(4).to_a", "[1, 4, 9, 16]");
+    eq(
+        "(1..).lazy.filter_map { |x| x * 2 if x.odd? }.first(3)",
+        "[2, 6, 10]",
+    );
+    eq("(1..).lazy.drop(3).first(2)", "[4, 5]");
+    // Finite sources materialize fully with to_a/force.
+    eq(
+        "[1, 2, 3, 4, 5].lazy.map { |x| x * x }.select { |x| x > 5 }.to_a",
+        "[9, 16, 25]",
+    );
+    eq("(1..20).lazy.take_while { |x| x < 5 }.to_a", "[1, 2, 3, 4]");
+    eq(
+        "[1, 2, 3].lazy.flat_map { |x| [x, -x] }.force",
+        "[1, -1, 2, -2, 3, -3]",
+    );
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).
