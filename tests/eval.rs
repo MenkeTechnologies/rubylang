@@ -1971,6 +1971,40 @@ fn bitwise_operators_dispatch_by_type() {
 }
 
 #[test]
+fn struct_type() {
+    eq("Point = Struct.new(:x, :y); Point.new(1, 2).x", "1");
+    eq(
+        "Point = Struct.new(:x, :y); p = Point.new(1, 2); p.y = 5; p.y",
+        "5",
+    );
+    eq("Point = Struct.new(:x, :y); Point.new(1, 2).to_a", "[1, 2]");
+    eq(
+        "Point = Struct.new(:x, :y); Point.new(1, 2).to_h",
+        "{x: 1, y: 2}",
+    );
+    eq(
+        "Point = Struct.new(:x, :y); Point.new(1, 2).members",
+        "[:x, :y]",
+    );
+    eq(
+        "Point = Struct.new(:x, :y); Point.new(1, 2) == Point.new(1, 2)",
+        "true",
+    );
+    eq(
+        "Point = Struct.new(:x, :y); Point.new(1, 2) == Point.new(1, 3)",
+        "false",
+    );
+    eq("Point = Struct.new(:x, :y); Point.new(1, 2)[0]", "1");
+    eq("Point = Struct.new(:x, :y); Point.new(1, 2)[:y]", "2");
+    eq("Config = Struct.new(:host, :port, keyword_init: true); Config.new(host: \"h\", port: 80).port", "80");
+    // The anonymous struct is named after the constant it is bound to.
+    eq(
+        "Point = Struct.new(:x, :y); Point.new(3, 4).inspect",
+        "\"#<struct Point x=3, y=4>\"",
+    );
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).

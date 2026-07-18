@@ -325,6 +325,11 @@ pub struct RubyHost {
     /// value here, and `take_enum_sink` reclaims the buffer. A stack (not a single
     /// buffer) so a nested enumerable call inside `each` can't clobber the outer one.
     enum_sinks: Vec<Vec<Value>>,
+    /// `Struct.new(:a, :b)` definitions: class name → (member names, keyword_init).
+    /// Anonymous structs start as `Struct:N` and are renamed when first assigned
+    /// to a constant (`Point = Struct.new(...)`).
+    struct_defs: IndexMap<String, (Vec<String>, bool)>,
+    struct_counter: u32,
 }
 
 thread_local! {
@@ -374,6 +379,8 @@ impl RubyHost {
             active_scope: None,
             frozen: HashSet::new(),
             enum_sinks: Vec::new(),
+            struct_defs: IndexMap::new(),
+            struct_counter: 0,
         }
     }
 
@@ -1025,6 +1032,26 @@ impl RubyHost {
     pub fn class_exists(&self, name: &str) -> bool {
         self.classes.contains_key(name)
     }
+    /// Register a `Struct.new(...)` definition under a fresh anonymous name and
+    /// return that name (used as the class of its instances until renamed).
+    pub fn define_struct(&mut self, members: Vec<String>, keyword_init: bool) -> String {
+        self.struct_counter += 1;
+        let name = format!("Struct:{}", self.struct_counter);
+        self.struct_defs
+            .insert(name.clone(), (members, keyword_init));
+        name
+    }
+    /// The `(members, keyword_init)` of a struct class, if `name` names one.
+    pub fn struct_def(&self, name: &str) -> Option<(Vec<String>, bool)> {
+        self.struct_defs.get(name).cloned()
+    }
+    /// Rename an anonymous struct (`Struct:N`) to the constant it was assigned to,
+    /// the first time that happens — matching how Ruby names an anonymous class.
+    pub fn rename_struct(&mut self, old: &str, new: &str) {
+        if let Some(def) = self.struct_defs.shift_remove(old) {
+            self.struct_defs.insert(new.to_string(), def);
+        }
+    }
     /// Allocate an instance of `class`.
     pub fn new_object(&mut self, class: &str) -> Value {
         self.alloc(RObj::Object {
@@ -1107,6 +1134,7 @@ impl RubyHost {
                 | "TrueClass"
                 | "FalseClass"
                 | "Set"
+                | "Struct"
         )
     }
     pub fn classref_name(&self, v: &Value) -> Option<String> {
@@ -1372,11 +1400,22 @@ impl RubyHost {
                 }
                 Some(RObj::ClassRef(n)) => n,
                 Some(RObj::Object { class, ivars }) => {
-                    // An exception object prints its message; other objects show
-                    // their class, like Ruby's default `to_s`.
-                    match ivars.get("message") {
-                        Some(m) => self.to_s(&m.clone()),
-                        None => format!("#<{class}>"),
+                    // A struct prints `#<struct Name a=1, b=2>`; an exception
+                    // object prints its message; other objects show their class.
+                    if let Some((members, _)) = self.struct_def(&class) {
+                        let parts: Vec<String> = members
+                            .iter()
+                            .map(|m| {
+                                let v = ivars.get(m).cloned().unwrap_or(Value::Undef);
+                                format!("{m}={}", self.inspect(&v))
+                            })
+                            .collect();
+                        format!("#<struct {class} {}>", parts.join(", "))
+                    } else {
+                        match ivars.get("message") {
+                            Some(m) => self.to_s(&m.clone()),
+                            None => format!("#<{class}>"),
+                        }
                     }
                 }
                 None => "nil".to_string(),
@@ -1650,6 +1689,22 @@ impl RubyHost {
                     // Set equality is order-independent membership equality.
                     (Some(RObj::Set(x)), Some(RObj::Set(y))) => {
                         x.len() == y.len() && x.keys().all(|k| y.contains_key(k))
+                    }
+                    // Two struct instances are equal when they share a class and
+                    // all their members compare equal.
+                    (
+                        Some(RObj::Object {
+                            class: cx,
+                            ivars: ix,
+                        }),
+                        Some(RObj::Object { class: cy, .. }),
+                    ) if cx == cy && self.struct_def(cx).is_some() => {
+                        let members = self.struct_def(cx).unwrap().0;
+                        let ix = ix.clone();
+                        members.iter().all(|m| {
+                            let bv = self.ivar_of(b, m);
+                            self.eq_values(ix.get(m).unwrap_or(&Value::Undef), &bv)
+                        })
                     }
                     _ => matches!((a, b), (Value::Obj(i), Value::Obj(j)) if i == j),
                 }

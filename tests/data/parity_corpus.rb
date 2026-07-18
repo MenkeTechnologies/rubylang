@@ -528,3 +528,16 @@ puts (Set[1, 2, 3, 4] & Set[2, 4, 6]).to_a.inspect
 puts Set[1, 2, 3].subset?(Set[1, 2, 3, 4])
 puts([1, 2, 3, 4] & [3, 4, 5]).inspect if false
 puts ([1, 2, 3] | [3, 4]).inspect
+#==#
+Point = Struct.new(:x, :y)
+origin = Point.new(0, 0)
+p1 = Point.new(3, 4)
+puts p1.x + p1.y
+puts p1.to_a.inspect
+puts p1.to_h.inspect
+puts (p1 == Point.new(3, 4))
+puts p1.inspect
+Person = Struct.new(:name, :age, keyword_init: true)
+alice = Person.new(name: "Alice", age: 30)
+puts "#{alice.name} is #{alice.age}"
+puts Point.new(1, 2).members.inspect

@@ -263,6 +263,14 @@ fn is_exception_class(cls: &str) -> bool {
 fn b_setconst(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let name = name_of(&vm.pop());
+    // `Point = Struct.new(...)` names the anonymous struct after the constant.
+    let val = with_host(|h| match h.classref_name(&val) {
+        Some(cref) if cref.starts_with("Struct:") && h.struct_def(&cref).is_some() => {
+            h.rename_struct(&cref, &name);
+            h.class_ref(&name)
+        }
+        _ => val.clone(),
+    });
     with_host(|h| h.set_const(&name, val.clone()));
     val
 }
@@ -668,6 +676,54 @@ fn dispatch_classref(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    // `Struct.new(:a, :b [, keyword_init: true])` defines a new struct class and
+    // returns a reference to it (usually assigned to a constant).
+    if cls == "Struct" && name == "new" {
+        let mut members = Vec::new();
+        let mut keyword_init = false;
+        for a in args {
+            if let Some(sym) = with_host(|h| h.as_symbol(a)) {
+                members.push(sym);
+            } else if let Some(kw) = with_host(|h| h.as_hash(a)) {
+                keyword_init = kw
+                    .get(&RKey::Sym("keyword_init".into()))
+                    .map(|v| with_host(|h| h.truthy(v)))
+                    .unwrap_or(false);
+            }
+        }
+        let struct_name = with_host(|h| h.define_struct(members, keyword_init));
+        return Ok(with_host(|h| h.class_ref(&struct_name)));
+    }
+    // Instantiating a struct class: bind positional args (or keyword args) to the
+    // member instance variables.
+    if let Some((members, keyword_init)) = with_host(|h| h.struct_def(cls)) {
+        if name == "new" || name == "[]" {
+            let obj = with_host(|h| h.new_object(cls));
+            if keyword_init {
+                let kw = args.first().and_then(|a| with_host(|h| h.as_hash(a)));
+                for m in &members {
+                    let v = kw
+                        .as_ref()
+                        .and_then(|k| k.get(&RKey::Sym(m.clone())).cloned())
+                        .unwrap_or(Value::Undef);
+                    with_host(|h| h.set_ivar_of(&obj, m, v));
+                }
+            } else {
+                for (i, m) in members.iter().enumerate() {
+                    let v = args.get(i).cloned().unwrap_or(Value::Undef);
+                    with_host(|h| h.set_ivar_of(&obj, m, v));
+                }
+            }
+            return Ok(obj);
+        }
+        if name == "members" {
+            let syms: Vec<Value> = members
+                .iter()
+                .map(|m| with_host(|h| h.new_symbol(m)))
+                .collect();
+            return Ok(new_arr(syms));
+        }
+    }
     // `Set.new(enum)` / `Set[a, b, c]` — a deduplicated collection.
     if cls == "Set" {
         match name {
@@ -763,6 +819,101 @@ fn dispatch_classref(
     }
 }
 
+/// Instance methods generated for a `Struct` class. Returns `Ok(None)` for a
+/// method not provided by Struct (so normal object dispatch can continue).
+fn struct_method(
+    recv: &Value,
+    cls: &str,
+    members: &[String],
+    name: &str,
+    args: &[Value],
+    block: &Option<Value>,
+) -> Result<Option<Value>, String> {
+    let values = || -> Vec<Value> {
+        members
+            .iter()
+            .map(|m| with_host(|h| h.ivar_of(recv, m)))
+            .collect()
+    };
+    // A member reader / writer (`p.x` / `p.x = v`).
+    if let Some(m) = name.strip_suffix('=') {
+        if members.iter().any(|mm| mm == m) {
+            with_host(|h| h.set_ivar_of(recv, m, args[0].clone()));
+            return Ok(Some(args[0].clone()));
+        }
+    }
+    if members.iter().any(|m| m == name) {
+        return Ok(Some(with_host(|h| h.ivar_of(recv, name))));
+    }
+    let r = match name {
+        "to_a" | "values" | "deconstruct" => new_arr(values()),
+        "members" => new_arr(
+            members
+                .iter()
+                .map(|m| with_host(|h| h.new_symbol(m)))
+                .collect(),
+        ),
+        "size" | "length" => Value::Int(members.len() as i64),
+        "to_h" | "deconstruct_keys" => {
+            let mut map = IndexMap::new();
+            for (m, v) in members.iter().zip(values()) {
+                map.insert(RKey::Sym(m.clone()), v);
+            }
+            with_host(|h| h.new_hash(map))
+        }
+        "[]" => {
+            let vals = values();
+            match &args[0] {
+                Value::Int(i) => norm_idx(*i, vals.len())
+                    .and_then(|k| vals.get(k))
+                    .cloned()
+                    .unwrap_or(Value::Undef),
+                other => {
+                    let key = with_host(|h| h.as_symbol(other))
+                        .or_else(|| with_host(|h| h.as_str(other)));
+                    key.and_then(|k| members.iter().position(|m| *m == k))
+                        .and_then(|i| vals.get(i))
+                        .cloned()
+                        .unwrap_or(Value::Undef)
+                }
+            }
+        }
+        "each" if block.is_some() => {
+            let bl = block.clone().unwrap();
+            for v in values() {
+                call_proc(&bl, &[v])?;
+            }
+            recv.clone()
+        }
+        "each_pair" if block.is_some() => {
+            let bl = block.clone().unwrap();
+            for (m, v) in members.iter().zip(values()) {
+                let sym = with_host(|h| h.new_symbol(m));
+                call_proc(&bl, &[sym, v])?;
+            }
+            recv.clone()
+        }
+        "==" | "eql?" => {
+            let same = with_host(|h| h.object_class(&args[0])).as_deref() == Some(cls)
+                && members
+                    .iter()
+                    .zip(values())
+                    .all(|(m, v)| with_host(|h| h.eq_values(&h.ivar_of(&args[0], m), &v)));
+            Value::Bool(same)
+        }
+        "to_s" | "inspect" => {
+            let parts: Vec<String> = members
+                .iter()
+                .zip(values())
+                .map(|(m, v)| format!("{m}={}", with_host(|h| h.inspect(&v))))
+                .collect();
+            new_str(format!("#<struct {cls} {}>", parts.join(", ")))
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(r))
+}
+
 /// Methods on a user object: dispatch through the class chain, else the
 /// exception `message` accessor, else an error.
 fn dispatch_object(
@@ -774,6 +925,12 @@ fn dispatch_object(
 ) -> Result<Value, String> {
     if with_host(|h| h.find_method_owner(cls, name)).is_some() {
         return call_instance_method(recv.clone(), cls, name, args, block);
+    }
+    // Struct instance methods (accessors, ==, to_a/to_h, members, [], each, …).
+    if let Some((members, _)) = with_host(|h| h.struct_def(cls)) {
+        if let Some(r) = struct_method(recv, cls, &members, name, args, &block)? {
+            return Ok(r);
+        }
     }
     // Comparable module: `< <= > >= between? clamp` derived from the class's `<=>`.
     if with_host(|h| h.is_a(recv, "Comparable")) {

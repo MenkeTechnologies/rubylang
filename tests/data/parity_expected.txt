@@ -314,3 +314,11 @@ XX:XX:XX
 [2, 4]
 true
 [1, 2, 3, 4]
+#==#
+7
+[3, 4]
+{x: 3, y: 4}
+true
+#<struct Point x=3, y=4>
+Alice is 30
+[:x, :y]
