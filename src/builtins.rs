@@ -3272,14 +3272,121 @@ fn read_line() -> Value {
     }
 }
 
-/// Minimal `sprintf`/`format`: handles `%s %d %f %x %%` positionally.
+/// One base-b digit (`d < base`), lower- or upper-case for a..f.
+fn digit_char(d: u8, upper: bool) -> char {
+    if d < 10 {
+        (b'0' + d) as char
+    } else if upper {
+        (b'A' + (d - 10)) as char
+    } else {
+        (b'a' + (d - 10)) as char
+    }
+}
+
+/// Ruby's `..`-prefixed two's-complement notation for a negative integer in
+/// base `b` (b ∈ {2,8,16}): e.g. `-255` in hex → `"..f01"`. Returns the digit
+/// text *including* the leading `".."` and the repeating fill digit (for
+/// zero-padding). Computed as the b-1's complement of the magnitude plus one.
+fn complement_body(n: i128, base: u8, upper: bool) -> (String, char) {
+    let mut v = n.unsigned_abs();
+    let mut digits: Vec<u8> = Vec::new();
+    while v > 0 {
+        digits.push((v % base as u128) as u8);
+        v /= base as u128;
+    }
+    if digits.is_empty() {
+        digits.push(0);
+    }
+    let b1 = base - 1;
+    let mut comp: Vec<u8> = digits.iter().map(|d| b1 - d).collect();
+    let mut carry = 1u8;
+    for d in comp.iter_mut() {
+        let s = *d + carry;
+        *d = s % base;
+        carry = s / base;
+    }
+    // The top magnitude digit is non-zero, so the carry cannot escape and the
+    // infinite high digits stay `b1`.
+    comp.reverse();
+    let rc = digit_char(b1, upper);
+    let s: String = comp.iter().map(|&d| digit_char(d, upper)).collect();
+    // The infinite high digits are all `rc`; show one of them, then the digits
+    // that differ. e.g. hex `-255` → comp `"01"` → `"..f01"`.
+    let stripped = s.trim_start_matches(rc);
+    (format!("..{rc}{stripped}"), rc)
+}
+
+/// Strip trailing zeros (and a trailing `.`) from a fixed-point string — the
+/// C `%g` cleanup applied unless the `#` flag is set.
+fn strip_trailing_zeros(s: &mut String) {
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+}
+
+/// Render a non-negative finite float in `%e`/`%E` form with Ruby's exponent
+/// style (sign + at-least-two digits): `1.23e+04`.
+fn fmt_e(f: f64, prec: usize, upper: bool, alt: bool) -> String {
+    let raw = format!("{:.*e}", prec, f);
+    let (mant, exp) = raw.split_once('e').unwrap();
+    let mut mant = mant.to_string();
+    if alt && !mant.contains('.') {
+        mant.push('.');
+    }
+    let e: i32 = exp.parse().unwrap_or(0);
+    let ec = if upper { 'E' } else { 'e' };
+    let es = if e < 0 { '-' } else { '+' };
+    format!("{mant}{ec}{es}{:02}", e.abs())
+}
+
+/// Render a non-negative finite float in `%g`/`%G` form (C general format).
+fn fmt_g(f: f64, prec: usize, upper: bool, alt: bool) -> String {
+    let p = if prec == 0 { 1 } else { prec };
+    // Exponent after rounding to `p` significant digits.
+    let raw = format!("{:.*e}", p - 1, f);
+    let e: i32 = raw.split_once('e').and_then(|(_, x)| x.parse().ok()).unwrap_or(0);
+    if e >= -4 && e < p as i32 {
+        let frac = (p as i32 - 1 - e).max(0) as usize;
+        let mut s = format!("{:.*}", frac, f);
+        if !alt {
+            strip_trailing_zeros(&mut s);
+        } else if !s.contains('.') {
+            s.push('.');
+        }
+        s
+    } else {
+        let (mant, exp) = raw.split_once('e').unwrap();
+        let mut mant = mant.to_string();
+        if !alt {
+            strip_trailing_zeros(&mut mant);
+        } else if !mant.contains('.') {
+            mant.push('.');
+        }
+        let ee: i32 = exp.parse().unwrap_or(0);
+        let ec = if upper { 'E' } else { 'e' };
+        let es = if ee < 0 { '-' } else { '+' };
+        format!("{mant}{ec}{es}{:02}", ee.abs())
+    }
+}
+
 /// `format`/`sprintf`/`String#%` — handles `%[flags][width][.precision]conv`
-/// with flags `-`, `0`, `+`, ` `, and conversions d/i/f/e/g/s/x/X/o/b/c/%.
+/// with flags `-`, `0`, `+`, ` `, `#`, `*` dynamic width/precision, and
+/// conversions d/i/u/f/e/E/g/G/s/p/x/X/o/b/B/c/%.
 fn sprintf(fmt: &str, args: &[Value]) -> String {
     let bytes: Vec<char> = fmt.chars().collect();
     let mut out = String::new();
     let mut i = 0;
     let mut ai = 0;
+    let next_arg = |ai: &mut usize| {
+        let v = args.get(*ai).cloned().unwrap_or(Value::Undef);
+        *ai += 1;
+        v
+    };
     while i < bytes.len() {
         if bytes[i] != '%' {
             out.push(bytes[i]);
@@ -3293,74 +3400,267 @@ fn sprintf(fmt: &str, args: &[Value]) -> String {
             continue;
         }
         // flags
-        let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
+        let (mut left, mut zero, mut plus, mut space, mut alt) =
+            (false, false, false, false, false);
         while i < bytes.len() {
             match bytes[i] {
                 '-' => left = true,
                 '0' => zero = true,
                 '+' => plus = true,
                 ' ' => space = true,
+                '#' => alt = true,
                 _ => break,
             }
             i += 1;
         }
-        // width
+        // width (`*` = dynamic; a negative dynamic width means left-align)
         let mut width = 0usize;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            width = width * 10 + (bytes[i] as usize - '0' as usize);
+        if i < bytes.len() && bytes[i] == '*' {
             i += 1;
+            let w = as_i(&next_arg(&mut ai));
+            if w < 0 {
+                left = true;
+                width = w.unsigned_abs() as usize;
+            } else {
+                width = w as usize;
+            }
+        } else {
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                width = width * 10 + (bytes[i] as usize - '0' as usize);
+                i += 1;
+            }
         }
-        // precision
+        // precision (`.` then digits or `*`; a negative dynamic precision drops it)
         let mut prec: Option<usize> = None;
         if i < bytes.len() && bytes[i] == '.' {
             i += 1;
-            let mut p = 0usize;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                p = p * 10 + (bytes[i] as usize - '0' as usize);
+            if i < bytes.len() && bytes[i] == '*' {
                 i += 1;
+                let p = as_i(&next_arg(&mut ai));
+                if p >= 0 {
+                    prec = Some(p as usize);
+                }
+            } else {
+                let mut p = 0usize;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    p = p * 10 + (bytes[i] as usize - '0' as usize);
+                    i += 1;
+                }
+                prec = Some(p);
             }
-            prec = Some(p);
         }
         let conv = if i < bytes.len() { bytes[i] } else { '%' };
         i += 1;
-        let arg = args.get(ai).cloned().unwrap_or(Value::Undef);
-        ai += 1;
+        if conv == '%' {
+            out.push('%');
+            continue;
+        }
+        let arg = next_arg(&mut ai);
 
-        // Render the value (body), then apply sign, zero-fill, and width.
-        let (mut body, numeric, negative) = match conv {
+        // Per-conversion: (sign, prefix, body, numeric, int_conv, complement fill).
+        let mut sign = "";
+        let mut prefix = String::new();
+        let mut numeric = false;
+        let mut int_conv = false;
+        let mut zero_ok = true;
+        let mut complement: Option<char> = None;
+
+        // Integer base conversions share sign / precision / `#` handling.
+        let base_conv = |base: u8, up: bool| -> (String, Option<char>, String, &'static str) {
+            let n = as_i(&arg) as i128;
+            let neg = n < 0;
+            if neg && !(plus || space) {
+                // Ruby two's-complement `..` notation (no leading sign).
+                let (b, rc) = complement_body(n, base, up);
+                let pfx = if alt {
+                    match base {
+                        16 if up => "0X".to_string(),
+                        16 => "0x".to_string(),
+                        8 => String::new(), // handled by digit form below
+                        2 if up => "0B".to_string(),
+                        2 => "0b".to_string(),
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
+                };
+                (b, Some(rc), pfx, "")
+            } else {
+                let mag = n.unsigned_abs();
+                let mut b = String::new();
+                let mut v = mag;
+                if v == 0 {
+                    b.push('0');
+                }
+                while v > 0 {
+                    b.push(digit_char((v % base as u128) as u8, up));
+                    v /= base as u128;
+                }
+                let mut b: String = b.chars().rev().collect();
+                // precision = minimum number of digits
+                if let Some(p) = prec {
+                    if mag == 0 && p == 0 {
+                        b.clear();
+                    } else if b.len() < p {
+                        b = format!("{}{}", "0".repeat(p - b.len()), b);
+                    }
+                }
+                let sgn = if neg {
+                    "-"
+                } else if plus {
+                    "+"
+                } else if space {
+                    " "
+                } else {
+                    ""
+                };
+                let pfx = if alt && mag != 0 {
+                    match base {
+                        16 if up => "0X".to_string(),
+                        16 => "0x".to_string(),
+                        2 if up => "0B".to_string(),
+                        2 => "0b".to_string(),
+                        8 => {
+                            if b.starts_with('0') {
+                                String::new()
+                            } else {
+                                b.insert(0, '0');
+                                String::new()
+                            }
+                        }
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
+                };
+                (b, None, pfx, sgn)
+            }
+        };
+
+        let body: String = match conv {
             'd' | 'i' | 'u' => {
+                numeric = true;
+                int_conv = true;
                 let n = as_i(&arg);
-                (n.unsigned_abs().to_string(), true, n < 0)
+                let neg = n < 0;
+                sign = if neg {
+                    "-"
+                } else if plus {
+                    "+"
+                } else if space {
+                    " "
+                } else {
+                    ""
+                };
+                let mut b = n.unsigned_abs().to_string();
+                if let Some(p) = prec {
+                    if n == 0 && p == 0 {
+                        b.clear();
+                    } else if b.len() < p {
+                        b = format!("{}{}", "0".repeat(p - b.len()), b);
+                    }
+                }
+                b
+            }
+            'x' | 'X' | 'o' | 'b' | 'B' => {
+                numeric = true;
+                int_conv = true;
+                let (base, up) = match conv {
+                    'x' => (16, false),
+                    'X' => (16, true),
+                    'o' => (8, false),
+                    'B' => (2, true),
+                    _ => (2, false),
+                };
+                let (b, cpl, pfx, sgn) = base_conv(base, up);
+                prefix = pfx;
+                complement = cpl;
+                sign = sgn;
+                b
             }
             'f' => {
+                numeric = true;
                 let f = as_f(&arg);
-                (format!("{:.*}", prec.unwrap_or(6), f.abs()), true, f < 0.0)
-            }
-            'e' => {
-                let f = as_f(&arg);
-                (format!("{:.*e}", prec.unwrap_or(6), f.abs()), true, f < 0.0)
-            }
-            'g' => {
-                let f = as_f(&arg);
-                (format!("{}", f.abs()), true, f < 0.0)
-            }
-            'x' => (format!("{:x}", as_i(&arg)), false, false),
-            'X' => (format!("{:X}", as_i(&arg)), false, false),
-            'o' => (format!("{:o}", as_i(&arg)), false, false),
-            'b' => (format!("{:b}", as_i(&arg)), false, false),
-            'c' => (
-                char::from_u32(as_i(&arg) as u32)
-                    .map(String::from)
-                    .unwrap_or_default(),
-                false,
-                false,
-            ),
-            's' => {
-                let mut s = with_host(|h| h.to_s(&arg));
-                if let Some(p) = prec {
-                    s.truncate(p);
+                if !f.is_finite() {
+                    zero_ok = false;
+                    if !f.is_nan() && f.is_sign_negative() {
+                        sign = "-";
+                    } else if !f.is_nan() && plus {
+                        sign = "+";
+                    } else if !f.is_nan() && space {
+                        sign = " ";
+                    }
+                    if f.is_nan() { "NaN".into() } else { "Inf".into() }
+                } else {
+                    if f.is_sign_negative() {
+                        sign = "-";
+                    } else if plus {
+                        sign = "+";
+                    } else if space {
+                        sign = " ";
+                    }
+                    let p = prec.unwrap_or(6);
+                    let mut s = format!("{:.*}", p, f.abs());
+                    if alt && !s.contains('.') {
+                        s.push('.');
+                    }
+                    s
                 }
-                (s, false, false)
+            }
+            'e' | 'E' | 'g' | 'G' => {
+                numeric = true;
+                let f = as_f(&arg);
+                let up = conv == 'E' || conv == 'G';
+                if !f.is_finite() {
+                    zero_ok = false;
+                    if !f.is_nan() && f.is_sign_negative() {
+                        sign = "-";
+                    } else if !f.is_nan() && plus {
+                        sign = "+";
+                    } else if !f.is_nan() && space {
+                        sign = " ";
+                    }
+                    if f.is_nan() { "NaN".into() } else { "Inf".into() }
+                } else {
+                    if f.is_sign_negative() {
+                        sign = "-";
+                    } else if plus {
+                        sign = "+";
+                    } else if space {
+                        sign = " ";
+                    }
+                    if conv == 'e' || conv == 'E' {
+                        fmt_e(f.abs(), prec.unwrap_or(6), up, alt)
+                    } else {
+                        fmt_g(f.abs(), prec.unwrap_or(6), up, alt)
+                    }
+                }
+            }
+            'c' => {
+                zero_ok = false;
+                match &arg {
+                    Value::Int(n) => char::from_u32(*n as u32).map(String::from).unwrap_or_default(),
+                    _ => {
+                        let s = arg_str(&arg);
+                        s.chars().next().map(String::from).unwrap_or_default()
+                    }
+                }
+            }
+            'p' => {
+                zero_ok = false;
+                let mut s = with_host(|h| h.inspect(&arg));
+                if let Some(p) = prec {
+                    s = s.chars().take(p).collect();
+                }
+                s
+            }
+            's' => {
+                zero_ok = false;
+                let mut s = arg_str(&arg);
+                if let Some(p) = prec {
+                    s = s.chars().take(p).collect();
+                }
+                s
             }
             other => {
                 out.push('%');
@@ -3370,36 +3670,39 @@ fn sprintf(fmt: &str, args: &[Value]) -> String {
             }
         };
 
-        let sign = if negative {
-            "-"
-        } else if numeric && plus {
-            "+"
-        } else if numeric && space {
-            " "
-        } else {
-            ""
-        };
-        let total = sign.len() + body.len();
-        if width > total {
-            let pad = width - total;
+        // Width padding (counted in characters).
+        let numeric_zeropad = numeric && zero_ok && !(int_conv && prec.is_some());
+        let vis = sign.chars().count() + prefix.chars().count() + body.chars().count();
+        if width > vis {
+            let deficit = width - vis;
             if left {
                 out.push_str(sign);
+                out.push_str(&prefix);
                 out.push_str(&body);
-                out.extend(std::iter::repeat(' ').take(pad));
-            } else if zero && numeric {
-                out.push_str(sign);
-                out.extend(std::iter::repeat('0').take(pad));
-                out.push_str(&body);
+                out.extend(std::iter::repeat(' ').take(deficit));
+            } else if zero && numeric_zeropad {
+                if let Some(rc) = complement {
+                    out.push_str(&prefix);
+                    out.push_str("..");
+                    out.extend(std::iter::repeat(rc).take(deficit));
+                    out.push_str(&body[2..]);
+                } else {
+                    out.push_str(sign);
+                    out.push_str(&prefix);
+                    out.extend(std::iter::repeat('0').take(deficit));
+                    out.push_str(&body);
+                }
             } else {
-                out.extend(std::iter::repeat(' ').take(pad));
+                out.extend(std::iter::repeat(' ').take(deficit));
                 out.push_str(sign);
+                out.push_str(&prefix);
                 out.push_str(&body);
             }
         } else {
             out.push_str(sign);
+            out.push_str(&prefix);
             out.push_str(&body);
         }
-        let _ = &mut body;
     }
     out
 }

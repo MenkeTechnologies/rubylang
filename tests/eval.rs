@@ -986,6 +986,45 @@ fn proc_methods_batch() {
 }
 
 #[test]
+fn sprintf_full_batch() {
+    // Base conversions, `#` alternate prefixes, and the `..` two's-complement
+    // notation for negative integers.
+    eq("format(\"%b\", 10)", "\"1010\"");
+    eq("format(\"%x\", 255)", "\"ff\"");
+    eq("format(\"%#o\", 8)", "\"010\"");
+    eq("format(\"%#b\", 10)", "\"0b1010\"");
+    eq("format(\"%#X\", 255)", "\"0XFF\"");
+    eq("\"%#x\" % 255", "\"0xff\"");
+    eq("format(\"%x\", -255)", "\"..f01\"");
+    eq("format(\"%o\", -8)", "\"..70\"");
+    eq("format(\"%b\", -1)", "\"..1\"");
+    // Float conversions: fixed, scientific (Ruby exponent style), general.
+    eq("format(\"%08.3f\", 3.14159)", "\"0003.142\"");
+    eq("format(\"%+.2e\", 12345.678)", "\"+1.23e+04\"");
+    eq("format(\"%E\", 12345.678)", "\"1.234568E+04\"");
+    eq("format(\"%g\", 12345.678)", "\"12345.7\"");
+    eq("format(\"%g\", 1000000.0)", "\"1e+06\"");
+    eq("format(\"%g\", 0.0001)", "\"0.0001\"");
+    // Character conversion (codepoint or first char of a string).
+    eq("format(\"%c\", 65)", "\"A\"");
+    eq("format(\"%c\", \"hello\")", "\"h\"");
+    // Width, precision, flags, and `*` dynamic width/precision.
+    eq("format(\"%-8d|\", 42)", "\"42      |\"");
+    eq("format(\"% d\", 42)", "\" 42\"");
+    eq("format(\"%+d\", 42)", "\"+42\"");
+    eq("format(\"%.3d\", 5)", "\"005\"");
+    eq("format(\"%*d\", 5, 42)", "\"   42\"");
+    eq("format(\"%.*f\", 2, 3.14159)", "\"3.14\"");
+    eq("format(\"%#08x\", 255)", "\"0x0000ff\"");
+    // Strings, inspect, literal percent, and String#% with an array.
+    eq("format(\"%5s\", \"ab\")", "\"   ab\"");
+    eq("format(\"%.2s\", \"abcdef\")", "\"ab\"");
+    eq("format(\"%p\", \"hi\")", "\"\\\"hi\\\"\"");
+    eq("format(\"%d%%\", 50)", "\"50%\"");
+    eq("\"%d-%d\" % [1, 2]", "\"1-2\"");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
