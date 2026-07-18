@@ -173,15 +173,29 @@ impl Parser {
                 };
             } else if self.eat_kw("while") {
                 let cond = self.expr()?;
-                e = Expr::While {
-                    cond: Box::new(cond),
-                    body: vec![e],
+                // A `while` modifier attached to a `begin … end` is a post-test
+                // loop: the body runs once before the condition is first checked.
+                e = match do_while_body(e) {
+                    Ok(body) => Expr::DoWhile {
+                        cond: Box::new(cond),
+                        body,
+                    },
+                    Err(e) => Expr::While {
+                        cond: Box::new(cond),
+                        body: vec![e],
+                    },
                 };
             } else if self.eat_kw("until") {
                 let cond = self.expr()?;
-                e = Expr::While {
-                    cond: Box::new(Expr::Unary(UnOp::Not, Box::new(cond))),
-                    body: vec![e],
+                e = match do_while_body(e) {
+                    Ok(body) => Expr::DoWhile {
+                        cond: Box::new(Expr::Unary(UnOp::Not, Box::new(cond))),
+                        body,
+                    },
+                    Err(e) => Expr::While {
+                        cond: Box::new(Expr::Unary(UnOp::Not, Box::new(cond))),
+                        body: vec![e],
+                    },
                 };
             } else if self.eat_kw("rescue") {
                 // `expr rescue fallback` — a bare rescue catching StandardError.
@@ -1204,6 +1218,26 @@ impl Parser {
         self.expect_op("=>")?;
         let v = self.expr()?;
         Ok((k, v))
+    }
+}
+
+/// A `while`/`until` modifier on a `begin … end` block is a post-test loop.
+/// Returns `Ok(body)` — the loop body to run once before each condition check —
+/// when `e` is a `begin … end`; otherwise returns the expression unchanged as
+/// `Err(e)` so the caller falls back to an ordinary pre-test `while`.
+///
+/// A plain `begin … end` (no `rescue`/`ensure`) unwraps to its statement list.
+/// A `begin … rescue/ensure … end` is kept whole as a single body statement so
+/// its exception handling still fires each iteration.
+fn do_while_body(e: Expr) -> Result<Vec<Expr>, Expr> {
+    match e {
+        Expr::Begin {
+            body,
+            rescues,
+            ensure,
+        } if rescues.is_empty() && ensure.is_none() => Ok(body),
+        e @ Expr::Begin { .. } => Ok(vec![e]),
+        other => Err(other),
     }
 }
 

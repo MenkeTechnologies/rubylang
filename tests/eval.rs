@@ -1591,6 +1591,21 @@ fn float_format_batch() {
 }
 
 #[test]
+fn begin_while_batch() {
+    // `begin … end while/until cond` is a post-test loop: the body runs at
+    // least once, then the condition is checked.
+    eq("i=0; begin; i+=1; end while i<3; i", "3");
+    eq("n=0; begin; n+=1; end until n>=5; n", "5");
+    eq("r=[]; i=0; begin; r<<i; i+=1; end while i<3; r", "[0, 1, 2]");
+    // The body runs once even when the condition is immediately false/true.
+    eq("x=10; begin; x+=1; end while false; x", "11");
+    eq("y=10; begin; y+=1; end until true; y", "11");
+    // `next` jumps to the condition check; `break` exits the loop.
+    eq("s=0;i=0; begin; i+=1; next if i==2; s+=i; end while i<4; s", "8");
+    eq("c=0; begin; c+=1; break if c==3; end while true; c", "3");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

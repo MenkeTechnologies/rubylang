@@ -104,6 +104,13 @@ pub enum Expr {
         cond: Box<Expr>,
         body: Vec<Expr>,
     },
+    /// `begin … end while cond` / `begin … end until cond` — a post-test loop:
+    /// the body runs at least once, then the condition is checked (until is
+    /// parsed as `while !cond`).
+    DoWhile {
+        cond: Box<Expr>,
+        body: Vec<Expr>,
+    },
     /// `for v in iter … end`.
     For {
         var: String,

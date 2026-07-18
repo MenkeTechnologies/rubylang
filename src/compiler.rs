@@ -221,6 +221,7 @@ impl Compiler {
                 els,
             } => self.compile_if(b, cond, then, elifs, els)?,
             Expr::While { cond, body } => self.compile_while(b, cond, body)?,
+            Expr::DoWhile { cond, body } => self.compile_do_while(b, cond, body)?,
             Expr::For { var, iter, body } => self.compile_for(b, var, iter, body)?,
             Expr::Case {
                 subject,
@@ -606,6 +607,40 @@ impl Compiler {
             b.patch_jump(j, ctx.start);
         }
         // `while` evaluates to nil.
+        b.emit(Op::LoadUndef, 0);
+        Ok(())
+    }
+
+    /// `begin … end while cond` / `… until cond`: a post-test loop. The body is
+    /// compiled first (so it always runs at least once), then the condition is
+    /// checked and, if truthy, control jumps back to the body. `next` targets the
+    /// condition check; `break` exits. Like `while`, it evaluates to nil.
+    fn compile_do_while(
+        &mut self,
+        b: &mut ChunkBuilder,
+        cond: &Expr,
+        body: &[Expr],
+    ) -> Result<(), String> {
+        let body_start = b.current_pos();
+        self.loops.push(LoopCtx {
+            start: body_start,
+            breaks: vec![],
+            nexts: vec![],
+        });
+        self.compile_seq(b, body)?;
+        b.emit(Op::Pop, 0); // discard the body value each iteration
+        let cond_pos = b.current_pos();
+        self.compile_cond(b, cond)?;
+        b.emit(Op::JumpIfTrue(body_start), 0);
+        let end = b.current_pos();
+        let ctx = self.loops.pop().unwrap();
+        for j in ctx.breaks {
+            b.patch_jump(j, end);
+        }
+        for j in ctx.nexts {
+            b.patch_jump(j, cond_pos);
+        }
+        // A post-test loop evaluates to nil, like `while`.
         b.emit(Op::LoadUndef, 0);
         Ok(())
     }
