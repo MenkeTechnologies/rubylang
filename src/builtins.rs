@@ -661,6 +661,12 @@ fn dispatch_object(
     if with_host(|h| h.find_method_owner(cls, name)).is_some() {
         return call_instance_method(recv.clone(), cls, name, args, block);
     }
+    // Comparable module: `< <= > >= between? clamp` derived from the class's `<=>`.
+    if with_host(|h| h.is_a(recv, "Comparable")) {
+        if let Some(r) = comparable_method(recv, name, args)? {
+            return Ok(r);
+        }
+    }
     match name {
         "message" | "to_s" => {
             let m = with_host(|h| h.ivar_of(recv, "message"));
@@ -674,6 +680,68 @@ fn dispatch_object(
             "NoMethodError",
             &format!("undefined method '{name}' for an instance of {cls}"),
         )),
+    }
+}
+
+/// Comparable's derived instance methods (`< <= > >= between? clamp`), each built
+/// on the class's own `<=>`. Returns `Ok(None)` when `name` is not one Comparable
+/// provides. A `<=>` result of `nil` means the operands are incomparable, which
+/// Ruby surfaces as `ArgumentError` for the ordering helpers.
+fn comparable_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+    let spaceship = |other: &Value| -> Result<Option<i64>, String> {
+        match dispatch(recv, "<=>", std::slice::from_ref(other), None)? {
+            Value::Undef => Ok(None),
+            v => Ok(Some(as_i(&v))),
+        }
+    };
+    let cmp_err = |other: &Value| -> String {
+        raise_exc(
+            "ArgumentError",
+            &format!(
+                "comparison of {} with {} failed",
+                with_host(|h| h.class_of(recv)),
+                with_host(|h| h.class_of(other)),
+            ),
+        )
+    };
+    match name {
+        "<" | "<=" | ">" | ">=" => {
+            let o = &args[0];
+            let Some(c) = spaceship(o)? else {
+                return Err(cmp_err(o));
+            };
+            let b = match name {
+                "<" => c < 0,
+                "<=" => c <= 0,
+                ">" => c > 0,
+                _ => c >= 0,
+            };
+            Ok(Some(Value::Bool(b)))
+        }
+        "between?" => {
+            let (lo, hi) = (&args[0], &args[1]);
+            let (Some(a), Some(b)) = (spaceship(lo)?, spaceship(hi)?) else {
+                return Err(cmp_err(lo));
+            };
+            Ok(Some(Value::Bool(a >= 0 && b <= 0)))
+        }
+        "clamp" => {
+            let (lo, hi) = (&args[0], &args[1]);
+            let Some(a) = spaceship(lo)? else {
+                return Err(cmp_err(lo));
+            };
+            if a < 0 {
+                return Ok(Some(lo.clone()));
+            }
+            let Some(b) = spaceship(hi)? else {
+                return Err(cmp_err(hi));
+            };
+            if b > 0 {
+                return Ok(Some(hi.clone()));
+            }
+            Ok(Some(recv.clone()))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -1854,7 +1922,7 @@ fn dispatch_array(
             let parts: Vec<String> = arr.iter().map(|x| with_host(|h| h.to_s(x))).collect();
             Ok(new_str(parts.join(&sep)))
         }
-        "sort" => {
+        "sort" | "sort!" => {
             let a = match &block {
                 Some(bl) => sort_with_block(arr, bl)?,
                 None => {
@@ -1863,7 +1931,37 @@ fn dispatch_array(
                     a
                 }
             };
+            // `sort!` sorts in place and returns the receiver.
+            if name == "sort!" {
+                with_host(|h| h.set_array(recv, a));
+                return Ok(recv.clone());
+            }
             Ok(new_arr(a))
+        }
+        "minmax" => {
+            if arr.is_empty() {
+                return Ok(new_arr(vec![Value::Undef, Value::Undef]));
+            }
+            let (mut lo, mut hi) = (arr[0].clone(), arr[0].clone());
+            let cmp = |x: &Value, y: &Value| -> Result<i64, String> {
+                Ok(match &block {
+                    Some(bl) => as_i(&call_proc(bl, &[x.clone(), y.clone()])?),
+                    None => match cmp_values(x, y) {
+                        std::cmp::Ordering::Less => -1,
+                        std::cmp::Ordering::Equal => 0,
+                        std::cmp::Ordering::Greater => 1,
+                    },
+                })
+            };
+            for x in &arr[1..] {
+                if cmp(x, &lo)? < 0 {
+                    lo = x.clone();
+                }
+                if cmp(x, &hi)? > 0 {
+                    hi = x.clone();
+                }
+            }
+            Ok(new_arr(vec![lo, hi]))
         }
         "min" | "max" => {
             if arr.is_empty() {
@@ -2078,7 +2176,9 @@ fn dispatch_array(
             }
             Ok(acc)
         }
-        "min_by" | "max_by" | "sort_by" => sort_by_family(recv, name, &arr, &block),
+        "min_by" | "max_by" | "sort_by" | "minmax_by" => {
+            sort_by_family(recv, name, &arr, &block)
+        }
         "[]" => Ok(arr_index(&arr, args)),
         "fetch" => {
             let len = arr.len();
@@ -2491,6 +2591,19 @@ fn sort_by_family(
             .max_by(|a, c| cmp_values(&a.0, &c.0))
             .map(|p| p.1)
             .unwrap_or(Value::Undef)),
+        "minmax_by" => {
+            let lo = keyed
+                .iter()
+                .min_by(|a, c| cmp_values(&a.0, &c.0))
+                .map(|p| p.1.clone())
+                .unwrap_or(Value::Undef);
+            let hi = keyed
+                .iter()
+                .max_by(|a, c| cmp_values(&a.0, &c.0))
+                .map(|p| p.1.clone())
+                .unwrap_or(Value::Undef);
+            Ok(new_arr(vec![lo, hi]))
+        }
         _ => {
             keyed.sort_by(|a, c| cmp_values(&a.0, &c.0));
             Ok(new_arr(keyed.into_iter().map(|p| p.1).collect()))

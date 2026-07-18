@@ -1106,6 +1106,35 @@ fn range_methods_batch() {
 }
 
 #[test]
+fn comparable_batch() {
+    // sort_by / min_by / max_by with a key block.
+    eq("[3, 1, 2].sort_by { |x| -x }", "[3, 2, 1]");
+    eq("[3, 1, 2].min_by { |x| -x }", "3");
+    eq("[3, 1, 2].max_by { |x| -x }", "1");
+    eq(r#"["bb", "a", "ccc"].max_by(&:length)"#, r#""ccc""#);
+    // minmax / minmax_by return [min, max].
+    eq("[5, 3, 8, 1].minmax", "[1, 8]");
+    eq("[].minmax", "[nil, nil]");
+    eq("[3, 1, 2].minmax_by { |x| -x }", "[3, 1]");
+    eq(r#"["bb", "a", "ccc"].minmax_by(&:length)"#, r#"["a", "ccc"]"#);
+    // sort with a two-arg comparator block, and in-place sort!.
+    eq("[3, 1, 2].sort { |a, b| b <=> a }", "[3, 2, 1]");
+    eq("[3, 1, 2].sort!", "[1, 2, 3]");
+    eq("a = [3, 1, 2]; a.sort!; a", "[1, 2, 3]");
+    // A user class mixing in Comparable via `<=>` gets the ordering helpers.
+    let t = "class T; include Comparable; attr_reader :v; def initialize(v); @v = v; end; def <=>(o); v <=> o.v; end; end; ";
+    eq(&format!("{t}T.new(1) < T.new(2)"), "true");
+    eq(&format!("{t}T.new(2) > T.new(1)"), "true");
+    eq(&format!("{t}T.new(2) >= T.new(2)"), "true");
+    eq(&format!("{t}T.new(2) == T.new(2)"), "true");
+    eq(&format!("{t}T.new(2).between?(T.new(1), T.new(3))"), "true");
+    eq(&format!("{t}T.new(5).clamp(T.new(1), T.new(3)).v"), "3");
+    eq(&format!("{t}T.new(0).clamp(T.new(1), T.new(3)).v"), "1");
+    eq(&format!("{t}[T.new(3), T.new(1), T.new(2)].sort.map(&:v)"), "[1, 2, 3]");
+    eq(&format!("{t}[T.new(3), T.new(1), T.new(2)].minmax.map(&:v)"), "[1, 3]");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
