@@ -830,8 +830,12 @@ fn dispatch_number(
                     }
                     i += 1;
                 }
+                Ok(recv.clone())
+            } else {
+                // No Enumerator type yet: return the yielded values as an array so
+                // `n.times.to_a` / `.map` still work.
+                Ok(new_arr((0..n.max(0)).map(Value::Int).collect()))
             }
-            Ok(recv.clone())
         }
         "**" | "pow" => {
             // Two-arg `Integer#pow(e, mod)` is modular exponentiation.
@@ -886,12 +890,22 @@ fn dispatch_number(
                         }
                         i += by;
                     }
+                    return Ok(recv.clone());
                 }
+                // No Enumerator type yet: return the stepped values as an array so
+                // `n.step(lim, by).to_a` / `.map` still work.
+                let mut vals = Vec::new();
+                let mut i = as_i(recv);
+                while (by > 0 && i <= limit) || (by < 0 && i >= limit) {
+                    vals.push(Value::Int(i));
+                    i += by;
+                }
+                return Ok(new_arr(vals));
             }
             Ok(recv.clone())
         }
-        "upto" => iter_int_range(recv, as_i(&args[0]), 1, &block, recv.clone()),
-        "downto" => iter_int_range(recv, as_i(&args[0]), -1, &block, recv.clone()),
+        "upto" => iter_int_range(recv, as_i(&args[0]), 1, &block),
+        "downto" => iter_int_range(recv, as_i(&args[0]), -1, &block),
         "to_s" => {
             // `Integer#to_s(base)` renders in the given radix (2..=36).
             if let (Value::Int(n), Some(base)) = (recv, args.first().map(as_i)) {
@@ -1102,7 +1116,6 @@ fn iter_int_range(
     bound: i64,
     step: i64,
     block: &Option<Value>,
-    ret: Value,
 ) -> Result<Value, String> {
     let start = as_i(recv);
     if let Some(b) = block {
@@ -1117,8 +1130,17 @@ fn iter_int_range(
             }
             i += step;
         }
+        return Ok(recv.clone());
     }
-    Ok(ret)
+    // No Enumerator type yet: return the yielded values as an array so
+    // `n.upto(m).to_a` / `n.downto(m).map` still work.
+    let mut vals = Vec::new();
+    let mut i = start;
+    while (step > 0 && i <= bound) || (step < 0 && i >= bound) {
+        vals.push(Value::Int(i));
+        i += step;
+    }
+    Ok(new_arr(vals))
 }
 
 /// Ruby integer division floors toward negative infinity (`-7 / 2 == -4`).

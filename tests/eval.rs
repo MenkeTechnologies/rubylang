@@ -1362,6 +1362,24 @@ fn numeric_predicates_batch() {
 }
 
 #[test]
+fn times_upto_arrays_batch() {
+    // Block-less integer iterators yield an array of their values (approximating
+    // an Enumerator whose .to_a/.map work), verified byte-for-byte vs ruby 4.0.6.
+    eq("3.times.to_a", "[0, 1, 2]");
+    eq("1.upto(4).to_a", "[1, 2, 3, 4]");
+    eq("5.downto(2).to_a", "[5, 4, 3, 2]");
+    eq("[10,20].each_with_index.to_a", "[[10, 0], [20, 1]]");
+    eq("1.step(10,3).to_a", "[1, 4, 7, 10]");
+    // Chaining .map onto the block-less enumerator still works.
+    eq("3.times.map { |i| i * 2 }", "[0, 2, 4]");
+    eq("2.upto(5).map { |i| i }", "[2, 3, 4, 5]");
+    // Block forms are unchanged: they run the block and return the receiver.
+    eq("3.times { |i| i }", "3");
+    eq("1.upto(3) { |i| i }", "1");
+    eq("5.downto(3) { |i| i }", "5");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
