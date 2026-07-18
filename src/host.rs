@@ -103,6 +103,7 @@ pub mod ops {
     pub const CALL_METHOD_ARR: u16 = 34; // [recv, name, args_array] -> method call
     pub const MKREGEX: u16 = 35; // [source, flags] -> Regexp
     pub const MKLAMBDA: u16 = 36; // [proc_id] -> Proc (lambda? == true)
+    pub const SIG_RETRY: u16 = 37; // [v] -> restart the enclosing begin body
 }
 
 /// A heap object — the Ruby reference types.
@@ -244,12 +245,14 @@ struct Frame {
     args: Vec<Value>,
 }
 
-/// A non-local control signal raised by `break`/`next`/`return` inside a block.
+/// A non-local control signal raised by `break`/`next`/`return`/`retry`.
 #[derive(Clone)]
 enum Signal {
     Break(Value),
     Next(Value),
     Return(Value),
+    /// `retry` inside a `rescue` clause — restarts the enclosing `begin` body.
+    Retry,
 }
 
 /// The Ruby runtime.
@@ -783,6 +786,10 @@ impl RubyHost {
             Some(RObj::Object { class, .. }) => Some(class.clone()),
             _ => None,
         }
+    }
+    /// The direct superclass of a user class, if registered.
+    pub fn superclass_of(&self, name: &str) -> Option<String> {
+        self.classes.get(name).and_then(|d| d.superclass.clone())
     }
     /// Whether `class` is an ancestor of (or equal to) `start` — walking the
     /// superclass chain and included modules.
@@ -1523,45 +1530,58 @@ pub fn run_begin(begin_id: usize) -> Result<Value, String> {
         return Err("bad begin id".to_string());
     };
 
-    let mut result = run_template(bd.body, &[]);
+    // The body may run more than once: a `retry` inside a matching `rescue`
+    // clause restarts it from the top.
+    let result = loop {
+        let mut result = run_template(bd.body, &[]);
 
-    let err = result.as_ref().err().cloned();
-    if let Some(e) = err {
+        let err = result.as_ref().err().cloned();
+        let Some(e) = err else {
+            break result;
+        };
         // Only a *raised exception* (pending_exc set) is rescuable; a bare
         // `return`/`break` signal must fall through untouched.
         let has_signal = with_host(|h| h.signal.is_some());
-        if !has_signal {
-            let exc = with_host(|h| h.take_pending_exc());
-            let exc_class = exc
-                .as_ref()
-                .and_then(|v| with_host(|h| h.object_class(v)))
-                .unwrap_or_else(|| "StandardError".to_string());
-            let excv = exc.clone().unwrap_or(Value::Undef);
-            let mut handled = false;
-            for rd in &bd.rescues {
-                let matches = rd.classes.is_empty()
-                    || rd
-                        .classes
-                        .iter()
-                        .any(|c| with_host(|h| h.exc_matches(&exc_class, c)));
-                if matches {
-                    let args = if rd.binding.is_some() {
-                        vec![excv.clone()]
-                    } else {
-                        vec![]
-                    };
-                    result = run_template(rd.body, &args);
-                    handled = true;
-                    break;
-                }
-            }
-            if !handled {
-                // Re-raise for an outer handler.
-                with_host(|h| h.pending_exc = exc);
-                result = Err(e);
+        if has_signal {
+            break result;
+        }
+        let exc = with_host(|h| h.take_pending_exc());
+        let exc_class = exc
+            .as_ref()
+            .and_then(|v| with_host(|h| h.object_class(v)))
+            .unwrap_or_else(|| "StandardError".to_string());
+        let excv = exc.clone().unwrap_or(Value::Undef);
+        let mut handled = false;
+        let mut retrying = false;
+        for rd in &bd.rescues {
+            let matches = rd.classes.is_empty()
+                || rd
+                    .classes
+                    .iter()
+                    .any(|c| with_host(|h| h.exc_matches(&exc_class, c)));
+            if matches {
+                let args = if rd.binding.is_some() {
+                    vec![excv.clone()]
+                } else {
+                    vec![]
+                };
+                result = run_template(rd.body, &args);
+                handled = true;
+                // A `retry` in the clause clears itself and restarts the body.
+                retrying = take_retry_signal();
+                break;
             }
         }
-    }
+        if retrying {
+            continue;
+        }
+        if !handled {
+            // Re-raise for an outer handler.
+            with_host(|h| h.pending_exc = exc);
+            result = Err(e);
+        }
+        break result;
+    };
 
     if let Some(eid) = bd.ensure {
         // `ensure` always runs; an exception it raises supersedes the result.
@@ -1679,6 +1699,20 @@ pub fn raise_signal_next(v: Value) {
 }
 pub fn raise_signal_return(v: Value) {
     with_host(|h| h.signal = Some(Signal::Return(v)));
+}
+pub fn raise_signal_retry() {
+    with_host(|h| h.signal = Some(Signal::Retry));
+}
+/// Consume a pending `retry` signal, returning whether one was set.
+pub fn take_retry_signal() -> bool {
+    with_host(|h| {
+        if matches!(h.signal, Some(Signal::Retry)) {
+            h.signal = None;
+            true
+        } else {
+            false
+        }
+    })
 }
 pub fn take_break() -> Option<Value> {
     with_host(|h| match &h.signal {

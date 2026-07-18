@@ -159,6 +159,8 @@ pub enum Expr {
     Return(Option<Box<Expr>>),
     Break(Option<Box<Expr>>),
     Next(Option<Box<Expr>>),
+    /// `retry` — restart the enclosing `begin` body from a `rescue` clause.
+    Retry,
     /// `yield args` — invoke the block passed to the enclosing method.
     Yield(Vec<Expr>),
     /// `super` (args `None` = forward the current method's args) / `super(args)`.

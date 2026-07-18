@@ -10,7 +10,8 @@
 use crate::host::ops;
 use crate::host::{
     call_instance_method, call_method, call_proc, current_block, has_pending_signal,
-    raise_signal_break, raise_signal_next, raise_signal_return, take_break, with_host, RKey,
+    raise_signal_break, raise_signal_next, raise_signal_retry, raise_signal_return, take_break,
+    with_host, RKey,
 };
 use fusevm::{Value, VM};
 use indexmap::IndexMap;
@@ -46,6 +47,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::SIG_BREAK, b_sig_break);
     vm.register_builtin(ops::SIG_NEXT, b_sig_next);
     vm.register_builtin(ops::SIG_RETURN, b_sig_return);
+    vm.register_builtin(ops::SIG_RETRY, b_sig_retry);
     vm.register_builtin(ops::GETSELF, b_getself);
     vm.register_builtin(ops::BEGIN, b_begin);
     vm.register_builtin(ops::SUPER, b_super);
@@ -241,6 +243,23 @@ fn b_getconst(vm: &mut VM, _: u8) -> Value {
 fn is_builtin_exception(name: &str) -> bool {
     name.ends_with("Error") || name == "Exception" || name == "StopIteration"
 }
+/// Whether `cls` is an exception class — a builtin one, or a user class whose
+/// superclass chain reaches a builtin exception (e.g. `class MyErr < StandardError`).
+fn is_exception_class(cls: &str) -> bool {
+    if is_builtin_exception(cls) {
+        return true;
+    }
+    with_host(|h| {
+        let mut cur = h.superclass_of(cls);
+        while let Some(name) = cur {
+            if is_builtin_exception(&name) {
+                return true;
+            }
+            cur = h.superclass_of(&name);
+        }
+        false
+    })
+}
 fn b_setconst(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let name = name_of(&vm.pop());
@@ -410,6 +429,12 @@ fn b_sig_next(vm: &mut VM, _: u8) -> Value {
 fn b_sig_return(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
     raise_signal_return(v);
+    vm.ip = vm.chunk.ops.len();
+    Value::Undef
+}
+fn b_sig_retry(vm: &mut VM, _: u8) -> Value {
+    vm.pop(); // `retry` carries no value
+    raise_signal_retry();
     vm.ip = vm.chunk.ops.len();
     Value::Undef
 }
@@ -586,11 +611,21 @@ fn dispatch_classref(
 ) -> Result<Value, String> {
     match name {
         "new" => {
-            let obj = with_host(|h| h.new_object(cls));
+            // A user `initialize` wins. Otherwise an exception class's default
+            // `new(msg)` stores the message (defaulting to the class name).
             if with_host(|h| h.find_method(cls, "initialize")).is_some() {
+                let obj = with_host(|h| h.new_object(cls));
                 call_instance_method(obj.clone(), cls, "initialize", args, block)?;
+                Ok(obj)
+            } else if is_exception_class(cls) {
+                let msg = match args.first() {
+                    Some(a) => with_host(|h| h.to_s(a)),
+                    None => cls.to_string(),
+                };
+                Ok(with_host(|h| h.new_exception(cls, &msg)))
+            } else {
+                Ok(with_host(|h| h.new_object(cls)))
             }
-            Ok(obj)
         }
         "name" | "to_s" | "inspect" => Ok(new_str(cls.to_string())),
         // `Class === obj` and `obj.is_a?(Class)` — case/when matching.
@@ -2022,6 +2057,22 @@ fn dispatch_array(
         }
         "min_by" | "max_by" | "sort_by" => sort_by_family(recv, name, &arr, &block),
         "[]" => Ok(arr_index(&arr, args)),
+        "fetch" => {
+            let len = arr.len();
+            let raw = as_i(&args[0]);
+            match norm_idx(raw, len).filter(|&i| i < len) {
+                Some(i) => Ok(arr[i].clone()),
+                // Out of bounds: an explicit default, else a block, else IndexError.
+                None if args.len() > 1 => Ok(args[1].clone()),
+                None => match &block {
+                    Some(b) => call_proc(b, &[Value::Int(raw)]),
+                    None => Err(raise_exc(
+                        "IndexError",
+                        &format!("index {raw} outside of array bounds: -{len}...{len}"),
+                    )),
+                },
+            }
+        }
         "[]=" => {
             let mut a = arr;
             let idx = norm_idx(as_i(&args[0]), a.len()).unwrap_or(a.len());

@@ -268,6 +268,12 @@ impl Compiler {
             Expr::Return(e) => self.compile_flow(b, e, ops::SIG_RETURN, FlowKind::Return)?,
             Expr::Break(e) => self.compile_flow(b, e, ops::SIG_BREAK, FlowKind::Break)?,
             Expr::Next(e) => self.compile_flow(b, e, ops::SIG_NEXT, FlowKind::Next)?,
+            Expr::Retry => {
+                // `retry` is always a signal (never a native loop jump): push a
+                // dummy value the builtin pops, then raise the retry signal.
+                b.emit(Op::LoadUndef, 0);
+                b.emit(Op::CallBuiltin(ops::SIG_RETRY, 1), 0);
+            }
             Expr::Yield(args) => {
                 for a in args {
                     self.compile_expr(b, a)?;

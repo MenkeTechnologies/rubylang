@@ -730,6 +730,89 @@ fn hash_methods_batch() {
 }
 
 #[test]
+fn exceptions_batch() {
+    // raise Class, msg / rescue Class => e / #message
+    eq(
+        "begin; raise ArgumentError, \"bad\"; rescue ArgumentError => e; e.message; end",
+        "\"bad\"",
+    );
+    // Kernel Integer() raises ArgumentError on garbage
+    eq(
+        "begin; Integer(\"x\"); rescue ArgumentError; :caught; end",
+        ":caught",
+    );
+    // Hash#fetch on a missing key raises KeyError (with the Ruby message)
+    eq("begin; {}.fetch(:x); rescue KeyError; :nokey; end", ":nokey");
+    eq(
+        "begin; {}.fetch(:x); rescue KeyError => e; e.message; end",
+        "\"key not found: :x\"",
+    );
+    // Hash#fetch default and block forms
+    eq("{}.fetch(:x, 99)", "99");
+    eq("{}.fetch(:x) { :dflt }", ":dflt");
+    // Array#fetch out of bounds raises IndexError; defaults/blocks otherwise
+    eq(
+        "begin; [1,2].fetch(5); rescue IndexError => e; e.message; end",
+        "\"index 5 outside of array bounds: -2...2\"",
+    );
+    eq("[1,2].fetch(5, :d)", ":d");
+    eq("[1,2].fetch(5) { |i| i * 10 }", "50");
+    eq("[1,2,3].fetch(-1)", "3");
+    // raise "msg" and bare rescue bind to RuntimeError
+    eq("begin; raise \"boom\"; rescue => e; e.message; end", "\"boom\"");
+    // raise Class with no message uses the class name
+    eq(
+        "begin; raise RuntimeError; rescue RuntimeError => e; e.message; end",
+        "\"RuntimeError\"",
+    );
+    // rescue naming several classes
+    eq(
+        "begin; raise TypeError, \"t\"; rescue ArgumentError, TypeError => e; e.message; end",
+        "\"t\"",
+    );
+    // StandardError catches every builtin subclass
+    eq(
+        "begin; raise KeyError, \"kk\"; rescue StandardError => e; e.message; end",
+        "\"kk\"",
+    );
+    // Custom exception subclass carries its message; superclass rescue matches
+    eq(
+        "class MyErr < StandardError; end; begin; raise MyErr, \"custom\"; rescue MyErr => e; e.message; end",
+        "\"custom\"",
+    );
+    eq(
+        "class E1 < StandardError; end; class E2 < E1; end; begin; raise E2, \"deep\"; rescue E1 => e; e.message; end",
+        "\"deep\"",
+    );
+    // Exception.new(msg).message, and raising an instance
+    eq("RuntimeError.new(\"hi\").message", "\"hi\"");
+    eq("ArgumentError.new(\"z\").message", "\"z\"");
+    eq(
+        "begin; raise ArgumentError.new(\"na\"); rescue => e; e.message; end",
+        "\"na\"",
+    );
+    // Bounded retry re-runs the begin body
+    eq(
+        "i = 0; begin; i += 1; raise \"x\" if i < 3; i; rescue; retry if i < 3; end",
+        "3",
+    );
+    eq(
+        "n = 0; begin; n += 1; raise \"e\"; rescue; retry if n < 3; n; end",
+        "3",
+    );
+    // ensure runs but a return from the body still wins
+    eq(
+        "def f; begin; return 1; ensure; nil; end; end; f",
+        "1",
+    );
+    // first matching rescue clause wins
+    eq(
+        "begin; raise ArgumentError; rescue TypeError; :t; rescue ArgumentError; :a; end",
+        ":a",
+    );
+}
+
+#[test]
 fn kernel_convert_batch() {
     // Kernel conversion functions: Integer/Float/String/Array with the full
     // Ruby radix-prefix, base-argument, underscore, and sign handling.

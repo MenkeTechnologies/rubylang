@@ -761,6 +761,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Next(self.opt_value()?))
             }
+            "retry" => {
+                self.advance();
+                Ok(Expr::Retry)
+            }
             "yield" => {
                 self.advance();
                 let (args, _) = if self.is_op("(") {
