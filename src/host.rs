@@ -107,6 +107,12 @@ pub mod ops {
     pub const SIG_RETRY: u16 = 37; // [v] -> restart the enclosing begin body
 }
 
+/// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried
+/// through the integer-`Range` representation. The compiler substitutes these
+/// for an absent bound; index/iteration code treats them as "start"/"end".
+pub const RANGE_BEGINLESS: i64 = i64::MIN;
+pub const RANGE_ENDLESS: i64 = i64::MAX;
+
 /// A heap object — the Ruby reference types.
 #[derive(Debug, Clone)]
 pub enum RObj {

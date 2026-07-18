@@ -308,18 +308,44 @@ impl Parser {
     }
 
     fn range(&mut self) -> Result<Expr, String> {
-        let lo = self.binary(0)?;
+        // Beginless range: `..hi` / `...hi` (no low bound).
         if self.is_op("..") || self.is_op("...") {
             let exclusive = self.is_op("...");
             self.advance();
             let hi = self.binary(0)?;
             return Ok(Expr::Range {
-                lo: Box::new(lo),
-                hi: Box::new(hi),
+                lo: None,
+                hi: Some(Box::new(hi)),
+                exclusive,
+            });
+        }
+        let lo = self.binary(0)?;
+        if self.is_op("..") || self.is_op("...") {
+            let exclusive = self.is_op("...");
+            self.advance();
+            // Endless range: nothing that could start a bound follows the `..`.
+            let hi = if self.range_end_follows() {
+                None
+            } else {
+                Some(Box::new(self.binary(0)?))
+            };
+            return Ok(Expr::Range {
+                lo: Some(Box::new(lo)),
+                hi,
                 exclusive,
             });
         }
         Ok(lo)
+    }
+
+    /// Whether the current token ends an endless range (`lo..` with no high
+    /// bound) — a closing bracket, separator, terminator, or a block keyword.
+    fn range_end_follows(&self) -> bool {
+        matches!(self.peek(), Tok::Newline | Tok::Semicolon | Tok::Eof)
+            || matches!(self.peek(), Tok::Op(o)
+                if matches!(o.as_str(), "]" | ")" | "}" | ","))
+            || matches!(self.peek(), Tok::Keyword(k)
+                if matches!(k.as_str(), "then" | "do" | "end"))
     }
 
     /// Binding power of a binary operator token, or None if not a binary op.

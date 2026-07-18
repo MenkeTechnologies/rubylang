@@ -76,9 +76,11 @@ pub enum Expr {
     /// key/value pairs; `k => v` and `k: v` both land here.
     Hash(Vec<(Expr, Expr)>),
     /// `lo..hi` (exclusive=false) / `lo...hi` (exclusive=true).
+    /// `lo..hi`. Either bound may be absent for a beginless (`..hi`) or endless
+    /// (`lo..`) range.
     Range {
-        lo: Box<Expr>,
-        hi: Box<Expr>,
+        lo: Option<Box<Expr>>,
+        hi: Option<Box<Expr>>,
         exclusive: bool,
     },
 

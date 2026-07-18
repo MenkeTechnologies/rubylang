@@ -1861,6 +1861,33 @@ fn string_slice_bang_and_eql() {
 }
 
 #[test]
+fn endless_and_beginless_ranges() {
+    // Endless / beginless ranges as slice indices for strings and arrays.
+    eq("\"hello\"[2..]", "\"llo\"");
+    eq("\"hello\"[..2]", "\"hel\"");
+    eq("\"hello\"[..-2]", "\"hell\"");
+    eq("[1, 2, 3, 4, 5][2..]", "[3, 4, 5]");
+    eq("[1, 2, 3, 4, 5][..2]", "[1, 2, 3]");
+    eq("[1, 2, 3, 4, 5][1...3]", "[2, 3]");
+    eq("s = \"hello\"; s.slice!(2..); s", "\"he\"");
+    // Endless-range methods that don't need an upper bound.
+    eq("(1..).first(3)", "[1, 2, 3]");
+    eq("(1..).take(5)", "[1, 2, 3, 4, 5]");
+    eq("(10..).min", "10");
+    eq("(5..).include?(100)", "true");
+    eq("(5..).cover?(2)", "false");
+    eq(
+        "r = []; (1..).each { |i| break if i > 4; r << i }; r",
+        "[1, 2, 3, 4]",
+    );
+    // Beginless-range membership.
+    eq("(..5).include?(3)", "true");
+    eq("(..5).cover?(10)", "false");
+    // Materializing an endless range raises rather than hanging.
+    assert!(ev("(1..).to_a").is_err());
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).

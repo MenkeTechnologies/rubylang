@@ -2509,13 +2509,8 @@ fn str_slice_remove(s: &str, args: &[Value]) -> Option<(String, String)> {
         }
         [rng] if with_host(|h| h.as_range(rng)).is_some() => {
             let (lo, hi, excl) = with_host(|h| h.as_range(rng)).unwrap();
-            let start = norm_idx(lo, n)?;
-            let mut e = norm_idx(hi, n).unwrap_or(n);
-            if !excl {
-                e += 1;
-            }
-            let e = e.min(n).max(start);
-            (start <= n).then(|| cut(start, e))
+            let (start, e) = range_bounds(lo, hi, excl, n)?;
+            Some(cut(start, e))
         }
         // A string or regex argument removes its first occurrence.
         [pat] => {
@@ -2556,16 +2551,9 @@ fn str_index(s: &str, args: &[Value]) -> Value {
         }
         [rng] => {
             if let Some((lo, hi, excl)) = with_host(|h| h.as_range(rng)) {
-                let start = norm_idx(lo, chars.len()).unwrap_or(chars.len());
-                let mut e = norm_idx(hi, chars.len()).unwrap_or(chars.len());
-                if !excl {
-                    e += 1;
-                }
-                let e = e.min(chars.len());
-                if start > chars.len() {
-                    Value::Undef
-                } else {
-                    new_str(chars[start..e.max(start)].iter().collect())
+                match range_bounds(lo, hi, excl, chars.len()) {
+                    Some((start, e)) => new_str(chars[start..e].iter().collect()),
+                    None => Value::Undef,
                 }
             } else {
                 Value::Undef
@@ -3749,16 +3737,9 @@ fn arr_index(arr: &[Value], args: &[Value]) -> Value {
         }
         [rng] => {
             if let Some((lo, hi, excl)) = with_host(|h| h.as_range(rng)) {
-                let s = norm_idx(lo, arr.len()).unwrap_or(arr.len());
-                let mut e = norm_idx(hi, arr.len()).unwrap_or(arr.len());
-                if !excl {
-                    e += 1;
-                }
-                let e = e.min(arr.len());
-                if s > arr.len() {
-                    Value::Undef
-                } else {
-                    new_arr(arr[s..e.max(s)].to_vec())
+                match range_bounds(lo, hi, excl, arr.len()) {
+                    Some((s, e)) => new_arr(arr[s..e].to_vec()),
+                    None => Value::Undef,
                 }
             } else {
                 Value::Undef
@@ -4117,6 +4098,62 @@ fn dispatch_range(
         return dispatch_str_range(recv, name, args, block, lo, hi, excl);
     }
     let (lo, hi, excl) = with_host(|h| h.as_range(recv).unwrap());
+    let endless = hi == crate::host::RANGE_ENDLESS;
+    let beginless = lo == crate::host::RANGE_BEGINLESS;
+
+    // An endless range (`1..`) supports the methods that don't need an upper
+    // bound; anything that would materialize it raises like Ruby.
+    if endless {
+        match name {
+            "first" | "take" if !args.is_empty() => {
+                let n = as_i(&args[0]).max(0) as usize;
+                return Ok(new_arr((lo..).take(n).map(Value::Int).collect()));
+            }
+            "first" | "begin" | "min" => return Ok(Value::Int(lo)),
+            "include?" | "cover?" | "member?" | "===" => {
+                return Ok(Value::Bool(as_i(&args[0]) >= lo));
+            }
+            "end" => return Ok(Value::Undef),
+            "each" | "step" if block.is_some() => {
+                let b = block.as_ref().unwrap();
+                let by = if name == "step" {
+                    as_i(&args[0]).max(1)
+                } else {
+                    1
+                };
+                let mut i = lo;
+                loop {
+                    call_proc(b, &[Value::Int(i)])?;
+                    if has_pending_signal() {
+                        if let Some(bv) = take_break() {
+                            return Ok(bv);
+                        }
+                        break;
+                    }
+                    i += by;
+                }
+                return Ok(recv.clone());
+            }
+            _ => {
+                return Err(raise_exc(
+                    "RangeError",
+                    "cannot convert endless range to an array",
+                ))
+            }
+        }
+    }
+    // A beginless range (`..5`) only supports the upper-bound queries.
+    if beginless {
+        match name {
+            "include?" | "cover?" | "member?" | "===" => {
+                let n = as_i(&args[0]);
+                return Ok(Value::Bool(if excl { n < hi } else { n <= hi }));
+            }
+            "end" | "last" | "max" => return Ok(Value::Int(if excl { hi - 1 } else { hi })),
+            _ => return Err(raise_exc("TypeError", "can't iterate from NilClass")),
+        }
+    }
+
     let end = if excl { hi } else { hi + 1 };
     match name {
         "to_a" | "to_ary" | "entries" => Ok(new_arr((lo..end).map(Value::Int).collect())),
@@ -5659,6 +5696,31 @@ fn parse_leading_float(s: &str) -> f64 {
         }
     }
     buf.parse().unwrap_or(0.0)
+}
+
+/// Resolve a range `lo..hi` to a `[start, end)` half-open slice range over a
+/// collection of `len` elements, honoring negative indices, exclusivity, and the
+/// beginless/endless sentinels. Returns `None` when the start is out of range.
+fn range_bounds(lo: i64, hi: i64, excl: bool, len: usize) -> Option<(usize, usize)> {
+    use crate::host::{RANGE_BEGINLESS, RANGE_ENDLESS};
+    let start = if lo == RANGE_BEGINLESS {
+        0
+    } else {
+        norm_idx(lo, len)?
+    };
+    if start > len {
+        return None;
+    }
+    let end = if hi == RANGE_ENDLESS {
+        len
+    } else {
+        let mut e = norm_idx(hi, len).unwrap_or(len);
+        if !excl {
+            e += 1;
+        }
+        e.min(len)
+    };
+    Some((start, end.max(start)))
 }
 
 fn norm_idx(i: i64, len: usize) -> Option<usize> {

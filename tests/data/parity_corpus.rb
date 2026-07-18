@@ -487,3 +487,16 @@ removed = s.slice!(0, 5)
 puts removed
 puts s
 puts "café".eql?("café")
+#==#
+line = "2024-01-15 event"
+puts line[..9]
+puts line[11..]
+nums = [10, 20, 30, 40, 50]
+puts nums[2..].inspect
+puts nums[..1].inspect
+puts (1..).first(5).inspect
+puts (100..).take(3).inspect
+result = []
+(1..).each { |n| break if n > 6; result << n * n }
+puts result.inspect
+puts (..10).include?(7)

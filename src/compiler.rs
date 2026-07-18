@@ -195,8 +195,19 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::MKHASH, argc(pairs.len() * 2)?), 0);
             }
             Expr::Range { lo, hi, exclusive } => {
-                self.compile_expr(b, lo)?;
-                self.compile_expr(b, hi)?;
+                // An absent bound compiles to a sentinel the runtime recognizes.
+                match lo {
+                    Some(e) => self.compile_expr(b, e)?,
+                    None => {
+                        b.emit(Op::LoadInt(crate::host::RANGE_BEGINLESS), 0);
+                    }
+                }
+                match hi {
+                    Some(e) => self.compile_expr(b, e)?,
+                    None => {
+                        b.emit(Op::LoadInt(crate::host::RANGE_ENDLESS), 0);
+                    }
+                }
                 b.emit(
                     if *exclusive {
                         Op::LoadTrue
