@@ -514,8 +514,9 @@ impl Parser {
             return Ok(());
         }
         if self.is_op("&") {
-            if let Tok::Symbol(s) = self.toks[self.pos + 1].kind.clone() {
-                self.advance(); // &
+            self.advance(); // &
+            // `&:sym` — inline the send as `{ |__blkx__| __blkx__.sym }`.
+            if let Tok::Symbol(s) = self.peek().clone() {
                 self.advance(); // :sym
                 let call = Expr::Call {
                     recv: Some(Box::new(Expr::Var(VarKind::Local, "__blkx__".into()))),
@@ -529,6 +530,20 @@ impl Parser {
                 });
                 return Ok(());
             }
+            // `&expr` — block-pass any callable (Proc / Method / to_proc-able):
+            // `{ |__blkx__| (expr).call(__blkx__) }`.
+            let e = self.arg()?;
+            let call = Expr::Call {
+                recv: Some(Box::new(e)),
+                name: "call".into(),
+                args: vec![Expr::Var(VarKind::Local, "__blkx__".into())],
+                block: None,
+            };
+            *amp_block = Some(Block {
+                params: vec!["__blkx__".into()],
+                body: vec![call],
+            });
+            return Ok(());
         }
         args.push(self.arg()?);
         Ok(())

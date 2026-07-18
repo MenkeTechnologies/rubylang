@@ -1705,6 +1705,45 @@ fn symbol_more_batch() {
 }
 
 #[test]
+fn method_objects_batch() {
+    // `obj.method(:name)` captures a bound, callable Method.
+    eq("m = \"hello\".method(:upcase); m.call", "\"HELLO\"");
+    eq("[1,2,3].method(:size).call", "3");
+    eq("m = 5.method(:+); m.call(3)", "8");
+    eq("\"x\".method(:+).call(\"y\")", "\"xy\"");
+    // `&method` block-pass: the Method feeds `map`/`each`/… as a proc.
+    eq("[\"a\",\"b\"].map(&\"x\".method(:+))", "[\"xa\", \"xb\"]");
+    eq("[1,2,3].map(&5.method(:+))", "[6, 7, 8]");
+    // `#name`, `#to_proc`, `#is_a?`.
+    eq("\"hello\".method(:upcase).name", ":upcase");
+    eq("[1,2,3].method(:size).name", ":size");
+    eq("\"hello\".method(:upcase).to_proc.call", "\"HELLO\"");
+    eq("5.method(:+).to_proc.call(3)", "8");
+    eq("\"hello\".method(:upcase).is_a?(Method)", "true");
+    // `#arity` and `#call` on a user-defined method.
+    eq(
+        "class Foo\n  def bar(a,b); a+b; end\n  def baz; 42; end\n  def qux(*a); a; end\nend\nFoo.new.method(:bar).call(3,4)",
+        "7",
+    );
+    eq(
+        "class Foo\n  def bar(a,b); a+b; end\nend\nFoo.new.method(:bar).arity",
+        "2",
+    );
+    eq(
+        "class Foo\n  def baz; 42; end\nend\nFoo.new.method(:baz).arity",
+        "0",
+    );
+    eq(
+        "class Foo\n  def qux(*a); a; end\nend\nFoo.new.method(:qux).arity",
+        "-1",
+    );
+    eq(
+        "class Foo\n  def qux(*a); a; end\nend\nFoo.new.method(:qux).call(1,2,3)",
+        "[1, 2, 3]",
+    );
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

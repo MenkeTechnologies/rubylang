@@ -147,6 +147,10 @@ pub enum RObj {
     /// A native proc produced by `Symbol#to_proc` (`&:upcase`): calling it sends
     /// the named method to its first argument (`:upcase.to_proc.call(s)` == `s.upcase`).
     SymProc(String),
+    /// A bound `Method` object (`obj.method(:name)`): the captured receiver plus
+    /// the method name. `#call(*args)` routes back through dispatch on the stored
+    /// receiver; `#to_proc` yields a callable that closes over both.
+    Method { recv: Value, name: String },
     /// A user-defined object: its class name and its instance variables.
     Object {
         class: String,
@@ -664,6 +668,45 @@ impl RubyHost {
             _ => None,
         }
     }
+    /// Allocate a bound `Method` object (`obj.method(:name)`).
+    pub fn new_method(&mut self, recv: Value, name: &str) -> Value {
+        self.alloc(RObj::Method {
+            recv,
+            name: name.to_string(),
+        })
+    }
+    /// The (receiver, method-name) of a bound `Method` value (`None` otherwise).
+    pub fn as_method(&self, v: &Value) -> Option<(Value, String)> {
+        match self.obj(v) {
+            Some(RObj::Method { recv, name }) => Some((recv.clone(), name.clone())),
+            _ => None,
+        }
+    }
+    /// `Method#arity`. For a user-defined method the arity is the count of required
+    /// positional parameters, negated (`-(n+1)`) when a `*rest` splat is present.
+    /// For a built-in method the exact arity is unknown here, so it reports `-1`
+    /// (variadic), matching Ruby's convention for optional/variadic methods.
+    pub fn method_arity(&self, recv: &Value, name: &str) -> i64 {
+        let def = if let Some(cls) = self.object_class(recv) {
+            self.find_method_owner(&cls, name).map(|(d, _)| d)
+        } else if let Some(cls) = self.classref_name(recv) {
+            self.find_class_method(&cls, name)
+        } else {
+            self.methods.get(name).cloned()
+        };
+        match def {
+            Some(d) => {
+                if d.splat.is_some() {
+                    // Required positional params = all positional minus the splat.
+                    -((d.params.len().saturating_sub(1)) as i64 + 1)
+                } else {
+                    d.params.len() as i64
+                }
+            }
+            // Built-in method: real arity is not tracked; report variadic.
+            None => -1,
+        }
+    }
 
     // ---- public accessors used by builtins (fine-grained borrows) ---------
 
@@ -966,6 +1009,7 @@ impl RubyHost {
                 | "Hash"
                 | "Range"
                 | "Proc"
+                | "Method"
                 | "Object"
                 | "BasicObject"
                 | "Comparable"
@@ -1222,6 +1266,9 @@ impl RubyHost {
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash { map, .. }) => self.inspect_hash(&map),
                 Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) => "#<Proc>".to_string(),
+                Some(RObj::Method { recv, name }) => {
+                    format!("#<Method: {}#{name}>", self.class_of(&recv))
+                }
                 Some(RObj::Regexp { source, .. }) => format!("(?-mix:{source})"),
                 // MatchData#to_s is the whole matched substring (group 0).
                 Some(RObj::MatchData { groups, .. }) => {
@@ -1322,6 +1369,7 @@ impl RubyHost {
                 Some(RObj::Range { .. }) => "Range",
                 Some(RObj::StrRange { .. }) => "Range",
                 Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) => "Proc",
+                Some(RObj::Method { .. }) => "Method",
                 Some(RObj::Regexp { .. }) => "Regexp",
                 Some(RObj::MatchData { .. }) => "MatchData",
                 Some(RObj::ClassRef(_)) => "Class",
@@ -1747,6 +1795,19 @@ pub fn call_proc(proc_val: &Value, args: &[Value]) -> Result<Value, String> {
             kind,
             ..
         }) => (template, scope, kind),
+        // A bound `Method` used as a block/proc (`map(&obj.method(:m))`): re-dispatch
+        // the stored method on its captured receiver.
+        Some(RObj::Method { recv, name }) => {
+            return crate::builtins::dispatch(&recv, &name, args, None);
+        }
+        // A `Symbol#to_proc` proc used as a block value: send the symbol's method
+        // to the first argument.
+        Some(RObj::SymProc(s)) => {
+            return match args.split_first() {
+                Some((recv, rest)) => crate::builtins::dispatch(recv, &s, rest, None),
+                None => Err("no receiver is available".to_string()),
+            };
+        }
         _ => return Err("not a proc".to_string()),
     };
 

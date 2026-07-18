@@ -469,7 +469,7 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
 }
 
 /// A receiver method call. Universal methods first, then per-class.
-fn dispatch(
+pub(crate) fn dispatch(
     recv: &Value,
     name: &str,
     args: &[Value],
@@ -602,6 +602,11 @@ fn dispatch(
             let m = name_of(&args[0]);
             return dispatch(recv, &m, &args[1..], block);
         }
+        // `obj.method(:name)` — capture a bound Method object.
+        "method" => {
+            let m = name_of(&args[0]);
+            return Ok(with_host(|h| h.new_method(recv.clone(), &m)));
+        }
         "respond_to?" => return Ok(Value::Bool(true)),
         _ => {}
     }
@@ -623,6 +628,7 @@ fn dispatch(
         "Range" => dispatch_range(recv, name, args, block),
         "Symbol" => dispatch_symbol(recv, name, args),
         "Proc" => dispatch_proc(recv, name, args),
+        "Method" => dispatch_method(recv, name, args, block),
         "Regexp" => dispatch_regexp(recv, name, args),
         "MatchData" => dispatch_matchdata(recv, name, args),
         _ => Err(raise_exc(
@@ -1272,6 +1278,33 @@ fn dispatch_number(
             let n = as_f(recv);
             Ok(Value::Bool(n >= as_f(&args[0]) && n <= as_f(&args[1])))
         }
+        // Arithmetic/comparison operators normally lower to native VM ops, so they
+        // only reach here through an explicit send (`5.method(:+).call(3)`,
+        // `5.send(:+, 3)`). Compute them the same way the VM would: an Int/Int pair
+        // stays Integer, any Float operand promotes to Float.
+        "+" | "-" | "*" | "<" | ">" | "<=" | ">=" => match (recv, &args[0]) {
+            (Value::Int(x), Value::Int(y)) => Ok(match name {
+                "+" => Value::Int(x + y),
+                "-" => Value::Int(x - y),
+                "*" => Value::Int(x * y),
+                "<" => Value::Bool(x < y),
+                ">" => Value::Bool(x > y),
+                "<=" => Value::Bool(x <= y),
+                _ => Value::Bool(x >= y),
+            }),
+            _ => {
+                let (x, y) = (as_f(recv), as_f(&args[0]));
+                Ok(match name {
+                    "+" => Value::Float(x + y),
+                    "-" => Value::Float(x - y),
+                    "*" => Value::Float(x * y),
+                    "<" => Value::Bool(x < y),
+                    ">" => Value::Bool(x > y),
+                    "<=" => Value::Bool(x <= y),
+                    _ => Value::Bool(x >= y),
+                })
+            }
+        },
         _ => Err(format!(
             "undefined method '{name}' for {}",
             with_host(|h| h.class_of(recv))
@@ -4120,6 +4153,30 @@ fn dispatch_proc(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
             Ok(with_host(|h| h.new_composed(g, recv.clone(), is_lambda)))
         }
         _ => Err(format!("undefined method '{name}' for Proc")),
+    }
+}
+
+/// Methods on a bound `Method` object (`obj.method(:m)`): `call`/`[]`/`()` route
+/// back through dispatch on the captured receiver; `arity`, `name`, `to_proc`,
+/// `receiver` expose its parts.
+fn dispatch_method(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    let (mrecv, mname) = match with_host(|h| h.as_method(recv)) {
+        Some(m) => m,
+        None => return Err(format!("undefined method '{name}' for Method")),
+    };
+    match name {
+        "call" | "()" | "[]" | "yield" | "===" => dispatch(&mrecv, &mname, args, block),
+        "arity" => Ok(Value::Int(with_host(|h| h.method_arity(&mrecv, &mname)))),
+        "name" => Ok(with_host(|h| h.new_symbol(&mname))),
+        "receiver" => Ok(mrecv),
+        // A `Method` is itself callable via `call_proc`, so `to_proc` is identity.
+        "to_proc" => Ok(recv.clone()),
+        _ => Err(format!("undefined method '{name}' for Method")),
     }
 }
 
