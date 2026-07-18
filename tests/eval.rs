@@ -1650,6 +1650,40 @@ fn array_search_batch() {
 }
 
 #[test]
+fn enumerable_module_batch() {
+    // A user class that `include Enumerable` and defines `each` derives the whole
+    // Enumerable surface from that one method (mirrors real Ruby).
+    const L: &str = "class L; include Enumerable; def initialize(*a); @a=a; end; \
+                     def each; @a.each { |x| yield x }; end; end\n";
+    let with_l = |expr: &str, expected: &str| eq(&format!("{L}{expr}"), expected);
+
+    with_l("L.new(3, 1, 2).sort", "[1, 2, 3]");
+    with_l("L.new(1, 2, 3).map { |x| x * 2 }", "[2, 4, 6]");
+    with_l("L.new(1, 2, 3).select(&:odd?)", "[1, 3]");
+    with_l("L.new(1, 2, 3).reduce(:+)", "6");
+    with_l("L.new(1, 2, 3).reject(&:odd?)", "[2]");
+    with_l("L.new(1, 2, 3).to_a", "[1, 2, 3]");
+    with_l("L.new(1, 2, 3).find { |x| x > 1 }", "2");
+    with_l("L.new(1, 2, 3).count", "3");
+    with_l("L.new(3, 1, 2).min", "1");
+    with_l("L.new(3, 1, 2).max", "3");
+    with_l("L.new(1, 2, 3).include?(2)", "true");
+    with_l("L.new(1, 2, 3).include?(9)", "false");
+    with_l("L.new(1, 2, 3).first", "1");
+    with_l("L.new(1, 2, 3).first(2)", "[1, 2]");
+    // reduce with an initial value and a block; sum; sort_by / min_by key blocks.
+    with_l("L.new(1, 2, 3).reduce(10) { |s, x| s + x }", "16");
+    with_l("L.new(1, 2, 3).sum", "6");
+    with_l("L.new(1, 2, 3).min_by { |x| -x }", "3");
+    with_l("L.new(1, 2, 3).sort_by { |x| -x }", "[3, 2, 1]");
+    with_l("L.new(1, 2, 3).partition(&:odd?)", "[[1, 3], [2]]");
+    with_l("L.new(1, 2, 3, 3).tally", "{1 => 1, 2 => 1, 3 => 2}");
+    with_l("L.new(1, 2, 3).any? { |x| x > 2 }", "true");
+    with_l("L.new(1, 2, 3).all? { |x| x > 0 }", "true");
+    with_l("L.new(1, 2, 3).each_with_index.to_a", "[[1, 0], [2, 1], [3, 2]]");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

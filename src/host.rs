@@ -188,6 +188,10 @@ pub enum ProcKind {
         first: Box<Value>,
         second: Box<Value>,
     },
+    /// A native collector block (no template) used to materialize a user
+    /// `Enumerable`'s elements: calling it appends its argument to
+    /// `enum_sinks[usize]` and returns nil. Never escapes to user code.
+    Collect(usize),
 }
 
 /// A user-defined class: its optional superclass, its instance methods, the
@@ -294,6 +298,12 @@ pub struct RubyHost {
     /// object as frozen (and `frozen?` reports it); immutability itself is not
     /// enforced here, but the recorded flag is faithful to `Object#frozen?`.
     frozen: HashSet<u32>,
+    /// A LIFO stack of buffers that materialize a user `Enumerable`'s elements:
+    /// `new_enum_sink` pushes an empty buffer and hands back a native collector
+    /// `Proc`; driving the object's `each` with that block appends every yielded
+    /// value here, and `take_enum_sink` reclaims the buffer. A stack (not a single
+    /// buffer) so a nested enumerable call inside `each` can't clobber the outer one.
+    enum_sinks: Vec<Vec<Value>>,
 }
 
 thread_local! {
@@ -342,6 +352,7 @@ impl RubyHost {
             signal: None,
             active_scope: None,
             frozen: HashSet::new(),
+            enum_sinks: Vec::new(),
         }
     }
 
@@ -574,6 +585,7 @@ impl RubyHost {
         match self.obj(v) {
             Some(RObj::Proc { kind, template, .. }) => match kind {
                 ProcKind::Curried { .. } | ProcKind::Composed { .. } => Some(-1),
+                ProcKind::Collect(_) => Some(1),
                 ProcKind::Normal => Some(self.procs[*template].params.len() as i64),
             },
             _ => None,
@@ -591,7 +603,7 @@ impl RubyHost {
             }) => {
                 let arity = match kind {
                     ProcKind::Curried { arity, .. } => arity,
-                    ProcKind::Composed { .. } => return Some(v.clone()),
+                    ProcKind::Composed { .. } | ProcKind::Collect(_) => return Some(v.clone()),
                     ProcKind::Normal => self.procs[template].params.len(),
                 };
                 Some(self.alloc(RObj::Proc {
@@ -622,6 +634,24 @@ impl RubyHost {
     }
     pub fn new_symbol(&mut self, name: &str) -> Value {
         self.intern(name)
+    }
+    /// Open a fresh element buffer and return a native collector `Proc` bound to
+    /// it. Passing this block to a user `Enumerable`'s `each` appends every
+    /// yielded element to the buffer; pair with `take_enum_sink`.
+    pub fn new_enum_sink(&mut self) -> Value {
+        let idx = self.enum_sinks.len();
+        self.enum_sinks.push(Vec::new());
+        let scope = self.cur_scope().clone();
+        self.alloc(RObj::Proc {
+            template: 0,
+            scope,
+            is_lambda: false,
+            kind: ProcKind::Collect(idx),
+        })
+    }
+    /// Reclaim the most recently opened collector buffer (LIFO with `new_enum_sink`).
+    pub fn take_enum_sink(&mut self) -> Vec<Value> {
+        self.enum_sinks.pop().unwrap_or_default()
     }
     /// Allocate the native proc backing `Symbol#to_proc`.
     pub fn new_sym_proc(&mut self, sym: &str) -> Value {
@@ -1753,6 +1783,17 @@ pub fn call_proc(proc_val: &Value, args: &[Value]) -> Result<Value, String> {
                     },
                 })
             }));
+        }
+        ProcKind::Collect(idx) => {
+            // A multi-value `yield a, b` collects as an Array element, matching
+            // how `to_a` groups multiple yielded values; a single value is stored
+            // as-is.
+            let elem = match args {
+                [single] => single.clone(),
+                many => with_host(|h| h.new_array(many.to_vec())),
+            };
+            with_host(|h| h.enum_sinks[idx].push(elem));
+            return Ok(Value::Undef);
         }
         ProcKind::Normal => {}
     }

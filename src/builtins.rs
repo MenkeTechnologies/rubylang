@@ -736,6 +736,12 @@ fn dispatch_object(
             return Ok(r);
         }
     }
+    // Enumerable module: `map`, `select`, `reduce`, … derived from the class's `each`.
+    if with_host(|h| h.is_a(recv, "Enumerable")) {
+        if let Some(r) = enumerable_method(recv, name, args, block.clone())? {
+            return Ok(r);
+        }
+    }
     match name {
         "message" | "to_s" => {
             let m = with_host(|h| h.ivar_of(recv, "message"));
@@ -812,6 +818,85 @@ fn comparable_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<
         }
         _ => Ok(None),
     }
+}
+
+/// Materialize a user `Enumerable`'s elements by driving its own `each` with a
+/// native collector block, exactly how real Ruby's `Enumerable` derives every
+/// method from `each`. Returns the yielded values in iteration order.
+fn enum_to_vec(recv: &Value) -> Result<Vec<Value>, String> {
+    let sink = with_host(|h| h.new_enum_sink());
+    dispatch(recv, "each", &[], Some(sink))?;
+    Ok(with_host(|h| h.take_enum_sink()))
+}
+
+/// Enumerable's derived instance methods (`map select reject reduce to_a find
+/// count min max sort include? first`, plus their standard aliases), each built
+/// on the class's own `each`: the elements are materialized once and the request
+/// is delegated to the eager `Array` implementation so the block, symbol-proc,
+/// and argument handling all match Ruby. Returns `Ok(None)` when `name` is not an
+/// Enumerable method (so the caller raises `NoMethodError`).
+fn enumerable_method(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Option<Value>, String> {
+    // Only names Enumerable actually provides (and that `dispatch_array`
+    // implements) are derived; anything else falls through to `NoMethodError`.
+    const ENUM_METHODS: &[&str] = &[
+        "map",
+        "collect",
+        "flat_map",
+        "collect_concat",
+        "select",
+        "filter",
+        "filter_map",
+        "reject",
+        "reduce",
+        "inject",
+        "to_a",
+        "entries",
+        "find",
+        "detect",
+        "find_index",
+        "count",
+        "min",
+        "max",
+        "minmax",
+        "min_by",
+        "max_by",
+        "sort",
+        "sort_by",
+        "sum",
+        "include?",
+        "member?",
+        "first",
+        "take",
+        "drop",
+        "take_while",
+        "drop_while",
+        "each_with_index",
+        "each_with_object",
+        "group_by",
+        "partition",
+        "tally",
+        "uniq",
+        "zip",
+        "any?",
+        "all?",
+        "none?",
+        "one?",
+        "each_slice",
+        "each_cons",
+        "chunk_while",
+        "to_h",
+    ];
+    if !ENUM_METHODS.contains(&name) {
+        return Ok(None);
+    }
+    let elems = enum_to_vec(recv)?;
+    let arr = with_host(|h| h.new_array(elems));
+    Ok(Some(dispatch_array(&arr, name, args, block)?))
 }
 
 fn as_i(v: &Value) -> i64 {
