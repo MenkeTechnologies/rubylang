@@ -906,16 +906,31 @@ fn dispatch_number(
         }
         "to_i" | "to_int" | "floor" if name != "floor" => Ok(Value::Int(as_i(recv))),
         "to_f" => Ok(Value::Float(as_f(recv))),
-        "abs" => Ok(match recv {
+        "abs" | "magnitude" => Ok(match recv {
             Value::Int(n) => Value::Int(n.abs()),
             Value::Float(f) => Value::Float(f.abs()),
+            _ => recv.clone(),
+        }),
+        // `abs2` is the square of the magnitude (self * self), preserving the
+        // Integer/Float distinction like Ruby's `Numeric#abs2`.
+        "abs2" => Ok(match recv {
+            Value::Int(n) => Value::Int(n * n),
+            Value::Float(f) => Value::Float(f * f),
             _ => recv.clone(),
         }),
         "even?" => Ok(Value::Bool(as_i(recv) % 2 == 0)),
         "odd?" => Ok(Value::Bool(as_i(recv) % 2 != 0)),
         "zero?" => Ok(Value::Bool(as_f(recv) == 0.0)),
+        // `nonzero?` returns self when non-zero, else nil (`Value::Undef`).
+        "nonzero?" => Ok(if as_f(recv) != 0.0 {
+            recv.clone()
+        } else {
+            Value::Undef
+        }),
         "positive?" => Ok(Value::Bool(as_f(recv) > 0.0)),
         "negative?" => Ok(Value::Bool(as_f(recv) < 0.0)),
+        // `Integer#integer?` is true; `Float#integer?` is false.
+        "integer?" => Ok(Value::Bool(matches!(recv, Value::Int(_)))),
         "succ" | "next" => Ok(Value::Int(as_i(recv) + 1)),
         "pred" => Ok(Value::Int(as_i(recv) - 1)),
         "floor" => Ok(round_like(recv, args.first().map(as_i), f64::floor)),

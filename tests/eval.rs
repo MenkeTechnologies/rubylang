@@ -1340,6 +1340,28 @@ fn string_bytes_batch() {
 }
 
 #[test]
+fn numeric_predicates_batch() {
+    eq("0.zero?", "true");
+    eq("5.zero?", "false");
+    eq("0.0.zero?", "true");
+    eq("5.positive?", "true");
+    eq("(-3).negative?", "true");
+    eq("5.nonzero?", "5");
+    eq("0.nonzero?", "nil");
+    eq("4.even?", "true");
+    eq("5.odd?", "true");
+    eq("5.integer?", "true");
+    eq("3.14.integer?", "false");
+    eq("(-4).abs2", "16");
+    eq("3.abs2", "9");
+    eq("3.14.abs2", "9.8596");
+    eq("(-4).magnitude", "4");
+    eq("(-4.0).magnitude", "4.0");
+    eq("6.succ", "7");
+    eq("6.pred", "5");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
