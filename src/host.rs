@@ -1481,6 +1481,108 @@ impl RubyHost {
         }
         false
     }
+    /// The ancestor chain of a class (self first), including modules, matching
+    /// `Module#ancestors`. Builtin types use a fixed table; user classes walk
+    /// their superclass chain and included modules, then close with the
+    /// `Object`/`Kernel`/`BasicObject` root.
+    pub fn class_ancestry(&self, name: &str) -> Vec<String> {
+        let own = |mods: &[&str]| {
+            let mut v = vec![name.to_string()];
+            v.extend(mods.iter().map(|s| s.to_string()));
+            v.extend(["Object", "Kernel", "BasicObject"].map(String::from));
+            v
+        };
+        match name {
+            "BasicObject" => vec!["BasicObject".into()],
+            "Object" => vec!["Object".into(), "Kernel".into(), "BasicObject".into()],
+            // Bare modules are their own only ancestor here.
+            "Kernel" | "Comparable" | "Enumerable" => vec![name.into()],
+            "Numeric" => own(&["Comparable"]),
+            "Integer" | "Float" | "Rational" => own(&["Numeric", "Comparable"]),
+            "Complex" => own(&["Numeric"]),
+            "String" | "Symbol" | "Time" | "Date" => own(&["Comparable"]),
+            "Array" | "Hash" | "Range" | "Set" | "Struct" => own(&["Enumerable"]),
+            _ => {
+                if self.classes.contains_key(name) {
+                    // A user-defined class: self, its included modules, then up
+                    // the superclass chain; finally the common root.
+                    let mut out = Vec::new();
+                    let mut cur = Some(name.to_string());
+                    while let Some(n) = cur {
+                        out.push(n.clone());
+                        match self.classes.get(&n) {
+                            Some(def) => {
+                                for m in def.includes.iter().rev() {
+                                    out.push(m.clone());
+                                }
+                                cur = def.superclass.clone();
+                            }
+                            None => {
+                                // Superclass is a builtin (e.g. StandardError):
+                                // splice in its ancestry and stop.
+                                out.pop();
+                                out.extend(self.class_ancestry(&n));
+                                return dedup_keep_first(out);
+                            }
+                        }
+                    }
+                    out.extend(["Object", "Kernel", "BasicObject"].map(String::from));
+                    dedup_keep_first(out)
+                } else if is_builtin_exception_name(name) {
+                    // Exception hierarchy: <name> → Exception → Object → …
+                    if name == "Exception" {
+                        own(&[])
+                    } else {
+                        let mut v = vec![name.to_string(), "Exception".to_string()];
+                        v.extend(["Object", "Kernel", "BasicObject"].map(String::from));
+                        v
+                    }
+                } else {
+                    own(&[])
+                }
+            }
+        }
+    }
+    /// The direct superclass name of a class (`Module#superclass`), or `None`
+    /// for `BasicObject`. Derived from the ancestry, skipping modules.
+    pub fn class_superclass(&self, name: &str) -> Option<String> {
+        if name == "BasicObject" {
+            return None;
+        }
+        // User class with an explicit superclass.
+        if let Some(sc) = self.superclass_of(name) {
+            return Some(sc);
+        }
+        // Otherwise the first non-module ancestor after `name`.
+        let modules = ["Kernel", "Comparable", "Enumerable"];
+        self.class_ancestry(name)
+            .into_iter()
+            .skip(1)
+            .find(|a| !modules.contains(&a.as_str()))
+            .or_else(|| {
+                // A user class with no explicit superclass inherits from Object.
+                if self.classes.contains_key(name) {
+                    Some("Object".to_string())
+                } else {
+                    None
+                }
+            })
+    }
+    /// The Ruby `<` class relation: `Some(true)` when `a` is a proper descendant
+    /// of `b`, `Some(false)` when `a == b` or `a` is an ancestor of `b`, and
+    /// `None` when the two classes are unrelated.
+    pub fn class_lt(&self, a: &str, b: &str) -> Option<bool> {
+        if a == b {
+            return Some(false);
+        }
+        if self.class_ancestry(a).iter().any(|c| c == b) {
+            return Some(true); // b is an ancestor of a → a < b
+        }
+        if self.class_ancestry(b).iter().any(|c| c == a) {
+            return Some(false); // a is an ancestor of b
+        }
+        None
+    }
     /// Whether `name` is a builtin class/type name (for constant resolution).
     pub fn is_builtin_class(&self, name: &str) -> bool {
         matches!(
@@ -2165,6 +2267,25 @@ impl RubyHost {
                 _ => {}
             }
         }
+        // Class comparison operators (`Integer < Numeric`): true when the left
+        // class is a proper subclass, false when equal or an ancestor, nil when
+        // the two classes are unrelated.
+        if matches!(op, Lt | Gt | Le | Ge) {
+            if let (Some(x), Some(y)) = (self.classref_name(a), self.classref_name(b)) {
+                let res = match op {
+                    Lt => self.class_lt(&x, &y),
+                    Gt => self.class_lt(&y, &x),
+                    Le if x == y => Some(true),
+                    Le => self.class_lt(&x, &y),
+                    Ge if x == y => Some(true),
+                    _ => self.class_lt(&y, &x),
+                };
+                return Ok(match res {
+                    Some(b) => Value::Bool(b),
+                    None => Value::Undef,
+                });
+            }
+        }
         // Set `+` (union) and `-` (difference) arrive as native Add/Sub; the
         // bitwise-named set operators (`|`/`&`/`^`) route through method dispatch.
         if let Some(xs) = self.as_set(a) {
@@ -2358,6 +2479,21 @@ fn as_int(v: &Value) -> Option<i64> {
         Value::Float(f) => Some(*f as i64),
         _ => None,
     }
+}
+
+/// Remove duplicate entries from an ancestry list, keeping the first occurrence
+/// (a module included at several levels appears once, at its earliest position).
+fn dedup_keep_first(items: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .filter(|x| seen.insert(x.clone()))
+        .collect()
+}
+
+/// Whether `name` is a builtin exception class name (for ancestry).
+fn is_builtin_exception_name(name: &str) -> bool {
+    name.ends_with("Error") || name == "Exception" || name == "StopIteration"
 }
 
 fn cmp_ord(op: NumOp, o: std::cmp::Ordering) -> bool {

@@ -535,3 +535,18 @@ Dog
 ArgumentError: caught
 8
 1
+#==#
+[Integer, Numeric, Comparable, Object, Kernel, BasicObject]
+Object
+Numeric
+true
+true
+
+Shape
+[Circle, Shape, Object, Kernel, BasicObject]
+true
+true
+
+[Sprite, Drawable, Object, Kernel, BasicObject]
+true
+["Numeric", "Integer", "Float"]

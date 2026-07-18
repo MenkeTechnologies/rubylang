@@ -2358,6 +2358,50 @@ fn time_utc() {
 }
 
 #[test]
+fn class_reflection() {
+    // superclass walks the class chain (skipping modules).
+    eq("Integer.superclass", "Numeric");
+    eq("String.superclass", "Object");
+    eq("Numeric.superclass", "Object");
+    eq("Object.superclass", "BasicObject");
+    eq("BasicObject.superclass", "nil");
+    eq("class A; end; A.superclass", "Object");
+    eq("class A; end; class B < A; end; B.superclass", "A");
+    // ancestors includes modules.
+    eq(
+        "Integer.ancestors",
+        "[Integer, Numeric, Comparable, Object, Kernel, BasicObject]",
+    );
+    eq(
+        "String.ancestors",
+        "[String, Comparable, Object, Kernel, BasicObject]",
+    );
+    eq(
+        "Array.ancestors",
+        "[Array, Enumerable, Object, Kernel, BasicObject]",
+    );
+    eq(
+        "class A; end; class B < A; end; B.ancestors",
+        "[B, A, Object, Kernel, BasicObject]",
+    );
+    eq(
+        "module M; end; class C; include M; end; C.ancestors",
+        "[C, M, Object, Kernel, BasicObject]",
+    );
+    eq("Integer.ancestors.include?(Numeric)", "true");
+    eq("5.class.ancestors.first", "Integer");
+    // The class comparison operators: subclass (<), self-or-subclass (<=),
+    // unrelated (nil).
+    eq("Integer < Numeric", "true");
+    eq("Integer <= Integer", "true");
+    eq("Integer < Integer", "false");
+    eq("Numeric > Integer", "true");
+    eq("String < Numeric", "nil");
+    eq("class A; end; class B < A; end; B < A", "true");
+    eq("Object > Integer", "true");
+}
+
+#[test]
 fn object_class_returns_class_object() {
     // `.class` is a Class object (prints the bare name), not its String name.
     eq("5.class", "Integer");

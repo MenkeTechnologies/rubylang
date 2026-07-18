@@ -1027,6 +1027,21 @@ fn dispatch_classref(
             }
         }
         "name" | "to_s" | "inspect" => Ok(new_str(cls.to_string())),
+        // `Class#superclass` — the direct superclass reference, or nil for
+        // `BasicObject`.
+        "superclass" => Ok(with_host(|h| match h.class_superclass(cls) {
+            Some(sc) => h.class_ref(&sc),
+            None => Value::Undef,
+        })),
+        // `Module#ancestors` — the class/module ancestor chain as class refs.
+        "ancestors" => Ok(with_host(|h| {
+            let refs: Vec<Value> = h
+                .class_ancestry(cls)
+                .iter()
+                .map(|n| h.class_ref(n))
+                .collect();
+            h.new_array(refs)
+        })),
         // Numeric class constants (`Float::INFINITY`, `Float::NAN`, …), reached
         // via `::` (which lowers to a method call on the class reference).
         "INFINITY" if cls == "Float" => Ok(Value::Float(f64::INFINITY)),

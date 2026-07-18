@@ -77,9 +77,12 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   the pattern, lookaround) are unavailable.
 - **`Object#class` returns a Class object** (a class reference): `p obj.class`
   prints the bare name, `obj.class == SomeClass` and `Integer == Integer`
-  compare by class identity, and `obj.class.name` / `.to_s` give the name. Not
-  yet: `Class#ancestors`/`#superclass`, and a Class object does not round-trip as
-  a Hash key (it reduces to its name String).
+  compare by class identity, and `obj.class.name` / `.to_s` give the name.
+  `Class#superclass` and `Module#ancestors` walk the class chain (builtin types
+  use a fixed table; user classes follow their superclass + included modules),
+  and the `<`/`<=`/`>`/`>=` class relations return `true`/`false`/`nil` like
+  Ruby (`Integer < Numeric` → true, `String < Numeric` → nil). Not yet: a Class
+  object does not round-trip as a Hash key (it reduces to its name String).
 - **Enumerator.** A block-less `each`/`map`/`select`/`reject`/`each_with_index`
   (on arrays), `String#each_char`/`each_byte`/`each_line`, and
   `Integer#times`/`upto`/`downto`/`step`

@@ -954,3 +954,23 @@ rescue => e
 end
 puts values.map(&:class).uniq.length
 puts values.count { |v| v.class == Integer }
+#==#
+puts Integer.ancestors.inspect
+puts String.superclass
+puts Float.superclass
+puts(Integer < Numeric)
+puts(Integer < Comparable)
+puts(String < Numeric).inspect
+class Shape; def area; 0; end; end
+class Circle < Shape; end
+class Square < Shape; end
+puts Circle.superclass
+puts Circle.ancestors.inspect
+puts(Circle < Shape)
+puts(Shape > Circle)
+puts(Circle < Square).inspect
+module Drawable; end
+class Sprite; include Drawable; end
+puts Sprite.ancestors.inspect
+puts Sprite.ancestors.include?(Drawable)
+puts [Integer, Float, Numeric].sort_by { |c| c.ancestors.length }.map(&:name).inspect
