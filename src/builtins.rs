@@ -490,8 +490,39 @@ fn dispatch(
             let cls = name_of(&args[0]);
             return Ok(Value::Bool(with_host(|h| h.class_of(recv)) == cls));
         }
-        "freeze" | "itself" | "dup" | "clone" | "tap" if name != "tap" => return Ok(recv.clone()),
-        "frozen?" => return Ok(Value::Bool(false)),
+        "freeze" | "itself" => return Ok(recv.clone()),
+        // `dup`/`clone` make a fresh shallow copy so mutating the copy does not
+        // leak back to the original (Ruby's shallow-copy semantics).
+        "dup" | "clone" => return Ok(with_host(|h| h.dup_value(recv))),
+        // Immediates (Integer/Float/true/false/nil) and Symbols are always frozen
+        // in Ruby; freeze itself is a best-effort no-op so mutable reference types
+        // report unfrozen.
+        "frozen?" => {
+            let frozen = match recv {
+                Value::Obj(_) => with_host(|h| h.as_symbol(recv).is_some()),
+                _ => true,
+            };
+            return Ok(Value::Bool(frozen));
+        }
+        "instance_variable_get" => {
+            let raw = name_of(&args[0]);
+            let key = raw.strip_prefix('@').unwrap_or(&raw);
+            return Ok(with_host(|h| h.ivar_of(recv, key)));
+        }
+        "instance_variable_set" => {
+            let raw = name_of(&args[0]);
+            let key = raw.strip_prefix('@').unwrap_or(&raw).to_string();
+            let val = args[1].clone();
+            with_host(|h| h.set_ivar_of(recv, &key, val.clone()));
+            return Ok(val);
+        }
+        "instance_variables" => {
+            let names = with_host(|h| h.ivar_names(recv));
+            return Ok(with_host(|h| {
+                let syms: Vec<Value> = names.iter().map(|n| h.new_symbol(n)).collect();
+                h.new_array(syms)
+            }));
+        }
         "tap" => {
             if let Some(b) = &block {
                 call_proc(b, std::slice::from_ref(recv))?;

@@ -399,9 +399,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     space: core::mem::take(&mut sp),
                 });
             }
-            b':' if i + 1 < b.len() && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_') => {
+            b':' if i + 1 < b.len()
+                && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_' || b[i + 1] == b'@') =>
+            {
                 i += 1;
                 let start = i;
+                // Instance/class-variable symbols keep their sigil: `:@x`, `:@@x`.
+                while i < b.len() && b[i] == b'@' {
+                    i += 1;
+                }
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                     i += 1;
                 }

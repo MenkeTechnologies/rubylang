@@ -335,6 +335,21 @@ impl RubyHost {
             _ => None,
         }
     }
+    /// Shallow copy of `v` for `Object#dup`/`clone`: reference types get a fresh
+    /// heap object whose contents alias the original (like Ruby's shallow dup);
+    /// immediates (Int/Float/Bool/nil/Symbol) return unchanged.
+    pub fn dup_value(&mut self, v: &Value) -> Value {
+        match self.obj(v) {
+            // Interned symbols and class references dup to themselves in Ruby;
+            // copying them would break identity/interning.
+            Some(RObj::Symbol(_)) | Some(RObj::ClassRef(_)) => v.clone(),
+            Some(obj) => {
+                let copy = obj.clone();
+                self.alloc(copy)
+            }
+            None => v.clone(),
+        }
+    }
     pub fn new_string(&mut self, s: String) -> Value {
         self.alloc(RObj::Str(s))
     }
@@ -791,6 +806,21 @@ impl RubyHost {
         match self.obj(obj) {
             Some(RObj::Object { ivars, .. }) => ivars.get(name).cloned().unwrap_or(Value::Undef),
             _ => Value::Undef,
+        }
+    }
+    /// Set the instance variable `name` (bare, no `@`) on a specific object.
+    pub fn set_ivar_of(&mut self, obj: &Value, name: &str, v: Value) {
+        if let Value::Obj(i) = obj {
+            if let Some(RObj::Object { ivars, .. }) = self.heap.get_mut(*i as usize) {
+                ivars.insert(name.to_string(), v);
+            }
+        }
+    }
+    /// The instance-variable names of `obj`, each with its `@` sigil restored.
+    pub fn ivar_names(&self, obj: &Value) -> Vec<String> {
+        match self.obj(obj) {
+            Some(RObj::Object { ivars, .. }) => ivars.keys().map(|k| format!("@{k}")).collect(),
+            _ => Vec::new(),
         }
     }
     /// Bind method parameters to the call arguments, honoring a single `*splat`

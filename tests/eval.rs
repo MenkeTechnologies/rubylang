@@ -768,6 +768,45 @@ fn kernel_convert_batch() {
 }
 
 #[test]
+fn object_model_batch() {
+    // instance_variable_get / _set / instance_variables (symbols keep the @ sigil)
+    eq(
+        "class C; def initialize; @x=5; end; end; C.new.instance_variable_get(:@x)",
+        "5",
+    );
+    eq(
+        "class C; def initialize; @x=5; @y=6; end; end; C.new.instance_variables",
+        "[:@x, :@y]",
+    );
+    eq(
+        "class C; end; o=C.new; o.instance_variable_set(:@z, 9); o.instance_variable_get(:@z)",
+        "9",
+    );
+    // is_a? / kind_of? / instance_of?
+    eq("5.instance_of?(Integer)", "true");
+    eq("5.instance_of?(Numeric)", "false");
+    eq("5.kind_of?(Numeric)", "true");
+    eq("5.is_a?(Integer)", "true");
+    // send / public_send
+    eq("\"hi\".send(:upcase)", "\"HI\"");
+    eq("\"hi\".public_send(:upcase)", "\"HI\"");
+    eq("[1,2,3].send(:length)", "3");
+    // respond_to?
+    eq("\"hi\".respond_to?(:upcase)", "true");
+    // dup makes an independent shallow copy (mutating the copy does not leak)
+    eq("a=[1,2]; b=a.dup; b<<3; a", "[1, 2]");
+    eq("a=[1,2]; b=a.dup; b<<3; b", "[1, 2, 3]");
+    // frozen? — immediates and symbols are frozen; mutable containers are not
+    eq("5.frozen?", "true");
+    eq("nil.frozen?", "true");
+    eq(":sym.frozen?", "true");
+    eq("\"x\".frozen?", "false");
+    eq("[1].frozen?", "false");
+    // itself returns the receiver
+    eq("[1,2].itself", "[1, 2]");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
