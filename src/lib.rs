@@ -41,9 +41,11 @@ pub fn run_compiled(prog: compiler::Program) -> Result<Value, String> {
     let compiler::Program {
         main,
         methods,
+        classes,
+        begins,
         procs,
     } = prog;
-    host::with_host(|h| h.load_program(methods, procs));
+    host::with_host(|h| h.load_program(methods, classes, begins, procs));
     host::run_main(main)
 }
 

@@ -10,7 +10,7 @@
 //! cleanly instead of loading stale bytecode.
 
 use crate::compiler::Program;
-use crate::host::{MethodDef, ProcDef};
+use crate::host::{BeginDef, ClassDef, MethodDef, ProcDef, RescueDef};
 use fusevm::Chunk;
 use rkyv::{Archive, Deserialize as RkyvDe, Serialize as RkyvSer};
 use serde::{Deserialize, Serialize};
@@ -34,12 +34,26 @@ struct Entry {
     blob: Vec<u8>,
 }
 
-/// The inner, serde/bincode form of a compiled program.
+/// (name/method-name, params, chunk) — a serde-flat method.
+type CMethod = (String, Vec<String>, Chunk);
+/// (name, superclass, methods) — a serde-flat class.
+type CClass = (String, Option<String>, Vec<CMethod>);
+/// (rescue classes, binding, proc id) — a serde-flat rescue clause.
+type CRescue = (Vec<String>, Option<String>, usize);
+/// (body proc id, rescues, ensure proc id) — a serde-flat begin block.
+type CBegin = (usize, Vec<CRescue>, Option<usize>);
+/// (params, chunk) — a serde-flat proc template.
+type CProc = (Vec<String>, Chunk);
+
+/// The inner, serde/bincode form of a compiled program. Tuples keep the shape
+/// flat so `fusevm::Chunk`'s serde impl is the only nontrivial dependency.
 #[derive(Serialize, Deserialize)]
 struct CProg {
     main: Chunk,
-    methods: Vec<(String, Vec<String>, Chunk)>,
-    procs: Vec<(Vec<String>, Chunk)>,
+    methods: Vec<CMethod>,
+    classes: Vec<CClass>,
+    begins: Vec<CBegin>,
+    procs: Vec<CProc>,
 }
 
 /// A stable content key for a source string.
@@ -99,6 +113,30 @@ fn to_cprog(prog: &Program) -> CProg {
             .iter()
             .map(|(n, m)| (n.clone(), m.params.clone(), m.chunk.clone()))
             .collect(),
+        classes: prog
+            .classes
+            .iter()
+            .map(|(n, c)| {
+                let methods = c
+                    .methods
+                    .iter()
+                    .map(|(mn, m)| (mn.clone(), m.params.clone(), m.chunk.clone()))
+                    .collect();
+                (n.clone(), c.superclass.clone(), methods)
+            })
+            .collect(),
+        begins: prog
+            .begins
+            .iter()
+            .map(|bd| {
+                let rescues = bd
+                    .rescues
+                    .iter()
+                    .map(|r| (r.classes.clone(), r.binding.clone(), r.body))
+                    .collect();
+                (bd.body, rescues, bd.ensure)
+            })
+            .collect(),
         procs: prog
             .procs
             .iter()
@@ -114,6 +152,42 @@ fn from_cprog(cp: CProg) -> Program {
             .methods
             .into_iter()
             .map(|(n, params, chunk)| (n, MethodDef { params, chunk }))
+            .collect(),
+        classes: cp
+            .classes
+            .into_iter()
+            .map(|(n, superclass, methods)| {
+                let methods = methods
+                    .into_iter()
+                    .map(|(mn, params, chunk)| (mn, MethodDef { params, chunk }))
+                    .collect();
+                (
+                    n,
+                    ClassDef {
+                        superclass,
+                        methods,
+                    },
+                )
+            })
+            .collect(),
+        begins: cp
+            .begins
+            .into_iter()
+            .map(|(body, rescues, ensure)| {
+                let rescues = rescues
+                    .into_iter()
+                    .map(|(classes, binding, body)| RescueDef {
+                        classes,
+                        binding,
+                        body,
+                    })
+                    .collect();
+                BeginDef {
+                    body,
+                    rescues,
+                    ensure,
+                }
+            })
             .collect(),
         procs: cp
             .procs

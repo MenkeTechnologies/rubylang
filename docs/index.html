@@ -188,9 +188,13 @@ puts({ a: 1, b: 2 }.merge({ c: 3 }).keys.length)   # =&gt; 3</pre>
             <tr><td>Blocks, <code>yield</code>, closures</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Scope-sharing blocks; <code>break</code>/<code>next</code>/<code>return</code> control flow.</td></tr>
             <tr><td>Standalone <code>ruby</code> binary + REPL</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Run <code>.rb</code> files, <code>-e</code> one-liners, interactive REPL (<code>src/main.rs</code>).</td></tr>
             <tr><td>rkyv bytecode script cache</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Versioned, migration-safe on-disk cache (<code>src/cache.rs</code>).</td></tr>
+            <tr><td>Classes, inheritance, <code>attr_*</code></td><td><span class="status-pill status-implemented">Implemented</span></td><td><code>initialize</code>, instance vars, single inheritance, method chaining (<code>src/host.rs</code>).</td></tr>
+            <tr><td>Exceptions (<code>begin</code>/<code>rescue</code>/<code>ensure</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Typed classes, method-body + modifier <code>rescue</code>, custom exception classes.</td></tr>
+            <tr><td>Parallel assignment, default args</td><td><span class="status-pill status-implemented">Implemented</span></td><td><code>a, b = 1, 2</code>, array destructuring; defaulted parameters.</td></tr>
+            <tr><td>Parity harness vs reference <code>ruby</code></td><td><span class="status-pill status-implemented">Implemented</span></td><td>Differential corpus, frozen + replayed in CI (<code>tests/parity.rs</code>).</td></tr>
             <tr><td>LSP server (<code>--lsp</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Diagnostics, hover, completion (<code>src/lsp.rs</code>).</td></tr>
             <tr><td>DAP adapter (<code>--dap</code>)</td><td><span class="status-pill status-progress">Partial</span></td><td>Handshake + run-to-completion with stdout capture; stepping is a later wave (<code>src/dap.rs</code>).</td></tr>
-            <tr><td>User classes / modules, exceptions</td><td><span class="status-pill status-planned">Planned</span></td><td>Parsed where present; full <code>class</code>/<code>rescue</code> semantics pending.</td></tr>
+            <tr><td>Modules/mixins, splat/keyword params</td><td><span class="status-pill status-planned">Planned</span></td><td><code>include</code>, <code>super</code>, <code>*args</code>/<code>**kwargs</code>, class methods pending.</td></tr>
           </tbody>
         </table>
       </section>

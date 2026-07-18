@@ -137,6 +137,79 @@ fn multi_param_block_destructures_a_single_array() {
 }
 
 #[test]
+fn classes_with_initialize_attrs_and_methods() {
+    eq(
+        "class Point; attr_accessor :x, :y; def initialize(a, b); @x = a; @y = b; end; \
+         def to_s; \"(#{@x}, #{@y})\"; end; end; \
+         p = Point.new(3, 4); p.x = 10; p.to_s",
+        "\"(10, 4)\"",
+    );
+}
+
+#[test]
+fn inheritance_and_implicit_self_dispatch() {
+    eq(
+        "class Animal; def speak; \"...\"; end; def describe; \"I say #{speak}\"; end; end; \
+         class Dog < Animal; def speak; \"woof\"; end; end; Dog.new.describe",
+        "\"I say woof\"",
+    );
+}
+
+#[test]
+fn method_chaining_returning_self() {
+    eq(
+        "class Counter; def initialize; @n = 0; end; def inc; @n += 1; self; end; \
+         def value; @n; end; end; Counter.new.inc.inc.inc.value",
+        "3",
+    );
+}
+
+#[test]
+fn exceptions_rescue_and_ensure() {
+    eq(
+        "begin; raise \"boom\"; rescue => e; e.message; end",
+        "\"boom\"",
+    );
+    eq(
+        "class MyError < StandardError; end; \
+         begin; raise MyError, \"x\"; rescue MyError => e; e.message; end",
+        "\"x\"",
+    );
+    // A rescue only catches matching classes; ensure always runs.
+    eq(
+        "r = begin; 1 / 0; rescue ZeroDivisionError; :caught; end; r",
+        ":caught",
+    );
+}
+
+#[test]
+fn method_body_rescue_without_begin() {
+    eq(
+        "def safe(a, b); a / b; rescue ZeroDivisionError; -1; end; safe(6, 0)",
+        "-1",
+    );
+}
+
+#[test]
+fn default_arguments() {
+    eq(
+        "def g(name = \"world\"); \"hi #{name}\"; end; g",
+        "\"hi world\"",
+    );
+    eq(
+        "def g(name = \"world\"); \"hi #{name}\"; end; g(\"ruby\")",
+        "\"hi ruby\"",
+    );
+}
+
+#[test]
+fn parallel_assignment() {
+    eq("a, b = 1, 2; a, b = b, a; [a, b]", "[2, 1]");
+    eq("x, y, z = [10, 20, 30]; x + y + z", "60");
+    eq("a, b = 5; [a, b]", "[5, nil]");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

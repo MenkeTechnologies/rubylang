@@ -24,9 +24,11 @@ fn store_then_load_reproduces_the_program() {
     let compiler::Program {
         main,
         methods,
+        classes,
+        begins,
         procs,
     } = loaded;
-    host::with_host(|h| h.load_program(methods, procs));
+    host::with_host(|h| h.load_program(methods, classes, begins, procs));
     let v = host::run_main(main).expect("run cached");
     let got = host::with_host(|h| h.inspect(&v));
     assert_eq!(got, "42");

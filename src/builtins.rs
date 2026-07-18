@@ -9,8 +9,8 @@
 
 use crate::host::ops;
 use crate::host::{
-    call_method, call_proc, current_block, has_pending_signal, raise_signal_break,
-    raise_signal_next, raise_signal_return, take_break, with_host,
+    call_instance_method, call_method, call_proc, current_block, has_pending_signal,
+    raise_signal_break, raise_signal_next, raise_signal_return, take_break, with_host,
 };
 use fusevm::{Value, VM};
 use indexmap::IndexMap;
@@ -44,6 +44,23 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::SIG_BREAK, b_sig_break);
     vm.register_builtin(ops::SIG_NEXT, b_sig_next);
     vm.register_builtin(ops::SIG_RETURN, b_sig_return);
+    vm.register_builtin(ops::GETSELF, b_getself);
+    vm.register_builtin(ops::BEGIN, b_begin);
+}
+
+fn b_getself(_vm: &mut VM, _: u8) -> Value {
+    with_host(|h| h.current_self())
+}
+
+fn b_begin(vm: &mut VM, _: u8) -> Value {
+    let id = match vm.pop() {
+        Value::Int(n) => n as usize,
+        _ => return abort(vm, "bad begin id".into()),
+    };
+    match crate::host::run_begin(id) {
+        Ok(v) => propagate(vm, v),
+        Err(e) => abort(vm, e),
+    }
 }
 
 /// Pop `n` values, returning them in push order (first pushed at index 0).
@@ -75,8 +92,9 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     if defined {
         return v;
     }
-    // A bare name that is not a local is a zero-arg call to a user method.
-    if with_host(|h| h.has_method(&name)) {
+    // A bare name that is not a local is a zero-arg call to a method on `self`
+    // (or a top-level method).
+    if with_host(|h| h.responds_to(&name)) {
         return match call_method(&name, &[], None) {
             Ok(v) => propagate(vm, v),
             Err(e) => abort(vm, e),
@@ -122,7 +140,22 @@ fn b_setgvar(vm: &mut VM, _: u8) -> Value {
 }
 fn b_getconst(vm: &mut VM, _: u8) -> Value {
     let name = name_of(&vm.pop());
-    with_host(|h| h.get_const(&name))
+    let v = with_host(|h| h.get_const(&name));
+    if !matches!(v, Value::Undef) {
+        return v;
+    }
+    // An unassigned constant that names a class (user-defined, or a builtin
+    // exception like `RuntimeError`) resolves to a class reference.
+    if with_host(|h| h.class_exists(&name)) || is_builtin_exception(&name) {
+        return with_host(|h| h.class_ref(&name));
+    }
+    v
+}
+
+/// Builtin exception class names that resolve to a class reference even without
+/// a user `class` definition.
+fn is_builtin_exception(name: &str) -> bool {
+    name.ends_with("Error") || name == "Exception" || name == "StopIteration"
 }
 fn b_setconst(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
@@ -178,13 +211,11 @@ fn b_call_method_blk(vm: &mut VM, argc: u8) -> Value {
 
 fn b_mkstr(vm: &mut VM, argc: u8) -> Value {
     let parts = pop_n(vm, argc as usize);
-    with_host(|h| {
-        let mut s = String::new();
-        for p in &parts {
-            s.push_str(&h.to_s(p));
-        }
-        h.new_string(s)
-    })
+    let mut s = String::new();
+    for p in &parts {
+        s.push_str(&display(p));
+    }
+    with_host(|h| h.new_string(s))
 }
 fn b_mksym(vm: &mut VM, _: u8) -> Value {
     let name = name_of(&vm.pop());
@@ -303,6 +334,13 @@ fn dispatch(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    // A user-defined method wins over the universal fallbacks (so a class can
+    // override `to_s`, `==`, `inspect`, etc.).
+    if let Some(cls) = with_host(|h| h.object_class(recv)) {
+        if let Some(def) = with_host(|h| h.find_method(&cls, name)) {
+            return call_instance_method(recv.clone(), &def, args, block);
+        }
+    }
     // Universal methods available on every object.
     match name {
         "to_s" => {
@@ -363,7 +401,15 @@ fn dispatch(
         _ => {}
     }
 
-    let class = with_host(|h| h.class_of(recv).to_string());
+    // A class reference (`Foo.new`, `Foo.name`) or a user object.
+    if let Some(cls) = with_host(|h| h.classref_name(recv)) {
+        return dispatch_classref(&cls, name, args, block);
+    }
+    if let Some(cls) = with_host(|h| h.object_class(recv)) {
+        return dispatch_object(recv, &cls, name, args, block);
+    }
+
+    let class = with_host(|h| h.class_of(recv));
     match class.as_str() {
         "Integer" | "Float" => dispatch_number(recv, name, args, block),
         "String" => dispatch_string(recv, name, args, block),
@@ -372,7 +418,61 @@ fn dispatch(
         "Range" => dispatch_range(recv, name, args, block),
         "Symbol" => dispatch_symbol(recv, name, args),
         "Proc" => dispatch_proc(recv, name, args),
-        _ => Err(format!("undefined method '{name}' for {class}")),
+        _ => Err(raise_exc(
+            "NoMethodError",
+            &format!("undefined method '{name}' for {class}"),
+        )),
+    }
+}
+
+/// Methods on a class reference: `new` (allocate + `initialize`), `name`.
+fn dispatch_classref(
+    cls: &str,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    match name {
+        "new" => {
+            let obj = with_host(|h| h.new_object(cls));
+            if let Some(init) = with_host(|h| h.find_method(cls, "initialize")) {
+                call_instance_method(obj.clone(), &init, args, block)?;
+            }
+            Ok(obj)
+        }
+        "name" | "to_s" | "inspect" => Ok(new_str(cls.to_string())),
+        _ => {
+            // A class method defined as `def self.m` is not modeled yet.
+            Err(format!("undefined method '{name}' for {cls}:Class"))
+        }
+    }
+}
+
+/// Methods on a user object: dispatch through the class chain, else the
+/// exception `message` accessor, else an error.
+fn dispatch_object(
+    recv: &Value,
+    cls: &str,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    if let Some(def) = with_host(|h| h.find_method(cls, name)) {
+        return call_instance_method(recv.clone(), &def, args, block);
+    }
+    match name {
+        "message" | "to_s" => {
+            let m = with_host(|h| h.ivar_of(recv, "message"));
+            if matches!(m, Value::Undef) {
+                Ok(new_str(cls.to_string()))
+            } else {
+                Ok(m)
+            }
+        }
+        _ => Err(raise_exc(
+            "NoMethodError",
+            &format!("undefined method '{name}' for an instance of {cls}"),
+        )),
     }
 }
 
@@ -427,12 +527,12 @@ fn dispatch_number(
             }
         }
         "/" => match (recv, &args[0]) {
-            (Value::Int(_), Value::Int(0)) => Err("divided by 0".into()),
+            (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(floor_div(*a, *b))),
             _ => Ok(Value::Float(as_f(recv) / as_f(&args[0]))),
         },
         "%" | "modulo" => match (recv, &args[0]) {
-            (Value::Int(_), Value::Int(0)) => Err("divided by 0".into()),
+            (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(floor_mod(*a, *b))),
             _ => {
                 let (x, y) = (as_f(recv), as_f(&args[0]));
@@ -1201,8 +1301,7 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
         }
         "print" => {
             for a in args {
-                let s = with_host(|h| h.to_s(a));
-                print!("{s}");
+                print!("{}", display(a));
             }
             Ok(Value::Undef)
         }
@@ -1220,16 +1319,53 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
         "pp" => kernel("p", args, block),
         "require" | "require_relative" | "load" => Ok(Value::Bool(true)),
         "raise" | "fail" => {
-            let msg = args
-                .first()
-                .map(|a| with_host(|h| h.to_s(a)))
-                .unwrap_or_else(|| "RuntimeError".into());
-            Err(msg)
+            // Forms: `raise` / `raise "msg"` / `raise SomeError` /
+            // `raise SomeError, "msg"` / `raise instance`.
+            let (class, message) = match args {
+                [] => ("RuntimeError".to_string(), "RuntimeError".to_string()),
+                [a] => {
+                    if let Some(cls) = with_host(|h| h.classref_name(a)) {
+                        (cls.clone(), cls)
+                    } else if let Some(cls) = with_host(|h| h.object_class(a)) {
+                        // Re-raising an existing exception instance.
+                        let m = with_host(|h| h.to_s(a));
+                        with_host(|h| h.set_pending_exc(a.clone()));
+                        return Err(if m.is_empty() { cls } else { m });
+                    } else {
+                        let m = with_host(|h| h.to_s(a));
+                        ("RuntimeError".to_string(), m)
+                    }
+                }
+                [cls, msg, ..] => {
+                    let clsname = with_host(|h| h.classref_name(cls))
+                        .unwrap_or_else(|| with_host(|h| h.to_s(cls)));
+                    (clsname, with_host(|h| h.to_s(msg)))
+                }
+            };
+            let exc = with_host(|h| h.new_exception(&class, &message));
+            with_host(|h| h.set_pending_exc(exc));
+            Err(message)
         }
         "rand" => Ok(kernel_rand(args)),
         "srand" | "sleep" => Ok(Value::Int(0)),
-        "Integer" => Ok(Value::Int(as_i(&args[0]))),
-        "Float" => Ok(Value::Float(as_f(&args[0]))),
+        "Integer" => match &args[0] {
+            Value::Int(n) => Ok(Value::Int(*n)),
+            Value::Float(f) => Ok(Value::Int(*f as i64)),
+            _ => match with_host(|h| h.as_str(&args[0])).and_then(|s| s.trim().parse::<i64>().ok())
+            {
+                Some(n) => Ok(Value::Int(n)),
+                None => Err(raise_exc("ArgumentError", "invalid value for Integer()")),
+            },
+        },
+        "Float" => match &args[0] {
+            Value::Int(n) => Ok(Value::Float(*n as f64)),
+            Value::Float(f) => Ok(Value::Float(*f)),
+            _ => match with_host(|h| h.as_str(&args[0])).and_then(|s| s.trim().parse::<f64>().ok())
+            {
+                Some(f) => Ok(Value::Float(f)),
+                None => Err(raise_exc("ArgumentError", "invalid value for Float()")),
+            },
+        },
         "String" => Ok(with_host(|h| {
             let s = h.to_s(&args[0]);
             h.new_string(s)
@@ -1272,8 +1408,7 @@ fn puts_one(v: &Value) {
             puts_one(e);
         }
     } else {
-        let s = with_host(|h| h.to_s(v));
-        println!("{s}");
+        println!("{}", display(v));
     }
 }
 
@@ -1351,6 +1486,27 @@ fn sprintf(args: &[Value]) -> String {
 
 fn new_str(s: String) -> Value {
     with_host(|h| h.new_string(s))
+}
+
+/// Raise a typed exception: register the exception object (so `rescue Class` can
+/// match it) and return the message as the `Err` payload.
+fn raise_exc(class: &str, msg: &str) -> String {
+    let exc = with_host(|h| h.new_exception(class, msg));
+    with_host(|h| h.set_pending_exc(exc));
+    msg.to_string()
+}
+
+/// The display string of a value — a user object's own `to_s` if it defines one,
+/// otherwise the host's default. Used by `puts`/`print`/interpolation.
+fn display(v: &Value) -> String {
+    if let Some(cls) = with_host(|h| h.object_class(v)) {
+        if with_host(|h| h.find_method(&cls, "to_s")).is_some() {
+            if let Ok(s) = dispatch(v, "to_s", &[], None) {
+                return with_host(|h| h.as_str(&s).unwrap_or_default());
+            }
+        }
+    }
+    with_host(|h| h.to_s(v))
 }
 fn new_arr(items: Vec<Value>) -> Value {
     with_host(|h| h.new_array(items))

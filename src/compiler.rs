@@ -11,7 +11,7 @@
 //! and `""` are true) differs from fusevm's default numeric truthiness.
 
 use crate::ast::*;
-use crate::host::{ops, MethodDef, ProcDef};
+use crate::host::{ops, BeginDef, ClassDef, MethodDef, ProcDef, RescueDef};
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::sync::Arc;
 
@@ -19,6 +19,8 @@ use std::sync::Arc;
 pub struct Program {
     pub main: Chunk,
     pub methods: Vec<(String, MethodDef)>,
+    pub classes: Vec<(String, ClassDef)>,
+    pub begins: Vec<BeginDef>,
     pub procs: Vec<ProcDef>,
 }
 
@@ -32,6 +34,8 @@ struct LoopCtx {
 #[derive(Default)]
 pub struct Compiler {
     methods: Vec<(String, MethodDef)>,
+    classes: Vec<(String, ClassDef)>,
+    begins: Vec<BeginDef>,
     procs: Vec<ProcDef>,
     loops: Vec<LoopCtx>,
 }
@@ -47,6 +51,8 @@ pub fn compile(stmts: &[Stmt]) -> Result<Program, String> {
     Ok(Program {
         main: b.build(),
         methods: c.methods,
+        classes: c.classes,
+        begins: c.begins,
         procs: c.procs,
     })
 }
@@ -66,6 +72,32 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// Compile a method: a prologue that fills in any defaulted parameter the
+    /// caller omitted (`defined?(p) ? p : <default>`), then the body.
+    fn compile_method(&mut self, params: &[Param], body: &[Expr]) -> Result<MethodDef, String> {
+        let saved = std::mem::take(&mut self.loops);
+        let mut b = ChunkBuilder::new();
+        for p in params {
+            if let Some(default) = &p.default {
+                // if !defined?(p) { p = default }
+                self.kstr(&mut b, &p.name);
+                b.emit(Op::CallBuiltin(ops::DEFINED, 1), 0);
+                let skip = b.emit(Op::JumpIfTrue(0), 0);
+                self.compile_assign(&mut b, &Expr::Var(VarKind::Local, p.name.clone()), default)?;
+                b.emit(Op::Pop, 0);
+                let here = b.current_pos();
+                b.patch_jump(skip, here);
+            }
+        }
+        self.compile_seq(&mut b, body)?;
+        self.loops = saved;
+        let pnames = params.iter().map(|p| p.name.clone()).collect();
+        Ok(MethodDef {
+            params: pnames,
+            chunk: b.build(),
+        })
     }
 
     fn compile_body_chunk(&mut self, body: &[Expr]) -> Result<Chunk, String> {
@@ -136,6 +168,9 @@ impl Compiler {
             }
             Expr::Var(kind, name) => self.compile_var_read(b, *kind, name),
             Expr::Assign(target, value) => self.compile_assign(b, target, value)?,
+            Expr::MultiAssign { targets, values } => {
+                self.compile_multi_assign(b, targets, values)?
+            }
             Expr::Unary(op, e) => self.compile_unary(b, *op, e)?,
             Expr::Binary(op, l, r) => self.compile_binary(b, *op, l, r)?,
             Expr::If {
@@ -165,19 +200,26 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::INDEX_GET, argc(1 + idx.len())?), 0);
             }
             Expr::Def { name, params, body } => {
-                let chunk = self.compile_body_chunk(body)?;
-                let pnames = params.iter().map(|p| p.name.clone()).collect();
-                self.methods.push((
-                    name.clone(),
-                    MethodDef {
-                        params: pnames,
-                        chunk,
-                    },
-                ));
+                let def = self.compile_method(params, body)?;
+                self.methods.push((name.clone(), def));
                 // `def` evaluates to the method name as a symbol.
                 self.kstr(b, name);
                 b.emit(Op::CallBuiltin(ops::MKSYM, 1), 0);
             }
+            Expr::Class {
+                name,
+                superclass,
+                body,
+            } => self.compile_class(b, name, superclass, body)?,
+            Expr::Module { name, body } => self.compile_class(b, name, &None, body)?,
+            Expr::SelfExpr => {
+                b.emit(Op::CallBuiltin(ops::GETSELF, 0), 0);
+            }
+            Expr::Begin {
+                body,
+                rescues,
+                ensure,
+            } => self.compile_begin(b, body, rescues, ensure)?,
             Expr::Return(e) => self.compile_flow(b, e, ops::SIG_RETURN, FlowKind::Return)?,
             Expr::Break(e) => self.compile_flow(b, e, ops::SIG_BREAK, FlowKind::Break)?,
             Expr::Next(e) => self.compile_flow(b, e, ops::SIG_NEXT, FlowKind::Next)?,
@@ -192,10 +234,6 @@ impl Compiler {
     }
 
     fn compile_var_read(&mut self, b: &mut ChunkBuilder, kind: VarKind, name: &str) {
-        if kind == VarKind::Local && name == "self" {
-            b.emit(Op::LoadUndef, 0);
-            return;
-        }
         let op = match kind {
             VarKind::Local => ops::GETLOCAL,
             VarKind::Instance => ops::GETIVAR,
@@ -232,8 +270,55 @@ impl Compiler {
                 self.compile_expr(b, value)?;
                 b.emit(Op::CallBuiltin(ops::INDEX_SET, argc(2 + idx.len())?), 0);
             }
+            // Attribute assignment: `recv.attr = v` is the setter call
+            // `recv.attr=(v)`.
+            Expr::Call {
+                recv: Some(r),
+                name,
+                args,
+                block: None,
+            } if args.is_empty() => {
+                self.compile_expr(b, r)?;
+                self.kstr(b, &format!("{name}="));
+                self.compile_expr(b, value)?;
+                b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), 0);
+            }
             _ => return Err("invalid assignment target".into()),
         }
+        Ok(())
+    }
+
+    /// Parallel assignment: normalize the right-hand side to an array in a
+    /// synthetic local, assign each target from its index, and yield the array.
+    fn compile_multi_assign(
+        &mut self,
+        b: &mut ChunkBuilder,
+        targets: &[Expr],
+        values: &[Expr],
+    ) -> Result<(), String> {
+        let tmp = "__massign__";
+        // rhs = a single Array (splat) or the coerced value list.
+        let rhs = if values.len() == 1 {
+            Expr::Call {
+                recv: None,
+                name: "Array".into(),
+                args: vec![values[0].clone()],
+                block: None,
+            }
+        } else {
+            Expr::Array(values.to_vec())
+        };
+        self.compile_assign(b, &Expr::Var(VarKind::Local, tmp.into()), &rhs)?;
+        b.emit(Op::Pop, 0);
+        for (i, t) in targets.iter().enumerate() {
+            let idx = Expr::Index(
+                Box::new(Expr::Var(VarKind::Local, tmp.into())),
+                vec![Expr::Int(i as i64)],
+            );
+            self.compile_assign(b, t, &idx)?;
+            b.emit(Op::Pop, 0);
+        }
+        self.compile_var_read(b, VarKind::Local, tmp);
         Ok(())
     }
 
@@ -523,13 +608,127 @@ impl Compiler {
     }
 
     fn compile_proc(&mut self, block: &Block) -> Result<usize, String> {
-        let chunk = self.compile_body_chunk(&block.body)?;
+        self.compile_proc_body(&block.body, &block.params)
+    }
+
+    /// Compile a body into a proc template with the given params; return its id.
+    fn compile_proc_body(&mut self, body: &[Expr], params: &[String]) -> Result<usize, String> {
+        let chunk = self.compile_body_chunk(body)?;
         let id = self.procs.len();
         self.procs.push(ProcDef {
-            params: block.params.clone(),
+            params: params.to_vec(),
             chunk,
         });
         Ok(id)
+    }
+
+    /// Lower a `class`/`module` body: `def`s become instance methods and
+    /// `attr_*` calls generate accessor methods. Other class-body statements are
+    /// not yet executed (constants/`include` — tracked in BUGS.md).
+    fn compile_class(
+        &mut self,
+        b: &mut ChunkBuilder,
+        name: &str,
+        superclass: &Option<String>,
+        body: &[Expr],
+    ) -> Result<(), String> {
+        let mut methods: indexmap::IndexMap<String, MethodDef> = indexmap::IndexMap::new();
+        for stmt in body {
+            match stmt {
+                Expr::Def { name, params, body } => {
+                    let def = self.compile_method(params, body)?;
+                    methods.insert(name.clone(), def);
+                }
+                Expr::Call {
+                    recv: None,
+                    name: m,
+                    args,
+                    ..
+                } if matches!(m.as_str(), "attr_accessor" | "attr_reader" | "attr_writer") => {
+                    for a in args {
+                        if let Some(field) = sym_name(a) {
+                            if m != "attr_writer" {
+                                methods.insert(field.clone(), self.build_getter(&field));
+                            }
+                            if m != "attr_reader" {
+                                methods.insert(format!("{field}="), self.build_setter(&field));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.classes.push((
+            name.to_string(),
+            ClassDef {
+                superclass: superclass.clone(),
+                methods,
+            },
+        ));
+        // A class/module definition evaluates to nil here.
+        b.emit(Op::LoadUndef, 0);
+        Ok(())
+    }
+
+    /// A generated `attr_reader` method body: `@field`.
+    fn build_getter(&mut self, field: &str) -> MethodDef {
+        let mut b = ChunkBuilder::new();
+        let idx = b.add_constant(Value::Str(Arc::new(field.to_string())));
+        b.emit(Op::LoadConst(idx), 0);
+        b.emit(Op::CallBuiltin(ops::GETIVAR, 1), 0);
+        MethodDef {
+            params: vec![],
+            chunk: b.build(),
+        }
+    }
+
+    /// A generated `attr_writer` method body: `@field = value`.
+    fn build_setter(&mut self, field: &str) -> MethodDef {
+        let mut b = ChunkBuilder::new();
+        let fidx = b.add_constant(Value::Str(Arc::new(field.to_string())));
+        b.emit(Op::LoadConst(fidx), 0);
+        let vidx = b.add_constant(Value::Str(Arc::new("value".to_string())));
+        b.emit(Op::LoadConst(vidx), 0);
+        b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
+        b.emit(Op::CallBuiltin(ops::SETIVAR, 2), 0);
+        MethodDef {
+            params: vec!["value".to_string()],
+            chunk: b.build(),
+        }
+    }
+
+    fn compile_begin(
+        &mut self,
+        b: &mut ChunkBuilder,
+        body: &[Expr],
+        rescues: &[Rescue],
+        ensure: &Option<Vec<Expr>>,
+    ) -> Result<(), String> {
+        let body_id = self.compile_proc_body(body, &[])?;
+        let mut rdefs = Vec::new();
+        for r in rescues {
+            let params: Vec<String> = r.binding.iter().cloned().collect();
+            let rid = self.compile_proc_body(&r.body, &params)?;
+            rdefs.push(RescueDef {
+                classes: r.classes.clone(),
+                binding: r.binding.clone(),
+                body: rid,
+            });
+        }
+        let ensure_id = match ensure {
+            Some(e) => Some(self.compile_proc_body(e, &[])?),
+            None => None,
+        };
+        let begin_id = self.begins.len();
+        self.begins.push(BeginDef {
+            body: body_id,
+            rescues: rdefs,
+            ensure: ensure_id,
+        });
+        b.emit(Op::LoadInt(begin_id as i64), 0);
+        b.emit(Op::CallBuiltin(ops::BEGIN, 1), 0);
+        Ok(())
     }
 
     fn compile_flow(
@@ -575,6 +774,18 @@ enum FlowKind {
     Return,
     Break,
     Next,
+}
+
+/// The field name from an `attr_*` argument (`:sym` or `"str"`).
+fn sym_name(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Symbol(s) => Some(s.clone()),
+        Expr::Str(parts) => match parts.as_slice() {
+            [StrPart::Lit(s)] => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// argc must fit in a `u8`; a call/collection wider than 255 is rejected.

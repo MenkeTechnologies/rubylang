@@ -81,6 +81,11 @@ pub enum Expr {
     Var(VarKind, String),
     /// `target op= value` is desugared in the parser to `Assign(target, Bin(...))`.
     Assign(Box<Expr>, Box<Expr>),
+    /// `a, b, c = 1, 2, 3` (or `a, b = arr`) — parallel assignment.
+    MultiAssign {
+        targets: Vec<Expr>,
+        values: Vec<Expr>,
+    },
 
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
@@ -126,6 +131,26 @@ pub enum Expr {
         params: Vec<Param>,
         body: Vec<Expr>,
     },
+    /// `class Name [< Super] … end`.
+    Class {
+        name: String,
+        superclass: Option<String>,
+        body: Vec<Expr>,
+    },
+    /// `module Name … end` (treated as a namespace of methods for now).
+    Module {
+        name: String,
+        body: Vec<Expr>,
+    },
+    /// `self`.
+    SelfExpr,
+
+    /// `begin … rescue [Class] [=> e] … ensure … end`.
+    Begin {
+        body: Vec<Expr>,
+        rescues: Vec<Rescue>,
+        ensure: Option<Vec<Expr>>,
+    },
 
     Return(Option<Box<Expr>>),
     Break(Option<Box<Expr>>),
@@ -146,6 +171,16 @@ pub enum StrPart {
 pub struct Param {
     pub name: String,
     pub default: Option<Expr>,
+}
+
+/// One `rescue` clause of a `begin`/`rescue` block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rescue {
+    /// Exception class names to match (empty = catch StandardError/any).
+    pub classes: Vec<String>,
+    /// Optional `=> name` binding for the caught exception.
+    pub binding: Option<String>,
+    pub body: Vec<Expr>,
 }
 
 /// A top-level statement. Ruby is expression-oriented; this is a thin wrapper so

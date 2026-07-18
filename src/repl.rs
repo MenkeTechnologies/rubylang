@@ -51,9 +51,11 @@ fn eval_line(line: &str) {
     let crate::compiler::Program {
         main,
         methods,
+        classes,
+        begins,
         procs,
     } = prog;
-    host::with_host(|h| h.load_program(methods, procs));
+    host::with_host(|h| h.load_program(methods, classes, begins, procs));
     match host::run_main(main) {
         Ok(v) => {
             let s = host::with_host(|h| h.inspect(&v));

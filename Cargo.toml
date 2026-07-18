@@ -38,6 +38,14 @@ path = "src/main.rs"
 name = "gen-docs"
 path = "src/bin/gen_docs.rs"
 
+# Differential parity harness: runs the corpus through rubyrs and the reference
+# `ruby`, diffing stdout. Development tool — needs `ruby` on PATH, so CI never
+# runs it; its frozen outputs live in tests/data/parity_expected.txt, which
+# tests/parity.rs replays with no `ruby` installed.
+[[bin]]
+name = "parity"
+path = "src/bin/parity.rs"
+
 [dependencies]
 # Ruby executes on fusevm. rubyrs is a pure frontend: it lowers Ruby to fusevm
 # bytecode (src/compiler.rs) and hosts the Ruby object heap (src/host.rs,

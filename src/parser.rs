@@ -135,6 +135,21 @@ impl Parser {
     /// (`expr if cond`, `expr while cond`, …).
     fn statement(&mut self) -> Result<Expr, String> {
         let mut e = self.expr()?;
+        // Parallel assignment is a statement-level form: `a, b = 1, 2`. A comma
+        // after a bare lvalue (not consumed by a command call) starts the target
+        // list. (Detecting this in `assign()` would misfire on array elements.)
+        if self.is_op(",") {
+            let mut targets = vec![e];
+            while self.eat_op(",") {
+                targets.push(self.ternary()?);
+            }
+            self.expect_op("=")?;
+            let mut values = vec![self.ternary()?];
+            while self.eat_op(",") {
+                values.push(self.ternary()?);
+            }
+            e = Expr::MultiAssign { targets, values };
+        }
         loop {
             if self.eat_kw("if") {
                 let cond = self.expr()?;
@@ -163,6 +178,18 @@ impl Parser {
                 e = Expr::While {
                     cond: Box::new(Expr::Unary(UnOp::Not, Box::new(cond))),
                     body: vec![e],
+                };
+            } else if self.eat_kw("rescue") {
+                // `expr rescue fallback` — a bare rescue catching StandardError.
+                let handler = self.expr()?;
+                e = Expr::Begin {
+                    body: vec![e],
+                    rescues: vec![Rescue {
+                        classes: vec![],
+                        binding: None,
+                        body: vec![handler],
+                    }],
+                    ensure: None,
                 };
             } else {
                 break;
@@ -588,6 +615,12 @@ impl Parser {
             | Tok::Const(_)
             | Tok::Ident(_) => true,
             Tok::Keyword(k) => matches!(k.as_str(), "nil" | "true" | "false" | "self"),
+            // A tight unary sign (`puts -7` — space before `-`, none after) is a
+            // command argument; a spaced `x - 7` stays a binary operator (the
+            // caller only reaches here when a space already precedes the token).
+            Tok::Op(o) if o == "-" || o == "+" => {
+                !self.toks.get(self.pos + 1).map(|t| t.space).unwrap_or(true)
+            }
             Tok::Op(o) => o == "[" || o == "(",
             _ => false,
         }
@@ -609,7 +642,7 @@ impl Parser {
             }
             "self" => {
                 self.advance();
-                Ok(Expr::Var(VarKind::Local, "self".into()))
+                Ok(Expr::SelfExpr)
             }
             "if" => self.if_expr(false),
             "unless" => self.if_expr(true),
@@ -618,6 +651,8 @@ impl Parser {
             "for" => self.for_expr(),
             "case" => self.case_expr(),
             "def" => self.def_expr(),
+            "class" => self.class_expr(),
+            "module" => self.module_expr(),
             "return" => {
                 self.advance();
                 Ok(Expr::Return(self.opt_value()?))
@@ -646,15 +681,15 @@ impl Parser {
                 Ok(Expr::Yield(args))
             }
             "begin" => {
-                // minimal begin/end (rescue/ensure parsed and dropped for now)
                 self.advance();
-                let body = self.body_until(&["end", "rescue", "ensure"])?;
-                while self.is_kw("rescue") || self.is_kw("ensure") {
-                    self.advance();
-                    let _ = self.body_until(&["end", "rescue", "ensure"])?;
-                }
+                let body = self.body_until(&["rescue", "ensure", "end"])?;
+                let (rescues, ensure) = self.rescue_tail()?;
                 self.expect_kw("end")?;
-                Ok(block_value(body))
+                Ok(Expr::Begin {
+                    body,
+                    rescues,
+                    ensure,
+                })
             }
             other => Err(format!(
                 "line {}: unexpected keyword '{}'",
@@ -763,6 +798,92 @@ impl Parser {
         })
     }
 
+    fn class_expr(&mut self) -> Result<Expr, String> {
+        self.advance(); // class
+        let name = match self.advance() {
+            Tok::Const(s) => s,
+            other => {
+                return Err(format!(
+                    "line {}: expected class name, found '{}'",
+                    self.line(),
+                    other
+                ))
+            }
+        };
+        let superclass = if self.eat_op("<") {
+            match self.advance() {
+                Tok::Const(s) => Some(s),
+                other => {
+                    return Err(format!(
+                        "line {}: expected superclass, found '{}'",
+                        self.line(),
+                        other
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+        let body = self.body_until(&["end"])?;
+        self.expect_kw("end")?;
+        Ok(Expr::Class {
+            name,
+            superclass,
+            body,
+        })
+    }
+
+    fn module_expr(&mut self) -> Result<Expr, String> {
+        self.advance(); // module
+        let name = match self.advance() {
+            Tok::Const(s) => s,
+            other => {
+                return Err(format!(
+                    "line {}: expected module name, found '{}'",
+                    self.line(),
+                    other
+                ))
+            }
+        };
+        let body = self.body_until(&["end"])?;
+        self.expect_kw("end")?;
+        Ok(Expr::Module { name, body })
+    }
+
+    /// Parse the `rescue …` clauses and optional `ensure …` after a body.
+    fn rescue_tail(&mut self) -> Result<(Vec<Rescue>, Option<Vec<Expr>>), String> {
+        let mut rescues = Vec::new();
+        while self.eat_kw("rescue") {
+            let mut classes = Vec::new();
+            // optional list of exception class names
+            while let Tok::Const(c) = self.peek().clone() {
+                self.advance();
+                classes.push(c);
+                if !self.eat_op(",") {
+                    break;
+                }
+            }
+            let binding = if self.eat_op("=>") {
+                Some(self.ident_name()?)
+            } else {
+                None
+            };
+            self.eat_kw("then");
+            let body = self.body_until(&["rescue", "ensure", "end"])?;
+            rescues.push(Rescue {
+                classes,
+                binding,
+                body,
+            });
+        }
+        let ensure = if self.eat_kw("ensure") {
+            Some(self.body_until(&["end"])?)
+        } else {
+            None
+        };
+        Ok((rescues, ensure))
+    }
+
     fn def_expr(&mut self) -> Result<Expr, String> {
         self.advance();
         let name = self.method_name()?;
@@ -782,9 +903,26 @@ impl Parser {
                 params.push(self.param()?);
             }
         }
-        let body = self.body_until(&["end"])?;
+        let body = self.body_with_rescue()?;
         self.expect_kw("end")?;
         Ok(Expr::Def { name, params, body })
+    }
+
+    /// A method body that may carry a bare `rescue`/`ensure` (implicit `begin`),
+    /// stopping at `end`. If any rescue/ensure clause is present, the body is
+    /// wrapped in a `Begin` node.
+    fn body_with_rescue(&mut self) -> Result<Vec<Expr>, String> {
+        let body = self.body_until(&["rescue", "ensure", "end"])?;
+        let (rescues, ensure) = self.rescue_tail()?;
+        if rescues.is_empty() && ensure.is_none() {
+            Ok(body)
+        } else {
+            Ok(vec![Expr::Begin {
+                body,
+                rescues,
+                ensure,
+            }])
+        }
     }
 
     fn param(&mut self) -> Result<Param, String> {
@@ -875,21 +1013,6 @@ fn matchop(op: &str) -> BinOp {
         "<<" => BinOp::Shl,
         ">>" => BinOp::Shr,
         _ => unreachable!("not a binary op: {op}"),
-    }
-}
-
-/// Wrap a body so it yields its last expression's value (used by `begin`/`end`).
-fn block_value(mut body: Vec<Expr>) -> Expr {
-    if body.len() == 1 {
-        body.pop().unwrap()
-    } else {
-        // fabricate an if-true wrapper that evaluates the sequence
-        Expr::If {
-            cond: Box::new(Expr::True),
-            then: body,
-            elifs: vec![],
-            els: None,
-        }
     }
 }
 

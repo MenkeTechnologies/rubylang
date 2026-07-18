@@ -46,6 +46,8 @@ pub mod ops {
     pub const SIG_BREAK: u16 = 25; // [v] -> halt block, propagate break
     pub const SIG_NEXT: u16 = 26; // [v] -> halt block, block value = v
     pub const SIG_RETURN: u16 = 27; // [v] -> halt method, return v
+    pub const GETSELF: u16 = 28; // [] -> current self
+    pub const BEGIN: u16 = 29; // [begin_id] -> run begin/rescue/ensure
 }
 
 /// A heap object — the Ruby reference types.
@@ -68,6 +70,37 @@ pub enum RObj {
         template: usize,
         frame: usize,
     },
+    /// A user-defined object: its class name and its instance variables.
+    Object {
+        class: String,
+        ivars: IndexMap<String, Value>,
+    },
+    /// A reference to a class/module (the value of a constant like `Foo`), used
+    /// as the receiver of `Foo.new`, `Foo.name`, etc.
+    ClassRef(String),
+}
+
+/// A user-defined class: its optional superclass and its instance methods.
+#[derive(Clone, Default)]
+pub struct ClassDef {
+    pub superclass: Option<String>,
+    pub methods: IndexMap<String, MethodDef>,
+}
+
+/// A `begin`/`rescue`/`ensure` block, compiled to proc templates.
+#[derive(Clone)]
+pub struct BeginDef {
+    pub body: usize,
+    pub rescues: Vec<RescueDef>,
+    pub ensure: Option<usize>,
+}
+
+/// One compiled `rescue` clause.
+#[derive(Clone)]
+pub struct RescueDef {
+    pub classes: Vec<String>,
+    pub binding: Option<String>,
+    pub body: usize,
 }
 
 /// A hashable Ruby value used as a Hash key.
@@ -99,6 +132,8 @@ pub struct ProcDef {
 struct Frame {
     locals: IndexMap<String, Value>,
     block: Option<Value>,
+    /// The receiver `self` this frame runs against (`Undef` = top-level main).
+    self_obj: Value,
 }
 
 /// A non-local control signal raised by `break`/`next`/`return` inside a block.
@@ -116,9 +151,13 @@ pub struct RubyHost {
     globals: IndexMap<String, Value>,
     consts: IndexMap<String, Value>,
     methods: IndexMap<String, MethodDef>,
+    classes: IndexMap<String, ClassDef>,
+    begins: Vec<BeginDef>,
     procs: Vec<ProcDef>,
     symbols: IndexMap<String, u32>,
     pub error: Option<String>,
+    /// The exception object of the in-flight `raise`, if any (for `rescue`).
+    pending_exc: Option<Value>,
     signal: Option<Signal>,
     /// The frame local variable access targets. `None` = the top of the frame
     /// stack (a method body / top level); `Some(i)` = a captured frame while a
@@ -153,23 +192,38 @@ impl RubyHost {
             frames: vec![Frame {
                 locals: IndexMap::new(),
                 block: None,
+                self_obj: Value::Undef,
             }],
             globals: IndexMap::new(),
             consts: IndexMap::new(),
             methods: IndexMap::new(),
+            classes: IndexMap::new(),
+            begins: Vec::new(),
             procs: Vec::new(),
             symbols: IndexMap::new(),
             error: None,
+            pending_exc: None,
             signal: None,
             active_frame: None,
         }
     }
 
-    /// Install compiled methods and block templates before running main.
-    pub fn load_program(&mut self, methods: Vec<(String, MethodDef)>, procs: Vec<ProcDef>) {
+    /// Install compiled methods, classes, begin-blocks, and block templates
+    /// before running main.
+    pub fn load_program(
+        &mut self,
+        methods: Vec<(String, MethodDef)>,
+        classes: Vec<(String, ClassDef)>,
+        begins: Vec<BeginDef>,
+        procs: Vec<ProcDef>,
+    ) {
         for (name, def) in methods {
             self.methods.insert(name, def);
         }
+        for (name, def) in classes {
+            self.classes.insert(name, def);
+        }
+        self.begins = begins;
         self.procs = procs;
     }
 
@@ -273,8 +327,24 @@ impl RubyHost {
     pub fn has_method(&self, name: &str) -> bool {
         self.methods.contains_key(name)
     }
-    pub fn class_of(&self, v: &Value) -> &'static str {
-        self.class_name(v)
+    /// Whether a bare name resolves as a callable method — a method on the
+    /// current `self`'s class, or a top-level method.
+    pub fn responds_to(&self, name: &str) -> bool {
+        if let Some(cls) = self.object_class(&self.current_self()) {
+            if self.find_method(&cls, name).is_some() {
+                return true;
+            }
+        }
+        self.methods.contains_key(name)
+    }
+    /// The class name of any value — the dynamic class for a user object, the
+    /// builtin class name otherwise.
+    pub fn class_of(&self, v: &Value) -> String {
+        match self.obj(v) {
+            Some(RObj::Object { class, .. }) => class.clone(),
+            Some(RObj::ClassRef(_)) => "Class".to_string(),
+            _ => self.class_name(v).to_string(),
+        }
     }
     pub fn value_to_key(&self, v: &Value) -> RKey {
         self.to_key(v)
@@ -330,15 +400,139 @@ impl RubyHost {
     pub fn set_const(&mut self, name: &str, v: Value) {
         self.consts.insert(name.to_string(), v);
     }
-    // Instance vars share the top-level object for now (no user classes yet).
+    // Instance vars live on the current `self` object; at the top level (self is
+    // the main object) they fall back to a global-keyed table.
     pub fn get_ivar(&self, name: &str) -> Value {
-        self.globals
-            .get(&format!("@{name}"))
-            .cloned()
-            .unwrap_or(Value::Undef)
+        match self.current_self() {
+            Value::Obj(_) => {
+                if let Some(RObj::Object { ivars, .. }) = self.obj(&self.current_self()) {
+                    return ivars.get(name).cloned().unwrap_or(Value::Undef);
+                }
+                Value::Undef
+            }
+            _ => self
+                .globals
+                .get(&format!("@{name}"))
+                .cloned()
+                .unwrap_or(Value::Undef),
+        }
     }
     pub fn set_ivar(&mut self, name: &str, v: Value) {
-        self.globals.insert(format!("@{name}"), v);
+        let this = self.current_self();
+        match this {
+            Value::Obj(i) => {
+                if let Some(RObj::Object { ivars, .. }) = self.heap.get_mut(i as usize) {
+                    ivars.insert(name.to_string(), v);
+                }
+            }
+            _ => {
+                self.globals.insert(format!("@{name}"), v);
+            }
+        }
+    }
+
+    // ---- classes / objects / self -----------------------------------------
+
+    /// The receiver of the currently-active frame.
+    pub fn current_self(&self) -> Value {
+        self.frames[self.active_idx()].self_obj.clone()
+    }
+    /// Register a user class.
+    pub fn add_class(&mut self, name: String, def: ClassDef) {
+        self.classes.insert(name, def);
+    }
+    pub fn class_exists(&self, name: &str) -> bool {
+        self.classes.contains_key(name)
+    }
+    /// Allocate an instance of `class`.
+    pub fn new_object(&mut self, class: &str) -> Value {
+        self.alloc(RObj::Object {
+            class: class.to_string(),
+            ivars: IndexMap::new(),
+        })
+    }
+    pub fn class_ref(&mut self, name: &str) -> Value {
+        self.alloc(RObj::ClassRef(name.to_string()))
+    }
+    /// The class name of a user object, if `v` is one.
+    pub fn object_class(&self, v: &Value) -> Option<String> {
+        match self.obj(v) {
+            Some(RObj::Object { class, .. }) => Some(class.clone()),
+            _ => None,
+        }
+    }
+    pub fn classref_name(&self, v: &Value) -> Option<String> {
+        match self.obj(v) {
+            Some(RObj::ClassRef(n)) => Some(n.clone()),
+            _ => None,
+        }
+    }
+    /// Look up `method` on `class`, walking the superclass chain.
+    pub fn find_method(&self, class: &str, method: &str) -> Option<MethodDef> {
+        let mut cur = Some(class.to_string());
+        while let Some(name) = cur {
+            let def = self.classes.get(&name)?;
+            if let Some(m) = def.methods.get(method) {
+                return Some(m.clone());
+            }
+            cur = def.superclass.clone();
+        }
+        None
+    }
+    /// If `self_obj` is a user object whose class defines `method`, return the
+    /// method and the receiver (for implicit-self calls inside instance methods).
+    fn method_for_self(&self, self_obj: &Value, method: &str) -> Option<(MethodDef, Value)> {
+        let class = self.object_class(self_obj)?;
+        self.find_method(&class, method)
+            .map(|m| (m, self_obj.clone()))
+    }
+    pub fn ivar_of(&self, obj: &Value, name: &str) -> Value {
+        match self.obj(obj) {
+            Some(RObj::Object { ivars, .. }) => ivars.get(name).cloned().unwrap_or(Value::Undef),
+            _ => Value::Undef,
+        }
+    }
+
+    // ---- exceptions -------------------------------------------------------
+
+    pub fn set_pending_exc(&mut self, v: Value) {
+        self.pending_exc = Some(v);
+    }
+    pub fn take_pending_exc(&mut self) -> Option<Value> {
+        self.pending_exc.take()
+    }
+    /// Build an exception object of `class` carrying `message`.
+    pub fn new_exception(&mut self, class: &str, message: &str) -> Value {
+        let msg = self.new_string(message.to_string());
+        let mut ivars = IndexMap::new();
+        ivars.insert("message".to_string(), msg);
+        self.alloc(RObj::Object {
+            class: class.to_string(),
+            ivars,
+        })
+    }
+    /// Whether an exception of class `exc_class` is caught by a `rescue` naming
+    /// `rescued` (walks the exception's superclass chain; unknown classes match
+    /// generously so a bare `StandardError` rescue still fires).
+    pub fn exc_matches(&self, exc_class: &str, rescued: &str) -> bool {
+        if exc_class == rescued || rescued == "Exception" || rescued == "StandardError" {
+            return true;
+        }
+        // Walk the user superclass chain if the exception is a user class.
+        let mut cur = Some(exc_class.to_string());
+        while let Some(name) = cur {
+            if name == rescued {
+                return true;
+            }
+            cur = self.classes.get(&name).and_then(|d| d.superclass.clone());
+        }
+        false
+    }
+    pub fn begin_def(&self, id: usize) -> Option<BeginDef> {
+        self.begins.get(id).cloned()
+    }
+    pub fn proc_def(&self, id: usize) -> ProcDef {
+        self.procs[id].clone()
     }
 
     // ---- truthiness / conversion -----------------------------------------
@@ -365,6 +559,15 @@ impl RubyHost {
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash(map)) => self.inspect_hash(&map),
                 Some(RObj::Proc { .. }) => "#<Proc>".to_string(),
+                Some(RObj::ClassRef(n)) => n,
+                Some(RObj::Object { class, ivars }) => {
+                    // An exception object prints its message; other objects show
+                    // their class, like Ruby's default `to_s`.
+                    match ivars.get("message") {
+                        Some(m) => self.to_s(&m.clone()),
+                        None => format!("#<{class}>"),
+                    }
+                }
                 None => "nil".to_string(),
             },
             _ => String::new(),
@@ -428,6 +631,8 @@ impl RubyHost {
                 Some(RObj::Symbol(_)) => "Symbol",
                 Some(RObj::Range { .. }) => "Range",
                 Some(RObj::Proc { .. }) => "Proc",
+                Some(RObj::ClassRef(_)) => "Class",
+                Some(RObj::Object { .. }) => "Object",
                 None => "Object",
             },
             _ => "Object",
@@ -608,20 +813,28 @@ pub fn run_main(chunk: Chunk) -> Result<Value, String> {
     r
 }
 
-/// Invoke a user method by name: push a fresh frame, bind args, run the body.
-pub fn call_method(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, String> {
-    let def = with_host(|h| h.methods.get(name).cloned());
-    let Some(def) = def else {
-        return Err(format!("undefined method '{name}'"));
-    };
-    // Push a fresh frame for the method body and run it with locals targeting
-    // that new top frame (not any captured block frame from the caller).
+/// Run a resolved method: push a fresh frame bound to `self_obj`, bind args, and
+/// run the body with locals targeting that new top frame.
+fn run_method(
+    def: &MethodDef,
+    self_obj: Value,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
     let saved_active = with_host(|h| {
         let mut locals = IndexMap::new();
+        // Bind only the args the caller actually passed; an omitted parameter is
+        // left unbound so the method prologue can apply its default.
         for (i, p) in def.params.iter().enumerate() {
-            locals.insert(p.clone(), args.get(i).cloned().unwrap_or(Value::Undef));
+            if let Some(v) = args.get(i) {
+                locals.insert(p.clone(), v.clone());
+            }
         }
-        h.frames.push(Frame { locals, block });
+        h.frames.push(Frame {
+            locals,
+            block,
+            self_obj,
+        });
         h.active_frame.take()
     });
     let r = run_chunk_on(def.chunk.clone());
@@ -634,6 +847,119 @@ pub fn call_method(name: &str, args: &[Value], block: Option<Value>) -> Result<V
         Some(Signal::Return(v)) => Ok(v),
         _ => r,
     }
+}
+
+/// Invoke a top-level / implicit-self method by name. If the current `self` is a
+/// user object, its class methods take priority (an unqualified call inside an
+/// instance method dispatches on `self`).
+pub fn call_method(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, String> {
+    let self_obj = with_host(|h| h.current_self());
+    if let Some((def, recv)) = with_host(|h| h.method_for_self(&self_obj, name)) {
+        return run_method(&def, recv, args, block);
+    }
+    let def = with_host(|h| h.methods.get(name).cloned());
+    let Some(def) = def else {
+        return Err(format!("undefined method '{name}'"));
+    };
+    run_method(&def, self_obj, args, block)
+}
+
+/// Invoke a resolved instance method on `recv`.
+pub fn call_instance_method(
+    recv: Value,
+    def: &MethodDef,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    run_method(def, recv, args, block)
+}
+
+/// Run a proc *template* (by id) in the current frame — used for `begin`/`rescue`
+/// /`ensure` bodies, which do not open a new scope. Params (the `rescue => e`
+/// binding) are bound into the current frame and restored afterward.
+fn run_template(id: usize, args: &[Value]) -> Result<Value, String> {
+    let def = with_host(|h| h.proc_def(id));
+    let saved: Vec<(String, Option<Value>)> = with_host(|h| {
+        def.params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let prev = h.get_local(p);
+                let had = h.local_defined(p);
+                h.set_local(p, args.get(i).cloned().unwrap_or(Value::Undef));
+                (p.clone(), had.then_some(prev))
+            })
+            .collect()
+    });
+    let r = run_chunk_on(def.chunk.clone());
+    with_host(|h| {
+        for (p, prev) in saved {
+            match prev {
+                Some(v) => h.set_local(&p, v),
+                None => {
+                    let i = h.active_idx();
+                    h.frames[i].locals.shift_remove(&p);
+                }
+            }
+        }
+    });
+    r
+}
+
+/// Run a `begin`/`rescue`/`ensure` block. The body runs; a raised exception is
+/// matched against each `rescue` clause (by class); `ensure` always runs. An
+/// unrescued exception is re-raised so an outer `begin` (or the top level) sees
+/// it.
+pub fn run_begin(begin_id: usize) -> Result<Value, String> {
+    let Some(bd) = with_host(|h| h.begin_def(begin_id)) else {
+        return Err("bad begin id".to_string());
+    };
+
+    let mut result = run_template(bd.body, &[]);
+
+    let err = result.as_ref().err().cloned();
+    if let Some(e) = err {
+        // Only a *raised exception* (pending_exc set) is rescuable; a bare
+        // `return`/`break` signal must fall through untouched.
+        let has_signal = with_host(|h| h.signal.is_some());
+        if !has_signal {
+            let exc = with_host(|h| h.take_pending_exc());
+            let exc_class = exc
+                .as_ref()
+                .and_then(|v| with_host(|h| h.object_class(v)))
+                .unwrap_or_else(|| "StandardError".to_string());
+            let excv = exc.clone().unwrap_or(Value::Undef);
+            let mut handled = false;
+            for rd in &bd.rescues {
+                let matches = rd.classes.is_empty()
+                    || rd
+                        .classes
+                        .iter()
+                        .any(|c| with_host(|h| h.exc_matches(&exc_class, c)));
+                if matches {
+                    let args = if rd.binding.is_some() {
+                        vec![excv.clone()]
+                    } else {
+                        vec![]
+                    };
+                    result = run_template(rd.body, &args);
+                    handled = true;
+                    break;
+                }
+            }
+            if !handled {
+                // Re-raise for an outer handler.
+                with_host(|h| h.pending_exc = exc);
+                result = Err(e);
+            }
+        }
+    }
+
+    if let Some(eid) = bd.ensure {
+        // `ensure` always runs; an exception it raises supersedes the result.
+        run_template(eid, &[])?;
+    }
+    result
 }
 
 /// Invoke a block/proc with the given arguments in the frame it was *created*
