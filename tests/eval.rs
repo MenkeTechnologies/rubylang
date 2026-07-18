@@ -2358,6 +2358,32 @@ fn time_utc() {
 }
 
 #[test]
+fn symproc_over_array_elements() {
+    // `&:sym` must send the method to each element as a whole — an array
+    // element is the receiver, never auto-splatted into (recv, *args).
+    eq(
+        "[[\"a\", \"b\"], [\"c\", \"d\"]].map(&:join)",
+        "[\"ab\", \"cd\"]",
+    );
+    eq("[[1, 2], [3, 4]].map(&:sum)", "[3, 7]");
+    eq("[[1, 2, 3], [4, 5]].map(&:max)", "[3, 5]");
+    // Chained through Enumerators (each_slice yields sub-arrays).
+    eq("(1..10).each_slice(3).map(&:sum)", "[6, 15, 24, 10]");
+    eq(
+        "\"abcdef\".each_char.each_slice(2).map(&:join)",
+        "[\"ab\", \"cd\", \"ef\"]",
+    );
+    // Surplus-argument forwarding still works: reduce yields (acc, x).
+    eq("[1, 2, 3, 4].reduce(&:+)", "10");
+    eq("[1, 2, 3, 4].reduce(&:*)", "24");
+    // Scalar elements unchanged.
+    eq("[1, -2, 3].map(&:abs)", "[1, 2, 3]");
+    eq("[\"x\", \"y\"].map(&:upcase)", "[\"X\", \"Y\"]");
+    // A pair element: `&:first` takes the whole pair as receiver.
+    eq("[[1, 2], [3, 4]].map(&:first)", "[1, 3]");
+}
+
+#[test]
 fn block_parameter_destructuring() {
     // A `(a, b)` block parameter unpacks the corresponding array argument.
     eq("[[1, 2], [3, 4]].map { |(a, b)| a + b }", "[3, 7]");

@@ -865,3 +865,16 @@ add = ->((x, y)) { x + y }
 puts add.call([7, 8])
 grouped = [[:a, 1], [:a, 2], [:b, 3]]
 puts grouped.each_with_object(Hash.new { |h, k| h[k] = [] }) { |(key, val), acc| acc[key] << val }.inspect
+#==#
+rows = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+puts rows.map(&:sum).inspect
+puts rows.map(&:max).inspect
+puts rows.map(&:min).inspect
+words = [["hello", "world"], ["foo", "bar"]]
+puts words.map(&:join).inspect
+puts (1..12).each_slice(4).map(&:sum).inspect
+puts "abcdefgh".each_char.each_slice(2).map(&:join).inspect
+puts [1, 2, 3, 4, 5].reduce(&:+)
+puts [2, 3, 4].reduce(&:*)
+puts [[3, 1], [2, 4], [5, 0]].map(&:min).inspect
+puts [[3, 1], [2, 4]].sort_by(&:first).inspect

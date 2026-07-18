@@ -589,20 +589,30 @@ impl Parser {
                             // `&:sym` — inline the send as `{ |__blkx__| __blkx__.sym }`.
             if let Tok::Symbol(s) = self.peek().clone() {
                 self.advance(); // :sym
-                                // `{ |__blkx__, *__rest__| __blkx__.sym(*__rest__) }` — Symbol#to_proc
-                                // forwards surplus args, so `reduce(&:+)` calls `acc.+(x)`.
+                                // `{ |*__symargs__| :sym.to_proc.call(*__symargs__) }` —
+                                // `&:sym` is `Symbol#to_proc`, which sends `sym` to its
+                                // first argument and forwards the rest (`reduce(&:+)` →
+                                // `acc.+(x)`). A lone splat parameter is used so a single
+                                // *array* argument is NOT auto-splatted — `[[1,2]].map(&:sum)`
+                                // must call `sum` on `[1, 2]`, not on `1` with arg `2`.
+                let sym_to_proc = Expr::Call {
+                    recv: Some(Box::new(Expr::Symbol(s))),
+                    name: "to_proc".into(),
+                    args: vec![],
+                    block: None,
+                };
                 let call = Expr::Call {
-                    recv: Some(Box::new(Expr::Var(VarKind::Local, "__blkx__".into()))),
-                    name: s,
+                    recv: Some(Box::new(sym_to_proc)),
+                    name: "call".into(),
                     args: vec![Expr::Splat(Box::new(Expr::Var(
                         VarKind::Local,
-                        "__rest__".into(),
+                        "__symargs__".into(),
                     )))],
                     block: None,
                 };
                 *amp_block = Some(Block {
-                    params: vec!["__blkx__".into(), "__rest__".into()],
-                    splat: Some(1),
+                    params: vec!["__symargs__".into()],
+                    splat: Some(0),
                     body: vec![call],
                 });
                 return Ok(());
