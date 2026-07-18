@@ -500,3 +500,9 @@ result = []
 (1..).each { |n| break if n > 6; result << n * n }
 puts result.inspect
 puts (..10).include?(7)
+#==#
+puts("%2$s, %1$s!" % ["World", "Hello"])
+puts("item %1$d costs $%2$.2f (that's %1$d units)" % [3, 4.5])
+puts "STRASSE".downcase(:ascii)
+puts "hello world".upcase(:ascii)
+puts "10:30:45".tr("0-9", "X")

@@ -292,3 +292,9 @@ event
 [100, 101, 102]
 [1, 4, 9, 16, 25, 36]
 true
+#==#
+Hello, World!
+item 3 costs $4.50 (that's 3 units)
+strasse
+HELLO WORLD
+XX:XX:XX

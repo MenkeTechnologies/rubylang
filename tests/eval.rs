@@ -1888,6 +1888,22 @@ fn endless_and_beginless_ranges() {
 }
 
 #[test]
+fn format_positional_and_case_and_tr() {
+    // `%N$` positional arguments; reuse and out-of-order both work.
+    eq("\"%2$s %1$s\" % [\"a\", \"b\"]", "\"b a\"");
+    eq("\"%1$s %1$s\" % [\"x\"]", "\"x x\"");
+    eq("\"%2$s=%1$d\" % [7, \"k\"]", "\"k=7\"");
+    eq("\"%1$05d\" % [42]", "\"00042\"");
+    // `:ascii` case option leaves non-ASCII untouched; default is full Unicode.
+    eq("\"groß\".upcase(:ascii)", "\"GROß\"");
+    eq("\"ÜBER\".downcase(:ascii)", "\"Über\"");
+    eq("\"groß\".upcase", "\"GROSS\"");
+    // A descending tr range raises ArgumentError.
+    assert!(ev("\"12345\".tr(\"0-9\", \"9-0\")").is_err());
+    eq("\"hello\".tr(\"a-y\", \"*\")", "\"*****\"");
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).

@@ -1473,8 +1473,18 @@ fn dispatch_string(
     let s = with_host(|h| h.as_str(recv).unwrap_or_default());
     match name {
         "length" | "size" => Ok(Value::Int(s.chars().count() as i64)),
-        "upcase" => Ok(new_str(s.to_uppercase())),
-        "downcase" => Ok(new_str(s.to_lowercase())),
+        // The `:ascii` option restricts case conversion to the ASCII letters,
+        // leaving non-ASCII code points (ß, ü, …) untouched.
+        "upcase" => Ok(new_str(if is_ascii_case_opt(args) {
+            s.to_ascii_uppercase()
+        } else {
+            s.to_uppercase()
+        })),
+        "downcase" => Ok(new_str(if is_ascii_case_opt(args) {
+            s.to_ascii_lowercase()
+        } else {
+            s.to_lowercase()
+        })),
         "swapcase" => {
             let out: String = s
                 .chars()
@@ -1616,8 +1626,8 @@ fn dispatch_string(
             }
         }
         "tr" => {
-            let (neg, from) = expand_tr_spec(&arg_str(&args[0]), true);
-            let (_, to) = expand_tr_spec(&arg_str(&args[1]), false);
+            let (neg, from) = expand_tr_spec(&arg_str(&args[0]), true)?;
+            let (_, to) = expand_tr_spec(&arg_str(&args[1]), false)?;
             let out: String = s
                 .chars()
                 .filter_map(|c| tr_map(c, neg, &from, &to))
@@ -1910,8 +1920,8 @@ fn dispatch_string(
         // `tr_s`: translate like `tr`, then squeeze runs of chars that were
         // translated (adjacent duplicates produced by the translation collapse).
         "tr_s" => {
-            let (neg, from) = expand_tr_spec(&arg_str(&args[0]), true);
-            let (_, to) = expand_tr_spec(&arg_str(&args[1]), false);
+            let (neg, from) = expand_tr_spec(&arg_str(&args[0]), true)?;
+            let (_, to) = expand_tr_spec(&arg_str(&args[1]), false)?;
             let mut out = String::new();
             let mut last_translated: Option<char> = None;
             for c in s.chars() {
@@ -2405,7 +2415,14 @@ fn parse_char_selector(spec: &str) -> (bool, std::collections::HashSet<char>) {
 /// Expand a `tr`/`tr_s` character spec into an ordered list of chars, honouring
 /// `a-z` ranges, `\`-escapes, and (when `allow_neg`) a leading `^` negation.
 /// Unlike `parse_char_selector` this preserves order for positional mapping.
-fn expand_tr_spec(spec: &str, allow_neg: bool) -> (bool, Vec<char>) {
+/// Whether a case method was passed the `:ascii` option (`"x".upcase(:ascii)`).
+fn is_ascii_case_opt(args: &[Value]) -> bool {
+    args.first()
+        .and_then(|v| with_host(|h| h.as_symbol(v)))
+        .is_some_and(|s| s == "ascii")
+}
+
+fn expand_tr_spec(spec: &str, allow_neg: bool) -> Result<(bool, Vec<char>), String> {
     let chars: Vec<char> = spec.chars().collect();
     let mut i = 0;
     let mut negated = false;
@@ -2420,10 +2437,14 @@ fn expand_tr_spec(spec: &str, allow_neg: bool) -> (bool, Vec<char>) {
             i += 2;
         } else if i + 2 < chars.len() && chars[i + 1] == '-' {
             let (start, end) = (chars[i], chars[i + 2]);
-            if start <= end {
-                for ch in start..=end {
-                    out.push(ch);
-                }
+            if start > end {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!("invalid range \"{start}-{end}\" in string transliteration"),
+                ));
+            }
+            for ch in start..=end {
+                out.push(ch);
             }
             i += 3;
         } else {
@@ -2431,7 +2452,7 @@ fn expand_tr_spec(spec: &str, allow_neg: bool) -> (bool, Vec<char>) {
             i += 1;
         }
     }
-    (negated, out)
+    Ok((negated, out))
 }
 
 /// Translate a single char for `tr`/`tr_s`. `None` means the char is deleted
@@ -5073,6 +5094,26 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
             out.push_str(&arg_str(&named_val(&nm)));
             continue;
         }
+        // `%N$` positional argument selector (1-based): `%2$s` uses args[1] and
+        // does not advance the sequential counter. Only consumes the digits when
+        // they are actually followed by `$`.
+        let mut pos_arg: Option<usize> = None;
+        {
+            let save = i;
+            let mut n = 0usize;
+            let mut saw = false;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                n = n * 10 + (bytes[i] as usize - '0' as usize);
+                i += 1;
+                saw = true;
+            }
+            if saw && i < bytes.len() && bytes[i] == '$' {
+                i += 1;
+                pos_arg = n.checked_sub(1);
+            } else {
+                i = save;
+            }
+        }
         // `%<name>s` reference: Ruby accepts it anywhere in the spec (before
         // flags, between flags and width, or after width), so probe at each
         // stage and let the value flow into the conversion below.
@@ -5152,9 +5193,10 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
             out.push('%');
             continue;
         }
-        let arg = match named_arg {
-            Some(v) => v,
-            None => next_arg(&mut ai),
+        let arg = match (pos_arg, named_arg) {
+            (Some(k), _) => args.get(k).cloned().unwrap_or(Value::Undef),
+            (None, Some(v)) => v,
+            (None, None) => next_arg(&mut ai),
         };
 
         // Per-conversion: (sign, prefix, body, numeric, int_conv, complement fill).
