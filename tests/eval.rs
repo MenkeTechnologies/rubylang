@@ -1684,6 +1684,27 @@ fn enumerable_module_batch() {
 }
 
 #[test]
+fn symbol_more_batch() {
+    // `swapcase` returns a Symbol, inverting case per-character.
+    eq(":hello.swapcase", ":HELLO");
+    eq(":HELLO.swapcase", ":hello");
+    eq(":HeLLo.swapcase", ":hEllO");
+    // `end_with?` mirrors `start_with?`.
+    eq(":hello.end_with?(\"lo\")", "true");
+    eq(":hello.end_with?(\"xy\")", "false");
+    // `match?` tests the name against a Regexp without touching `$~`.
+    eq(":abc.match?(/b/)", "true");
+    eq(":abc.match?(/z/)", "false");
+    // Range/index and succ on the name.
+    eq(":hello[1..3]", "\"ell\"");
+    eq(":abc.succ", ":abd");
+    // `Symbol#to_proc` forwards multiple args: arg[0] is the receiver, the rest
+    // become method arguments.
+    eq(":concat.to_proc.call(\"a\", \"b\")", "\"ab\"");
+    eq(":end_with?.to_proc.call(\"hello\", \"lo\")", "true");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

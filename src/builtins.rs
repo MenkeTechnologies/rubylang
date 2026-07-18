@@ -4034,6 +4034,22 @@ fn dispatch_symbol(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         "upcase" => Ok(with_host(|h| h.new_symbol(&s.to_uppercase()))),
         "downcase" => Ok(with_host(|h| h.new_symbol(&s.to_lowercase()))),
         "succ" | "next" => Ok(with_host(|h| h.new_symbol(&str_succ(&s)))),
+        // `swapcase` returns a Symbol (unlike String's String), inverting case.
+        "swapcase" => {
+            let out: String = s
+                .chars()
+                .map(|c| {
+                    if c.is_uppercase() {
+                        c.to_lowercase().collect::<String>()
+                    } else if c.is_lowercase() {
+                        c.to_uppercase().collect::<String>()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect();
+            Ok(with_host(|h| h.new_symbol(&out)))
+        }
         "capitalize" => {
             let mut c = s.chars();
             let cap = match c.next() {
@@ -4045,6 +4061,14 @@ fn dispatch_symbol(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         // `Symbol#[]` indexes the name and returns a String, like `String#[]`.
         "[]" | "slice" => Ok(str_index(&s, args)),
         "start_with?" => Ok(Value::Bool(args.iter().any(|a| s.starts_with(&arg_str(a))))),
+        "end_with?" => Ok(Value::Bool(args.iter().any(|a| s.ends_with(&arg_str(a))))),
+        // `match?` tests the name against a Regexp (or string pattern) without $~.
+        "match?" => {
+            let m = str_regex(&args[0])
+                .map(|re| re.is_match(&s))
+                .unwrap_or(false);
+            Ok(Value::Bool(m))
+        }
         // `<=>` compares names; nil when the other operand is not a Symbol.
         "<=>" => Ok(match with_host(|h| h.as_symbol(&args[0])) {
             Some(other) => Value::Int(match s.cmp(&other) {
