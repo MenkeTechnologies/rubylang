@@ -549,6 +549,45 @@ fn integer_math_batch() {
 }
 
 #[test]
+fn string_case_batch() {
+    // Case transforms.
+    eq("\"Hello\".swapcase", "\"hELLO\"");
+    eq("\"MixEd\".swapcase", "\"mIXeD\"");
+    eq("\"hello world\".capitalize", "\"Hello world\"");
+    // chomp: no arg removes one trailing separator; arg removes that suffix.
+    eq("\"line\\n\".chomp", "\"line\"");
+    eq("\"string\\n\\n\".chomp", "\"string\\n\"");
+    eq("\"test\\r\\n\".chomp", "\"test\"");
+    eq("\"hello.rb\".chomp(\".rb\")", "\"hello\"");
+    eq("\"a\\n\\n\\n\".chomp(\"\")", "\"a\"");
+    // chop: drop last char, "\r\n" counts as one.
+    eq("\"string\".chop", "\"strin\"");
+    eq("\"string\\n\".chop", "\"string\"");
+    eq("\"x\\r\\n\".chop", "\"x\"");
+    eq("\"\".chop", "\"\"");
+    // strip family.
+    eq("\"  hi  \".strip", "\"hi\"");
+    eq("\"  hi  \".lstrip", "\"hi  \"");
+    eq("\"  hi  \".rstrip", "\"  hi\"");
+    // justify with pad.
+    eq("\"5\".rjust(3, \"0\")", "\"005\"");
+    eq("\"abc\".ljust(5, \".\")", "\"abc..\"");
+    // delete / squeeze / count with selectors (ranges, negation, intersection).
+    eq("\"aaabbb\".squeeze", "\"ab\"");
+    eq("\"yellow moon\".squeeze", "\"yelow mon\"");
+    eq("\"  now   is  the\".squeeze(\" \")", "\" now is the\"");
+    eq("\"aaabbbccc\".squeeze(\"a-b\")", "\"abccc\"");
+    eq("\"aaabbbccc\".squeeze(\"^a\")", "\"aaabc\"");
+    eq("\"hello\".count(\"l\")", "2");
+    eq("\"hello world\".count(\"lo\")", "5");
+    eq("\"hello world\".count(\"^l\")", "8");
+    eq("\"hello world\".count(\"a-y\")", "10");
+    eq("\"hello\".count(\"l\", \"lo\")", "2");
+    eq("\"hello world\".delete(\"l\", \"lo\")", "\"heo word\"");
+    eq("\"hello\".delete(\"a-y\")", "\"\"");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

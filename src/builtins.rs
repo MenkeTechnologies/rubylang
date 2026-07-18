@@ -921,6 +921,21 @@ fn dispatch_string(
         "length" | "size" => Ok(Value::Int(s.chars().count() as i64)),
         "upcase" => Ok(new_str(s.to_uppercase())),
         "downcase" => Ok(new_str(s.to_lowercase())),
+        "swapcase" => {
+            let out: String = s
+                .chars()
+                .map(|c| {
+                    if c.is_uppercase() {
+                        c.to_lowercase().collect::<String>()
+                    } else if c.is_lowercase() {
+                        c.to_uppercase().collect::<String>()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect();
+            Ok(new_str(out))
+        }
         "capitalize" => {
             let mut c = s.chars();
             let out = match c.next() {
@@ -933,7 +948,41 @@ fn dispatch_string(
         "strip" => Ok(new_str(s.trim().to_string())),
         "lstrip" => Ok(new_str(s.trim_start().to_string())),
         "rstrip" => Ok(new_str(s.trim_end().to_string())),
-        "chomp" => Ok(new_str(s.trim_end_matches(['\n', '\r']).to_string())),
+        "chomp" => {
+            let out = match args.first() {
+                Some(a) => {
+                    let sep = arg_str(a);
+                    if sep.is_empty() {
+                        // Paragraph mode: strip all trailing record separators.
+                        s.trim_end_matches(['\n', '\r']).to_string()
+                    } else {
+                        s.strip_suffix(&sep).unwrap_or(&s).to_string()
+                    }
+                }
+                None => {
+                    // Remove one trailing "\r\n", "\n", or "\r".
+                    if let Some(x) = s.strip_suffix("\r\n") {
+                        x.to_string()
+                    } else if let Some(x) = s.strip_suffix('\n').or_else(|| s.strip_suffix('\r')) {
+                        x.to_string()
+                    } else {
+                        s.clone()
+                    }
+                }
+            };
+            Ok(new_str(out))
+        }
+        "chop" => {
+            // Remove the last character; a trailing "\r\n" counts as one.
+            let out = if let Some(x) = s.strip_suffix("\r\n") {
+                x.to_string()
+            } else {
+                let mut c = s.chars();
+                c.next_back();
+                c.as_str().to_string()
+            };
+            Ok(new_str(out))
+        }
         "chars" => Ok(new_arr(s.chars().map(|c| new_str(c.to_string())).collect())),
         "bytes" => Ok(new_arr(s.bytes().map(|b| Value::Int(b as i64)).collect())),
         "lines" => Ok(new_arr(split_lines(&s).into_iter().map(new_str).collect())),
@@ -977,14 +1026,26 @@ fn dispatch_string(
             Ok(new_str(out))
         }
         "delete" => {
-            let set: Vec<char> = arg_str(&args[0]).chars().collect();
-            Ok(new_str(s.chars().filter(|c| !set.contains(c)).collect()))
+            let m = char_matcher(args);
+            Ok(new_str(s.chars().filter(|&c| !m(c)).collect()))
         }
         "count" => {
-            let set: Vec<char> = arg_str(&args[0]).chars().collect();
-            Ok(Value::Int(
-                s.chars().filter(|c| set.contains(c)).count() as i64
-            ))
+            let m = char_matcher(args);
+            Ok(Value::Int(s.chars().filter(|&c| m(c)).count() as i64))
+        }
+        "squeeze" => {
+            let m = char_matcher(args);
+            let all = args.is_empty();
+            let mut prev: Option<char> = None;
+            let mut out = String::new();
+            for c in s.chars() {
+                if Some(c) == prev && (all || m(c)) {
+                    continue;
+                }
+                out.push(c);
+                prev = Some(c);
+            }
+            Ok(new_str(out))
         }
         "empty?" => Ok(Value::Bool(s.is_empty())),
         "to_i" => match args.first().map(as_i) {
@@ -1259,6 +1320,46 @@ fn split_lines(s: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// Parse one Ruby character-selector spec (as used by `count`/`delete`/`squeeze`)
+/// into `(negated, set)`. A char `c` matches the spec when `negated != set.contains(c)`.
+/// Supports leading `^` negation, `a-z` ranges, and `\` escaping.
+fn parse_char_selector(spec: &str) -> (bool, std::collections::HashSet<char>) {
+    let chars: Vec<char> = spec.chars().collect();
+    let mut i = 0;
+    let mut negated = false;
+    if chars.len() > 1 && chars[0] == '^' {
+        negated = true;
+        i = 1;
+    }
+    let mut set = std::collections::HashSet::new();
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            set.insert(chars[i + 1]);
+            i += 2;
+        } else if i + 2 < chars.len() && chars[i + 1] == '-' {
+            let (start, end) = (chars[i], chars[i + 2]);
+            if start <= end {
+                for ch in start..=end {
+                    set.insert(ch);
+                }
+            }
+            i += 3;
+        } else {
+            set.insert(chars[i]);
+            i += 1;
+        }
+    }
+    (negated, set)
+}
+
+/// Build a predicate matching a char against ALL selector specs (Ruby intersects
+/// multiple args). With no args every char matches.
+fn char_matcher(args: &[Value]) -> impl Fn(char) -> bool {
+    let parsed: Vec<(bool, std::collections::HashSet<char>)> =
+        args.iter().map(|v| parse_char_selector(&arg_str(v))).collect();
+    move |c| parsed.iter().all(|(neg, set)| *neg != set.contains(&c))
 }
 
 fn pad_str(args: &[Value]) -> String {
