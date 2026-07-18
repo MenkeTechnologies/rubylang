@@ -1758,10 +1758,56 @@ fn scan_interp(raw: &str) -> Result<Vec<StrPart>, String> {
                 b'r' => lit.push('\r'),
                 b'0' => lit.push('\0'),
                 b'e' => lit.push('\x1b'),
+                b'a' => lit.push('\x07'),
+                b'b' => lit.push('\x08'),
+                b'f' => lit.push('\x0c'),
+                b'v' => lit.push('\x0b'),
                 b's' => lit.push(' '),
                 b'\\' => lit.push('\\'),
                 b'"' => lit.push('"'),
                 b'#' => lit.push('#'),
+                // `\xHH` — one or two hex digits → a byte.
+                b'x' => {
+                    let mut j = i + 2;
+                    let mut val = 0u32;
+                    let mut count = 0;
+                    while j < b.len() && count < 2 && (b[j] as char).is_ascii_hexdigit() {
+                        val = val * 16 + (b[j] as char).to_digit(16).unwrap();
+                        j += 1;
+                        count += 1;
+                    }
+                    if count > 0 {
+                        lit.push(char::from_u32(val).unwrap_or('\u{fffd}'));
+                        i = j;
+                        continue;
+                    }
+                    lit.push('x');
+                }
+                // `\uHHHH` or `\u{H...}` — a Unicode codepoint.
+                b'u' => {
+                    let mut j = i + 2;
+                    let mut val = 0u32;
+                    if b.get(j) == Some(&b'{') {
+                        j += 1;
+                        while j < b.len() && (b[j] as char).is_ascii_hexdigit() {
+                            val = val * 16 + (b[j] as char).to_digit(16).unwrap();
+                            j += 1;
+                        }
+                        if b.get(j) == Some(&b'}') {
+                            j += 1;
+                        }
+                    } else {
+                        let mut count = 0;
+                        while j < b.len() && count < 4 && (b[j] as char).is_ascii_hexdigit() {
+                            val = val * 16 + (b[j] as char).to_digit(16).unwrap();
+                            j += 1;
+                            count += 1;
+                        }
+                    }
+                    lit.push(char::from_u32(val).unwrap_or('\u{fffd}'));
+                    i = j;
+                    continue;
+                }
                 other => {
                     lit.push('\\');
                     lit.push(other as char);

@@ -1098,3 +1098,16 @@ def check(x) = defined?(x) ? "defined" : "undefined"
 puts check(42)
 puts defined?(1 + 2 * 3)
 puts defined?({a: 1}).inspect
+#==#
+puts "tab\tsep\tvalues".inspect
+puts "line1\nline2".inspect
+puts "esc\e[1mbold".inspect
+puts "bell\a and null\x00".inspect
+puts "ctrl\x01\x1f\x7f".inspect
+puts "literal \#{not_interp}".inspect
+puts "unicode: café ☃".inspect
+puts ["a\tb", "c\nd", "e\x00f"].inspect
+puts({"key\t1" => "val\e2"}.inspect)
+data = "field1\x1ffield2\x1efield3"
+puts data.inspect
+puts data.split("\x1f").inspect

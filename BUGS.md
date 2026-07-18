@@ -64,9 +64,14 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   (`0b1010` binary, `0o17`/`017` octal, `0xff` hex, `0d99` decimal, with `_`
   separators), and the `%q`/`%Q`/`%r`/`%s` percent literals (single/double-
   quoted string, Regexp, Symbol — any punctuation delimiter, with `()`/`{}`/
-  `[]`/`<>` nesting) **are** lexed. Not yet: the bare `%(…)` string form (its
-  disambiguation from the modulo operator is skipped; use `%Q(…)`), and
-  `#{`/`#@`-escaping in `String#inspect` for a literal `#{` in a string.
+  `[]`/`<>` nesting) **are** lexed. Double-quoted string escapes cover
+  `\a\b\t\n\v\f\r\e\s\0\\\"\#`, `\xHH` (hex byte), and `\uHHHH`/`\u{H…}`
+  (Unicode). `String#inspect` renders these Ruby-faithfully — named escapes,
+  `\uXXXX` (uppercase) for other control chars, and `\#` before `{`/`@`/`$`. Not
+  yet: the bare `%(…)` string form (its disambiguation from the modulo operator
+  is skipped; use `%Q(…)`), and an unknown escape like `"\d"` keeps its
+  backslash rather than dropping it as MRI does (deliberate, for regex-source
+  strings).
 
 ## Runtime / methods
 

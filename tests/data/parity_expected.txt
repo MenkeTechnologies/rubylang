@@ -624,3 +624,15 @@ require: sym
 defined
 method
 "expression"
+#==#
+"tab\tsep\tvalues"
+"line1\nline2"
+"esc\e[1mbold"
+"bell\a and null\u0000"
+"ctrl\u0001\u001F\u007F"
+"literal \#{not_interp}"
+"unicode: café ☃"
+["a\tb", "c\nd", "e\u0000f"]
+{"key\t1" => "val\e2"}
+"field1\u001Ffield2\u001Efield3"
+["field1", "field2\u001Efield3"]

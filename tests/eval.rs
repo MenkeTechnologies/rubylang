@@ -2035,7 +2035,7 @@ fn heredocs() {
     // Interpolation inside a heredoc.
     eq("n = \"Bob\"\n<<~MSG\n  Hi #{n}\nMSG", "\"Hi Bob\\n\"");
     // Single-quoted delimiter is a literal (no interpolation).
-    eq("<<'RAW'\nno #{x} here\nRAW", "\"no #{x} here\\n\"");
+    eq("<<'RAW'\nno #{x} here\nRAW", "\"no \\#{x} here\\n\"");
     // Squiggly keeps relative indentation.
     eq("<<~A\n  x\n    y\n  z\nA", "\"x\\n  y\\nz\\n\"");
     // `<<` is still the shift operator in value context.
@@ -2355,6 +2355,28 @@ fn time_utc() {
         "t = Time.at(-1).utc; [t.month, t.day, t.hour, t.min, t.sec]",
         "[12, 31, 23, 59, 59]",
     );
+}
+
+#[test]
+fn string_inspect_escaping() {
+    // Named control escapes round-trip through inspect.
+    eq("\"\\e[0m\"", "\"\\e[0m\""); // ESC -> \e
+    eq("\"\\a\\b\\f\\v\\r\"", "\"\\a\\b\\f\\v\\r\"");
+    eq("\"tab\\there\"", "\"tab\\there\"");
+    eq("\"a\\nb\"", "\"a\\nb\"");
+    // Control chars without a named escape use \uXXXX (uppercase, UTF-8).
+    eq("\"\\x00\"", "\"\\u0000\"");
+    eq("\"\\x01\\x1f\\x7f\"", "\"\\u0001\\u001F\\u007F\"");
+    // `#` is escaped only before `{`/`@`/`$` (so the literal is unambiguous).
+    eq("\"\\#{x}\"", "\"\\#{x}\"");
+    eq("\"a # b\"", "\"a # b\"");
+    // Quotes and backslashes.
+    eq("\"say \\\"hi\\\"\"", "\"say \\\"hi\\\"\"");
+    eq("\"a\\\\b\"", "\"a\\\\b\"");
+    // Multibyte UTF-8 is verbatim.
+    eq("\"café\"", "\"café\"");
+    // Nested in a collection.
+    eq("[\"a\\tb\", \"c\\x01d\"]", "[\"a\\tb\", \"c\\u0001d\"]");
 }
 
 #[test]

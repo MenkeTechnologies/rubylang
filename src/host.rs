@@ -1928,9 +1928,9 @@ impl RubyHost {
     pub fn inspect(&mut self, v: &Value) -> String {
         match v {
             Value::Undef => "nil".to_string(),
-            Value::Str(s) => format!("{s:?}"),
+            Value::Str(s) => inspect_string(s),
             Value::Obj(_) => match self.obj(v).cloned() {
-                Some(RObj::Str(s)) => format!("{s:?}"),
+                Some(RObj::Str(s)) => inspect_string(&s),
                 Some(RObj::Symbol(s)) => format!(":{s}"),
                 Some(RObj::BigInt(b)) => b.to_string(),
                 Some(RObj::Rational(r)) => format!("({}/{})", r.numer(), r.denom()),
@@ -1955,7 +1955,7 @@ impl RubyHost {
                     let mut out = format!("#<MatchData {whole:?}");
                     for (i, g) in groups.iter().enumerate().skip(1) {
                         match g {
-                            Some(s) => out.push_str(&format!(" {i}:{s:?}")),
+                            Some(s) => out.push_str(&format!(" {i}:{}", inspect_string(s))),
                             None => out.push_str(&format!(" {i}:nil")),
                         }
                     }
@@ -1990,7 +1990,7 @@ impl RubyHost {
     fn key_inspect(&mut self, k: &RKey) -> String {
         match k {
             RKey::Int(n) => n.to_string(),
-            RKey::Str(s) => format!("{s:?}"),
+            RKey::Str(s) => inspect_string(s),
             RKey::Sym(s) => format!(":{s}"),
             RKey::Bool(b) => b.to_string(),
             RKey::Nil => "nil".to_string(),
@@ -2483,6 +2483,44 @@ impl RubyHost {
 }
 
 /// Format an `f64` the way Ruby prints a Float (always shows a decimal point).
+/// Ruby's `String#inspect`: wrap in double quotes and escape with Ruby's rules —
+/// the named escapes `\a\b\t\n\v\f\r\e`, `\uXXXX` (4-digit uppercase) for other
+/// control chars and `0x7f`, `\"`/`\\`, and `\#` when a `#` precedes `{`/`@`/`$`
+/// (so the literal reads back unambiguously). Printable and multibyte UTF-8 is
+/// verbatim.
+pub fn inspect_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '#' => {
+                if matches!(chars.peek(), Some('{') | Some('@') | Some('$')) {
+                    out.push_str("\\#");
+                } else {
+                    out.push('#');
+                }
+            }
+            '\u{07}' => out.push_str("\\a"),
+            '\u{08}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{0b}' => out.push_str("\\v"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            '\u{1b}' => out.push_str("\\e"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn fmt_float(f: f64) -> String {
     if !f.is_finite() {
         return if f.is_nan() {
