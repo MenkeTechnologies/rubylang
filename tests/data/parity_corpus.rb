@@ -580,3 +580,27 @@ puts a.abs
 puts (3 + 4i).inspect
 puts (Complex(0, 1) ** 2).inspect
 puts [Complex(1, 0), Complex(0, 1), Complex(1, 1)].reduce(:+).inspect
+#==#
+def describe(shape)
+  case shape
+  in {type: "circle", radius:}
+    "circle area=#{(3.14 * radius * radius).round(2)}"
+  in {type: "rect", w:, h:}
+    "rect area=#{w * h}"
+  in [x, y]
+    "point (#{x}, #{y})"
+  in Integer => n
+    "number #{n}"
+  else
+    "unknown"
+  end
+end
+puts describe({type: "circle", radius: 2})
+puts describe({type: "rect", w: 3, h: 4})
+puts describe([5, 6])
+puts describe(42)
+puts describe("x")
+case [1, 2, 3, 4, 5]
+in [first, *middle, last]
+  puts "#{first} .. #{last}, middle=#{middle.inspect}"
+end

@@ -48,6 +48,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::SIG_NEXT, b_sig_next);
     vm.register_builtin(ops::SIG_RETURN, b_sig_return);
     vm.register_builtin(ops::SIG_RETRY, b_sig_retry);
+    vm.register_builtin(ops::NO_MATCH, b_no_match);
     vm.register_builtin(ops::GETSELF, b_getself);
     vm.register_builtin(ops::BEGIN, b_begin);
     vm.register_builtin(ops::SUPER, b_super);
@@ -131,6 +132,14 @@ fn pop_n(vm: &mut VM, n: usize) -> Vec<Value> {
     }
     v.reverse();
     v
+}
+
+/// `case/in` fell through with no matching clause and no `else`.
+fn b_no_match(vm: &mut VM, _: u8) -> Value {
+    let subj = vm.pop();
+    let msg = with_host(|h| h.inspect(&subj));
+    let e = raise_exc("NoMatchingPatternError", &msg);
+    abort(vm, e)
 }
 
 /// Abort the running chunk with an error, halting the VM cleanly.

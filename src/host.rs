@@ -105,6 +105,7 @@ pub mod ops {
     pub const MKREGEX: u16 = 35; // [source, flags] -> Regexp
     pub const MKLAMBDA: u16 = 36; // [proc_id] -> Proc (lambda? == true)
     pub const SIG_RETRY: u16 = 37; // [v] -> restart the enclosing begin body
+    pub const NO_MATCH: u16 = 38; // [subj] -> raise NoMatchingPatternError
 }
 
 /// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried

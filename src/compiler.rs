@@ -38,6 +38,8 @@ pub struct Compiler {
     begins: Vec<BeginDef>,
     procs: Vec<ProcDef>,
     loops: Vec<LoopCtx>,
+    /// Monotonic counter for unique temporaries (`case/in` subject slots).
+    tmp: usize,
 }
 
 /// Compile a parsed program.
@@ -239,6 +241,11 @@ impl Compiler {
                 whens,
                 els,
             } => self.compile_case(b, subject, whens, els)?,
+            Expr::CaseIn {
+                subject,
+                clauses,
+                els,
+            } => self.compile_case_in(b, subject, clauses, els)?,
             Expr::Call {
                 recv,
                 name,
@@ -688,6 +695,66 @@ impl Compiler {
         self.compile_expr(b, &call)
     }
 
+    /// `case/in` pattern matching: bind the subject to a temporary, then try each
+    /// clause's pattern test + variable bindings + optional guard, running the
+    /// first that matches. No `else` raises `NoMatchingPatternError`.
+    fn compile_case_in(
+        &mut self,
+        b: &mut ChunkBuilder,
+        subject: &Expr,
+        clauses: &[InClause],
+        els: &Option<Vec<Expr>>,
+    ) -> Result<(), String> {
+        self.tmp += 1;
+        let tmp = format!("__casein{}__", self.tmp);
+        let subj = Expr::Var(VarKind::Local, tmp.clone());
+        // Evaluate the subject once into the temporary.
+        self.compile_assign(b, &subj, subject)?;
+        b.emit(Op::Pop, 0);
+
+        let mut end_jumps = Vec::new();
+        for clause in clauses {
+            let (test, binds) = lower_pattern(&clause.pattern, &subj);
+            // Pattern test: on failure, skip to the next clause (`JumpIfFalse`
+            // consumes the condition).
+            self.compile_cond(b, &test)?;
+            let next = b.emit(Op::JumpIfFalse(0), 0);
+            // Bindings (assignments) run once the shape matches.
+            for bind in &binds {
+                self.compile_expr(b, bind)?;
+                b.emit(Op::Pop, 0);
+            }
+            // A guard runs after binding; failing it also falls through.
+            let guard_next = if let Some(g) = &clause.guard {
+                self.compile_cond(b, g)?;
+                Some(b.emit(Op::JumpIfFalse(0), 0))
+            } else {
+                None
+            };
+            self.compile_seq(b, &clause.body)?;
+            end_jumps.push(b.emit(Op::Jump(0), 0));
+            // Land here on a failed test / guard.
+            let here = b.current_pos();
+            b.patch_jump(next, here);
+            if let Some(j) = guard_next {
+                b.patch_jump(j, here);
+            }
+        }
+        // No clause matched: run `else`, or raise like Ruby.
+        match els {
+            Some(body) => self.compile_seq(b, body)?,
+            None => {
+                self.compile_expr(b, &subj)?;
+                b.emit(Op::CallBuiltin(ops::NO_MATCH, 1), 0);
+            }
+        }
+        let end = b.current_pos();
+        for j in end_jumps {
+            b.patch_jump(j, end);
+        }
+        Ok(())
+    }
+
     fn compile_case(
         &mut self,
         b: &mut ChunkBuilder,
@@ -1053,4 +1120,191 @@ fn sym_name(e: &Expr) -> Option<String> {
 /// argc must fit in a `u8`; a call/collection wider than 255 is rejected.
 fn argc(n: usize) -> Result<u8, String> {
     u8::try_from(n).map_err(|_| format!("too many arguments/elements ({n} > 255)"))
+}
+
+// ===========================================================================
+// Pattern-match lowering (`case/in`).
+// ===========================================================================
+
+/// A method call `recv.name(args)`.
+fn pcall(recv: Expr, name: &str, args: Vec<Expr>) -> Expr {
+    Expr::Call {
+        recv: Some(Box::new(recv)),
+        name: name.to_string(),
+        args,
+        block: None,
+    }
+}
+
+fn pand(a: Expr, b: Expr) -> Expr {
+    Expr::Binary(BinOp::And, Box::new(a), Box::new(b))
+}
+
+/// The element `subj[i]` (a negative `i` counts from the end).
+fn pindex(subj: &Expr, i: i64) -> Expr {
+    Expr::Index(Box::new(subj.clone()), vec![Expr::Int(i)])
+}
+
+/// Lower a pattern against a subject expression into `(test, bindings)`: a
+/// boolean test expression, and the assignments to run when the shape matches
+/// (before any guard). Bindings are plain `Expr::Assign`s to local variables.
+fn lower_pattern(pat: &Pattern, subj: &Expr) -> (Expr, Vec<Expr>) {
+    match pat {
+        // `in 5` / `in 1..10` / `in Integer` — case-equality (`pattern === subj`).
+        Pattern::Value(v) => (pcall(v.clone(), "===", vec![subj.clone()]), vec![]),
+        // `in ^x` — pinned value, matched with `==`.
+        Pattern::Pin(e) => (
+            Expr::Binary(BinOp::Eq, Box::new(subj.clone()), Box::new(e.clone())),
+            vec![],
+        ),
+        Pattern::Bind(name) if name == "_" => (Expr::True, vec![]),
+        Pattern::Bind(name) => (
+            Expr::True,
+            vec![Expr::Assign(
+                Box::new(Expr::Var(VarKind::Local, name.clone())),
+                Box::new(subj.clone()),
+            )],
+        ),
+        Pattern::Const(name, None) => (
+            pcall(
+                Expr::Var(VarKind::Const, name.clone()),
+                "===",
+                vec![subj.clone()],
+            ),
+            vec![],
+        ),
+        // `Const[...]` / `Const(...)` — class check plus a deconstructed match.
+        Pattern::Const(name, Some(inner)) => {
+            let type_test = pcall(
+                Expr::Var(VarKind::Const, name.clone()),
+                "===",
+                vec![subj.clone()],
+            );
+            let decon = pcall(subj.clone(), "deconstruct", vec![]);
+            let (t, binds) = lower_pattern(inner, &decon);
+            (pand(type_test, t), binds)
+        }
+        // `pat => name` — bind the whole subject after the inner pattern matches.
+        Pattern::As(inner, name) => {
+            let (t, mut binds) = lower_pattern(inner, subj);
+            binds.push(Expr::Assign(
+                Box::new(Expr::Var(VarKind::Local, name.clone())),
+                Box::new(subj.clone()),
+            ));
+            (t, binds)
+        }
+        // `p1 | p2 | …` — any alternative matches (bindings inside are ignored).
+        Pattern::Or(alts) => {
+            let test = alts
+                .iter()
+                .map(|p| lower_pattern(p, subj).0)
+                .reduce(|a, c| Expr::Binary(BinOp::Or, Box::new(a), Box::new(c)))
+                .unwrap_or(Expr::False);
+            (test, vec![])
+        }
+        Pattern::Splat(_) => (Expr::True, vec![]), // handled inside Array
+        Pattern::Array(elems) => lower_array_pattern(elems, subj),
+        Pattern::Hash(pairs, _rest) => lower_hash_pattern(pairs, subj),
+    }
+}
+
+fn lower_array_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
+    let is_arr = pcall(
+        subj.clone(),
+        "is_a?",
+        vec![Expr::Var(VarKind::Const, "Array".into())],
+    );
+    let splat_at = elems.iter().position(|p| matches!(p, Pattern::Splat(_)));
+    let len = pcall(subj.clone(), "length", vec![]);
+
+    let mut test = is_arr;
+    let mut binds = Vec::new();
+    match splat_at {
+        None => {
+            // Exact length, then element-wise.
+            test = pand(
+                test,
+                Expr::Binary(
+                    BinOp::Eq,
+                    Box::new(len),
+                    Box::new(Expr::Int(elems.len() as i64)),
+                ),
+            );
+            for (i, p) in elems.iter().enumerate() {
+                let (t, bs) = lower_pattern(p, &pindex(subj, i as i64));
+                test = pand(test, t);
+                binds.extend(bs);
+            }
+        }
+        Some(s) => {
+            let pre = &elems[..s];
+            let post = &elems[s + 1..];
+            let min = (pre.len() + post.len()) as i64;
+            test = pand(
+                test,
+                Expr::Binary(BinOp::Ge, Box::new(len.clone()), Box::new(Expr::Int(min))),
+            );
+            for (i, p) in pre.iter().enumerate() {
+                let (t, bs) = lower_pattern(p, &pindex(subj, i as i64));
+                test = pand(test, t);
+                binds.extend(bs);
+            }
+            // The `*rest` slice: `subj[pre_len, length - pre_len - post_len]`.
+            if let Pattern::Splat(Some(name)) = &elems[s] {
+                let count = Expr::Binary(
+                    BinOp::Sub,
+                    Box::new(Expr::Binary(
+                        BinOp::Sub,
+                        Box::new(len),
+                        Box::new(Expr::Int(pre.len() as i64)),
+                    )),
+                    Box::new(Expr::Int(post.len() as i64)),
+                );
+                let slice = Expr::Index(
+                    Box::new(subj.clone()),
+                    vec![Expr::Int(pre.len() as i64), count],
+                );
+                binds.push(Expr::Assign(
+                    Box::new(Expr::Var(VarKind::Local, name.clone())),
+                    Box::new(slice),
+                ));
+            }
+            // Post-splat elements count back from the end.
+            for (j, p) in post.iter().enumerate() {
+                let idx = -(post.len() as i64) + j as i64;
+                let (t, bs) = lower_pattern(p, &pindex(subj, idx));
+                test = pand(test, t);
+                binds.extend(bs);
+            }
+        }
+    }
+    (test, binds)
+}
+
+fn lower_hash_pattern(pairs: &[(String, Option<Pattern>)], subj: &Expr) -> (Expr, Vec<Expr>) {
+    let mut test = pcall(
+        subj.clone(),
+        "is_a?",
+        vec![Expr::Var(VarKind::Const, "Hash".into())],
+    );
+    let mut binds = Vec::new();
+    for (key, sub) in pairs {
+        let at = Expr::Index(Box::new(subj.clone()), vec![Expr::Symbol(key.clone())]);
+        test = pand(
+            test,
+            pcall(subj.clone(), "key?", vec![Expr::Symbol(key.clone())]),
+        );
+        match sub {
+            None => binds.push(Expr::Assign(
+                Box::new(Expr::Var(VarKind::Local, key.clone())),
+                Box::new(at),
+            )),
+            Some(p) => {
+                let (t, bs) = lower_pattern(p, &at);
+                test = pand(test, t);
+                binds.extend(bs);
+            }
+        }
+    }
+    (test, binds)
 }

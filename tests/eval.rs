@@ -2060,6 +2060,44 @@ fn complex_numbers() {
 }
 
 #[test]
+fn pattern_matching_case_in() {
+    // Array patterns bind elements; splat collects the middle/rest.
+    eq("case [1, 2]; in [a, b]; a + b; end", "3");
+    eq(
+        "case [1, 2, 3, 4]; in [first, *rest]; rest; end",
+        "[2, 3, 4]",
+    );
+    eq("case [1, 2, 3]; in [a, *, c]; [a, c]; end", "[1, 3]");
+    // Hash patterns bind by key (shorthand) or match a subpattern.
+    eq(
+        "case {name: \"Al\", age: 30}; in {name:, age:}; \"#{name}:#{age}\"; end",
+        "\"Al:30\"",
+    );
+    eq(
+        "case {t: \"c\", r: 5}; in {t: \"c\", r: Integer => n}; n; end",
+        "5",
+    );
+    // Type patterns with binding, ordered by clause.
+    eq("case 5; in String; :s; in Integer => n; n * 2; end", "10");
+    // Ranges, alternatives, and pins.
+    eq("case 7; in 1..5; :lo; in 6..10; :hi; end", ":hi");
+    eq("case 3; in 1 | 2 | 3; :small; else; :big; end", ":small");
+    eq("x = 5; case 5; in ^x; :pinned; end", ":pinned");
+    // Guards, nesting, and the whole-match `=> name` binding.
+    eq(
+        "case [1, 2]; in [a, b] if a < b; :ok; else; :no; end",
+        ":ok",
+    );
+    eq("case [1, [2, 3]]; in [a, [b, c]]; a + b + c; end", "6");
+    eq(
+        "case [1, 2]; in [Integer, Integer] => pair; pair; end",
+        "[1, 2]",
+    );
+    // No matching clause and no else raises.
+    assert!(ev("case 99; in 1; :x; end").is_err());
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).

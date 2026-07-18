@@ -1,0 +1,9 @@
+show user 42
+list users
+create user Ada
+DELETE /sessions/1
+empty
+one: 7
+pair 1, 2
+1 and 4 more
+three ints: 6

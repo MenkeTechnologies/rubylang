@@ -80,6 +80,11 @@ capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
 - **`rand`.** Seeded from the system clock (no `srand` determinism yet).
 - **Method surface.** The Enumerable/String/Hash/Range surface is broad but not
   exhaustive; an unimplemented method raises `undefined method '<name>'`.
+- **Pattern matching (`case/in`).** Array/hash/find-by-key patterns, class
+  patterns (`Integer`, `Point[...]`), variable/`_` binding, `=> name`, `^pin`,
+  `|` alternatives, `*rest` splats, and `if`/`unless` guards work. Not yet: the
+  two-sided find pattern (`[*, x, *]`), `**nil` exact-key enforcement, and
+  variable bindings *inside* an `|` alternative.
 
 ## Tooling
 

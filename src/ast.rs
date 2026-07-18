@@ -128,6 +128,13 @@ pub enum Expr {
         whens: Vec<(Vec<Expr>, Vec<Expr>)>,
         els: Option<Vec<Expr>>,
     },
+    /// `case subj; in pattern [if guard]; body; … end` — structural pattern
+    /// matching (Ruby 3). An absent `else` raises `NoMatchingPatternError`.
+    CaseIn {
+        subject: Box<Expr>,
+        clauses: Vec<InClause>,
+        els: Option<Vec<Expr>>,
+    },
 
     /// A call. `recv` is `None` for a bare/self call (`puts x`, `foo`).
     Call {
@@ -183,6 +190,40 @@ pub enum Expr {
     Lambda(Block),
     /// A regex literal `/pattern/flags`.
     Regex(String, String),
+}
+
+/// One `in pattern [if/unless guard]` clause of a `case/in`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InClause {
+    pub pattern: Pattern,
+    /// A trailing `if cond` (or `unless cond`, stored pre-negated) guard.
+    pub guard: Option<Expr>,
+    pub body: Vec<Expr>,
+}
+
+/// A structural pattern for `case/in`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    /// A literal / range / anything matched with `===` (`in 5`, `in 1..10`).
+    Value(Expr),
+    /// `^expr` — match the subject against a pinned value with `==`.
+    Pin(Expr),
+    /// A local-variable binding (`in x`); `_` is a wildcard that binds nothing.
+    Bind(String),
+    /// `*rest` inside an array pattern (name `None` for a bare `*`).
+    Splat(Option<String>),
+    /// `[p0, p1, *rest, pk]`.
+    Array(Vec<Pattern>),
+    /// `{key: subpattern, key2:, **rest}` — a `None` subpattern is the `key:`
+    /// shorthand that binds `key`. `bool` = whether a `**rest`/`**` is present.
+    Hash(Vec<(String, Option<Pattern>)>, bool),
+    /// A class match (`in Integer`); the optional inner pattern is `Const[...]` /
+    /// `Const(...)` deconstruction.
+    Const(String, Option<Box<Pattern>>),
+    /// `pattern => name` — match, then bind the whole subject to `name`.
+    As(Box<Pattern>, String),
+    /// `p1 | p2 | …` — alternative patterns.
+    Or(Vec<Pattern>),
 }
 
 /// One segment of an interpolated string.

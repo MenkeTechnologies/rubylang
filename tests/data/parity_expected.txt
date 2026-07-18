@@ -346,3 +346,10 @@ second
 (3+4i)
 (-1+0i)
 (2+2i)
+#==#
+circle area=12.56
+rect area=12
+point (5, 6)
+number 42
+unknown
+1 .. 5, middle=[2, 3, 4]

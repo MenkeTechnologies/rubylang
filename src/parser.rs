@@ -986,6 +986,10 @@ impl Parser {
         self.advance();
         let subject = self.expr()?;
         self.skip_terms();
+        // `case/in` (pattern matching) is chosen by the first clause keyword.
+        if self.is_kw("in") {
+            return self.case_in(subject);
+        }
         let mut whens = Vec::new();
         while self.eat_kw("when") {
             let mut labels = vec![self.expr()?];
@@ -1007,6 +1011,175 @@ impl Parser {
             whens,
             els,
         })
+    }
+
+    /// `case subj; in pattern [if/unless guard]; body; … [else …] end`.
+    fn case_in(&mut self, subject: Expr) -> Result<Expr, String> {
+        let mut clauses = Vec::new();
+        while self.eat_kw("in") {
+            let pattern = self.parse_pattern()?;
+            let guard = if self.eat_kw("if") {
+                Some(self.expr()?)
+            } else if self.eat_kw("unless") {
+                Some(Expr::Unary(UnOp::Not, Box::new(self.expr()?)))
+            } else {
+                None
+            };
+            self.eat_kw("then");
+            let body = self.body_until(&["in", "else", "end"])?;
+            clauses.push(InClause {
+                pattern,
+                guard,
+                body,
+            });
+        }
+        let els = if self.eat_kw("else") {
+            Some(self.body_until(&["end"])?)
+        } else {
+            None
+        };
+        self.expect_kw("end")?;
+        Ok(Expr::CaseIn {
+            subject: Box::new(subject),
+            clauses,
+            els,
+        })
+    }
+
+    /// A full pattern: alternatives joined by `|`, with an optional `=> name`
+    /// binding of the whole match.
+    fn parse_pattern(&mut self) -> Result<Pattern, String> {
+        let mut alts = vec![self.parse_pattern_binding()?];
+        while self.eat_op("|") {
+            alts.push(self.parse_pattern_binding()?);
+        }
+        if alts.len() == 1 {
+            Ok(alts.pop().unwrap())
+        } else {
+            Ok(Pattern::Or(alts))
+        }
+    }
+
+    fn parse_pattern_binding(&mut self) -> Result<Pattern, String> {
+        let p = self.parse_pattern_primary()?;
+        if self.eat_op("=>") {
+            Ok(Pattern::As(Box::new(p), self.ident_name()?))
+        } else {
+            Ok(p)
+        }
+    }
+
+    fn parse_pattern_primary(&mut self) -> Result<Pattern, String> {
+        match self.peek().clone() {
+            Tok::Op(o) if o == "[" => {
+                self.advance();
+                let elems = self.parse_array_pattern("]")?;
+                self.expect_op("]")?;
+                Ok(Pattern::Array(elems))
+            }
+            Tok::Op(o) if o == "{" => {
+                self.advance();
+                let (pairs, rest) = self.parse_hash_pattern()?;
+                self.expect_op("}")?;
+                Ok(Pattern::Hash(pairs, rest))
+            }
+            Tok::Op(o) if o == "^" => {
+                self.advance();
+                Ok(Pattern::Pin(self.primary()?))
+            }
+            Tok::Op(o) if o == "*" => {
+                self.advance();
+                let name = match self.peek().clone() {
+                    Tok::Ident(n) => {
+                        self.advance();
+                        Some(n)
+                    }
+                    _ => None,
+                };
+                Ok(Pattern::Splat(name))
+            }
+            Tok::Const(name) => {
+                self.advance();
+                // `Const[...]` / `Const(...)` deconstruction.
+                if self.eat_op("[") {
+                    let elems = self.parse_array_pattern("]")?;
+                    self.expect_op("]")?;
+                    Ok(Pattern::Const(name, Some(Box::new(Pattern::Array(elems)))))
+                } else if self.eat_op("(") {
+                    let elems = self.parse_array_pattern(")")?;
+                    self.expect_op(")")?;
+                    Ok(Pattern::Const(name, Some(Box::new(Pattern::Array(elems)))))
+                } else {
+                    Ok(Pattern::Const(name, None))
+                }
+            }
+            Tok::Ident(n) => {
+                self.advance();
+                Ok(Pattern::Bind(n))
+            }
+            // Everything else is a literal / range value matched with `===`.
+            _ => Ok(Pattern::Value(self.range()?)),
+        }
+    }
+
+    /// Comma-separated patterns until `close`.
+    fn parse_array_pattern(&mut self, close: &str) -> Result<Vec<Pattern>, String> {
+        let mut elems = Vec::new();
+        self.skip_terms();
+        if !self.is_op(close) {
+            elems.push(self.parse_pattern()?);
+            while self.eat_op(",") {
+                self.skip_terms();
+                if self.is_op(close) {
+                    break;
+                }
+                elems.push(self.parse_pattern()?);
+            }
+        }
+        self.skip_terms();
+        Ok(elems)
+    }
+
+    /// `key:`, `key: subpattern`, and a trailing `**rest`/`**nil`, until `}`.
+    #[allow(clippy::type_complexity)]
+    fn parse_hash_pattern(&mut self) -> Result<(Vec<(String, Option<Pattern>)>, bool), String> {
+        let mut pairs = Vec::new();
+        let mut rest = false;
+        self.skip_terms();
+        while !self.is_op("}") {
+            if self.eat_op("**") {
+                // `**rest` / `**nil` — both just mean "allow other keys".
+                if matches!(self.peek(), Tok::Ident(_)) || self.is_kw("nil") {
+                    self.advance();
+                }
+                rest = true;
+            } else {
+                let key = match self.advance() {
+                    Tok::Ident(k) | Tok::Const(k) => k,
+                    Tok::Symbol(k) => k,
+                    other => {
+                        return Err(format!(
+                            "line {}: bad hash pattern key '{other}'",
+                            self.line()
+                        ))
+                    }
+                };
+                self.expect_op(":")?;
+                // `key:` shorthand binds `key`; otherwise a subpattern follows.
+                let sub = if self.is_op(",") || self.is_op("}") {
+                    None
+                } else {
+                    Some(self.parse_pattern()?)
+                };
+                pairs.push((key, sub));
+            }
+            self.skip_terms();
+            if !self.eat_op(",") {
+                break;
+            }
+            self.skip_terms();
+        }
+        Ok((pairs, rest))
     }
 
     fn class_expr(&mut self) -> Result<Expr, String> {
