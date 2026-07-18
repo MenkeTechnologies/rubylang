@@ -1606,6 +1606,17 @@ fn begin_while_batch() {
 }
 
 #[test]
+fn array_zip_flat_batch() {
+    eq("[1,2,3].each_cons(2).to_a", "[[1, 2], [2, 3]]");
+    eq("[1,2,4,5].slice_when{|a,b| b-a>1}.to_a", "[[1, 2], [4, 5]]");
+    eq("[1,2].product([3,4],[5]).length", "4");
+    eq("[[1,2],[3,4]].flat_map{|x| x}", "[1, 2, 3, 4]");
+    eq("r=[]; [1,2,3].zip([4,5,6]){|x| r<<x}; r", "[[1, 4], [2, 5], [3, 6]]");
+    eq("[1,2,3].zip([4,5,6]){|x| x}", "nil");
+    eq("[1,2,3].each_slice(2).to_a", "[[1, 2], [3]]");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

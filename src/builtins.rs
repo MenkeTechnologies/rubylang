@@ -2804,6 +2804,17 @@ fn dispatch_array(
                     new_arr(row)
                 })
                 .collect();
+            // With a block, MRI yields each row and returns nil.
+            if let Some(bl) = &block {
+                for row in &rows {
+                    call_proc(bl, std::slice::from_ref(row))?;
+                    if has_pending_signal() {
+                        take_break();
+                        break;
+                    }
+                }
+                return Ok(Value::Undef);
+            }
             Ok(new_arr(rows))
         }
         "product" => {
@@ -3059,6 +3070,29 @@ fn dispatch_array(
                     if let Some(prev) = cur.last() {
                         let r = call_proc(bl, &[prev.clone(), x.clone()])?;
                         if !with_host(|h| h.truthy(&r)) {
+                            chunks.push(new_arr(std::mem::take(&mut cur)));
+                        }
+                    }
+                    cur.push(x.clone());
+                }
+                if !cur.is_empty() {
+                    chunks.push(new_arr(cur));
+                }
+            }
+            // No lazy Enumerator yet: return the chunk array (usable with `.to_a`).
+            Ok(new_arr(chunks))
+        }
+        "slice_when" => {
+            // Split into runs; a new run starts whenever the block returns
+            // truthy for an adjacent pair (elem[i-1], elem[i]). Inverse of
+            // chunk_while.
+            let mut chunks: Vec<Value> = Vec::new();
+            if let Some(bl) = &block {
+                let mut cur: Vec<Value> = Vec::new();
+                for x in &arr {
+                    if let Some(prev) = cur.last() {
+                        let r = call_proc(bl, &[prev.clone(), x.clone()])?;
+                        if with_host(|h| h.truthy(&r)) {
                             chunks.push(new_arr(std::mem::take(&mut cur)));
                         }
                     }
