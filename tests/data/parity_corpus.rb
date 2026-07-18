@@ -463,3 +463,9 @@ puts "the quick brown fox".gsub(/(\w)(\w*)/) { $1.upcase + $2 }
 puts "hello world".gsub(/\w+/) { $&.capitalize }
 "no match here" =~ /\d+/
 puts $1.inspect
+#==#
+r = []
+"one1two2three3".scan(/([a-z]+)(\d)/) { |word, num| r << "#{word}:#{num}" }
+puts r.inspect
+puts "hello world".gsub(/[aeiou]/, "a" => "4", "e" => "3", "o" => "0")
+puts "2024".gsub(/\d/, "0" => "zero", "2" => "two")

@@ -88,6 +88,27 @@ fn hash_equality_is_order_independent() {
 }
 
 #[test]
+fn string_scan_block_and_gsub_hash() {
+    // scan with a block yields each match and returns the string (self).
+    eq(
+        "r = []; \"a1b2c3\".scan(/[a-z]\\d/) { |m| r << m }; r",
+        "[\"a1\", \"b2\", \"c3\"]",
+    );
+    eq("\"a1b2\".scan(/[a-z]\\d/) { |m| }", "\"a1b2\"");
+    eq(
+        "r = []; \"x1y2\".scan(/([a-z])(\\d)/) { |l, d| r << \"#{l}=#{d}\" }; r",
+        "[\"x=1\", \"y=2\"]",
+    );
+    // gsub / sub with a hash maps each match through the hash (missing => empty).
+    eq(
+        "\"hello\".gsub(/[el]/, \"e\" => \"3\", \"l\" => \"1\")",
+        "\"h311o\"",
+    );
+    eq("\"cat\".sub(/[aeiou]/, \"a\" => \"@\")", "\"c@t\"");
+    eq("\"aXbYc\".gsub(/[A-Z]/, \"X\" => \"1\")", "\"a1bc\"");
+}
+
+#[test]
 fn ranges() {
     eq("(1..5).to_a", "[1, 2, 3, 4, 5]");
     eq("(1...5).to_a", "[1, 2, 3, 4]");

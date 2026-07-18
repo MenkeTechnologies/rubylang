@@ -1011,7 +1011,10 @@ fn dispatch_number(
             // participant switches to Float stepping (matching Numeric#step).
             let all_int = matches!(recv, Value::Int(_))
                 && matches!(&args[0], Value::Int(_))
-                && args.get(1).map(|v| matches!(v, Value::Int(_))).unwrap_or(true);
+                && args
+                    .get(1)
+                    .map(|v| matches!(v, Value::Int(_)))
+                    .unwrap_or(true);
             if all_int {
                 let limit = as_i(&args[0]);
                 let by = args.get(1).map(as_i).unwrap_or(1);
@@ -1189,7 +1192,9 @@ fn dispatch_number(
             (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
             // Ruby: `n.ceildiv(d)` == `-(-n / d)` using floor division.
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(-floor_div(-*a, *b))),
-            _ => Ok(Value::Int(as_f(recv).div_euclid(as_f(&args[0])).ceil() as i64)),
+            _ => Ok(Value::Int(
+                as_f(recv).div_euclid(as_f(&args[0])).ceil() as i64
+            )),
         },
         "gcdlcm" => {
             let (a, b) = (as_i(recv), as_i(&args[0]));
@@ -1549,7 +1554,11 @@ fn dispatch_string(
         "getbyte" => {
             let bytes = s.as_bytes();
             let raw = as_i(&args[0]);
-            let idx = if raw < 0 { raw + bytes.len() as i64 } else { raw };
+            let idx = if raw < 0 {
+                raw + bytes.len() as i64
+            } else {
+                raw
+            };
             if idx < 0 || idx >= bytes.len() as i64 {
                 Ok(Value::Undef)
             } else {
@@ -1603,7 +1612,10 @@ fn dispatch_string(
         "tr" => {
             let (neg, from) = expand_tr_spec(&arg_str(&args[0]), true);
             let (_, to) = expand_tr_spec(&arg_str(&args[1]), false);
-            let out: String = s.chars().filter_map(|c| tr_map(c, neg, &from, &to)).collect();
+            let out: String = s
+                .chars()
+                .filter_map(|c| tr_map(c, neg, &from, &to))
+                .collect();
             Ok(new_str(out))
         }
         "delete" => {
@@ -1675,7 +1687,16 @@ fn dispatch_string(
             None => Ok(Value::Undef),
         },
         "scan" => match str_regex(&args[0]) {
-            Some(re) => Ok(scan_regex(&re, &s)),
+            // With a block, yield each match and return the string (self); each
+            // yielded value is the whole match, or the capture-group array for a
+            // grouped pattern. Without a block, collect them into an array.
+            Some(re) => match &block {
+                Some(bl) => {
+                    scan_each(&re, &s, bl)?;
+                    Ok(recv.clone())
+                }
+                None => Ok(scan_regex(&re, &s)),
+            },
             None => Ok(new_arr(vec![])),
         },
         "split" => {
@@ -1859,7 +1880,11 @@ fn dispatch_string(
             let mut out = String::new();
             let mut last_translated: Option<char> = None;
             for c in s.chars() {
-                let matched = if neg { !from.contains(&c) } else { from.contains(&c) };
+                let matched = if neg {
+                    !from.contains(&c)
+                } else {
+                    from.contains(&c)
+                };
                 if matched {
                     // Translated (or deleted when `to` is empty); squeeze runs
                     // of the same replacement char.
@@ -2116,6 +2141,29 @@ fn scan_regex(re: &regex::Regex, s: &str) -> Value {
     }
 }
 
+/// `String#scan(re) { ... }`: yield each match (setting `$~`), passing the whole
+/// match for an ungrouped pattern or the capture-group array for a grouped one.
+fn scan_each(re: &regex::Regex, s: &str, bl: &Value) -> Result<(), String> {
+    let ngroups = re.captures_len();
+    for caps in re.captures_iter(s) {
+        set_match_globals(Some((&caps, s)));
+        let arg = if ngroups <= 1 {
+            new_str(caps.get(0).unwrap().as_str().to_string())
+        } else {
+            let groups: Vec<Value> = (1..ngroups)
+                .map(|i| {
+                    caps.get(i)
+                        .map(|m| new_str(m.as_str().to_string()))
+                        .unwrap_or(Value::Undef)
+                })
+                .collect();
+            new_arr(groups)
+        };
+        call_proc(bl, &[arg])?;
+    }
+    Ok(())
+}
+
 /// `String#sub`/`gsub` with a Regexp: a replacement string (with `\1` group
 /// refs) or a block that receives each match.
 fn regex_replace(
@@ -2138,6 +2186,14 @@ fn regex_replace(
             set_match_globals(Some((&caps, s)));
             let r = call_proc(bl, &[new_str(m.as_str().to_string())])?;
             out.push_str(&with_host(|h| h.to_s(&r)));
+        } else if let Some(map) = rest.first().and_then(|v| with_host(|h| h.as_hash(v))) {
+            // `gsub(re, hash)`: each match is replaced by `hash[match]` (empty for
+            // a key the hash lacks).
+            let matched = new_str(m.as_str().to_string());
+            let key = with_host(|h| h.value_to_key(&matched));
+            if let Some(v) = map.get(&key) {
+                out.push_str(&with_host(|h| h.to_s(v)));
+            }
         } else {
             let repl = arg_str(&rest[0]);
             out.push_str(&expand_backrefs(&repl, &caps));
@@ -3779,7 +3835,10 @@ fn dispatch_hash(
         "to_h" => Ok(recv.clone()),
         "except" => {
             // Return a copy without the given keys (original order preserved).
-            let drop: Vec<_> = args.iter().map(|a| with_host(|h| h.value_to_key(a))).collect();
+            let drop: Vec<_> = args
+                .iter()
+                .map(|a| with_host(|h| h.value_to_key(a)))
+                .collect();
             let mut out = IndexMap::new();
             for (k, v) in &map {
                 if !drop.contains(k) {

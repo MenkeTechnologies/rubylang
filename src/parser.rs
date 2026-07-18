@@ -515,7 +515,7 @@ impl Parser {
         }
         if self.is_op("&") {
             self.advance(); // &
-            // `&:sym` — inline the send as `{ |__blkx__| __blkx__.sym }`.
+                            // `&:sym` — inline the send as `{ |__blkx__| __blkx__.sym }`.
             if let Tok::Symbol(s) = self.peek().clone() {
                 self.advance(); // :sym
                 let call = Expr::Call {
@@ -545,7 +545,16 @@ impl Parser {
             });
             return Ok(());
         }
-        args.push(self.arg()?);
+        // `key => value` trailing pair (arbitrary key expr) — collected into the
+        // implicit trailing hash alongside any `key: value` pairs.
+        let e = self.arg()?;
+        if self.is_op("=>") {
+            self.advance();
+            let v = self.arg()?;
+            kwargs.push((e, v));
+            return Ok(());
+        }
+        args.push(e);
         Ok(())
     }
 
