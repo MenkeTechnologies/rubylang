@@ -8,11 +8,10 @@
 //! terminator mid-expression — matching Ruby's own "expression clearly
 //! continues" rule.
 //!
-//! Not yet lexed (tracked in BUGS.md): heredocs, regex literals, `?c` character
-//! literals. `%w[]`/`%i[]` word/symbol arrays ARE lexed (expanded to synthetic
-//! array-literal tokens). Double-quoted `#{…}` interpolation IS handled — the
-//! interpolating scan is done in the parser from the raw string body this lexer
-//! captures.
+//! Heredocs (`<<END`, `<<~SQL`, `<<-EOT`, `<<'RAW'`), regex literals, `?c`
+//! character literals, and `%w[]`/`%i[]` word/symbol arrays are all lexed.
+//! Double-quoted `#{…}` interpolation IS handled — the interpolating scan is
+//! done in the parser from the raw string body this lexer captures.
 
 use std::fmt;
 
@@ -74,6 +73,105 @@ const KEYWORDS: &[&str] = &[
 
 /// Tokenize `src`. Returns an error string on an unterminated string or an
 /// unexpected byte.
+/// A heredoc marker seen mid-line whose body is collected once the line ends.
+struct Heredoc {
+    delim: String,
+    /// `<<~` — strip the common leading indentation from the body.
+    squiggly: bool,
+    /// `<<-` or `<<~` — the terminator line may be indented.
+    indent_term: bool,
+    /// Whether the body interpolates (`<<END`/`<<"END"`/`<<~`, but not `<<'END'`).
+    interp: bool,
+    /// Index in the token stream of the placeholder `Str` token to fill in.
+    tok_idx: usize,
+}
+
+/// Collect a heredoc body starting at byte offset `start` (the first char after
+/// the marker line's newline) up to a line equal to `delim`. Returns the raw
+/// body, the offset just past the terminator line, and the number of newlines
+/// consumed. `indent_term` allows the terminator to have leading whitespace.
+fn collect_heredoc_body(
+    b: &[u8],
+    start: usize,
+    delim: &str,
+    indent_term: bool,
+) -> (String, usize, u32) {
+    let mut body = String::new();
+    let mut pos = start;
+    let mut lines = 0u32;
+    while pos < b.len() {
+        let line_start = pos;
+        while pos < b.len() && b[pos] != b'\n' {
+            pos += 1;
+        }
+        let line = std::str::from_utf8(&b[line_start..pos]).unwrap_or("");
+        let trimmed = if indent_term { line.trim_start() } else { line };
+        // Consume the newline (if any) that ends this line.
+        let had_nl = pos < b.len();
+        if had_nl {
+            pos += 1;
+            lines += 1;
+        }
+        if trimmed == delim {
+            return (body, pos, lines);
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    // Unterminated: treat the rest of the input as the body.
+    (body, pos, lines)
+}
+
+/// `<<~` squiggly heredoc: strip the least-indented line's leading whitespace
+/// from every line.
+fn strip_squiggly(body: &str) -> String {
+    let indent = body
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for line in body.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        if content.len() >= indent {
+            out.push_str(&content[indent..]);
+        }
+        if line.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Whether a `<<` here begins a heredoc rather than a left-shift: true after a
+/// value is NOT on the stack (start of expression, after an operator/`(`/`,`),
+/// or whenever an unambiguous form (`<<~`/`<<-`/`<<"`/`<<'`) is used.
+fn heredoc_here(out: &[Token], after: &[u8]) -> bool {
+    let unambiguous = matches!(
+        after.first(),
+        Some(b'~') | Some(b'-') | Some(b'"') | Some(b'\'')
+    );
+    if unambiguous {
+        return true;
+    }
+    // A bare `<<IDENT` heredoc must start with an uppercase letter or `_` and
+    // appear in value position (not after a value that would make it a shift).
+    let bare_ok = matches!(after.first(), Some(c) if c.is_ascii_uppercase() || *c == b'_');
+    if !bare_ok {
+        return false;
+    }
+    match out.iter().rev().find(|t| t.kind != Tok::Newline) {
+        None => true,
+        Some(t) => {
+            matches!(
+                &t.kind,
+                Tok::Op(o) if o != ")" && o != "]" && o != "}"
+            ) || matches!(&t.kind, Tok::Keyword(_))
+        }
+    }
+}
+
 pub fn lex(src: &str) -> Result<Vec<Token>, String> {
     let b = src.as_bytes();
     let mut i = 0usize;
@@ -81,6 +179,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
     let mut out: Vec<Token> = Vec::new();
     // Whether whitespace has been seen since the last emitted token.
     let mut sp = true;
+    // Heredoc markers seen on the current line, whose bodies are collected when
+    // the line's newline is reached.
+    let mut pending: Vec<Heredoc> = Vec::new();
 
     // Whether a newline here continues the previous expression (last real token
     // is a binary op / comma / dot / open bracket / `=`).
@@ -120,6 +221,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 sp = true;
                 line += 1;
                 i += 1;
+                // Collect the bodies of any heredocs opened on this line, in
+                // order, from the lines that follow.
+                if !pending.is_empty() {
+                    for hd in pending.drain(..) {
+                        let (raw, next, lines) =
+                            collect_heredoc_body(b, i, &hd.delim, hd.indent_term);
+                        let body = if hd.squiggly {
+                            strip_squiggly(&raw)
+                        } else {
+                            raw
+                        };
+                        out[hd.tok_idx].kind = Tok::Str(body, hd.interp);
+                        i = next;
+                        line += lines;
+                    }
+                }
             }
             b'#' => {
                 while i < b.len() && b[i] != b'\n' {
@@ -510,6 +627,51 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     line,
                     space: core::mem::take(&mut sp),
                 });
+            }
+            b'<' if i + 2 < b.len() && b[i + 1] == b'<' && heredoc_here(&out, &b[i + 2..]) => {
+                // A heredoc marker: `<<DELIM`, `<<~DELIM`, `<<-DELIM`, or a quoted
+                // delimiter. Consume the marker; the body is filled in when the
+                // line's newline is reached.
+                let mut j = i + 2;
+                let squiggly = b[j] == b'~';
+                let dash = b[j] == b'-';
+                if squiggly || dash {
+                    j += 1;
+                }
+                let (quote, interp) = match b.get(j) {
+                    Some(b'\'') => (Some(b'\''), false),
+                    Some(b'"') => (Some(b'"'), true),
+                    Some(b'`') => (Some(b'`'), true),
+                    _ => (None, true),
+                };
+                if quote.is_some() {
+                    j += 1;
+                }
+                let delim_start = j;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+                let delim = src[delim_start..j].to_string();
+                if let Some(q) = quote {
+                    if b.get(j) == Some(&q) {
+                        j += 1;
+                    }
+                }
+                // Emit a placeholder Str token (filled at end of line) and record
+                // the pending heredoc.
+                out.push(Token {
+                    kind: Tok::Str(String::new(), interp),
+                    line,
+                    space: core::mem::take(&mut sp),
+                });
+                pending.push(Heredoc {
+                    delim,
+                    squiggly,
+                    indent_term: squiggly || dash,
+                    interp,
+                    tok_idx: out.len() - 1,
+                });
+                i = j;
             }
             _ => {
                 // operators / punctuation, longest match first. Guard the string

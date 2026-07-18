@@ -2005,6 +2005,22 @@ fn struct_type() {
 }
 
 #[test]
+fn heredocs() {
+    // Plain heredoc interpolates; the body keeps its own newlines.
+    eq("x = <<END\nhello\nworld\nEND\nx", "\"hello\\nworld\\n\"");
+    // Squiggly `<<~` strips the common leading indentation.
+    eq("x = <<~TXT\n  a\n  b\nTXT\nx", "\"a\\nb\\n\"");
+    // Interpolation inside a heredoc.
+    eq("n = \"Bob\"\n<<~MSG\n  Hi #{n}\nMSG", "\"Hi Bob\\n\"");
+    // Single-quoted delimiter is a literal (no interpolation).
+    eq("<<'RAW'\nno #{x} here\nRAW", "\"no #{x} here\\n\"");
+    // Squiggly keeps relative indentation.
+    eq("<<~A\n  x\n    y\n  z\nA", "\"x\\n  y\\nz\\n\"");
+    // `<<` is still the shift operator in value context.
+    eq("a = []; a << 1 << 2; a", "[1, 2]");
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).

@@ -322,3 +322,11 @@ true
 #<struct Point x=3, y=4>
 Alice is 30
 [:x, :y]
+#==#
+SELECT name, age
+FROM users
+WHERE active = true
+  Total items: 3
+  Status: OK
+first
+second

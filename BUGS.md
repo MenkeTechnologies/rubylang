@@ -49,10 +49,10 @@ capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
 
 ## Lexer
 
-- **Not lexed:** heredocs (`<<~`, `<<-`), `__END__`. `%w[]` / `%i[]` word/symbol
-  arrays (and the `()`/`{}`/`<>` delimiter variants) **are** lexed, as is
+- **Not lexed:** `__END__`. Heredocs (`<<END`, `<<~SQL`, `<<-EOT`, `<<'RAW'`),
+  `%w[]` / `%i[]` word/symbol arrays (and the `()`/`{}`/`<>` delimiter variants),
   double-quoted `#{}` interpolation, `?c` character literals, and regex literals
-  (`/pat/flags`, with `i`/`m`/`x` flags).
+  (`/pat/flags`, with `i`/`m`/`x` flags) **are** lexed.
 
 ## Runtime / methods
 

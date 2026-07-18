@@ -1,0 +1,6 @@
+== Report ==
+generated below
+Name: Ada
+Role: engineer
+Hello #{user}, your balance is #{amount}.
+["one", "two", "three"]

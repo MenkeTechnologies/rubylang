@@ -5398,7 +5398,14 @@ fn puts_one(v: &Value) {
             puts_one(e);
         }
     } else {
-        println!("{}", display(v));
+        // Ruby's `puts` appends a newline only when the value's string form does
+        // not already end in one.
+        let s = display(v);
+        if s.ends_with('\n') {
+            print!("{s}");
+        } else {
+            println!("{s}");
+        }
     }
 }
 

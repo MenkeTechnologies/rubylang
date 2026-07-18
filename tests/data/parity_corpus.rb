@@ -541,3 +541,21 @@ Person = Struct.new(:name, :age, keyword_init: true)
 alice = Person.new(name: "Alice", age: 30)
 puts "#{alice.name} is #{alice.age}"
 puts Point.new(1, 2).members.inspect
+#==#
+sql = <<~SQL
+  SELECT name, age
+  FROM users
+  WHERE active = true
+SQL
+puts sql
+count = 3
+report = <<-REPORT
+  Total items: #{count}
+  Status: OK
+REPORT
+puts report
+puts(<<~A + <<~B)
+  first
+A
+  second
+B
