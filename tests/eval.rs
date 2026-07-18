@@ -2358,6 +2358,35 @@ fn time_utc() {
 }
 
 #[test]
+fn hash_enumerable_and_default() {
+    // Hash#reduce/inject iterate the `[k, v]` pairs.
+    eq("{a: 1, b: 2, c: 3}.reduce(0) { |s, (k, v)| s + v }", "6");
+    eq("{a: 1, b: 2}.inject(0) { |s, (k, v)| s + v }", "3");
+    eq(
+        "{a: 1, b: 2}.reduce([]) { |acc, (k, v)| acc << k }",
+        "[:a, :b]",
+    );
+    // group_by / partition / find_all over pairs.
+    eq(
+        "{a: 1, b: 2}.group_by { |k, v| v.even? }",
+        "{false => [[:a, 1]], true => [[:b, 2]]}",
+    );
+    eq(
+        "{a: 1, b: 2}.partition { |k, v| v > 1 }",
+        "[[[:b, 2]], [[:a, 1]]]",
+    );
+    eq("{a: 1, b: 2}.find_all { |k, v| v > 1 }", "[[:b, 2]]");
+    eq("[1, 2, 3, 4].find_all { |x| x > 2 }", "[3, 4]");
+    // Hash#default / #default= for missing keys.
+    eq("h = {}; h.default = 5; [h[:x], h[:y]]", "[5, 5]");
+    eq("h = Hash.new; h.default = 0; h[:a] += 1; h", "{a: 1}");
+    eq("{a: 1}.default", "nil");
+    eq("Hash.new(9).default", "9");
+    // default= does not affect present keys.
+    eq("h = {a: 1}; h.default = 0; h[:a]", "1");
+}
+
+#[test]
 fn float_ranges() {
     // Float ranges support step (with Ruby's drift-free count).
     eq("(1.0..2.0).step(0.5).to_a", "[1.0, 1.5, 2.0]");

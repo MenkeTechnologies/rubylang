@@ -607,6 +607,12 @@ impl RubyHost {
             default_proc: None,
         })
     }
+    /// Set the value returned for missing keys (`Hash#default=`), in place.
+    pub fn set_hash_default(&mut self, v: &Value, default: Value) {
+        if let Some(RObj::Hash { default: d, .. }) = self.obj_mut(v) {
+            *d = default;
+        }
+    }
     /// `Hash.new { |h,k| ... }` — a hash whose `[]` calls the block on a miss.
     pub fn new_hash_with_proc(&mut self, map: IndexMap<RKey, Value>, proc: Value) -> Value {
         self.alloc(RObj::Hash {

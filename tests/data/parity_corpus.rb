@@ -899,3 +899,22 @@ temps.each do |t|
           end
   puts "#{t}: #{label}"
 end
+#==#
+inventory = {apples: 30, bananas: 12, cherries: 45}
+total = inventory.reduce(0) { |sum, (name, count)| sum + count }
+puts total
+low_stock = inventory.find_all { |name, count| count < 20 }
+puts low_stock.inspect
+by_parity = inventory.group_by { |name, count| count.even? ? :even : :odd }
+puts by_parity.inspect
+big, small = inventory.partition { |name, count| count >= 30 }
+puts big.inspect
+puts small.inspect
+counts = Hash.new(0)
+"mississippi".each_char { |c| counts[c] += 1 }
+puts counts.inspect
+puts counts.default
+seen = {}
+seen.default = "unseen"
+puts seen[:missing]
+puts inventory.inject(:apples => 0) { |acc, (k, v)| acc }.inspect

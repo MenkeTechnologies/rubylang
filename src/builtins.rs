@@ -3715,7 +3715,7 @@ fn dispatch_array(
             }
             Ok(new_arr(out))
         }
-        "select" | "filter" | "reject" => {
+        "select" | "filter" | "find_all" | "reject" => {
             if block.is_none() {
                 // Block-less: an Enumerator over the elements, tagged with the
                 // filtering method so `select.with_index { … }` filters.
@@ -5525,7 +5525,11 @@ fn dispatch_hash(
             }
             Ok(Value::Bool(name != "any?"))
         }
-        "min_by" | "max_by" | "sort_by" => {
+        // Enumerable methods that iterate the hash as `[k, v]` pairs: delegate
+        // to the array of pairs (blocks receive the pair, auto-splat to `|k, v|`
+        // or destructure to `|(k, v)|`).
+        "min_by" | "max_by" | "sort_by" | "reduce" | "inject" | "group_by" | "partition"
+        | "find_all" | "chunk_while" | "each_slice" | "each_cons" | "minmax_by" => {
             let rows: Vec<Value> = with_host(|h| {
                 map.iter()
                     .map(|(k, v)| {
@@ -5545,6 +5549,12 @@ fn dispatch_hash(
                 out.insert(nk, kv);
             }
             Ok(with_host(|h| h.new_hash(out)))
+        }
+        // The value returned for a missing key (`Hash#default` / `#default=`).
+        "default" => Ok(with_host(|h| h.hash_default(recv))),
+        "default=" => {
+            with_host(|h| h.set_hash_default(recv, args[0].clone()));
+            Ok(args[0].clone())
         }
         "to_h" => Ok(recv.clone()),
         "except" => {

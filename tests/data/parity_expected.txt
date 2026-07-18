@@ -492,3 +492,13 @@ true
 15.0: cold
 25.0: mild
 40.0: hot
+#==#
+87
+[[:bananas, 12]]
+{even: [[:apples, 30], [:bananas, 12]], odd: [[:cherries, 45]]}
+[[:apples, 30], [:cherries, 45]]
+[[:bananas, 12]]
+{"m" => 1, "i" => 4, "s" => 4, "p" => 2}
+0
+unseen
+{apples: 0}

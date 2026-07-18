@@ -24,7 +24,8 @@ call-site/array/target splat (`f(*a)`, `[1, *a]`, `a, *b = …`); parallel
 assignment (`a, b = 1, 2`, swap); `case`/`when Class`
 (`when Integer`) and `is_a?`; `sprintf`/`format`/`String#%` with width/precision
 flags; a broad Enumerable/Hash surface (`partition`, `group_by`, `tally`, `zip`,
-`each_with_object`, `transform_values`, …); blocks/`yield`/closures with lexical
+`each_with_object`, `transform_values`, Hash `reduce`/`inject`/`find_all` over
+`[k, v]` pairs, `Hash#default`/`default=`, …); blocks/`yield`/closures with lexical
 capture, `&block` params + `block_given?`/`__method__`, block-parameter
 destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
 `->((a, b)) { }` lambda form), lambdas (`->(x) { }`,
