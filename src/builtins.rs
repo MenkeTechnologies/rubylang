@@ -2595,32 +2595,6 @@ fn dispatch_array(
             }
             Ok(with_host(|h| h.new_hash(m)))
         }
-        "minmax" => {
-            if arr.is_empty() {
-                return Ok(new_arr(vec![Value::Undef, Value::Undef]));
-            }
-            let cmp = |a: &Value, b: &Value| -> Result<std::cmp::Ordering, String> {
-                match &block {
-                    Some(bl) => Ok(match as_i(&call_proc(bl, &[a.clone(), b.clone()])?) {
-                        n if n < 0 => std::cmp::Ordering::Less,
-                        0 => std::cmp::Ordering::Equal,
-                        _ => std::cmp::Ordering::Greater,
-                    }),
-                    None => Ok(cmp_values(a, b)),
-                }
-            };
-            let mut min = arr[0].clone();
-            let mut max = arr[0].clone();
-            for x in &arr[1..] {
-                if cmp(x, &min)? == std::cmp::Ordering::Less {
-                    min = x.clone();
-                }
-                if cmp(x, &max)? == std::cmp::Ordering::Greater {
-                    max = x.clone();
-                }
-            }
-            Ok(new_arr(vec![min, max]))
-        }
         "cycle" => {
             let Some(bl) = &block else {
                 // Without a block MRI returns an Enumerator; no Enumerator type yet.
