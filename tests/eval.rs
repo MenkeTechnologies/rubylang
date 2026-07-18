@@ -480,6 +480,50 @@ fn method_breadth_batch() {
 }
 
 #[test]
+fn regexp_batch() {
+    // Literals, matching operators, and String regex methods.
+    eq("\"Hello World\".scan(/\\w+/)", "[\"Hello\", \"World\"]");
+    eq(
+        "\"a1b2c3\".scan(/([a-z])(\\d)/)",
+        "[[\"a\", \"1\"], [\"b\", \"2\"], [\"c\", \"3\"]]",
+    );
+    eq("\"a1b2\".gsub(/\\d/, \"#\")", "\"a#b#\"");
+    eq("\"foo123\" =~ /\\d+/", "3");
+    eq("\"abc\" =~ /\\d/", "nil");
+    eq("\"a,b;c\".split(/[,;]/)", "[\"a\", \"b\", \"c\"]");
+    eq("\"hello\".match?(/l+/)", "true");
+    eq(
+        "\"hello world\".gsub(/o/) { |m| m.upcase }",
+        "\"hellO wOrld\"",
+    );
+    eq(
+        "\"cat dog\".scan(/\\w+/).map(&:upcase)",
+        "[\"CAT\", \"DOG\"]",
+    );
+    // Regexp object + case-equality.
+    eq("/\\d+/.class", "\"Regexp\"");
+    eq("/ab/.source", "\"ab\"");
+    eq("/AB/i.match?(\"xabx\")", "true");
+    eq(
+        "case \"word\"; when /\\d/ then 1; when /[a-z]+/ then 2; end",
+        "2",
+    );
+}
+
+#[test]
+fn matchdata_batch() {
+    eq("\"hello\".match(/l(l)/).class", "\"MatchData\"");
+    eq("\"hello\".match(/l(l)/)[0]", "\"ll\"");
+    eq("\"hello\".match(/l(l)/)[1]", "\"l\"");
+    eq("\"hello\".match(/l(l)/).pre_match", "\"he\"");
+    eq("\"hello\".match(/l(l)/).post_match", "\"o\"");
+    eq("\"hello\".match(/l(l)/).to_a", "[\"ll\", \"l\"]");
+    eq("\"hello\".match(/l(l)/).captures", "[\"l\"]");
+    eq("\"xyz\".match(/\\d/)", "nil");
+    eq("/(\\d+)/.match(\"id 42\")[1]", "\"42\"");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

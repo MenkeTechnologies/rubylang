@@ -420,3 +420,18 @@ puts "ff".to_i(16)
 puts "1010".to_i(2)
 puts ?A
 puts ?z
+#==#
+puts "Hello World".scan(/\w+/).inspect
+puts "a1b2c3".scan(/([a-z])(\d)/).inspect
+puts "a1b2".gsub(/\d/, "#")
+puts("foo123" =~ /\d+/)
+puts "a,b;c".split(/[,;]/).inspect
+puts "hello".match?(/l+/)
+puts "hello world".gsub(/o/) { |m| m.upcase }
+m = "2024-01-15".match(/(\d+)-(\d+)-(\d+)/)
+puts m[1]
+puts m[2]
+puts m[3]
+puts m.pre_match.inspect
+puts "cat dog bird".scan(/\w+/).map(&:upcase).inspect
+puts(/\d+/.match("id 42").to_s)

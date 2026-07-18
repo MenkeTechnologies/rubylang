@@ -198,8 +198,9 @@ The standalone `ruby` binary, the REPL, the rkyv bytecode cache, the AOP
 method-intercept registry, and the LSP server are all in the tree.
 
 The DAP adapter is partial (handshake + run-to-completion; stepping pending).
-`extend` / `prepend`, keyword parameters, regex, and bignum are planned. See
-[`BUGS.md`](BUGS.md) for the full known-gaps list.
+Regex literals (`/pat/flags`), `=~`/`!~`, `String#{match,scan,match?,sub,gsub}`
+with `Regexp`, and `MatchData` are supported. `extend` / `prepend` and bignum are
+planned. See [`BUGS.md`](BUGS.md) for the full known-gaps list.
 
 ---
 

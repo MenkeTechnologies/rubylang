@@ -364,7 +364,10 @@ impl RubyHost {
             format!("(?{inline}){source}")
         };
         match regex::Regex::new(&full) {
-            Ok(re) => Ok(self.alloc(RObj::Regexp { source: source.to_string(), re })),
+            Ok(re) => Ok(self.alloc(RObj::Regexp {
+                source: source.to_string(),
+                re,
+            })),
             Err(e) => Err(format!("invalid regex /{source}/: {e}")),
         }
     }

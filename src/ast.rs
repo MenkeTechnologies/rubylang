@@ -25,8 +25,8 @@ pub enum BinOp {
     Cmp,    // <=>
     Match,  // =~
     NMatch, // !~
-    And, // &&
-    Or,  // ||
+    And,    // &&
+    Or,     // ||
     BitAnd,
     BitOr,
     BitXor,

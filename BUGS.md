@@ -49,14 +49,23 @@ capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
 
 ## Lexer
 
-- **Not lexed:** heredocs (`<<~`, `<<-`), regex literals (`/.../`), `?c` character
-  literals, `__END__`. `%w[]` / `%i[]` word/symbol arrays (and the `()`/`{}`/`<>`
-  delimiter variants) **are** lexed, as is double-quoted `#{}` interpolation.
+- **Not lexed:** heredocs (`<<~`, `<<-`), `__END__`. `%w[]` / `%i[]` word/symbol
+  arrays (and the `()`/`{}`/`<>` delimiter variants) **are** lexed, as is
+  double-quoted `#{}` interpolation, `?c` character literals, and regex literals
+  (`/pat/flags`, with `i`/`m`/`x` flags).
 
 ## Runtime / methods
 
-- **Regexp.** No `Regexp` type; `String#sub`/`gsub` do literal (non-regex)
-  replacement only.
+- **Regexp.** Supported: `/pat/flags` literals, `=~`/`!~`, `String#match`
+  (returns `MatchData` with `[n]`/`pre_match`/`post_match`/`to_a`/`captures`),
+  `match?`, `scan`, `split(re)`, `sub`/`gsub` with a Regexp (backrefs `\1`..`\9`
+  in the replacement and a block form), and `Regexp#{source,match,scan,match?}`
+  plus `case`/`when /re/` case-equality. Backed by the Rust `regex` crate, so
+  Ruby's Onigmo-only constructs (backreferences within the pattern, lookaround)
+  are unavailable. `$~` / `$1`..`$9` match globals are not set — use `MatchData`
+  or a block param instead.
+- **`Object#class` returns a String** (the class name), not a `Class` object;
+  `.class.name` and class-object identity are therefore unsupported.
 - **Enumerator without block.** `each_with_index.map` (an enumerator returned
   from a block-less call) is not supported. (`&:sym` block-pass IS.)
 - **Bignum.** Integers are `i64`; there is no automatic promotion to arbitrary

@@ -934,7 +934,9 @@ fn dispatch_string(
         "start_with?" => Ok(Value::Bool(s.starts_with(&arg_str(&args[0])))),
         "end_with?" => Ok(Value::Bool(s.ends_with(&arg_str(&args[0])))),
         "match?" => {
-            let m = str_regex(&args[0]).map(|re| re.is_match(&s)).unwrap_or(false);
+            let m = str_regex(&args[0])
+                .map(|re| re.is_match(&s))
+                .unwrap_or(false);
             Ok(Value::Bool(m))
         }
         "=~" => match str_regex(&args[0]) {
@@ -954,7 +956,9 @@ fn dispatch_string(
         },
         "split" => {
             let parts: Vec<Value> = if args.is_empty() {
-                s.split_whitespace().map(|p| new_str(p.to_string())).collect()
+                s.split_whitespace()
+                    .map(|p| new_str(p.to_string()))
+                    .collect()
             } else if let Some(re) = str_regex(&args[0]) {
                 re.split(&s).map(|p| new_str(p.to_string())).collect()
             } else {
@@ -970,7 +974,11 @@ fn dispatch_string(
             }
             let from = arg_str(&args[0]);
             let to = arg_str(&args[1]);
-            Ok(new_str(if all { s.replace(&from, &to) } else { s.replacen(&from, &to, 1) }))
+            Ok(new_str(if all {
+                s.replace(&from, &to)
+            } else {
+                s.replacen(&from, &to, 1)
+            }))
         }
         "replace" => {
             let n = arg_str(&args[0]);
@@ -1078,14 +1086,21 @@ fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value,
 fn scan_regex(re: &regex::Regex, s: &str) -> Value {
     let ngroups = re.captures_len(); // includes the whole-match group 0
     if ngroups <= 1 {
-        let out: Vec<Value> = re.find_iter(s).map(|m| new_str(m.as_str().to_string())).collect();
+        let out: Vec<Value> = re
+            .find_iter(s)
+            .map(|m| new_str(m.as_str().to_string()))
+            .collect();
         new_arr(out)
     } else {
         let out: Vec<Value> = re
             .captures_iter(s)
             .map(|c| {
                 let groups: Vec<Value> = (1..ngroups)
-                    .map(|i| c.get(i).map(|m| new_str(m.as_str().to_string())).unwrap_or(Value::Undef))
+                    .map(|i| {
+                        c.get(i)
+                            .map(|m| new_str(m.as_str().to_string()))
+                            .unwrap_or(Value::Undef)
+                    })
                     .collect();
                 new_arr(groups)
             })
@@ -1105,8 +1120,7 @@ fn regex_replace(
 ) -> Result<Value, String> {
     let mut out = String::new();
     let mut last = 0;
-    let mut count = 0;
-    for caps in re.captures_iter(s) {
+    for (count, caps) in re.captures_iter(s).enumerate() {
         if !all && count >= 1 {
             break;
         }
@@ -1120,7 +1134,6 @@ fn regex_replace(
             out.push_str(&expand_backrefs(&repl, &caps));
         }
         last = m.end();
-        count += 1;
     }
     out.push_str(&s[last..]);
     Ok(new_str(out))
