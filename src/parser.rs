@@ -11,6 +11,11 @@
 use crate::ast::*;
 use crate::lexer::{lex, Tok, Token};
 
+/// A parsed block/lambda parameter list: the flat parameter names, the splat
+/// index (if any), and the destructuring "prelude" assignments to prepend to
+/// the block body (unpacking each `(a, b)` group from its temp parameter).
+type BlockParams = (Vec<String>, Option<usize>, Vec<Expr>);
+
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
@@ -639,9 +644,10 @@ impl Parser {
 
     fn maybe_block(&mut self) -> Result<Option<Block>, String> {
         if self.eat_kw("do") {
-            let (params, splat) = self.block_params()?;
-            let body = self.body_until(&["end"])?;
+            let (params, splat, preludes) = self.block_params()?;
+            let rest = self.body_until(&["end"])?;
             self.expect_kw("end")?;
+            let body = self.prepend_preludes(preludes, rest);
             return Ok(Some(Block {
                 params,
                 splat,
@@ -650,7 +656,7 @@ impl Parser {
         }
         if self.is_op("{") {
             self.advance();
-            let (params, splat) = self.block_params()?;
+            let (params, splat, preludes) = self.block_params()?;
             let mut body = Vec::new();
             self.skip_terms();
             while !self.is_op("}") && !matches!(self.peek(), Tok::Eof) {
@@ -658,6 +664,7 @@ impl Parser {
                 self.skip_terms();
             }
             self.expect_op("}")?;
+            let body = self.prepend_preludes(preludes, body);
             return Ok(Some(Block {
                 params,
                 splat,
@@ -667,33 +674,98 @@ impl Parser {
         Ok(None)
     }
 
-    fn block_params(&mut self) -> Result<(Vec<String>, Option<usize>), String> {
+    /// Prepend the destructuring `preludes` (parallel-assignment unpackings) to
+    /// the block `body`, so `(a, b)` parameters are unpacked before the body runs.
+    fn prepend_preludes(&self, mut preludes: Vec<Expr>, body: Vec<Expr>) -> Vec<Expr> {
+        if preludes.is_empty() {
+            return body;
+        }
+        preludes.extend(body);
+        preludes
+    }
+
+    /// Parse a block/lambda parameter list, returning the flat parameter names,
+    /// the splat index (if any), and a list of "prelude" assignments that
+    /// destructure any `(a, b)` parameters into their names. A destructuring
+    /// parameter is bound to a fresh temp name and unpacked at the top of the
+    /// block body via ordinary parallel assignment (`a, b = __tmp`), so nested
+    /// patterns become a sequence of flat assignments.
+    fn block_params(&mut self) -> Result<BlockParams, String> {
         let mut params = Vec::new();
         let mut splat = None;
+        let mut preludes = Vec::new();
         if self.eat_op("|") {
             if !self.is_op("|") {
-                self.block_param(&mut params, &mut splat)?;
+                self.block_param(&mut params, &mut splat, &mut preludes)?;
                 while self.eat_op(",") {
-                    self.block_param(&mut params, &mut splat)?;
+                    if self.is_op("|") {
+                        break; // trailing comma
+                    }
+                    self.block_param(&mut params, &mut splat, &mut preludes)?;
                 }
             }
             self.expect_op("|")?;
         }
-        Ok((params, splat))
+        Ok((params, splat, preludes))
     }
 
-    /// One block/lambda parameter: `name` or `*rest` (the splat collects surplus
-    /// positional args). Records the splat index when it sees `*`.
+    /// One block/lambda parameter: `name`, `*rest` (the splat collects surplus
+    /// positional args), or a `(a, b)` destructuring group. Records the splat
+    /// index when it sees `*`; a destructuring group pushes a fresh temp name as
+    /// the parameter and appends its unpacking assignment(s) to `preludes`.
     fn block_param(
         &mut self,
         params: &mut Vec<String>,
         splat: &mut Option<usize>,
+        preludes: &mut Vec<Expr>,
     ) -> Result<(), String> {
+        if self.is_op("(") {
+            let (temp, assigns) = self.destructure_param()?;
+            params.push(temp);
+            preludes.extend(assigns);
+            return Ok(());
+        }
         if self.eat_op("*") {
             *splat = Some(params.len());
         }
         params.push(self.ident_name()?);
         Ok(())
+    }
+
+    /// Parse a `(a, b, *rest, (c, d))` destructuring group. Returns a fresh temp
+    /// name (the actual parameter, which receives the whole array argument) and
+    /// the parallel-assignment statements that unpack it — this level first, then
+    /// any nested groups, so temps are always filled before they are read.
+    fn destructure_param(&mut self) -> Result<(String, Vec<Expr>), String> {
+        self.expect_op("(")?;
+        let temp = format!("__destructure_{}", self.tmp);
+        self.tmp += 1;
+        let mut targets: Vec<Expr> = Vec::new();
+        let mut nested: Vec<Expr> = Vec::new();
+        loop {
+            if self.eat_op("*") {
+                targets.push(Expr::Splat(Box::new(Expr::Var(
+                    VarKind::Local,
+                    self.ident_name()?,
+                ))));
+            } else if self.is_op("(") {
+                let (inner_temp, inner_assigns) = self.destructure_param()?;
+                targets.push(Expr::Var(VarKind::Local, inner_temp));
+                nested.extend(inner_assigns);
+            } else {
+                targets.push(Expr::Var(VarKind::Local, self.ident_name()?));
+            }
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        let mut out = vec![Expr::MultiAssign {
+            targets,
+            values: vec![Expr::Var(VarKind::Local, temp.clone())],
+        }];
+        out.extend(nested);
+        Ok((temp, out))
     }
 
     fn ident_name(&mut self) -> Result<String, String> {
@@ -1466,13 +1538,14 @@ impl Parser {
         self.expect_op("->")?;
         let mut params = Vec::new();
         let mut splat = None;
+        let mut preludes = Vec::new();
         let mut had_parens = false;
         if self.eat_op("(") {
             had_parens = true;
             if !self.is_op(")") {
-                self.block_param(&mut params, &mut splat)?;
+                self.block_param(&mut params, &mut splat, &mut preludes)?;
                 while self.eat_op(",") {
-                    self.block_param(&mut params, &mut splat)?;
+                    self.block_param(&mut params, &mut splat, &mut preludes)?;
                 }
             }
             self.expect_op(")")?;
@@ -1481,18 +1554,19 @@ impl Parser {
         let block = self
             .maybe_block()?
             .ok_or_else(|| format!("line {}: lambda without a body", self.line()))?;
-        // Params from the `->()` header win; if there were none, adopt the
-        // block's own `{ |x| }` params (and its splat).
-        let (params, splat) = if had_parens {
-            (params, splat)
+        // Params from the `->()` header win (with its destructuring preludes
+        // prepended to the body); if there were none, adopt the block's own
+        // `{ |x| }` params/splat/body verbatim.
+        if had_parens {
+            let body = self.prepend_preludes(preludes, block.body);
+            Ok(Expr::Lambda(Block {
+                params,
+                splat,
+                body,
+            }))
         } else {
-            (block.params, block.splat)
-        };
-        Ok(Expr::Lambda(Block {
-            params,
-            splat,
-            body: block.body,
-        }))
+            Ok(Expr::Lambda(block))
+        }
     }
 
     fn array_lit(&mut self) -> Result<Expr, String> {

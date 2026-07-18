@@ -5412,7 +5412,11 @@ fn dispatch_hash(
             if let Some(b) = &block {
                 for (k, v) in &map {
                     let kv = with_host(|h| h.key_value(k));
-                    out.push(call_proc(b, &[kv, v.clone()])?);
+                    // Yield the `[k, v]` pair as a single argument: a 2-param
+                    // block auto-splats it, and a 1-param destructuring block
+                    // (`|(k, v)|`) receives the whole pair to unpack.
+                    let pair = new_arr(vec![kv, v.clone()]);
+                    out.push(call_proc(b, &[pair])?);
                 }
             }
             Ok(new_arr(out))

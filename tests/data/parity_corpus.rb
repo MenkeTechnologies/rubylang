@@ -849,3 +849,19 @@ puts 10.step(2, -2).to_a.inspect
 counter = 3.times
 puts [counter.next, counter.next].inspect
 puts "hello".each_char.with_index.map { |c, i| "#{i}:#{c}" }.inspect
+#==#
+pairs = [[1, 2], [3, 4], [5, 6]]
+puts pairs.map { |(a, b)| a * b }.inspect
+puts pairs.each_with_index.map { |(a, b), i| "#{i}:#{a + b}" }.inspect
+nested = [[1, [2, 3]], [4, [5, 6]]]
+puts nested.map { |(a, (b, c))| a + b + c }.inspect
+prices = {apple: 3, banana: 2}
+total = prices.each_with_object([]) { |(name, cost), lines| lines << "#{name}: $#{cost}" }
+puts total.inspect
+puts prices.map { |(k, v)| "#{k}=#{v}" }.inspect
+rows = [[10, 20, 30], [40, 50, 60]]
+puts rows.map { |(first, *others)| [first, others.sum] }.inspect
+add = ->((x, y)) { x + y }
+puts add.call([7, 8])
+grouped = [[:a, 1], [:a, 2], [:b, 3]]
+puts grouped.each_with_object(Hash.new { |h, k| h[k] = [] }) { |(key, val), acc| acc[key] << val }.inspect

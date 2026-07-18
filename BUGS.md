@@ -25,7 +25,9 @@ assignment (`a, b = 1, 2`, swap); `case`/`when Class`
 (`when Integer`) and `is_a?`; `sprintf`/`format`/`String#%` with width/precision
 flags; a broad Enumerable/Hash surface (`partition`, `group_by`, `tally`, `zip`,
 `each_with_object`, `transform_values`, …); blocks/`yield`/closures with lexical
-capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
+capture, `&block` params + `block_given?`/`__method__`, block-parameter
+destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
+`->((a, b)) { }` lambda form), lambdas (`->(x) { }`,
 `.call`/`.()`/`[]`), keyword args + `**opts`, `Integer#step`, `?c` char literals,
 `String#center`/`tr`/`lines`/`delete`/`count`/`to_i(base)`, `Integer#to_s(base)`,
 `Array#dig`/`first(n)`/`last(n)`/`min(n)`/`max(n)`/`each_cons`/`sum { }`,

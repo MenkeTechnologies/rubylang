@@ -142,7 +142,8 @@ Implemented and checked against the reference `ruby`:
   classes.
 - **Parameters & assignment** — splat parameters (`def f(a, *rest)`), `&:sym`
   block-pass (`map(&:upcase)`), parallel assignment (`a, b = 1, 2`, array
-  destructuring, swap), default arguments.
+  destructuring, swap), block-parameter destructuring (`map { |(a, b), i| … }`,
+  nested and splat groups, `->((a, b)) { }`), default arguments.
 - **String interpolation** — double-quoted `#{}` interpolation.
 
 ---

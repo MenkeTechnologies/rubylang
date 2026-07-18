@@ -2358,6 +2358,35 @@ fn time_utc() {
 }
 
 #[test]
+fn block_parameter_destructuring() {
+    // A `(a, b)` block parameter unpacks the corresponding array argument.
+    eq("[[1, 2], [3, 4]].map { |(a, b)| a + b }", "[3, 7]");
+    // Nested destructuring.
+    eq("[[1, [2, 3]]].map { |(a, (b, c))| a + b + c }", "[6]");
+    // Splat inside a destructuring group.
+    eq("[[1, 2, 3]].map { |(a, *rest)| rest }", "[[2, 3]]");
+    // Destructure the first param, keep a plain second param.
+    eq(
+        "[[1, 2], [3, 4]].each_with_index.map { |(a, b), i| [a, b, i] }",
+        "[[1, 2, 0], [3, 4, 1]]",
+    );
+    // The classic each_with_object over hash pairs.
+    eq(
+        "{a: 1, b: 2}.each_with_object([]) { |(k, v), acc| acc << \"#{k}=#{v}\" }",
+        "[\"a=1\", \"b=2\"]",
+    );
+    // A single destructuring param over a hash pair.
+    eq("{x: 1}.map { |(k, v)| \"#{k}=#{v}\" }", "[\"x=1\"]");
+    // Lambda and proc destructuring.
+    eq("f = ->((a, b)) { a + b }; f.call([1, 2])", "3");
+    eq("pr = proc { |(a, b)| a * b }; pr.call([3, 4])", "12");
+    // Auto-splat of a hash pair to a 2-param block still works.
+    eq("{a: 1, b: 2}.map { |k, v| v * 10 }", "[10, 20]");
+    // A single plain param receives the whole pair.
+    eq("{a: 1}.map { |pair| pair }", "[[:a, 1]]");
+}
+
+#[test]
 fn blockless_iterators_return_enumerators() {
     // String#each_char without a block yields an Enumerator, not the string.
     eq(
