@@ -637,6 +637,21 @@ fn dispatch_number(
             Ok(recv.clone())
         }
         "**" | "pow" => {
+            // Two-arg `Integer#pow(e, mod)` is modular exponentiation.
+            if name == "pow" && args.len() >= 2 {
+                if let (Value::Int(base), Value::Int(exp), Value::Int(m)) =
+                    (recv, &args[0], &args[1])
+                {
+                    if *m == 0 {
+                        return Err(raise_exc("ZeroDivisionError", "divided by 0"));
+                    }
+                    if *exp >= 0 {
+                        return Ok(Value::Int(mod_pow(*base, *exp, *m)));
+                    }
+                    // TODO: negative exponent needs a modular inverse (gcd == 1);
+                    // not yet implemented, fall through to the plain-pow path.
+                }
+            }
             // Integer ** non-negative Integer stays an Integer, like Ruby.
             match (recv, &args[0]) {
                 (Value::Int(base), Value::Int(exp)) if *exp >= 0 => {
@@ -726,7 +741,11 @@ fn dispatch_number(
             }))
         }
         "digits" => {
-            let mut n = as_i(recv).abs();
+            let mut n = as_i(recv);
+            if n < 0 {
+                // Ruby raises for a negative receiver rather than using abs.
+                return Err(raise_exc("Math::DomainError", "out of domain"));
+            }
             let base = args.first().map(as_i).unwrap_or(10).max(2);
             let mut out = Vec::new();
             if n == 0 {
@@ -738,6 +757,25 @@ fn dispatch_number(
             }
             Ok(new_arr(out))
         }
+        "bit_length" => {
+            let n = as_i(recv);
+            // Ruby: negative n has the bit length of ~n (its complement).
+            let m = if n >= 0 { n as u64 } else { (!n) as u64 };
+            Ok(Value::Int((64 - m.leading_zeros()) as i64))
+        }
+        "divmod" => match (recv, &args[0]) {
+            (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
+            (Value::Int(a), Value::Int(b)) => Ok(new_arr(vec![
+                Value::Int(floor_div(*a, *b)),
+                Value::Int(floor_mod(*a, *b)),
+            ])),
+            _ => {
+                let (x, y) = (as_f(recv), as_f(&args[0]));
+                let q = (x / y).floor();
+                Ok(new_arr(vec![Value::Float(q), Value::Float(x - q * y)]))
+            }
+        },
+        "fdiv" => Ok(Value::Float(as_f(recv) / as_f(&args[0]))),
         "clamp" => {
             let n = as_i(recv);
             let (lo, hi) = (as_i(&args[0]), as_i(&args[1]));
@@ -840,6 +878,34 @@ fn gcd(mut a: i64, mut b: i64) -> i64 {
         (a, b) = (b, a % b);
     }
     a
+}
+
+/// Modular exponentiation `base**exp mod m` for `exp >= 0` (Ruby `Integer#pow`).
+/// Uses i128 intermediates and floored modulo, so the result carries the sign of
+/// `m` exactly as Ruby's floored `%` does.
+fn mod_pow(base: i64, exp: i64, m: i64) -> i64 {
+    let mm = m as i128;
+    let fmod = |x: i128| {
+        let r = x % mm;
+        if r != 0 && ((r < 0) != (mm < 0)) {
+            r + mm
+        } else {
+            r
+        }
+    };
+    let mut b = fmod(base as i128);
+    let mut e = exp;
+    let mut r = fmod(1);
+    while e > 0 {
+        if e & 1 == 1 {
+            r = fmod(r * b);
+        }
+        e >>= 1;
+        if e > 0 {
+            b = fmod(b * b);
+        }
+    }
+    r as i64
 }
 
 // ---- String ---------------------------------------------------------------

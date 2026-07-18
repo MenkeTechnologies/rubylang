@@ -524,6 +524,31 @@ fn matchdata_batch() {
 }
 
 #[test]
+fn integer_math_batch() {
+    eq("12.gcd(8)", "4");
+    eq("4.lcm(6)", "12");
+    eq("123.digits", "[3, 2, 1]");
+    eq("100.digits(16)", "[4, 6]");
+    eq("255.bit_length", "8");
+    eq("256.bit_length", "9");
+    eq("0.bit_length", "0");
+    eq("(-1).bit_length", "0");
+    eq("17.divmod(5)", "[3, 2]");
+    eq("(-17).divmod(5)", "[-4, 3]");
+    eq("7.fdiv(2)", "3.5");
+    eq("5.pow(3, 7)", "6"); // modular exponentiation
+    eq("5.pow(0, 7)", "1");
+    eq("(-5).pow(3, 7)", "1");
+    eq("5.clamp(1, 3)", "3");
+    eq("3.between?(1, 5)", "true");
+    eq("5.succ", "6");
+    eq("5.pred", "4");
+    eq("r = 0; 1.upto(3) { |i| r += i }; r", "6");
+    eq("r = 0; 3.downto(1) { |i| r += i }; r", "6");
+    eq("r = []; 1.step(10, 3) { |i| r << i }; r", "[1, 4, 7, 10]");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
