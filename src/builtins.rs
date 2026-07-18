@@ -2616,6 +2616,164 @@ fn dispatch_regexp(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
 // Kernel functions (self / top-level calls with no user method).
 // ===========================================================================
 
+/// The name Ruby reports for a value in a `can't convert X into ...` TypeError:
+/// the literals `nil`/`true`/`false`, else the class name.
+fn type_name_for(v: &Value) -> String {
+    match v {
+        Value::Undef => "nil".to_string(),
+        Value::Bool(true) => "true".to_string(),
+        Value::Bool(false) => "false".to_string(),
+        _ => with_host(|h| h.class_of(v)),
+    }
+}
+
+/// Value of an ASCII digit char in the given base (2..=36), or `None`.
+fn base_digit(b: u8, base: i64) -> Option<u8> {
+    let v = match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'z' => b - b'a' + 10,
+        b'A'..=b'Z' => b - b'A' + 10,
+        _ => return None,
+    };
+    if (v as i64) < base {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// Strip Ruby digit-grouping underscores, rejecting any that are not sandwiched
+/// between two valid base digits (leading/trailing/doubled underscores are
+/// invalid). Also rejects any non-digit char.
+fn strip_underscores(s: &str, base: i64) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'_' {
+            let prev_ok = i > 0 && base_digit(bytes[i - 1], base).is_some();
+            let next_ok = i + 1 < bytes.len() && base_digit(bytes[i + 1], base).is_some();
+            if !prev_ok || !next_ok {
+                return None;
+            }
+            continue;
+        }
+        base_digit(b, base)?;
+        out.push(b as char);
+    }
+    Some(out)
+}
+
+/// Faithful `Kernel#Integer` string parse. `base == 0` auto-detects a radix
+/// prefix (0x/0b/0o/0d) or a bare leading `0` (octal); an explicit base in
+/// 2..=36 must agree with any prefix present. Returns `None` on invalid input.
+fn ruby_integer_str(input: &str, base: i64) -> Option<i64> {
+    let s = input.trim();
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut idx = 0;
+    let mut neg = false;
+    if bytes[0] == b'+' || bytes[0] == b'-' {
+        neg = bytes[0] == b'-';
+        idx = 1;
+    }
+    let rest = &s[idx..];
+    let rb = rest.as_bytes();
+    let mut base = base;
+    let mut digits = rest;
+    let mut had_prefix = false;
+    if rb.len() >= 2 && rb[0] == b'0' {
+        let (pbase, ok) = match rb[1] | 0x20 {
+            b'x' => (16, base == 0 || base == 16),
+            b'b' => (2, base == 0 || base == 2),
+            b'o' => (8, base == 0 || base == 8),
+            b'd' => (10, base == 0 || base == 10),
+            _ => (0, false),
+        };
+        if pbase != 0 && ok {
+            base = pbase;
+            digits = &rest[2..];
+            had_prefix = true;
+        }
+    }
+    if !had_prefix && base == 0 {
+        // A bare leading `0` (e.g. "077") is octal; everything else is decimal.
+        base = if rb.len() > 1 && rb[0] == b'0' { 8 } else { 10 };
+    }
+    if !(2..=36).contains(&base) {
+        return None;
+    }
+    let cleaned = strip_underscores(digits, base)?;
+    if cleaned.is_empty() {
+        return None;
+    }
+    let n = i64::from_str_radix(&cleaned, base as u32).ok()?;
+    Some(if neg { -n } else { n })
+}
+
+/// Faithful `Kernel#Float` string parse: decimal (with digit-grouping
+/// underscores and `.5`/`5.` forms) or a C99 hex float (`0x1.8p3`). Unlike
+/// Rust's `f64::from_str`, this rejects `inf`/`nan`/`Infinity`. `None` if invalid.
+fn ruby_float_str(input: &str) -> Option<f64> {
+    let s = input.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (sign, body) = match s.as_bytes()[0] {
+        b'+' => (1.0, &s[1..]),
+        b'-' => (-1.0, &s[1..]),
+        _ => (1.0, s),
+    };
+    let bb = body.as_bytes();
+    if bb.len() >= 2 && bb[0] == b'0' && (bb[1] | 0x20) == b'x' {
+        return parse_hex_float(&body[2..]).map(|v| sign * v);
+    }
+    // Decimal: allow only the float grammar's chars (this rejects inf/nan), and
+    // require any underscore to sit between two digits.
+    let bytes = s.as_bytes();
+    let mut cleaned = String::with_capacity(bytes.len());
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'_' => {
+                let prev_ok = i > 0 && bytes[i - 1].is_ascii_digit();
+                let next_ok = i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit();
+                if !prev_ok || !next_ok {
+                    return None;
+                }
+            }
+            b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-' => cleaned.push(b as char),
+            _ => return None,
+        }
+    }
+    cleaned.parse::<f64>().ok()
+}
+
+/// Parse the body (after `0x`) of a C99 hex float: `[hex].[hex]p[+-]dec`.
+fn parse_hex_float(s: &str) -> Option<f64> {
+    let (mantissa, exp) = match s.split_once(['p', 'P']) {
+        Some((m, e)) => (m, e.parse::<i32>().ok()?),
+        None => (s, 0),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (mantissa, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    let mut val = 0.0f64;
+    for c in int_part.chars() {
+        val = val * 16.0 + c.to_digit(16)? as f64;
+    }
+    let mut scale = 1.0 / 16.0;
+    for c in frac_part.chars() {
+        val += c.to_digit(16)? as f64 * scale;
+        scale /= 16.0;
+    }
+    Some(val * 2f64.powi(exp))
+}
+
 fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, String> {
     match name {
         "puts" => {
@@ -2676,22 +2834,70 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
         }
         "rand" => Ok(kernel_rand(args)),
         "srand" | "sleep" => Ok(Value::Int(0)),
-        "Integer" => match &args[0] {
-            Value::Int(n) => Ok(Value::Int(*n)),
-            Value::Float(f) => Ok(Value::Int(*f as i64)),
-            _ => match with_host(|h| h.as_str(&args[0])).and_then(|s| s.trim().parse::<i64>().ok())
-            {
-                Some(n) => Ok(Value::Int(n)),
-                None => Err(raise_exc("ArgumentError", "invalid value for Integer()")),
-            },
-        },
+        "Integer" => {
+            // `Integer(str, base=0)` / `Integer(numeric)`. A base is only valid
+            // for a string receiver; auto-detect (base 0) honours radix prefixes
+            // (0x/0b/0o/0d) and a bare leading `0` (octal), plus digit-grouping
+            // underscores and an optional sign.
+            let has_base = args.len() >= 2;
+            match &args[0] {
+                Value::Int(n) => {
+                    if has_base {
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            "base specified for non string value",
+                        ));
+                    }
+                    Ok(Value::Int(*n))
+                }
+                Value::Float(f) => {
+                    if has_base {
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            "base specified for non string value",
+                        ));
+                    }
+                    Ok(Value::Int(*f as i64))
+                }
+                _ => match with_host(|h| h.as_str(&args[0])) {
+                    Some(s) => {
+                        let base = if has_base { as_i(&args[1]) } else { 0 };
+                        if base != 0 && !(2..=36).contains(&base) {
+                            return Err(raise_exc(
+                                "ArgumentError",
+                                &format!("invalid radix {base}"),
+                            ));
+                        }
+                        match ruby_integer_str(&s, base) {
+                            Some(n) => Ok(Value::Int(n)),
+                            None => Err(raise_exc(
+                                "ArgumentError",
+                                &format!("invalid value for Integer(): {s:?}"),
+                            )),
+                        }
+                    }
+                    None => Err(raise_exc(
+                        "TypeError",
+                        &format!("can't convert {} into Integer", type_name_for(&args[0])),
+                    )),
+                },
+            }
+        }
         "Float" => match &args[0] {
             Value::Int(n) => Ok(Value::Float(*n as f64)),
             Value::Float(f) => Ok(Value::Float(*f)),
-            _ => match with_host(|h| h.as_str(&args[0])).and_then(|s| s.trim().parse::<f64>().ok())
-            {
-                Some(f) => Ok(Value::Float(f)),
-                None => Err(raise_exc("ArgumentError", "invalid value for Float()")),
+            _ => match with_host(|h| h.as_str(&args[0])) {
+                Some(s) => match ruby_float_str(&s) {
+                    Some(f) => Ok(Value::Float(f)),
+                    None => Err(raise_exc(
+                        "ArgumentError",
+                        &format!("invalid value for Float(): {s:?}"),
+                    )),
+                },
+                None => Err(raise_exc(
+                    "TypeError",
+                    &format!("can't convert {} into Float", type_name_for(&args[0])),
+                )),
             },
         },
         "String" => Ok(with_host(|h| {

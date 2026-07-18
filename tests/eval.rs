@@ -730,6 +730,44 @@ fn hash_methods_batch() {
 }
 
 #[test]
+fn kernel_convert_batch() {
+    // Kernel conversion functions: Integer/Float/String/Array with the full
+    // Ruby radix-prefix, base-argument, underscore, and sign handling.
+    eq("Integer(\"42\")", "42");
+    eq("Integer(\"ff\", 16)", "255");
+    eq("Integer(\"0xff\", 16)", "255");
+    eq("Integer(\"100\", 2)", "4");
+    eq("Integer(\"z\", 36)", "35");
+    eq("Integer(\"0d99\")", "99");
+    eq("Integer(\"-0b101\")", "-5");
+    eq("Integer(\"077\")", "63"); // bare leading zero is octal
+    eq("Integer(\"077\", 10)", "77"); // explicit base overrides
+    eq("Integer(\"1_000\")", "1000");
+    eq("Integer(\"  42  \")", "42");
+    eq("Integer(3.9)", "3");
+    eq("Float(\"3.14\")", "3.14");
+    eq("Float(\"1_000.5\")", "1000.5");
+    eq("Float(\".5\")", "0.5");
+    eq("Float(\"5.\")", "5.0");
+    eq("Float(\"0x1.8p3\")", "12.0"); // C99 hex float
+    eq("Float(42)", "42.0");
+    eq("String(42)", "\"42\"");
+    eq("String(nil)", "\"\"");
+    eq("Array(nil)", "[]");
+    eq("Array([1, 2])", "[1, 2]");
+    // Utility methods: tap returns the receiver, then/yield_self return the block.
+    eq("5.tap { |x| x }", "5");
+    eq("3.then { |x| x * 2 }", "6");
+    eq("42.yield_self { |x| x + 1 }", "43");
+    eq("x = 0; loop { x += 1; break if x > 3 }; x", "4");
+    // Bad input raises the right exception class.
+    assert!(ev("Integer(\"3.14\")").is_err());
+    assert!(ev("Integer(\"abc\")").is_err());
+    assert!(ev("Integer(nil)").is_err());
+    assert!(ev("Float(\"inf\")").is_err());
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
