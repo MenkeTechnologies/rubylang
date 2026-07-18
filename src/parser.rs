@@ -416,17 +416,46 @@ impl Parser {
     /// Parse the argument list + optional block that follow a method name.
     fn call_tail(&mut self) -> Result<(Vec<Expr>, Option<Block>), String> {
         let mut args = Vec::new();
+        let mut amp_block = None;
         if self.eat_op("(") {
             if !self.is_op(")") {
-                args.push(self.arg()?);
+                self.arg_or_amp(&mut args, &mut amp_block)?;
                 while self.eat_op(",") {
-                    args.push(self.arg()?);
+                    self.arg_or_amp(&mut args, &mut amp_block)?;
                 }
             }
             self.expect_op(")")?;
         }
-        let block = self.maybe_block()?;
+        let block = self.maybe_block()?.or(amp_block);
         Ok((args, block))
+    }
+
+    /// Parse one call argument, recognizing a `&:sym` block-pass (`map(&:upcase)`)
+    /// and turning it into an equivalent block `{ |__x| __x.sym }`.
+    fn arg_or_amp(
+        &mut self,
+        args: &mut Vec<Expr>,
+        amp_block: &mut Option<Block>,
+    ) -> Result<(), String> {
+        if self.is_op("&") {
+            if let Tok::Symbol(s) = self.toks[self.pos + 1].kind.clone() {
+                self.advance(); // &
+                self.advance(); // :sym
+                let call = Expr::Call {
+                    recv: Some(Box::new(Expr::Var(VarKind::Local, "__blkx__".into()))),
+                    name: s,
+                    args: vec![],
+                    block: None,
+                };
+                *amp_block = Some(Block {
+                    params: vec!["__blkx__".into()],
+                    body: vec![call],
+                });
+                return Ok(());
+            }
+        }
+        args.push(self.arg()?);
+        Ok(())
     }
 
     /// An argument allows `key: val` and `key => val` pair sugar (collapsed into
@@ -680,6 +709,23 @@ impl Parser {
                 };
                 Ok(Expr::Yield(args))
             }
+            "super" => {
+                self.advance();
+                // `super` (no parens) forwards the current args; `super(...)` /
+                // `super a, b` passes explicit args.
+                if self.is_op("(") {
+                    let (args, _) = self.call_tail()?;
+                    Ok(Expr::Super(Some(args)))
+                } else if self.cur_space() && self.starts_command_arg() {
+                    let mut args = vec![self.arg()?];
+                    while self.eat_op(",") {
+                        args.push(self.arg()?);
+                    }
+                    Ok(Expr::Super(Some(args)))
+                } else {
+                    Ok(Expr::Super(None))
+                }
+            }
             "begin" => {
                 self.advance();
                 let body = self.body_until(&["rescue", "ensure", "end"])?;
@@ -886,6 +932,13 @@ impl Parser {
 
     fn def_expr(&mut self) -> Result<Expr, String> {
         self.advance();
+        // `def self.name` is a class (singleton) method.
+        let singleton =
+            self.is_kw("self") && matches!(&self.toks[self.pos + 1].kind, Tok::Op(o) if o == ".");
+        if singleton {
+            self.advance(); // self
+            self.advance(); // .
+        }
         let name = self.method_name()?;
         let mut params = Vec::new();
         if self.eat_op("(") {
@@ -905,7 +958,12 @@ impl Parser {
         }
         let body = self.body_with_rescue()?;
         self.expect_kw("end")?;
-        Ok(Expr::Def { name, params, body })
+        Ok(Expr::Def {
+            name,
+            params,
+            body,
+            singleton,
+        })
     }
 
     /// A method body that may carry a bare `rescue`/`ensure` (implicit `begin`),
@@ -926,13 +984,18 @@ impl Parser {
     }
 
     fn param(&mut self) -> Result<Param, String> {
+        let splat = self.eat_op("*");
         let name = self.ident_name()?;
-        let default = if self.eat_op("=") {
+        let default = if !splat && self.eat_op("=") {
             Some(self.ternary()?)
         } else {
             None
         };
-        Ok(Param { name, default })
+        Ok(Param {
+            name,
+            default,
+            splat,
+        })
     }
 
     fn array_lit(&mut self) -> Result<Expr, String> {

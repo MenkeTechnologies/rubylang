@@ -46,10 +46,27 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::SIG_RETURN, b_sig_return);
     vm.register_builtin(ops::GETSELF, b_getself);
     vm.register_builtin(ops::BEGIN, b_begin);
+    vm.register_builtin(ops::SUPER, b_super);
+    vm.register_builtin(ops::SUPER_FWD, b_super_fwd);
 }
 
 fn b_getself(_vm: &mut VM, _: u8) -> Value {
     with_host(|h| h.current_self())
+}
+
+fn b_super(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_n(vm, argc as usize);
+    match crate::host::call_super(Some(args)) {
+        Ok(v) => propagate(vm, v),
+        Err(e) => abort(vm, e),
+    }
+}
+
+fn b_super_fwd(vm: &mut VM, _: u8) -> Value {
+    match crate::host::call_super(None) {
+        Ok(v) => propagate(vm, v),
+        Err(e) => abort(vm, e),
+    }
 }
 
 fn b_begin(vm: &mut VM, _: u8) -> Value {
@@ -93,9 +110,9 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
         return v;
     }
     // A bare name that is not a local is a zero-arg call to a method on `self`
-    // (or a top-level method).
+    // (or a class method / top-level method).
     if with_host(|h| h.responds_to(&name)) {
-        return match call_method(&name, &[], None) {
+        return match dispatch_call(&name, &[], None) {
             Ok(v) => propagate(vm, v),
             Err(e) => abort(vm, e),
         };
@@ -321,7 +338,16 @@ fn b_sig_return(vm: &mut VM, _: u8) -> Value {
 
 /// A self/top-level call: a user method if defined, else a Kernel function.
 fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, String> {
-    if with_host(|h| h.has_method(name)) {
+    // Inside a class method `self` is a class ref — `new` and class methods
+    // dispatch on the class; anything else (raise, puts, …) is a Kernel call.
+    let this = with_host(|h| h.current_self());
+    if let Some(cls) = with_host(|h| h.classref_name(&this)) {
+        if name == "new" || with_host(|h| h.find_class_method(&cls, name)).is_some() {
+            return dispatch_classref(&cls, name, args, block);
+        }
+        return kernel(name, args, block);
+    }
+    if with_host(|h| h.responds_to(name)) {
         return call_method(name, args, block);
     }
     kernel(name, args, block)
@@ -337,8 +363,8 @@ fn dispatch(
     // A user-defined method wins over the universal fallbacks (so a class can
     // override `to_s`, `==`, `inspect`, etc.).
     if let Some(cls) = with_host(|h| h.object_class(recv)) {
-        if let Some(def) = with_host(|h| h.find_method(&cls, name)) {
-            return call_instance_method(recv.clone(), &def, args, block);
+        if with_host(|h| h.find_method_owner(&cls, name)).is_some() {
+            return call_instance_method(recv.clone(), &cls, name, args, block);
         }
     }
     // Universal methods available on every object.
@@ -435,14 +461,18 @@ fn dispatch_classref(
     match name {
         "new" => {
             let obj = with_host(|h| h.new_object(cls));
-            if let Some(init) = with_host(|h| h.find_method(cls, "initialize")) {
-                call_instance_method(obj.clone(), &init, args, block)?;
+            if with_host(|h| h.find_method(cls, "initialize")).is_some() {
+                call_instance_method(obj.clone(), cls, "initialize", args, block)?;
             }
             Ok(obj)
         }
         "name" | "to_s" | "inspect" => Ok(new_str(cls.to_string())),
         _ => {
-            // A class method defined as `def self.m` is not modeled yet.
+            // A class method: `def self.m` runs with self bound to the class ref.
+            if let Some(def) = with_host(|h| h.find_class_method(cls, name)) {
+                let recv = with_host(|h| h.class_ref(cls));
+                return crate::host::call_class_method(recv, &def, name, cls, args, block);
+            }
             Err(format!("undefined method '{name}' for {cls}:Class"))
         }
     }
@@ -457,8 +487,8 @@ fn dispatch_object(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
-    if let Some(def) = with_host(|h| h.find_method(cls, name)) {
-        return call_instance_method(recv.clone(), &def, args, block);
+    if with_host(|h| h.find_method_owner(cls, name)).is_some() {
+        return call_instance_method(recv.clone(), cls, name, args, block);
     }
     match name {
         "message" | "to_s" => {

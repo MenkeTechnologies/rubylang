@@ -85,18 +85,20 @@ puts({ a: 1, b: 2 }.merge({ c: 3 }).keys.length)   # => 3
 Implemented: lexer/parser, AST→bytecode lowering, the object heap and method
 dispatch (Integer, Float, String, Array, Hash, Symbol, Range, Proc), a growing
 core-method and Kernel surface, blocks / `yield` / closures, **classes with
-`initialize`/`attr_*`/inheritance**, **exceptions (`begin`/`rescue`/`ensure`,
-method-body and modifier `rescue`, typed exception classes)**, **parallel
-assignment and default arguments**, the standalone `ruby` binary and REPL, the
-rkyv bytecode cache, an AOP method-intercept registry, and an LSP server.
+`initialize`/`attr_*`/single inheritance/`super`**, **modules and `include`
+mixins**, **class methods (`def self.m`)**, **exceptions (`begin`/`rescue`/
+`ensure`, method-body and modifier `rescue`, typed exception classes)**, **splat
+parameters, `&:sym` block-pass, parallel assignment, and default arguments**, the
+standalone `ruby` binary and REPL, the rkyv bytecode cache, an AOP
+method-intercept registry, and an LSP server.
 
 Behaviour is checked against the reference `ruby` by a **differential parity
-harness** — `cargo run --bin parity` diffs a corpus live, and `tests/parity.rs`
-replays the frozen outputs in CI with no `ruby` installed.
+harness** — `cargo run --bin parity` diffs a 35-snippet corpus live, and
+`tests/parity.rs` replays the frozen outputs in CI with no `ruby` installed.
 
 The DAP adapter is partial (handshake + run-to-completion; stepping pending).
-Modules/mixins, `super`, class methods, and splat/keyword parameters are planned.
-See [`BUGS.md`](BUGS.md) for the full known-gaps list.
+`extend`/`prepend`, keyword parameters, regex, and bignum are planned. See
+[`BUGS.md`](BUGS.md) for the full known-gaps list.
 
 ## Building
 

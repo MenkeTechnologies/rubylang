@@ -9,25 +9,26 @@ unimplemented method raises `undefined method`.
 
 ## Working (for reference)
 
-Classes with `initialize`/`attr_*`/instance methods, single inheritance and
-`super`-less method resolution, `self`, instance variables, method chaining;
-`begin`/`rescue`/`ensure`, method-body and statement-modifier `rescue`, `raise`
-with a message or an exception class, typed `ZeroDivisionError`/`NoMethodError`/
-`ArgumentError`; default arguments; parallel assignment (`a, b = 1, 2`, array
+Classes with `initialize`/`attr_*`/instance methods, single inheritance, `super`
+(bare-forwarding and explicit-args), method resolution through the ancestor chain
+(own → included modules → superclass), `self`, instance variables, method
+chaining; `module` + `include` mixins; class methods (`def self.m`); `begin`/
+`rescue`/`ensure`, method-body and statement-modifier `rescue`, `raise` with a
+message or an exception class, typed `ZeroDivisionError`/`NoMethodError`/
+`ArgumentError`; default arguments; splat parameters (`def f(a, *rest)`); `&:sym`
+block-pass (`map(&:upcase)`); parallel assignment (`a, b = 1, 2`, array
 destructuring, swap); blocks/`yield`/closures with lexical capture.
 
 ## Language
 
-- **Modules & mixins.** `module` bodies register their methods but `include` /
-  `extend` / `prepend` are not implemented, so a module's methods are not yet
-  mixed into a class. `super` is not implemented.
-- **Class methods / singletons.** `def self.method` and `class << self` are not
-  modeled — only instance methods.
-- **Class-body statements.** Only `def` and `attr_*` in a class body take effect;
-  constants and other executable statements in the body are ignored.
-- **Splat / keyword / block params.** `*rest`, `**kwargs`, and `&block`
-  parameters (and splat at call sites) are not yet supported. A single Array
-  passed to a multi-parameter *block* IS auto-splatted.
+- **`extend` / `prepend` / `class << self`.** Only `include` and `def self.m` are
+  modeled; other mixin/singleton forms are not. `super` resolves through the
+  superclass chain (module-`super` ordering is approximate).
+- **Class-body statements.** Only `def`, `attr_*`, and `include` in a class body
+  take effect; constants and other executable statements are ignored.
+- **Keyword / block params.** `**kwargs` and an explicit `&block` parameter are
+  not supported (a splat `*rest` and `&:sym` block-pass are). Splat at a call
+  site (`f(*arr)`) is not yet supported.
 - **Numeric literal / method binding.** `-7.abs` parses as `-(7.abs)` (operator
   precedence) rather than `(-7).abs`; MRI treats `-7` as a literal. Use
   `(-7).abs`.
@@ -45,8 +46,8 @@ destructuring, swap); blocks/`yield`/closures with lexical capture.
 
 - **Regexp.** No `Regexp` type; `String#sub`/`gsub` do literal (non-regex)
   replacement only.
-- **Symbol#to_proc.** `&:sym` block-pass shorthand (`map(&:upcase)`) and
-  enumerator-without-block (`each_with_index.map`) are not supported.
+- **Enumerator without block.** `each_with_index.map` (an enumerator returned
+  from a block-less call) is not supported. (`&:sym` block-pass IS.)
 - **`String#%` / full `sprintf`.** `format`/`sprintf` handle `%s %d %i %f %x %%`
   but not width/precision flags (`%0.2f`) or the `String#%` operator.
 - **Bignum.** Integers are `i64`; there is no automatic promotion to arbitrary

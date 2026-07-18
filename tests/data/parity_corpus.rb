@@ -194,3 +194,40 @@ s.push(1).push(2).push(3)
 puts s.size
 puts s.pop
 puts s.size
+#==#
+class Animal
+  def initialize(name); @name = name; end
+  def greet; "I am #{@name}"; end
+end
+class Dog < Animal
+  def initialize(name); super(name); @legs = 4; end
+  def greet; super + " with #{@legs} legs"; end
+end
+puts Dog.new("Rex").greet
+#==#
+module Greetable
+  def hello; "hello from #{name}"; end
+end
+class Person
+  include Greetable
+  def initialize(n); @n = n; end
+  def name; @n; end
+end
+puts Person.new("Ann").hello
+#==#
+class Widget
+  def self.build(n); new(n); end
+  def initialize(n); @n = n; end
+  def label; "widget #{@n}"; end
+end
+puts Widget.build(7).label
+#==#
+def stats(label, *nums)
+  "#{label}: count=#{nums.length} sum=#{nums.sum}"
+end
+puts stats("scores", 10, 20, 30)
+puts stats("empty")
+#==#
+puts [1, 2, 3].map(&:to_s).inspect
+puts [1, 2, 3, 4].select(&:even?).inspect
+puts (1..5).map(&:to_s).join(",")

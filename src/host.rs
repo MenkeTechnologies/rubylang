@@ -48,6 +48,8 @@ pub mod ops {
     pub const SIG_RETURN: u16 = 27; // [v] -> halt method, return v
     pub const GETSELF: u16 = 28; // [] -> current self
     pub const BEGIN: u16 = 29; // [begin_id] -> run begin/rescue/ensure
+    pub const SUPER: u16 = 30; // [args...] argc=n -> super with explicit args
+    pub const SUPER_FWD: u16 = 31; // [] -> super forwarding the current args
 }
 
 /// A heap object — the Ruby reference types.
@@ -80,11 +82,15 @@ pub enum RObj {
     ClassRef(String),
 }
 
-/// A user-defined class: its optional superclass and its instance methods.
+/// A user-defined class: its optional superclass, its instance methods, the
+/// modules it `include`s (searched after own methods, before the superclass),
+/// and its class methods (`def self.m`).
 #[derive(Clone, Default)]
 pub struct ClassDef {
     pub superclass: Option<String>,
     pub methods: IndexMap<String, MethodDef>,
+    pub includes: Vec<String>,
+    pub class_methods: IndexMap<String, MethodDef>,
 }
 
 /// A `begin`/`rescue`/`ensure` block, compiled to proc templates.
@@ -114,10 +120,12 @@ pub enum RKey {
     FloatBits(u64),
 }
 
-/// A compiled method: parameter names plus the body chunk.
+/// A compiled method: parameter names, the index of a splat (`*rest`) parameter
+/// if any, and the body chunk.
 #[derive(Clone)]
 pub struct MethodDef {
     pub params: Vec<String>,
+    pub splat: Option<usize>,
     pub chunk: Chunk,
 }
 
@@ -134,6 +142,12 @@ struct Frame {
     block: Option<Value>,
     /// The receiver `self` this frame runs against (`Undef` = top-level main).
     self_obj: Value,
+    /// The running method's name and the class it was defined in, plus the args
+    /// it was called with — for `super` (which resumes the lookup above
+    /// `def_class` and, bare, forwards these args).
+    method_name: Option<String>,
+    def_class: Option<String>,
+    args: Vec<Value>,
 }
 
 /// A non-local control signal raised by `break`/`next`/`return` inside a block.
@@ -193,6 +207,9 @@ impl RubyHost {
                 locals: IndexMap::new(),
                 block: None,
                 self_obj: Value::Undef,
+                method_name: None,
+                def_class: None,
+                args: Vec::new(),
             }],
             globals: IndexMap::new(),
             consts: IndexMap::new(),
@@ -327,10 +344,15 @@ impl RubyHost {
     pub fn has_method(&self, name: &str) -> bool {
         self.methods.contains_key(name)
     }
-    /// Whether a bare name resolves as a callable method — a method on the
-    /// current `self`'s class, or a top-level method.
+    /// Whether a bare name resolves as a callable method — a class method (or
+    /// `new`) when `self` is a class ref, an instance method on `self`'s class,
+    /// or a top-level method.
     pub fn responds_to(&self, name: &str) -> bool {
-        if let Some(cls) = self.object_class(&self.current_self()) {
+        let this = self.current_self();
+        if let Some(cls) = self.classref_name(&this) {
+            return name == "new" || self.find_class_method(&cls, name).is_some();
+        }
+        if let Some(cls) = self.object_class(&this) {
             if self.find_method(&cls, name).is_some() {
                 return true;
             }
@@ -467,12 +489,45 @@ impl RubyHost {
             _ => None,
         }
     }
-    /// Look up `method` on `class`, walking the superclass chain.
-    pub fn find_method(&self, class: &str, method: &str) -> Option<MethodDef> {
+    /// Look up `method` on `class`, walking the ancestor chain (own methods,
+    /// then included modules, then the superclass), returning the method and the
+    /// class/module it was defined in.
+    pub fn find_method_owner(&self, class: &str, method: &str) -> Option<(MethodDef, String)> {
         let mut cur = Some(class.to_string());
         while let Some(name) = cur {
             let def = self.classes.get(&name)?;
             if let Some(m) = def.methods.get(method) {
+                return Some((m.clone(), name.clone()));
+            }
+            // Included modules take priority over the superclass (last include
+            // wins, matching Ruby's reverse-order ancestor insertion).
+            for module in def.includes.iter().rev() {
+                if let Some(md) = self.classes.get(module) {
+                    if let Some(m) = md.methods.get(method) {
+                        return Some((m.clone(), module.clone()));
+                    }
+                }
+            }
+            cur = def.superclass.clone();
+        }
+        None
+    }
+    /// Look up `method` on `class`, walking the ancestor chain.
+    pub fn find_method(&self, class: &str, method: &str) -> Option<MethodDef> {
+        self.find_method_owner(class, method).map(|(m, _)| m)
+    }
+    /// Resolve a `super` call: find `method` in the ancestors *above* `def_class`
+    /// (its superclass chain), returning the method and its owner.
+    pub fn find_super(&self, def_class: &str, method: &str) -> Option<(MethodDef, String)> {
+        let sup = self.classes.get(def_class)?.superclass.clone()?;
+        self.find_method_owner(&sup, method)
+    }
+    /// A class method (`def self.m`), walking the superclass chain.
+    pub fn find_class_method(&self, class: &str, method: &str) -> Option<MethodDef> {
+        let mut cur = Some(class.to_string());
+        while let Some(name) = cur {
+            let def = self.classes.get(&name)?;
+            if let Some(m) = def.class_methods.get(method) {
                 return Some(m.clone());
             }
             cur = def.superclass.clone();
@@ -480,17 +535,74 @@ impl RubyHost {
         None
     }
     /// If `self_obj` is a user object whose class defines `method`, return the
-    /// method and the receiver (for implicit-self calls inside instance methods).
-    fn method_for_self(&self, self_obj: &Value, method: &str) -> Option<(MethodDef, Value)> {
+    /// method, the owner class, and the receiver (for implicit-self calls).
+    fn method_for_self(
+        &self,
+        self_obj: &Value,
+        method: &str,
+    ) -> Option<(MethodDef, String, Value)> {
         let class = self.object_class(self_obj)?;
-        self.find_method(&class, method)
-            .map(|m| (m, self_obj.clone()))
+        self.find_method_owner(&class, method)
+            .map(|(m, owner)| (m, owner, self_obj.clone()))
     }
     pub fn ivar_of(&self, obj: &Value, name: &str) -> Value {
         match self.obj(obj) {
             Some(RObj::Object { ivars, .. }) => ivars.get(name).cloned().unwrap_or(Value::Undef),
             _ => Value::Undef,
         }
+    }
+    /// Bind method parameters to the call arguments, honoring a single `*splat`
+    /// parameter (params before it bind positionally, the splat collects the
+    /// middle into an array, params after it bind from the tail). Omitted
+    /// non-splat params are left unbound so the method prologue applies defaults.
+    pub fn bind_params(
+        &mut self,
+        params: &[String],
+        splat: Option<usize>,
+        args: &[Value],
+    ) -> IndexMap<String, Value> {
+        let mut locals = IndexMap::new();
+        match splat {
+            None => {
+                for (i, p) in params.iter().enumerate() {
+                    if let Some(v) = args.get(i) {
+                        locals.insert(p.clone(), v.clone());
+                    }
+                }
+            }
+            Some(si) => {
+                let after = params.len() - si - 1;
+                for (i, p) in params.iter().take(si).enumerate() {
+                    if let Some(v) = args.get(i) {
+                        locals.insert(p.clone(), v.clone());
+                    }
+                }
+                let splat_end = args.len().saturating_sub(after).max(si);
+                let rest: Vec<Value> = args
+                    .get(si..splat_end)
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default();
+                let arr = self.new_array(rest);
+                locals.insert(params[si].clone(), arr);
+                for (j, p) in params.iter().skip(si + 1).enumerate() {
+                    if let Some(v) = args.get(splat_end + j) {
+                        locals.insert(p.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        locals
+    }
+
+    /// The `self`, method name, and defining class of the current frame (`super`).
+    pub fn super_context(&self) -> (Value, Option<String>, Option<String>, Vec<Value>) {
+        let f = &self.frames[self.active_idx()];
+        (
+            f.self_obj.clone(),
+            f.method_name.clone(),
+            f.def_class.clone(),
+            f.args.clone(),
+        )
     }
 
     // ---- exceptions -------------------------------------------------------
@@ -815,25 +927,24 @@ pub fn run_main(chunk: Chunk) -> Result<Value, String> {
 
 /// Run a resolved method: push a fresh frame bound to `self_obj`, bind args, and
 /// run the body with locals targeting that new top frame.
+#[allow(clippy::too_many_arguments)]
 fn run_method(
     def: &MethodDef,
     self_obj: Value,
     args: &[Value],
     block: Option<Value>,
+    method_name: Option<String>,
+    def_class: Option<String>,
 ) -> Result<Value, String> {
     let saved_active = with_host(|h| {
-        let mut locals = IndexMap::new();
-        // Bind only the args the caller actually passed; an omitted parameter is
-        // left unbound so the method prologue can apply its default.
-        for (i, p) in def.params.iter().enumerate() {
-            if let Some(v) = args.get(i) {
-                locals.insert(p.clone(), v.clone());
-            }
-        }
+        let locals = h.bind_params(&def.params, def.splat, args);
         h.frames.push(Frame {
             locals,
             block,
             self_obj,
+            method_name,
+            def_class,
+            args: args.to_vec(),
         });
         h.active_frame.take()
     });
@@ -854,24 +965,62 @@ fn run_method(
 /// instance method dispatches on `self`).
 pub fn call_method(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, String> {
     let self_obj = with_host(|h| h.current_self());
-    if let Some((def, recv)) = with_host(|h| h.method_for_self(&self_obj, name)) {
-        return run_method(&def, recv, args, block);
+    if let Some((def, owner, recv)) = with_host(|h| h.method_for_self(&self_obj, name)) {
+        return run_method(&def, recv, args, block, Some(name.into()), Some(owner));
     }
     let def = with_host(|h| h.methods.get(name).cloned());
     let Some(def) = def else {
         return Err(format!("undefined method '{name}'"));
     };
-    run_method(&def, self_obj, args, block)
+    run_method(&def, self_obj, args, block, Some(name.into()), None)
 }
 
-/// Invoke a resolved instance method on `recv`.
+/// Invoke an instance method `name` on `recv` (an object of class `class`),
+/// resolving it through the ancestor chain.
 pub fn call_instance_method(
     recv: Value,
-    def: &MethodDef,
+    class: &str,
+    name: &str,
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
-    run_method(def, recv, args, block)
+    let (def, owner) = with_host(|h| h.find_method_owner(class, name))
+        .ok_or_else(|| format!("undefined method '{name}' for {class}"))?;
+    run_method(&def, recv, args, block, Some(name.into()), Some(owner))
+}
+
+/// Invoke a class method (`def self.m`) with `self` bound to the class ref.
+pub fn call_class_method(
+    recv: Value,
+    def: &MethodDef,
+    name: &str,
+    def_class: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    run_method(
+        def,
+        recv,
+        args,
+        block,
+        Some(name.into()),
+        Some(def_class.into()),
+    )
+}
+
+/// Invoke `super`: resume the method lookup above the current frame's defining
+/// class. `args` is `None` to forward the current method's arguments.
+pub fn call_super(explicit_args: Option<Vec<Value>>) -> Result<Value, String> {
+    let (self_obj, method, def_class, cur_args) = with_host(|h| h.super_context());
+    let (Some(method), Some(def_class)) = (method, def_class) else {
+        return Err("super called outside of a method".to_string());
+    };
+    let Some((def, owner)) = with_host(|h| h.find_super(&def_class, &method)) else {
+        return Err(format!("super: no superclass method '{method}'"));
+    };
+    let args = explicit_args.unwrap_or(cur_args);
+    let block = with_host(|h| h.frames[h.active_idx()].block.clone());
+    run_method(&def, self_obj, &args, block, Some(method), Some(owner))
 }
 
 /// Run a proc *template* (by id) in the current frame — used for `begin`/`rescue`

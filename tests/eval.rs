@@ -210,6 +210,47 @@ fn parallel_assignment() {
 }
 
 #[test]
+fn super_forwards_and_extends() {
+    eq(
+        "class A; def initialize(n); @n = n; end; def val; @n; end; end; \
+         class B < A; def initialize(n); super(n); @x = 2; end; def val; super + @x; end; end; \
+         B.new(10).val",
+        "12",
+    );
+}
+
+#[test]
+fn module_include_mixes_in_methods() {
+    eq(
+        "module M; def doubled; value * 2; end; end; \
+         class C; include M; def initialize(v); @v = v; end; def value; @v; end; end; \
+         C.new(21).doubled",
+        "42",
+    );
+}
+
+#[test]
+fn class_methods_via_def_self() {
+    eq(
+        "class Factory; def self.make; new; end; def initialize; @ok = true; end; \
+         def ok?; @ok; end; end; Factory.make.ok?",
+        "true",
+    );
+}
+
+#[test]
+fn splat_parameters() {
+    eq("def f(a, *rest); [a, rest]; end; f(1, 2, 3)", "[1, [2, 3]]");
+    eq("def f(a, *rest); rest; end; f(1)", "[]");
+}
+
+#[test]
+fn symbol_to_proc_block_pass() {
+    eq("[1, 2, 3].map(&:to_s)", "[\"1\", \"2\", \"3\"]");
+    eq("[1, 2, 3, 4].select(&:even?)", "[2, 4]");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

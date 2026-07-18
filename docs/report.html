@@ -125,15 +125,15 @@
             <tr><td>AST → fusevm bytecode</td><td>Implemented</td><td>Native arithmetic + host dispatch; no local VM (<code>src/compiler.rs</code>).</td></tr>
             <tr><td>object heap &amp; dispatch</td><td>Implemented</td><td>Integer/Float/String/Array/Hash/Symbol/Range/Proc (<code>src/host.rs</code>, <code>src/builtins.rs</code>).</td></tr>
             <tr><td>blocks / yield / closures</td><td>Implemented</td><td>Scope-sharing blocks; break/next/return control flow.</td></tr>
-            <tr><td>classes / inheritance / exceptions</td><td>Implemented</td><td><code>attr_*</code>, <code>initialize</code>, single inheritance; <code>begin</code>/<code>rescue</code>/<code>ensure</code>, typed exceptions.</td></tr>
-            <tr><td>parallel assignment / default args</td><td>Implemented</td><td><code>a, b = 1, 2</code>, array destructuring, defaulted parameters.</td></tr>
+            <tr><td>classes / inheritance / super / mixins</td><td>Implemented</td><td><code>attr_*</code>, <code>initialize</code>, single inheritance, <code>super</code>, <code>module</code>+<code>include</code>, <code>def self.m</code>; typed exceptions.</td></tr>
+            <tr><td>splat / &amp;:sym / parallel assignment / defaults</td><td>Implemented</td><td><code>def f(a, *rest)</code>, <code>map(&amp;:upcase)</code>, <code>a, b = 1, 2</code>, defaulted parameters.</td></tr>
             <tr><td>parity harness vs reference <code>ruby</code></td><td>Implemented</td><td>Differential corpus frozen + replayed in CI (<code>src/bin/parity.rs</code>, <code>tests/parity.rs</code>).</td></tr>
             <tr><td>standalone <code>ruby</code> binary + REPL</td><td>Implemented</td><td>Files, <code>-e</code> one-liners, interactive REPL (<code>src/main.rs</code>, <code>src/repl.rs</code>).</td></tr>
             <tr><td>rkyv bytecode cache</td><td>Implemented</td><td>Versioned, migration-safe on-disk format (<code>src/cache.rs</code>).</td></tr>
             <tr><td>AOP method intercepts</td><td>Implemented</td><td>Glob-matched before/after/around registry (<code>src/intercepts.rs</code>).</td></tr>
             <tr><td>LSP server (<code>--lsp</code>)</td><td>Implemented</td><td>Diagnostics, hover, completion (<code>src/lsp.rs</code>).</td></tr>
             <tr><td>DAP adapter (<code>--dap</code>)</td><td>Partial</td><td>Handshake + run-to-completion with stdout capture; stepping pending (<code>src/dap.rs</code>).</td></tr>
-            <tr><td>modules / mixins / class methods</td><td>Planned</td><td><code>include</code>, <code>super</code>, <code>def self.m</code>, splat/keyword params pending.</td></tr>
+            <tr><td>extend / prepend / keyword params / regex</td><td>Planned</td><td><code>**kwargs</code>, <code>&amp;block</code> params, <code>Regexp</code>, bignum pending.</td></tr>
           </tbody>
         </table>
       </section>

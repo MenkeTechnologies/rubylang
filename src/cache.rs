@@ -34,10 +34,16 @@ struct Entry {
     blob: Vec<u8>,
 }
 
-/// (name/method-name, params, chunk) — a serde-flat method.
-type CMethod = (String, Vec<String>, Chunk);
-/// (name, superclass, methods) — a serde-flat class.
-type CClass = (String, Option<String>, Vec<CMethod>);
+/// (name/method-name, params, splat index, chunk) — a serde-flat method.
+type CMethod = (String, Vec<String>, Option<usize>, Chunk);
+/// (name, superclass, methods, includes, class methods) — a serde-flat class.
+type CClass = (
+    String,
+    Option<String>,
+    Vec<CMethod>,
+    Vec<String>,
+    Vec<CMethod>,
+);
 /// (rescue classes, binding, proc id) — a serde-flat rescue clause.
 type CRescue = (Vec<String>, Option<String>, usize);
 /// (body proc id, rescues, ensure proc id) — a serde-flat begin block.
@@ -105,24 +111,37 @@ pub fn store(src: &str, prog: &Program) -> Result<(), String> {
     write_shard(&shard)
 }
 
+fn m_to(name: &str, m: &MethodDef) -> CMethod {
+    (name.to_string(), m.params.clone(), m.splat, m.chunk.clone())
+}
+fn m_from((name, params, splat, chunk): CMethod) -> (String, MethodDef) {
+    (
+        name,
+        MethodDef {
+            params,
+            splat,
+            chunk,
+        },
+    )
+}
+
 fn to_cprog(prog: &Program) -> CProg {
     CProg {
         main: prog.main.clone(),
-        methods: prog
-            .methods
-            .iter()
-            .map(|(n, m)| (n.clone(), m.params.clone(), m.chunk.clone()))
-            .collect(),
+        methods: prog.methods.iter().map(|(n, m)| m_to(n, m)).collect(),
         classes: prog
             .classes
             .iter()
             .map(|(n, c)| {
-                let methods = c
-                    .methods
-                    .iter()
-                    .map(|(mn, m)| (mn.clone(), m.params.clone(), m.chunk.clone()))
-                    .collect();
-                (n.clone(), c.superclass.clone(), methods)
+                let methods = c.methods.iter().map(|(mn, m)| m_to(mn, m)).collect();
+                let class_methods = c.class_methods.iter().map(|(mn, m)| m_to(mn, m)).collect();
+                (
+                    n.clone(),
+                    c.superclass.clone(),
+                    methods,
+                    c.includes.clone(),
+                    class_methods,
+                )
             })
             .collect(),
         begins: prog
@@ -148,24 +167,20 @@ fn to_cprog(prog: &Program) -> CProg {
 fn from_cprog(cp: CProg) -> Program {
     Program {
         main: cp.main,
-        methods: cp
-            .methods
-            .into_iter()
-            .map(|(n, params, chunk)| (n, MethodDef { params, chunk }))
-            .collect(),
+        methods: cp.methods.into_iter().map(m_from).collect(),
         classes: cp
             .classes
             .into_iter()
-            .map(|(n, superclass, methods)| {
-                let methods = methods
-                    .into_iter()
-                    .map(|(mn, params, chunk)| (mn, MethodDef { params, chunk }))
-                    .collect();
+            .map(|(n, superclass, methods, includes, class_methods)| {
+                let methods = methods.into_iter().map(m_from).collect();
+                let class_methods = class_methods.into_iter().map(m_from).collect();
                 (
                     n,
                     ClassDef {
                         superclass,
                         methods,
+                        includes,
+                        class_methods,
                     },
                 )
             })

@@ -94,8 +94,10 @@ impl Compiler {
         self.compile_seq(&mut b, body)?;
         self.loops = saved;
         let pnames = params.iter().map(|p| p.name.clone()).collect();
+        let splat = params.iter().position(|p| p.splat);
         Ok(MethodDef {
             params: pnames,
+            splat,
             chunk: b.build(),
         })
     }
@@ -199,7 +201,11 @@ impl Compiler {
                 }
                 b.emit(Op::CallBuiltin(ops::INDEX_GET, argc(1 + idx.len())?), 0);
             }
-            Expr::Def { name, params, body } => {
+            Expr::Def {
+                name, params, body, ..
+            } => {
+                // A top-level `def` (singleton or not) registers a top-level
+                // method; class-body `def`s are handled in `compile_class`.
                 let def = self.compile_method(params, body)?;
                 self.methods.push((name.clone(), def));
                 // `def` evaluates to the method name as a symbol.
@@ -229,6 +235,17 @@ impl Compiler {
                 }
                 b.emit(Op::CallBuiltin(ops::YIELD, argc(args.len())?), 0);
             }
+            Expr::Super(args) => match args {
+                Some(args) => {
+                    for a in args {
+                        self.compile_expr(b, a)?;
+                    }
+                    b.emit(Op::CallBuiltin(ops::SUPER, argc(args.len())?), 0);
+                }
+                None => {
+                    b.emit(Op::CallBuiltin(ops::SUPER_FWD, 0), 0);
+                }
+            },
         }
         Ok(())
     }
@@ -622,9 +639,10 @@ impl Compiler {
         Ok(id)
     }
 
-    /// Lower a `class`/`module` body: `def`s become instance methods and
-    /// `attr_*` calls generate accessor methods. Other class-body statements are
-    /// not yet executed (constants/`include` — tracked in BUGS.md).
+    /// Lower a `class`/`module` body: `def`s become instance methods (or class
+    /// methods for `def self.m`), `attr_*` generate accessor methods, `include M`
+    /// records a mixin. Other class-body statements are not yet executed
+    /// (constants — tracked in BUGS.md).
     fn compile_class(
         &mut self,
         b: &mut ChunkBuilder,
@@ -633,11 +651,22 @@ impl Compiler {
         body: &[Expr],
     ) -> Result<(), String> {
         let mut methods: indexmap::IndexMap<String, MethodDef> = indexmap::IndexMap::new();
+        let mut class_methods: indexmap::IndexMap<String, MethodDef> = indexmap::IndexMap::new();
+        let mut includes: Vec<String> = Vec::new();
         for stmt in body {
             match stmt {
-                Expr::Def { name, params, body } => {
+                Expr::Def {
+                    name,
+                    params,
+                    body,
+                    singleton,
+                } => {
                     let def = self.compile_method(params, body)?;
-                    methods.insert(name.clone(), def);
+                    if *singleton {
+                        class_methods.insert(name.clone(), def);
+                    } else {
+                        methods.insert(name.clone(), def);
+                    }
                 }
                 Expr::Call {
                     recv: None,
@@ -656,6 +685,19 @@ impl Compiler {
                         }
                     }
                 }
+                // `include ModuleName` — record the mixin.
+                Expr::Call {
+                    recv: None,
+                    name: m,
+                    args,
+                    ..
+                } if m == "include" => {
+                    for a in args {
+                        if let Expr::Var(VarKind::Const, module) = a {
+                            includes.push(module.clone());
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -664,6 +706,8 @@ impl Compiler {
             ClassDef {
                 superclass: superclass.clone(),
                 methods,
+                includes,
+                class_methods,
             },
         ));
         // A class/module definition evaluates to nil here.
@@ -679,6 +723,7 @@ impl Compiler {
         b.emit(Op::CallBuiltin(ops::GETIVAR, 1), 0);
         MethodDef {
             params: vec![],
+            splat: None,
             chunk: b.build(),
         }
     }
@@ -694,6 +739,7 @@ impl Compiler {
         b.emit(Op::CallBuiltin(ops::SETIVAR, 2), 0);
         MethodDef {
             params: vec!["value".to_string()],
+            splat: None,
             chunk: b.build(),
         }
     }

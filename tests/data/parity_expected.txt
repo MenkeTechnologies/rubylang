@@ -111,3 +111,16 @@ rescued a bad call
 3
 3
 2
+#==#
+I am Rex with 4 legs
+#==#
+hello from Ann
+#==#
+widget 7
+#==#
+scores: count=3 sum=60
+empty: count=0 sum=0
+#==#
+["1", "2", "3"]
+[2, 4]
+1,2,3,4,5

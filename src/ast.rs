@@ -125,11 +125,13 @@ pub enum Expr {
     /// `recv[idx]` — sugar for `recv.[](idx)` but lowered directly.
     Index(Box<Expr>, Vec<Expr>),
 
-    /// `def name(params) … end`.
+    /// `def name(params) … end`. `singleton` is true for `def self.name` (a
+    /// class method).
     Def {
         name: String,
         params: Vec<Param>,
         body: Vec<Expr>,
+        singleton: bool,
     },
     /// `class Name [< Super] … end`.
     Class {
@@ -157,6 +159,8 @@ pub enum Expr {
     Next(Option<Box<Expr>>),
     /// `yield args` — invoke the block passed to the enclosing method.
     Yield(Vec<Expr>),
+    /// `super` (args `None` = forward the current method's args) / `super(args)`.
+    Super(Option<Vec<Expr>>),
 }
 
 /// One segment of an interpolated string.
@@ -166,11 +170,13 @@ pub enum StrPart {
     Interp(Box<Expr>),
 }
 
-/// A method parameter: name plus an optional default expression.
+/// A method parameter: name, an optional default expression, and whether it is a
+/// splat (`*rest`) that collects the remaining positional arguments.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub name: String,
     pub default: Option<Expr>,
+    pub splat: bool,
 }
 
 /// One `rescue` clause of a `begin`/`rescue` block.
