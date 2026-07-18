@@ -34,8 +34,15 @@ struct Entry {
     blob: Vec<u8>,
 }
 
-/// (name/method-name, params, splat index, keyword params, chunk) — serde-flat.
-type CMethod = (String, Vec<String>, Option<usize>, Vec<String>, Chunk);
+/// (name, params, splat index, keyword params, kwsplat name, chunk) — serde-flat.
+type CMethod = (
+    String,
+    Vec<String>,
+    Option<usize>,
+    Vec<String>,
+    Option<String>,
+    Chunk,
+);
 /// (name, superclass, methods, includes, class methods) — a serde-flat class.
 type CClass = (
     String,
@@ -117,16 +124,18 @@ fn m_to(name: &str, m: &MethodDef) -> CMethod {
         m.params.clone(),
         m.splat,
         m.kwparams.clone(),
+        m.kwsplat.clone(),
         m.chunk.clone(),
     )
 }
-fn m_from((name, params, splat, kwparams, chunk): CMethod) -> (String, MethodDef) {
+fn m_from((name, params, splat, kwparams, kwsplat, chunk): CMethod) -> (String, MethodDef) {
     (
         name,
         MethodDef {
             params,
             splat,
             kwparams,
+            kwsplat,
             chunk,
         },
     )

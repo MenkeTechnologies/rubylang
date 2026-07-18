@@ -181,6 +181,8 @@ pub struct Param {
     pub default: Option<Expr>,
     pub splat: bool,
     pub keyword: bool,
+    /// `**opts` — collects unmatched keyword arguments into a hash.
+    pub kwsplat: bool,
 }
 
 /// One `rescue` clause of a `begin`/`rescue` block.

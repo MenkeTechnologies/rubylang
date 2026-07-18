@@ -131,6 +131,8 @@ pub struct MethodDef {
     pub params: Vec<String>,
     pub splat: Option<usize>,
     pub kwparams: Vec<String>,
+    /// `**opts` collector parameter name, if any.
+    pub kwsplat: Option<String>,
     pub chunk: Chunk,
 }
 
@@ -626,21 +628,23 @@ impl RubyHost {
         params: &[String],
         splat: Option<usize>,
         kwparams: &[String],
+        kwsplat: Option<&str>,
         args: &[Value],
     ) -> IndexMap<String, Value> {
-        // With keyword params, the final positional argument (if it is a Hash) is
-        // the keyword hash; bind the rest positionally.
-        let (positional, kwhash): (&[Value], Option<IndexMap<RKey, Value>>) =
-            if !kwparams.is_empty() {
-                match args.last() {
-                    Some(v) if matches!(self.obj(v), Some(RObj::Hash(_))) => {
-                        (&args[..args.len() - 1], self.as_hash(v))
-                    }
-                    _ => (args, None),
+        // With keyword params (explicit or a `**` collector), the final positional
+        // argument (if it is a Hash) is the keyword hash; bind the rest
+        // positionally.
+        let wants_kw = !kwparams.is_empty() || kwsplat.is_some();
+        let (positional, kwhash): (&[Value], Option<IndexMap<RKey, Value>>) = if wants_kw {
+            match args.last() {
+                Some(v) if matches!(self.obj(v), Some(RObj::Hash(_))) => {
+                    (&args[..args.len() - 1], self.as_hash(v))
                 }
-            } else {
-                (args, None)
-            };
+                _ => (args, None),
+            }
+        } else {
+            (args, None)
+        };
 
         let mut locals = IndexMap::new();
         match splat {
@@ -680,6 +684,21 @@ impl RubyHost {
             if let Some(v) = kwhash.as_ref().and_then(|m| m.get(&key)) {
                 locals.insert(kw.clone(), v.clone());
             }
+        }
+        // A `**opts` collector receives the keyword entries not claimed by an
+        // explicit keyword parameter.
+        if let Some(name) = kwsplat {
+            let mut rest = IndexMap::new();
+            if let Some(m) = &kwhash {
+                for (k, v) in m {
+                    let claimed = matches!(k, RKey::Sym(s) if kwparams.iter().any(|p| p == s));
+                    if !claimed {
+                        rest.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            let h = self.new_hash(rest);
+            locals.insert(name.to_string(), h);
         }
         locals
     }
@@ -1031,7 +1050,13 @@ fn run_method(
     def_class: Option<String>,
 ) -> Result<Value, String> {
     let saved_active = with_host(|h| {
-        let locals = h.bind_params(&def.params, def.splat, &def.kwparams, args);
+        let locals = h.bind_params(
+            &def.params,
+            def.splat,
+            &def.kwparams,
+            def.kwsplat.as_deref(),
+            args,
+        );
         h.frames.push(Frame {
             locals,
             block,

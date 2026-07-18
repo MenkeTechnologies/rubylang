@@ -435,30 +435,49 @@ impl Parser {
         let mut args = Vec::new();
         let mut amp_block = None;
         let mut kwargs: Vec<(Expr, Expr)> = Vec::new();
+        let mut kwsplats: Vec<Expr> = Vec::new();
         if self.eat_op("(") {
             if !self.is_op(")") {
-                self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs)?;
+                self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
                 while self.eat_op(",") {
-                    self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs)?;
+                    self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
                 }
             }
             self.expect_op(")")?;
         }
-        if !kwargs.is_empty() {
-            args.push(Expr::Hash(kwargs));
+        if !kwargs.is_empty() || !kwsplats.is_empty() {
+            // The trailing keyword hash: the literal pairs, then each `**hash`
+            // merged in (last-wins), matching Ruby's keyword-splat semantics.
+            let mut trailing = Expr::Hash(kwargs);
+            for s in kwsplats {
+                trailing = Expr::Call {
+                    recv: Some(Box::new(trailing)),
+                    name: "merge".into(),
+                    args: vec![s],
+                    block: None,
+                };
+            }
+            args.push(trailing);
         }
         let block = self.maybe_block()?.or(amp_block);
         Ok((args, block))
     }
 
     /// Parse one call argument, recognizing a `key: value` keyword argument, a
-    /// `&:sym` block-pass (`map(&:upcase)`), and a `*expr` splat.
+    /// `**hash` keyword splat, a `&:sym` block-pass, and a `*expr` splat.
     fn arg_or_amp(
         &mut self,
         args: &mut Vec<Expr>,
         amp_block: &mut Option<Block>,
         kwargs: &mut Vec<(Expr, Expr)>,
+        kwsplats: &mut Vec<Expr>,
     ) -> Result<(), String> {
+        // `**hash` — spread a hash as keyword arguments.
+        if self.is_op("**") {
+            self.advance();
+            kwsplats.push(self.arg()?);
+            return Ok(());
+        }
         // `key: value` keyword argument (symbol key).
         if let Tok::Ident(key) = self.peek().clone() {
             if matches!(&self.toks[self.pos + 1].kind, Tok::Op(o) if o == ":") {
@@ -1022,6 +1041,17 @@ impl Parser {
     }
 
     fn param(&mut self) -> Result<Param, String> {
+        // `**opts` — a keyword-splat collector.
+        if self.eat_op("**") {
+            let name = self.ident_name()?;
+            return Ok(Param {
+                name,
+                default: None,
+                splat: false,
+                keyword: false,
+                kwsplat: true,
+            });
+        }
         let splat = self.eat_op("*");
         let name = self.ident_name()?;
         // Keyword parameter: `name:` (required) or `name: default`.
@@ -1040,6 +1070,7 @@ impl Parser {
                 default,
                 splat: false,
                 keyword: true,
+                kwsplat: false,
             });
         }
         let default = if !splat && self.eat_op("=") {
@@ -1052,6 +1083,7 @@ impl Parser {
             default,
             splat,
             keyword: false,
+            kwsplat: false,
         })
     }
 

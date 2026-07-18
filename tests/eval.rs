@@ -378,6 +378,33 @@ fn sort_min_max_with_block() {
 }
 
 #[test]
+fn double_splat_keyword_args() {
+    // `**opts` collector.
+    eq("def f(**o); o; end; f(a: 1, b: 2)", "{a: 1, b: 2}");
+    // `**hash` call-site splat into explicit keyword params.
+    eq("def g(a:, b:); a + b; end; h = {a: 4, b: 5}; g(**h)", "9");
+    // Explicit keyword param + `**rest` collector.
+    eq(
+        "def m(a:, **rest); [a, rest]; end; m(a: 1, x: 2, y: 3)",
+        "[1, {x: 2, y: 3}]",
+    );
+    // Positional + `**opts`.
+    eq(
+        "def d(name, **o); [name, o]; end; d(\"z\", k: 9)",
+        "[\"z\", {k: 9}]",
+    );
+}
+
+#[test]
+fn nested_string_interpolation() {
+    eq("x = 5; \"outer #{\"inner #{x}\"}\"", "\"outer inner 5\"");
+    eq(
+        "\"#{[1, 2].map { |n| \"n=#{n}\" }.join(\",\")}\"",
+        "\"n=1,n=2\"",
+    );
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

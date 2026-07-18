@@ -326,3 +326,17 @@ puts Vec.new(1, 1) == Vec.new(1, 1)
 puts [3, 1, 2].sort { |a, b| b <=> a }.inspect
 puts ["bb", "a", "ccc"].sort_by(&:length).inspect
 puts [5, 3, 8, 1].max { |a, b| a <=> b }
+#==#
+def describe(name, **attrs)
+  "#{name}: #{attrs.map { |k, v| "#{k}=#{v}" }.join(", ")}"
+end
+puts describe("widget", size: 5, color: "red")
+puts describe("empty")
+#==#
+def connect(host:, port: 80, **opts)
+  extra = opts.empty? ? "" : " (#{opts.inspect})"
+  "#{host}:#{port}#{extra}"
+end
+settings = { host: "example.com", port: 8080, timeout: 30 }
+puts connect(**settings)
+puts connect(host: "localhost")

@@ -97,7 +97,7 @@ impl Compiler {
         // params (bound from the trailing keyword hash).
         let pnames: Vec<String> = params
             .iter()
-            .filter(|p| !p.keyword)
+            .filter(|p| !p.keyword && !p.kwsplat)
             .map(|p| p.name.clone())
             .collect();
         let kwparams: Vec<String> = params
@@ -105,11 +105,16 @@ impl Compiler {
             .filter(|p| p.keyword)
             .map(|p| p.name.clone())
             .collect();
-        let splat = params.iter().filter(|p| !p.keyword).position(|p| p.splat);
+        let kwsplat = params.iter().find(|p| p.kwsplat).map(|p| p.name.clone());
+        let splat = params
+            .iter()
+            .filter(|p| !p.keyword && !p.kwsplat)
+            .position(|p| p.splat);
         Ok(MethodDef {
             params: pnames,
             splat,
             kwparams,
+            kwsplat,
             chunk: b.build(),
         })
     }
@@ -835,6 +840,7 @@ impl Compiler {
             params: vec![],
             splat: None,
             kwparams: vec![],
+            kwsplat: None,
             chunk: b.build(),
         }
     }
@@ -852,6 +858,7 @@ impl Compiler {
             params: vec!["value".to_string()],
             splat: None,
             kwparams: vec![],
+            kwsplat: None,
             chunk: b.build(),
         }
     }

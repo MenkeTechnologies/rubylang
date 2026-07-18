@@ -206,6 +206,58 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         i += 2;
                         continue;
                     }
+                    // A `#{ … }` interpolation in a double-quoted string is copied
+                    // verbatim (the parser re-scans it), balancing braces and any
+                    // nested string literals so an inner `"` doesn't end us.
+                    if dq && ch == b'#' && i + 1 < b.len() && b[i + 1] == b'{' {
+                        s.push('#');
+                        s.push('{');
+                        i += 2;
+                        let mut depth = 1u32;
+                        while i < b.len() && depth > 0 {
+                            let d = b[i];
+                            match d {
+                                b'{' => depth += 1,
+                                b'}' => depth -= 1,
+                                b'"' | b'\'' => {
+                                    // skip a nested string literal wholesale
+                                    let q = d;
+                                    s.push(q as char);
+                                    i += 1;
+                                    while i < b.len() && b[i] != q {
+                                        if b[i] == b'\\' && i + 1 < b.len() {
+                                            s.push('\\');
+                                            s.push(b[i + 1] as char);
+                                            i += 2;
+                                            continue;
+                                        }
+                                        if b[i] == b'\n' {
+                                            line += 1;
+                                        }
+                                        let cl = utf8_len(b[i]);
+                                        s.push_str(&src[i..i + cl]);
+                                        i += cl;
+                                    }
+                                    if i < b.len() {
+                                        s.push(q as char);
+                                        i += 1;
+                                    }
+                                    continue;
+                                }
+                                b'\n' => line += 1,
+                                _ => {}
+                            }
+                            if depth == 0 {
+                                s.push('}');
+                                i += 1;
+                                break;
+                            }
+                            let cl = utf8_len(d);
+                            s.push_str(&src[i..i + cl]);
+                            i += cl;
+                        }
+                        continue;
+                    }
                     if ch == b'\n' {
                         line += 1;
                     }
