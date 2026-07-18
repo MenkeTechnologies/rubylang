@@ -435,3 +435,20 @@ puts m[3]
 puts m.pre_match.inspect
 puts "cat dog bird".scan(/\w+/).map(&:upcase).inspect
 puts(/\d+/.match("id 42").to_s)
+#==#
+puts Array.new(3).inspect
+puts Array.new(3, 0).inspect
+puts Array.new(4) { |i| i * i }.inspect
+h = Hash.new(0)
+"aabbbc".each_char { |c| h[c] += 1 }
+puts h.inspect
+g = Hash.new { |hh, k| hh[k] = [] }
+g[:x] << 1
+g[:x] << 2
+g[:y] << 9
+puts g.inspect
+puts Hash[[[:a, 1], [:b, 2]]].inspect
+puts "path/to/file".partition("/").inspect
+puts "path/to/file".rpartition("/").inspect
+puts "Hello".casecmp?("HELLO")
+puts "mississippi".tr_s("sp", "*")

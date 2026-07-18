@@ -1192,6 +1192,34 @@ fn op_assign_batch() {
 }
 
 #[test]
+fn construction_batch() {
+    eq("Array.new(3)", "[nil, nil, nil]");
+    eq("Array.new(3, 0)", "[0, 0, 0]");
+    eq("Array.new(4) { |i| i * i }", "[0, 1, 4, 9]");
+    eq("Array.new(0)", "[]");
+    eq("Hash.new(0)[:missing]", "0");
+    // Block default: the block runs on each miss and may mutate the hash.
+    eq("h = Hash.new { |hh, k| hh[k] = k.to_s }; h[5]; h", "{5 => \"5\"}");
+    eq("h = Hash.new { |hh, k| hh[k] = [] }; h[:a] << 1; h[:a] << 2; h", "{a: [1, 2]}");
+    eq("Hash[[[:a, 1], [:b, 2]]]", "{a: 1, b: 2}");
+    eq("Hash[:a, 1, :b, 2]", "{a: 1, b: 2}");
+    eq("[[:x, 10], [:y, 20]].to_h", "{x: 10, y: 20}");
+}
+
+#[test]
+fn string_more_batch() {
+    eq("\"a-b-c\".partition(\"-\")", "[\"a\", \"-\", \"b-c\"]");
+    eq("\"a-b-c\".rpartition(\"-\")", "[\"a-b\", \"-\", \"c\"]");
+    eq("\"xyz\".partition(\"-\")", "[\"xyz\", \"\", \"\"]");
+    eq("\"Hello\".casecmp(\"hello\")", "0");
+    eq("\"aB\".casecmp(\"ac\")", "-1");
+    eq("\"Hello\".casecmp?(\"hello\")", "true");
+    eq("\"mississippi\".tr_s(\"sp\", \"*\")", "\"mi*i*i*i\"");
+    eq("\"a\\nb\\nc\".each_line.to_a", "[\"a\\n\", \"b\\n\", \"c\"]");
+    eq("\"hi\".center(6, \"*\")", "\"**hi**\"");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

@@ -111,11 +111,13 @@ pub mod ops {
 pub enum RObj {
     Str(String),
     Array(Vec<Value>),
-    /// A Hash: its ordered entries plus the value returned for a missing key
-    /// (`Hash.new(0)` stores `Int(0)`; a plain `{}` stores `Undef`/nil).
+    /// A Hash: its ordered entries, the value returned for a missing key
+    /// (`Hash.new(0)` stores `Int(0)`; a plain `{}` stores `Undef`/nil), and an
+    /// optional default block (`Hash.new { |h,k| ... }`) called on a miss.
     Hash {
         map: IndexMap<RKey, Value>,
         default: Value,
+        default_proc: Option<Value>,
     },
     Symbol(String),
     Range {
@@ -403,17 +405,37 @@ impl RubyHost {
         self.alloc(RObj::Hash {
             map,
             default: Value::Undef,
+            default_proc: None,
         })
     }
     /// `Hash.new(default)` — a hash whose `[]` returns `default` for absent keys.
     pub fn new_hash_with_default(&mut self, map: IndexMap<RKey, Value>, default: Value) -> Value {
-        self.alloc(RObj::Hash { map, default })
+        self.alloc(RObj::Hash {
+            map,
+            default,
+            default_proc: None,
+        })
+    }
+    /// `Hash.new { |h,k| ... }` — a hash whose `[]` calls the block on a miss.
+    pub fn new_hash_with_proc(&mut self, map: IndexMap<RKey, Value>, proc: Value) -> Value {
+        self.alloc(RObj::Hash {
+            map,
+            default: Value::Undef,
+            default_proc: Some(proc),
+        })
     }
     /// The value `Hash#[]` yields for a missing key (nil unless `Hash.new(d)`).
     pub fn hash_default(&self, v: &Value) -> Value {
         match self.obj(v) {
             Some(RObj::Hash { default, .. }) => default.clone(),
             _ => Value::Undef,
+        }
+    }
+    /// The default block of a hash (`Hash.new { |h,k| ... }`), if any.
+    pub fn hash_default_proc(&self, v: &Value) -> Option<Value> {
+        match self.obj(v) {
+            Some(RObj::Hash { default_proc, .. }) => default_proc.clone(),
+            _ => None,
         }
     }
     pub fn new_range(&mut self, lo: i64, hi: i64, exclusive: bool) -> Value {

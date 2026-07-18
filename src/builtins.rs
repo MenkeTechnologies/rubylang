@@ -619,10 +619,26 @@ fn dispatch_classref(
 ) -> Result<Value, String> {
     match name {
         "new" => {
+            // `Array.new(n)` / `Array.new(n, val)` / `Array.new(n) { |i| ... }`.
+            if cls == "Array" {
+                let n = args.first().map(as_i).unwrap_or(0).max(0) as usize;
+                let items: Vec<Value> = if let Some(bl) = &block {
+                    (0..n)
+                        .map(|i| call_proc(bl, &[Value::Int(i as i64)]))
+                        .collect::<Result<_, _>>()?
+                } else {
+                    let fill = args.get(1).cloned().unwrap_or(Value::Undef);
+                    vec![fill; n]
+                };
+                return Ok(new_arr(items));
+            }
             // `Hash.new(default)` builds a real Hash whose `[]` returns `default`
-            // for a missing key (the counter idiom `Hash.new(0)`). A block form
-            // (`Hash.new { |h,k| ... }`) is not yet supported.
+            // for a missing key (the counter idiom `Hash.new(0)`); the block form
+            // `Hash.new { |h,k| ... }` calls the block on each miss instead.
             if cls == "Hash" {
+                if let Some(bl) = block {
+                    return Ok(with_host(|h| h.new_hash_with_proc(IndexMap::new(), bl)));
+                }
                 let default = args.first().cloned().unwrap_or(Value::Undef);
                 return Ok(with_host(|h| h.new_hash_with_default(IndexMap::new(), default)));
             }
@@ -645,6 +661,28 @@ fn dispatch_classref(
         "name" | "to_s" | "inspect" => Ok(new_str(cls.to_string())),
         // `Class === obj` and `obj.is_a?(Class)` — case/when matching.
         "===" => Ok(Value::Bool(with_host(|h| h.is_a(&args[0], cls)))),
+        // `Hash[...]` / `Array[...]` constructors.
+        "[]" if cls == "Hash" => {
+            let mut map = IndexMap::new();
+            // `Hash[[[k,v],...]]` (one array-of-pairs arg) vs `Hash[k,v,k,v]`.
+            let pairs: Vec<Value> =
+                if args.len() == 1 && with_host(|h| h.as_array(&args[0])).is_some() {
+                    with_host(|h| h.as_array(&args[0]).unwrap())
+                        .iter()
+                        .flat_map(|p| with_host(|h| h.as_array(p)).unwrap_or_default())
+                        .collect()
+                } else {
+                    args.to_vec()
+                };
+            for pair in pairs.chunks(2) {
+                if pair.len() == 2 {
+                    let k = with_host(|h| h.value_to_key(&pair[0]));
+                    map.insert(k, pair[1].clone());
+                }
+            }
+            Ok(with_host(|h| h.new_hash(map)))
+        }
+        "[]" if cls == "Array" => Ok(new_arr(args.to_vec())),
         _ => {
             // A class method: `def self.m` runs with self bound to the class ref.
             if let Some(def) = with_host(|h| h.find_class_method(cls, name)) {
@@ -1189,16 +1227,21 @@ fn dispatch_string(
         "bytes" => Ok(new_arr(s.bytes().map(|b| Value::Int(b as i64)).collect())),
         "lines" => Ok(new_arr(split_lines(&s).into_iter().map(new_str).collect())),
         "each_line" => {
-            if let Some(bl) = &block {
-                for line in split_lines(&s) {
-                    call_proc(bl, &[new_str(line)])?;
-                    if has_pending_signal() {
-                        take_break();
-                        break;
+            // With a block, iterate the lines; without one, yield the lines
+            // array so `.each_line.to_a` works without a real Enumerator.
+            match &block {
+                Some(bl) => {
+                    for line in split_lines(&s) {
+                        call_proc(bl, &[new_str(line)])?;
+                        if has_pending_signal() {
+                            take_break();
+                            break;
+                        }
                     }
+                    Ok(recv.clone())
                 }
+                None => Ok(new_arr(split_lines(&s).into_iter().map(new_str).collect())),
             }
-            Ok(recv.clone())
         }
         "center" => {
             let width = as_i(&args[0]).max(0) as usize;
@@ -1384,6 +1427,64 @@ fn dispatch_string(
             None => Err(raise_exc("ArgumentError", "empty string")),
         },
         "chr" => Ok(new_str(s.chars().next().map(|c| c.to_string()).unwrap_or_default())),
+        // `"a-b-c".partition("-")` => ["a", "-", "b-c"]; no match => [whole, "", ""].
+        "partition" => {
+            let sep = arg_str(&args[0]);
+            Ok(match s.find(&sep) {
+                Some(i) => new_arr(vec![
+                    new_str(s[..i].to_string()),
+                    new_str(sep.clone()),
+                    new_str(s[i + sep.len()..].to_string()),
+                ]),
+                None => new_arr(vec![new_str(s.clone()), new_str(String::new()), new_str(String::new())]),
+            })
+        }
+        // `rpartition` splits on the LAST occurrence; no match => ["", "", whole].
+        "rpartition" => {
+            let sep = arg_str(&args[0]);
+            Ok(match s.rfind(&sep) {
+                Some(i) => new_arr(vec![
+                    new_str(s[..i].to_string()),
+                    new_str(sep.clone()),
+                    new_str(s[i + sep.len()..].to_string()),
+                ]),
+                None => new_arr(vec![new_str(String::new()), new_str(String::new()), new_str(s.clone())]),
+            })
+        }
+        // Case-insensitive compare: `casecmp` => -1/0/1, `casecmp?` => bool.
+        "casecmp" => {
+            let o = arg_str(&args[0]);
+            let ord = s.to_lowercase().cmp(&o.to_lowercase());
+            Ok(Value::Int(ord as i64))
+        }
+        "casecmp?" => {
+            let o = arg_str(&args[0]);
+            Ok(Value::Bool(s.to_lowercase() == o.to_lowercase()))
+        }
+        // `tr_s`: translate like `tr`, then squeeze runs of chars that were
+        // translated (adjacent duplicates produced by the translation collapse).
+        "tr_s" => {
+            let from: Vec<char> = arg_str(&args[0]).chars().collect();
+            let to: Vec<char> = arg_str(&args[1]).chars().collect();
+            let mut out = String::new();
+            let mut last_translated: Option<char> = None;
+            for c in s.chars() {
+                match from.iter().position(|&f| f == c) {
+                    Some(i) => {
+                        let r = *to.get(i).or_else(|| to.last()).unwrap_or(&c);
+                        if last_translated != Some(r) {
+                            out.push(r);
+                        }
+                        last_translated = Some(r);
+                    }
+                    None => {
+                        out.push(c);
+                        last_translated = None;
+                    }
+                }
+            }
+            Ok(new_str(out))
+        }
         "succ" | "next" => Ok(new_str(str_succ(&s))),
         "insert" => {
             let mut chars: Vec<char> = s.chars().collect();
@@ -2805,10 +2906,15 @@ fn dispatch_hash(
         )),
         "[]" => {
             let k = with_host(|h| h.value_to_key(&args[0]));
-            // A missing key yields the hash's default (nil unless `Hash.new(d)`).
+            // A missing key calls the default block (`Hash.new { |h,k| ... }`,
+            // which may itself mutate the hash), else yields the plain default
+            // (nil unless `Hash.new(d)`).
             match map.get(&k).cloned() {
                 Some(v) => Ok(v),
-                None => Ok(with_host(|h| h.hash_default(recv))),
+                None => match with_host(|h| h.hash_default_proc(recv)) {
+                    Some(bl) => call_proc(&bl, &[recv.clone(), args[0].clone()]),
+                    None => Ok(with_host(|h| h.hash_default(recv))),
+                },
             }
         }
         "fetch" => {

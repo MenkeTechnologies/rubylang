@@ -245,3 +245,14 @@ hellO wOrld
 ""
 ["CAT", "DOG", "BIRD"]
 42
+#==#
+[nil, nil, nil]
+[0, 0, 0]
+[0, 1, 4, 9]
+{"a" => 2, "b" => 3, "c" => 1}
+{x: [1, 2], y: [9]}
+{a: 1, b: 2}
+["path", "/", "to/file"]
+["path/to", "/", "file"]
+true
+mi*i*i*i

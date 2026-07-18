@@ -73,6 +73,9 @@ capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
 - **`rand`.** Seeded from the system clock (no `srand` determinism yet).
 - **Method surface.** The Enumerable/String/Hash/Range surface is broad but not
   exhaustive; an unimplemented method raises `undefined method '<name>'`.
+- **`String#tr`/`tr_s` ranges.** The character-set forms work, but range syntax
+  (`tr("a-c", "x")`) is treated as the literal chars `a`, `-`, `c` — ranges are
+  not expanded (shared by `tr` and `tr_s`).
 
 ## Tooling
 
