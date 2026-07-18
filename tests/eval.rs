@@ -2245,6 +2245,21 @@ fn float_constants_and_leading_dot_chains() {
 }
 
 #[test]
+fn safe_navigation() {
+    // `&.` short-circuits to nil when the receiver is nil.
+    eq("a = nil; a&.upcase", "nil");
+    eq("b = \"hi\"; b&.upcase", "\"HI\"");
+    // Chains stop at the first nil.
+    eq("a = nil; a&.foo&.bar", "nil");
+    eq("s = \"Hello\"; s&.downcase&.reverse", "\"olleh\"");
+    // Works with arguments, blocks, and after an index.
+    eq("x = [1, 2, 3]; x&.map { |n| n * 2 }", "[2, 4, 6]");
+    eq("h = {x: {y: 5}}; h[:x]&.fetch(:y)", "5");
+    // The receiver is evaluated once; the call is skipped entirely on nil.
+    eq("n = 0; a = nil; a&.tap { n += 1 }; n", "0");
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).

@@ -718,3 +718,16 @@ squares = (1..Float::INFINITY)
   .take_while { |sq| sq < 100 }
   .to_a
 puts squares.inspect
+#==#
+def find_user(id)
+  id == 1 ? {name: "Alice", address: {city: "NYC"}} : nil
+end
+u = find_user(1)
+puts u&.fetch(:name)
+puts u&.fetch(:address)&.fetch(:city)
+missing = find_user(99)
+puts missing&.fetch(:name).inspect
+puts missing&.fetch(:address)&.fetch(:city).inspect
+config = {timeout: 30}
+puts config&.fetch(:timeout)
+puts config[:retries]&.to_s.inspect

@@ -381,3 +381,10 @@ example.com:443 (30s)
 Infinity
 true
 [1, 4, 9, 16, 25, 36, 49, 64, 81]
+#==#
+Alice
+NYC
+nil
+nil
+30
+nil

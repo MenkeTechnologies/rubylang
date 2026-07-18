@@ -41,7 +41,6 @@ capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
   and other executable statements all take effect. (Constants are stored
   globally rather than namespaced under the class.)
 - **Paren-less keyword args** (`greet name: "x"`) are not parsed.
-- **Safe navigation** (`obj&.foo`) is not parsed yet.
 - **Numeric literal / method binding.** `-7.abs` parses as `-(7.abs)` (operator
   precedence) rather than `(-7).abs`; MRI treats `-7` as a literal. Use
   `(-7).abs`.

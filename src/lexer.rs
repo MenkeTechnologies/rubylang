@@ -791,6 +791,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         | "->"
                         | "=~"
                         | "!~"
+                        | "&."
                 ) {
                     two
                 } else {

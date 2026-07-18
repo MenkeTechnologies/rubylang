@@ -14,12 +14,18 @@ use crate::lexer::{lex, Tok, Token};
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    /// Counter for unique temporaries (safe-navigation desugaring).
+    tmp: usize,
 }
 
 /// Parse a full program.
 pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
     let toks = lex(src)?;
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        tmp: 0,
+    };
     p.program()
 }
 
@@ -410,6 +416,7 @@ impl Parser {
     fn postfix(&mut self) -> Result<Expr, String> {
         let mut e = self.primary()?;
         loop {
+            let safe = self.is_op("&.");
             if self.eat_op(".") || self.eat_op("&.") {
                 // `recv.(args)` is sugar for `recv.call(args)` (Proc/Method).
                 let name = if self.is_op("(") {
@@ -418,12 +425,39 @@ impl Parser {
                     self.method_name()?
                 };
                 let (args, block) = self.call_tail()?;
-                e = Expr::Call {
-                    recv: Some(Box::new(e)),
-                    name,
-                    args,
-                    block,
-                };
+                if safe {
+                    // `a&.b(args)` desugars to `(t = a).nil? ? nil : t.b(args)`,
+                    // evaluating the receiver once and skipping the call on nil.
+                    self.tmp += 1;
+                    let tmp = format!("__safenav{}__", self.tmp);
+                    let assign = Expr::Assign(
+                        Box::new(Expr::Var(VarKind::Local, tmp.clone())),
+                        Box::new(e),
+                    );
+                    e = Expr::If {
+                        cond: Box::new(Expr::Call {
+                            recv: Some(Box::new(assign)),
+                            name: "nil?".to_string(),
+                            args: vec![],
+                            block: None,
+                        }),
+                        then: vec![Expr::Nil],
+                        elifs: vec![],
+                        els: Some(vec![Expr::Call {
+                            recv: Some(Box::new(Expr::Var(VarKind::Local, tmp))),
+                            name,
+                            args,
+                            block,
+                        }]),
+                    };
+                } else {
+                    e = Expr::Call {
+                        recv: Some(Box::new(e)),
+                        name,
+                        args,
+                        block,
+                    };
+                }
             } else if self.is_op("[") {
                 self.advance();
                 let mut idx = Vec::new();
