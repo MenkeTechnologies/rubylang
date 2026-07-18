@@ -807,6 +807,25 @@ fn as_f(v: &Value) -> f64 {
     }
 }
 
+/// Resolve the `(lo, hi)` bounds for a numeric `clamp`, accepting either the
+/// two-argument form `clamp(lo, hi)` or the single-`Range` form `clamp(1..5)`.
+/// An exclusive range is rejected, matching Ruby's `Comparable#clamp`.
+fn clamp_bounds(args: &[Value]) -> Result<(Value, Value), String> {
+    if args.len() == 1 {
+        if let Some((lo, hi, exclusive)) = with_host(|h| h.as_range(&args[0])) {
+            if exclusive {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    "cannot clamp with an exclusive range",
+                ));
+            }
+            return Ok((Value::Int(lo), Value::Int(hi)));
+        }
+        return Err(raise_exc("TypeError", "wrong argument type"));
+    }
+    Ok((args[0].clone(), args[1].clone()))
+}
+
 // ---- Integer / Float ------------------------------------------------------
 
 fn dispatch_number(
@@ -1048,11 +1067,16 @@ fn dispatch_number(
         "clamp" => {
             // Ruby returns the receiver when in range, otherwise the bound
             // itself (preserving its type, so `(-2.7).clamp(-1.0, 1.0)` is a Float).
+            // Accepts `clamp(lo, hi)` or `clamp(range)`; an exclusive range is
+            // rejected exactly like `Comparable#clamp`.
+            // TODO: beginless/endless ranges (`clamp(3..)`) aren't representable
+            // as a `Range` in rubylang yet, so single-sided clamps are unhandled.
+            let (lo, hi) = clamp_bounds(args)?;
             let x = as_f(recv);
-            if x < as_f(&args[0]) {
-                Ok(args[0].clone())
-            } else if x > as_f(&args[1]) {
-                Ok(args[1].clone())
+            if x < as_f(&lo) {
+                Ok(lo)
+            } else if x > as_f(&hi) {
+                Ok(hi)
             } else {
                 Ok(recv.clone())
             }
@@ -1502,6 +1526,37 @@ fn dispatch_string(
             })),
             None => Ok(Value::Undef),
         },
+        "between?" => {
+            let (lo, hi) = (arg_str(&args[0]), arg_str(&args[1]));
+            Ok(Value::Bool(s >= lo && s <= hi))
+        }
+        "clamp" => {
+            // `clamp(lo, hi)` or `clamp("a".."z")`; exclusive ranges are rejected
+            // just as `Comparable#clamp` does.
+            let (lo, hi) = if args.len() == 1 {
+                match with_host(|h| h.as_str_range(&args[0])) {
+                    Some((lo, hi, exclusive)) => {
+                        if exclusive {
+                            return Err(raise_exc(
+                                "ArgumentError",
+                                "cannot clamp with an exclusive range",
+                            ));
+                        }
+                        (lo, hi)
+                    }
+                    None => return Err(raise_exc("TypeError", "wrong argument type")),
+                }
+            } else {
+                (arg_str(&args[0]), arg_str(&args[1]))
+            };
+            if s < lo {
+                Ok(new_str(lo))
+            } else if s > hi {
+                Ok(new_str(hi))
+            } else {
+                Ok(recv.clone())
+            }
+        }
         "*" => Ok(new_str(s.repeat(as_i(&args[0]).max(0) as usize))),
         "%" => {
             // `"%d-%d" % [1, 2]` or `"%d" % 5`.

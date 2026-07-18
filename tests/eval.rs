@@ -1380,6 +1380,36 @@ fn times_upto_arrays_batch() {
 }
 
 #[test]
+fn comparable_range_batch() {
+    // Integer/Float#clamp(range) alongside the existing clamp(lo, hi).
+    eq("5.clamp(1..3)", "3");
+    eq("(-2).clamp(0..10)", "0");
+    eq("5.5.clamp(1..3)", "3");
+    eq("2.5.clamp(1..3)", "2.5");
+    eq("5.clamp(1, 3)", "3");
+    eq("(-2.7).clamp(-1.0, 1.0)", "-1.0");
+    // between? on numbers.
+    eq("3.between?(1, 5)", "true");
+    eq("7.between?(1, 5)", "false");
+    // String#clamp via range and two-arg, plus between?.
+    eq("\"m\".clamp(\"a\"..\"z\")", "\"m\"");
+    eq("\"A\".clamp(\"a\"..\"z\")", "\"a\"");
+    eq("\"a\".clamp(\"m\", \"z\")", "\"m\"");
+    eq("\"b\".between?(\"a\", \"c\")", "true");
+    eq("\"z\".between?(\"a\", \"c\")", "false");
+    // String comparison operators derive from <=>.
+    eq("\"a\" < \"b\"", "true");
+    eq("\"abc\" <=> \"abd\"", "-1");
+    // minmax on arrays.
+    eq("[\"b\", \"a\", \"c\"].minmax", "[\"a\", \"c\"]");
+    // Exclusive ranges are rejected by clamp.
+    eq(
+        "begin; 5.clamp(1...3); rescue => e; e.message; end",
+        "\"cannot clamp with an exclusive range\"",
+    );
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
