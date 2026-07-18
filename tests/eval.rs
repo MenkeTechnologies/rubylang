@@ -1025,6 +1025,45 @@ fn sprintf_full_batch() {
 }
 
 #[test]
+fn radix_batch() {
+    // Integer#to_s(base) and #digits(base) in radix 2..36.
+    eq("255.to_s(16)", "\"ff\"");
+    eq("255.to_s(2)", "\"11111111\"");
+    eq("35.to_s(36)", "\"z\"");
+    eq("255.digits(16)", "[15, 15]");
+    // String#to_i(base): matching prefixes, underscores, base 0 auto-detect.
+    eq("\"ff\".to_i(16)", "255");
+    eq("\"-ff\".to_i(16)", "-255");
+    eq("\"z\".to_i(36)", "35");
+    eq("\"0xff\".to_i(16)", "255");
+    eq("\"ff_ff\".to_i(16)", "65535");
+    eq("\"0xff\".to_i(0)", "255");
+    eq("\"777\".to_i(0)", "777");
+    eq("\"1_000\".to_i", "1000");
+    // String#hex / #oct.
+    eq("\"0xff\".hex", "255");
+    eq("\"foo\".hex", "15");
+    eq("\"777\".oct", "511");
+    eq("\"0b101\".oct", "5");
+    eq("\"0o17\".oct", "15");
+    eq("\"0x1f\".oct", "31");
+    eq("\"9\".oct", "0");
+    // Integer#chr and String#ord round-trip.
+    eq("65.chr", "\"A\"");
+    eq("\"A\".ord", "65");
+    // Kernel#Integer(str, base): strict, honours prefixes and signs.
+    eq("Integer(\"ff\", 16)", "255");
+    eq("Integer(\"0xff\", 16)", "255");
+    eq("Integer(\"1010\", 2)", "10");
+    eq("Integer(\"777\")", "777");
+    eq("Integer(\"010\")", "8");
+    eq("Integer(\"-0x10\")", "-16");
+    // Integer() is strict: trailing garbage raises.
+    assert!(ev("Integer(\"ff\")").is_err());
+    assert!(ev("Integer(\"099\")").is_err());
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

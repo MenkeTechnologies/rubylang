@@ -1167,11 +1167,26 @@ fn dispatch_string(
             Ok(new_str(out))
         }
         "empty?" => Ok(Value::Bool(s.is_empty())),
-        "to_i" => match args.first().map(as_i) {
-            Some(base) if (2..=36).contains(&base) => Ok(Value::Int(
-                i64::from_str_radix(s.trim(), base as u32).unwrap_or(0),
-            )),
-            _ => Ok(Value::Int(parse_leading_int(&s))),
+        "to_i" => {
+            let base = args.first().map(as_i).unwrap_or(10);
+            if base != 0 && !(2..=36).contains(&base) {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!("invalid radix {base}"),
+                ));
+            }
+            Ok(Value::Int(scan_int(&s, base).map(|(v, _)| v).unwrap_or(0)))
+        }
+        "hex" => Ok(Value::Int(scan_int(&s, 16).map(|(v, _)| v).unwrap_or(0))),
+        "oct" => {
+            // Ruby `String#oct` defaults to base 8 but honours a
+            // `0x`/`0b`/`0o`/`0d` prefix, which flips it to auto-detect.
+            let base = if has_radix_prefix(&s) { 0 } else { 8 };
+            Ok(Value::Int(scan_int(&s, base).map(|(v, _)| v).unwrap_or(0)))
+        }
+        "ord" => match s.chars().next() {
+            Some(c) => Ok(Value::Int(c as i64)),
+            None => Err(raise_exc("ArgumentError", "empty string")),
         },
         "to_f" => Ok(Value::Float(parse_leading_float(&s))),
         "to_s" | "to_str" => Ok(recv.clone()),
@@ -3868,17 +3883,106 @@ fn arg_str(v: &Value) -> String {
 }
 
 /// Ruby `String#to_i`: the leading integer prefix, or 0.
-fn parse_leading_int(s: &str) -> i64 {
-    let t = s.trim();
-    let mut buf = String::new();
-    for (i, c) in t.chars().enumerate() {
-        if c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+')) {
-            buf.push(c);
-        } else {
-            break;
+/// Scan a leading Ruby-style integer from `s` in the given `base`.
+///
+/// `base == 0` auto-detects the radix from a `0x`/`0b`/`0o`/`0d` prefix or a
+/// bare leading `0` (octal), defaulting to decimal. Otherwise `base` is
+/// 2..=36 and a matching prefix (`0x` for 16, `0b` for 2, `0o` for 8, `0d`
+/// for 10) is consumed if present. A leading sign and single underscores
+/// between digits are honoured. Returns `(value, byte_offset_past_number)`
+/// or `None` when no digit was consumed. Shared by `String#to_i`, `#hex`,
+/// `#oct`, and `Kernel#Integer`.
+fn scan_int(s: &str, base: i64) -> Option<(i64, usize)> {
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n && (bytes[i] as char).is_ascii_whitespace() {
+        i += 1;
+    }
+    let mut neg = false;
+    if i < n && (bytes[i] == b'+' || bytes[i] == b'-') {
+        neg = bytes[i] == b'-';
+        i += 1;
+    }
+    let prefix_base = |c: u8| -> Option<i64> {
+        match c {
+            b'x' | b'X' => Some(16),
+            b'b' | b'B' => Some(2),
+            b'o' | b'O' => Some(8),
+            b'd' | b'D' => Some(10),
+            _ => None,
+        }
+    };
+    let mut radix = base;
+    // Explicit `0x`-style prefix (auto-detect, or when it matches `base`).
+    if i + 1 < n && bytes[i] == b'0' {
+        if let Some(pb) = prefix_base(bytes[i + 1]) {
+            if base == 0 || base == pb {
+                radix = pb;
+                i += 2;
+            }
         }
     }
-    buf.parse().unwrap_or(0)
+    let mut val: i64 = 0;
+    let mut count = 0usize;
+    let mut prev_digit = false;
+    // Base 0 with no `0x`-style prefix: a bare leading `0` selects octal and
+    // is itself the first (zero-valued) digit; anything else is decimal.
+    if radix == 0 {
+        if i < n && bytes[i] == b'0' {
+            radix = 8;
+            i += 1;
+            count = 1;
+            prev_digit = true;
+        } else {
+            radix = 10;
+        }
+    }
+    let r = radix as u32;
+    while i < n {
+        let c = bytes[i] as char;
+        if c == '_' {
+            if prev_digit && i + 1 < n && (bytes[i + 1] as char).is_digit(r) {
+                i += 1;
+                prev_digit = false;
+                continue;
+            }
+            break;
+        }
+        match c.to_digit(r) {
+            Some(d) => {
+                val = val.saturating_mul(radix).saturating_add(d as i64);
+                count += 1;
+                i += 1;
+                prev_digit = true;
+            }
+            None => break,
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    Some((if neg { -val } else { val }, i))
+}
+
+/// True when `s` (after leading whitespace and an optional sign) opens with a
+/// `0x`/`0b`/`0o`/`0d` radix prefix. Used by `String#oct` to switch from its
+/// default base 8 into prefix auto-detect.
+fn has_radix_prefix(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && (b[i] as char).is_ascii_whitespace() {
+        i += 1;
+    }
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        i += 1;
+    }
+    i + 1 < b.len()
+        && b[i] == b'0'
+        && matches!(
+            b[i + 1],
+            b'x' | b'X' | b'b' | b'B' | b'o' | b'O' | b'd' | b'D'
+        )
 }
 
 /// Ruby `String#to_f`: the leading float prefix, or 0.0.
