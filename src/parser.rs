@@ -418,29 +418,46 @@ impl Parser {
     }
 
     /// Parse the argument list + optional block that follow a method name.
+    /// Trailing `key: value` keyword arguments are collected into a single Hash
+    /// argument (symbol keys), matching Ruby's implicit keyword hash.
     fn call_tail(&mut self) -> Result<(Vec<Expr>, Option<Block>), String> {
         let mut args = Vec::new();
         let mut amp_block = None;
+        let mut kwargs: Vec<(Expr, Expr)> = Vec::new();
         if self.eat_op("(") {
             if !self.is_op(")") {
-                self.arg_or_amp(&mut args, &mut amp_block)?;
+                self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs)?;
                 while self.eat_op(",") {
-                    self.arg_or_amp(&mut args, &mut amp_block)?;
+                    self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs)?;
                 }
             }
             self.expect_op(")")?;
+        }
+        if !kwargs.is_empty() {
+            args.push(Expr::Hash(kwargs));
         }
         let block = self.maybe_block()?.or(amp_block);
         Ok((args, block))
     }
 
-    /// Parse one call argument, recognizing a `&:sym` block-pass (`map(&:upcase)`)
-    /// and turning it into an equivalent block `{ |__x| __x.sym }`.
+    /// Parse one call argument, recognizing a `key: value` keyword argument, a
+    /// `&:sym` block-pass (`map(&:upcase)`), and a `*expr` splat.
     fn arg_or_amp(
         &mut self,
         args: &mut Vec<Expr>,
         amp_block: &mut Option<Block>,
+        kwargs: &mut Vec<(Expr, Expr)>,
     ) -> Result<(), String> {
+        // `key: value` keyword argument (symbol key).
+        if let Tok::Ident(key) = self.peek().clone() {
+            if matches!(&self.toks[self.pos + 1].kind, Tok::Op(o) if o == ":") {
+                self.advance(); // key
+                self.advance(); // :
+                let v = self.arg()?;
+                kwargs.push((Expr::Symbol(key), v));
+                return Ok(());
+            }
+        }
         // `*expr` — splat the array's elements into the argument list.
         if self.is_op("*") {
             self.advance();
@@ -996,6 +1013,24 @@ impl Parser {
     fn param(&mut self) -> Result<Param, String> {
         let splat = self.eat_op("*");
         let name = self.ident_name()?;
+        // Keyword parameter: `name:` (required) or `name: default`.
+        if !splat && self.is_op(":") {
+            self.advance();
+            let default = if self.is_op(",")
+                || self.is_op(")")
+                || matches!(self.peek(), Tok::Newline | Tok::Semicolon)
+            {
+                None
+            } else {
+                Some(self.ternary()?)
+            };
+            return Ok(Param {
+                name,
+                default,
+                splat: false,
+                keyword: true,
+            });
+        }
         let default = if !splat && self.eat_op("=") {
             Some(self.ternary()?)
         } else {
@@ -1005,6 +1040,7 @@ impl Parser {
             name,
             default,
             splat,
+            keyword: false,
         })
     }
 

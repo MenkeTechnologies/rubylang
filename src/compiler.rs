@@ -93,11 +93,23 @@ impl Compiler {
         }
         self.compile_seq(&mut b, body)?;
         self.loops = saved;
-        let pnames = params.iter().map(|p| p.name.clone()).collect();
-        let splat = params.iter().position(|p| p.splat);
+        // Positional params (name-bound by index) are separate from keyword
+        // params (bound from the trailing keyword hash).
+        let pnames: Vec<String> = params
+            .iter()
+            .filter(|p| !p.keyword)
+            .map(|p| p.name.clone())
+            .collect();
+        let kwparams: Vec<String> = params
+            .iter()
+            .filter(|p| p.keyword)
+            .map(|p| p.name.clone())
+            .collect();
+        let splat = params.iter().filter(|p| !p.keyword).position(|p| p.splat);
         Ok(MethodDef {
             params: pnames,
             splat,
+            kwparams,
             chunk: b.build(),
         })
     }
@@ -819,6 +831,7 @@ impl Compiler {
         MethodDef {
             params: vec![],
             splat: None,
+            kwparams: vec![],
             chunk: b.build(),
         }
     }
@@ -835,6 +848,7 @@ impl Compiler {
         MethodDef {
             params: vec!["value".to_string()],
             splat: None,
+            kwparams: vec![],
             chunk: b.build(),
         }
     }

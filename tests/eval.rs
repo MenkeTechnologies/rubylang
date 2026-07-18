@@ -310,6 +310,28 @@ fn call_site_and_target_splat() {
 }
 
 #[test]
+fn keyword_arguments() {
+    eq(
+        "def g(name:, greeting: \"hi\"); \"#{greeting}, #{name}\"; end; g(name: \"Ann\")",
+        "\"hi, Ann\"",
+    );
+    // Order-independent, with an explicit override.
+    eq(
+        "def g(name:, greeting: \"hi\"); \"#{greeting}, #{name}\"; end; g(greeting: \"yo\", name: \"Bob\")",
+        "\"yo, Bob\"",
+    );
+    // Mixed positional + keyword.
+    eq(
+        "def f(a, b, unit: \"px\"); \"#{a + b}#{unit}\"; end; f(1, 2)",
+        "\"3px\"",
+    );
+    eq(
+        "def f(a, b, unit: \"px\"); \"#{a + b}#{unit}\"; end; f(3, 4, unit: \"em\")",
+        "\"7em\"",
+    );
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

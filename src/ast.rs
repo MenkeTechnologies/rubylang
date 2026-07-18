@@ -172,13 +172,15 @@ pub enum StrPart {
     Interp(Box<Expr>),
 }
 
-/// A method parameter: name, an optional default expression, and whether it is a
-/// splat (`*rest`) that collects the remaining positional arguments.
+/// A method parameter: name, an optional default expression, whether it is a
+/// splat (`*rest`) collecting the remaining positional args, and whether it is a
+/// keyword parameter (`name:` / `name: default`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub name: String,
     pub default: Option<Expr>,
     pub splat: bool,
+    pub keyword: bool,
 }
 
 /// One `rescue` clause of a `begin`/`rescue` block.

@@ -30,11 +30,13 @@ capture.
   superclass chain (module-`super` ordering is approximate).
 - **Class-body statements.** Only `def`, `attr_*`, and `include` in a class body
   take effect; constants and other executable statements are ignored.
-- **Keyword params / `&block` param.** `**kwargs` and an explicit `&block`
-  parameter are not supported. (Splat `*rest` params, call-site splat `f(*arr)`,
-  array splat `[1, *a]`, splat assignment targets `a, *b = …`, and `&:sym`
-  block-pass all are.) A block cannot be combined with call-site splat in one
-  call yet.
+- **`**kwargs` / `&block` param.** A double-splat keyword-collector (`**opts`) and
+  an explicit `&block` parameter are not supported. (Explicit keyword params
+  `def f(name:, greeting: "hi")` with `f(name: "x")` call-site keyword args, splat
+  `*rest` params, call-site splat `f(*arr)`, array splat `[1, *a]`, splat
+  assignment targets `a, *b = …`, and `&:sym` block-pass all are.) A block cannot
+  be combined with call-site splat in one call yet; paren-less keyword args
+  (`greet name: "x"`) are not parsed.
 - **Numeric literal / method binding.** `-7.abs` parses as `-(7.abs)` (operator
   precedence) rather than `(-7).abs`; MRI treats `-7` as a literal. Use
   `(-7).abs`.

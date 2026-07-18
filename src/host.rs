@@ -123,12 +123,14 @@ pub enum RKey {
     FloatBits(u64),
 }
 
-/// A compiled method: parameter names, the index of a splat (`*rest`) parameter
-/// if any, and the body chunk.
+/// A compiled method: positional parameter names, the index of a splat
+/// (`*rest`) parameter if any, the keyword parameter names (`name:`), and the
+/// body chunk. Keyword params are bound from a trailing keyword Hash argument.
 #[derive(Clone)]
 pub struct MethodDef {
     pub params: Vec<String>,
     pub splat: Option<usize>,
+    pub kwparams: Vec<String>,
     pub chunk: Chunk,
 }
 
@@ -623,13 +625,28 @@ impl RubyHost {
         &mut self,
         params: &[String],
         splat: Option<usize>,
+        kwparams: &[String],
         args: &[Value],
     ) -> IndexMap<String, Value> {
+        // With keyword params, the final positional argument (if it is a Hash) is
+        // the keyword hash; bind the rest positionally.
+        let (positional, kwhash): (&[Value], Option<IndexMap<RKey, Value>>) =
+            if !kwparams.is_empty() {
+                match args.last() {
+                    Some(v) if matches!(self.obj(v), Some(RObj::Hash(_))) => {
+                        (&args[..args.len() - 1], self.as_hash(v))
+                    }
+                    _ => (args, None),
+                }
+            } else {
+                (args, None)
+            };
+
         let mut locals = IndexMap::new();
         match splat {
             None => {
                 for (i, p) in params.iter().enumerate() {
-                    if let Some(v) = args.get(i) {
+                    if let Some(v) = positional.get(i) {
                         locals.insert(p.clone(), v.clone());
                     }
                 }
@@ -637,22 +654,31 @@ impl RubyHost {
             Some(si) => {
                 let after = params.len() - si - 1;
                 for (i, p) in params.iter().take(si).enumerate() {
-                    if let Some(v) = args.get(i) {
+                    if let Some(v) = positional.get(i) {
                         locals.insert(p.clone(), v.clone());
                     }
                 }
-                let splat_end = args.len().saturating_sub(after).max(si);
-                let rest: Vec<Value> = args
+                let splat_end = positional.len().saturating_sub(after).max(si);
+                let rest: Vec<Value> = positional
                     .get(si..splat_end)
                     .map(|s| s.to_vec())
                     .unwrap_or_default();
                 let arr = self.new_array(rest);
                 locals.insert(params[si].clone(), arr);
                 for (j, p) in params.iter().skip(si + 1).enumerate() {
-                    if let Some(v) = args.get(splat_end + j) {
+                    if let Some(v) = positional.get(splat_end + j) {
                         locals.insert(p.clone(), v.clone());
                     }
                 }
+            }
+        }
+        // Bind keyword params from the keyword hash; omitted ones stay unbound so
+        // the method prologue can apply their default (a required keyword left
+        // unbound reads as nil).
+        for kw in kwparams {
+            let key = RKey::Sym(kw.clone());
+            if let Some(v) = kwhash.as_ref().and_then(|m| m.get(&key)) {
+                locals.insert(kw.clone(), v.clone());
             }
         }
         locals
@@ -1005,7 +1031,7 @@ fn run_method(
     def_class: Option<String>,
 ) -> Result<Value, String> {
     let saved_active = with_host(|h| {
-        let locals = h.bind_params(&def.params, def.splat, args);
+        let locals = h.bind_params(&def.params, def.splat, &def.kwparams, args);
         h.frames.push(Frame {
             locals,
             block,

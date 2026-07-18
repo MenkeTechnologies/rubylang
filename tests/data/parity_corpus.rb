@@ -274,3 +274,22 @@ first, *rest = [10, 20, 30, 40]
 puts "#{first} / #{rest.inspect}"
 a, *mid, z = [1, 2, 3, 4, 5]
 puts "#{a} #{mid.inspect} #{z}"
+#==#
+def greet(name:, greeting: "hi")
+  "#{greeting}, #{name}"
+end
+puts greet(name: "Ann")
+puts greet(name: "Bob", greeting: "yo")
+#==#
+def build(width:, height:, label: "box")
+  "#{label} #{width}x#{height}"
+end
+puts build(height: 3, width: 5)
+puts build(width: 2, height: 2, label: "square")
+#==#
+def config(host, port: 80, secure: false)
+  scheme = secure ? "https" : "http"
+  "#{scheme}://#{host}:#{port}"
+end
+puts config("example.com")
+puts config("example.com", port: 8080, secure: true)
