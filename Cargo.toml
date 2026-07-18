@@ -1,6 +1,6 @@
 [package]
 name = "rubylang"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.80"
 authors = ["MenkeTechnologies <linux.dev25@gmail.com>"]
@@ -13,8 +13,19 @@ readme = "README.md"
 keywords = ["ruby", "interpreter", "compiler", "jit", "fusevm"]
 categories = ["command-line-utilities", "compilers"]
 publish = true
-# `docs/` is the published HUD site; not part of the crate build.
-exclude = ["/docs/"]
+# Dev-only artifacts kept out of the published crate. Consumers get src + the
+# `ruby`/gen-docs/parity bins, the man page, and shell completions — not the
+# HUD site, CI config, integration-test corpus, self-test .rb examples, or the
+# bug tracker. None are referenced at compile time (no include_str! into them),
+# so the packaged crate still builds and its bins run.
+exclude = [
+    "/docs/",
+    "/.github/",
+    "/tests/",
+    "/examples/",
+    "/scripts/",
+    "/BUGS.md",
+]
 
 # rubylang is a standalone crate, not a workspace member. An explicit empty
 # `[workspace]` stops cargo walking up to the MenkeTechnologiesMeta parent.
