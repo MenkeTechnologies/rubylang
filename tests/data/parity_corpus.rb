@@ -1026,3 +1026,17 @@ puts perms
 puts 0xCAFE
 mask = 0xFF & 0b1010_1010
 puts mask
+#==#
+name = "Ruby"
+puts %q(literal #{name} stays)
+puts %Q(interpolated #{name} works)
+puts %w[red green blue].map(&:upcase).inspect
+tokens = "foo=1; bar=2; baz=3".scan(%r{(\w+)=(\d+)})
+puts tokens.inspect
+puts %q{path: /usr/local/bin}
+labels = %i[alpha beta gamma]
+puts labels.inspect
+text = "The year 2024 and month 03"
+puts text.scan(%r{\d+}).inspect
+puts(%r{^\d{4}$}.match?("2024"))
+puts %s(symbol).class

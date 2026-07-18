@@ -536,6 +536,68 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     space: core::mem::take(&mut sp),
                 });
             }
+            // `%q(…)` / `%Q(…)` / `%r{…}flags` / `%s(…)` percent literals. The
+            // explicit type letter is unambiguous (never the modulo operator);
+            // the delimiter is any following punctuation, with `()`/`{}`/`[]`/
+            // `<>` nesting. `%q` is single-quoted (no interpolation), `%Q` is
+            // double-quoted, `%r` is a Regexp, `%s` is a Symbol.
+            b'%' if i + 2 < b.len()
+                && matches!(b[i + 1], b'q' | b'Q' | b'r' | b's')
+                && !b[i + 2].is_ascii_alphanumeric()
+                && !matches!(b[i + 2], b' ' | b'\t' | b'\n' | b'=') =>
+            {
+                let letter = b[i + 1];
+                let open = b[i + 2];
+                let close = match open {
+                    b'[' => b']',
+                    b'(' => b')',
+                    b'{' => b'}',
+                    b'<' => b'>',
+                    other => other,
+                };
+                i += 3;
+                let start = i;
+                let mut depth = 1u32;
+                while i < b.len() {
+                    if b[i] == b'\\' && i + 1 < b.len() {
+                        i += 2; // an escaped char is never a delimiter
+                        continue;
+                    }
+                    if b[i] == b'\n' {
+                        line += 1;
+                    }
+                    if b[i] == open && open != close {
+                        depth += 1;
+                    } else if b[i] == close {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                let body = src[start..i.min(b.len())].to_string();
+                i += 1; // consume the closing delimiter
+                let kind = match letter {
+                    b'q' => Tok::Str(body, false),
+                    b'Q' => Tok::Str(body, true),
+                    b's' => Tok::Symbol(body),
+                    _ => {
+                        // `%r{…}` — collect trailing regex flags.
+                        let fstart = i;
+                        while i < b.len() && matches!(b[i], b'i' | b'm' | b'x' | b'o' | b'u' | b'n')
+                        {
+                            i += 1;
+                        }
+                        Tok::Regex(body, src[fstart..i].to_string())
+                    }
+                };
+                out.push(Token {
+                    kind,
+                    line,
+                    space: core::mem::take(&mut sp),
+                });
+            }
             // `%w[…]` / `%i[…]` word/symbol arrays → synthetic `[ … ]` tokens so
             // the parser handles them as ordinary array literals.
             b'%' if i + 2 < b.len()

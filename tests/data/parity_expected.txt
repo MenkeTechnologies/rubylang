@@ -581,3 +581,13 @@ ERROR
 493
 51966
 170
+#==#
+literal #{name} stays
+interpolated Ruby works
+["RED", "GREEN", "BLUE"]
+[["foo", "1"], ["bar", "2"], ["baz", "3"]]
+path: /usr/local/bin
+[:alpha, :beta, :gamma]
+["2024", "03"]
+true
+Symbol

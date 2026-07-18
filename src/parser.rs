@@ -930,6 +930,7 @@ impl Parser {
             Tok::Int(_)
             | Tok::Float(_)
             | Tok::Str(_, _)
+            | Tok::Regex(_, _)
             | Tok::Symbol(_)
             | Tok::IVar(_)
             | Tok::CVar(_)

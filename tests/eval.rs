@@ -2358,6 +2358,32 @@ fn time_utc() {
 }
 
 #[test]
+fn percent_literals() {
+    // %q — single-quoted (no interpolation), various delimiters.
+    eq("%q(hello world)", "\"hello world\"");
+    eq("%q{braces}", "\"braces\"");
+    eq("%q[brackets]", "\"brackets\"");
+    eq("%q<angle>", "\"angle\"");
+    eq("%q!bang!", "\"bang\"");
+    eq("%q(nested (parens) work)", "\"nested (parens) work\"");
+    // %Q — double-quoted (interpolation).
+    eq("%Q(sum=#{2 * 3})", "\"sum=6\"");
+    eq("x = 5; %Q(val is #{x})", "\"val is 5\"");
+    // %r — Regexp, including flags and a paren-less command position.
+    eq("%r{ab+c} =~ \"xabbbc\"", "1");
+    eq("%r{[0-9]+}.match?(\"abc123\")", "true");
+    eq("%r{ABC}i =~ \"xabc\"", "1");
+    eq("\"Hello World\".scan(%r{\\w+})", "[\"Hello\", \"World\"]");
+    // %s — Symbol.
+    eq("%s(hello)", ":hello");
+    // A plain regex literal as a paren-less command arg now parses.
+    eq("/\\d+/.match(\"abc123\")[0]", "\"123\"");
+    // Modulo is unaffected.
+    eq("10 % 3", "1");
+    eq("\"%05.2f\" % 3.14", "\"03.14\"");
+}
+
+#[test]
 fn filter_map_transpose_string_index_radix() {
     // Array#filter_map maps and keeps truthy results.
     eq("[1, 2, 3, 4].filter_map { |x| x * 2 if x.even? }", "[4, 8]");

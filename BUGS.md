@@ -59,9 +59,13 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
 - **Not lexed:** `__END__`. Heredocs (`<<END`, `<<~SQL`, `<<-EOT`, `<<'RAW'`),
   `%w[]` / `%i[]` word/symbol arrays (and the `()`/`{}`/`<>` delimiter variants),
   double-quoted `#{}` interpolation, `?c` character literals, regex literals
-  (`/pat/flags`, with `i`/`m`/`x` flags), and radix integer literals
+  (`/pat/flags`, with `i`/`m`/`x` flags), radix integer literals
   (`0b1010` binary, `0o17`/`017` octal, `0xff` hex, `0d99` decimal, with `_`
-  separators) **are** lexed.
+  separators), and the `%q`/`%Q`/`%r`/`%s` percent literals (single/double-
+  quoted string, Regexp, Symbol — any punctuation delimiter, with `()`/`{}`/
+  `[]`/`<>` nesting) **are** lexed. Not yet: the bare `%(…)` string form (its
+  disambiguation from the modulo operator is skipped; use `%Q(…)`), and
+  `#{`/`#@`-escaping in `String#inspect` for a literal `#{` in a string.
 
 ## Runtime / methods
 
