@@ -1401,6 +1401,71 @@ fn str_index(s: &str, args: &[Value]) -> Value {
     }
 }
 
+/// Ruby `String#succ` / `Symbol#succ`: increment the rightmost alphanumeric,
+/// carrying leftward across alphanumerics only; on carry-out of the leftmost
+/// alnum, a new leading char of the same class is inserted (`"Zz"` -> `"AAa"`).
+/// A string with no alphanumerics increments its last code point with carry.
+fn str_succ(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let mut chars: Vec<char> = s.chars().collect();
+    if chars.iter().any(|c| c.is_ascii_alphanumeric()) {
+        let mut idx = chars.len() as isize - 1;
+        let mut prepend: Option<char> = None;
+        loop {
+            while idx >= 0 && !chars[idx as usize].is_ascii_alphanumeric() {
+                idx -= 1;
+            }
+            if idx < 0 {
+                break;
+            }
+            let c = chars[idx as usize];
+            let (next, carry) = match c {
+                '0'..='8' | 'a'..='y' | 'A'..='Y' => ((c as u8 + 1) as char, false),
+                '9' => ('0', true),
+                'z' => ('a', true),
+                'Z' => ('A', true),
+                _ => (c, false),
+            };
+            chars[idx as usize] = next;
+            if !carry {
+                prepend = None;
+                break;
+            }
+            prepend = Some(match c {
+                '0'..='9' => '1',
+                'a'..='z' => 'a',
+                _ => 'A',
+            });
+            idx -= 1;
+        }
+        if let Some(pc) = prepend {
+            chars.insert((idx + 1).max(0) as usize, pc);
+        }
+    } else {
+        // No alphanumerics: increment the last code point, carrying leftward.
+        let mut idx = chars.len() as isize - 1;
+        loop {
+            if idx < 0 {
+                chars.insert(0, '\u{1}');
+                break;
+            }
+            match char::from_u32(chars[idx as usize] as u32 + 1) {
+                Some(nc) => {
+                    chars[idx as usize] = nc;
+                    break;
+                }
+                None => {
+                    chars[idx as usize] = '\u{0}';
+                    idx -= 1;
+                }
+            }
+        }
+    }
+    chars.into_iter().collect()
+}
+
 // ---- Array ----------------------------------------------------------------
 
 fn dispatch_array(
@@ -2403,19 +2468,61 @@ fn dispatch_range(
 
 // ---- Symbol / Proc --------------------------------------------------------
 
-fn dispatch_symbol(recv: &Value, name: &str, _args: &[Value]) -> Result<Value, String> {
+fn dispatch_symbol(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     let s = with_host(|h| h.as_symbol(recv).unwrap_or_default());
     match name {
         "to_s" | "id2name" | "name" => Ok(new_str(s)),
-        "to_sym" => Ok(recv.clone()),
+        // `to_sym` returns self; `itself`/`intern` are Ruby aliases in this context.
+        "to_sym" | "intern" => Ok(recv.clone()),
         "length" | "size" => Ok(Value::Int(s.chars().count() as i64)),
+        "empty?" => Ok(Value::Bool(s.is_empty())),
+        // Case/`succ`/`capitalize` all return a Symbol (unlike String's String).
         "upcase" => Ok(with_host(|h| h.new_symbol(&s.to_uppercase()))),
         "downcase" => Ok(with_host(|h| h.new_symbol(&s.to_lowercase()))),
+        "succ" | "next" => Ok(with_host(|h| h.new_symbol(&str_succ(&s)))),
+        "capitalize" => {
+            let mut c = s.chars();
+            let cap = match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+                None => String::new(),
+            };
+            Ok(with_host(|h| h.new_symbol(&cap)))
+        }
+        // `Symbol#[]` indexes the name and returns a String, like `String#[]`.
+        "[]" | "slice" => Ok(str_index(&s, args)),
+        "start_with?" => Ok(Value::Bool(
+            args.iter().any(|a| s.starts_with(&arg_str(a))),
+        )),
+        // `<=>` compares names; nil when the other operand is not a Symbol.
+        "<=>" => Ok(match with_host(|h| h.as_symbol(&args[0])) {
+            Some(other) => Value::Int(match s.cmp(&other) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }),
+            None => Value::Undef,
+        }),
+        // `&:upcase` — a proc that sends the named method to its first argument.
+        "to_proc" => Ok(with_host(|h| h.new_sym_proc(&s))),
         _ => Err(format!("undefined method '{name}' for Symbol")),
     }
 }
 
 fn dispatch_proc(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // A `Symbol#to_proc` proc: calling it sends the symbol's method to arg[0].
+    if let Some(sym) = with_host(|h| h.as_sym_proc(recv)) {
+        return match name {
+            "call" | "()" | "[]" | "yield" => {
+                if args.is_empty() {
+                    Err(raise_exc("ArgumentError", "no receiver is available"))
+                } else {
+                    dispatch(&args[0], &sym, &args[1..], None)
+                }
+            }
+            "to_proc" => Ok(recv.clone()),
+            _ => Err(format!("undefined method '{name}' for Proc")),
+        };
+    }
     match name {
         "call" | "()" | "[]" | "yield" => call_proc(recv, args),
         _ => Err(format!("undefined method '{name}' for Proc")),

@@ -123,6 +123,9 @@ pub enum RObj {
         template: usize,
         scope: Scope,
     },
+    /// A native proc produced by `Symbol#to_proc` (`&:upcase`): calling it sends
+    /// the named method to its first argument (`:upcase.to_proc.call(s)` == `s.upcase`).
+    SymProc(String),
     /// A user-defined object: its class name and its instance variables.
     Object {
         class: String,
@@ -407,6 +410,17 @@ impl RubyHost {
     pub fn new_symbol(&mut self, name: &str) -> Value {
         self.intern(name)
     }
+    /// Allocate the native proc backing `Symbol#to_proc`.
+    pub fn new_sym_proc(&mut self, sym: &str) -> Value {
+        self.alloc(RObj::SymProc(sym.to_string()))
+    }
+    /// The method name a `Symbol#to_proc` proc dispatches (`None` for a normal proc).
+    pub fn as_sym_proc(&self, v: &Value) -> Option<String> {
+        match self.obj(v) {
+            Some(RObj::SymProc(s)) => Some(s.clone()),
+            _ => None,
+        }
+    }
 
     // ---- public accessors used by builtins (fine-grained borrows) ---------
 
@@ -459,7 +473,7 @@ impl RubyHost {
         }
     }
     pub fn is_proc(&self, v: &Value) -> bool {
-        matches!(self.obj(v), Some(RObj::Proc { .. }))
+        matches!(self.obj(v), Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)))
     }
     pub fn has_method(&self, name: &str) -> bool {
         self.methods.contains_key(name)
@@ -939,7 +953,7 @@ impl RubyHost {
                 }
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash(map)) => self.inspect_hash(&map),
-                Some(RObj::Proc { .. }) => "#<Proc>".to_string(),
+                Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) => "#<Proc>".to_string(),
                 Some(RObj::Regexp { source, .. }) => format!("(?-mix:{source})"),
                 // MatchData#to_s is the whole matched substring (group 0).
                 Some(RObj::MatchData { groups, .. }) => {
@@ -1034,7 +1048,7 @@ impl RubyHost {
                 Some(RObj::Hash(_)) => "Hash",
                 Some(RObj::Symbol(_)) => "Symbol",
                 Some(RObj::Range { .. }) => "Range",
-                Some(RObj::Proc { .. }) => "Proc",
+                Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) => "Proc",
                 Some(RObj::Regexp { .. }) => "Regexp",
                 Some(RObj::MatchData { .. }) => "MatchData",
                 Some(RObj::ClassRef(_)) => "Class",

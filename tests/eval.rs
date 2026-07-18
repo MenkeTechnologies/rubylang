@@ -667,6 +667,32 @@ fn array_combine_batch() {
 }
 
 #[test]
+fn symbol_methods_batch() {
+    eq(":hello.to_s", "\"hello\"");
+    eq(":hello.id2name", "\"hello\"");
+    eq(":hello.to_sym", ":hello");
+    eq(":hello.upcase", ":HELLO");
+    eq(":HELLO.downcase", ":hello");
+    eq(":hello.capitalize", ":Hello");
+    eq(":hello.length", "5");
+    eq(":hello.size", "5");
+    eq(":hello.empty?", "false");
+    eq(":abc[1]", "\"b\"");
+    eq(":abc[-1]", "\"c\"");
+    eq(":hello[1, 3]", "\"ell\"");
+    eq(":hello.succ", ":hellp");
+    eq(":az.succ", ":ba");
+    eq(":hello.start_with?(\"he\")", "true");
+    eq(":hello.start_with?(\"xy\")", "false");
+    eq("(:a <=> :b)", "-1");
+    eq("(:b <=> :a)", "1");
+    eq("(:a <=> :a)", "0");
+    eq("(:a <=> 5)", "nil");
+    // `Symbol#to_proc` (`&:upcase`) sends the method to its argument.
+    eq(":upcase.to_proc.call(\"x\")", "\"X\"");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
