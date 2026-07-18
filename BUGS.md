@@ -94,6 +94,12 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   allocates a `BigInt` heap object (backed by `num-bigint`). Arithmetic, bit
   ops, `**`, comparison, `to_s(base)`, `bit_length`, and `digits` all cross the
   boundary transparently.
+- **Numeric conversions.** `Integer#to_r` / `Float#to_r` (the *exact* rational
+  an f64 represents), `String#to_r` (leading `a/b` or decimal), `#to_c`
+  (`(n+0i)`), and `Float#rationalize([eps])` (simplest rational within a
+  tolerance) are supported, backed by `num-rational`. `nil.to_a`/`to_h` return
+  the empty collection. `Array#sum` (and `reduce(:+)`) stay exact for Rational,
+  BigInt, String, and Array elements.
 - **`Time` is UTC-only.** `Time.at`, `Time.utc`/`Time.gm`, and `Time.now`
   construct times; the field readers (`year`/`month`/`day`/`hour`/`min`/`sec`/
   `wday`/`yday`), `to_i`/`to_f`, `to_s`/`inspect`, `strftime` (common directives

@@ -918,3 +918,19 @@ seen = {}
 seen.default = "unseen"
 puts seen[:missing]
 puts inventory.inject(:apples => 0) { |acc, (k, v)| acc }.inspect
+#==#
+puts 0.5.to_r.inspect
+puts 0.1.to_r.inspect
+puts 3.to_r.inspect
+puts "22/7".to_r.inspect
+puts "3.14159".to_r.inspect
+puts 3.14159.rationalize(0.001).inspect
+puts 0.3.rationalize.inspect
+puts 42.to_c.inspect
+puts (0.25.to_r + 0.5.to_r).inspect
+puts ("1/6".to_r + "1/3".to_r).inspect
+puts nil.to_a.inspect
+prices = [1.5, 2.25, 0.75]
+exact = prices.map(&:to_r)
+puts exact.inspect
+puts exact.sum.inspect

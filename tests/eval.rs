@@ -2358,6 +2358,35 @@ fn time_utc() {
 }
 
 #[test]
+fn numeric_rational_conversions() {
+    // Integer#to_r is n/1; Float#to_r is the exact rational the f64 represents.
+    eq("3.to_r", "(3/1)");
+    eq("(-4).to_r", "(-4/1)");
+    eq("0.5.to_r", "(1/2)");
+    eq("0.75.to_r", "(3/4)");
+    eq("0.1.to_r", "(3602879701896397/36028797018963968)");
+    eq("(-1.5).to_r", "(-3/2)");
+    // String#to_r parses a leading rational/decimal.
+    eq("\"3/4\".to_r", "(3/4)");
+    eq("\"3.14\".to_r", "(157/50)");
+    eq("\"-5/10\".to_r", "(-1/2)");
+    eq("\"abc\".to_r", "(0/1)");
+    // rationalize finds the simplest rational within a tolerance.
+    eq("3.14.rationalize(0.01)", "(22/7)");
+    eq("0.3.rationalize", "(3/10)");
+    eq("0.1.rationalize", "(1/10)");
+    // to_c wraps a real number as a Complex.
+    eq("10.to_c", "(10+0i)");
+    eq("3.5.to_c", "(3.5+0i)");
+    // nil conversions.
+    eq("nil.to_a", "[]");
+    eq("nil.to_h", "{}");
+    // Round-trips through arithmetic.
+    eq("0.5.to_r + 0.25.to_r", "(3/4)");
+    eq("\"1/3\".to_r * 3", "(1/1)");
+}
+
+#[test]
 fn hash_enumerable_and_default() {
     // Hash#reduce/inject iterate the `[k, v]` pairs.
     eq("{a: 1, b: 2, c: 3}.reduce(0) { |s, (k, v)| s + v }", "6");

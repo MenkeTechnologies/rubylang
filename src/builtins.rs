@@ -841,6 +841,9 @@ fn dispatch_bool(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
         "^" => Ok(Value::Bool(this != arg())),
         "!" => Ok(Value::Bool(!this)),
         "to_s" | "inspect" => Ok(new_str(with_host(|h| h.to_s(recv)))),
+        // `nil.to_a` is `[]`; `nil.to_h` is `{}` — the empty-conversion methods.
+        "to_a" if matches!(recv, Value::Undef) => Ok(new_arr(vec![])),
+        "to_h" if matches!(recv, Value::Undef) => Ok(with_host(|h| h.new_hash(IndexMap::new()))),
         _ => Err(no_method_error(recv, name)),
     }
 }
@@ -1392,6 +1395,94 @@ fn as_f(v: &Value) -> f64 {
     }
 }
 
+/// The default tolerance for `Float#rationalize` with no argument: half the gap
+/// to the adjacent representable f64, so the result is the simplest rational
+/// that still rounds back to `f`.
+fn default_rationalize_eps(f: f64) -> f64 {
+    if f == 0.0 || !f.is_finite() {
+        return 0.0;
+    }
+    let next = f64::from_bits(f.to_bits() + 1);
+    (next - f).abs() * 0.5
+}
+
+/// The simplest rational within `eps` of `f` (the fraction with the smallest
+/// denominator in `[f - eps, f + eps]`), via the continued-fraction / mediant
+/// search Ruby uses for `rationalize`.
+fn simplest_rational_within(f: f64, eps: f64) -> num_rational::BigRational {
+    use num_bigint::BigInt;
+    let rat = |n: i128, d: i128| num_rational::BigRational::new(BigInt::from(n), BigInt::from(d));
+    if eps == 0.0 || !f.is_finite() {
+        return num_rational::BigRational::from_float(f).unwrap_or_else(|| rat(0, 1));
+    }
+    if f < 0.0 {
+        return -simplest_rational_within(-f, eps);
+    }
+    // Simplest fraction in the closed interval [lo, hi], with 0 <= lo <= hi.
+    fn simplest(lo: f64, hi: f64) -> (i128, i128) {
+        let fl = lo.floor();
+        if fl >= lo {
+            // `lo` is an integer — it is the simplest value in the interval.
+            return (fl as i128, 1);
+        }
+        if fl < hi.floor() || hi.floor() >= hi {
+            // An integer (fl + 1) lies within (lo, hi].
+            return (fl as i128 + 1, 1);
+        }
+        // Recurse on the reciprocal of the fractional interval.
+        let (n, d) = simplest(1.0 / (hi - fl), 1.0 / (lo - fl));
+        (fl as i128 * n + d, n)
+    }
+    let (n, d) = simplest(f - eps, f + eps);
+    rat(n, d)
+}
+
+/// Parse the leading rational of a string for `String#to_r`: `"3/4"` → `3/4`,
+/// `"3.14"` → `157/50` (exact decimal), leading non-numeric text → `0/1`.
+fn string_to_rational(s: &str) -> num_rational::BigRational {
+    use num_bigint::BigInt;
+    let zero = || num_rational::BigRational::from(BigInt::from(0));
+    let s = s.trim_start();
+    // `numerator/denominator` form.
+    if let Some((n, d)) = s.split_once('/') {
+        if let (Ok(n), Ok(d)) = (n.trim().parse::<BigInt>(), d.trim().parse::<BigInt>()) {
+            if d != BigInt::from(0) {
+                return num_rational::BigRational::new(n, d);
+            }
+        }
+    }
+    // Leading `[-]digits[.digits]` decimal.
+    let mut end = 0;
+    let bytes = s.as_bytes();
+    if end < bytes.len() && (bytes[end] == b'-' || bytes[end] == b'+') {
+        end += 1;
+    }
+    let int_start = end;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    let mut frac_digits = 0usize;
+    if end < bytes.len() && bytes[end] == b'.' {
+        let dot = end;
+        end += 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        frac_digits = end - dot - 1;
+    }
+    if end == int_start && frac_digits == 0 {
+        return zero();
+    }
+    let digits: String = s[..end].chars().filter(|c| *c != '.').collect();
+    match digits.parse::<BigInt>() {
+        Ok(num) => {
+            let den = BigInt::from(10).pow(frac_digits as u32);
+            num_rational::BigRational::new(num, den)
+        }
+        Err(_) => zero(),
+    }
+}
+
 /// Current wall-clock time as seconds since the Unix epoch, for `Time.now`.
 fn now_epoch_secs() -> f64 {
     std::time::SystemTime::now()
@@ -1692,6 +1783,42 @@ fn dispatch_number(
         }
         "to_i" | "to_int" | "floor" if name != "floor" => Ok(Value::Int(as_i(recv))),
         "to_f" => Ok(Value::Float(as_f(recv))),
+        // `Integer#to_r` is `n/1`; `Float#to_r` is the *exact* rational the f64
+        // represents (`0.5` → `1/2`, `0.1` → `3602879701896397/36028797018963968`).
+        "to_r" => match recv {
+            Value::Int(n) => Ok(with_host(|h| {
+                h.new_rational(num_rational::BigRational::from(num_bigint::BigInt::from(
+                    *n,
+                )))
+            })),
+            Value::Float(f) => match num_rational::BigRational::from_float(*f) {
+                Some(r) => Ok(with_host(|h| h.new_rational(r))),
+                None => Err(raise_exc(
+                    "FloatDomainError",
+                    if f.is_nan() {
+                        "NaN"
+                    } else if *f > 0.0 {
+                        "Infinity"
+                    } else {
+                        "-Infinity"
+                    },
+                )),
+            },
+            _ => Ok(recv.clone()),
+        },
+        // `rationalize([eps])` finds the simplest rational within `eps` of the
+        // value (default: the tightest interval that still round-trips the f64).
+        "rationalize" => {
+            let f = as_f(recv);
+            let eps = match args.first() {
+                Some(v) => as_f(v).abs(),
+                None => default_rationalize_eps(f),
+            };
+            let r = simplest_rational_within(f, eps);
+            Ok(with_host(|h| h.new_rational(r)))
+        }
+        // `Numeric#to_c` is `(n+0i)`.
+        "to_c" => Ok(with_host(|h| h.new_complex(recv.clone(), Value::Int(0)))),
         "coerce" => match (recv, &args[0]) {
             // Integer#coerce keeps both as Integer when the other is an Integer,
             // otherwise both become Float (matching Numeric#coerce).
@@ -2272,6 +2399,9 @@ fn dispatch_string(
             Ok(Value::Int(scan_int(&s, base).map(|(v, _)| v).unwrap_or(0)))
         }
         "to_f" => Ok(Value::Float(parse_leading_float(&s))),
+        // `String#to_r` parses a leading rational: `"3/4"` → `3/4`, `"3.14"` →
+        // `157/50` (exact decimal), other leading text → `0/1`.
+        "to_r" => Ok(with_host(|h| h.new_rational(string_to_rational(&s)))),
         "to_s" | "to_str" => Ok(recv.clone()),
         "to_sym" => Ok(with_host(|h| h.new_symbol(&s))),
         "include?" => Ok(Value::Bool(s.contains(&arg_str(&args[0])))),
@@ -7512,7 +7642,13 @@ fn norm_idx(i: i64, len: usize) -> Option<usize> {
 fn add_values(a: &Value, b: &Value) -> Value {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Value::Int(x + y),
-        _ => Value::Float(as_f(a) + as_f(b)),
+        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
+            Value::Float(as_f(a) + as_f(b))
+        }
+        // Object operands (Rational, BigInt, String, Array, …) add through host
+        // dispatch so `sum`/`reduce(:+)` stay exact and type-correct.
+        _ => with_host(|h| h.num_op(fusevm::NumOp::Add, a, b))
+            .unwrap_or_else(|_| Value::Float(as_f(a) + as_f(b))),
     }
 }
 
