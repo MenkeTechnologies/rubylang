@@ -559,3 +559,14 @@ puts(<<~A + <<~B)
 A
   second
 B
+#==#
+half = Rational(1, 2)
+third = Rational(1, 3)
+puts (half + third).inspect
+puts (half * 6).inspect
+puts Rational(10, 4).inspect
+puts Rational(22, 7).to_f.round(4)
+total = [Rational(1, 2), Rational(1, 3), Rational(1, 6)].reduce(:+)
+puts total.inspect
+puts (3/4r).inspect
+puts Rational(7, 2).to_i

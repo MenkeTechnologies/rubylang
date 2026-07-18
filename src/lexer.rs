@@ -285,11 +285,38 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     });
                 } else {
                     let n: i64 = raw.parse().map_err(|_| format!("bad integer: {raw}"))?;
-                    out.push(Token {
-                        kind: Tok::Int(n),
-                        line,
-                        space: core::mem::take(&mut sp),
-                    });
+                    // A trailing `r` (not part of an identifier) makes a Rational
+                    // literal: `4r` desugars to `Rational(4)`.
+                    let rational = b.get(i) == Some(&b'r')
+                        && !b
+                            .get(i + 1)
+                            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_');
+                    let this_sp = core::mem::take(&mut sp);
+                    if rational {
+                        i += 1;
+                        for kind in [
+                            Tok::Ident("Rational".into()),
+                            Tok::Op("(".into()),
+                            Tok::Int(n),
+                            Tok::Op(")".into()),
+                        ] {
+                            out.push(Token {
+                                kind,
+                                line,
+                                space: false,
+                            });
+                        }
+                        // The `Rational` identifier carries the number's spacing.
+                        if let Some(first) = out.iter_mut().rev().nth(3) {
+                            first.space = this_sp;
+                        }
+                    } else {
+                        out.push(Token {
+                            kind: Tok::Int(n),
+                            line,
+                            space: this_sp,
+                        });
+                    }
                 }
             }
             b'"' | b'\'' => {

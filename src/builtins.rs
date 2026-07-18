@@ -640,6 +640,7 @@ pub(crate) fn dispatch(
         "Regexp" => dispatch_regexp(recv, name, args),
         "MatchData" => dispatch_matchdata(recv, name, args),
         "Set" => dispatch_set(recv, name, args, block),
+        "Rational" => dispatch_rational(recv, name, args),
         "TrueClass" | "FalseClass" | "NilClass" => dispatch_bool(recv, name, args),
         _ => Err(raise_exc(
             "NoMethodError",
@@ -1288,6 +1289,19 @@ fn dispatch_number(
         "/" => match (recv, &args[0]) {
             (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(floor_div(*a, *b))),
+            // `Integer / Rational` stays exact (`3 / 4r == (3/4)`).
+            _ if with_host(|h| h.as_rational(&args[0])).is_some()
+                && matches!(recv, Value::Int(_)) =>
+            {
+                let x = with_host(|h| h.as_rational(recv)).unwrap();
+                let y = with_host(|h| h.as_rational(&args[0])).unwrap();
+                use num_traits::Zero as _;
+                if y.is_zero() {
+                    Err(raise_exc("ZeroDivisionError", "divided by 0"))
+                } else {
+                    Ok(with_host(|h| h.new_rational(x / y)))
+                }
+            }
             _ => Ok(Value::Float(as_f(recv) / as_f(&args[0]))),
         },
         "%" | "modulo" => match (recv, &args[0]) {
@@ -4106,6 +4120,81 @@ fn arr_index(arr: &[Value], args: &[Value]) -> Value {
 
 // ---- Hash -----------------------------------------------------------------
 
+/// `Rational` methods. Arithmetic (`+`/`-`/`*`) arrives via the numeric hook;
+/// this handles `/`, `**`, queries, and conversions.
+fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    use num_traits::{Signed as _, ToPrimitive as _, Zero as _};
+    let r = with_host(|h| h.as_rational(recv)).unwrap();
+    let rat = |v: num_rational::BigRational| with_host(|h| h.new_rational(v));
+    match name {
+        "numerator" => Ok(with_host(|h| h.new_bigint(r.numer().clone()))),
+        "denominator" => Ok(with_host(|h| h.new_bigint(r.denom().clone()))),
+        "to_f" => Ok(Value::Float(r.to_f64().unwrap_or(f64::NAN))),
+        "to_i" | "to_int" | "truncate" => Ok(with_host(|h| h.new_bigint(r.to_integer()))),
+        "to_r" => Ok(recv.clone()),
+        "abs" | "magnitude" => Ok(rat(r.abs())),
+        "-@" => Ok(rat(-r)),
+        "+@" => Ok(recv.clone()),
+        "zero?" => Ok(Value::Bool(r.is_zero())),
+        "positive?" => Ok(Value::Bool(r.is_positive())),
+        "negative?" => Ok(Value::Bool(r.is_negative())),
+        "/" | "quo" => match with_host(|h| h.as_rational(&args[0])) {
+            Some(d) if !d.is_zero() => Ok(rat(r / d)),
+            Some(_) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
+            None => Ok(Value::Float(
+                r.to_f64().unwrap_or(f64::NAN) / as_f(&args[0]),
+            )),
+        },
+        "**" | "pow" => {
+            if let Some(exp) = int_arg(&args[0]) {
+                let p = if exp >= 0 {
+                    num_traits::pow::pow(r, exp as usize)
+                } else {
+                    num_traits::pow::pow(r.recip(), (-exp) as usize)
+                };
+                Ok(rat(p))
+            } else {
+                Ok(Value::Float(
+                    r.to_f64().unwrap_or(f64::NAN).powf(as_f(&args[0])),
+                ))
+            }
+        }
+        "<=>" => match with_host(|h| h.as_rational(&args[0])) {
+            Some(o) => Ok(Value::Int(match r.cmp(&o) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            })),
+            None => Ok(Value::Undef),
+        },
+        "coerce" => Ok(new_arr(vec![
+            with_host(|h| h.new_rational(h.as_rational(&args[0]).unwrap_or_else(|| r.clone()))),
+            recv.clone(),
+        ])),
+        "hash" => Ok(Value::Int(r.to_i64().unwrap_or(0))),
+        "integer?" => Ok(Value::Bool(r.is_integer())),
+        // The arithmetic/comparison operators reach here when invoked as methods
+        // (`r.+(x)`, e.g. `reduce(:+)`); delegate to the numeric hook.
+        "+" | "-" | "*" | "==" | "<" | ">" | "<=" | ">=" => {
+            let op = match name {
+                "+" => fusevm::NumOp::Add,
+                "-" => fusevm::NumOp::Sub,
+                "*" => fusevm::NumOp::Mul,
+                "==" => fusevm::NumOp::Eq,
+                "<" => fusevm::NumOp::Lt,
+                ">" => fusevm::NumOp::Gt,
+                "<=" => fusevm::NumOp::Le,
+                _ => fusevm::NumOp::Ge,
+            };
+            with_host(|h| h.num_op(op, recv, &args[0]))
+        }
+        _ => Err(raise_exc(
+            "NoMethodError",
+            &format!("undefined method '{name}' for a Rational"),
+        )),
+    }
+}
+
 /// `Set` methods. Membership/mutation go through the host `RObj::Set`; set
 /// algebra (`|`, `&`, `-`, subset queries) builds fresh sets. Enumerable methods
 /// fall through to the Array implementation over the element list.
@@ -5289,6 +5378,21 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
                 )),
             },
         },
+        "Rational" => {
+            let num = with_host(|h| h.as_bigint(&args[0]))
+                .ok_or_else(|| raise_exc("TypeError", "can't convert to Rational"))?;
+            let den = match args.get(1) {
+                Some(d) => with_host(|h| h.as_bigint(d))
+                    .ok_or_else(|| raise_exc("TypeError", "can't convert to Rational"))?,
+                None => num_bigint::BigInt::from(1),
+            };
+            use num_traits::Zero as _;
+            if den.is_zero() {
+                return Err(raise_exc("ZeroDivisionError", "divided by 0"));
+            }
+            let r = num_rational::BigRational::new(num, den);
+            Ok(with_host(|h| h.new_rational(r)))
+        }
         "String" => Ok(with_host(|h| {
             let s = h.to_s(&args[0]);
             h.new_string(s)

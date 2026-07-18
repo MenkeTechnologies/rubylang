@@ -2021,6 +2021,27 @@ fn heredocs() {
 }
 
 #[test]
+fn rational_numbers() {
+    eq("Rational(1, 2)", "(1/2)");
+    eq("Rational(6, 4)", "(3/2)"); // reduced to lowest terms
+    eq("Rational(3, 4) + Rational(1, 4)", "(1/1)");
+    eq("Rational(1, 2) + Rational(1, 3)", "(5/6)");
+    eq("Rational(1, 2) * 4", "(2/1)");
+    eq("Rational(1, 2) ** 3", "(1/8)");
+    eq("Rational(1, 2) < Rational(2, 3)", "true");
+    eq("Rational(2, 4) == Rational(1, 2)", "true");
+    eq("Rational(1, 2).to_f", "0.5");
+    eq("Rational(1, 2).numerator", "1");
+    eq("Rational(1, 2).denominator", "2");
+    eq("Rational(3, 2).to_i", "1");
+    eq("Rational(-3, 4).abs", "(3/4)");
+    // Literal `Nr` suffix; a Float operand demotes the result to Float.
+    eq("1r + 2r", "(3/1)");
+    eq("3 / 4r", "(3/4)");
+    eq("Rational(1, 2) + 0.5", "1.0");
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).

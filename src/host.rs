@@ -133,6 +133,8 @@ pub enum RObj {
     /// An integer that outgrew `i64` (Ruby auto-promotes; `Integer` has no
     /// fixed width). Kept normalized: never holds a value that fits in `i64`.
     BigInt(num_bigint::BigInt),
+    /// An exact rational number, always stored in lowest terms.
+    Rational(num_rational::BigRational),
     Range {
         lo: i64,
         hi: i64,
@@ -561,6 +563,19 @@ impl RubyHost {
         match self.obj(v) {
             Some(RObj::BigInt(b)) => Some(b.clone()),
             _ => None,
+        }
+    }
+    /// Wrap a rational as a Ruby value (always kept in lowest terms by
+    /// `num-rational`; an integer-valued rational stays a `Rational`, matching
+    /// Ruby — `Rational(4, 2)` is `(2/1)`, not `2`).
+    pub fn new_rational(&mut self, r: num_rational::BigRational) -> Value {
+        self.alloc(RObj::Rational(r))
+    }
+    /// View an integer or rational as a `BigRational`.
+    pub fn as_rational(&self, v: &Value) -> Option<num_rational::BigRational> {
+        match self.obj(v) {
+            Some(RObj::Rational(r)) => Some(r.clone()),
+            _ => self.as_bigint(v).map(num_rational::BigRational::from),
         }
     }
     /// View any Integer (`i64` immediate or promoted `BigInt`) as a `BigInt`.
@@ -1376,6 +1391,7 @@ impl RubyHost {
                 Some(RObj::Str(s)) => s,
                 Some(RObj::Symbol(s)) => s,
                 Some(RObj::BigInt(b)) => b.to_string(),
+                Some(RObj::Rational(r)) => format!("{}/{}", r.numer(), r.denom()),
                 Some(RObj::Set(map)) => {
                     let items: Vec<Value> = map.values().cloned().collect();
                     let inner: Vec<String> = items.iter().map(|v| self.inspect(v)).collect();
@@ -1433,6 +1449,7 @@ impl RubyHost {
                 Some(RObj::Str(s)) => format!("{s:?}"),
                 Some(RObj::Symbol(s)) => format!(":{s}"),
                 Some(RObj::BigInt(b)) => b.to_string(),
+                Some(RObj::Rational(r)) => format!("({}/{})", r.numer(), r.denom()),
                 Some(RObj::Set(map)) => {
                     let inner: Vec<String> = map.values().map(|v| self.inspect(v)).collect();
                     format!("Set[{}]", inner.join(", "))
@@ -1504,6 +1521,7 @@ impl RubyHost {
             Value::Obj(_) => match self.obj(v) {
                 Some(RObj::Str(_)) => "String",
                 Some(RObj::BigInt(_)) => "Integer",
+                Some(RObj::Rational(_)) => "Rational",
                 Some(RObj::Set(_)) => "Set",
                 Some(RObj::Array(_)) => "Array",
                 Some(RObj::Hash { .. }) => "Hash",
@@ -1584,6 +1602,54 @@ impl RubyHost {
                 Le => return Ok(Value::Bool(x <= y)),
                 Ge => return Ok(Value::Bool(x >= y)),
                 _ => {}
+            }
+        }
+        // Rational arithmetic (an integer operand is promoted to a rational). A
+        // Float operand instead demotes the rational to Float, matching Ruby.
+        if matches!(self.obj(a), Some(RObj::Rational(_)))
+            || matches!(self.obj(b), Some(RObj::Rational(_)))
+        {
+            if matches!(a, Value::Float(_)) || matches!(b, Value::Float(_)) {
+                use num_traits::ToPrimitive as _;
+                let to_f = |this: &Self, v: &Value| -> f64 {
+                    match v {
+                        Value::Float(f) => *f,
+                        Value::Int(n) => *n as f64,
+                        _ => this.as_rational(v).and_then(|r| r.to_f64()).unwrap_or(0.0),
+                    }
+                };
+                let (af, bf) = (to_f(self, a), to_f(self, b));
+                return Ok(match op {
+                    Add => Value::Float(af + bf),
+                    Sub => Value::Float(af - bf),
+                    Mul => Value::Float(af * bf),
+                    Div => Value::Float(af / bf),
+                    Lt => Value::Bool(af < bf),
+                    Gt => Value::Bool(af > bf),
+                    Le => Value::Bool(af <= bf),
+                    Ge => Value::Bool(af >= bf),
+                    _ => Value::Float(af),
+                });
+            }
+            if let (Some(x), Some(y)) = (self.as_rational(a), self.as_rational(b)) {
+                use num_traits::Zero as _;
+                let r = match op {
+                    Add => Some(x.clone() + &y),
+                    Sub => Some(x.clone() - &y),
+                    Mul => Some(x.clone() * &y),
+                    Div if !y.is_zero() => Some(x.clone() / &y),
+                    _ => None,
+                };
+                if let Some(v) = r {
+                    return Ok(self.new_rational(v));
+                }
+                match op {
+                    Lt => return Ok(Value::Bool(x < y)),
+                    Gt => return Ok(Value::Bool(x > y)),
+                    Le => return Ok(Value::Bool(x <= y)),
+                    Ge => return Ok(Value::Bool(x >= y)),
+                    _ => {}
+                }
             }
         }
         // String and Array operators.
@@ -1667,6 +1733,15 @@ impl RubyHost {
                 || matches!(self.obj(b), Some(RObj::BigInt(_))) =>
             {
                 match (self.as_bigint(a), self.as_bigint(b)) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => false,
+                }
+            }
+            // Rational equality (also equal to an integer of the same value).
+            _ if matches!(self.obj(a), Some(RObj::Rational(_)))
+                || matches!(self.obj(b), Some(RObj::Rational(_))) =>
+            {
+                match (self.as_rational(a), self.as_rational(b)) {
                     (Some(x), Some(y)) => x == y,
                     _ => false,
                 }
