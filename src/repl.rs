@@ -40,10 +40,47 @@ const RUBY_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Ruby reserved words (mirrors `lexer::KEYWORDS`, kept local so the REPL does
 /// not depend on the lexer's private const).
 const KEYWORDS: &[&str] = &[
-    "def", "end", "if", "elsif", "else", "unless", "while", "until", "for", "in", "do", "return",
-    "break", "next", "yield", "then", "case", "when", "nil", "true", "false", "and", "or", "not",
-    "class", "module", "begin", "rescue", "ensure", "self", "super", "puts", "print", "p", "raise",
-    "require", "attr_accessor", "attr_reader", "attr_writer", "lambda", "proc",
+    "def",
+    "end",
+    "if",
+    "elsif",
+    "else",
+    "unless",
+    "while",
+    "until",
+    "for",
+    "in",
+    "do",
+    "return",
+    "break",
+    "next",
+    "yield",
+    "then",
+    "case",
+    "when",
+    "nil",
+    "true",
+    "false",
+    "and",
+    "or",
+    "not",
+    "class",
+    "module",
+    "begin",
+    "rescue",
+    "ensure",
+    "self",
+    "super",
+    "puts",
+    "print",
+    "p",
+    "raise",
+    "require",
+    "attr_accessor",
+    "attr_reader",
+    "attr_writer",
+    "lambda",
+    "proc",
 ];
 
 fn rubylang_dir() -> std::path::PathBuf {
@@ -150,8 +187,16 @@ fn install_menu_bindings(keybindings: &mut Keybindings) {
             ReedlineEvent::MenuNext,
         ]),
     );
-    keybindings.add_binding(KeyModifiers::SHIFT, KeyCode::BackTab, ReedlineEvent::MenuPrevious);
-    keybindings.add_binding(KeyModifiers::NONE, KeyCode::BackTab, ReedlineEvent::MenuPrevious);
+    keybindings.add_binding(
+        KeyModifiers::SHIFT,
+        KeyCode::BackTab,
+        ReedlineEvent::MenuPrevious,
+    );
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::BackTab,
+        ReedlineEvent::MenuPrevious,
+    );
 }
 
 fn build_static_completions() -> Vec<String> {
@@ -202,15 +247,28 @@ fn method_context(line: &str, pos: usize) -> Option<usize> {
         .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || *c == '?' || *c == '!'))
         .map(|(i, c)| i + c.len_utf8())
         .unwrap_or(0);
-    // A `.` immediately precedes the name, and something (an ident/`)`/`]`)
-    // precedes that dot — otherwise a leading `.` is a float / range, not a call.
+    // A `.` immediately precedes the name, and a receiver precedes that dot.
     let pre = line.get(..name_start)?;
-    let pre = pre.strip_suffix('.')?;
-    let recv = pre.chars().next_back()?;
-    if recv.is_alphanumeric() || recv == '_' || recv == ')' || recv == ']' || recv == '"' {
-        Some(name_start)
-    } else {
+    let recv_str = pre.strip_suffix('.')?;
+    // A `.` after `)` / `]` / `"` is a method call on an expression result.
+    let last = recv_str.chars().next_back()?;
+    if last == ')' || last == ']' || last == '"' {
+        return Some(name_start);
+    }
+    // Otherwise the receiver is a bare token: the run of ident chars before the
+    // dot. It is a method call unless that token is a pure numeric literal —
+    // `3.14` is a Float, not `3` dot-`14`.
+    let recv_start = recv_str
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_alphanumeric() || *c == '_'))
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let recv_tok = recv_str.get(recv_start..).unwrap_or("");
+    if recv_tok.is_empty() || recv_tok.bytes().all(|b| b.is_ascii_digit()) {
         None
+    } else {
+        Some(name_start)
     }
 }
 
@@ -263,7 +321,11 @@ impl Completer for RubyCompleter {
             Ok(g) => g,
             Err(_) => return Vec::new(),
         };
-        Self::suggestions_from(self.static_words.iter().chain(dyn_list.iter()), prefix, span)
+        Self::suggestions_from(
+            self.static_words.iter().chain(dyn_list.iter()),
+            prefix,
+            span,
+        )
     }
 }
 
@@ -353,7 +415,11 @@ impl Prompt for RubyPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
         let count = self.cmd_count.lock().map(|g| *g).unwrap_or(0);
         let bar = render_status_bar(count);
-        let prompt = Style::new().fg(NuColor::Cyan).bold().paint("ruby").to_string();
+        let prompt = Style::new()
+            .fg(NuColor::Cyan)
+            .bold()
+            .paint("ruby")
+            .to_string();
         Cow::Owned(format!("{}\n{}", bar, prompt))
     }
 
@@ -362,11 +428,22 @@ impl Prompt for RubyPrompt {
     }
 
     fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
-        Cow::Owned(Style::new().fg(NuColor::LightCyan).bold().paint("❯ ").to_string())
+        Cow::Owned(
+            Style::new()
+                .fg(NuColor::LightCyan)
+                .bold()
+                .paint("❯ ")
+                .to_string(),
+        )
     }
 
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
-        Cow::Owned(Style::new().fg(NuColor::DarkGray).paint("····❯ ").to_string())
+        Cow::Owned(
+            Style::new()
+                .fg(NuColor::DarkGray)
+                .paint("····❯ ")
+                .to_string(),
+        )
     }
 
     fn render_prompt_history_search_indicator(
@@ -377,7 +454,10 @@ impl Prompt for RubyPrompt {
             PromptHistorySearchStatus::Passing => "",
             PromptHistorySearchStatus::Failing => "failing ",
         };
-        Cow::Owned(format!("({}reverse-search: {}) ", prefix, history_search.term))
+        Cow::Owned(format!(
+            "({}reverse-search: {}) ",
+            prefix, history_search.term
+        ))
     }
 }
 
@@ -393,7 +473,10 @@ pub fn run() {
 
     let static_words = build_static_completions();
     let method_words: Vec<String> = {
-        let mut v: Vec<String> = lsp::corpus().iter().map(|(n, _)| (*n).to_string()).collect();
+        let mut v: Vec<String> = lsp::corpus()
+            .iter()
+            .map(|(n, _)| (*n).to_string())
+            .collect();
         v.sort();
         v.dedup();
         v
@@ -504,7 +587,11 @@ fn eval_line(line: &str) {
     match host::run_main(main) {
         Ok(v) => {
             let s = host::with_host(|h| h.inspect(&v));
-            println!("{} {}", NuColor::DarkGray.paint("=>"), NuColor::Green.paint(s));
+            println!(
+                "{} {}",
+                NuColor::DarkGray.paint("=>"),
+                NuColor::Green.paint(s)
+            );
         }
         Err(e) => eprintln!("{}", NuColor::Red.paint(format!("ruby: {e}"))),
     }
