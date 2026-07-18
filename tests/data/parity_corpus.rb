@@ -476,3 +476,14 @@ puts [1, 2, 3].reduce(100, &:+)
 total = ->(*nums) { nums.sum }
 puts total.call(10, 20, 30)
 puts [[1, 2], [3, 4]].map { |first, *rest| "#{first}|#{rest.inspect}" }.inspect
+#==#
+puts "2024-01-15".split("-", 2).inspect
+puts "key=value=extra".split("=", 2).inspect
+puts "a1b2c3".split(/(\d)/).inspect
+puts "one two  three".split(" ").inspect
+puts "trailing,,,".split(",").inspect
+s = "hello world"
+removed = s.slice!(0, 5)
+puts removed
+puts s
+puts "café".eql?("café")

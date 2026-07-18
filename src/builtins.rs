@@ -1706,17 +1706,31 @@ fn dispatch_string(
             None => Ok(new_arr(vec![])),
         },
         "split" => {
-            let parts: Vec<Value> = if args.is_empty() {
-                s.split_whitespace()
-                    .map(|p| new_str(p.to_string()))
-                    .collect()
+            let limit = args.get(1).map(as_i).unwrap_or(0);
+            // Awk mode: no separator, or a single-space string. Splits on runs of
+            // whitespace, ignoring leading whitespace and (unless a limit is
+            // given) trailing empty fields.
+            let awk =
+                args.is_empty() || (str_regex(&args[0]).is_none() && arg_str(&args[0]) == " ");
+            let parts: Vec<String> = if awk {
+                if limit > 0 {
+                    // Keep at most `limit` fields; the last holds the remainder.
+                    let trimmed = s.trim_start();
+                    split_ws_limit(trimmed, limit as usize)
+                } else {
+                    s.split_whitespace().map(str::to_string).collect()
+                }
             } else if let Some(re) = str_regex(&args[0]) {
-                re.split(&s).map(|p| new_str(p.to_string())).collect()
+                regex_split(&re, &s, limit)
             } else {
                 let sep = arg_str(&args[0]);
-                s.split(&sep).map(|p| new_str(p.to_string())).collect()
+                if sep.is_empty() {
+                    s.chars().map(|c| c.to_string()).collect()
+                } else {
+                    string_split(&s, &sep, limit)
+                }
             };
-            Ok(new_arr(parts))
+            Ok(new_arr(parts.into_iter().map(new_str).collect()))
         }
         "sub" | "gsub" => {
             let all = name == "gsub";
@@ -1829,6 +1843,21 @@ fn dispatch_string(
         }
         "[]" => Ok(str_index(&s, args)),
         "slice" => Ok(str_index(&s, args)),
+        // `eql?` is content equality with no type coercion: only another String
+        // (not a Symbol) can be equal.
+        "eql?" => Ok(Value::Bool(
+            with_host(|h| h.as_str(&args[0]))
+                .map(|o| o == s)
+                .unwrap_or(false),
+        )),
+        // `slice!` removes the sliced portion in place and returns it.
+        "slice!" => match str_slice_remove(&s, args) {
+            Some((removed, rest)) => {
+                with_host(|h| h.set_str(recv, rest));
+                Ok(new_str(removed))
+            }
+            None => Ok(Value::Undef),
+        },
         "ord" => match s.chars().next() {
             Some(c) => Ok(Value::Int(c as i64)),
             None => Err(raise_exc("ArgumentError", "empty string")),
@@ -2147,6 +2176,81 @@ fn scan_regex(re: &regex::Regex, s: &str) -> Value {
     }
 }
 
+/// Awk-mode split keeping at most `limit` fields (the last holds the remainder,
+/// with its internal whitespace intact). `s` should already be left-trimmed.
+fn split_ws_limit(s: &str, limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while out.len() + 1 < limit {
+        match rest.find(char::is_whitespace) {
+            Some(i) => {
+                out.push(rest[..i].to_string());
+                rest = rest[i..].trim_start();
+            }
+            None => break,
+        }
+    }
+    if !rest.is_empty() || !out.is_empty() {
+        out.push(rest.to_string());
+    }
+    out
+}
+
+/// Split `s` on the string `sep` with Ruby's limit rules: `limit > 0` keeps at
+/// most `limit` fields (last is the remainder); `limit == 0` drops trailing empty
+/// fields; `limit < 0` keeps them all. An empty subject yields no fields.
+fn string_split(s: &str, sep: &str, limit: i64) -> Vec<String> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let mut parts: Vec<String> = if limit > 0 {
+        s.splitn(limit as usize, sep).map(str::to_string).collect()
+    } else {
+        s.split(sep).map(str::to_string).collect()
+    };
+    if limit == 0 {
+        while parts.last().is_some_and(|p| p.is_empty()) {
+            parts.pop();
+        }
+    }
+    parts
+}
+
+/// Split `s` on a regex. Capture groups in the pattern are interleaved into the
+/// result (Ruby behavior). `limit` follows the same rules as `string_split`.
+fn regex_split(re: &regex::Regex, s: &str, limit: i64) -> Vec<String> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut last = 0;
+    let ngroups = re.captures_len();
+    for caps in re.captures_iter(s) {
+        if limit > 0 && out.len() as i64 >= limit - 1 {
+            break;
+        }
+        let m = caps.get(0).unwrap();
+        // A zero-width match would loop forever; skip it.
+        if m.start() == m.end() {
+            continue;
+        }
+        out.push(s[last..m.start()].to_string());
+        for i in 1..ngroups {
+            if let Some(g) = caps.get(i) {
+                out.push(g.as_str().to_string());
+            }
+        }
+        last = m.end();
+    }
+    out.push(s[last..].to_string());
+    if limit == 0 {
+        while out.last().is_some_and(|p| p.is_empty()) {
+            out.pop();
+        }
+    }
+    out
+}
+
 /// `String#scan(re) { ... }`: yield each match (setting `$~`), passing the whole
 /// match for an ungrouped pattern or the capture-group array for a grouped one.
 fn scan_each(re: &regex::Regex, s: &str, bl: &Value) -> Result<(), String> {
@@ -2372,6 +2476,63 @@ fn pad(s: &str, width: usize, p: String, left: bool) -> String {
         format!("{s}{fill}")
     } else {
         format!("{fill}{s}")
+    }
+}
+
+/// For `String#slice!`: the removed substring and what remains after removing
+/// it. Handles the index/(index,len)/range/string/regex argument forms, mirroring
+/// `str_index`. Returns `None` when nothing matches.
+fn str_slice_remove(s: &str, args: &[Value]) -> Option<(String, String)> {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let cut = |start: usize, end: usize| -> (String, String) {
+        let removed: String = chars[start..end].iter().collect();
+        let mut rest: String = chars[..start].iter().collect();
+        rest.extend(&chars[end..]);
+        (removed, rest)
+    };
+    match args {
+        [Value::Int(i)] => {
+            let k = norm_idx(*i, n)?;
+            (k < n).then(|| cut(k, k + 1))
+        }
+        [Value::Int(i), Value::Int(len)] => {
+            if *len < 0 {
+                return None;
+            }
+            let start = norm_idx(*i, n)?;
+            if start > n {
+                return None;
+            }
+            let end = (start + *len as usize).min(n);
+            Some(cut(start, end))
+        }
+        [rng] if with_host(|h| h.as_range(rng)).is_some() => {
+            let (lo, hi, excl) = with_host(|h| h.as_range(rng)).unwrap();
+            let start = norm_idx(lo, n)?;
+            let mut e = norm_idx(hi, n).unwrap_or(n);
+            if !excl {
+                e += 1;
+            }
+            let e = e.min(n).max(start);
+            (start <= n).then(|| cut(start, e))
+        }
+        // A string or regex argument removes its first occurrence.
+        [pat] => {
+            if let Some(re) = str_regex(pat) {
+                let m = re.find(s)?;
+                let start = s[..m.start()].chars().count();
+                let end = start + m.as_str().chars().count();
+                Some(cut(start, end))
+            } else {
+                let needle = arg_str(pat);
+                let bpos = s.find(&needle)?;
+                let start = s[..bpos].chars().count();
+                let end = start + needle.chars().count();
+                Some(cut(start, end))
+            }
+        }
+        _ => None,
     }
 }
 

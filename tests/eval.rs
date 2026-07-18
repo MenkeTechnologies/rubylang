@@ -1826,6 +1826,41 @@ fn block_and_lambda_splat_params() {
 }
 
 #[test]
+fn string_split_semantics() {
+    // Limit keeps at most N fields; the last holds the remainder.
+    eq("\"a,b,c,d\".split(\",\", 2)", "[\"a\", \"b,c,d\"]");
+    // A capture group in the pattern is interleaved into the result.
+    eq(
+        "\"a1b2c\".split(/(\\d)/)",
+        "[\"a\", \"1\", \"b\", \"2\", \"c\"]",
+    );
+    // Trailing empty fields are dropped at the default limit, kept when negative.
+    eq("\"a,b,c,,\".split(\",\")", "[\"a\", \"b\", \"c\"]");
+    eq("\"a,b,,\".split(\",\", -1)", "[\"a\", \"b\", \"\", \"\"]");
+    // Leading empty fields are always kept.
+    eq("\",a,b\".split(\",\")", "[\"\", \"a\", \"b\"]");
+    // Empty separator splits into characters; awk mode on a single space.
+    eq(
+        "\"hello\".split(\"\")",
+        "[\"h\", \"e\", \"l\", \"l\", \"o\"]",
+    );
+    eq("\"a b  c\".split(\" \")", "[\"a\", \"b\", \"c\"]");
+    eq("\"\".split(\",\")", "[]");
+}
+
+#[test]
+fn string_slice_bang_and_eql() {
+    eq(
+        "s = \"hello\"; x = s.slice!(1, 2); [x, s]",
+        "[\"el\", \"hlo\"]",
+    );
+    eq("s = \"hello\"; s.slice!(0); s", "\"ello\"");
+    eq("s = \"hello\"; s.slice!(\"ell\"); s", "\"ho\"");
+    eq("\"abc\".eql?(\"abc\")", "true");
+    eq("\"abc\".eql?(:abc)", "false");
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).
