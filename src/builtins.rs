@@ -804,6 +804,7 @@ pub(crate) fn dispatch(
         "Regexp" => dispatch_regexp(recv, name, args),
         "MatchData" => dispatch_matchdata(recv, name, args),
         "Set" => dispatch_set(recv, name, args, block),
+        "Time" => dispatch_time(recv, name, args),
         "Enumerator" => dispatch_enumerator(recv, name, args, block),
         "Enumerator::Lazy" => dispatch_lazy(recv, name, args, block),
         "Rational" => dispatch_rational(recv, name, args),
@@ -905,6 +906,33 @@ fn dispatch_classref(
                 return Ok(with_host(|h| h.new_set(items)));
             }
             "[]" => return Ok(with_host(|h| h.new_set(args.to_vec()))),
+            _ => {}
+        }
+    }
+    // `Time` constructors. All produce a UTC time (the local-timezone offset is
+    // not modeled). `Time.at(n)` wraps epoch seconds; `Time.utc`/`Time.gm`
+    // build from broken-down UTC fields; `Time.now` reads the system clock.
+    if cls == "Time" {
+        match name {
+            "at" => {
+                let secs = args.first().map(as_f).unwrap_or(0.0);
+                return Ok(with_host(|h| h.new_time(secs)));
+            }
+            "utc" | "gm" | "new" | "local" | "mktime" => {
+                // Time.utc(year, month=1, day=1, hour=0, min=0, sec=0).
+                let g = |i: usize, dflt: i64| args.get(i).map(as_i).unwrap_or(dflt);
+                let (y, mo, d) = (g(0, 1970), g(1, 1), g(2, 1));
+                let (hh, mi) = (g(3, 0), g(4, 0));
+                let ss = args.get(5).map(as_f).unwrap_or(0.0);
+                // `Time.new` with no args is `Time.now`; with args it builds a date.
+                if name == "new" && args.is_empty() {
+                    return Ok(with_host(|h| h.new_time(now_epoch_secs())));
+                }
+                let days = crate::host::days_from_civil(y, mo, d);
+                let secs = days as f64 * 86_400.0 + (hh * 3600 + mi * 60) as f64 + ss;
+                return Ok(with_host(|h| h.new_time(secs)));
+            }
+            "now" => return Ok(with_host(|h| h.new_time(now_epoch_secs()))),
             _ => {}
         }
     }
@@ -1318,6 +1346,14 @@ fn as_f(v: &Value) -> f64 {
         Value::Float(f) => *f,
         _ => 0.0,
     }
+}
+
+/// Current wall-clock time as seconds since the Unix epoch, for `Time.now`.
+fn now_epoch_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 /// Resolve the `(lo, hi)` bounds for a numeric `clamp`, accepting either the
@@ -4776,6 +4812,189 @@ fn dispatch_enumerator(
     }
 }
 
+const WDAY_FULL: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+const MON_FULL: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// Left-pad an integer to `width` using `pad`, honoring an optional strftime
+/// flag: `-` suppresses padding, `_` forces space, `0` forces zero.
+fn strf_num(n: i64, width: usize, pad: char, flag: Option<char>) -> String {
+    let (width, pad) = match flag {
+        Some('-') => (0, ' '),
+        Some('_') => (width, ' '),
+        Some('0') => (width, '0'),
+        _ => (width, pad),
+    };
+    let body = n.abs().to_string();
+    let sign = if n < 0 { "-" } else { "" };
+    let need = width.saturating_sub(body.len() + sign.len());
+    format!("{sign}{}{body}", pad.to_string().repeat(need))
+}
+
+/// `Time#strftime` over the common directive set, including the `-`/`_`/`0`
+/// padding flags (`%-d` = no pad, `%_d` = space, `%0e` = zero). Unrecognized
+/// directives are emitted verbatim (leading `%` kept), matching MRI's lenient
+/// behavior.
+fn time_strftime(
+    fmt: &str,
+    f: (i64, i64, i64, i64, i64, i64, i64, i64, f64),
+    epoch: f64,
+) -> String {
+    let (y, mo, d, hh, mi, ss, wday, yday, frac) = f;
+    let hour12 = if hh % 12 == 0 { 12 } else { hh % 12 };
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        // An optional padding flag between `%` and the directive letter.
+        let flag = match chars.peek() {
+            Some(&f @ ('-' | '_' | '0')) => {
+                chars.next();
+                Some(f)
+            }
+            _ => None,
+        };
+        match chars.next() {
+            Some('Y') => out.push_str(&strf_num(y, 4, '0', flag)),
+            Some('C') => out.push_str(&strf_num(y / 100, 2, '0', flag)),
+            Some('y') => out.push_str(&strf_num(y.rem_euclid(100), 2, '0', flag)),
+            Some('m') => out.push_str(&strf_num(mo, 2, '0', flag)),
+            Some('d') => out.push_str(&strf_num(d, 2, '0', flag)),
+            Some('e') => out.push_str(&strf_num(d, 2, ' ', flag)),
+            Some('H') => out.push_str(&strf_num(hh, 2, '0', flag)),
+            Some('k') => out.push_str(&strf_num(hh, 2, ' ', flag)),
+            Some('I') => out.push_str(&strf_num(hour12, 2, '0', flag)),
+            Some('l') => out.push_str(&strf_num(hour12, 2, ' ', flag)),
+            Some('M') => out.push_str(&strf_num(mi, 2, '0', flag)),
+            Some('S') => out.push_str(&strf_num(ss, 2, '0', flag)),
+            Some('L') => out.push_str(&strf_num((frac * 1000.0).round() as i64, 3, '0', flag)),
+            Some('j') => out.push_str(&strf_num(yday, 3, '0', flag)),
+            Some('p') => out.push_str(if hh < 12 { "AM" } else { "PM" }),
+            Some('P') => out.push_str(if hh < 12 { "am" } else { "pm" }),
+            Some('A') => out.push_str(WDAY_FULL[wday as usize]),
+            Some('a') => out.push_str(&WDAY_FULL[wday as usize][..3]),
+            Some('B') => out.push_str(MON_FULL[(mo - 1) as usize]),
+            Some('b') | Some('h') => out.push_str(&MON_FULL[(mo - 1) as usize][..3]),
+            Some('w') => out.push_str(&wday.to_string()),
+            Some('u') => out.push_str(&(if wday == 0 { 7 } else { wday }).to_string()),
+            Some('s') => out.push_str(&(epoch.floor() as i64).to_string()),
+            Some('z') => out.push_str("+0000"),
+            Some('Z') => out.push_str("UTC"),
+            Some('F') => out.push_str(&format!("{y:04}-{mo:02}-{d:02}")),
+            Some('T') | Some('X') => out.push_str(&format!("{hh:02}:{mi:02}:{ss:02}")),
+            Some('R') => out.push_str(&format!("{hh:02}:{mi:02}")),
+            Some('D') => out.push_str(&format!("{:02}/{d:02}/{:02}", mo, y.rem_euclid(100))),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                if let Some(fl) = flag {
+                    out.push(fl);
+                }
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+/// `Time` instance methods (all UTC). Field readers come from `time_fields`;
+/// `strftime` formats; comparison/arithmetic operators also route here (with
+/// the native `+`/`-`/`<`/`>` forms handled in `Host::num_op`).
+fn dispatch_time(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let secs = with_host(|h| h.time_secs(recv).unwrap_or(0.0));
+    let f = with_host(|h| h.time_fields(secs));
+    let (y, mo, d, hh, mi, ss, wday, yday, _frac) = f;
+    match name {
+        "year" => Ok(Value::Int(y)),
+        "month" | "mon" => Ok(Value::Int(mo)),
+        "day" | "mday" => Ok(Value::Int(d)),
+        "hour" => Ok(Value::Int(hh)),
+        "min" => Ok(Value::Int(mi)),
+        "sec" => Ok(Value::Int(ss)),
+        "wday" => Ok(Value::Int(wday)),
+        "yday" => Ok(Value::Int(yday)),
+        "to_i" | "tv_sec" => Ok(Value::Int(secs.floor() as i64)),
+        "to_f" => Ok(Value::Float(secs)),
+        "sunday?" => Ok(Value::Bool(wday == 0)),
+        "monday?" => Ok(Value::Bool(wday == 1)),
+        "tuesday?" => Ok(Value::Bool(wday == 2)),
+        "wednesday?" => Ok(Value::Bool(wday == 3)),
+        "thursday?" => Ok(Value::Bool(wday == 4)),
+        "friday?" => Ok(Value::Bool(wday == 5)),
+        "saturday?" => Ok(Value::Bool(wday == 6)),
+        // UTC-only model: these conversions are all no-ops that return an
+        // equivalent Time (or the flag). Local-timezone offset is not modeled.
+        "utc" | "getutc" | "gmtime" | "localtime" | "getlocal" => {
+            Ok(with_host(|h| h.new_time(secs)))
+        }
+        "utc?" | "gmt?" => Ok(Value::Bool(true)),
+        "to_s" | "inspect" => Ok(with_host(|h| {
+            let s = h.time_to_s(secs, name == "inspect");
+            h.new_string(s)
+        })),
+        "strftime" => {
+            let fmt = with_host(|h| h.as_str(&args[0]).unwrap_or_default());
+            Ok(with_host(|h| {
+                let s = time_strftime(&fmt, f, secs);
+                h.new_string(s)
+            }))
+        }
+        "<=>" => {
+            if let Some(other) = with_host(|h| h.time_secs(&args[0])) {
+                Ok(Value::Int(match secs.total_cmp(&other) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }))
+            } else {
+                Ok(Value::Undef)
+            }
+        }
+        "==" => Ok(Value::Bool(
+            with_host(|h| h.time_secs(&args[0])) == Some(secs),
+        )),
+        "+" => Ok(with_host(|h| h.new_time(secs + as_f(&args[0])))),
+        "-" => {
+            if let Some(other) = with_host(|h| h.time_secs(&args[0])) {
+                Ok(Value::Float(secs - other))
+            } else {
+                Ok(with_host(|h| h.new_time(secs - as_f(&args[0]))))
+            }
+        }
+        "hash" => Ok(Value::Int(secs.to_bits() as i64)),
+        _ => Err(raise_exc(
+            "NoMethodError",
+            &format!("undefined method '{name}' for an instance of Time"),
+        )),
+    }
+}
+
 fn dispatch_set(
     recv: &Value,
     name: &str,
@@ -6970,6 +7189,10 @@ fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         if let Ok(v) = dispatch(a, "<=>", std::slice::from_ref(b), None) {
             return as_i(&v).cmp(&0);
         }
+    }
+    // Two Times order by their epoch seconds.
+    if let (Some(x), Some(y)) = with_host(|h| (h.time_secs(a), h.time_secs(b))) {
+        return x.total_cmp(&y);
     }
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),

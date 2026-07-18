@@ -236,6 +236,41 @@ pub enum RObj {
         /// returns the receiver.
         method: String,
     },
+    /// A `Time`, stored as seconds since the Unix epoch (a float, so
+    /// sub-second precision and `Time - Time` Float differences are faithful).
+    /// Always interpreted as UTC — the local-timezone offset is not modeled
+    /// (there is no tz database), so `.utc`/`Time.utc` are exact and
+    /// `.localtime` is a no-op.
+    Time {
+        secs: f64,
+    },
+}
+
+/// Days from the civil calendar date `(y, m, d)` to the Unix epoch
+/// (1970-01-01). Howard Hinnant's public-domain algorithm; valid for the full
+/// proleptic Gregorian range. `m` is 1..=12, `d` is 1..=31.
+pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
+/// The civil date `(year, month, day)` for a count of days since the Unix
+/// epoch. Inverse of [`days_from_civil`] (Hinnant, public domain).
+pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// How a `Proc` value behaves when called. `Normal` runs its own template;
@@ -690,6 +725,48 @@ impl RubyHost {
         if let Some(RObj::Enumerator { cursor, .. }) = self.obj_mut(v) {
             *cursor = 0;
         }
+    }
+    /// Build a `Time` from seconds since the Unix epoch (UTC).
+    pub fn new_time(&mut self, secs: f64) -> Value {
+        self.alloc(RObj::Time { secs })
+    }
+    /// The epoch seconds of a `Time`, if `v` is one.
+    pub fn time_secs(&self, v: &Value) -> Option<f64> {
+        match self.obj(v) {
+            Some(RObj::Time { secs }) => Some(*secs),
+            _ => None,
+        }
+    }
+    /// The broken-down UTC fields of an epoch: `(year, month, day, hour, minute,
+    /// second, weekday, yearday, subsecond)`. `weekday` is 0=Sunday..6=Saturday;
+    /// `yearday` is 1..=366.
+    pub fn time_fields(&self, secs: f64) -> (i64, i64, i64, i64, i64, i64, i64, i64, f64) {
+        let whole = secs.floor() as i64;
+        let subsec = secs - whole as f64;
+        // Floor-divide so negative epochs land on the correct earlier day.
+        let days = whole.div_euclid(86_400);
+        let rem = whole.rem_euclid(86_400);
+        let (y, m, d) = civil_from_days(days);
+        let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+        // 1970-01-01 was a Thursday (=4 counting from Sunday=0).
+        let wday = (days.rem_euclid(7) + 4) % 7;
+        let yday = days - days_from_civil(y, 1, 1) + 1;
+        (y, m, d, hh, mm, ss, wday, yday, subsec)
+    }
+    /// The canonical `Time#to_s` / `#inspect` text: `YYYY-MM-DD HH:MM:SS UTC`.
+    /// With `subsec`, a non-zero fractional second is appended (`.5`), matching
+    /// `Time#inspect`.
+    pub fn time_to_s(&self, secs: f64, subsec: bool) -> String {
+        let (y, m, d, hh, mm, ss, _, _, frac) = self.time_fields(secs);
+        let mut out = format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}");
+        if subsec && frac.abs() > f64::EPSILON {
+            // Trim to the significant fractional digits, dropping the leading 0.
+            let s = format!("{frac:.9}");
+            let trimmed = s.trim_start_matches('0').trim_end_matches('0');
+            out.push_str(trimmed);
+        }
+        out.push_str(" UTC");
+        out
     }
     /// The `(real, imaginary)` parts of a complex number, if `v` is one.
     pub fn complex_parts(&self, v: &Value) -> Option<(Value, Value)> {
@@ -1354,6 +1431,7 @@ impl RubyHost {
                 | "FalseClass"
                 | "Set"
                 | "Struct"
+                | "Time"
         )
     }
     pub fn classref_name(&self, v: &Value) -> Option<String> {
@@ -1602,6 +1680,7 @@ impl RubyHost {
                     let inner: Vec<String> = items.iter().map(|v| self.inspect(v)).collect();
                     format!("Set[{}]", inner.join(", "))
                 }
+                Some(RObj::Time { secs }) => self.time_to_s(secs, false),
                 Some(RObj::Lazy { .. }) => "#<Enumerator::Lazy>".to_string(),
                 Some(RObj::Enumerator { buf, .. }) => {
                     format!("#<Enumerator: {}>", self.inspect_array(&buf))
@@ -1667,6 +1746,8 @@ impl RubyHost {
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash { map, .. }) => self.inspect_hash(&map),
                 Some(RObj::Regexp { source, .. }) => format!("/{source}/"),
+                // `Time#inspect` shows a fractional second (unlike `#to_s`).
+                Some(RObj::Time { secs }) => self.time_to_s(secs, true),
                 // A String range inspects its endpoints with quotes: `"a".."e"`.
                 Some(RObj::StrRange { lo, hi, exclusive }) => {
                     format!("{lo:?}{}{hi:?}", if exclusive { "..." } else { ".." })
@@ -1735,6 +1816,7 @@ impl RubyHost {
                 Some(RObj::Complex { .. }) => "Complex",
                 Some(RObj::Lazy { .. }) => "Enumerator::Lazy",
                 Some(RObj::Enumerator { .. }) => "Enumerator",
+                Some(RObj::Time { .. }) => "Time",
                 Some(RObj::Set(_)) => "Set",
                 Some(RObj::Array(_)) => "Array",
                 Some(RObj::Hash { .. }) => "Hash",
@@ -1939,6 +2021,39 @@ impl RubyHost {
             }
             _ => {}
         }
+        // `Time` arithmetic and comparison. `Time - Time` is the Float number of
+        // seconds between them; `Time ± Numeric` shifts by that many seconds and
+        // stays a `Time`. Comparisons order two times by their epoch seconds.
+        if let Some(ta) = self.time_secs(a) {
+            let num_f = |v: &Value| -> Option<f64> {
+                match v {
+                    Value::Int(n) => Some(*n as f64),
+                    Value::Float(f) => Some(*f),
+                    _ => None,
+                }
+            };
+            match op {
+                Sub => {
+                    if let Some(tb) = self.time_secs(b) {
+                        return Ok(Value::Float(ta - tb));
+                    }
+                    if let Some(n) = num_f(b) {
+                        return Ok(self.new_time(ta - n));
+                    }
+                }
+                Add => {
+                    if let Some(n) = num_f(b) {
+                        return Ok(self.new_time(ta + n));
+                    }
+                }
+                Lt | Gt | Le | Ge => {
+                    if let Some(tb) = self.time_secs(b) {
+                        return Ok(Value::Bool(cmp_ord(op, ta.total_cmp(&tb))));
+                    }
+                }
+                _ => {}
+            }
+        }
         // Set `+` (union) and `-` (difference) arrive as native Add/Sub; the
         // bitwise-named set operators (`|`/`&`/`^`) route through method dispatch.
         if let Some(xs) = self.as_set(a) {
@@ -2017,6 +2132,8 @@ impl RubyHost {
                     (Some(RObj::Set(x)), Some(RObj::Set(y))) => {
                         x.len() == y.len() && x.keys().all(|k| y.contains_key(k))
                     }
+                    // Two Times are equal when they name the same instant.
+                    (Some(RObj::Time { secs: x }), Some(RObj::Time { secs: y })) => x == y,
                     // Two struct instances are equal when they share a class and
                     // all their members compare equal.
                     (

@@ -781,3 +781,18 @@ puts kept.inspect
 sum = [1, 2, 3, 4].each.with_object({ total: 0 }) { |x, h| h[:total] += x }
 puts sum.inspect
 [100, 200].each.with_index(10) { |v, i| puts "#{i} -> #{v}" }
+#==#
+launch = Time.utc(2001, 9, 9, 1, 46, 40)
+puts launch.to_i
+puts launch.strftime("%Y-%m-%d %H:%M:%S %Z")
+puts launch.strftime("%A %B %-d")
+deadline = launch + (7 * 24 * 3600)
+puts deadline.strftime("%F")
+puts (deadline - launch)
+epochs = [1_600_000_000, 1_500_000_000, 1_700_000_000]
+times = epochs.map { |e| Time.at(e).utc }
+puts times.sort.map(&:year).inspect
+t = Time.at(0).utc
+puts [t.year, t.month, t.day, t.wday, t.yday].inspect
+newyear = Time.gm(2024, 1, 1, 0, 0, 0)
+puts newyear.strftime("%j %u")

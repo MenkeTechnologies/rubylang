@@ -89,6 +89,20 @@ capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
   allocates a `BigInt` heap object (backed by `num-bigint`). Arithmetic, bit
   ops, `**`, comparison, `to_s(base)`, `bit_length`, and `digits` all cross the
   boundary transparently.
+- **`Time` is UTC-only.** `Time.at`, `Time.utc`/`Time.gm`, and `Time.now`
+  construct times; the field readers (`year`/`month`/`day`/`hour`/`min`/`sec`/
+  `wday`/`yday`), `to_i`/`to_f`, `to_s`/`inspect`, `strftime` (common directives
+  plus the `-`/`_`/`0` padding flags), arithmetic (`Time - Time → Float`,
+  `Time ± Numeric → Time`) and comparison/sort all work, with a dependency-free
+  proleptic-Gregorian calendar (valid for negative epochs too). The
+  local-timezone offset is **not** modeled — there is no tz database, so
+  `.utc`/`.getutc` are exact and `.localtime`/`Time.local` behave as UTC. `Date`/
+  `DateTime` and timezone-aware `strftime` (`%Z` always prints `UTC`, `%z` always
+  `+0000`) are not implemented.
+- **`Array#pack` / `String#unpack`** are not implemented: strings are UTF-8
+  (`String`, not a byte buffer), so the binary directives (`N`/`n`/`V`/`v`/`H`,
+  high `C` bytes) cannot round-trip. This is a durable encoding limitation, not a
+  temporary gap.
 - **`rand`.** Seeded from the system clock (no `srand` determinism yet).
 - **Method surface.** The Enumerable/String/Hash/Range surface is broad but not
   exhaustive; an unimplemented method raises `undefined method '<name>'`.

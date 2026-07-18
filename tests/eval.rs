@@ -2307,6 +2307,57 @@ fn enumerator_with_index_and_object() {
 }
 
 #[test]
+fn time_utc() {
+    // Broken-down UTC fields from an epoch.
+    eq(
+        "t = Time.at(1500000000).utc; [t.year, t.month, t.day, t.hour, t.min, t.sec]",
+        "[2017, 7, 14, 2, 40, 0]",
+    );
+    eq("Time.at(0).utc.year", "1970");
+    eq("Time.at(0).utc.wday", "4"); // 1970-01-01 was a Thursday
+    eq("Time.at(86400).utc.yday", "2");
+    // Building from fields.
+    eq("Time.utc(2020, 1, 1).to_i", "1577836800");
+    eq("Time.utc(2020, 2, 29, 12, 30, 15).to_i", "1582979415"); // leap day
+    eq("Time.gm(1999, 12, 31, 23, 59, 59).to_i", "946684799");
+    // to_s (no subsecond) and inspect (with subsecond).
+    eq(
+        "Time.at(1000000000).utc.to_s",
+        "\"2001-09-09 01:46:40 UTC\"",
+    );
+    eq("Time.at(1.5).utc.inspect", "\"1970-01-01 00:00:01.5 UTC\"");
+    // strftime.
+    eq(
+        "Time.at(1000000000).utc.strftime(\"%Y-%m-%d %H:%M:%S\")",
+        "\"2001-09-09 01:46:40\"",
+    );
+    eq(
+        "Time.at(1000000000).utc.strftime(\"%A, %B %d, %Y\")",
+        "\"Sunday, September 09, 2001\"",
+    );
+    eq(
+        "Time.at(1000000000).utc.strftime(\"%a %b %e %T %Z\")",
+        "\"Sun Sep  9 01:46:40 UTC\"",
+    );
+    // Arithmetic and comparison.
+    eq("Time.at(100) - Time.at(40)", "60.0");
+    eq("(Time.at(100) + 3600).to_i", "3700");
+    eq("Time.at(100) < Time.at(200)", "true");
+    eq("Time.at(100) <=> Time.at(200)", "-1");
+    eq("Time.at(100) == Time.at(100)", "true");
+    eq(
+        "[Time.at(30), Time.at(10), Time.at(20)].sort.map(&:to_i)",
+        "[10, 20, 30]",
+    );
+    // Negative epoch (before 1970) via floor-division calendar math.
+    eq("Time.at(-1).utc.year", "1969");
+    eq(
+        "t = Time.at(-1).utc; [t.month, t.day, t.hour, t.min, t.sec]",
+        "[12, 31, 23, 59, 59]",
+    );
+}
+
+#[test]
 fn float_constants_and_leading_dot_chains() {
     eq("Float::INFINITY", "Infinity");
     eq("5 < Float::INFINITY", "true");
