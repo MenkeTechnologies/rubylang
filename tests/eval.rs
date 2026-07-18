@@ -1517,6 +1517,26 @@ fn string_justify_batch() {
 }
 
 #[test]
+fn string_tr_ranges_batch() {
+    // tr/tr_s/delete/count/squeeze expand `a-z` ranges and `^` negation.
+    eq(r#""hello".tr("a-y", "*")"#, r#""*****""#);
+    eq(r#""hello".tr("a-c", "x")"#, r#""hello""#);
+    eq(r#""abc".tr("a-c", "x-z")"#, r#""xyz""#);
+    eq(r#""hello".tr("^aeiou", "*")"#, r#""*e**o""#);
+    eq(r#""hello".tr("el", "")"#, r#""ho""#);
+    eq(r#""hello world".tr("a-z", "A-Z")"#, r#""HELLO WORLD""#);
+    eq(r#""hello".delete("a-m")"#, r#""o""#);
+    eq(r#""hello".delete("a-y")"#, r#""""#);
+    eq(r#""hello".delete("^aeiou")"#, r#""eo""#);
+    eq(r#""hello world".count("a-z")"#, "10");
+    eq(r#""hello".count("a-z")"#, "5");
+    eq(r#""hello".count("^l")"#, "3");
+    eq(r#""aaabbbccc".squeeze("a-b")"#, r#""abccc""#);
+    eq(r#""aabbcc".tr_s("a-c", "x")"#, r#""x""#);
+    eq(r#""hello".tr_s("l", "r")"#, r#""hero""#);
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

@@ -1417,15 +1417,9 @@ fn dispatch_string(
             }
         }
         "tr" => {
-            let from: Vec<char> = arg_str(&args[0]).chars().collect();
-            let to: Vec<char> = arg_str(&args[1]).chars().collect();
-            let out: String = s
-                .chars()
-                .map(|c| match from.iter().position(|&f| f == c) {
-                    Some(i) => *to.get(i).or_else(|| to.last()).unwrap_or(&c),
-                    None => c,
-                })
-                .collect();
+            let (neg, from) = expand_tr_spec(&arg_str(&args[0]), true);
+            let (_, to) = expand_tr_spec(&arg_str(&args[1]), false);
+            let out: String = s.chars().filter_map(|c| tr_map(c, neg, &from, &to)).collect();
             Ok(new_str(out))
         }
         "delete" => {
@@ -1676,23 +1670,24 @@ fn dispatch_string(
         // `tr_s`: translate like `tr`, then squeeze runs of chars that were
         // translated (adjacent duplicates produced by the translation collapse).
         "tr_s" => {
-            let from: Vec<char> = arg_str(&args[0]).chars().collect();
-            let to: Vec<char> = arg_str(&args[1]).chars().collect();
+            let (neg, from) = expand_tr_spec(&arg_str(&args[0]), true);
+            let (_, to) = expand_tr_spec(&arg_str(&args[1]), false);
             let mut out = String::new();
             let mut last_translated: Option<char> = None;
             for c in s.chars() {
-                match from.iter().position(|&f| f == c) {
-                    Some(i) => {
-                        let r = *to.get(i).or_else(|| to.last()).unwrap_or(&c);
+                let matched = if neg { !from.contains(&c) } else { from.contains(&c) };
+                if matched {
+                    // Translated (or deleted when `to` is empty); squeeze runs
+                    // of the same replacement char.
+                    if let Some(r) = tr_map(c, neg, &from, &to) {
                         if last_translated != Some(r) {
                             out.push(r);
                         }
                         last_translated = Some(r);
                     }
-                    None => {
-                        out.push(c);
-                        last_translated = None;
-                    }
+                } else {
+                    out.push(c);
+                    last_translated = None;
                 }
             }
             Ok(new_str(out))
@@ -2055,6 +2050,56 @@ fn parse_char_selector(spec: &str) -> (bool, std::collections::HashSet<char>) {
         }
     }
     (negated, set)
+}
+
+/// Expand a `tr`/`tr_s` character spec into an ordered list of chars, honouring
+/// `a-z` ranges, `\`-escapes, and (when `allow_neg`) a leading `^` negation.
+/// Unlike `parse_char_selector` this preserves order for positional mapping.
+fn expand_tr_spec(spec: &str, allow_neg: bool) -> (bool, Vec<char>) {
+    let chars: Vec<char> = spec.chars().collect();
+    let mut i = 0;
+    let mut negated = false;
+    if allow_neg && chars.len() > 1 && chars[0] == '^' {
+        negated = true;
+        i = 1;
+    }
+    let mut out: Vec<char> = Vec::new();
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            out.push(chars[i + 1]);
+            i += 2;
+        } else if i + 2 < chars.len() && chars[i + 1] == '-' {
+            let (start, end) = (chars[i], chars[i + 2]);
+            if start <= end {
+                for ch in start..=end {
+                    out.push(ch);
+                }
+            }
+            i += 3;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    (negated, out)
+}
+
+/// Translate a single char for `tr`/`tr_s`. `None` means the char is deleted
+/// (empty `to` spec). With `neg`, every char NOT in `from` maps to the last
+/// char of `to`; otherwise a matched char maps positionally.
+fn tr_map(c: char, neg: bool, from: &[char], to: &[char]) -> Option<char> {
+    if neg {
+        if from.contains(&c) {
+            Some(c)
+        } else {
+            to.last().copied()
+        }
+    } else {
+        match from.iter().position(|&f| f == c) {
+            Some(i) => to.get(i).or_else(|| to.last()).copied(),
+            None => Some(c),
+        }
+    }
 }
 
 /// Build a predicate matching a char against ALL selector specs (Ruby intersects
