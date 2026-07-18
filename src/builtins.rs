@@ -912,6 +912,17 @@ fn as_i(v: &Value) -> i64 {
         _ => 0,
     }
 }
+
+/// An integer argument as `i64` (an immediate or a small-enough BigInt), or
+/// `None` when the value is not an integer at all (e.g. a Float).
+fn int_arg(v: &Value) -> Option<i64> {
+    use num_traits::ToPrimitive;
+    match v {
+        Value::Int(n) => Some(*n),
+        Value::Obj(_) => with_host(|h| h.as_bigint(v)).and_then(|b| b.to_i64()),
+        _ => None,
+    }
+}
 fn as_f(v: &Value) -> f64 {
     match v {
         Value::Int(n) => *n as f64,
@@ -941,12 +952,95 @@ fn clamp_bounds(args: &[Value]) -> Result<(Value, Value), String> {
 
 // ---- Integer / Float ------------------------------------------------------
 
+/// Arbitrary-precision methods for a promoted `BigInt` receiver. Returns
+/// `Ok(None)` for a method not handled here (so `dispatch_number` can try its
+/// generic arms, which fall back to `<=>`/coerce behavior).
+fn dispatch_bigint(
+    b: &num_bigint::BigInt,
+    name: &str,
+    args: &[Value],
+) -> Result<Option<Value>, String> {
+    use num_integer::Integer as _;
+    use num_traits::{Signed as _, ToPrimitive as _, Zero as _};
+    let big = |v: num_bigint::BigInt| with_host(|h| h.new_bigint(v));
+    let r = match name {
+        "to_s" | "inspect" => {
+            let radix = args.first().and_then(int_arg).unwrap_or(10);
+            new_str(b.to_str_radix(radix as u32))
+        }
+        "to_i" | "to_int" | "floor" | "ceil" | "round" | "truncate" => big(b.clone()),
+        "to_f" => Value::Float(b.to_f64().unwrap_or(f64::INFINITY)),
+        "abs" | "magnitude" => big(b.abs()),
+        "-@" => big(-b.clone()),
+        "bit_length" => Value::Int(b.bits() as i64),
+        "even?" => Value::Bool(b.is_even()),
+        "odd?" => Value::Bool(b.is_odd()),
+        "zero?" => Value::Bool(b.is_zero()),
+        "positive?" => Value::Bool(b.is_positive()),
+        "negative?" => Value::Bool(b.is_negative()),
+        "integer?" => Value::Bool(true),
+        "hash" => Value::Int(b.to_i64().unwrap_or(b.bits() as i64)),
+        "succ" | "next" => big(b + 1),
+        "pred" => big(b - 1),
+        "digits" => {
+            let base = args.first().and_then(int_arg).unwrap_or(10).max(2);
+            let base = num_bigint::BigInt::from(base);
+            let mut n = b.abs();
+            let mut out = Vec::new();
+            if n.is_zero() {
+                out.push(Value::Int(0));
+            }
+            while n > num_bigint::BigInt::zero() {
+                let (q, rem) = n.div_rem(&base);
+                out.push(with_host(|h| h.new_bigint(rem)));
+                n = q;
+            }
+            new_arr(out)
+        }
+        "/" | "div" => match with_host(|h| h.as_bigint(&args[0])) {
+            Some(d) if !d.is_zero() => big(b.div_floor(&d)),
+            Some(_) => return Err(raise_exc("ZeroDivisionError", "divided by 0")),
+            None => return Ok(None),
+        },
+        "%" | "modulo" => match with_host(|h| h.as_bigint(&args[0])) {
+            Some(d) if !d.is_zero() => big(b.mod_floor(&d)),
+            Some(_) => return Err(raise_exc("ZeroDivisionError", "divided by 0")),
+            None => return Ok(None),
+        },
+        "divmod" => match with_host(|h| h.as_bigint(&args[0])) {
+            Some(d) if !d.is_zero() => {
+                let (q, m) = b.div_mod_floor(&d);
+                new_arr(vec![big(q), big(m)])
+            }
+            _ => return Err(raise_exc("ZeroDivisionError", "divided by 0")),
+        },
+        "<=>" => match with_host(|h| h.as_bigint(&args[0])) {
+            Some(o) => Value::Int(match b.cmp(&o) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }),
+            None => Value::Undef,
+        },
+        "coerce" => new_arr(vec![args[0].clone(), big(b.clone())]),
+        _ => return Ok(None),
+    };
+    Ok(Some(r))
+}
+
 fn dispatch_number(
     recv: &Value,
     name: &str,
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    // Promoted BigInt receivers need arbitrary-precision handling for the
+    // methods that would otherwise truncate through `i64`.
+    if let Some(b) = with_host(|h| h.as_promoted_bigint(recv)) {
+        if let Some(r) = dispatch_bigint(&b, name, args)? {
+            return Ok(r);
+        }
+    }
     match name {
         "times" => {
             let n = as_i(recv);
@@ -985,13 +1079,15 @@ fn dispatch_number(
                     // not yet implemented, fall through to the plain-pow path.
                 }
             }
-            // Integer ** non-negative Integer stays an Integer, like Ruby.
-            match (recv, &args[0]) {
-                (Value::Int(base), Value::Int(exp)) if *exp >= 0 => {
-                    Ok(Value::Int(base.pow(*exp as u32)))
+            // Integer ** non-negative Integer stays an exact Integer (promoting
+            // to BigInt on overflow), like Ruby.
+            if let (Some(base), Some(exp)) = (with_host(|h| h.as_bigint(recv)), int_arg(&args[0])) {
+                if exp >= 0 {
+                    let r = base.pow(exp as u32);
+                    return Ok(with_host(|h| h.new_bigint(r)));
                 }
-                _ => Ok(Value::Float(as_f(recv).powf(as_f(&args[0])))),
             }
+            Ok(Value::Float(as_f(recv).powf(as_f(&args[0]))))
         }
         "/" => match (recv, &args[0]) {
             (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
@@ -1280,11 +1376,28 @@ fn dispatch_number(
                 None => Value::Undef,
             })
         }
-        "<<" => Ok(Value::Int(as_i(recv) << as_i(&args[0]))),
-        ">>" => Ok(Value::Int(as_i(recv) >> as_i(&args[0]))),
-        "&" => Ok(Value::Int(as_i(recv) & as_i(&args[0]))),
-        "|" => Ok(Value::Int(as_i(recv) | as_i(&args[0]))),
-        "^" => Ok(Value::Int(as_i(recv) ^ as_i(&args[0]))),
+        // Bit operations promote to BigInt on overflow (`1 << 64`) and accept
+        // already-promoted operands.
+        "<<" | ">>" | "&" | "|" | "^" => {
+            let (a, b) = (
+                with_host(|h| h.as_bigint(recv)),
+                with_host(|h| h.as_bigint(&args[0])),
+            );
+            match (a, b) {
+                (Some(a), Some(b)) => {
+                    use num_traits::ToPrimitive;
+                    let r = match name {
+                        "<<" => a << b.to_i64().unwrap_or(0).max(0) as usize,
+                        ">>" => a >> b.to_i64().unwrap_or(0).max(0) as usize,
+                        "&" => a & b,
+                        "|" => a | b,
+                        _ => a ^ b,
+                    };
+                    Ok(with_host(|h| h.new_bigint(r)))
+                }
+                _ => Err(raise_exc("TypeError", "no implicit conversion to Integer")),
+            }
+        }
         "between?" => {
             let n = as_f(recv);
             Ok(Value::Bool(n >= as_f(&args[0]) && n <= as_f(&args[1])))

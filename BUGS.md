@@ -72,8 +72,11 @@ capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
   `.class.name` and class-object identity are therefore unsupported.
 - **Enumerator without block.** `each_with_index.map` (an enumerator returned
   from a block-less call) is not supported. (`&:sym` block-pass IS.)
-- **Bignum.** Integers are `i64`; there is no automatic promotion to arbitrary
-  precision on overflow (unlike MRI).
+- **Bignum.** Integers auto-promote to arbitrary precision on overflow, like
+  MRI: values that fit stay `i64` immediates, and only the overflow path
+  allocates a `BigInt` heap object (backed by `num-bigint`). Arithmetic, bit
+  ops, `**`, comparison, `to_s(base)`, `bit_length`, and `digits` all cross the
+  boundary transparently.
 - **`rand`.** Seeded from the system clock (no `srand` determinism yet).
 - **Method surface.** The Enumerable/String/Hash/Range surface is broad but not
   exhaustive; an unimplemented method raises `undefined method '<name>'`.

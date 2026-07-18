@@ -1904,6 +1904,39 @@ fn format_positional_and_case_and_tr() {
 }
 
 #[test]
+fn bignum_arithmetic() {
+    // Integers auto-promote past i64 instead of overflowing.
+    eq("9223372036854775807 + 1", "9223372036854775808");
+    eq("2 ** 64", "18446744073709551616");
+    eq("2 ** 100", "1267650600228229401496703205376");
+    eq("1 << 64", "18446744073709551616");
+    eq("(10 ** 20) & 255", "0");
+    eq("(2 ** 64) + (2 ** 64)", "36893488147419103232");
+    eq("(2 ** 64) / 3", "6148914691236517205");
+    eq("(2 ** 64) % 7", "2");
+    eq("(2 ** 64) > (2 ** 63)", "true");
+    eq("(2 ** 64) == (2 ** 64)", "true");
+    eq("(2 ** 64).to_s(16)", "\"10000000000000000\"");
+    eq("(2 ** 64).bit_length", "65");
+    eq("(2 ** 64).class", "\"Integer\"");
+    // Factorials stay exact.
+    eq(
+        "def fact(n); (1..n).reduce(1) { |a, b| a * b }; end; fact(30)",
+        "265252859812191058636308480000000",
+    );
+}
+
+#[test]
+fn float_to_s_matches_ruby() {
+    eq("1e20", "1.0e+20");
+    eq("0.00001", "1.0e-05");
+    eq("0.0001", "0.0001");
+    eq("1000000.0", "1000000.0");
+    eq("(2 ** 64).to_f", "1.8446744073709552e+19");
+    eq("1.0 / 0", "Infinity");
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).

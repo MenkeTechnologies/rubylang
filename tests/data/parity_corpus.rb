@@ -506,3 +506,13 @@ puts("item %1$d costs $%2$.2f (that's %1$d units)" % [3, 4.5])
 puts "STRASSE".downcase(:ascii)
 puts "hello world".upcase(:ascii)
 puts "10:30:45".tr("0-9", "X")
+#==#
+puts 2 ** 128
+puts (1..30).reduce(1) { |a, b| a * b }
+puts (2 ** 100).to_s(16)
+puts (2 ** 80) % 1000000
+big = 10 ** 40
+puts big.bit_length
+puts (big / 7).to_s
+puts 1.0e20
+puts 0.00001

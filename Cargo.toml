@@ -107,5 +107,12 @@ toml = "0.8"
 regex = "1"
 glob = "0.3"
 
+# Arbitrary-precision integers: Ruby Integer auto-promotes past the i64 range
+# (2**64, factorials, …) instead of overflowing. Values that fit stay `i64`;
+# only the overflow path allocates a `BigInt` heap object.
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

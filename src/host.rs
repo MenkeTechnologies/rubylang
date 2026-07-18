@@ -127,6 +127,9 @@ pub enum RObj {
         default_proc: Option<Value>,
     },
     Symbol(String),
+    /// An integer that outgrew `i64` (Ruby auto-promotes; `Integer` has no
+    /// fixed width). Kept normalized: never holds a value that fits in `i64`.
+    BigInt(num_bigint::BigInt),
     Range {
         lo: i64,
         hi: i64,
@@ -486,6 +489,34 @@ impl RubyHost {
     pub fn hash_default_proc(&self, v: &Value) -> Option<Value> {
         match self.obj(v) {
             Some(RObj::Hash { default_proc, .. }) => default_proc.clone(),
+            _ => None,
+        }
+    }
+    /// Wrap a `BigInt` as a Ruby Integer, demoting to an immediate `Value::Int`
+    /// when it fits in `i64` (so ordinary-sized results never allocate).
+    pub fn new_bigint(&mut self, b: num_bigint::BigInt) -> Value {
+        use num_traits::ToPrimitive;
+        match b.to_i64() {
+            Some(n) => Value::Int(n),
+            None => self.alloc(RObj::BigInt(b)),
+        }
+    }
+    /// The stored `BigInt` if `v` is a *promoted* Integer (not an `i64`
+    /// immediate). Used to route BigInt receivers to arbitrary-precision code.
+    pub fn as_promoted_bigint(&self, v: &Value) -> Option<num_bigint::BigInt> {
+        match self.obj(v) {
+            Some(RObj::BigInt(b)) => Some(b.clone()),
+            _ => None,
+        }
+    }
+    /// View any Integer (`i64` immediate or promoted `BigInt`) as a `BigInt`.
+    pub fn as_bigint(&self, v: &Value) -> Option<num_bigint::BigInt> {
+        match v {
+            Value::Int(n) => Some(num_bigint::BigInt::from(*n)),
+            Value::Obj(_) => match self.obj(v) {
+                Some(RObj::BigInt(b)) => Some(b.clone()),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1268,6 +1299,7 @@ impl RubyHost {
             Value::Obj(_) => match self.obj(v).cloned() {
                 Some(RObj::Str(s)) => s,
                 Some(RObj::Symbol(s)) => s,
+                Some(RObj::BigInt(b)) => b.to_string(),
                 Some(RObj::Range { lo, hi, exclusive }) => {
                     format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
                 }
@@ -1308,6 +1340,7 @@ impl RubyHost {
             Value::Obj(_) => match self.obj(v).cloned() {
                 Some(RObj::Str(s)) => format!("{s:?}"),
                 Some(RObj::Symbol(s)) => format!(":{s}"),
+                Some(RObj::BigInt(b)) => b.to_string(),
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash { map, .. }) => self.inspect_hash(&map),
                 Some(RObj::Regexp { source, .. }) => format!("/{source}/"),
@@ -1374,6 +1407,7 @@ impl RubyHost {
             Value::Str(_) => "String",
             Value::Obj(_) => match self.obj(v) {
                 Some(RObj::Str(_)) => "String",
+                Some(RObj::BigInt(_)) => "Integer",
                 Some(RObj::Array(_)) => "Array",
                 Some(RObj::Hash { .. }) => "Hash",
                 Some(RObj::Symbol(_)) => "Symbol",
@@ -1429,6 +1463,32 @@ impl RubyHost {
             Ne => return Ok(Value::Bool(!self.eq_values(a, b))),
             _ => {}
         }
+        // Integer arithmetic that overflowed `i64`, or that involves a value
+        // already promoted to `BigInt`. Division/modulo floor toward negative
+        // infinity, matching Ruby.
+        if let (Some(x), Some(y)) = (self.as_bigint(a), self.as_bigint(b)) {
+            use num_integer::Integer as _;
+            use num_traits::Zero as _;
+            let arith = match op {
+                Add => Some(x.clone() + &y),
+                Sub => Some(x.clone() - &y),
+                Mul => Some(x.clone() * &y),
+                Div if !y.is_zero() => Some(x.div_floor(&y)),
+                Mod if !y.is_zero() => Some(x.mod_floor(&y)),
+                _ => None,
+            };
+            if let Some(v) = arith {
+                return Ok(self.new_bigint(v));
+            }
+            match op {
+                Div | Mod => return Err("divided by 0".to_string()),
+                Lt => return Ok(Value::Bool(x < y)),
+                Gt => return Ok(Value::Bool(x > y)),
+                Le => return Ok(Value::Bool(x <= y)),
+                Ge => return Ok(Value::Bool(x >= y)),
+                _ => {}
+            }
+        }
         // String and Array operators.
         match (self.obj(a).cloned(), op) {
             (Some(RObj::Str(s)), Add) => {
@@ -1475,6 +1535,17 @@ impl RubyHost {
             (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => *x as f64 == *y,
             (Value::Bool(x), Value::Bool(y)) => x == y,
             (Value::Undef, Value::Undef) => true,
+            // Integer equality across the i64/BigInt boundary (a promoted BigInt
+            // is never equal to an i64, since it never holds an in-range value,
+            // but two BigInts or a BigInt vs Int compare by value).
+            _ if matches!(self.obj(a), Some(RObj::BigInt(_)))
+                || matches!(self.obj(b), Some(RObj::BigInt(_))) =>
+            {
+                match (self.as_bigint(a), self.as_bigint(b)) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => false,
+                }
+            }
             _ => {
                 let (oa, ob) = (self.obj(a), self.obj(b));
                 match (oa, ob) {
@@ -1499,11 +1570,42 @@ impl RubyHost {
 
 /// Format an `f64` the way Ruby prints a Float (always shows a decimal point).
 fn fmt_float(f: f64) -> String {
-    if f == f.trunc() && f.is_finite() && f.abs() < 1e16 {
+    if !f.is_finite() {
+        return if f.is_nan() {
+            "NaN".to_string()
+        } else if f > 0.0 {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        };
+    }
+    let a = f.abs();
+    // Ruby prints very large / very small magnitudes in scientific notation.
+    if a != 0.0 && !(1e-4..1e16).contains(&a) {
+        return sci_notation(f);
+    }
+    if f == f.trunc() {
         format!("{f:.1}")
     } else {
         format!("{f}")
     }
+}
+
+/// Ruby-style scientific notation: `1.8446744073709552e+19`, `1.0e-05` — a
+/// mantissa that always shows a decimal point and a signed, ≥2-digit exponent.
+fn sci_notation(f: f64) -> String {
+    let s = format!("{f:e}"); // e.g. "1.8446744073709552e19" / "1e-5"
+    let (mant, exp) = s.split_once('e').unwrap_or((&s, "0"));
+    let mant = if mant.contains('.') {
+        mant.to_string()
+    } else {
+        format!("{mant}.0")
+    };
+    let (sign, digits) = match exp.strip_prefix('-') {
+        Some(d) => ("-", d),
+        None => ("+", exp),
+    };
+    format!("{mant}e{sign}{digits:0>2}")
 }
 
 fn as_int(v: &Value) -> Option<i64> {
