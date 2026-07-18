@@ -293,3 +293,10 @@ def config(host, port: 80, secure: false)
 end
 puts config("example.com")
 puts config("example.com", port: 8080, secure: true)
+#==#
+fruits = %w[apple banana cherry]
+puts fruits.length
+puts fruits.map(&:upcase).join(", ")
+syms = %i[red green blue]
+puts syms.inspect
+puts %w(one two three).reverse.inspect

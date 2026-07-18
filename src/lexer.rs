@@ -8,10 +8,11 @@
 //! terminator mid-expression — matching Ruby's own "expression clearly
 //! continues" rule.
 //!
-//! Not yet lexed (tracked in BUGS.md): heredocs, `%w[]`/`%i[]` literals, regex
-//! literals, `?c` character literals. Double-quoted `#{…}` interpolation IS
-//! handled — the interpolating scan is done in the parser from the raw string
-//! body this lexer captures.
+//! Not yet lexed (tracked in BUGS.md): heredocs, regex literals, `?c` character
+//! literals. `%w[]`/`%i[]` word/symbol arrays ARE lexed (expanded to synthetic
+//! array-literal tokens). Double-quoted `#{…}` interpolation IS handled — the
+//! interpolating scan is done in the parser from the raw string body this lexer
+//! captures.
 
 use std::fmt;
 
@@ -241,6 +242,71 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     kind: Tok::GVar(src[start..i].to_string()),
                     line,
                     space: core::mem::take(&mut sp),
+                });
+            }
+            // `%w[…]` / `%i[…]` word/symbol arrays → synthetic `[ … ]` tokens so
+            // the parser handles them as ordinary array literals.
+            b'%' if i + 2 < b.len()
+                && matches!(b[i + 1], b'w' | b'i' | b'W' | b'I')
+                && matches!(b[i + 2], b'[' | b'(' | b'{' | b'<' | b'|') =>
+            {
+                let symbols = matches!(b[i + 1], b'i' | b'I');
+                let open = b[i + 2];
+                let close = match open {
+                    b'[' => b']',
+                    b'(' => b')',
+                    b'{' => b'}',
+                    b'<' => b'>',
+                    other => other,
+                };
+                i += 3;
+                let start = i;
+                let mut depth = 1u32;
+                while i < b.len() {
+                    if b[i] == b'\n' {
+                        line += 1;
+                    }
+                    if b[i] == open && open != close {
+                        depth += 1;
+                    } else if b[i] == close {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                let body = &src[start..i.min(b.len())];
+                i += 1; // consume the closing delimiter
+                let words: Vec<&str> = body.split_whitespace().collect();
+                out.push(Token {
+                    kind: Tok::Op("[".into()),
+                    line,
+                    space: core::mem::take(&mut sp),
+                });
+                for (idx, w) in words.iter().enumerate() {
+                    if idx > 0 {
+                        out.push(Token {
+                            kind: Tok::Op(",".into()),
+                            line,
+                            space: false,
+                        });
+                    }
+                    let kind = if symbols {
+                        Tok::Symbol((*w).to_string())
+                    } else {
+                        Tok::Str((*w).to_string(), false)
+                    };
+                    out.push(Token {
+                        kind,
+                        line,
+                        space: false,
+                    });
+                }
+                out.push(Token {
+                    kind: Tok::Op("]".into()),
+                    line,
+                    space: false,
                 });
             }
             b':' if i + 1 < b.len() && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_') => {

@@ -162,3 +162,8 @@ square 2x2
 #==#
 http://example.com:80
 https://example.com:8080
+#==#
+3
+APPLE, BANANA, CHERRY
+[:red, :green, :blue]
+["three", "two", "one"]

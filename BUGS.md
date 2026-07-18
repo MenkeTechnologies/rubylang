@@ -46,9 +46,9 @@ capture.
 
 ## Lexer
 
-- **Not lexed:** heredocs (`<<~`, `<<-`), `%w[]` / `%i[]` word/symbol arrays,
-  regex literals (`/.../`), `?c` character literals, `__END__`. Double-quoted
-  `#{}` interpolation **is** supported.
+- **Not lexed:** heredocs (`<<~`, `<<-`), regex literals (`/.../`), `?c` character
+  literals, `__END__`. `%w[]` / `%i[]` word/symbol arrays (and the `()`/`{}`/`<>`
+  delimiter variants) **are** lexed, as is double-quoted `#{}` interpolation.
 
 ## Runtime / methods
 

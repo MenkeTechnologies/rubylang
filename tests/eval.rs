@@ -332,6 +332,18 @@ fn keyword_arguments() {
 }
 
 #[test]
+fn word_and_symbol_arrays() {
+    eq(
+        "%w[apple banana cherry]",
+        "[\"apple\", \"banana\", \"cherry\"]",
+    );
+    eq("%i[a b c]", "[:a, :b, :c]");
+    eq("%w(one two).reverse", "[\"two\", \"one\"]");
+    eq("%w[].length", "0");
+    eq("%w[a b c].map(&:upcase)", "[\"A\", \"B\", \"C\"]");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
