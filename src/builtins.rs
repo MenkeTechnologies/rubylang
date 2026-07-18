@@ -644,10 +644,13 @@ pub(crate) fn dispatch(
             }))
         }
         "class" => {
+            // `Object#class` returns the Class object (a class reference), not
+            // its name — so `5.class == Integer`, `obj.class.name`, and
+            // `p e.class` (prints the bare name) all behave like Ruby.
             return Ok(with_host(|h| {
-                let s = h.class_of(recv).to_string();
-                h.new_string(s)
-            }))
+                let name = h.class_of(recv).to_string();
+                h.class_ref(&name)
+            }));
         }
         "nil?" => return Ok(Value::Bool(matches!(recv, Value::Undef))),
         "==" => return Ok(Value::Bool(with_host(|h| h.eq_values(recv, &args[0])))),

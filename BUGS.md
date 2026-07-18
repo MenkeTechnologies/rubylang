@@ -75,8 +75,11 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   quote as a string delimiter; reference them outside interpolation.) Backed by
   the Rust `regex` crate, so Ruby's Onigmo-only constructs (backreferences within
   the pattern, lookaround) are unavailable.
-- **`Object#class` returns a String** (the class name), not a `Class` object;
-  `.class.name` and class-object identity are therefore unsupported.
+- **`Object#class` returns a Class object** (a class reference): `p obj.class`
+  prints the bare name, `obj.class == SomeClass` and `Integer == Integer`
+  compare by class identity, and `obj.class.name` / `.to_s` give the name. Not
+  yet: `Class#ancestors`/`#superclass`, and a Class object does not round-trip as
+  a Hash key (it reduces to its name String).
 - **Enumerator.** A block-less `each`/`map`/`select`/`reject`/`each_with_index`
   (on arrays), `String#each_char`/`each_byte`/`each_line`, and
   `Integer#times`/`upto`/`downto`/`step`

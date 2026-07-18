@@ -2282,6 +2282,9 @@ impl RubyHost {
                             exclusive: bx,
                         }),
                     ) => al == bl && ah == bh && ax == bx,
+                    // Two class references are equal when they name the same
+                    // class (`5.class == Integer`, `Integer == Integer`).
+                    (Some(RObj::ClassRef(x)), Some(RObj::ClassRef(y))) => x == y,
                     // Two Times are equal when they name the same instant.
                     (Some(RObj::Time { secs: x }), Some(RObj::Time { secs: y })) => x == y,
                     // Two Dates are equal when they name the same day.

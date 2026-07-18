@@ -934,3 +934,23 @@ prices = [1.5, 2.25, 0.75]
 exact = prices.map(&:to_r)
 puts exact.inspect
 puts exact.sum.inspect
+#==#
+values = [42, 3.14, "hello", :sym, [1, 2], {a: 1}, nil, true]
+values.each { |v| puts v.class }
+puts values.map { |v| v.class.name }.inspect
+puts(5.class == Integer)
+puts("x".class == String)
+puts(5.class == Float)
+class Animal; end
+class Dog < Animal; end
+d = Dog.new
+puts d.class
+puts(d.class == Dog)
+puts d.class.name
+begin
+  Integer("not a number")
+rescue => e
+  puts "#{e.class}: caught"
+end
+puts values.map(&:class).uniq.length
+puts values.count { |v| v.class == Integer }

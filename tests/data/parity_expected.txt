@@ -516,3 +516,22 @@ unseen
 []
 [(3/2), (9/4), (3/4)]
 (9/2)
+#==#
+Integer
+Float
+String
+Symbol
+Array
+Hash
+NilClass
+TrueClass
+["Integer", "Float", "String", "Symbol", "Array", "Hash", "NilClass", "TrueClass"]
+true
+true
+false
+Dog
+true
+Dog
+ArgumentError: caught
+8
+1

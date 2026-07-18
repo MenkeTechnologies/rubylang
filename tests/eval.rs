@@ -558,7 +558,7 @@ fn regexp_batch() {
         "[\"CAT\", \"DOG\"]",
     );
     // Regexp object + case-equality.
-    eq("/\\d+/.class", "\"Regexp\"");
+    eq("/\\d+/.class", "Regexp");
     eq("/ab/.source", "\"ab\"");
     eq("/AB/i.match?(\"xabx\")", "true");
     eq(
@@ -569,7 +569,7 @@ fn regexp_batch() {
 
 #[test]
 fn matchdata_batch() {
-    eq("\"hello\".match(/l(l)/).class", "\"MatchData\"");
+    eq("\"hello\".match(/l(l)/).class", "MatchData");
     eq("\"hello\".match(/l(l)/)[0]", "\"ll\"");
     eq("\"hello\".match(/l(l)/)[1]", "\"l\"");
     eq("\"hello\".match(/l(l)/).pre_match", "\"he\"");
@@ -1940,7 +1940,7 @@ fn bignum_arithmetic() {
     eq("(2 ** 64) == (2 ** 64)", "true");
     eq("(2 ** 64).to_s(16)", "\"10000000000000000\"");
     eq("(2 ** 64).bit_length", "65");
-    eq("(2 ** 64).class", "\"Integer\"");
+    eq("(2 ** 64).class", "Integer");
     // Factorials stay exact.
     eq(
         "def fact(n); (1..n).reduce(1) { |a, b| a * b }; end; fact(30)",
@@ -2354,6 +2354,42 @@ fn time_utc() {
     eq(
         "t = Time.at(-1).utc; [t.month, t.day, t.hour, t.min, t.sec]",
         "[12, 31, 23, 59, 59]",
+    );
+}
+
+#[test]
+fn object_class_returns_class_object() {
+    // `.class` is a Class object (prints the bare name), not its String name.
+    eq("5.class", "Integer");
+    eq("\"x\".class", "String");
+    eq("[1].class", "Array");
+    eq(":s.class", "Symbol");
+    eq("nil.class", "NilClass");
+    eq("3.14.class", "Float");
+    eq("(2 ** 64).class", "Integer");
+    eq("{}.class", "Hash");
+    // Class-object identity: `obj.class == SomeClass`.
+    eq("5.class == Integer", "true");
+    eq("\"x\".class == String", "true");
+    eq("5.class == String", "false");
+    eq("1.0.class == Float", "true");
+    eq("Integer == Integer", "true");
+    // `.class.name` / `.class.to_s` give the name String.
+    eq("5.class.name", "\"Integer\"");
+    eq("[].class.to_s", "\"Array\"");
+    // A user class instance.
+    eq("class Widget; end; Widget.new.class == Widget", "true");
+    eq("class Widget; end; Widget.new.class.name", "\"Widget\"");
+    // Rescued exceptions report their Class.
+    eq(
+        "begin; raise ArgumentError, \"y\"; rescue => e; e.class == ArgumentError; end",
+        "true",
+    );
+    // Interpolation and mapping.
+    eq("\"#{5.class}\"", "\"Integer\"");
+    eq(
+        "[1, \"a\", :b].map { |x| x.class }",
+        "[Integer, String, Symbol]",
     );
 }
 
