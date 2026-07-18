@@ -1568,8 +1568,14 @@ fn dispatch_array(
                 .collect(),
         )),
         "flatten" => {
+            // `flatten` recurses fully; `flatten(n)` flattens at most n levels.
+            // A negative/nil depth means unbounded, matching MRI.
+            let depth = match args.first() {
+                Some(Value::Undef) | None => -1,
+                Some(n) => as_i(n),
+            };
             let mut out = Vec::new();
-            flatten_into(&arr, &mut out);
+            flatten_depth_into(&arr, depth, &mut out);
             Ok(new_arr(out))
         }
         "concat" => {
@@ -1853,7 +1859,43 @@ fn dispatch_array(
         "each_slice" => {
             let n = as_i(&args[0]).max(1) as usize;
             let slices: Vec<Value> = arr.chunks(n).map(|c| new_arr(c.to_vec())).collect();
-            Ok(new_arr(slices))
+            if let Some(bl) = &block {
+                for s in &slices {
+                    call_proc(bl, std::slice::from_ref(s))?;
+                    if has_pending_signal() {
+                        take_break();
+                        break;
+                    }
+                }
+                // MRI returns the receiver when a block is given.
+                Ok(recv.clone())
+            } else {
+                // No lazy Enumerator yet: return the slices array (usable with
+                // `.to_a`/`.map`/`.each`).
+                Ok(new_arr(slices))
+            }
+        }
+        "chunk_while" => {
+            // Split into runs; a new run starts whenever the block returns
+            // falsey for an adjacent pair (elem[i-1], elem[i]).
+            let mut chunks: Vec<Value> = Vec::new();
+            if let Some(bl) = &block {
+                let mut cur: Vec<Value> = Vec::new();
+                for x in &arr {
+                    if let Some(prev) = cur.last() {
+                        let r = call_proc(bl, &[prev.clone(), x.clone()])?;
+                        if !with_host(|h| h.truthy(&r)) {
+                            chunks.push(new_arr(std::mem::take(&mut cur)));
+                        }
+                    }
+                    cur.push(x.clone());
+                }
+                if !cur.is_empty() {
+                    chunks.push(new_arr(cur));
+                }
+            }
+            // No lazy Enumerator yet: return the chunk array (usable with `.to_a`).
+            Ok(new_arr(chunks))
         }
         "to_h" => {
             let mut m = IndexMap::new();
@@ -1906,12 +1948,12 @@ fn sort_by_family(
     }
 }
 
-fn flatten_into(arr: &[Value], out: &mut Vec<Value>) {
+/// Flatten at most `depth` levels; a negative `depth` means unbounded.
+fn flatten_depth_into(arr: &[Value], depth: i64, out: &mut Vec<Value>) {
     for x in arr {
-        if let Some(inner) = with_host(|h| h.as_array(x)) {
-            flatten_into(&inner, out);
-        } else {
-            out.push(x.clone());
+        match with_host(|h| h.as_array(x)) {
+            Some(inner) if depth != 0 => flatten_depth_into(&inner, depth - 1, out),
+            _ => out.push(x.clone()),
         }
     }
 }

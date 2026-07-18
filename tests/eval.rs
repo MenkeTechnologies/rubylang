@@ -588,6 +588,32 @@ fn string_case_batch() {
 }
 
 #[test]
+fn array_transform_batch() {
+    // Each expected string is the `.inspect` form, byte-matched against `ruby`.
+    eq("[1,[2,[3]]].flatten(1)", "[1, 2, [3]]");
+    eq("[1,[2,[3,[4]]]].flatten(2)", "[1, 2, 3, [4]]");
+    eq("[1,[2,[3]]].flatten", "[1, 2, 3]");
+    eq("[1,nil,2,nil].compact", "[1, 2]");
+    eq("[1,2,3,4,5].rotate(2)", "[3, 4, 5, 1, 2]");
+    eq("[1,2,3,4].rotate", "[2, 3, 4, 1]");
+    eq("[1,2,3,4].each_slice(2).to_a", "[[1, 2], [3, 4]]");
+    eq("[1,2,3,4,5,6].partition(&:even?)", "[[2, 4, 6], [1, 3, 5]]");
+    eq(
+        "[\"a\",\"a\",\"b\",\"c\",\"c\",\"c\"].tally",
+        "{\"a\" => 2, \"b\" => 1, \"c\" => 3}",
+    );
+    eq("[1,2,3,4,5].take(3)", "[1, 2, 3]");
+    eq("[1,2,3,4,5].drop(2)", "[3, 4, 5]");
+    eq("[1,2,3,4,1].take_while {|x| x < 3}", "[1, 2]");
+    eq("[1,2,3,4,1].drop_while {|x| x < 3}", "[3, 4, 1]");
+    eq(
+        "[1,2,4,9,10,11,12,0].chunk_while {|i,j| i+1==j}.to_a",
+        "[[1, 2], [4], [9, 10, 11, 12], [0]]",
+    );
+    eq("[1,2,3].flat_map {|x| [x,-x]}", "[1, -1, 2, -2, 3, -3]");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
