@@ -1803,6 +1803,29 @@ fn method_objects_batch() {
 }
 
 #[test]
+fn block_and_lambda_splat_params() {
+    // Symbol#to_proc forwards surplus args, so it works as a reduce operator.
+    eq("[1, 2, 3, 4].inject(&:+)", "10");
+    eq("[1, 2, 3, 4].reduce(&:*)", "24");
+    eq("[1, 2, 3].reduce(10, &:+)", "16");
+    // A `*rest` block param collects the surplus positional args into an array.
+    eq(
+        "r = []; [1, 2, 3].each { |*x| r << x }; r",
+        "[[1], [2], [3]]",
+    );
+    eq("[[1, 2], [3, 4]].map { |*a| a }", "[[[1, 2]], [[3, 4]]]");
+    eq(
+        "[1, 2, 3].map { |x, *rest| [x, rest] }",
+        "[[1, []], [2, []], [3, []]]",
+    );
+    // Lambda splat params.
+    eq("sq = ->(*a) { a.sum }; sq.call(1, 2, 3)", "6");
+    eq("f = ->(a, *b) { [a, b] }; f.call(1, 2, 3)", "[1, [2, 3]]");
+    // Auto-splat of a two-param block over pair elements still works.
+    eq("[[1, 10], [2, 20]].map { |k, v| k + v }", "[11, 22]");
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).
@@ -1817,7 +1840,10 @@ fn no_panic_on_edge_inputs() {
     // A required argument omitted raises ArgumentError instead of panicking.
     assert!(ev("10.gcd").is_err());
     assert!(ev("10.ceildiv").is_err());
-    eq("begin; 10.gcd; rescue ArgumentError; :caught; end", ":caught");
+    eq(
+        "begin; 10.gcd; rescue ArgumentError; :caught; end",
+        ":caught",
+    );
 }
 
 #[test]

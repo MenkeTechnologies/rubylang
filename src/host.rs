@@ -258,6 +258,8 @@ pub struct MethodDef {
 #[derive(Clone)]
 pub struct ProcDef {
     pub params: Vec<String>,
+    /// Index of a `*rest` splat parameter, if any.
+    pub splat: Option<usize>,
     pub chunk: Chunk,
 }
 
@@ -1871,7 +1873,9 @@ pub fn call_proc(proc_val: &Value, args: &[Value]) -> Result<Value, String> {
 
     let def = with_host(|h| h.procs[template].clone());
 
-    // Auto-splat: `pairs.each { |k, v| … }` over `[k, v]` elements.
+    // Auto-splat: a block with more than one parameter slot destructures a single
+    // array argument — `pairs.each { |k, v| … }`, and also `{ |first, *rest| … }`.
+    // A lone `*rest` (one slot) does not auto-splat.
     let bound: Vec<Value> = if def.params.len() > 1 && args.len() == 1 {
         match with_host(|h| h.as_array(&args[0])) {
             Some(items) => items,
@@ -1885,11 +1889,35 @@ pub fn call_proc(proc_val: &Value, args: &[Value]) -> Result<Value, String> {
     // params are block-local while enclosing variables stay read/writable — and a
     // closure created inside keeps this env alive (via `Rc`) after the block ends.
     let child = child_env(scope.locals.clone());
-    for (i, p) in def.params.iter().enumerate() {
-        child
-            .borrow_mut()
-            .vars
-            .insert(p.clone(), bound.get(i).cloned().unwrap_or(Value::Undef));
+    match def.splat {
+        None => {
+            for (i, p) in def.params.iter().enumerate() {
+                child
+                    .borrow_mut()
+                    .vars
+                    .insert(p.clone(), bound.get(i).cloned().unwrap_or(Value::Undef));
+            }
+        }
+        Some(si) => {
+            // Params before the splat bind positionally; the splat collects the
+            // middle; params after it bind from the end.
+            let after = def.params.len() - si - 1;
+            for (i, p) in def.params.iter().take(si).enumerate() {
+                let v = bound.get(i).cloned().unwrap_or(Value::Undef);
+                child.borrow_mut().vars.insert(p.clone(), v);
+            }
+            let splat_end = bound.len().saturating_sub(after).max(si);
+            let rest: Vec<Value> = bound
+                .get(si..splat_end)
+                .map(|s| s.to_vec())
+                .unwrap_or_default();
+            let arr = with_host(|h| h.new_array(rest));
+            child.borrow_mut().vars.insert(def.params[si].clone(), arr);
+            for (j, p) in def.params.iter().skip(si + 1).enumerate() {
+                let v = bound.get(splat_end + j).cloned().unwrap_or(Value::Undef);
+                child.borrow_mut().vars.insert(p.clone(), v);
+            }
+        }
     }
     let block_scope = Scope {
         locals: child,

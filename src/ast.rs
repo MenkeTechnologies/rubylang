@@ -55,6 +55,9 @@ pub enum VarKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     pub params: Vec<String>,
+    /// Index into `params` of a `*rest` splat parameter, if any (collects the
+    /// surplus positional args into an array).
+    pub splat: Option<usize>,
     pub body: Vec<Expr>,
 }
 

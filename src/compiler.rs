@@ -656,6 +656,7 @@ impl Compiler {
         // so `v` and any assignments leak, matching Ruby's `for`).
         let block = Block {
             params: vec![var.to_string()],
+            splat: None,
             body: body.to_vec(),
         };
         let call = Expr::Call {
@@ -791,7 +792,7 @@ impl Compiler {
     }
 
     fn compile_proc(&mut self, block: &Block) -> Result<usize, String> {
-        self.compile_proc_body(&block.body, &block.params)
+        self.compile_proc_body(&block.body, &block.params, block.splat)
     }
 
     /// Emit code leaving a single array on the stack that is `items` flattened
@@ -812,11 +813,17 @@ impl Compiler {
     }
 
     /// Compile a body into a proc template with the given params; return its id.
-    fn compile_proc_body(&mut self, body: &[Expr], params: &[String]) -> Result<usize, String> {
+    fn compile_proc_body(
+        &mut self,
+        body: &[Expr],
+        params: &[String],
+        splat: Option<usize>,
+    ) -> Result<usize, String> {
         let chunk = self.compile_body_chunk(body)?;
         let id = self.procs.len();
         self.procs.push(ProcDef {
             params: params.to_vec(),
+            splat,
             chunk,
         });
         Ok(id)
@@ -940,11 +947,11 @@ impl Compiler {
         rescues: &[Rescue],
         ensure: &Option<Vec<Expr>>,
     ) -> Result<(), String> {
-        let body_id = self.compile_proc_body(body, &[])?;
+        let body_id = self.compile_proc_body(body, &[], None)?;
         let mut rdefs = Vec::new();
         for r in rescues {
             let params: Vec<String> = r.binding.iter().cloned().collect();
-            let rid = self.compile_proc_body(&r.body, &params)?;
+            let rid = self.compile_proc_body(&r.body, &params, None)?;
             rdefs.push(RescueDef {
                 classes: r.classes.clone(),
                 binding: r.binding.clone(),
@@ -952,7 +959,7 @@ impl Compiler {
             });
         }
         let ensure_id = match ensure {
-            Some(e) => Some(self.compile_proc_body(e, &[])?),
+            Some(e) => Some(self.compile_proc_body(e, &[], None)?),
             None => None,
         };
         let begin_id = self.begins.len();

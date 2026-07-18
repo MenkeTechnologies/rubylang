@@ -56,8 +56,8 @@ type CClass = (
 type CRescue = (Vec<String>, Option<String>, usize);
 /// (body proc id, rescues, ensure proc id) — a serde-flat begin block.
 type CBegin = (usize, Vec<CRescue>, Option<usize>);
-/// (params, chunk) — a serde-flat proc template.
-type CProc = (Vec<String>, Chunk);
+/// (params, splat index, chunk) — a serde-flat proc template.
+type CProc = (Vec<String>, Option<usize>, Chunk);
 
 /// The inner, serde/bincode form of a compiled program. Tuples keep the shape
 /// flat so `fusevm::Chunk`'s serde impl is the only nontrivial dependency.
@@ -180,7 +180,7 @@ fn to_cprog(prog: &Program) -> CProg {
         procs: prog
             .procs
             .iter()
-            .map(|p| (p.params.clone(), p.chunk.clone()))
+            .map(|p| (p.params.clone(), p.splat, p.chunk.clone()))
             .collect(),
     }
 }
@@ -228,7 +228,11 @@ fn from_cprog(cp: CProg) -> Program {
         procs: cp
             .procs
             .into_iter()
-            .map(|(params, chunk)| ProcDef { params, chunk })
+            .map(|(params, splat, chunk)| ProcDef {
+                params,
+                splat,
+                chunk,
+            })
             .collect(),
     }
 }

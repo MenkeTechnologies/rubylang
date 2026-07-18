@@ -268,3 +268,9 @@ nil
 ["one:1", "two:2", "three:3"]
 h3ll0 w0rld
 twozerotwo
+#==#
+15
+24
+106
+60
+["1|[2]", "3|[4]"]

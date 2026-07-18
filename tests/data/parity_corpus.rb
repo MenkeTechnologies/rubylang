@@ -469,3 +469,10 @@ r = []
 puts r.inspect
 puts "hello world".gsub(/[aeiou]/, "a" => "4", "e" => "3", "o" => "0")
 puts "2024".gsub(/\d/, "0" => "zero", "2" => "two")
+#==#
+puts [1, 2, 3, 4, 5].inject(&:+)
+puts [1, 2, 3, 4].reduce(&:*)
+puts [1, 2, 3].reduce(100, &:+)
+total = ->(*nums) { nums.sum }
+puts total.call(10, 20, 30)
+puts [[1, 2], [3, 4]].map { |first, *rest| "#{first}|#{rest.inspect}" }.inspect

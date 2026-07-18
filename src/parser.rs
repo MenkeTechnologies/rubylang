@@ -518,14 +518,20 @@ impl Parser {
                             // `&:sym` — inline the send as `{ |__blkx__| __blkx__.sym }`.
             if let Tok::Symbol(s) = self.peek().clone() {
                 self.advance(); // :sym
+                                // `{ |__blkx__, *__rest__| __blkx__.sym(*__rest__) }` — Symbol#to_proc
+                                // forwards surplus args, so `reduce(&:+)` calls `acc.+(x)`.
                 let call = Expr::Call {
                     recv: Some(Box::new(Expr::Var(VarKind::Local, "__blkx__".into()))),
                     name: s,
-                    args: vec![],
+                    args: vec![Expr::Splat(Box::new(Expr::Var(
+                        VarKind::Local,
+                        "__rest__".into(),
+                    )))],
                     block: None,
                 };
                 *amp_block = Some(Block {
-                    params: vec!["__blkx__".into()],
+                    params: vec!["__blkx__".into(), "__rest__".into()],
+                    splat: Some(1),
                     body: vec![call],
                 });
                 return Ok(());
@@ -541,6 +547,7 @@ impl Parser {
             };
             *amp_block = Some(Block {
                 params: vec!["__blkx__".into()],
+                splat: None,
                 body: vec![call],
             });
             return Ok(());
@@ -566,14 +573,18 @@ impl Parser {
 
     fn maybe_block(&mut self) -> Result<Option<Block>, String> {
         if self.eat_kw("do") {
-            let params = self.block_params()?;
+            let (params, splat) = self.block_params()?;
             let body = self.body_until(&["end"])?;
             self.expect_kw("end")?;
-            return Ok(Some(Block { params, body }));
+            return Ok(Some(Block {
+                params,
+                splat,
+                body,
+            }));
         }
         if self.is_op("{") {
             self.advance();
-            let params = self.block_params()?;
+            let (params, splat) = self.block_params()?;
             let mut body = Vec::new();
             self.skip_terms();
             while !self.is_op("}") && !matches!(self.peek(), Tok::Eof) {
@@ -581,23 +592,42 @@ impl Parser {
                 self.skip_terms();
             }
             self.expect_op("}")?;
-            return Ok(Some(Block { params, body }));
+            return Ok(Some(Block {
+                params,
+                splat,
+                body,
+            }));
         }
         Ok(None)
     }
 
-    fn block_params(&mut self) -> Result<Vec<String>, String> {
+    fn block_params(&mut self) -> Result<(Vec<String>, Option<usize>), String> {
         let mut params = Vec::new();
+        let mut splat = None;
         if self.eat_op("|") {
             if !self.is_op("|") {
-                params.push(self.ident_name()?);
+                self.block_param(&mut params, &mut splat)?;
                 while self.eat_op(",") {
-                    params.push(self.ident_name()?);
+                    self.block_param(&mut params, &mut splat)?;
                 }
             }
             self.expect_op("|")?;
         }
-        Ok(params)
+        Ok((params, splat))
+    }
+
+    /// One block/lambda parameter: `name` or `*rest` (the splat collects surplus
+    /// positional args). Records the splat index when it sees `*`.
+    fn block_param(
+        &mut self,
+        params: &mut Vec<String>,
+        splat: &mut Option<usize>,
+    ) -> Result<(), String> {
+        if self.eat_op("*") {
+            *splat = Some(params.len());
+        }
+        params.push(self.ident_name()?);
+        Ok(())
     }
 
     fn ident_name(&mut self) -> Result<String, String> {
@@ -1158,11 +1188,14 @@ impl Parser {
     fn lambda_lit(&mut self) -> Result<Expr, String> {
         self.expect_op("->")?;
         let mut params = Vec::new();
+        let mut splat = None;
+        let mut had_parens = false;
         if self.eat_op("(") {
+            had_parens = true;
             if !self.is_op(")") {
-                params.push(self.ident_name()?);
+                self.block_param(&mut params, &mut splat)?;
                 while self.eat_op(",") {
-                    params.push(self.ident_name()?);
+                    self.block_param(&mut params, &mut splat)?;
                 }
             }
             self.expect_op(")")?;
@@ -1171,12 +1204,16 @@ impl Parser {
         let block = self
             .maybe_block()?
             .ok_or_else(|| format!("line {}: lambda without a body", self.line()))?;
+        // Params from the `->()` header win; if there were none, adopt the
+        // block's own `{ |x| }` params (and its splat).
+        let (params, splat) = if had_parens {
+            (params, splat)
+        } else {
+            (block.params, block.splat)
+        };
         Ok(Expr::Lambda(Block {
-            params: if params.is_empty() {
-                block.params
-            } else {
-                params
-            },
+            params,
+            splat,
             body: block.body,
         }))
     }
