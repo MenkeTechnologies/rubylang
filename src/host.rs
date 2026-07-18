@@ -3,9 +3,10 @@
 //!
 //! rubylang owns no VM and no JIT: the compiler lowers Ruby to `fusevm::Chunk`,
 //! and every Ruby-specific operation the VM can't do natively is a builtin call
-//! that lands here. Because the host is a thread-local, a method or block body
-//! run as a *nested* fusevm VM automatically shares the caller's lexical scope
-//! — which is exactly Ruby's block-capture semantics, for free.
+//! that lands here. Local variables live in `Rc<RefCell>` environments chained
+//! parent-to-child, so a block/lambda captures its defining scope by reference —
+//! keeping those variables alive and shared after the method returns (real Ruby
+//! closure semantics), while block params stay block-local.
 //!
 //! Value representation:
 //!   - immediate: `Value::Int` (Integer), `Value::Float` (Float),
@@ -16,6 +17,53 @@
 use fusevm::{Chunk, NumOp, VMResult, Value, VM};
 use indexmap::IndexMap;
 use std::cell::RefCell;
+use std::rc::Rc;
+
+/// A local-variable environment, shared (by `Rc`) between a frame and any block
+/// or lambda that captures it — so a closure keeps its variables alive after the
+/// defining method returns, and closure/enclosing mutations are mutually visible.
+/// A block gets its own env whose `parent` is the captured one, so block params
+/// are block-local while enclosing variables remain read/writable (Ruby's scope
+/// chain). Method frames have no parent (a fresh scope).
+pub struct EnvData {
+    vars: IndexMap<String, Value>,
+    parent: Option<Env>,
+}
+pub type Env = Rc<RefCell<EnvData>>;
+
+fn new_env() -> Env {
+    Rc::new(RefCell::new(EnvData {
+        vars: IndexMap::new(),
+        parent: None,
+    }))
+}
+fn env_with(vars: IndexMap<String, Value>) -> Env {
+    Rc::new(RefCell::new(EnvData { vars, parent: None }))
+}
+fn child_env(parent: Env) -> Env {
+    Rc::new(RefCell::new(EnvData {
+        vars: IndexMap::new(),
+        parent: Some(parent),
+    }))
+}
+
+/// The lexical + dynamic context a block/lambda captures: its variable
+/// environment plus the `self`, block, and method identity in effect where it
+/// was written.
+#[derive(Clone)]
+pub struct Scope {
+    locals: Env,
+    self_obj: Value,
+    block: Option<Value>,
+    method_name: Option<String>,
+    def_class: Option<String>,
+}
+
+impl std::fmt::Debug for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<scope>")
+    }
+}
 
 /// Builtin ids emitted by the compiler and registered on every VM.
 pub mod ops {
@@ -67,13 +115,12 @@ pub enum RObj {
         hi: i64,
         exclusive: bool,
     },
-    /// A block/proc: its compiled template plus the frame index it was created
-    /// in (Ruby blocks capture the *lexical* scope where they appear, so a block
-    /// passed down into another method and `yield`ed still reads the enclosing
-    /// method's locals, not the callee's).
+    /// A block/proc/lambda: its compiled template plus the captured lexical
+    /// scope (Ruby blocks read and write the variables of the scope where they
+    /// appear, even after that method has returned).
     Proc {
         template: usize,
-        frame: usize,
+        scope: Scope,
     },
     /// A user-defined object: its class name and its instance variables.
     Object {
@@ -145,17 +192,10 @@ pub struct ProcDef {
     pub chunk: Chunk,
 }
 
-/// One lexical scope frame (a method activation, or the top level).
+/// One method activation (or the top level): its captured scope plus the args it
+/// was called with (for a bare `super`).
 struct Frame {
-    locals: IndexMap<String, Value>,
-    block: Option<Value>,
-    /// The receiver `self` this frame runs against (`Undef` = top-level main).
-    self_obj: Value,
-    /// The running method's name and the class it was defined in, plus the args
-    /// it was called with — for `super` (which resumes the lookup above
-    /// `def_class` and, bare, forwards these args).
-    method_name: Option<String>,
-    def_class: Option<String>,
+    scope: Scope,
     args: Vec<Value>,
 }
 
@@ -182,10 +222,10 @@ pub struct RubyHost {
     /// The exception object of the in-flight `raise`, if any (for `rescue`).
     pending_exc: Option<Value>,
     signal: Option<Signal>,
-    /// The frame local variable access targets. `None` = the top of the frame
-    /// stack (a method body / top level); `Some(i)` = a captured frame while a
-    /// block created in frame `i` is running.
-    active_frame: Option<usize>,
+    /// The scope local/`self`/block access targets. `None` = the top frame (a
+    /// method body / top level); `Some(scope)` = a captured scope while a block
+    /// or lambda that captured it is running.
+    active_scope: Option<Scope>,
 }
 
 thread_local! {
@@ -213,11 +253,13 @@ impl RubyHost {
         RubyHost {
             heap: Vec::new(),
             frames: vec![Frame {
-                locals: IndexMap::new(),
-                block: None,
-                self_obj: Value::Undef,
-                method_name: None,
-                def_class: None,
+                scope: Scope {
+                    locals: new_env(),
+                    block: None,
+                    self_obj: Value::Undef,
+                    method_name: None,
+                    def_class: None,
+                },
                 args: Vec::new(),
             }],
             globals: IndexMap::new(),
@@ -230,7 +272,7 @@ impl RubyHost {
             error: None,
             pending_exc: None,
             signal: None,
-            active_frame: None,
+            active_scope: None,
         }
     }
 
@@ -288,10 +330,10 @@ impl RubyHost {
     pub fn new_range(&mut self, lo: i64, hi: i64, exclusive: bool) -> Value {
         self.alloc(RObj::Range { lo, hi, exclusive })
     }
-    /// Create a proc capturing the currently-active frame as its lexical scope.
+    /// Create a proc capturing the currently-active scope (shared by `Rc`).
     pub fn new_proc(&mut self, template: usize) -> Value {
-        let frame = self.active_idx();
-        self.alloc(RObj::Proc { template, frame })
+        let scope = self.cur_scope().clone();
+        self.alloc(RObj::Proc { template, scope })
     }
     pub fn new_symbol(&mut self, name: &str) -> Value {
         self.intern(name)
@@ -397,27 +439,60 @@ impl RubyHost {
 
     // ---- variable / scope -------------------------------------------------
 
-    /// The index of the frame local variable access should target.
-    fn active_idx(&self) -> usize {
-        self.active_frame.unwrap_or(self.frames.len() - 1)
+    /// The scope local/`self`/block access should target: a captured scope while
+    /// a block runs, else the top method frame.
+    fn cur_scope(&self) -> &Scope {
+        self.active_scope
+            .as_ref()
+            .unwrap_or(&self.frames.last().unwrap().scope)
     }
-    fn frame(&mut self) -> &mut Frame {
-        let i = self.active_idx();
-        &mut self.frames[i]
+    /// The active local-variable environment (shared, interior-mutable).
+    fn cur_env(&self) -> Env {
+        self.cur_scope().locals.clone()
     }
-    pub fn get_local(&mut self, name: &str) -> Value {
-        let i = self.active_idx();
-        self.frames[i]
-            .locals
-            .get(name)
-            .cloned()
-            .unwrap_or(Value::Undef)
+    /// Read a local, walking the scope chain to enclosing environments.
+    pub fn get_local(&self, name: &str) -> Value {
+        let mut env = self.cur_env();
+        loop {
+            if let Some(v) = env.borrow().vars.get(name).cloned() {
+                return v;
+            }
+            let parent = env.borrow().parent.clone();
+            match parent {
+                Some(p) => env = p,
+                None => return Value::Undef,
+            }
+        }
     }
-    pub fn set_local(&mut self, name: &str, v: Value) {
-        self.frame().locals.insert(name.to_string(), v);
+    /// Assign a local: update it where it already exists in the chain (so a block
+    /// mutates an enclosing variable), else create it in the innermost scope.
+    pub fn set_local(&self, name: &str, v: Value) {
+        let mut env = self.cur_env();
+        loop {
+            if env.borrow().vars.contains_key(name) {
+                env.borrow_mut().vars.insert(name.to_string(), v);
+                return;
+            }
+            let parent = env.borrow().parent.clone();
+            match parent {
+                Some(p) => env = p,
+                None => break,
+            }
+        }
+        self.cur_env().borrow_mut().vars.insert(name.to_string(), v);
     }
     pub fn local_defined(&self, name: &str) -> bool {
-        self.frames[self.active_idx()].locals.contains_key(name)
+        let mut env = self.cur_env();
+        loop {
+            if env.borrow().vars.contains_key(name) {
+                return true;
+            }
+            let parent = env.borrow().parent.clone();
+            match parent {
+                Some(p) => env = p,
+                None => return false,
+            }
+        }
     }
     pub fn get_global(&self, name: &str) -> Value {
         self.globals.get(name).cloned().unwrap_or(Value::Undef)
@@ -466,7 +541,7 @@ impl RubyHost {
 
     /// The receiver of the currently-active frame.
     pub fn current_self(&self) -> Value {
-        self.frames[self.active_idx()].self_obj.clone()
+        self.cur_scope().self_obj.clone()
     }
     /// Register a user class.
     pub fn add_class(&mut self, name: String, def: ClassDef) {
@@ -707,12 +782,12 @@ impl RubyHost {
 
     /// The `self`, method name, and defining class of the current frame (`super`).
     pub fn super_context(&self) -> (Value, Option<String>, Option<String>, Vec<Value>) {
-        let f = &self.frames[self.active_idx()];
+        let s = self.cur_scope();
         (
-            f.self_obj.clone(),
-            f.method_name.clone(),
-            f.def_class.clone(),
-            f.args.clone(),
+            s.self_obj.clone(),
+            s.method_name.clone(),
+            s.def_class.clone(),
+            self.frames.last().unwrap().args.clone(),
         )
     }
 
@@ -1052,7 +1127,7 @@ fn run_method(
     def_class: Option<String>,
 ) -> Result<Value, String> {
     let saved_active = with_host(|h| {
-        let mut locals = h.bind_params(
+        let mut binding = h.bind_params(
             &def.params,
             def.splat,
             &def.kwparams,
@@ -1061,22 +1136,26 @@ fn run_method(
         );
         // `&blk` captures the passed block as a Proc (or nil if none was given).
         if let Some(bp) = &def.blockparam {
-            locals.insert(bp.clone(), block.clone().unwrap_or(Value::Undef));
+            binding.insert(bp.clone(), block.clone().unwrap_or(Value::Undef));
         }
         h.frames.push(Frame {
-            locals,
-            block,
-            self_obj,
-            method_name,
-            def_class,
+            scope: Scope {
+                locals: env_with(binding),
+                block,
+                self_obj,
+                method_name,
+                def_class,
+            },
             args: args.to_vec(),
         });
-        h.active_frame.take()
+        // A method body runs against its own top frame, not any captured block
+        // scope in effect at the call site.
+        h.active_scope.take()
     });
     let r = run_chunk_on(def.chunk.clone());
     let sig = with_host(|h| {
         h.frames.pop();
-        h.active_frame = saved_active;
+        h.active_scope = saved_active;
         h.signal.take()
     });
     match sig {
@@ -1144,7 +1223,7 @@ pub fn call_super(explicit_args: Option<Vec<Value>>) -> Result<Value, String> {
         return Err(format!("super: no superclass method '{method}'"));
     };
     let args = explicit_args.unwrap_or(cur_args);
-    let block = with_host(|h| h.frames[h.active_idx()].block.clone());
+    let block = with_host(|h| h.cur_scope().block.clone());
     run_method(&def, self_obj, &args, block, Some(method), Some(owner))
 }
 
@@ -1167,12 +1246,14 @@ fn run_template(id: usize, args: &[Value]) -> Result<Value, String> {
     });
     let r = run_chunk_on(def.chunk.clone());
     with_host(|h| {
+        let env = h.cur_env();
         for (p, prev) in saved {
             match prev {
-                Some(v) => h.set_local(&p, v),
+                Some(v) => {
+                    env.borrow_mut().vars.insert(p, v);
+                }
                 None => {
-                    let i = h.active_idx();
-                    h.frames[i].locals.shift_remove(&p);
+                    env.borrow_mut().vars.shift_remove(&p);
                 }
             }
         }
@@ -1241,8 +1322,8 @@ pub fn run_begin(begin_id: usize) -> Result<Value, String> {
 /// params are bound for the duration and restored afterward. A single Array
 /// argument to a multi-parameter block is destructured, matching Ruby.
 pub fn call_proc(proc_val: &Value, args: &[Value]) -> Result<Value, String> {
-    let (template, frame) = match with_host(|h| h.obj(proc_val).cloned()) {
-        Some(RObj::Proc { template, frame }) => (template, frame),
+    let (template, scope) = match with_host(|h| h.obj(proc_val).cloned()) {
+        Some(RObj::Proc { template, scope }) => (template, scope),
         _ => return Err("not a proc".to_string()),
     };
     let def = with_host(|h| h.procs[template].clone());
@@ -1257,34 +1338,24 @@ pub fn call_proc(proc_val: &Value, args: &[Value]) -> Result<Value, String> {
         args.to_vec()
     };
 
-    // Run in the captured frame; save/restore both the active-frame pointer and
-    // any locals the block params shadow.
-    let prev_active = with_host(|h| h.active_frame.replace(frame));
-    let saved: Vec<(String, Option<Value>)> = with_host(|h| {
-        def.params
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let prev = h.frames[frame].locals.get(p).cloned();
-                let v = bound.get(i).cloned().unwrap_or(Value::Undef);
-                h.set_local(p, v);
-                (p.clone(), prev)
-            })
-            .collect()
-    });
+    // The block runs in a fresh child env chained to its captured scope, so its
+    // params are block-local while enclosing variables stay read/writable — and a
+    // closure created inside keeps this env alive (via `Rc`) after the block ends.
+    let child = child_env(scope.locals.clone());
+    for (i, p) in def.params.iter().enumerate() {
+        child
+            .borrow_mut()
+            .vars
+            .insert(p.clone(), bound.get(i).cloned().unwrap_or(Value::Undef));
+    }
+    let block_scope = Scope {
+        locals: child,
+        ..scope
+    };
+    let prev_active = with_host(|h| h.active_scope.replace(block_scope));
     let r = run_chunk_on(def.chunk.clone());
     with_host(|h| {
-        for (p, prev) in saved {
-            match prev {
-                Some(v) => {
-                    h.frames[frame].locals.insert(p, v);
-                }
-                None => {
-                    h.frames[frame].locals.shift_remove(&p);
-                }
-            }
-        }
-        h.active_frame = prev_active;
+        h.active_scope = prev_active;
     });
     // A `next` inside the block becomes the block's value; break/return propagate.
     let sig = with_host(|h| h.signal.take());
@@ -1300,10 +1371,7 @@ pub fn call_proc(proc_val: &Value, args: &[Value]) -> Result<Value, String> {
 
 /// The block passed to the current method (for `yield`).
 pub fn current_block() -> Option<Value> {
-    with_host(|h| {
-        let i = h.active_idx();
-        h.frames[i].block.clone()
-    })
+    with_host(|h| h.cur_scope().block.clone())
 }
 
 /// Set a control signal (break/next/return) — checked by the frame/loop above.

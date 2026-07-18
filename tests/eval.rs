@@ -442,6 +442,28 @@ fn integer_step() {
 }
 
 #[test]
+fn escaping_closures_keep_their_scope() {
+    // A lambda returned from a method keeps the method's locals alive and shared.
+    eq(
+        "def counter; c = 0; -> { c += 1 }; end; f = counter; f.call; f.call; f.call",
+        "3",
+    );
+    // A lambda capturing an outer lambda's parameter.
+    eq(
+        "make = ->(n) { ->(x) { x + n } }; make.call(5).call(10)",
+        "15",
+    );
+    // Each block iteration captures its own `n`.
+    eq(
+        "adders = (1..3).map { |n| ->(x) { x + n } }; adders.map { |f| f.call(10) }",
+        "[11, 12, 13]",
+    );
+    // A block mutates an enclosing local; a block param stays block-local.
+    eq("s = 0; [1, 2, 3].each { |x| s += x }; s", "6");
+    eq("n = 99; [1, 2, 3].each { |n| n * 2 }; n", "99");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

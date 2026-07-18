@@ -35,11 +35,6 @@ capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
   superclass chain (module-`super` ordering is approximate).
 - **Class-body statements.** Only `def`, `attr_*`, and `include` in a class body
   take effect; constants and other executable statements are ignored.
-- **Escaping closures over locals.** A block/lambda captures its defining frame
-  by index, so a `proc`/lambda *returned from a method* that reads that method's
-  locals won't see them once the method returns (e.g.
-  `->(n) { ->(x) { x + n } }` called and stored). Closures used within their
-  defining scope — the common case, incl. `each`/`map`/`yield` — work.
 - **Paren-less keyword args** (`greet name: "x"`) are not parsed, and a block
   cannot be combined with call-site splat (`f(*a) { }`) in one call yet.
 - **Numeric literal / method binding.** `-7.abs` parses as `-(7.abs)` (operator

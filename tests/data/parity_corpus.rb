@@ -363,3 +363,32 @@ total = 0
 1.step(20, 4) { |n| total += n }
 puts total
 puts [1, 2, 3, 4].each_with_object(0) { |x, _| }.inspect rescue puts "ok"
+#==#
+def make_counter
+  count = 0
+  increment = -> { count += 1 }
+  get = -> { count }
+  [increment, get]
+end
+inc, get = make_counter
+inc.call
+inc.call
+inc.call
+puts get.call
+#==#
+def multiplier(factor)
+  ->(x) { x * factor }
+end
+double = multiplier(2)
+triple = multiplier(3)
+puts double.call(10)
+puts triple.call(10)
+adders = (1..3).map { |n| ->(x) { x + n } }
+puts adders.map { |f| f.call(100) }.inspect
+#==#
+n = 99
+[1, 2, 3].each { |n| n * 2 }
+puts n
+running = 0
+[10, 20, 30].each { |v| running += v }
+puts running
