@@ -181,6 +181,11 @@ impl Compiler {
                 b.emit(Op::LoadInt(id as i64), 0);
                 b.emit(Op::CallBuiltin(ops::MKPROC, 1), 0);
             }
+            Expr::Regex(source, flags) => {
+                self.kstr(b, source);
+                self.kstr(b, flags);
+                b.emit(Op::CallBuiltin(ops::MKREGEX, 2), 0);
+            }
             Expr::Hash(pairs) => {
                 for (k, v) in pairs {
                     self.compile_expr(b, k)?;
@@ -466,7 +471,14 @@ impl Compiler {
         // work; the native `Spaceship` op would not consult a user method.
         if matches!(
             op,
-            BinOp::Pow | BinOp::Div | BinOp::Mod | BinOp::Shl | BinOp::Shr | BinOp::Cmp
+            BinOp::Pow
+                | BinOp::Div
+                | BinOp::Mod
+                | BinOp::Shl
+                | BinOp::Shr
+                | BinOp::Cmp
+                | BinOp::Match
+                | BinOp::NMatch
         ) {
             let name = match op {
                 BinOp::Pow => "**",
@@ -474,12 +486,18 @@ impl Compiler {
                 BinOp::Mod => "%",
                 BinOp::Shl => "<<",
                 BinOp::Shr => ">>",
-                _ => "<=>",
+                BinOp::Cmp => "<=>",
+                _ => "=~", // Match and NMatch both dispatch =~
             };
             self.compile_expr(b, l)?;
             self.kstr(b, name);
             self.compile_expr(b, r)?;
             b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), 0);
+            // `!~` is the negation of `=~`.
+            if op == BinOp::NMatch {
+                b.emit(Op::CallBuiltin(ops::TRUTHY, 1), 0);
+                b.emit(Op::LogNot, 0);
+            }
             return Ok(());
         }
         self.compile_expr(b, l)?;
@@ -503,7 +521,7 @@ impl Compiler {
             BinOp::BitXor => Op::BitXor,
             BinOp::Shl => Op::Shl,
             BinOp::Shr => Op::Shr,
-            BinOp::And | BinOp::Or => unreachable!(),
+            BinOp::And | BinOp::Or | BinOp::Match | BinOp::NMatch => unreachable!(),
         };
         b.emit(native, 0);
         Ok(())

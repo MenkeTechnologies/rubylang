@@ -93,6 +93,7 @@ toml = "0.8"
 
 # Glob matcher for the AOP method-call intercept engine (src/intercepts.rs) —
 # `*`/`?`/char-class matching of intercept patterns against method names.
+regex = "1"
 glob = "0.3"
 
 [dev-dependencies]

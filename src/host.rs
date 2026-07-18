@@ -101,6 +101,7 @@ pub mod ops {
     pub const MKARGS: u16 = 32; // [arrays...] argc=n -> concatenated array (splat)
     pub const CALL_ARR: u16 = 33; // [name, args_array] -> self call, args spread
     pub const CALL_METHOD_ARR: u16 = 34; // [recv, name, args_array] -> method call
+    pub const MKREGEX: u16 = 35; // [source, flags] -> Regexp
 }
 
 /// A heap object — the Ruby reference types.
@@ -130,6 +131,19 @@ pub enum RObj {
     /// A reference to a class/module (the value of a constant like `Foo`), used
     /// as the receiver of `Foo.new`, `Foo.name`, etc.
     ClassRef(String),
+    /// A compiled regular expression: its Ruby source plus the compiled matcher.
+    Regexp {
+        source: String,
+        re: regex::Regex,
+    },
+    /// The result of a successful `String#match` / `Regexp#match`: the group
+    /// captures (index 0 is the whole match; `None` = an unmatched optional
+    /// group) plus the text before and after the whole match.
+    MatchData {
+        groups: Vec<Option<String>>,
+        pre: String,
+        post: String,
+    },
 }
 
 /// A user-defined class: its optional superclass, its instance methods, the
@@ -330,6 +344,58 @@ impl RubyHost {
     pub fn new_range(&mut self, lo: i64, hi: i64, exclusive: bool) -> Value {
         self.alloc(RObj::Range { lo, hi, exclusive })
     }
+    /// Compile a regex literal (Ruby `flags` → Rust inline flags: `i`
+    /// case-insensitive, `m` dot-matches-newline, `x` extended). Returns an error
+    /// string if the pattern is not valid for the Rust regex engine.
+    pub fn new_regex(&mut self, source: &str, flags: &str) -> Result<Value, String> {
+        let mut inline = String::new();
+        if flags.contains('i') {
+            inline.push('i');
+        }
+        if flags.contains('m') {
+            inline.push('s'); // Ruby /m/ = dot matches newline = Rust (?s)
+        }
+        if flags.contains('x') {
+            inline.push('x');
+        }
+        let full = if inline.is_empty() {
+            source.to_string()
+        } else {
+            format!("(?{inline}){source}")
+        };
+        match regex::Regex::new(&full) {
+            Ok(re) => Ok(self.alloc(RObj::Regexp { source: source.to_string(), re })),
+            Err(e) => Err(format!("invalid regex /{source}/: {e}")),
+        }
+    }
+    /// The `(groups, pre, post)` of a `MatchData` value, if `v` is one.
+    #[allow(clippy::type_complexity)]
+    pub fn as_matchdata(&self, v: &Value) -> Option<(Vec<Option<String>>, String, String)> {
+        match self.obj(v) {
+            Some(RObj::MatchData { groups, pre, post }) => {
+                Some((groups.clone(), pre.clone(), post.clone()))
+            }
+            _ => None,
+        }
+    }
+    /// The compiled matcher + source of a regex value, if `v` is one.
+    pub fn as_regex(&self, v: &Value) -> Option<(regex::Regex, String)> {
+        match self.obj(v) {
+            Some(RObj::Regexp { re, source }) => Some((re.clone(), source.clone())),
+            _ => None,
+        }
+    }
+    /// Build a `MatchData` for `re.captures(subject)` at the point where the whole
+    /// match spans `[start, end)`.
+    pub fn new_matchdata(
+        &mut self,
+        groups: Vec<Option<String>>,
+        pre: String,
+        post: String,
+    ) -> Value {
+        self.alloc(RObj::MatchData { groups, pre, post })
+    }
+
     /// Create a proc capturing the currently-active scope (shared by `Rc`).
     pub fn new_proc(&mut self, template: usize) -> Value {
         let scope = self.cur_scope().clone();
@@ -394,6 +460,20 @@ impl RubyHost {
     }
     pub fn has_method(&self, name: &str) -> bool {
         self.methods.contains_key(name)
+    }
+    /// Names defined live on this host — top-level methods, classes/modules,
+    /// constants, and globals (`$name`). The REPL merges these with the static
+    /// keyword/builtin corpus so a `def`/`class`/assignment made on a prior
+    /// prompt completes on the next one. Class and const names overlap (a class
+    /// is a const), so the result is de-duplicated by the caller.
+    pub fn repl_completion_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        out.extend(self.methods.keys().cloned());
+        out.extend(self.classes.keys().cloned());
+        out.extend(self.consts.keys().cloned());
+        // Globals carry their `$` sigil so they complete as `$name`.
+        out.extend(self.globals.keys().map(|g| format!("${g}")));
+        out
     }
     /// Whether a bare name resolves as a callable method — a class method (or
     /// `new`) when `self` is a class ref, an instance method on `self`'s class,
@@ -857,6 +937,11 @@ impl RubyHost {
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash(map)) => self.inspect_hash(&map),
                 Some(RObj::Proc { .. }) => "#<Proc>".to_string(),
+                Some(RObj::Regexp { source, .. }) => format!("(?-mix:{source})"),
+                // MatchData#to_s is the whole matched substring (group 0).
+                Some(RObj::MatchData { groups, .. }) => {
+                    groups.first().and_then(|g| g.clone()).unwrap_or_default()
+                }
                 Some(RObj::ClassRef(n)) => n,
                 Some(RObj::Object { class, ivars }) => {
                     // An exception object prints its message; other objects show
@@ -882,6 +967,20 @@ impl RubyHost {
                 Some(RObj::Symbol(s)) => format!(":{s}"),
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash(map)) => self.inspect_hash(&map),
+                Some(RObj::Regexp { source, .. }) => format!("/{source}/"),
+                // `#<MatchData "ll" 1:"l">` — whole match then numbered groups.
+                Some(RObj::MatchData { groups, .. }) => {
+                    let whole = groups.first().and_then(|g| g.clone()).unwrap_or_default();
+                    let mut out = format!("#<MatchData {whole:?}");
+                    for (i, g) in groups.iter().enumerate().skip(1) {
+                        match g {
+                            Some(s) => out.push_str(&format!(" {i}:{s:?}")),
+                            None => out.push_str(&format!(" {i}:nil")),
+                        }
+                    }
+                    out.push('>');
+                    out
+                }
                 _ => self.to_s(v),
             },
             _ => self.to_s(v),
@@ -933,6 +1032,8 @@ impl RubyHost {
                 Some(RObj::Symbol(_)) => "Symbol",
                 Some(RObj::Range { .. }) => "Range",
                 Some(RObj::Proc { .. }) => "Proc",
+                Some(RObj::Regexp { .. }) => "Regexp",
+                Some(RObj::MatchData { .. }) => "MatchData",
                 Some(RObj::ClassRef(_)) => "Class",
                 Some(RObj::Object { .. }) => "Object",
                 None => "Object",

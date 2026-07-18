@@ -313,7 +313,7 @@ impl Parser {
         Some(match op {
             "||" => (1, BinOp::Or),
             "&&" => (2, BinOp::And),
-            "==" | "!=" | "<=>" | "===" => (3, matchop(op)),
+            "==" | "!=" | "<=>" | "===" | "=~" | "!~" => (3, matchop(op)),
             "<" | "<=" | ">" | ">=" => (4, matchop(op)),
             "|" | "^" => (5, matchop(op)),
             "&" => (6, BinOp::BitAnd),
@@ -590,6 +590,10 @@ impl Parser {
                 } else {
                     Ok(Expr::Str(vec![StrPart::Lit(s)]))
                 }
+            }
+            Tok::Regex(pat, flags) => {
+                self.advance();
+                Ok(Expr::Regex(pat, flags))
             }
             Tok::Symbol(s) => {
                 self.advance();
@@ -1231,6 +1235,8 @@ fn matchop(op: &str) -> BinOp {
         "==" => BinOp::Eq,
         "!=" => BinOp::Ne,
         "<=>" => BinOp::Cmp,
+        "=~" => BinOp::Match,
+        "!~" => BinOp::NMatch,
         "===" => BinOp::Eq,
         "<" => BinOp::Lt,
         "<=" => BinOp::Le,

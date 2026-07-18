@@ -35,6 +35,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::MKHASH, b_mkhash);
     vm.register_builtin(ops::MKRANGE, b_mkrange);
     vm.register_builtin(ops::MKPROC, b_mkproc);
+    vm.register_builtin(ops::MKREGEX, b_mkregex);
     vm.register_builtin(ops::YIELD, b_yield);
     vm.register_builtin(ops::TRUTHY, b_truthy);
     vm.register_builtin(ops::INDEX_GET, b_index_get);
@@ -335,6 +336,14 @@ fn b_mkproc(vm: &mut VM, _: u8) -> Value {
     };
     with_host(|h| h.new_proc(id))
 }
+fn b_mkregex(vm: &mut VM, _: u8) -> Value {
+    let flags = name_of(&vm.pop());
+    let source = name_of(&vm.pop());
+    match with_host(|h| h.new_regex(&source, &flags)) {
+        Ok(v) => v,
+        Err(e) => abort(vm, e),
+    }
+}
 fn b_yield(vm: &mut VM, argc: u8) -> Value {
     let args = pop_n(vm, argc as usize);
     let Some(block) = current_block() else {
@@ -458,9 +467,13 @@ fn dispatch(
         "==" => return Ok(Value::Bool(with_host(|h| h.eq_values(recv, &args[0])))),
         "!=" => return Ok(Value::Bool(!with_host(|h| h.eq_values(recv, &args[0])))),
         "===" => {
-            // Case-equality: a Class matches instances, a Range covers, else `==`.
+            // Case-equality: a Class matches instances, a Regexp matches a
+            // string, a Range covers, else `==`.
             if let Some(cls) = with_host(|h| h.classref_name(recv)) {
                 return Ok(Value::Bool(with_host(|h| h.is_a(&args[0], &cls))));
+            }
+            if let Some((re, _)) = with_host(|h| h.as_regex(recv)) {
+                return Ok(Value::Bool(re.is_match(&arg_str(&args[0]))));
             }
             if let Some((lo, hi, excl)) = with_host(|h| h.as_range(recv)) {
                 let n = as_i(&args[0]);
@@ -516,6 +529,8 @@ fn dispatch(
         "Range" => dispatch_range(recv, name, args, block),
         "Symbol" => dispatch_symbol(recv, name, args),
         "Proc" => dispatch_proc(recv, name, args),
+        "Regexp" => dispatch_regexp(recv, name, args),
+        "MatchData" => dispatch_matchdata(recv, name, args),
         _ => Err(raise_exc(
             "NoMethodError",
             &format!("undefined method '{name}' for {class}"),
@@ -918,24 +933,44 @@ fn dispatch_string(
         "include?" => Ok(Value::Bool(s.contains(&arg_str(&args[0])))),
         "start_with?" => Ok(Value::Bool(s.starts_with(&arg_str(&args[0])))),
         "end_with?" => Ok(Value::Bool(s.ends_with(&arg_str(&args[0])))),
+        "match?" => {
+            let m = str_regex(&args[0]).map(|re| re.is_match(&s)).unwrap_or(false);
+            Ok(Value::Bool(m))
+        }
+        "=~" => match str_regex(&args[0]) {
+            Some(re) => Ok(re
+                .find(&s)
+                .map(|m| Value::Int(s[..m.start()].chars().count() as i64))
+                .unwrap_or(Value::Undef)),
+            None => Ok(Value::Undef),
+        },
+        "match" => match str_regex(&args[0]) {
+            Some(re) => Ok(match_data(&re, &s)),
+            None => Ok(Value::Undef),
+        },
+        "scan" => match str_regex(&args[0]) {
+            Some(re) => Ok(scan_regex(&re, &s)),
+            None => Ok(new_arr(vec![])),
+        },
         "split" => {
             let parts: Vec<Value> = if args.is_empty() {
-                s.split_whitespace()
-                    .map(|p| new_str(p.to_string()))
-                    .collect()
+                s.split_whitespace().map(|p| new_str(p.to_string())).collect()
+            } else if let Some(re) = str_regex(&args[0]) {
+                re.split(&s).map(|p| new_str(p.to_string())).collect()
             } else {
                 let sep = arg_str(&args[0]);
                 s.split(&sep).map(|p| new_str(p.to_string())).collect()
             };
             Ok(new_arr(parts))
         }
-        "sub" => {
-            let (from, to) = (arg_str(&args[0]), arg_str(&args[1]));
-            Ok(new_str(s.replacen(&from, &to, 1)))
-        }
-        "gsub" => {
-            let (from, to) = (arg_str(&args[0]), arg_str(&args[1]));
-            Ok(new_str(s.replace(&from, &to)))
+        "sub" | "gsub" => {
+            let all = name == "gsub";
+            if let Some(re) = str_regex(&args[0]) {
+                return regex_replace(&re, &s, &args[1..], &block, all);
+            }
+            let from = arg_str(&args[0]);
+            let to = arg_str(&args[1]);
+            Ok(new_str(if all { s.replace(&from, &to) } else { s.replacen(&from, &to, 1) }))
         }
         "replace" => {
             let n = arg_str(&args[0]);
@@ -993,6 +1028,119 @@ fn dispatch_string(
         "[]" => Ok(str_index(&s, args)),
         _ => Err(format!("undefined method '{name}' for String")),
     }
+}
+
+/// The compiled regex for a value that is a Regexp, else `None`.
+fn str_regex(v: &Value) -> Option<regex::Regex> {
+    with_host(|h| h.as_regex(v)).map(|(re, _)| re)
+}
+
+/// Build a `MatchData` value for the first match of `re` in `s`, or `nil`.
+fn match_data(re: &regex::Regex, s: &str) -> Value {
+    match re.captures(s) {
+        Some(caps) => {
+            let whole = caps.get(0).unwrap();
+            let groups: Vec<Option<String>> = (0..caps.len())
+                .map(|i| caps.get(i).map(|m| m.as_str().to_string()))
+                .collect();
+            let pre = s[..whole.start()].to_string();
+            let post = s[whole.end()..].to_string();
+            with_host(|h| h.new_matchdata(groups, pre, post))
+        }
+        None => Value::Undef,
+    }
+}
+
+/// `MatchData#[n]`, `#pre_match`, `#post_match`, `#to_a`, `#captures`, `#to_s`.
+fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let (groups, pre, post) = match with_host(|h| h.as_matchdata(recv)) {
+        Some(t) => t,
+        None => return Err("not a MatchData".to_string()),
+    };
+    let strv = |o: &Option<String>| o.clone().map(new_str).unwrap_or(Value::Undef);
+    match name {
+        "[]" => {
+            let i = as_i(&args[0]);
+            Ok(groups.get(i as usize).map(strv).unwrap_or(Value::Undef))
+        }
+        "pre_match" => Ok(new_str(pre)),
+        "post_match" => Ok(new_str(post)),
+        "to_a" => Ok(new_arr(groups.iter().map(strv).collect())),
+        "captures" => Ok(new_arr(groups.iter().skip(1).map(strv).collect())),
+        "to_s" => Ok(strv(groups.first().unwrap_or(&None))),
+        "size" | "length" => Ok(Value::Int(groups.len() as i64)),
+        _ => Err(format!("undefined method '{name}' for MatchData")),
+    }
+}
+
+/// `String#scan(re)`: every match. With capture groups, each element is an array
+/// of the captured groups; otherwise each element is the whole matched string.
+fn scan_regex(re: &regex::Regex, s: &str) -> Value {
+    let ngroups = re.captures_len(); // includes the whole-match group 0
+    if ngroups <= 1 {
+        let out: Vec<Value> = re.find_iter(s).map(|m| new_str(m.as_str().to_string())).collect();
+        new_arr(out)
+    } else {
+        let out: Vec<Value> = re
+            .captures_iter(s)
+            .map(|c| {
+                let groups: Vec<Value> = (1..ngroups)
+                    .map(|i| c.get(i).map(|m| new_str(m.as_str().to_string())).unwrap_or(Value::Undef))
+                    .collect();
+                new_arr(groups)
+            })
+            .collect();
+        new_arr(out)
+    }
+}
+
+/// `String#sub`/`gsub` with a Regexp: a replacement string (with `\1` group
+/// refs) or a block that receives each match.
+fn regex_replace(
+    re: &regex::Regex,
+    s: &str,
+    rest: &[Value],
+    block: &Option<Value>,
+    all: bool,
+) -> Result<Value, String> {
+    let mut out = String::new();
+    let mut last = 0;
+    let mut count = 0;
+    for caps in re.captures_iter(s) {
+        if !all && count >= 1 {
+            break;
+        }
+        let m = caps.get(0).unwrap();
+        out.push_str(&s[last..m.start()]);
+        if let Some(bl) = block {
+            let r = call_proc(bl, &[new_str(m.as_str().to_string())])?;
+            out.push_str(&with_host(|h| h.to_s(&r)));
+        } else {
+            let repl = arg_str(&rest[0]);
+            out.push_str(&expand_backrefs(&repl, &caps));
+        }
+        last = m.end();
+        count += 1;
+    }
+    out.push_str(&s[last..]);
+    Ok(new_str(out))
+}
+
+/// Expand `\1`..`\9` (and `\0`) group back-references in a replacement string.
+fn expand_backrefs(repl: &str, caps: &regex::Captures) -> String {
+    let mut out = String::new();
+    let mut chars = repl.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(d) = chars.peek().and_then(|c| c.to_digit(10)) {
+                chars.next();
+                out.push_str(caps.get(d as usize).map(|m| m.as_str()).unwrap_or(""));
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Ruby `dig`: index into nested Arrays/Hashes by each key in turn, short-
@@ -1864,6 +2012,35 @@ fn dispatch_proc(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
     match name {
         "call" | "()" | "[]" | "yield" => call_proc(recv, args),
         _ => Err(format!("undefined method '{name}' for Proc")),
+    }
+}
+
+fn dispatch_regexp(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let (re, source) = with_host(|h| h.as_regex(recv)).unwrap();
+    match name {
+        "source" => Ok(new_str(source)),
+        "match?" => {
+            let s = arg_str(&args[0]);
+            Ok(Value::Bool(re.is_match(&s)))
+        }
+        "=~" => {
+            let s = arg_str(&args[0]);
+            Ok(re
+                .find(&s)
+                .map(|m| Value::Int(s[..m.start()].chars().count() as i64))
+                .unwrap_or(Value::Undef))
+        }
+        "match" => {
+            let s = arg_str(&args[0]);
+            Ok(match_data(&re, &s))
+        }
+        "scan" => {
+            let s = arg_str(&args[0]);
+            Ok(scan_regex(&re, &s))
+        }
+        "to_s" => Ok(new_str(format!("(?-mix:{source})"))),
+        "inspect" => Ok(new_str(format!("/{source}/"))),
+        _ => Err(format!("undefined method '{name}' for Regexp")),
     }
 }
 

@@ -33,6 +33,8 @@ pub enum Tok {
     Float(f64),
     /// Raw string body plus whether it was double-quoted (interpolation allowed).
     Str(String, bool),
+    /// A regex literal: `/pattern/flags` — (pattern, flags).
+    Regex(String, String),
     Symbol(String),
     Ident(String),
     Const(String), // capitalized identifier
@@ -51,6 +53,7 @@ impl fmt::Display for Tok {
             Tok::Int(n) => write!(f, "{n}"),
             Tok::Float(x) => write!(f, "{x}"),
             Tok::Str(s, _) => write!(f, "\"{s}\""),
+            Tok::Regex(s, fl) => write!(f, "/{s}/{fl}"),
             Tok::Symbol(s) => write!(f, ":{s}"),
             Tok::Ident(s) | Tok::Const(s) | Tok::Keyword(s) => write!(f, "{s}"),
             Tok::IVar(s) => write!(f, "@{s}"),
@@ -435,6 +438,44 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     space: core::mem::take(&mut sp),
                 });
             }
+            // `/pattern/flags` regex literal — when `/` is at an expression start
+            // (not a division / `/=`). Body respects `\/` escapes and `[…]`
+            // char-classes; trailing `imx` are flags.
+            b'/' if regex_start(&out, sp, b.get(i + 1).copied()) => {
+                i += 1;
+                let mut pat = String::new();
+                let mut in_class = false;
+                while i < b.len() {
+                    let ch = b[i];
+                    if ch == b'\\' && i + 1 < b.len() {
+                        pat.push('\\');
+                        pat.push(b[i + 1] as char);
+                        i += 2;
+                        continue;
+                    }
+                    match ch {
+                        b'[' => in_class = true,
+                        b']' => in_class = false,
+                        b'/' if !in_class => break,
+                        b'\n' => line += 1,
+                        _ => {}
+                    }
+                    let cl = utf8_len(ch);
+                    pat.push_str(&src[i..i + cl]);
+                    i += cl;
+                }
+                i += 1; // consume closing `/`
+                let fstart = i;
+                while i < b.len() && matches!(b[i], b'i' | b'm' | b'x' | b'o' | b'u' | b'n') {
+                    i += 1;
+                }
+                let flags = src[fstart..i].to_string();
+                out.push(Token {
+                    kind: Tok::Regex(pat, flags),
+                    line,
+                    space: core::mem::take(&mut sp),
+                });
+            }
             _ => {
                 // operators / punctuation, longest match first
                 let three = if i + 3 <= b.len() { &src[i..i + 3] } else { "" };
@@ -466,6 +507,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         | "&="
                         | "^="
                         | "->"
+                        | "=~"
+                        | "!~"
                 ) {
                     two
                 } else {
@@ -499,6 +542,39 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
 }
 
 /// Byte length of the UTF-8 sequence whose lead byte is `b`.
+/// Whether a `/` here begins a regex literal rather than division. It does when
+/// the previous real token is not a value (so `/` sits at an expression start),
+/// or — after a value — when there's a space before `/` but not after (the
+/// command-argument form `scan /re/`, versus `a / b` division).
+fn regex_start(out: &[Token], sp: bool, next: Option<u8>) -> bool {
+    // `/=` is always the divide-assign operator, never a regex.
+    if next == Some(b'=') {
+        return false;
+    }
+    let prev = out.iter().rev().find(|t| t.kind != Tok::Newline);
+    let prev_is_value = match prev.map(|t| &t.kind) {
+        None => false,
+        Some(Tok::Int(_))
+        | Some(Tok::Float(_))
+        | Some(Tok::Str(_, _))
+        | Some(Tok::Regex(_, _))
+        | Some(Tok::Ident(_))
+        | Some(Tok::Const(_))
+        | Some(Tok::IVar(_))
+        | Some(Tok::GVar(_))
+        | Some(Tok::Symbol(_)) => true,
+        Some(Tok::Op(o)) => o == ")" || o == "]" || o == "}",
+        Some(Tok::Keyword(k)) => matches!(k.as_str(), "self" | "end" | "true" | "false" | "nil"),
+        _ => false,
+    };
+    if !prev_is_value {
+        return true;
+    }
+    // After a value: a command-argument regex needs a leading space and no space
+    // immediately after the `/` (so `foo /re/` is a regex, `a / b` is division).
+    sp && !matches!(next, Some(b' ') | Some(b'\t') | None)
+}
+
 fn utf8_len(b: u8) -> usize {
     match b {
         0x00..=0x7F => 1,

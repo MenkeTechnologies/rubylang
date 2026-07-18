@@ -22,7 +22,9 @@ pub enum BinOp {
     Gt,
     Le,
     Ge,
-    Cmp, // <=>
+    Cmp,    // <=>
+    Match,  // =~
+    NMatch, // !~
     And, // &&
     Or,  // ||
     BitAnd,
@@ -165,6 +167,8 @@ pub enum Expr {
     Splat(Box<Expr>),
     /// A lambda literal `->(params) { body }` (a Proc value).
     Lambda(Block),
+    /// A regex literal `/pattern/flags`.
+    Regex(String, String),
 }
 
 /// One segment of an interpolated string.
