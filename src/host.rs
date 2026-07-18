@@ -1619,6 +1619,7 @@ impl RubyHost {
                 | "Struct"
                 | "Time"
                 | "Date"
+                | "Math"
         )
     }
     pub fn classref_name(&self, v: &Value) -> Option<String> {

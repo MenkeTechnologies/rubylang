@@ -1065,3 +1065,18 @@ class Calc
 end
 puts Calc.pi
 puts Calc.new.square(9)
+#==#
+def distance(x1, y1, x2, y2) = Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+puts distance(0, 0, 3, 4)
+puts distance(1, 1, 4, 5)
+radius = 10
+puts (Math::PI * radius ** 2).round(4)
+puts (2 * Math::PI * radius).round(4)
+angles = [0, 30, 60, 90]
+sines = angles.map { |deg| (Math.sin(deg * Math::PI / 180)).round(4) }
+puts sines.inspect
+puts Math.log(1000, 10).round(6)
+puts Math.hypot(5, 12)
+puts [1, 2, 4, 8, 16].map { |n| Math.log2(n).to_i }.inspect
+compound = 1000 * Math::E ** (0.05 * 10)
+puts compound.round(2)

@@ -143,6 +143,12 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   (`String`, not a byte buffer), so the binary directives (`N`/`n`/`V`/`v`/`H`,
   high `C` bytes) cannot round-trip. This is a durable encoding limitation, not a
   temporary gap.
+- **`Math` module.** `Math.sqrt`/`cbrt`/`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/
+  `atan2`/`sinh`/`cosh`/`tanh`/`exp`/`log`(with optional base)/`log2`/`log10`/
+  `hypot`/`ldexp` and the constants `Math::PI` / `Math::E` are implemented over
+  `f64`. `Math.gamma`/`erf` are not (they need approximations that would not
+  match MRI bit-for-bit). `Math.class` reports `Class` rather than `Module`
+  (modules aren't distinguished from classes yet).
 - **`rand`.** Seeded from the system clock (no `srand` determinism yet).
 - **Method surface.** The Enumerable/String/Hash/Range surface is broad but not
   exhaustive; an unimplemented method raises a `NoMethodError` whose message uses

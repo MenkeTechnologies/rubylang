@@ -983,6 +983,43 @@ fn dispatch_classref(
             _ => {}
         }
     }
+    // The `Math` module: floating-point functions and the constants `PI`/`E`,
+    // reached as `Math.sqrt(x)` and `Math::PI` (both a method send on the ref).
+    if cls == "Math" {
+        let x = || as_f(&args[0]);
+        let y = || as_f(&args[1]);
+        let f = match name {
+            "PI" => Some(std::f64::consts::PI),
+            "E" => Some(std::f64::consts::E),
+            "sqrt" => Some(x().sqrt()),
+            "cbrt" => Some(x().cbrt()),
+            "sin" => Some(x().sin()),
+            "cos" => Some(x().cos()),
+            "tan" => Some(x().tan()),
+            "asin" => Some(x().asin()),
+            "acos" => Some(x().acos()),
+            "atan" => Some(x().atan()),
+            "atan2" => Some(x().atan2(y())),
+            "sinh" => Some(x().sinh()),
+            "cosh" => Some(x().cosh()),
+            "tanh" => Some(x().tanh()),
+            "asinh" => Some(x().asinh()),
+            "acosh" => Some(x().acosh()),
+            "atanh" => Some(x().atanh()),
+            "exp" => Some(x().exp()),
+            // `Math.log(x)` is natural log; `Math.log(x, base)` changes base.
+            "log" if args.len() >= 2 => Some(x().log(y())),
+            "log" => Some(x().ln()),
+            "log2" => Some(x().log2()),
+            "log10" => Some(x().log10()),
+            "hypot" => Some(x().hypot(y())),
+            "ldexp" => Some(x() * 2f64.powi(as_i(&args[1]) as i32)),
+            _ => None,
+        };
+        if let Some(v) = f {
+            return Ok(Value::Float(v));
+        }
+    }
     match name {
         "new" => {
             // `Array.new(n)` / `Array.new(n, val)` / `Array.new(n) { |i| ... }`.

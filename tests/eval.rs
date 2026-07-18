@@ -2358,6 +2358,35 @@ fn time_utc() {
 }
 
 #[test]
+fn math_module() {
+    // Functions.
+    eq("Math.sqrt(25)", "5.0");
+    eq("Math.sqrt(2)", "1.4142135623730951");
+    eq("Math.cbrt(27)", "3.0");
+    eq("Math.sin(0)", "0.0");
+    eq("Math.cos(0)", "1.0");
+    eq("Math.exp(0)", "1.0");
+    eq("Math.log(Math::E)", "1.0");
+    eq("Math.log(100, 10)", "2.0"); // change-of-base
+    eq("Math.log2(8)", "3.0");
+    eq("Math.log10(1000)", "3.0");
+    eq("Math.hypot(3, 4)", "5.0");
+    eq("Math.atan2(1, 1)", "0.7853981633974483");
+    // Constants.
+    eq("Math::PI", "3.141592653589793");
+    eq("Math::E", "2.718281828459045");
+    eq("Math::PI.round(5)", "3.14159");
+    // Composed usage.
+    eq("Math.sqrt(3 ** 2 + 4 ** 2)", "5.0");
+    eq(
+        "[1, 4, 9, 16].map { |n| Math.sqrt(n) }",
+        "[1.0, 2.0, 3.0, 4.0]",
+    );
+    eq("r = 5; (Math::PI * r ** 2).round(2)", "78.54");
+    eq("Math.sin(Math::PI / 2)", "1.0");
+}
+
+#[test]
 fn endless_method_definitions() {
     // `def name(params) = expression` (Ruby 3+): single-expression body, no end.
     eq("def square(x) = x * x; square(5)", "25");
