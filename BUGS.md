@@ -81,8 +81,11 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   `Class#superclass` and `Module#ancestors` walk the class chain (builtin types
   use a fixed table; user classes follow their superclass + included modules),
   and the `<`/`<=`/`>`/`>=` class relations return `true`/`false`/`nil` like
-  Ruby (`Integer < Numeric` → true, `String < Numeric` → nil). Not yet: a Class
-  object does not round-trip as a Hash key (it reduces to its name String).
+  Ruby (`Integer < Numeric` → true, `String < Numeric` → nil). A Class object
+  is usable as a Hash key or Set member (keyed by class name), so
+  `group_by(&:class)` and counting-by-class work. Not yet: `Array`/`Range`/
+  other composite objects as Hash keys still key by heap identity (only
+  primitives, symbols, strings, and class objects round-trip).
 - **Enumerator.** A block-less `each`/`map`/`select`/`reject`/`each_with_index`
   (on arrays), `String#each_char`/`each_byte`/`each_line`, and
   `Integer#times`/`upto`/`downto`/`step`

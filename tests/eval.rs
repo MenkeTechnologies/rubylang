@@ -2358,6 +2358,33 @@ fn time_utc() {
 }
 
 #[test]
+fn class_objects_as_hash_keys() {
+    // A Class object works as a Hash key (compares by class, round-trips).
+    eq("{Integer => 1, String => 2}[Integer]", "1");
+    eq("{Integer => 1}[5.class]", "1");
+    eq("{Integer => \"int\"}.keys.first", "Integer");
+    eq("{Integer => 1}.inspect", "\"{Integer => 1}\"");
+    // group_by(&:class) — the common idiom — keys by the actual class.
+    eq(
+        "[1, \"a\", :b, 2].group_by(&:class)",
+        "{Integer => [1, 2], String => [\"a\"], Symbol => [:b]}",
+    );
+    eq(
+        "[1, \"a\", :b, 2].group_by(&:class).keys",
+        "[Integer, String, Symbol]",
+    );
+    // Counting by class through a default-0 hash.
+    eq(
+        "h = Hash.new(0); [1, 2.0, \"x\", 3].each { |v| h[v.class] += 1 }; h",
+        "{Integer => 2, Float => 1, String => 1}",
+    );
+    eq(
+        "[1, 2, 3, \"a\", \"b\"].group_by(&:class).transform_values(&:size)",
+        "{Integer => 3, String => 2}",
+    );
+}
+
+#[test]
 fn class_reflection() {
     // superclass walks the class chain (skipping modules).
     eq("Integer.superclass", "Numeric");

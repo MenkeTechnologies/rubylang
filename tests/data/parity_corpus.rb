@@ -974,3 +974,14 @@ class Sprite; include Drawable; end
 puts Sprite.ancestors.inspect
 puts Sprite.ancestors.include?(Drawable)
 puts [Integer, Float, Numeric].sort_by { |c| c.ancestors.length }.map(&:name).inspect
+#==#
+data = [1, 2.5, "hello", :sym, 3, "world", 4.0, :other]
+grouped = data.group_by(&:class)
+grouped.each { |cls, vals| puts "#{cls}: #{vals.inspect}" }
+puts grouped.keys.map(&:name).sort.inspect
+tally = Hash.new(0)
+data.each { |v| tally[v.class] += 1 }
+puts tally.map { |cls, n| "#{cls}=#{n}" }.sort.inspect
+type_map = {Integer => :whole, Float => :decimal, String => :text}
+puts data.map { |v| type_map[v.class] || :unknown }.inspect
+puts({Integer => 1, Float => 2}.fetch(2.0.class))

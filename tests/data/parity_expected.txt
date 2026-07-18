@@ -550,3 +550,12 @@ true
 [Sprite, Drawable, Object, Kernel, BasicObject]
 true
 ["Numeric", "Integer", "Float"]
+#==#
+Integer: [1, 3]
+Float: [2.5, 4.0]
+String: ["hello", "world"]
+Symbol: [:sym, :other]
+["Float", "Integer", "String", "Symbol"]
+["Float=2", "Integer=2", "String=2", "Symbol=2"]
+[:whole, :decimal, :text, :unknown, :whole, :text, :decimal, :unknown]
+2

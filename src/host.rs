@@ -366,6 +366,9 @@ pub enum RKey {
     Bool(bool),
     Nil,
     FloatBits(u64),
+    /// A class/module reference used as a Hash key (`group_by(&:class)`), keyed
+    /// by class name so it compares by value and round-trips to a class ref.
+    Class(String),
 }
 
 /// A compiled method: positional parameter names, the index of a splat
@@ -1982,6 +1985,7 @@ impl RubyHost {
             RKey::Bool(b) => b.to_string(),
             RKey::Nil => "nil".to_string(),
             RKey::FloatBits(b) => fmt_float(f64::from_bits(*b)),
+            RKey::Class(n) => n.clone(),
         }
     }
 
@@ -2031,6 +2035,7 @@ impl RubyHost {
             Value::Obj(_) => match self.obj(v) {
                 Some(RObj::Str(s)) => RKey::Str(s.clone()),
                 Some(RObj::Symbol(s)) => RKey::Sym(s.clone()),
+                Some(RObj::ClassRef(n)) => RKey::Class(n.clone()),
                 _ => RKey::Str(format!("{v:?}")),
             },
             _ => RKey::Nil,
@@ -2044,6 +2049,7 @@ impl RubyHost {
             RKey::Bool(b) => Value::Bool(*b),
             RKey::Nil => Value::Undef,
             RKey::FloatBits(b) => Value::Float(f64::from_bits(*b)),
+            RKey::Class(n) => self.class_ref(n),
         }
     }
 
