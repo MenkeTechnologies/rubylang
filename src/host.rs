@@ -106,6 +106,8 @@ pub mod ops {
     pub const MKLAMBDA: u16 = 36; // [proc_id] -> Proc (lambda? == true)
     pub const SIG_RETRY: u16 = 37; // [v] -> restart the enclosing begin body
     pub const NO_MATCH: u16 = 38; // [subj] -> raise NoMatchingPatternError
+    pub const CALL_ARR_BLK: u16 = 39; // [name, args_array, proc] -> self call + block
+    pub const CALL_METHOD_ARR_BLK: u16 = 40; // [recv, name, args_array, proc] -> method + block
 }
 
 /// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried

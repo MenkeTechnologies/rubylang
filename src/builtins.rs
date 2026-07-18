@@ -56,6 +56,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::MKARGS, b_mkargs);
     vm.register_builtin(ops::CALL_ARR, b_call_arr);
     vm.register_builtin(ops::CALL_METHOD_ARR, b_call_method_arr);
+    vm.register_builtin(ops::CALL_ARR_BLK, b_call_arr_blk);
+    vm.register_builtin(ops::CALL_METHOD_ARR_BLK, b_call_method_arr_blk);
 }
 
 /// Concatenate `argc` arrays into one (splat argument/element building).
@@ -77,6 +79,32 @@ fn b_call_arr(vm: &mut VM, _: u8) -> Value {
     let name = name_of(&vm.pop());
     let args = with_host(|h| h.as_array(&arr).unwrap_or_default());
     match dispatch_call(&name, &args, None) {
+        Ok(v) => propagate(vm, v),
+        Err(e) => abort(vm, e),
+    }
+}
+
+/// Self call with a spread argument array and a block: `[name, args, proc]`.
+fn b_call_arr_blk(vm: &mut VM, _: u8) -> Value {
+    let block = vm.pop();
+    let arr = vm.pop();
+    let name = name_of(&vm.pop());
+    let args = with_host(|h| h.as_array(&arr).unwrap_or_default());
+    match dispatch_call(&name, &args, Some(block)) {
+        Ok(v) => propagate(vm, v),
+        Err(e) => abort(vm, e),
+    }
+}
+
+/// Method call with a spread argument array and a block:
+/// `[recv, name, args, proc]`.
+fn b_call_method_arr_blk(vm: &mut VM, _: u8) -> Value {
+    let block = vm.pop();
+    let arr = vm.pop();
+    let name = name_of(&vm.pop());
+    let recv = vm.pop();
+    let args = with_host(|h| h.as_array(&arr).unwrap_or_default());
+    match dispatch(&recv, &name, &args, Some(block)) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
@@ -624,7 +652,30 @@ pub(crate) fn dispatch(
             let m = name_of(&args[0]);
             return Ok(with_host(|h| h.new_method(recv.clone(), &m)));
         }
-        "respond_to?" => return Ok(Value::Bool(true)),
+        "respond_to?" => {
+            // For a user object, a method responds if the class defines it or its
+            // `respond_to_missing?` returns true. Built-in receivers stay
+            // permissive (their method surface is not enumerable here).
+            if let Some(cls) = with_host(|h| h.object_class(recv)) {
+                let m = name_of(&args[0]);
+                if with_host(|h| h.find_method_owner(&cls, &m)).is_some() {
+                    return Ok(Value::Bool(true));
+                }
+                if with_host(|h| h.find_method_owner(&cls, "respond_to_missing?")).is_some() {
+                    let include_private = args.get(1).cloned().unwrap_or(Value::Bool(false));
+                    let sym = with_host(|h| h.new_symbol(&m));
+                    return call_instance_method(
+                        recv.clone(),
+                        &cls,
+                        "respond_to_missing?",
+                        &[sym, include_private],
+                        None,
+                    );
+                }
+                return Ok(Value::Bool(false));
+            }
+            return Ok(Value::Bool(true));
+        }
         _ => {}
     }
 
@@ -963,6 +1014,14 @@ fn dispatch_object(
             } else {
                 Ok(m)
             }
+        }
+        // A class that defines `method_missing` handles any otherwise-undefined
+        // method: `method_missing(:name, *args, &block)`.
+        _ if with_host(|h| h.find_method_owner(cls, "method_missing")).is_some() => {
+            let mut mm_args = Vec::with_capacity(args.len() + 1);
+            mm_args.push(with_host(|h| h.new_symbol(name)));
+            mm_args.extend_from_slice(args);
+            call_instance_method(recv.clone(), cls, "method_missing", &mm_args, block)
         }
         _ => Err(raise_exc(
             "NoMethodError",

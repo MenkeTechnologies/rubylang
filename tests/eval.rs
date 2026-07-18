@@ -2098,6 +2098,33 @@ fn pattern_matching_case_in() {
 }
 
 #[test]
+fn method_missing_and_respond_to_missing() {
+    // method_missing handles otherwise-undefined calls, with args and a block.
+    eq(
+        "class P; def method_missing(n, *a); \"#{n}:#{a.inspect}\"; end; end; P.new.foo(1, 2)",
+        "\"foo:[1, 2]\"",
+    );
+    eq(
+        "class P; def method_missing(n, *a, &b); b.call(a.first); end; end; P.new.x(5) { |v| v * 2 }",
+        "10",
+    );
+    // respond_to? consults respond_to_missing?.
+    eq(
+        "class P; def method_missing(n,*a); n; end; def respond_to_missing?(n, _=false); n == :ok; end; end; \
+         p = P.new; [p.respond_to?(:ok), p.respond_to?(:no)]",
+        "[true, false]",
+    );
+    // A class with no method_missing still raises.
+    assert!(ev("class Q; end; Q.new.nope").is_err());
+    // A proxy forwards calls (incl. a block through a splat) via method_missing.
+    eq(
+        "class Px; def initialize(t); @t = t; end; def method_missing(n, *a, &b); @t.send(n, *a, &b); end; end; \
+         Px.new([1, 2, 3]).map { |x| x * 2 }",
+        "[2, 4, 6]",
+    );
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).

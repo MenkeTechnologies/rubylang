@@ -819,19 +819,29 @@ impl Compiler {
             None => None,
         };
         // A call with a splat argument builds its argument array at runtime and
-        // uses the array-spreading call ops. (Block + splat together is not yet
-        // supported — tracked in BUGS.md.)
+        // uses the array-spreading call ops (with a block-carrying variant when a
+        // block is also passed, e.g. `foo(*args, &blk)`).
         if args.iter().any(|a| matches!(a, Expr::Splat(_))) {
-            match recv {
-                Some(r) => {
-                    self.compile_expr(b, r)?;
-                    self.kstr(b, name);
-                    self.compile_spread(b, args)?;
+            if let Some(r) = recv {
+                self.compile_expr(b, r)?;
+            }
+            self.kstr(b, name);
+            self.compile_spread(b, args)?;
+            match (recv.is_some(), proc_id) {
+                (true, Some(id)) => {
+                    b.emit(Op::LoadInt(id as i64), 0);
+                    b.emit(Op::CallBuiltin(ops::MKPROC, 1), 0);
+                    b.emit(Op::CallBuiltin(ops::CALL_METHOD_ARR_BLK, 4), 0);
+                }
+                (true, None) => {
                     b.emit(Op::CallBuiltin(ops::CALL_METHOD_ARR, 3), 0);
                 }
-                None => {
-                    self.kstr(b, name);
-                    self.compile_spread(b, args)?;
+                (false, Some(id)) => {
+                    b.emit(Op::LoadInt(id as i64), 0);
+                    b.emit(Op::CallBuiltin(ops::MKPROC, 1), 0);
+                    b.emit(Op::CallBuiltin(ops::CALL_ARR_BLK, 3), 0);
+                }
+                (false, None) => {
                     b.emit(Op::CallBuiltin(ops::CALL_ARR, 2), 0);
                 }
             }

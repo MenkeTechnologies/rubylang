@@ -604,3 +604,27 @@ case [1, 2, 3, 4, 5]
 in [first, *middle, last]
   puts "#{first} .. #{last}, middle=#{middle.inspect}"
 end
+#==#
+class DynamicConfig
+  def initialize; @data = {}; end
+  def method_missing(name, *args)
+    key = name.to_s
+    if key.end_with?("=")
+      @data[key[0..-2]] = args.first
+    else
+      @data[key]
+    end
+  end
+  def respond_to_missing?(name, include_private = false)
+    true
+  end
+end
+c = DynamicConfig.new
+c.host = "localhost"
+c.port = 8080
+puts c.host
+puts c.port
+puts c.respond_to?(:anything)
+nums = [3, 1, 2]
+puts nums.send(:sort).inspect
+puts [1, 2, 3].send(:map, *[]) { |x| x + 10 }.inspect
