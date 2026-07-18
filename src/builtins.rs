@@ -11,7 +11,7 @@ use crate::host::ops;
 use crate::host::{
     call_instance_method, call_method, call_proc, current_block, has_pending_signal,
     raise_signal_break, raise_signal_next, raise_signal_retry, raise_signal_return, take_break,
-    with_host, RKey,
+    with_host, RKey, RubyHost,
 };
 use fusevm::{Value, VM};
 use indexmap::IndexMap;
@@ -640,7 +640,9 @@ fn dispatch_classref(
                     return Ok(with_host(|h| h.new_hash_with_proc(IndexMap::new(), bl)));
                 }
                 let default = args.first().cloned().unwrap_or(Value::Undef);
-                return Ok(with_host(|h| h.new_hash_with_default(IndexMap::new(), default)));
+                return Ok(with_host(|h| {
+                    h.new_hash_with_default(IndexMap::new(), default)
+                }));
             }
             // A user `initialize` wins. Otherwise an exception class's default
             // `new(msg)` stores the message (defaulting to the class name).
@@ -1296,10 +1298,7 @@ fn dispatch_string(
         "to_i" => {
             let base = args.first().map(as_i).unwrap_or(10);
             if base != 0 && !(2..=36).contains(&base) {
-                return Err(raise_exc(
-                    "ArgumentError",
-                    &format!("invalid radix {base}"),
-                ));
+                return Err(raise_exc("ArgumentError", &format!("invalid radix {base}")));
             }
             Ok(Value::Int(scan_int(&s, base).map(|(v, _)| v).unwrap_or(0)))
         }
@@ -1327,10 +1326,14 @@ fn dispatch_string(
             Ok(Value::Bool(m))
         }
         "=~" => match str_regex(&args[0]) {
-            Some(re) => Ok(re
-                .find(&s)
-                .map(|m| Value::Int(s[..m.start()].chars().count() as i64))
-                .unwrap_or(Value::Undef)),
+            // `=~` sets `$~`/`$1`.. as a side effect, then yields the char offset.
+            Some(re) => {
+                match_data(&re, &s);
+                Ok(re
+                    .find(&s)
+                    .map(|m| Value::Int(s[..m.start()].chars().count() as i64))
+                    .unwrap_or(Value::Undef))
+            }
             None => Ok(Value::Undef),
         },
         "match" => match str_regex(&args[0]) {
@@ -1426,7 +1429,9 @@ fn dispatch_string(
             Some(c) => Ok(Value::Int(c as i64)),
             None => Err(raise_exc("ArgumentError", "empty string")),
         },
-        "chr" => Ok(new_str(s.chars().next().map(|c| c.to_string()).unwrap_or_default())),
+        "chr" => Ok(new_str(
+            s.chars().next().map(|c| c.to_string()).unwrap_or_default(),
+        )),
         // `"a-b-c".partition("-")` => ["a", "-", "b-c"]; no match => [whole, "", ""].
         "partition" => {
             let sep = arg_str(&args[0]);
@@ -1436,7 +1441,11 @@ fn dispatch_string(
                     new_str(sep.clone()),
                     new_str(s[i + sep.len()..].to_string()),
                 ]),
-                None => new_arr(vec![new_str(s.clone()), new_str(String::new()), new_str(String::new())]),
+                None => new_arr(vec![
+                    new_str(s.clone()),
+                    new_str(String::new()),
+                    new_str(String::new()),
+                ]),
             })
         }
         // `rpartition` splits on the LAST occurrence; no match => ["", "", whole].
@@ -1448,7 +1457,11 @@ fn dispatch_string(
                     new_str(sep.clone()),
                     new_str(s[i + sep.len()..].to_string()),
                 ]),
-                None => new_arr(vec![new_str(String::new()), new_str(String::new()), new_str(s.clone())]),
+                None => new_arr(vec![
+                    new_str(String::new()),
+                    new_str(String::new()),
+                    new_str(s.clone()),
+                ]),
             })
         }
         // Case-insensitive compare: `casecmp` => -1/0/1, `casecmp?` => bool.
@@ -1497,10 +1510,7 @@ fn dispatch_string(
                 i as usize
             };
             if at > chars.len() {
-                return Err(raise_exc(
-                    "IndexError",
-                    &format!("index {i} out of string"),
-                ));
+                return Err(raise_exc("IndexError", &format!("index {i} out of string")));
             }
             chars.splice(at..at, arg_str(&args[1]).chars());
             let out: String = chars.into_iter().collect();
@@ -1512,8 +1522,18 @@ fn dispatch_string(
             with_host(|h| h.set_str(recv, format!("{pre}{s}")));
             Ok(recv.clone())
         }
-        "index" => Ok(str_find(&s, &arg_str(&args[0]), args.get(1).map(as_i), false)),
-        "rindex" => Ok(str_find(&s, &arg_str(&args[0]), args.get(1).map(as_i), true)),
+        "index" => Ok(str_find(
+            &s,
+            &arg_str(&args[0]),
+            args.get(1).map(as_i),
+            false,
+        )),
+        "rindex" => Ok(str_find(
+            &s,
+            &arg_str(&args[0]),
+            args.get(1).map(as_i),
+            true,
+        )),
         "[]=" => str_index_set(recv, &s, args),
         _ => Err(format!("undefined method '{name}' for String")),
     }
@@ -1609,20 +1629,63 @@ fn str_regex(v: &Value) -> Option<regex::Regex> {
     with_host(|h| h.as_regex(v)).map(|(re, _)| re)
 }
 
-/// Build a `MatchData` value for the first match of `re` in `s`, or `nil`.
+/// Build a `MatchData` value for the first match of `re` in `s`, or `nil`, and
+/// update the match globals (`$~`, `$&`, `` $` ``, `$'`, `$+`, `$1`..`$9`).
 fn match_data(re: &regex::Regex, s: &str) -> Value {
-    match re.captures(s) {
-        Some(caps) => {
-            let whole = caps.get(0).unwrap();
-            let groups: Vec<Option<String>> = (0..caps.len())
-                .map(|i| caps.get(i).map(|m| m.as_str().to_string()))
-                .collect();
-            let pre = s[..whole.start()].to_string();
-            let post = s[whole.end()..].to_string();
-            with_host(|h| h.new_matchdata(groups, pre, post))
+    let caps = re.captures(s);
+    set_match_globals(caps.as_ref().map(|c| (c, s)))
+}
+
+/// Set the Ruby match globals from a set of captures (or clear them to `nil` on a
+/// failed match), and return the corresponding `MatchData` value (or `nil`).
+/// Ruby names these `$~` (the MatchData), `$&` (whole match), `` $` ``/`$'`
+/// (pre/post text), `$+` (last matched group), and `$1`..`$9` (numbered groups).
+fn set_match_globals(m: Option<(&regex::Captures, &str)>) -> Value {
+    with_host(|h| {
+        // Clear the numbered globals first so a failed match leaves no stale
+        // captures behind.
+        for n in 1..=9 {
+            h.set_global(&n.to_string(), Value::Undef);
         }
-        None => Value::Undef,
-    }
+        let Some((c, s)) = m else {
+            for g in ["~", "&", "`", "'", "+"] {
+                h.set_global(g, Value::Undef);
+            }
+            return Value::Undef;
+        };
+        let whole = c.get(0).unwrap();
+        let groups: Vec<Option<String>> = (0..c.len())
+            .map(|i| c.get(i).map(|g| g.as_str().to_string()))
+            .collect();
+        // Build each global's string value first, then store — never borrow the
+        // host mutably twice in one expression.
+        let to_val = |h: &mut RubyHost, o: &Option<String>| -> Value {
+            o.clone().map(|s| h.new_string(s)).unwrap_or(Value::Undef)
+        };
+        let pre = s[..whole.start()].to_string();
+        let post = s[whole.end()..].to_string();
+        let md = h.new_matchdata(groups.clone(), pre.clone(), post.clone());
+        h.set_global("~", md.clone());
+        let g0 = to_val(h, groups.first().unwrap_or(&None));
+        h.set_global("&", g0);
+        let pre_v = h.new_string(pre);
+        h.set_global("`", pre_v);
+        let post_v = h.new_string(post);
+        h.set_global("'", post_v);
+        // `$+` is the last group that actually matched.
+        let last = groups
+            .iter()
+            .skip(1)
+            .rposition(|g| g.is_some())
+            .map(|i| i + 1);
+        let plus = to_val(h, last.and_then(|i| groups.get(i)).unwrap_or(&None));
+        h.set_global("+", plus);
+        for i in 1..=9 {
+            let v = to_val(h, groups.get(i).unwrap_or(&None));
+            h.set_global(&i.to_string(), v);
+        }
+        md
+    })
 }
 
 /// `MatchData#[n]`, `#pre_match`, `#post_match`, `#to_a`, `#captures`, `#to_s`.
@@ -1693,6 +1756,8 @@ fn regex_replace(
         let m = caps.get(0).unwrap();
         out.push_str(&s[last..m.start()]);
         if let Some(bl) = block {
+            // Expose `$~`/`$1`.. to the block for the current match.
+            set_match_globals(Some((&caps, s)));
             let r = call_proc(bl, &[new_str(m.as_str().to_string())])?;
             out.push_str(&with_host(|h| h.to_s(&r)));
         } else {
@@ -1796,8 +1861,10 @@ fn parse_char_selector(spec: &str) -> (bool, std::collections::HashSet<char>) {
 /// Build a predicate matching a char against ALL selector specs (Ruby intersects
 /// multiple args). With no args every char matches.
 fn char_matcher(args: &[Value]) -> impl Fn(char) -> bool {
-    let parsed: Vec<(bool, std::collections::HashSet<char>)> =
-        args.iter().map(|v| parse_char_selector(&arg_str(v))).collect();
+    let parsed: Vec<(bool, std::collections::HashSet<char>)> = args
+        .iter()
+        .map(|v| parse_char_selector(&arg_str(v)))
+        .collect();
     move |c| parsed.iter().all(|(neg, set)| *neg != set.contains(&c))
 }
 
@@ -2317,9 +2384,7 @@ fn dispatch_array(
             }
             Ok(acc)
         }
-        "min_by" | "max_by" | "sort_by" | "minmax_by" => {
-            sort_by_family(recv, name, &arr, &block)
-        }
+        "min_by" | "max_by" | "sort_by" | "minmax_by" => sort_by_family(recv, name, &arr, &block),
         "[]" => Ok(arr_index(&arr, args)),
         "fetch" => {
             let len = arr.len();
@@ -2519,7 +2584,11 @@ fn dispatch_array(
             if let Some(bl) = &block {
                 // fill { |index| ... } / fill(start) { } / fill(start, length) { }
                 let start = args.first().map(as_i).unwrap_or(0);
-                let start = if start < 0 { (start + len).max(0) } else { start };
+                let start = if start < 0 {
+                    (start + len).max(0)
+                } else {
+                    start
+                };
                 let end = match args.get(1) {
                     Some(l) => start + as_i(l),
                     None => len,
@@ -2537,7 +2606,11 @@ fn dispatch_array(
                 // fill(value) / fill(value, start) / fill(value, start, length)
                 let val = args[0].clone();
                 let start = args.get(1).map(as_i).unwrap_or(0);
-                let start = if start < 0 { (start + len).max(0) } else { start };
+                let start = if start < 0 {
+                    (start + len).max(0)
+                } else {
+                    start
+                };
                 let end = match args.get(2) {
                     Some(l) => start + as_i(l),
                     None => len.max(start),
@@ -3307,9 +3380,7 @@ fn dispatch_symbol(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         }
         // `Symbol#[]` indexes the name and returns a String, like `String#[]`.
         "[]" | "slice" => Ok(str_index(&s, args)),
-        "start_with?" => Ok(Value::Bool(
-            args.iter().any(|a| s.starts_with(&arg_str(a))),
-        )),
+        "start_with?" => Ok(Value::Bool(args.iter().any(|a| s.starts_with(&arg_str(a))))),
         // `<=>` compares names; nil when the other operand is not a Symbol.
         "<=>" => Ok(match with_host(|h| h.as_symbol(&args[0])) {
             Some(other) => Value::Int(match s.cmp(&other) {
@@ -3374,6 +3445,7 @@ fn dispatch_regexp(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         }
         "=~" => {
             let s = arg_str(&args[0]);
+            match_data(&re, &s); // sets `$~`/`$1`..
             Ok(re
                 .find(&s)
                 .map(|m| Value::Int(s[..m.start()].chars().count() as i64))
@@ -3835,7 +3907,10 @@ fn fmt_g(f: f64, prec: usize, upper: bool, alt: bool) -> String {
     let p = if prec == 0 { 1 } else { prec };
     // Exponent after rounding to `p` significant digits.
     let raw = format!("{:.*e}", p - 1, f);
-    let e: i32 = raw.split_once('e').and_then(|(_, x)| x.parse().ok()).unwrap_or(0);
+    let e: i32 = raw
+        .split_once('e')
+        .and_then(|(_, x)| x.parse().ok())
+        .unwrap_or(0);
     if e >= -4 && e < p as i32 {
         let frac = (p as i32 - 1 - e).max(0) as usize;
         let mut s = format!("{:.*}", frac, f);
@@ -4076,7 +4151,11 @@ fn sprintf(fmt: &str, args: &[Value]) -> String {
                     } else if !f.is_nan() && space {
                         sign = " ";
                     }
-                    if f.is_nan() { "NaN".into() } else { "Inf".into() }
+                    if f.is_nan() {
+                        "NaN".into()
+                    } else {
+                        "Inf".into()
+                    }
                 } else {
                     if f.is_sign_negative() {
                         sign = "-";
@@ -4106,7 +4185,11 @@ fn sprintf(fmt: &str, args: &[Value]) -> String {
                     } else if !f.is_nan() && space {
                         sign = " ";
                     }
-                    if f.is_nan() { "NaN".into() } else { "Inf".into() }
+                    if f.is_nan() {
+                        "NaN".into()
+                    } else {
+                        "Inf".into()
+                    }
                 } else {
                     if f.is_sign_negative() {
                         sign = "-";
@@ -4125,7 +4208,9 @@ fn sprintf(fmt: &str, args: &[Value]) -> String {
             'c' => {
                 zero_ok = false;
                 match &arg {
-                    Value::Int(n) => char::from_u32(*n as u32).map(String::from).unwrap_or_default(),
+                    Value::Int(n) => char::from_u32(*n as u32)
+                        .map(String::from)
+                        .unwrap_or_default(),
                     _ => {
                         let s = arg_str(&arg);
                         s.chars().next().map(String::from).unwrap_or_default()

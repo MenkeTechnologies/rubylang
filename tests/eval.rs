@@ -657,7 +657,10 @@ fn array_combine_batch() {
     // insert (positive, negative, past-end padding).
     eq("a = [1, 2, 3]; a.insert(1, :x, :y); a", "[1, :x, :y, 2, 3]");
     eq("a = [1, 2, 3]; a.insert(-2, :z); a", "[1, 2, :z, 3]");
-    eq("a = [1, 2, 3]; a.insert(5, :x); a", "[1, 2, 3, nil, nil, :x]");
+    eq(
+        "a = [1, 2, 3]; a.insert(5, :x); a",
+        "[1, 2, 3, nil, nil, :x]",
+    );
     // delete_at returns the removed value.
     eq("a = [1, 2, 3]; a.delete_at(1)", "2");
     eq("a = [1, 2, 3]; a.delete_at(1); a", "[1, 3]");
@@ -695,7 +698,10 @@ fn symbol_methods_batch() {
 #[test]
 fn hash_methods_batch() {
     // Transforms.
-    eq("{a: 1, b: 2}.transform_values { |v| v * 10 }", "{a: 10, b: 20}");
+    eq(
+        "{a: 1, b: 2}.transform_values { |v| v * 10 }",
+        "{a: 10, b: 20}",
+    );
     eq(
         "{a: 1, b: 2}.transform_keys { |k| k.to_s }",
         "{\"a\" => 1, \"b\" => 2}",
@@ -742,7 +748,10 @@ fn exceptions_batch() {
         ":caught",
     );
     // Hash#fetch on a missing key raises KeyError (with the Ruby message)
-    eq("begin; {}.fetch(:x); rescue KeyError; :nokey; end", ":nokey");
+    eq(
+        "begin; {}.fetch(:x); rescue KeyError; :nokey; end",
+        ":nokey",
+    );
     eq(
         "begin; {}.fetch(:x); rescue KeyError => e; e.message; end",
         "\"key not found: :x\"",
@@ -759,7 +768,10 @@ fn exceptions_batch() {
     eq("[1,2].fetch(5) { |i| i * 10 }", "50");
     eq("[1,2,3].fetch(-1)", "3");
     // raise "msg" and bare rescue bind to RuntimeError
-    eq("begin; raise \"boom\"; rescue => e; e.message; end", "\"boom\"");
+    eq(
+        "begin; raise \"boom\"; rescue => e; e.message; end",
+        "\"boom\"",
+    );
     // raise Class with no message uses the class name
     eq(
         "begin; raise RuntimeError; rescue RuntimeError => e; e.message; end",
@@ -801,10 +813,7 @@ fn exceptions_batch() {
         "3",
     );
     // ensure runs but a return from the body still wins
-    eq(
-        "def f; begin; return 1; ensure; nil; end; end; f",
-        "1",
-    );
+    eq("def f; begin; return 1; ensure; nil; end; end; f", "1");
     // first matching rescue clause wins
     eq(
         "begin; raise ArgumentError; rescue TypeError; :t; rescue ArgumentError; :a; end",
@@ -822,8 +831,14 @@ fn enumerable_core_batch() {
     eq("[10, 3].inject(:/)", "3");
     eq("[\"a\", \"b\", \"c\"].inject(:+)", "\"abc\"");
     // each_with_index without a block yields `[elem, index]` pairs.
-    eq("[1, 2, 3].each_with_index.map { |x, i| x * i }", "[0, 2, 6]");
-    eq("[1, 2, 3, 4].each_with_index.to_a", "[[1, 0], [2, 1], [3, 2], [4, 3]]");
+    eq(
+        "[1, 2, 3].each_with_index.map { |x, i| x * i }",
+        "[0, 2, 6]",
+    );
+    eq(
+        "[1, 2, 3, 4].each_with_index.to_a",
+        "[[1, 0], [2, 1], [3, 2], [4, 3]]",
+    );
     // minmax, count(&:pred), sum(init).
     eq("[1, 2, 3, 4].minmax", "[1, 4]");
     eq("[5, 3, 8, 1].minmax", "[1, 8]");
@@ -927,7 +942,10 @@ fn string_iter_batch() {
     // chars / bytes / each_char
     eq("\"abc\".chars", "[\"a\", \"b\", \"c\"]");
     eq("\"abc\".bytes", "[97, 98, 99]");
-    eq("s = \"\"; \"abc\".each_char { |c| s << c.upcase }; s", "\"ABC\"");
+    eq(
+        "s = \"\"; \"abc\".each_char { |c| s << c.upcase }; s",
+        "\"ABC\"",
+    );
     // ord / chr
     eq("\"A\".ord", "65");
     eq("\"a\".ord", "97");
@@ -1012,8 +1030,14 @@ fn proc_methods_batch() {
     eq("add = ->(a, b) { a + b }; add.curry[1, 2]", "3");
     eq("add = ->(a, b) { a + b }; add.curry.arity", "-1");
     // >> and << composition.
-    eq("f = ->(x) { x + 1 }; g = ->(x) { x * 2 }; (f >> g).call(3)", "8");
-    eq("f = ->(x) { x + 1 }; g = ->(x) { x * 2 }; (f << g).call(3)", "7");
+    eq(
+        "f = ->(x) { x + 1 }; g = ->(x) { x * 2 }; (f >> g).call(3)",
+        "8",
+    );
+    eq(
+        "f = ->(x) { x + 1 }; g = ->(x) { x * 2 }; (f << g).call(3)",
+        "7",
+    );
     // to_proc on a Proc is the identity (same proc, still callable).
     eq("l = ->(x) { x + 1 }; l.to_proc.call(5)", "6");
 }
@@ -1134,8 +1158,14 @@ fn range_methods_batch() {
     eq("('a'..'e').first(2)", "[\"a\", \"b\"]");
     eq("('a'..'e').last(2)", "[\"d\", \"e\"]");
     eq("('a'..'e').count", "5");
-    eq("('a'..'e').map { |c| c.upcase }", "[\"A\", \"B\", \"C\", \"D\", \"E\"]");
-    eq("r = []; ('a'..'c').each { |c| r << c }; r", "[\"a\", \"b\", \"c\"]");
+    eq(
+        "('a'..'e').map { |c| c.upcase }",
+        "[\"A\", \"B\", \"C\", \"D\", \"E\"]",
+    );
+    eq(
+        "r = []; ('a'..'c').each { |c| r << c }; r",
+        "[\"a\", \"b\", \"c\"]",
+    );
 }
 
 #[test]
@@ -1149,7 +1179,10 @@ fn comparable_batch() {
     eq("[5, 3, 8, 1].minmax", "[1, 8]");
     eq("[].minmax", "[nil, nil]");
     eq("[3, 1, 2].minmax_by { |x| -x }", "[3, 1]");
-    eq(r#"["bb", "a", "ccc"].minmax_by(&:length)"#, r#"["a", "ccc"]"#);
+    eq(
+        r#"["bb", "a", "ccc"].minmax_by(&:length)"#,
+        r#"["a", "ccc"]"#,
+    );
     // sort with a two-arg comparator block, and in-place sort!.
     eq("[3, 1, 2].sort { |a, b| b <=> a }", "[3, 2, 1]");
     eq("[3, 1, 2].sort!", "[1, 2, 3]");
@@ -1163,8 +1196,14 @@ fn comparable_batch() {
     eq(&format!("{t}T.new(2).between?(T.new(1), T.new(3))"), "true");
     eq(&format!("{t}T.new(5).clamp(T.new(1), T.new(3)).v"), "3");
     eq(&format!("{t}T.new(0).clamp(T.new(1), T.new(3)).v"), "1");
-    eq(&format!("{t}[T.new(3), T.new(1), T.new(2)].sort.map(&:v)"), "[1, 2, 3]");
-    eq(&format!("{t}[T.new(3), T.new(1), T.new(2)].minmax.map(&:v)"), "[1, 3]");
+    eq(
+        &format!("{t}[T.new(3), T.new(1), T.new(2)].sort.map(&:v)"),
+        "[1, 2, 3]",
+    );
+    eq(
+        &format!("{t}[T.new(3), T.new(1), T.new(2)].minmax.map(&:v)"),
+        "[1, 3]",
+    );
 }
 
 #[test]
@@ -1188,7 +1227,10 @@ fn op_assign_batch() {
     // Hash.new(0) default drives the counter idiom.
     eq("h = Hash.new(0); h[:x] += 1; h[:x] += 1; h[:x]", "2");
     eq("h = Hash.new(0); h[\"z\"] == 0", "true");
-    eq(r#"h = Hash.new(0); "aab".chars.each { |c| h[c] += 1 }; h"#, r#"{"a" => 2, "b" => 1}"#);
+    eq(
+        r#"h = Hash.new(0); "aab".chars.each { |c| h[c] += 1 }; h"#,
+        r#"{"a" => 2, "b" => 1}"#,
+    );
 }
 
 #[test]
@@ -1199,8 +1241,14 @@ fn construction_batch() {
     eq("Array.new(0)", "[]");
     eq("Hash.new(0)[:missing]", "0");
     // Block default: the block runs on each miss and may mutate the hash.
-    eq("h = Hash.new { |hh, k| hh[k] = k.to_s }; h[5]; h", "{5 => \"5\"}");
-    eq("h = Hash.new { |hh, k| hh[k] = [] }; h[:a] << 1; h[:a] << 2; h", "{a: [1, 2]}");
+    eq(
+        "h = Hash.new { |hh, k| hh[k] = k.to_s }; h[5]; h",
+        "{5 => \"5\"}",
+    );
+    eq(
+        "h = Hash.new { |hh, k| hh[k] = [] }; h[:a] << 1; h[:a] << 2; h",
+        "{a: [1, 2]}",
+    );
     eq("Hash[[[:a, 1], [:b, 2]]]", "{a: 1, b: 2}");
     eq("Hash[:a, 1, :b, 2]", "{a: 1, b: 2}");
     eq("[[:x, 10], [:y, 20]].to_h", "{x: 10, y: 20}");
@@ -1215,8 +1263,38 @@ fn string_more_batch() {
     eq("\"aB\".casecmp(\"ac\")", "-1");
     eq("\"Hello\".casecmp?(\"hello\")", "true");
     eq("\"mississippi\".tr_s(\"sp\", \"*\")", "\"mi*i*i*i\"");
-    eq("\"a\\nb\\nc\".each_line.to_a", "[\"a\\n\", \"b\\n\", \"c\"]");
+    eq(
+        "\"a\\nb\\nc\".each_line.to_a",
+        "[\"a\\n\", \"b\\n\", \"c\"]",
+    );
     eq("\"hi\".center(6, \"*\")", "\"**hi**\"");
+}
+
+#[test]
+fn regex_match_globals_batch() {
+    // `=~` sets `$~`, `$1`..`$9`, `$&`, `` $` ``, `$'`, `$+`.
+    eq("\"foo123bar\" =~ /(\\d+)/; $1", "\"123\"");
+    eq("\"foo123bar\" =~ /(\\d+)/; $~[0]", "\"123\"");
+    eq("\"foo123bar\" =~ /(\\d+)/; $~.pre_match", "\"foo\"");
+    eq(
+        "\"2024-01-15\" =~ /(\\d+)-(\\d+)-(\\d+)/; [$1, $2, $3]",
+        "[\"2024\", \"01\", \"15\"]",
+    );
+    eq("\"abc\" =~ /b/; $&", "\"b\"");
+    eq("\"abc\" =~ /b/; $`", "\"a\"");
+    eq("\"abc\" =~ /b/; $'", "\"c\"");
+    eq("\"a1b2\" =~ /([a-z])(\\d)/; $+", "\"1\"");
+    // A failed match clears the numbered globals to nil.
+    eq("\"hello\" =~ /xyz/; $1", "nil");
+    // The globals are visible inside a gsub block.
+    eq(
+        "\"The Quick Brown\".gsub(/(\\w)(\\w+)/) { $1 }",
+        "\"T Q B\"",
+    );
+    eq(
+        "\"hello world\".gsub(/(\\w+)/) { $1.capitalize }",
+        "\"Hello World\"",
+    );
 }
 
 #[test]

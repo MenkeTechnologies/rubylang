@@ -24,6 +24,12 @@ puts m[1]
 puts m[2]
 puts m.pre_match.inspect
 
+# A successful =~ sets the match globals $~, $1..$9, $&.
+"order #4271 shipped" =~ /#(\d+)/
+puts $1
+puts $&
+puts $~.pre_match
+
 # Regexp objects work as case-equality tests.
 ["42", "foo", "3.14"].each do |s|
   kind = case s

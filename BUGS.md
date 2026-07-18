@@ -60,10 +60,14 @@ capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
   (returns `MatchData` with `[n]`/`pre_match`/`post_match`/`to_a`/`captures`),
   `match?`, `scan`, `split(re)`, `sub`/`gsub` with a Regexp (backrefs `\1`..`\9`
   in the replacement and a block form), and `Regexp#{source,match,scan,match?}`
-  plus `case`/`when /re/` case-equality. Backed by the Rust `regex` crate, so
-  Ruby's Onigmo-only constructs (backreferences within the pattern, lookaround)
-  are unavailable. `$~` / `$1`..`$9` match globals are not set — use `MatchData`
-  or a block param instead.
+  plus `case`/`when /re/` case-equality. A successful match sets the globals
+  `$~` (MatchData), `$&` (whole match), `` $` ``/`$'` (pre/post text), `$+`
+  (last group), and `$1`..`$9` (numbered groups) — visible after `=~`/`match`
+  and inside a `sub`/`gsub` block. (The punctuation globals `` $` `` and `$'`
+  can't yet appear inside a `#{...}` interpolation — the interp scanner reads the
+  quote as a string delimiter; reference them outside interpolation.) Backed by
+  the Rust `regex` crate, so Ruby's Onigmo-only constructs (backreferences within
+  the pattern, lookaround) are unavailable.
 - **`Object#class` returns a String** (the class name), not a `Class` object;
   `.class.name` and class-object identity are therefore unsupported.
 - **Enumerator without block.** `each_with_index.map` (an enumerator returned

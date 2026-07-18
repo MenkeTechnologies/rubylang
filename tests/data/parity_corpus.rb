@@ -452,3 +452,14 @@ puts "path/to/file".partition("/").inspect
 puts "path/to/file".rpartition("/").inspect
 puts "Hello".casecmp?("HELLO")
 puts "mississippi".tr_s("sp", "*")
+#==#
+"order #4271 shipped" =~ /#(\d+)/
+puts $1
+puts $~[0]
+puts $~.pre_match
+"2024-12-25" =~ /(\d+)-(\d+)-(\d+)/
+puts "#{$3}/#{$2}/#{$1}"
+puts "the quick brown fox".gsub(/(\w)(\w*)/) { $1.upcase + $2 }
+puts "hello world".gsub(/\w+/) { $&.capitalize }
+"no match here" =~ /\d+/
+puts $1.inspect

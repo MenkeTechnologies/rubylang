@@ -179,10 +179,7 @@ pub enum ProcKind {
     Normal,
     /// A partially-applied proc: it needs `arity` total args and has already
     /// gathered `collected`; when full it runs the base `template`/`scope`.
-    Curried {
-        arity: usize,
-        collected: Vec<Value>,
-    },
+    Curried { arity: usize, collected: Vec<Value> },
     /// Function composition: call `first`, feed its result to `second`.
     /// `f >> g` builds `{ first: f, second: g }`; `f << g` builds `{ first: g,
     /// second: f }`.
@@ -529,7 +526,13 @@ impl RubyHost {
     }
     /// `true` if this proc was made by `->`/`lambda` (not a plain block).
     pub fn proc_is_lambda(&self, v: &Value) -> bool {
-        matches!(self.obj(v), Some(RObj::Proc { is_lambda: true, .. }))
+        matches!(
+            self.obj(v),
+            Some(RObj::Proc {
+                is_lambda: true,
+                ..
+            })
+        )
     }
     /// Mark an existing proc as a lambda (used by the `lambda` Kernel method).
     pub fn set_proc_lambda(&mut self, v: &Value) {
@@ -655,7 +658,10 @@ impl RubyHost {
         }
     }
     pub fn is_proc(&self, v: &Value) -> bool {
-        matches!(self.obj(v), Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)))
+        matches!(
+            self.obj(v),
+            Some(RObj::Proc { .. }) | Some(RObj::SymProc(_))
+        )
     }
     pub fn has_method(&self, name: &str) -> bool {
         self.methods.contains_key(name)

@@ -290,8 +290,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             b'$' => {
                 i += 1;
                 let start = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                // Special single-punctuation globals: `$~` (last MatchData),
+                // `$&` (whole match), `` $` `` (pre-match), `$'` (post-match),
+                // `$+` (last group). Otherwise an alphanumeric/underscore name.
+                if i < b.len() && matches!(b[i], b'~' | b'&' | b'`' | b'\'' | b'+') {
                     i += 1;
+                } else {
+                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                        i += 1;
+                    }
                 }
                 out.push(Token {
                     kind: Tok::GVar(src[start..i].to_string()),
@@ -401,10 +408,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             }
             // Operator symbols: `:+`, `:<=>`, `:[]`, … only in value position (so
             // `a ? b : c` ternary and `key: v` hash keys are untouched).
-            b':'
-                if i + 1 < b.len()
-                    && op_symbol_at(&src[i + 1..]).is_some()
-                    && !prev_is_value(&out) =>
+            b':' if i + 1 < b.len()
+                && op_symbol_at(&src[i + 1..]).is_some()
+                && !prev_is_value(&out) =>
             {
                 let op = op_symbol_at(&src[i + 1..]).unwrap();
                 i += 1 + op.len();
