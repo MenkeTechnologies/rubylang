@@ -1298,6 +1298,25 @@ fn regex_match_globals_batch() {
 }
 
 #[test]
+fn integer_bits_batch() {
+    // Integer bit/math extras, byte-matched against ruby 4.0.6.
+    eq("2.pow(10, 1000)", "24"); // modular exponentiation
+    eq("10.ceildiv(3)", "4");
+    eq("(-10).ceildiv(3)", "-3");
+    eq("10.ceildiv(-3)", "-3");
+    eq("12.ceildiv(4)", "3");
+    eq("12.gcdlcm(8)", "[4, 24]");
+    eq("0.gcdlcm(5)", "[5, 0]");
+    eq("5[0]", "1");
+    eq("5[1]", "0");
+    eq("5[2]", "1");
+    eq("5[100]", "0");
+    eq("(-1)[0]", "1");
+    eq("(-1)[100]", "1");
+    eq("255.bit_length", "8");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

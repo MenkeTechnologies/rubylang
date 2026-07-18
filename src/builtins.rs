@@ -958,6 +958,40 @@ fn dispatch_number(
                 (a / gcd(a, b) * b).abs()
             }))
         }
+        "ceildiv" => match (recv, &args[0]) {
+            (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
+            // Ruby: `n.ceildiv(d)` == `-(-n / d)` using floor division.
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(-floor_div(-*a, *b))),
+            _ => Ok(Value::Int(as_f(recv).div_euclid(as_f(&args[0])).ceil() as i64)),
+        },
+        "gcdlcm" => {
+            let (a, b) = (as_i(recv), as_i(&args[0]));
+            let g = gcd(a, b);
+            let l = if a == 0 || b == 0 {
+                0
+            } else {
+                (a / g * b).abs()
+            };
+            Ok(new_arr(vec![Value::Int(g), Value::Int(l)]))
+        }
+        "[]" => {
+            // `Integer#[i]` reads bit i of the two's-complement representation;
+            // beyond the value's range positives read 0 and negatives read 1.
+            let n = as_i(recv);
+            let i = as_i(&args[0]);
+            let bit = if i < 0 {
+                0
+            } else if i >= 64 {
+                if n < 0 {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                (n >> i) & 1
+            };
+            Ok(Value::Int(bit))
+        }
         "digits" => {
             let mut n = as_i(recv);
             if n < 0 {
