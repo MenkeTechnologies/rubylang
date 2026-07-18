@@ -2358,6 +2358,37 @@ fn time_utc() {
 }
 
 #[test]
+fn filter_map_transpose_string_index_radix() {
+    // Array#filter_map maps and keeps truthy results.
+    eq("[1, 2, 3, 4].filter_map { |x| x * 2 if x.even? }", "[4, 8]");
+    eq("(1..10).filter_map { |x| x if x.odd? }", "[1, 3, 5, 7, 9]");
+    // Array#transpose.
+    eq("[[1, 2], [3, 4]].transpose", "[[1, 3], [2, 4]]");
+    eq(
+        "[[1, 2, 3], [4, 5, 6]].transpose",
+        "[[1, 4], [2, 5], [3, 6]]",
+    );
+    eq("[].transpose", "[]");
+    // String#[] with a Regexp or substring.
+    eq("\"hello\"[/l+/]", "\"ll\"");
+    eq("\"hello world\"[/\\w+/]", "\"hello\"");
+    eq("\"hello\"[/xyz/]", "nil");
+    eq("\"2024-01-15\"[/(\\d+)-(\\d+)/, 2]", "\"01\"");
+    eq("\"hello\"[\"ll\"]", "\"ll\"");
+    eq("\"hello\"[\"xyz\"]", "nil");
+    // Radix integer literals.
+    eq("0b1010", "10");
+    eq("0o17", "15");
+    eq("0xff", "255");
+    eq("0b1111_0000", "240");
+    eq("017", "15"); // leading-zero octal
+    eq("0xDEAD", "57005");
+    eq("0d99", "99");
+    eq("0xff + 1", "256");
+    eq("[0b1, 0b10, 0b100]", "[1, 2, 4]");
+}
+
+#[test]
 fn composite_hash_keys() {
     // Arrays as Hash keys — structural equality, round-trip, nesting.
     eq("{[1, 2] => \"a\", [3, 4] => \"b\"}[[3, 4]]", "\"b\"");

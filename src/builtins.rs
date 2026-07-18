@@ -3329,8 +3329,31 @@ fn str_index(s: &str, args: &[Value]) -> Value {
                     Some((start, e)) => new_str(chars[start..e].iter().collect()),
                     None => Value::Undef,
                 }
+            } else if let Some((re, _)) = with_host(|h| h.as_regex(rng)) {
+                // `s[/re/]` — the whole match, or nil.
+                re.find(s)
+                    .map(|m| new_str(m.as_str().to_string()))
+                    .unwrap_or(Value::Undef)
+            } else if let Some(sub) = with_host(|h| h.as_str(rng)) {
+                // `s["sub"]` — the substring itself if present, else nil.
+                if s.contains(&sub) {
+                    new_str(sub)
+                } else {
+                    Value::Undef
+                }
             } else {
                 Value::Undef
+            }
+        }
+        // `s[/re/, n]` — the nth capture group of the match (0 = whole match).
+        [re, Value::Int(n)] if with_host(|h| h.as_regex(re)).is_some() => {
+            let (re, _) = with_host(|h| h.as_regex(re)).unwrap();
+            match re.captures(s) {
+                Some(caps) => caps
+                    .get((*n).max(0) as usize)
+                    .map(|m| new_str(m.as_str().to_string()))
+                    .unwrap_or(Value::Undef),
+                None => Value::Undef,
             }
         }
         _ => Value::Undef,
@@ -3881,6 +3904,40 @@ fn dispatch_array(
                 }
             }
             Ok(new_arr(out))
+        }
+        // `filter_map` maps each element and keeps only the truthy results.
+        "filter_map" => {
+            let mut out = Vec::new();
+            if let Some(b) = &block {
+                for x in &arr {
+                    let r = call_proc(b, std::slice::from_ref(x))?;
+                    if with_host(|h| h.truthy(&r)) {
+                        out.push(r);
+                    }
+                }
+            }
+            Ok(new_arr(out))
+        }
+        // `transpose` turns an array of equal-length rows into columns.
+        "transpose" => {
+            let rows: Vec<Vec<Value>> = arr
+                .iter()
+                .map(|r| with_host(|h| h.as_array(r).unwrap_or_default()))
+                .collect();
+            let width = rows.first().map(|r| r.len()).unwrap_or(0);
+            if let Some(bad) = rows.iter().position(|r| r.len() != width) {
+                return Err(raise_exc(
+                    "IndexError",
+                    &format!(
+                        "element size differs ({} should be {width})",
+                        rows[bad].len()
+                    ),
+                ));
+            }
+            let cols: Vec<Value> = (0..width)
+                .map(|c| new_arr(rows.iter().map(|r| r[c].clone()).collect()))
+                .collect();
+            Ok(new_arr(cols))
         }
         "find" | "detect" => {
             if let Some(b) = &block {

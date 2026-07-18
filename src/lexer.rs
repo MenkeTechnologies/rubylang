@@ -278,6 +278,41 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 i += 1;
             }
             b'0'..=b'9' => {
+                // Radix-prefixed integer literals: `0b1010` (binary), `0o17` /
+                // `017` (octal), `0xff` (hex), `0d99` (decimal). A leading `0`
+                // followed by octal digits is octal, matching Ruby.
+                if b[i] == b'0' && i + 1 < b.len() {
+                    let (radix, skip) = match b[i + 1] {
+                        b'b' | b'B' => (2u32, 2),
+                        b'o' | b'O' => (8, 2),
+                        b'x' | b'X' => (16, 2),
+                        b'd' | b'D' => (10, 2),
+                        c if c.is_ascii_digit() => (8, 1),
+                        _ => (0, 0),
+                    };
+                    if radix != 0 {
+                        let dstart = i + skip;
+                        let mut j = dstart;
+                        while j < b.len() {
+                            let c = b[j] as char;
+                            if c == '_' || c.is_digit(radix) {
+                                j += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        let digits: String = src[dstart..j].chars().filter(|c| *c != '_').collect();
+                        let n = i64::from_str_radix(&digits, radix)
+                            .map_err(|_| format!("bad integer literal: {}", &src[i..j]))?;
+                        out.push(Token {
+                            kind: Tok::Int(n),
+                            line,
+                            space: core::mem::take(&mut sp),
+                        });
+                        i = j;
+                        continue;
+                    }
+                }
                 let start = i;
                 while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'_') {
                     i += 1;

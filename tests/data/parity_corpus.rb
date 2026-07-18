@@ -1008,3 +1008,21 @@ fib = lambda do |n|
 end
 puts fib.call(10)
 puts memo.size
+#==#
+matrix = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+puts matrix.transpose.inspect
+puts matrix.map { |row| row.sum }.inspect
+words = ["apple", "banana", "", "cherry", nil, "date"]
+puts words.filter_map { |w| w.upcase if w && !w.empty? }.inspect
+log = "2024-03-15 ERROR failed; 2024-03-16 WARN retry"
+puts log.scan(/\d{4}-\d{2}-\d{2}/).inspect
+puts log[/ERROR|WARN/]
+puts log[/(\d{4})-(\d{2})/, 1]
+flags = [0b001, 0b010, 0b100, 0b111]
+puts flags.map { |f| f.to_s(2) }.inspect
+puts flags.sum
+perms = 0o755
+puts perms
+puts 0xCAFE
+mask = 0xFF & 0b1010_1010
+puts mask

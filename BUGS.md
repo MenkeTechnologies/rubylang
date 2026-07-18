@@ -58,8 +58,10 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
 
 - **Not lexed:** `__END__`. Heredocs (`<<END`, `<<~SQL`, `<<-EOT`, `<<'RAW'`),
   `%w[]` / `%i[]` word/symbol arrays (and the `()`/`{}`/`<>` delimiter variants),
-  double-quoted `#{}` interpolation, `?c` character literals, and regex literals
-  (`/pat/flags`, with `i`/`m`/`x` flags) **are** lexed.
+  double-quoted `#{}` interpolation, `?c` character literals, regex literals
+  (`/pat/flags`, with `i`/`m`/`x` flags), and radix integer literals
+  (`0b1010` binary, `0o17`/`017` octal, `0xff` hex, `0d99` decimal, with `_`
+  separators) **are** lexed.
 
 ## Runtime / methods
 
