@@ -1080,3 +1080,21 @@ puts Math.hypot(5, 12)
 puts [1, 2, 4, 8, 16].map { |n| Math.log2(n).to_i }.inspect
 compound = 1000 * Math::E ** (0.05 * 10)
 puts compound.round(2)
+#==#
+puts defined?(puts)
+puts defined?(String).inspect
+puts defined?(NoSuchThing).inspect
+count = 0
+puts defined?(count)
+puts defined?(@missing).inspect
+CONFIG = {debug: true}
+puts defined?(CONFIG)
+result = defined?(Integer) ? "has Integer" : "no Integer"
+puts result
+[:puts, :nope, :require].each do |m|
+  puts "#{m}: #{defined?(m) ? 'sym' : 'sym'}"
+end
+def check(x) = defined?(x) ? "defined" : "undefined"
+puts check(42)
+puts defined?(1 + 2 * 3)
+puts defined?({a: 1}).inspect

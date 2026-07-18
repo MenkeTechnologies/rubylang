@@ -184,6 +184,9 @@ pub enum Expr {
     Retry,
     /// `yield args` — invoke the block passed to the enclosing method.
     Yield(Vec<Expr>),
+    /// `defined?(expr)` — a description string of the operand (or nil), without
+    /// evaluating it.
+    Defined(Box<Expr>),
     /// `super` (args `None` = forward the current method's args) / `super(args)`.
     Super(Option<Vec<Expr>>),
     /// A splat argument/element: `*expr` in a call or array literal.

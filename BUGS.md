@@ -143,6 +143,15 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   (`String`, not a byte buffer), so the binary directives (`N`/`n`/`V`/`v`/`H`,
   high `C` bytes) cannot round-trip. This is a durable encoding limitation, not a
   temporary gap.
+- **`defined?`.** The `defined?(expr)` / `defined? expr` operator returns the
+  Ruby description string (`"local-variable"`, `"instance-variable"`,
+  `"global-variable"`, `"constant"`, `"method"`, `"assignment"`, `"expression"`,
+  `"nil"`/`"true"`/`"false"`/`"self"`/`"yield"`) or `nil`, without evaluating the
+  operand. Kernel methods (`puts`, `require`, …) report `"method"`. Two edges
+  differ from MRI: an instance/class variable *set to `nil`* reads as undefined
+  (nil and unset are indistinguishable in the object model), and the lexical
+  local-declaration quirk (`x = 1 unless defined?(x)` — MRI treats `x` as an
+  already-declared local from the unexecuted assignment) is not modeled.
 - **`Math` module.** `Math.sqrt`/`cbrt`/`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/
   `atan2`/`sinh`/`cosh`/`tanh`/`exp`/`log`(with optional base)/`log2`/`log10`/
   `hypot`/`ldexp` and the constants `Math::PI` / `Math::E` are implemented over

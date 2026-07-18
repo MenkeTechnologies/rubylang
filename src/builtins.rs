@@ -60,6 +60,85 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::CALL_METHOD_ARR, b_call_method_arr);
     vm.register_builtin(ops::CALL_ARR_BLK, b_call_arr_blk);
     vm.register_builtin(ops::CALL_METHOD_ARR_BLK, b_call_method_arr_blk);
+    vm.register_builtin(ops::DEFINED_DESC, b_defined_desc);
+}
+
+/// Whether `name` is a built-in Kernel function (so `defined?(puts)` and the
+/// like report `"method"`). These are dispatched by `kernel()`, not registered
+/// as ordinary methods, so `responds_to` doesn't see them.
+fn is_kernel_function(name: &str) -> bool {
+    matches!(
+        name,
+        "puts"
+            | "print"
+            | "p"
+            | "pp"
+            | "gets"
+            | "require"
+            | "require_relative"
+            | "load"
+            | "raise"
+            | "fail"
+            | "abort"
+            | "exit"
+            | "exit!"
+            | "loop"
+            | "lambda"
+            | "proc"
+            | "format"
+            | "sprintf"
+            | "sleep"
+            | "rand"
+            | "srand"
+            | "catch"
+            | "throw"
+            | "block_given?"
+            | "Integer"
+            | "Float"
+            | "String"
+            | "Array"
+    )
+}
+
+/// `defined?(operand)` runtime check for a named operand: returns the Ruby
+/// description string (`"constant"`, `"local-variable"`, …) or nil when the
+/// thing is not defined. The compiler passes a `kind` tag and the `name`.
+fn b_defined_desc(vm: &mut VM, _: u8) -> Value {
+    let name = name_of(&vm.pop());
+    let kind = name_of(&vm.pop());
+    let set = |v: Value| !matches!(v, Value::Undef);
+    let desc: Option<&str> = match kind.as_str() {
+        "const" => {
+            let defined = with_host(|h| {
+                set(h.get_const(&name)) || h.class_exists(&name) || h.is_builtin_class(&name)
+            }) || is_builtin_exception(&name);
+            defined.then_some("constant")
+        }
+        "ivar" => with_host(|h| set(h.get_ivar(&name))).then_some("instance-variable"),
+        "gvar" => with_host(|h| set(h.get_global(&name))).then_some("global-variable"),
+        "cvar" => with_host(|h| {
+            let this = h.current_self();
+            h.cvar_owner(&this)
+                .map(|cls| set(h.get_cvar(&cls, &name)))
+                .unwrap_or(false)
+        })
+        .then_some("class variable"),
+        "local" => {
+            if with_host(|h| h.local_defined(&name)) {
+                Some("local-variable")
+            } else if with_host(|h| h.responds_to(&name)) || is_kernel_function(&name) {
+                Some("method")
+            } else {
+                None
+            }
+        }
+        "yield" => current_block().is_some().then_some("yield"),
+        _ => None,
+    };
+    match desc {
+        Some(s) => new_str(s.to_string()),
+        None => Value::Undef,
+    }
 }
 
 /// Concatenate `argc` arrays into one (splat argument/element building).

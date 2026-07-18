@@ -879,6 +879,20 @@ impl Parser {
     /// A bare identifier: a local var read, a paren call, or a command
     /// (paren-less) call.
     fn ident_primary(&mut self, name: String) -> Result<Expr, String> {
+        // `defined?(expr)` / `defined? expr` — describe the operand without
+        // evaluating it. Parenthesized form takes any expression; the bare form
+        // takes a single postfix operand (`defined? @x`, `defined? Foo.bar`).
+        if name == "defined?" {
+            let operand = if self.is_op("(") {
+                self.advance();
+                let e = self.expr()?;
+                self.expect_op(")")?;
+                e
+            } else {
+                self.postfix()?
+            };
+            return Ok(Expr::Defined(Box::new(operand)));
+        }
         // `foo(x)` — no space before `(` — is a parenthesized call.
         if self.is_op("(") && !self.cur_space() {
             let (args, block) = self.call_tail()?;

@@ -110,6 +110,7 @@ pub mod ops {
     pub const CALL_METHOD_ARR_BLK: u16 = 40; // [recv, name, args_array, proc] -> method + block
     pub const GETCVAR: u16 = 41; // [name] -> class variable of self's class
     pub const SETCVAR: u16 = 42; // [name, value] -> set class variable
+    pub const DEFINED_DESC: u16 = 43; // [kind, name] -> `defined?` description or nil
 }
 
 /// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried

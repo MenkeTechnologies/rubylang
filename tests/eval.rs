@@ -2358,6 +2358,37 @@ fn time_utc() {
 }
 
 #[test]
+fn defined_operator() {
+    // Undefined names return nil; defined ones return a description string.
+    eq("defined?(nonexistent_xyz)", "nil");
+    eq("x = 5; defined?(x)", "\"local-variable\"");
+    eq("defined?(also_undefined)", "nil");
+    // Constants (user, builtin class, module).
+    eq("defined?(String)", "\"constant\"");
+    eq("defined?(Math)", "\"constant\"");
+    eq("CONST = 1; defined?(CONST)", "\"constant\"");
+    eq("defined?(NoSuchConst)", "nil");
+    // Instance / global variables.
+    eq("defined?(@unset)", "nil");
+    eq("@ivar = 1; defined?(@ivar)", "\"instance-variable\"");
+    // Kernel methods and keyword literals.
+    eq("defined?(puts)", "\"method\"");
+    eq("defined?(nil)", "\"nil\"");
+    eq("defined?(true)", "\"true\"");
+    eq("defined?(self)", "\"self\"");
+    // Assignment / method call / expression classifications (no evaluation).
+    eq("x = 1; defined?(x = 10)", "\"assignment\"");
+    eq("defined?(String.new)", "\"method\"");
+    eq("defined?(1 + 1)", "\"method\"");
+    eq("defined?([1, 2, 3])", "\"expression\"");
+    // The bare (paren-less) form.
+    eq("y = 1; defined? y", "\"local-variable\"");
+    // Common guard patterns.
+    eq("defined?(unknown_thing) ? :y : :n", ":n");
+    eq("defined?(Integer) && :ok", ":ok");
+}
+
+#[test]
 fn math_module() {
     // Functions.
     eq("Math.sqrt(25)", "5.0");

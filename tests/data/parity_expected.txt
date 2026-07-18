@@ -610,3 +610,17 @@ Symbol
 13.0
 [0, 1, 2, 3, 4]
 1648.72
+#==#
+method
+"constant"
+nil
+local-variable
+nil
+constant
+has Integer
+puts: sym
+nope: sym
+require: sym
+defined
+method
+"expression"

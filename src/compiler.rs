@@ -299,6 +299,7 @@ impl Compiler {
                 }
                 b.emit(Op::CallBuiltin(ops::YIELD, argc(args.len())?), 0);
             }
+            Expr::Defined(operand) => self.compile_defined(b, operand)?,
             Expr::Super(args) => match args {
                 Some(args) => {
                     for a in args {
@@ -1129,6 +1130,51 @@ impl Compiler {
     fn kstr(&mut self, b: &mut ChunkBuilder, s: &str) {
         let idx = b.add_constant(Value::Str(Arc::new(s.to_string())));
         b.emit(Op::LoadConst(idx), 0);
+    }
+
+    /// Lower `defined?(operand)`. Literals map to a fixed description; a variable
+    /// or bare name defers to the `DEFINED_DESC` runtime check (which returns
+    /// `nil` when the thing is not defined); other shapes get a static
+    /// classification (`"method"`/`"assignment"`/`"expression"`). The operand is
+    /// never evaluated.
+    fn compile_defined(&mut self, b: &mut ChunkBuilder, operand: &Expr) -> Result<(), String> {
+        // Push a fixed heap-String description.
+        let lit = |c: &mut Self, b: &mut ChunkBuilder, s: &str| {
+            c.kstr(b, s);
+            b.emit(Op::CallBuiltin(ops::MKSTR, 1), 0);
+        };
+        // Emit a runtime `DEFINED_DESC(kind, name)` check.
+        let check = |c: &mut Self, b: &mut ChunkBuilder, kind: &str, name: &str| {
+            c.kstr(b, kind);
+            c.kstr(b, name);
+            b.emit(Op::CallBuiltin(ops::DEFINED_DESC, 2), 0);
+        };
+        match operand {
+            Expr::Nil => lit(self, b, "nil"),
+            Expr::True => lit(self, b, "true"),
+            Expr::False => lit(self, b, "false"),
+            Expr::SelfExpr => lit(self, b, "self"),
+            Expr::Assign(..) | Expr::MultiAssign { .. } => lit(self, b, "assignment"),
+            Expr::Var(VarKind::Const, n) => check(self, b, "const", n),
+            Expr::Var(VarKind::Instance, n) => check(self, b, "ivar", n),
+            Expr::Var(VarKind::Global, n) => check(self, b, "gvar", n),
+            Expr::Var(VarKind::Class, n) => check(self, b, "cvar", n),
+            Expr::Var(VarKind::Local, n) => check(self, b, "local", n),
+            Expr::Yield(_) => check(self, b, "yield", ""),
+            // A bare name with no receiver/args is a local-or-method reference.
+            Expr::Call {
+                recv: None,
+                name,
+                args,
+                block: None,
+            } if args.is_empty() => check(self, b, "local", name),
+            // Any other call (with a receiver or args) or an operator is a method.
+            Expr::Call { .. } | Expr::Binary(..) | Expr::Unary(..) | Expr::Index(..) => {
+                lit(self, b, "method")
+            }
+            _ => lit(self, b, "expression"),
+        }
+        Ok(())
     }
 }
 
