@@ -656,3 +656,26 @@ end
 Registry.register("alpha")
 Registry.register("beta")
 puts Registry.list
+#==#
+class Config
+  SETTINGS = [:host, :port, :timeout]
+  SETTINGS.each do |key|
+    define_method(key) { instance_variable_get("@#{key}") }
+    define_method("#{key}=") { |val| instance_variable_set("@#{key}", val) }
+  end
+end
+c = Config.new
+c.host = "example.com"
+c.port = 443
+c.timeout = 30
+puts "#{c.host}:#{c.port} (#{c.timeout}s)"
+
+class Calculator
+  [[:add, :+], [:sub, :-], [:mul, :*]].each do |name, op|
+    define_method(name) { |a, b| a.send(op, b) }
+  end
+end
+calc = Calculator.new
+puts calc.add(3, 4)
+puts calc.sub(10, 3)
+puts calc.mul(6, 7)

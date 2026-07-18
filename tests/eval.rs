@@ -2152,6 +2152,29 @@ fn class_variables() {
 }
 
 #[test]
+fn define_method_metaprogramming() {
+    // A block becomes an instance method taking arguments.
+    eq(
+        "class C; define_method(:double) { |x| x * 2 }; end; C.new.double(21)",
+        "42",
+    );
+    // The method body runs with self = the receiver (accesses its ivars).
+    eq(
+        "class C; def initialize; @x = 10; end; define_method(:plus) { |n| @x + n }; end; \
+         C.new.plus(5)",
+        "15",
+    );
+    // Defined in a loop, each block captures its own binding.
+    eq(
+        "class C; [:a, :b].each { |s| define_method(s) { s.to_s } }; end; \
+         [C.new.a, C.new.b]",
+        "[\"a\", \"b\"]",
+    );
+    // define_method also works with a dynamically built name.
+    eq("class C; define_method(\"m2\") { 99 }; end; C.new.m2", "99");
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).

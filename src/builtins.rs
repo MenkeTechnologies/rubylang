@@ -525,15 +525,64 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
     // dispatch on the class; anything else (raise, puts, …) is a Kernel call.
     let this = with_host(|h| h.current_self());
     if let Some(cls) = with_host(|h| h.classref_name(&this)) {
+        // `define_method(:name) { ... }` in a class body registers an instance
+        // method whose body is the block.
+        if name == "define_method" {
+            let mname = name_of(&args[0]);
+            let proc = block.or_else(|| args.get(1).cloned()).ok_or_else(|| {
+                raise_exc("ArgumentError", "tried to create method without a block")
+            })?;
+            with_host(|h| h.add_define_method(&cls, &mname, proc));
+            return Ok(with_host(|h| h.new_symbol(&mname)));
+        }
         if name == "new" || with_host(|h| h.find_class_method(&cls, name)).is_some() {
             return dispatch_classref(&cls, name, args, block);
         }
         return kernel(name, args, block);
     }
+    // A bare call inside an instance method is `self.name(...)`. Route to object
+    // dispatch when `self` handles it via a `define_method` or a universal object
+    // method (instance_variable_get/set, send, respond_to?, …); a plain user
+    // method goes through `call_method`, and anything else is a Kernel call.
+    if let Some(cls) = with_host(|h| h.object_class(&this)) {
+        if with_host(|h| h.find_define_method(&cls, name)).is_some()
+            || is_universal_object_method(name)
+        {
+            return dispatch(&this, name, args, block);
+        }
+    }
     if with_host(|h| h.responds_to(name)) {
         return call_method(name, args, block);
     }
     kernel(name, args, block)
+}
+
+/// Object methods available on every value (so a bare self-call inside a method
+/// resolves them before falling through to Kernel).
+fn is_universal_object_method(name: &str) -> bool {
+    matches!(
+        name,
+        "instance_variable_get"
+            | "instance_variable_set"
+            | "instance_variables"
+            | "instance_variable_defined?"
+            | "send"
+            | "__send__"
+            | "public_send"
+            | "respond_to?"
+            | "method"
+            | "is_a?"
+            | "kind_of?"
+            | "instance_of?"
+            | "tap"
+            | "then"
+            | "yield_self"
+            | "itself"
+            | "freeze"
+            | "frozen?"
+            | "dup"
+            | "clone"
+    )
 }
 
 /// A receiver method call. Universal methods first, then per-class.
@@ -1010,6 +1059,10 @@ fn dispatch_object(
 ) -> Result<Value, String> {
     if with_host(|h| h.find_method_owner(cls, name)).is_some() {
         return call_instance_method(recv.clone(), cls, name, args, block);
+    }
+    // A `define_method` block runs as an instance method with `self` = receiver.
+    if let Some(proc) = with_host(|h| h.find_define_method(cls, name)) {
+        return crate::host::call_proc_self(&proc, args, Some(recv));
     }
     // Struct instance methods (accessors, ==, to_a/to_h, members, [], each, …).
     if let Some((members, _)) = with_host(|h| h.struct_def(cls)) {

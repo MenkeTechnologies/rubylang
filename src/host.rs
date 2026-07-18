@@ -346,6 +346,8 @@ pub struct RubyHost {
     /// Class variables (`@@x`): class name → variable name → value. Shared across
     /// the class hierarchy (looked up by walking the superclass chain).
     class_vars: IndexMap<String, IndexMap<String, Value>>,
+    /// `define_method`-created instance methods: class → name → block Proc.
+    define_methods: IndexMap<String, IndexMap<String, Value>>,
 }
 
 thread_local! {
@@ -398,6 +400,7 @@ impl RubyHost {
             struct_defs: IndexMap::new(),
             struct_counter: 0,
             class_vars: IndexMap::new(),
+            define_methods: IndexMap::new(),
         }
     }
 
@@ -1097,6 +1100,24 @@ impl RubyHost {
     /// an instance's class, or a class-reference's own name.
     pub fn cvar_owner(&self, this: &Value) -> Option<String> {
         self.object_class(this).or_else(|| self.classref_name(this))
+    }
+    /// Register a `define_method`-created instance method (a block Proc) on a class.
+    pub fn add_define_method(&mut self, class: &str, name: &str, proc: Value) {
+        self.define_methods
+            .entry(class.to_string())
+            .or_default()
+            .insert(name.to_string(), proc);
+    }
+    /// A `define_method` block for `name`, walking the superclass chain.
+    pub fn find_define_method(&self, class: &str, name: &str) -> Option<Value> {
+        let mut cur = Some(class.to_string());
+        while let Some(c) = cur {
+            if let Some(p) = self.define_methods.get(&c).and_then(|m| m.get(name)) {
+                return Some(p.clone());
+            }
+            cur = self.superclass_of(&c);
+        }
+        None
     }
     /// Read a class variable, walking up the superclass chain (class variables
     /// are shared across the hierarchy). `nil` if never assigned.
@@ -2237,6 +2258,17 @@ pub fn run_begin(begin_id: usize) -> Result<Value, String> {
 /// params are bound for the duration and restored afterward. A single Array
 /// argument to a multi-parameter block is destructured, matching Ruby.
 pub fn call_proc(proc_val: &Value, args: &[Value]) -> Result<Value, String> {
+    call_proc_self(proc_val, args, None)
+}
+
+/// Like `call_proc`, but `self_override` (when given) rebinds `self` inside the
+/// proc body — used for `define_method`, where the block runs as an instance
+/// method with `self` = the receiver, yet still closes over its defining scope.
+pub fn call_proc_self(
+    proc_val: &Value,
+    args: &[Value],
+    self_override: Option<&Value>,
+) -> Result<Value, String> {
     let (template, scope, kind) = match with_host(|h| h.obj(proc_val).cloned()) {
         Some(RObj::Proc {
             template,
@@ -2358,6 +2390,9 @@ pub fn call_proc(proc_val: &Value, args: &[Value]) -> Result<Value, String> {
     }
     let block_scope = Scope {
         locals: child,
+        self_obj: self_override
+            .cloned()
+            .unwrap_or_else(|| scope.self_obj.clone()),
         ..scope
     };
     let prev_active = with_host(|h| h.active_scope.replace(block_scope));

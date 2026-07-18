@@ -362,3 +362,8 @@ true
 #==#
 3 accounts, $400 total
 alpha, beta
+#==#
+example.com:443 (30s)
+7
+7
+42
