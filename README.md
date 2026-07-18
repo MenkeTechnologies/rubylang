@@ -75,7 +75,11 @@ JIT. rubylang carries no VM or JIT of its own. Highlights:
 ## [0x01] INSTALL
 
 ```sh
-# From source
+# Via Homebrew tap (bumped by each release; formula is `rubylang`)
+brew tap MenkeTechnologies/menketech
+brew install rubylang
+
+# Or from source
 git clone https://github.com/MenkeTechnologies/rubylang
 cd rubylang
 cargo build
