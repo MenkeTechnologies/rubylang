@@ -102,6 +102,7 @@ pub mod ops {
     pub const CALL_ARR: u16 = 33; // [name, args_array] -> self call, args spread
     pub const CALL_METHOD_ARR: u16 = 34; // [recv, name, args_array] -> method call
     pub const MKREGEX: u16 = 35; // [source, flags] -> Regexp
+    pub const MKLAMBDA: u16 = 36; // [proc_id] -> Proc (lambda? == true)
 }
 
 /// A heap object — the Ruby reference types.
@@ -118,10 +119,14 @@ pub enum RObj {
     },
     /// A block/proc/lambda: its compiled template plus the captured lexical
     /// scope (Ruby blocks read and write the variables of the scope where they
-    /// appear, even after that method has returned).
+    /// appear, even after that method has returned). `is_lambda` distinguishes a
+    /// `->`/`lambda` proc (strict arity, `return` is local) from a plain block.
+    /// `kind` carries the derived-proc state produced by `curry`/`>>`/`<<`.
     Proc {
         template: usize,
         scope: Scope,
+        is_lambda: bool,
+        kind: ProcKind,
     },
     /// A native proc produced by `Symbol#to_proc` (`&:upcase`): calling it sends
     /// the named method to its first argument (`:upcase.to_proc.call(s)` == `s.upcase`).
@@ -146,6 +151,29 @@ pub enum RObj {
         groups: Vec<Option<String>>,
         pre: String,
         post: String,
+    },
+}
+
+/// How a `Proc` value behaves when called. `Normal` runs its own template;
+/// `Curried`/`Composed` are the derived procs built by `Proc#curry`, `#>>` and
+/// `#<<`. Ruby keeps these as ordinary `Proc` instances, so they still route to
+/// the Proc dispatcher and report `class == Proc`.
+#[derive(Debug, Clone)]
+pub enum ProcKind {
+    /// Runs the proc's own `template` in its captured `scope`.
+    Normal,
+    /// A partially-applied proc: it needs `arity` total args and has already
+    /// gathered `collected`; when full it runs the base `template`/`scope`.
+    Curried {
+        arity: usize,
+        collected: Vec<Value>,
+    },
+    /// Function composition: call `first`, feed its result to `second`.
+    /// `f >> g` builds `{ first: f, second: g }`; `f << g` builds `{ first: g,
+    /// second: f }`.
+    Composed {
+        first: Box<Value>,
+        second: Box<Value>,
     },
 }
 
@@ -420,7 +448,84 @@ impl RubyHost {
     /// Create a proc capturing the currently-active scope (shared by `Rc`).
     pub fn new_proc(&mut self, template: usize) -> Value {
         let scope = self.cur_scope().clone();
-        self.alloc(RObj::Proc { template, scope })
+        self.alloc(RObj::Proc {
+            template,
+            scope,
+            is_lambda: false,
+            kind: ProcKind::Normal,
+        })
+    }
+    /// Create a lambda (same as `new_proc` but `lambda?` is `true`).
+    pub fn new_lambda(&mut self, template: usize) -> Value {
+        let scope = self.cur_scope().clone();
+        self.alloc(RObj::Proc {
+            template,
+            scope,
+            is_lambda: true,
+            kind: ProcKind::Normal,
+        })
+    }
+    /// `true` if this proc was made by `->`/`lambda` (not a plain block).
+    pub fn proc_is_lambda(&self, v: &Value) -> bool {
+        matches!(self.obj(v), Some(RObj::Proc { is_lambda: true, .. }))
+    }
+    /// Mark an existing proc as a lambda (used by the `lambda` Kernel method).
+    pub fn set_proc_lambda(&mut self, v: &Value) {
+        if let Some(RObj::Proc { is_lambda, .. }) = self.obj_mut(v) {
+            *is_lambda = true;
+        }
+    }
+    /// Ruby `Proc#arity`. A curried proc reports `-1`; a normal proc reports its
+    /// declared parameter count (all params here are required, so arity is exact).
+    pub fn proc_arity(&self, v: &Value) -> Option<i64> {
+        match self.obj(v) {
+            Some(RObj::Proc { kind, template, .. }) => match kind {
+                ProcKind::Curried { .. } | ProcKind::Composed { .. } => Some(-1),
+                ProcKind::Normal => Some(self.procs[*template].params.len() as i64),
+            },
+            _ => None,
+        }
+    }
+    /// Build the curried view of a proc: shares the base template/scope but only
+    /// runs once `arity` args are gathered across successive calls.
+    pub fn proc_curry(&mut self, v: &Value) -> Option<Value> {
+        match self.obj(v).cloned() {
+            Some(RObj::Proc {
+                template,
+                scope,
+                is_lambda,
+                kind,
+            }) => {
+                let arity = match kind {
+                    ProcKind::Curried { arity, .. } => arity,
+                    ProcKind::Composed { .. } => return Some(v.clone()),
+                    ProcKind::Normal => self.procs[template].params.len(),
+                };
+                Some(self.alloc(RObj::Proc {
+                    template,
+                    scope,
+                    is_lambda,
+                    kind: ProcKind::Curried {
+                        arity,
+                        collected: Vec::new(),
+                    },
+                }))
+            }
+            _ => None,
+        }
+    }
+    /// Build a composed proc `first` then `second` (both are `Proc` values).
+    pub fn new_composed(&mut self, first: Value, second: Value, is_lambda: bool) -> Value {
+        let scope = self.cur_scope().clone();
+        self.alloc(RObj::Proc {
+            template: 0,
+            scope,
+            is_lambda,
+            kind: ProcKind::Composed {
+                first: Box::new(first),
+                second: Box::new(second),
+            },
+        })
     }
     pub fn new_symbol(&mut self, name: &str) -> Value {
         self.intern(name)
@@ -1470,10 +1575,53 @@ pub fn run_begin(begin_id: usize) -> Result<Value, String> {
 /// params are bound for the duration and restored afterward. A single Array
 /// argument to a multi-parameter block is destructured, matching Ruby.
 pub fn call_proc(proc_val: &Value, args: &[Value]) -> Result<Value, String> {
-    let (template, scope) = match with_host(|h| h.obj(proc_val).cloned()) {
-        Some(RObj::Proc { template, scope }) => (template, scope),
+    let (template, scope, kind) = match with_host(|h| h.obj(proc_val).cloned()) {
+        Some(RObj::Proc {
+            template,
+            scope,
+            kind,
+            ..
+        }) => (template, scope, kind),
         _ => return Err("not a proc".to_string()),
     };
+
+    // Derived procs (curry / composition) delegate rather than run a template.
+    match kind {
+        ProcKind::Composed { first, second } => {
+            let mid = call_proc(&first, args)?;
+            return call_proc(&second, std::slice::from_ref(&mid));
+        }
+        ProcKind::Curried { arity, collected } => {
+            let mut all = collected.clone();
+            all.extend_from_slice(args);
+            if all.len() >= arity {
+                // Enough args gathered: run the base template with all of them.
+                let base = with_host(|h| {
+                    h.alloc(RObj::Proc {
+                        template,
+                        scope: scope.clone(),
+                        is_lambda: false,
+                        kind: ProcKind::Normal,
+                    })
+                });
+                return call_proc(&base, &all);
+            }
+            // Still short: return a new curried proc that remembers what we have.
+            return Ok(with_host(|h| {
+                h.alloc(RObj::Proc {
+                    template,
+                    scope: scope.clone(),
+                    is_lambda: false,
+                    kind: ProcKind::Curried {
+                        arity,
+                        collected: all,
+                    },
+                })
+            }));
+        }
+        ProcKind::Normal => {}
+    }
+
     let def = with_host(|h| h.procs[template].clone());
 
     // Auto-splat: `pairs.each { |k, v| … }` over `[k, v]` elements.

@@ -177,9 +177,10 @@ impl Compiler {
             }
             Expr::Lambda(block) => {
                 // A lambda is a Proc value: compile its body as a proc template.
+                // `MKLAMBDA` (vs `MKPROC`) flags it so `lambda?` returns `true`.
                 let id = self.compile_proc(block)?;
                 b.emit(Op::LoadInt(id as i64), 0);
-                b.emit(Op::CallBuiltin(ops::MKPROC, 1), 0);
+                b.emit(Op::CallBuiltin(ops::MKLAMBDA, 1), 0);
             }
             Expr::Regex(source, flags) => {
                 self.kstr(b, source);

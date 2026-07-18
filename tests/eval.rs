@@ -879,6 +879,30 @@ fn float_math_batch() {
 }
 
 #[test]
+fn proc_methods_batch() {
+    // call / .() / [] invocation forms.
+    eq("add = ->(a, b) { a + b }; add.call(1, 2)", "3");
+    eq("sq = ->(x) { x * x }; sq.(3)", "9");
+    eq("sq = ->(x) { x * x }; sq[4]", "16");
+    // arity: all params are required, so it is the exact count.
+    eq("l = ->(a, b) { a }; l.arity", "2");
+    eq("g = -> { 42 }; g.arity", "0");
+    // lambda?: true for `->`/`lambda`, false for a plain block.
+    eq("->(x) { x }.lambda?", "true");
+    eq("proc { |a| a }.lambda?", "false");
+    eq("lambda { |a| a }.lambda?", "true");
+    // curry (best-effort): partial application across successive calls.
+    eq("add = ->(a, b) { a + b }; add.curry[1][2]", "3");
+    eq("add = ->(a, b) { a + b }; add.curry[1, 2]", "3");
+    eq("add = ->(a, b) { a + b }; add.curry.arity", "-1");
+    // >> and << composition.
+    eq("f = ->(x) { x + 1 }; g = ->(x) { x * 2 }; (f >> g).call(3)", "8");
+    eq("f = ->(x) { x + 1 }; g = ->(x) { x * 2 }; (f << g).call(3)", "7");
+    // to_proc on a Proc is the identity (same proc, still callable).
+    eq("l = ->(x) { x + 1 }; l.to_proc.call(5)", "6");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

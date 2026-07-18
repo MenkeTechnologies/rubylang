@@ -35,6 +35,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::MKHASH, b_mkhash);
     vm.register_builtin(ops::MKRANGE, b_mkrange);
     vm.register_builtin(ops::MKPROC, b_mkproc);
+    vm.register_builtin(ops::MKLAMBDA, b_mklambda);
     vm.register_builtin(ops::MKREGEX, b_mkregex);
     vm.register_builtin(ops::YIELD, b_yield);
     vm.register_builtin(ops::TRUTHY, b_truthy);
@@ -335,6 +336,13 @@ fn b_mkproc(vm: &mut VM, _: u8) -> Value {
         _ => return abort(vm, "bad proc id".into()),
     };
     with_host(|h| h.new_proc(id))
+}
+fn b_mklambda(vm: &mut VM, _: u8) -> Value {
+    let id = match vm.pop() {
+        Value::Int(n) => n as usize,
+        _ => return abort(vm, "bad proc id".into()),
+    };
+    with_host(|h| h.new_lambda(id))
 }
 fn b_mkregex(vm: &mut VM, _: u8) -> Value {
     let flags = name_of(&vm.pop());
@@ -2797,6 +2805,24 @@ fn dispatch_proc(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
     }
     match name {
         "call" | "()" | "[]" | "yield" => call_proc(recv, args),
+        "arity" => Ok(Value::Int(with_host(|h| h.proc_arity(recv)).unwrap_or(0))),
+        "lambda?" => Ok(Value::Bool(with_host(|h| h.proc_is_lambda(recv)))),
+        // `to_proc` on a Proc is the identity.
+        "to_proc" => Ok(recv.clone()),
+        "curry" => with_host(|h| h.proc_curry(recv))
+            .ok_or_else(|| "undefined method 'curry' for Proc".to_string()),
+        // Composition: `(f >> g).call(x) == g.call(f.call(x))`.
+        ">>" => {
+            let g = args[0].clone();
+            let is_lambda = with_host(|h| h.proc_is_lambda(recv));
+            Ok(with_host(|h| h.new_composed(recv.clone(), g, is_lambda)))
+        }
+        // `(f << g).call(x) == f.call(g.call(x))`.
+        "<<" => {
+            let g = args[0].clone();
+            let is_lambda = with_host(|h| h.proc_is_lambda(recv));
+            Ok(with_host(|h| h.new_composed(g, recv.clone(), is_lambda)))
+        }
         _ => Err(format!("undefined method '{name}' for Proc")),
     }
 }
@@ -3129,7 +3155,12 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
         }),
         "format" | "sprintf" => Ok(new_str(sprintf(&arg_str(&args[0]), &args[1..]))),
         "gets" => Ok(read_line()),
-        "lambda" | "proc" => block.ok_or_else(|| "tried to create Proc without a block".into()),
+        "proc" => block.ok_or_else(|| "tried to create Proc without a block".into()),
+        "lambda" => {
+            let b = block.ok_or_else(|| String::from("tried to create Proc without a block"))?;
+            with_host(|h| h.set_proc_lambda(&b));
+            Ok(b)
+        }
         "loop" => {
             if let Some(b) = &block {
                 loop {
