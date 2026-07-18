@@ -1260,10 +1260,6 @@ fn dispatch_string(
             let base = if has_radix_prefix(&s) { 0 } else { 8 };
             Ok(Value::Int(scan_int(&s, base).map(|(v, _)| v).unwrap_or(0)))
         }
-        "ord" => match s.chars().next() {
-            Some(c) => Ok(Value::Int(c as i64)),
-            None => Err(raise_exc("ArgumentError", "empty string")),
-        },
         "to_f" => Ok(Value::Float(parse_leading_float(&s))),
         "to_s" | "to_str" => Ok(recv.clone()),
         "to_sym" => Ok(with_host(|h| h.new_symbol(&s))),
