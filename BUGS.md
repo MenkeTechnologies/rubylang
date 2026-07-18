@@ -75,6 +75,8 @@ capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
 - **`Object#class` returns a String** (the class name), not a `Class` object;
   `.class.name` and class-object identity are therefore unsupported.
 - **Enumerator.** A block-less `each`/`map`/`select`/`reject`/`each_with_index`
+  (on arrays), `String#each_char`/`each_byte`/`each_line`, and
+  `Integer#times`/`upto`/`downto`/`step`
   returns a concrete `Enumerator` supporting external iteration (`next`, `peek`,
   `rewind`, `size`, raising `StopIteration` at the end), the full Enumerable
   surface (`to_a`, `map`, `select`, `each_with_index.map { … }`, …) delegated to

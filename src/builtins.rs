@@ -1512,9 +1512,12 @@ fn dispatch_number(
                 }
                 Ok(recv.clone())
             } else {
-                // No Enumerator type yet: return the yielded values as an array so
-                // `n.times.to_a` / `.map` still work.
-                Ok(new_arr((0..n.max(0)).map(Value::Int).collect()))
+                // Block-less: an Enumerator over `0...n`, so `n.times.next` and
+                // `n.times.to_a`/`.map` all work.
+                Ok(with_host(|h| {
+                    let items: Vec<Value> = (0..n.max(0)).map(Value::Int).collect();
+                    h.new_enumerator(items, "each")
+                }))
             }
         }
         "**" | "pow" => {
@@ -1596,15 +1599,14 @@ fn dispatch_number(
                         }
                         return Ok(recv.clone());
                     }
-                    // No Enumerator type yet: return the stepped values as an array so
-                    // `n.step(lim, by).to_a` / `.map` still work.
+                    // Block-less: an Enumerator over the stepped values.
                     let mut vals = Vec::new();
                     let mut i = as_i(recv);
                     while (by > 0 && i <= limit) || (by < 0 && i >= limit) {
                         vals.push(Value::Int(i));
                         i += by;
                     }
-                    return Ok(new_arr(vals));
+                    return Ok(with_host(|h| h.new_enumerator(vals, "each")));
                 }
             } else {
                 let from = as_f(recv);
@@ -1647,14 +1649,14 @@ fn dispatch_number(
                         }
                         return Ok(recv.clone());
                     }
-                    // Blockless: materialize the stepped floats as an array.
+                    // Block-less: an Enumerator over the stepped floats.
                     let mut vals = Vec::new();
                     let mut i = 0.0f64;
                     while i < n {
                         vals.push(Value::Float(clamp(i)));
                         i += 1.0;
                     }
-                    return Ok(new_arr(vals));
+                    return Ok(with_host(|h| h.new_enumerator(vals, "each")));
                 }
             }
             Ok(recv.clone())
@@ -1950,15 +1952,15 @@ fn iter_int_range(
         }
         return Ok(recv.clone());
     }
-    // No Enumerator type yet: return the yielded values as an array so
-    // `n.upto(m).to_a` / `n.downto(m).map` still work.
+    // Block-less: an Enumerator over the range, so `n.upto(m).next` and
+    // `n.upto(m).to_a` / `n.downto(m).map` all work.
     let mut vals = Vec::new();
     let mut i = start;
     while (step > 0 && i <= bound) || (step < 0 && i >= bound) {
         vals.push(Value::Int(i));
         i += step;
     }
-    Ok(new_arr(vals))
+    Ok(with_host(|h| h.new_enumerator(vals, "each")))
 }
 
 /// Ruby integer division floors toward negative infinity (`-7 / 2 == -4`).
@@ -2141,7 +2143,10 @@ fn dispatch_string(
                 }
                 Ok(recv.clone())
             }
-            None => Ok(new_arr(s.bytes().map(|b| Value::Int(b as i64)).collect())),
+            None => Ok(with_host(|h| {
+                let bytes: Vec<Value> = s.bytes().map(|b| Value::Int(b as i64)).collect();
+                h.new_enumerator(bytes, "each")
+            })),
         },
         // Byte at index `i` (supports negatives); nil when out of range.
         "getbyte" => {
@@ -2171,8 +2176,8 @@ fn dispatch_string(
         "encode" => Ok(new_str(s.clone())),
         "lines" => Ok(new_arr(split_lines(&s).into_iter().map(new_str).collect())),
         "each_line" => {
-            // With a block, iterate the lines; without one, yield the lines
-            // array so `.each_line.to_a` works without a real Enumerator.
+            // With a block, iterate the lines and return self; without one,
+            // return an Enumerator over the lines (external iteration + chains).
             match &block {
                 Some(bl) => {
                     for line in split_lines(&s) {
@@ -2184,7 +2189,10 @@ fn dispatch_string(
                     }
                     Ok(recv.clone())
                 }
-                None => Ok(new_arr(split_lines(&s).into_iter().map(new_str).collect())),
+                None => {
+                    let lines: Vec<Value> = split_lines(&s).into_iter().map(new_str).collect();
+                    Ok(with_host(|h| h.new_enumerator(lines, "each")))
+                }
             }
         }
         "center" => {
@@ -2425,8 +2433,13 @@ fn dispatch_string(
                         break;
                     }
                 }
+                Ok(recv.clone())
+            } else {
+                // Block-less: an Enumerator over the characters, so external
+                // iteration (`next`) and chained Enumerable calls work.
+                let chars: Vec<Value> = s.chars().map(|c| new_str(c.to_string())).collect();
+                Ok(with_host(|h| h.new_enumerator(chars, "each")))
             }
-            Ok(recv.clone())
         }
         "[]" => Ok(str_index(&s, args)),
         "slice" => Ok(str_index(&s, args)),

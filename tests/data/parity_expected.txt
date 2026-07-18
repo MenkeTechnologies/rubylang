@@ -445,3 +445,14 @@ undefined method 'no_such_method' for nil
 undefined method 'no_such_method' for true
 undefined method 'no_such_method' for class Integer
 NoMethodError: undefined method 'upcase' for nil
+#==#
+["R", "u", "b", "y"]
+[82, 117, 98, 121]
+Ru
+["one", "two", "three"]
+[97, 98, 99]
+[0, 1, 4, 9, 16]
+[2, 4]
+[10, 8, 6, 4, 2]
+[0, 1]
+["0:h", "1:e", "2:l", "3:l", "4:o"]

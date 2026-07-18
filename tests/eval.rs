@@ -2358,6 +2358,36 @@ fn time_utc() {
 }
 
 #[test]
+fn blockless_iterators_return_enumerators() {
+    // String#each_char without a block yields an Enumerator, not the string.
+    eq(
+        "\"Hello\".each_char.to_a",
+        "[\"H\", \"e\", \"l\", \"l\", \"o\"]",
+    );
+    eq("e = \"ab\".each_char; [e.next, e.next]", "[\"a\", \"b\"]");
+    eq("\"hi\".each_char.map { |c| c.upcase }", "[\"H\", \"I\"]");
+    eq(
+        "\"ab\".each_char.with_index.to_a",
+        "[[\"a\", 0], [\"b\", 1]]",
+    );
+    // each_line / each_byte likewise.
+    eq("\"a\\nb\".each_line.to_a", "[\"a\\n\", \"b\"]");
+    eq("\"AB\".each_byte.to_a", "[65, 66]");
+    eq("e = \"AB\".each_byte; [e.next, e.next]", "[65, 66]");
+    // Integer#times / upto / downto / step yield Enumerators.
+    eq("e = 3.times; [e.next, e.next, e.next]", "[0, 1, 2]");
+    eq("3.times.map { |i| i * i }", "[0, 1, 4]");
+    eq("5.upto(8).to_a", "[5, 6, 7, 8]");
+    eq("e = 5.upto(8); e.next", "5");
+    eq("8.downto(5).to_a", "[8, 7, 6, 5]");
+    eq("1.step(10, 3).to_a", "[1, 4, 7, 10]");
+    eq("e = 1.step(10, 3); [e.next, e.next]", "[1, 4]");
+    // With a block, these still run eagerly and return the receiver.
+    eq("s = \"ab\"; s.each_char { |c| c }; s", "\"ab\"");
+    eq("3.times { |i| i }", "3");
+}
+
+#[test]
 fn no_method_error_messages() {
     // Ruby 4.0 message form: instances say "for an instance of <Class>".
     eq(

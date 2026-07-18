@@ -833,3 +833,19 @@ begin
 rescue NoMethodError => e
   puts "#{e.class}: #{e.message}"
 end
+#==#
+word = "Ruby"
+puts word.each_char.to_a.inspect
+puts word.each_char.map { |c| c.ord }.inspect
+enum = word.each_char
+puts "#{enum.next}#{enum.next}"
+text = "one\ntwo\nthree"
+puts text.each_line.map(&:chomp).inspect
+puts "abc".each_byte.to_a.inspect
+squares = 5.times.map { |i| i * i }
+puts squares.inspect
+puts 1.upto(5).select(&:even?).inspect
+puts 10.step(2, -2).to_a.inspect
+counter = 3.times
+puts [counter.next, counter.next].inspect
+puts "hello".each_char.with_index.map { |c, i| "#{i}:#{c}" }.inspect
