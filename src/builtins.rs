@@ -1484,9 +1484,20 @@ fn dispatch_array(
             arr.iter().any(|x| with_host(|h| h.eq_values(x, &args[0]))),
         )),
         "index" | "find_index" => {
-            let pos = arr
-                .iter()
-                .position(|x| with_host(|h| h.eq_values(x, &args[0])));
+            let pos = if let Some(bl) = &block {
+                let mut found = None;
+                for (i, x) in arr.iter().enumerate() {
+                    let r = call_proc(bl, std::slice::from_ref(x))?;
+                    if with_host(|h| h.truthy(&r)) {
+                        found = Some(i);
+                        break;
+                    }
+                }
+                found
+            } else {
+                arr.iter()
+                    .position(|x| with_host(|h| h.eq_values(x, &args[0])))
+            };
             Ok(pos.map(|p| Value::Int(p as i64)).unwrap_or(Value::Undef))
         }
         "join" => {
@@ -1813,6 +1824,180 @@ fn dispatch_array(
                 })
                 .collect();
             Ok(new_arr(rows))
+        }
+        "product" => {
+            // Cartesian product of self with each argument array.
+            let lists: Vec<Vec<Value>> = std::iter::once(arr.clone())
+                .chain(
+                    args.iter()
+                        .map(|a| with_host(|h| h.as_array(a).unwrap_or_default())),
+                )
+                .collect();
+            let mut rows: Vec<Vec<Value>> = vec![Vec::new()];
+            for list in &lists {
+                let mut next = Vec::with_capacity(rows.len() * list.len());
+                for row in &rows {
+                    for item in list {
+                        let mut r = row.clone();
+                        r.push(item.clone());
+                        next.push(r);
+                    }
+                }
+                rows = next;
+            }
+            Ok(new_arr(rows.into_iter().map(new_arr).collect()))
+        }
+        "combination" => {
+            let n = as_i(&args[0]);
+            let combos = combinations(&arr, n);
+            let out: Vec<Value> = combos.into_iter().map(new_arr).collect();
+            if let Some(bl) = &block {
+                for c in &out {
+                    call_proc(bl, std::slice::from_ref(c))?;
+                    if has_pending_signal() {
+                        take_break();
+                        break;
+                    }
+                }
+                Ok(recv.clone())
+            } else {
+                // No Enumerator type: return the combinations array directly so
+                // `.to_a`/`.map`/`.each` all work.
+                Ok(new_arr(out))
+            }
+        }
+        "permutation" => {
+            let n = args.first().map(as_i).unwrap_or(arr.len() as i64);
+            let perms = permutations(&arr, n);
+            let out: Vec<Value> = perms.into_iter().map(new_arr).collect();
+            if let Some(bl) = &block {
+                for p in &out {
+                    call_proc(bl, std::slice::from_ref(p))?;
+                    if has_pending_signal() {
+                        take_break();
+                        break;
+                    }
+                }
+                Ok(recv.clone())
+            } else {
+                Ok(new_arr(out))
+            }
+        }
+        "assoc" => {
+            for x in &arr {
+                if let Some(sub) = with_host(|h| h.as_array(x)) {
+                    if let Some(first) = sub.first() {
+                        if with_host(|h| h.eq_values(first, &args[0])) {
+                            return Ok(x.clone());
+                        }
+                    }
+                }
+            }
+            Ok(Value::Undef)
+        }
+        "rassoc" => {
+            for x in &arr {
+                if let Some(sub) = with_host(|h| h.as_array(x)) {
+                    if let Some(second) = sub.get(1) {
+                        if with_host(|h| h.eq_values(second, &args[0])) {
+                            return Ok(x.clone());
+                        }
+                    }
+                }
+            }
+            Ok(Value::Undef)
+        }
+        "fill" => {
+            let mut a = arr;
+            let len = a.len() as i64;
+            if let Some(bl) = &block {
+                // fill { |index| ... } / fill(start) { } / fill(start, length) { }
+                let start = args.first().map(as_i).unwrap_or(0);
+                let start = if start < 0 { (start + len).max(0) } else { start };
+                let end = match args.get(1) {
+                    Some(l) => start + as_i(l),
+                    None => len,
+                };
+                let mut i = start;
+                while i < end {
+                    let idx = i as usize;
+                    if idx >= a.len() {
+                        a.push(Value::Undef);
+                    }
+                    a[idx] = call_proc(bl, &[Value::Int(i)])?;
+                    i += 1;
+                }
+            } else {
+                // fill(value) / fill(value, start) / fill(value, start, length)
+                let val = args[0].clone();
+                let start = args.get(1).map(as_i).unwrap_or(0);
+                let start = if start < 0 { (start + len).max(0) } else { start };
+                let end = match args.get(2) {
+                    Some(l) => start + as_i(l),
+                    None => len.max(start),
+                };
+                let mut i = start;
+                while i < end {
+                    let idx = i as usize;
+                    if idx >= a.len() {
+                        a.push(Value::Undef);
+                    }
+                    a[idx] = val.clone();
+                    i += 1;
+                }
+            }
+            with_host(|h| h.set_array(recv, a));
+            Ok(recv.clone())
+        }
+        "insert" => {
+            let mut a = arr;
+            let idx = as_i(&args[0]);
+            let vals = &args[1..];
+            let pos = if idx < 0 {
+                // Negative index inserts AFTER the referenced element.
+                (a.len() as i64 + idx + 1).max(0) as usize
+            } else {
+                idx as usize
+            };
+            if pos > a.len() {
+                // Pad with nil up to the insertion point.
+                a.resize(pos, Value::Undef);
+            }
+            for (k, v) in vals.iter().enumerate() {
+                a.insert(pos + k, v.clone());
+            }
+            with_host(|h| h.set_array(recv, a));
+            Ok(recv.clone())
+        }
+        "delete_at" => {
+            let mut a = arr;
+            let len = a.len() as i64;
+            let mut idx = as_i(&args[0]);
+            if idx < 0 {
+                idx += len;
+            }
+            let v = if idx < 0 || idx >= len {
+                Value::Undef
+            } else {
+                a.remove(idx as usize)
+            };
+            with_host(|h| h.set_array(recv, a));
+            Ok(v)
+        }
+        "delete_if" | "reject!" => {
+            let mut a = arr;
+            if let Some(bl) = &block {
+                let mut kept = Vec::with_capacity(a.len());
+                for x in a.drain(..) {
+                    let r = call_proc(bl, std::slice::from_ref(&x))?;
+                    if !with_host(|h| h.truthy(&r)) {
+                        kept.push(x);
+                    }
+                }
+                a = kept;
+            }
+            with_host(|h| h.set_array(recv, a));
+            Ok(recv.clone())
         }
         "take_while" => {
             let mut out = Vec::new();
@@ -2632,6 +2817,77 @@ fn display(v: &Value) -> String {
 }
 fn new_arr(items: Vec<Value>) -> Value {
     with_host(|h| h.new_array(items))
+}
+
+/// All `n`-element combinations of `arr` in MRI order (increasing indices).
+/// `n < 0` yields none; `n == 0` yields a single empty combination; `n > len`
+/// yields none.
+fn combinations(arr: &[Value], n: i64) -> Vec<Vec<Value>> {
+    if n < 0 || n as usize > arr.len() {
+        return Vec::new();
+    }
+    let n = n as usize;
+    let mut out = Vec::new();
+    let mut idx: Vec<usize> = (0..n).collect();
+    if n == 0 {
+        return vec![Vec::new()];
+    }
+    loop {
+        out.push(idx.iter().map(|&i| arr[i].clone()).collect());
+        // Advance the odometer: find rightmost index that can still move.
+        let mut i = n;
+        loop {
+            if i == 0 {
+                return out;
+            }
+            i -= 1;
+            if idx[i] != i + arr.len() - n {
+                break;
+            }
+        }
+        idx[i] += 1;
+        for j in i + 1..n {
+            idx[j] = idx[j - 1] + 1;
+        }
+    }
+}
+
+/// All `n`-length permutations of `arr` in MRI order (element-index order,
+/// no repeats). `n < 0` or `n > len` yields none; `n == 0` yields one empty
+/// permutation.
+fn permutations(arr: &[Value], n: i64) -> Vec<Vec<Value>> {
+    if n < 0 || n as usize > arr.len() {
+        return Vec::new();
+    }
+    let n = n as usize;
+    let mut out = Vec::new();
+    let mut used = vec![false; arr.len()];
+    let mut cur: Vec<Value> = Vec::with_capacity(n);
+    permute_rec(arr, n, &mut used, &mut cur, &mut out);
+    out
+}
+
+fn permute_rec(
+    arr: &[Value],
+    n: usize,
+    used: &mut [bool],
+    cur: &mut Vec<Value>,
+    out: &mut Vec<Vec<Value>>,
+) {
+    if cur.len() == n {
+        out.push(cur.clone());
+        return;
+    }
+    for i in 0..arr.len() {
+        if used[i] {
+            continue;
+        }
+        used[i] = true;
+        cur.push(arr[i].clone());
+        permute_rec(arr, n, used, cur, out);
+        cur.pop();
+        used[i] = false;
+    }
 }
 fn arg_str(v: &Value) -> String {
     with_host(|h| {

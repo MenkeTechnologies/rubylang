@@ -614,6 +614,59 @@ fn array_transform_batch() {
 }
 
 #[test]
+fn array_combine_batch() {
+    // zip with multiple others.
+    eq("[1, 2].zip([3, 4], [5, 6])", "[[1, 3, 5], [2, 4, 6]]");
+    // product: cartesian, first list slowest-varying.
+    eq("[1, 2].product([3, 4])", "[[1, 3], [1, 4], [2, 3], [2, 4]]");
+    eq(
+        "[1, 2].product([3, 4], [5])",
+        "[[1, 3, 5], [1, 4, 5], [2, 3, 5], [2, 4, 5]]",
+    );
+    eq("[1, 2].product", "[[1], [2]]");
+    // combination(n).to_a in MRI order.
+    eq("[1, 2, 3].combination(2).to_a", "[[1, 2], [1, 3], [2, 3]]");
+    eq("[1, 2, 3].combination(0).to_a", "[[]]");
+    eq("[1, 2, 3].combination(4).to_a", "[]");
+    // permutation(n).to_a in MRI order.
+    eq(
+        "[1, 2, 3].permutation(2).to_a",
+        "[[1, 2], [1, 3], [2, 1], [2, 3], [3, 1], [3, 2]]",
+    );
+    eq(
+        "[1, 2, 3].permutation.to_a",
+        "[[1, 2, 3], [1, 3, 2], [2, 1, 3], [2, 3, 1], [3, 1, 2], [3, 2, 1]]",
+    );
+    // each_with_object.
+    eq(
+        "[1, 2, 3, 4].each_with_object([]) { |x, a| a << x * 2 }",
+        "[2, 4, 6, 8]",
+    );
+    // find_index value and block forms.
+    eq("[10, 20, 30].find_index(20)", "1");
+    eq("[10, 20, 30].find_index { |x| x > 15 }", "1");
+    // assoc / rassoc.
+    eq("[[1, \"a\"], [2, \"b\"]].assoc(2)", "[2, \"b\"]");
+    eq("[[1, \"a\"], [2, \"b\"]].assoc(9)", "nil");
+    eq("[[1, \"a\"], [2, \"b\"]].rassoc(\"b\")", "[2, \"b\"]");
+    // fill: whole, from-start, start+length, block.
+    eq("[1, 2, 3].fill(0)", "[0, 0, 0]");
+    eq("[1, 2, 3, 4, 5].fill(9, 2)", "[1, 2, 9, 9, 9]");
+    eq("[1, 2, 3, 4, 5].fill(9, 1, 2)", "[1, 9, 9, 4, 5]");
+    eq("[1, 2, 3].fill { |i| i * i }", "[0, 1, 4]");
+    // insert (positive, negative, past-end padding).
+    eq("a = [1, 2, 3]; a.insert(1, :x, :y); a", "[1, :x, :y, 2, 3]");
+    eq("a = [1, 2, 3]; a.insert(-2, :z); a", "[1, 2, :z, 3]");
+    eq("a = [1, 2, 3]; a.insert(5, :x); a", "[1, 2, 3, nil, nil, :x]");
+    // delete_at returns the removed value.
+    eq("a = [1, 2, 3]; a.delete_at(1)", "2");
+    eq("a = [1, 2, 3]; a.delete_at(1); a", "[1, 3]");
+    eq("a = [1, 2, 3]; a.delete_at(9)", "nil");
+    // delete_if mutates and returns self.
+    eq("a = [1, 2, 3, 4]; a.delete_if { |x| x.even? }", "[1, 3]");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
