@@ -1064,6 +1064,48 @@ fn radix_batch() {
 }
 
 #[test]
+fn range_methods_batch() {
+    // Integer ranges: to_a (inclusive/exclusive), sum, min/max, size.
+    eq("(1..10).to_a", "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]");
+    eq("(1...10).to_a", "[1, 2, 3, 4, 5, 6, 7, 8, 9]");
+    eq("(1..100).sum", "5050");
+    eq("(1..10).min", "1");
+    eq("(1..10).max", "10");
+    eq("(1...10).max", "9");
+    eq("(1..10).size", "10");
+    eq("(1...10).size", "9");
+    // cover? / include? honor exclusivity.
+    eq("(1..5).cover?(3)", "true");
+    eq("(1..5).cover?(5)", "true");
+    eq("(1...5).cover?(5)", "false");
+    eq("(1..5).include?(3)", "true");
+    eq("(1..5).include?(9)", "false");
+    // step: with a block and via .to_a.
+    eq("(1..10).step(2).to_a", "[1, 3, 5, 7, 9]");
+    eq("(1..10).step(3).to_a", "[1, 4, 7, 10]");
+    eq("s = 0; (1..5).step(2) { |x| s += x }; s", "9");
+    // first(n) / last(n) return arrays; the no-arg forms a single element.
+    eq("(1..10).first(3)", "[1, 2, 3]");
+    eq("(1..10).last(2)", "[9, 10]");
+    eq("(1..10).first", "1");
+    eq("(1..10).last", "10");
+    // Character (String) ranges via String#succ succession.
+    eq("('a'..'e').to_a", "[\"a\", \"b\", \"c\", \"d\", \"e\"]");
+    eq("('a'...'e').to_a", "[\"a\", \"b\", \"c\", \"d\"]");
+    eq("('az'..'bb').to_a", "[\"az\", \"ba\", \"bb\"]");
+    eq("('a'..'e').include?('c')", "true");
+    eq("('a'..'e').include?('z')", "false");
+    eq("('a'..'e').cover?('c')", "true");
+    eq("('a'..'e').min", "\"a\"");
+    eq("('a'..'e').max", "\"e\"");
+    eq("('a'..'e').first(2)", "[\"a\", \"b\"]");
+    eq("('a'..'e').last(2)", "[\"d\", \"e\"]");
+    eq("('a'..'e').count", "5");
+    eq("('a'..'e').map { |c| c.upcase }", "[\"A\", \"B\", \"C\", \"D\", \"E\"]");
+    eq("r = []; ('a'..'c').each { |c| r << c }; r", "[\"a\", \"b\", \"c\"]");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

@@ -118,6 +118,13 @@ pub enum RObj {
         hi: i64,
         exclusive: bool,
     },
+    /// A Range with String endpoints, e.g. `'a'..'e'`. Iterated with
+    /// `String#succ` succession semantics.
+    StrRange {
+        lo: String,
+        hi: String,
+        exclusive: bool,
+    },
     /// A block/proc/lambda: its compiled template plus the captured lexical
     /// scope (Ruby blocks read and write the variables of the scope where they
     /// appear, even after that method has returned). `is_lambda` distinguishes a
@@ -392,6 +399,17 @@ impl RubyHost {
     }
     pub fn new_range(&mut self, lo: i64, hi: i64, exclusive: bool) -> Value {
         self.alloc(RObj::Range { lo, hi, exclusive })
+    }
+    pub fn new_str_range(&mut self, lo: String, hi: String, exclusive: bool) -> Value {
+        self.alloc(RObj::StrRange { lo, hi, exclusive })
+    }
+    pub fn as_str_range(&self, v: &Value) -> Option<(String, String, bool)> {
+        match self.obj(v) {
+            Some(RObj::StrRange { lo, hi, exclusive }) => {
+                Some((lo.clone(), hi.clone(), *exclusive))
+            }
+            _ => None,
+        }
     }
     /// Compile a regex literal (Ruby `flags` → Rust inline flags: `i`
     /// case-insensitive, `m` dot-matches-newline, `x` extended). Returns an error
@@ -1093,6 +1111,9 @@ impl RubyHost {
                 Some(RObj::Range { lo, hi, exclusive }) => {
                     format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
                 }
+                Some(RObj::StrRange { lo, hi, exclusive }) => {
+                    format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
+                }
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash(map)) => self.inspect_hash(&map),
                 Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) => "#<Proc>".to_string(),
@@ -1127,6 +1148,10 @@ impl RubyHost {
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash(map)) => self.inspect_hash(&map),
                 Some(RObj::Regexp { source, .. }) => format!("/{source}/"),
+                // A String range inspects its endpoints with quotes: `"a".."e"`.
+                Some(RObj::StrRange { lo, hi, exclusive }) => {
+                    format!("{lo:?}{}{hi:?}", if exclusive { "..." } else { ".." })
+                }
                 // `#<MatchData "ll" 1:"l">` — whole match then numbered groups.
                 Some(RObj::MatchData { groups, .. }) => {
                     let whole = groups.first().and_then(|g| g.clone()).unwrap_or_default();
@@ -1190,6 +1215,7 @@ impl RubyHost {
                 Some(RObj::Hash(_)) => "Hash",
                 Some(RObj::Symbol(_)) => "Symbol",
                 Some(RObj::Range { .. }) => "Range",
+                Some(RObj::StrRange { .. }) => "Range",
                 Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) => "Proc",
                 Some(RObj::Regexp { .. }) => "Regexp",
                 Some(RObj::MatchData { .. }) => "MatchData",

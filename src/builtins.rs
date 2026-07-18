@@ -344,9 +344,17 @@ fn b_mkrange(vm: &mut VM, _: u8) -> Value {
     let hi = vm.pop();
     let lo = vm.pop();
     let excl = matches!(excl, Value::Bool(true));
-    match (lo, hi) {
-        (Value::Int(a), Value::Int(b)) => with_host(|h| h.new_range(a, b, excl)),
-        _ => abort(vm, "range bounds must be integers".into()),
+    match (&lo, &hi) {
+        (Value::Int(a), Value::Int(b)) => with_host(|h| h.new_range(*a, *b, excl)),
+        _ => {
+            // String endpoints (`'a'..'e'`) produce a String range.
+            let ls = with_host(|h| h.as_str(&lo));
+            let hs = with_host(|h| h.as_str(&hi));
+            match (ls, hs) {
+                (Some(a), Some(b)) => with_host(|h| h.new_str_range(a, b, excl)),
+                _ => abort(vm, "bad value for range".into()),
+            }
+        }
     }
 }
 fn b_mkproc(vm: &mut VM, _: u8) -> Value {
@@ -2775,10 +2783,25 @@ fn dispatch_range(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    // String ranges (`'a'..'e'`) iterate with `String#succ` succession.
+    if let Some((lo, hi, excl)) = with_host(|h| h.as_str_range(recv)) {
+        return dispatch_str_range(recv, name, args, block, lo, hi, excl);
+    }
     let (lo, hi, excl) = with_host(|h| h.as_range(recv).unwrap());
     let end = if excl { hi } else { hi + 1 };
     match name {
         "to_a" | "to_ary" | "entries" => Ok(new_arr((lo..end).map(Value::Int).collect())),
+        // `first(n)` / `last(n)` (with a count) return an Array; the no-arg
+        // forms return the single boundary element.
+        "first" if !args.is_empty() => {
+            let n = as_i(&args[0]).max(0) as usize;
+            Ok(new_arr((lo..end).take(n).map(Value::Int).collect()))
+        }
+        "last" if !args.is_empty() => {
+            let n = as_i(&args[0]).max(0) as usize;
+            let start = end.saturating_sub(n as i64).max(lo);
+            Ok(new_arr((start..end).map(Value::Int).collect()))
+        }
         "min" | "first" | "begin" => Ok(Value::Int(lo)),
         "max" | "last" | "end" if name != "end" => Ok(Value::Int(if excl { hi - 1 } else { hi })),
         "end" => Ok(Value::Int(hi)),
@@ -2787,6 +2810,27 @@ fn dispatch_range(
         "include?" | "cover?" | "member?" | "===" => {
             let n = as_i(&args[0]);
             Ok(Value::Bool(n >= lo && n < end))
+        }
+        "step" => {
+            let n = as_i(&args[0]);
+            if n <= 0 {
+                return Err(raise_exc("ArgumentError", "step can't be negative"));
+            }
+            let vals: Vec<Value> = (lo..end).step_by(n as usize).map(Value::Int).collect();
+            if let Some(b) = &block {
+                for v in vals {
+                    call_proc(b, &[v])?;
+                    if has_pending_signal() {
+                        if let Some(bv) = take_break() {
+                            return Ok(bv);
+                        }
+                        break;
+                    }
+                }
+                Ok(recv.clone())
+            } else {
+                Ok(new_arr(vals))
+            }
         }
         "each" => {
             if let Some(b) = &block {
@@ -2806,6 +2850,104 @@ fn dispatch_range(
         // materialized elements (Range is Enumerable).
         _ => {
             let arr: Vec<Value> = (lo..end).map(Value::Int).collect();
+            let tmp = with_host(|h| h.new_array(arr));
+            dispatch_array(&tmp, name, args, block)
+        }
+    }
+}
+
+/// Materialize a String range into its elements via `String#succ` succession,
+/// with Ruby's length guard (stop once the successor grows past the endpoint).
+fn str_range_vec(lo: &str, hi: &str, excl: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = lo.to_string();
+    loop {
+        if cur.len() > hi.len() {
+            break;
+        }
+        match cur.as_str().cmp(hi) {
+            std::cmp::Ordering::Greater => break,
+            std::cmp::Ordering::Equal => {
+                if !excl {
+                    out.push(cur);
+                }
+                break;
+            }
+            std::cmp::Ordering::Less => {
+                let next = str_succ(&cur);
+                out.push(cur);
+                cur = next;
+            }
+        }
+    }
+    out
+}
+
+fn dispatch_str_range(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+    lo: String,
+    hi: String,
+    excl: bool,
+) -> Result<Value, String> {
+    let elems = || -> Vec<Value> {
+        str_range_vec(&lo, &hi, excl)
+            .into_iter()
+            .map(new_str)
+            .collect()
+    };
+    match name {
+        "to_a" | "to_ary" | "entries" => Ok(new_arr(elems())),
+        "begin" | "first" if args.is_empty() => Ok(new_str(lo)),
+        "end" => Ok(new_str(hi)),
+        "first" => {
+            let n = as_i(&args[0]).max(0) as usize;
+            Ok(new_arr(elems().into_iter().take(n).collect()))
+        }
+        "last" if args.is_empty() => Ok(elems().pop().unwrap_or(Value::Undef)),
+        "last" => {
+            let n = as_i(&args[0]).max(0) as usize;
+            let all = elems();
+            let start = all.len().saturating_sub(n);
+            Ok(new_arr(all[start..].to_vec()))
+        }
+        "min" => Ok(new_str(lo)),
+        "max" if !excl => Ok(new_str(hi)),
+        // A String range has no computable `size` (its elements aren't numeric),
+        // so Ruby returns nil. `count` still counts via the Enumerable fallback.
+        "size" => Ok(Value::Undef),
+        "include?" | "member?" => {
+            let s = arg_str(&args[0]);
+            Ok(Value::Bool(str_range_vec(&lo, &hi, excl).contains(&s)))
+        }
+        "cover?" | "===" => {
+            let s = arg_str(&args[0]);
+            let upper = if excl {
+                s.as_str() < hi.as_str()
+            } else {
+                s.as_str() <= hi.as_str()
+            };
+            Ok(Value::Bool(s.as_str() >= lo.as_str() && upper))
+        }
+        "each" => {
+            if let Some(b) = &block {
+                for e in elems() {
+                    call_proc(b, &[e])?;
+                    if has_pending_signal() {
+                        if let Some(bv) = take_break() {
+                            return Ok(bv);
+                        }
+                        break;
+                    }
+                }
+            }
+            Ok(recv.clone())
+        }
+        // Enumerable fallback over the materialized elements.
+        _ => {
+            let arr = elems();
             let tmp = with_host(|h| h.new_array(arr));
             dispatch_array(&tmp, name, args, block)
         }
