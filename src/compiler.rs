@@ -498,6 +498,9 @@ impl Compiler {
                 | BinOp::Cmp
                 | BinOp::Match
                 | BinOp::NMatch
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
         ) {
             let name = match op {
                 BinOp::Pow => "**",
@@ -506,6 +509,12 @@ impl Compiler {
                 BinOp::Shl => "<<",
                 BinOp::Shr => ">>",
                 BinOp::Cmp => "<=>",
+                // `&`/`|`/`^` are methods (Integer bit ops, Set/Array algebra,
+                // and user operator overloads), so dispatch rather than the
+                // native VM op.
+                BinOp::BitAnd => "&",
+                BinOp::BitOr => "|",
+                BinOp::BitXor => "^",
                 _ => "=~", // Match and NMatch both dispatch =~
             };
             self.compile_expr(b, l)?;

@@ -516,3 +516,15 @@ puts big.bit_length
 puts (big / 7).to_s
 puts 1.0e20
 puts 0.00001
+#==#
+seen = Set.new
+["a", "b", "a", "c", "b"].each { |x| seen << x }
+puts seen.to_a.inspect
+puts seen.size
+evens = Set[2, 4, 6]
+odds = Set[1, 3, 5]
+puts (evens | odds).to_a.sort.inspect
+puts (Set[1, 2, 3, 4] & Set[2, 4, 6]).to_a.inspect
+puts Set[1, 2, 3].subset?(Set[1, 2, 3, 4])
+puts([1, 2, 3, 4] & [3, 4, 5]).inspect if false
+puts ([1, 2, 3] | [3, 4]).inspect

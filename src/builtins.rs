@@ -631,9 +631,32 @@ pub(crate) fn dispatch(
         "Method" => dispatch_method(recv, name, args, block),
         "Regexp" => dispatch_regexp(recv, name, args),
         "MatchData" => dispatch_matchdata(recv, name, args),
+        "Set" => dispatch_set(recv, name, args, block),
+        "TrueClass" | "FalseClass" | "NilClass" => dispatch_bool(recv, name, args),
         _ => Err(raise_exc(
             "NoMethodError",
             &format!("undefined method '{name}' for {class}"),
+        )),
+    }
+}
+
+/// `true`/`false`/`nil` boolean logic operators (`&` `|` `^` `!`). Ruby treats
+/// the argument by truthiness (only `nil`/`false` are falsy).
+fn dispatch_bool(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let this = with_host(|h| h.truthy(recv));
+    let arg = || with_host(|h| h.truthy(&args[0]));
+    match name {
+        "&" => Ok(Value::Bool(this && arg())),
+        "|" => Ok(Value::Bool(this || arg())),
+        "^" => Ok(Value::Bool(this != arg())),
+        "!" => Ok(Value::Bool(!this)),
+        "to_s" | "inspect" => Ok(new_str(with_host(|h| h.to_s(recv)))),
+        _ => Err(raise_exc(
+            "NoMethodError",
+            &format!(
+                "undefined method '{name}' for {}",
+                if this { "true" } else { "false" }
+            ),
         )),
     }
 }
@@ -645,6 +668,22 @@ fn dispatch_classref(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    // `Set.new(enum)` / `Set[a, b, c]` — a deduplicated collection.
+    if cls == "Set" {
+        match name {
+            "new" => {
+                let items = match args.first() {
+                    Some(v) => with_host(|h| h.as_array(v))
+                        .or_else(|| with_host(|h| h.as_set(v)))
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                return Ok(with_host(|h| h.new_set(items)));
+            }
+            "[]" => return Ok(with_host(|h| h.new_set(args.to_vec()))),
+            _ => {}
+        }
+    }
     match name {
         "new" => {
             // `Array.new(n)` / `Array.new(n, val)` / `Array.new(n) { |i| ... }`.
@@ -2764,6 +2803,17 @@ fn str_succ(s: &str) -> String {
 
 // ---- Array ----------------------------------------------------------------
 
+/// Remove duplicates by `==`, keeping the first occurrence (for `Array#&`/`|`).
+fn dedup_keep(items: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for x in items {
+        if !out.iter().any(|y| with_host(|h| h.eq_values(&x, y))) {
+            out.push(x);
+        }
+    }
+    out
+}
+
 fn dispatch_array(
     recv: &Value,
     name: &str,
@@ -2772,6 +2822,20 @@ fn dispatch_array(
 ) -> Result<Value, String> {
     let arr = with_host(|h| h.as_array(recv).unwrap_or_default());
     match name {
+        // Set-like operators: `&` intersection (deduped), `|` union (deduped),
+        // `-` difference. `-` also arrives via the native path (num_op).
+        "&" | "intersection" | "|" | "union" | "-" | "difference" if !args.is_empty() => {
+            let other = with_host(|h| h.as_array(&args[0]).unwrap_or_default());
+            let has = |xs: &[Value], v: &Value| xs.iter().any(|w| with_host(|h| h.eq_values(v, w)));
+            let out = match name {
+                "&" | "intersection" => {
+                    dedup_keep(arr.iter().filter(|v| has(&other, v)).cloned().collect())
+                }
+                "-" | "difference" => arr.iter().filter(|v| !has(&other, v)).cloned().collect(),
+                _ => dedup_keep(arr.iter().chain(other.iter()).cloned().collect()),
+            };
+            Ok(new_arr(out))
+        }
         "length" | "size" | "count"
             if !(name == "count" && (!args.is_empty() || block.is_some())) =>
         {
@@ -3884,6 +3948,156 @@ fn arr_index(arr: &[Value], args: &[Value]) -> Value {
 }
 
 // ---- Hash -----------------------------------------------------------------
+
+/// `Set` methods. Membership/mutation go through the host `RObj::Set`; set
+/// algebra (`|`, `&`, `-`, subset queries) builds fresh sets. Enumerable methods
+/// fall through to the Array implementation over the element list.
+fn dispatch_set(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    let items = with_host(|h| h.as_set(recv).unwrap_or_default());
+    // The other operand's elements, for set-algebra methods.
+    let other = || -> Vec<Value> {
+        args.first()
+            .and_then(|v| with_host(|h| h.as_set(v)).or_else(|| with_host(|h| h.as_array(v))))
+            .unwrap_or_default()
+    };
+    match name {
+        "add" | "<<" => {
+            with_host(|h| h.set_add(recv, args[0].clone()));
+            Ok(recv.clone())
+        }
+        "add?" => {
+            let added = with_host(|h| h.set_add(recv, args[0].clone()));
+            Ok(if added { recv.clone() } else { Value::Undef })
+        }
+        "delete" => {
+            with_host(|h| h.set_remove(recv, &args[0]));
+            Ok(recv.clone())
+        }
+        "delete?" => {
+            let removed = with_host(|h| h.set_remove(recv, &args[0]));
+            Ok(if removed { recv.clone() } else { Value::Undef })
+        }
+        "include?" | "member?" | "===" | "contain?" => {
+            Ok(Value::Bool(with_host(|h| h.set_contains(recv, &args[0]))))
+        }
+        "size" | "length" | "count" if args.is_empty() && block.is_none() => {
+            Ok(Value::Int(items.len() as i64))
+        }
+        "empty?" => Ok(Value::Bool(items.is_empty())),
+        "clear" => {
+            for v in &items {
+                with_host(|h| h.set_remove(recv, v));
+            }
+            Ok(recv.clone())
+        }
+        "to_a" | "to_ary" => Ok(new_arr(items)),
+        "to_set" | "dup" | "clone" => Ok(with_host(|h| h.new_set(items))),
+        "merge" => {
+            for v in other() {
+                with_host(|h| h.set_add(recv, v));
+            }
+            Ok(recv.clone())
+        }
+        // Set algebra — build a fresh Set.
+        "union" | "|" | "+" | "merge_new" => {
+            let mut all = items.clone();
+            all.extend(other());
+            Ok(with_host(|h| h.new_set(all)))
+        }
+        "intersection" | "&" => {
+            let o = other();
+            let keep: Vec<Value> = items
+                .iter()
+                .filter(|v| o.iter().any(|w| with_host(|h| h.eq_values(v, w))))
+                .cloned()
+                .collect();
+            Ok(with_host(|h| h.new_set(keep)))
+        }
+        "difference" | "-" => {
+            let o = other();
+            let keep: Vec<Value> = items
+                .iter()
+                .filter(|v| !o.iter().any(|w| with_host(|h| h.eq_values(v, w))))
+                .cloned()
+                .collect();
+            Ok(with_host(|h| h.new_set(keep)))
+        }
+        "^" => {
+            // Symmetric difference: elements in exactly one of the two sets.
+            let o = other();
+            let mut out: Vec<Value> = items
+                .iter()
+                .filter(|v| !o.iter().any(|w| with_host(|h| h.eq_values(v, w))))
+                .cloned()
+                .collect();
+            out.extend(
+                o.iter()
+                    .filter(|w| !items.iter().any(|v| with_host(|h| h.eq_values(v, w))))
+                    .cloned(),
+            );
+            Ok(with_host(|h| h.new_set(out)))
+        }
+        "subset?" | "<=" => {
+            let o = other();
+            Ok(Value::Bool(items.iter().all(|v| {
+                o.iter().any(|w| with_host(|h| h.eq_values(v, w)))
+            })))
+        }
+        "superset?" | ">=" => {
+            let o = other();
+            Ok(Value::Bool(o.iter().all(|w| {
+                items.iter().any(|v| with_host(|h| h.eq_values(v, w)))
+            })))
+        }
+        "proper_subset?" | "<" => {
+            let o = other();
+            let subset = items
+                .iter()
+                .all(|v| o.iter().any(|w| with_host(|h| h.eq_values(v, w))));
+            Ok(Value::Bool(subset && items.len() < o.len()))
+        }
+        "proper_superset?" | ">" => {
+            let o = other();
+            let superset = o
+                .iter()
+                .all(|w| items.iter().any(|v| with_host(|h| h.eq_values(v, w))));
+            Ok(Value::Bool(superset && items.len() > o.len()))
+        }
+        "disjoint?" => {
+            let o = other();
+            Ok(Value::Bool(!items.iter().any(|v| {
+                o.iter().any(|w| with_host(|h| h.eq_values(v, w)))
+            })))
+        }
+        "intersect?" => {
+            let o = other();
+            Ok(Value::Bool(items.iter().any(|v| {
+                o.iter().any(|w| with_host(|h| h.eq_values(v, w)))
+            })))
+        }
+        "each" if block.is_some() => {
+            let bl = block.unwrap();
+            for v in &items {
+                call_proc(&bl, std::slice::from_ref(v))?;
+                if has_pending_signal() {
+                    if let Some(bv) = take_break() {
+                        return Ok(bv);
+                    }
+                    break;
+                }
+            }
+            Ok(recv.clone())
+        }
+        // Enumerable methods (map/select/reduce/sort/…) run over the element
+        // Array. `map`/`select` etc. return an Array, matching Ruby's Set.
+        _ => dispatch_array(&new_arr(items), name, args, block),
+    }
+}
 
 fn dispatch_hash(
     recv: &Value,

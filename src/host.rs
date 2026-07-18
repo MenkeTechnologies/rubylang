@@ -127,6 +127,9 @@ pub enum RObj {
         default_proc: Option<Value>,
     },
     Symbol(String),
+    /// A `Set`: insertion-ordered, deduplicated by `RKey` (the value form of a
+    /// hash key). Stores the original `Value` for iteration/`to_a`.
+    Set(IndexMap<RKey, Value>),
     /// An integer that outgrew `i64` (Ruby auto-promotes; `Integer` has no
     /// fixed width). Kept normalized: never holds a value that fits in `i64`.
     BigInt(num_bigint::BigInt),
@@ -490,6 +493,50 @@ impl RubyHost {
         match self.obj(v) {
             Some(RObj::Hash { default_proc, .. }) => default_proc.clone(),
             _ => None,
+        }
+    }
+    /// Build a `Set` from a sequence of values, deduplicating by key.
+    pub fn new_set(&mut self, items: Vec<Value>) -> Value {
+        let mut map = IndexMap::new();
+        for v in items {
+            let k = self.value_to_key(&v);
+            map.entry(k).or_insert(v);
+        }
+        self.alloc(RObj::Set(map))
+    }
+    /// The elements of a `Set` (in insertion order), if `v` is one.
+    pub fn as_set(&self, v: &Value) -> Option<Vec<Value>> {
+        match self.obj(v) {
+            Some(RObj::Set(map)) => Some(map.values().cloned().collect()),
+            _ => None,
+        }
+    }
+    /// Whether the set contains `item`.
+    pub fn set_contains(&self, set: &Value, item: &Value) -> bool {
+        let k = self.value_to_key(item);
+        matches!(self.obj(set), Some(RObj::Set(map)) if map.contains_key(&k))
+    }
+    /// Insert `item` into the set in place; returns `true` if it was new.
+    pub fn set_add(&mut self, set: &Value, item: Value) -> bool {
+        let k = self.value_to_key(&item);
+        if let Some(RObj::Set(map)) = self.obj_mut(set) {
+            if map.contains_key(&k) {
+                false
+            } else {
+                map.insert(k, item);
+                true
+            }
+        } else {
+            false
+        }
+    }
+    /// Remove `item` from the set in place; returns `true` if it was present.
+    pub fn set_remove(&mut self, set: &Value, item: &Value) -> bool {
+        let k = self.value_to_key(item);
+        if let Some(RObj::Set(map)) = self.obj_mut(set) {
+            map.shift_remove(&k).is_some()
+        } else {
+            false
         }
     }
     /// Wrap a `BigInt` as a Ruby Integer, demoting to an immediate `Value::Int`
@@ -1059,6 +1106,7 @@ impl RubyHost {
                 | "NilClass"
                 | "TrueClass"
                 | "FalseClass"
+                | "Set"
         )
     }
     pub fn classref_name(&self, v: &Value) -> Option<String> {
@@ -1300,6 +1348,11 @@ impl RubyHost {
                 Some(RObj::Str(s)) => s,
                 Some(RObj::Symbol(s)) => s,
                 Some(RObj::BigInt(b)) => b.to_string(),
+                Some(RObj::Set(map)) => {
+                    let items: Vec<Value> = map.values().cloned().collect();
+                    let inner: Vec<String> = items.iter().map(|v| self.inspect(v)).collect();
+                    format!("Set[{}]", inner.join(", "))
+                }
                 Some(RObj::Range { lo, hi, exclusive }) => {
                     format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
                 }
@@ -1341,6 +1394,10 @@ impl RubyHost {
                 Some(RObj::Str(s)) => format!("{s:?}"),
                 Some(RObj::Symbol(s)) => format!(":{s}"),
                 Some(RObj::BigInt(b)) => b.to_string(),
+                Some(RObj::Set(map)) => {
+                    let inner: Vec<String> = map.values().map(|v| self.inspect(v)).collect();
+                    format!("Set[{}]", inner.join(", "))
+                }
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash { map, .. }) => self.inspect_hash(&map),
                 Some(RObj::Regexp { source, .. }) => format!("/{source}/"),
@@ -1408,6 +1465,7 @@ impl RubyHost {
             Value::Obj(_) => match self.obj(v) {
                 Some(RObj::Str(_)) => "String",
                 Some(RObj::BigInt(_)) => "Integer",
+                Some(RObj::Set(_)) => "Set",
                 Some(RObj::Array(_)) => "Array",
                 Some(RObj::Hash { .. }) => "Hash",
                 Some(RObj::Symbol(_)) => "Symbol",
@@ -1510,6 +1568,18 @@ impl RubyHost {
                     return Ok(self.new_array(xs));
                 }
             }
+            // `Array - Array`: difference, preserving order and duplicates in the
+            // left operand that are absent from the right.
+            (Some(RObj::Array(xs)), Sub) => {
+                if let Some(RObj::Array(ys)) = self.obj(b).cloned() {
+                    let kept: Vec<Value> = xs
+                        .iter()
+                        .filter(|v| !ys.iter().any(|w| self.eq_values(v, w)))
+                        .cloned()
+                        .collect();
+                    return Ok(self.new_array(kept));
+                }
+            }
             (Some(RObj::Array(xs)), Mul) => {
                 let n = as_int(b).unwrap_or(0).max(0) as usize;
                 let mut out = Vec::with_capacity(xs.len() * n);
@@ -1519,6 +1589,22 @@ impl RubyHost {
                 return Ok(self.new_array(out));
             }
             _ => {}
+        }
+        // Set `+` (union) and `-` (difference) arrive as native Add/Sub; the
+        // bitwise-named set operators (`|`/`&`/`^`) route through method dispatch.
+        if let Some(xs) = self.as_set(a) {
+            if matches!(op, Add | Sub) {
+                let ys = self
+                    .as_set(b)
+                    .or_else(|| self.as_array(b))
+                    .unwrap_or_default();
+                let in_ys = |v: &Value, this: &Self| ys.iter().any(|w| this.eq_values(v, w));
+                let result: Vec<Value> = match op {
+                    Add => xs.iter().chain(ys.iter()).cloned().collect(),
+                    _ => xs.iter().filter(|v| !in_ys(v, self)).cloned().collect(),
+                };
+                return Ok(self.new_set(result));
+            }
         }
         Err(format!(
             "undefined method '{}' for {}",
@@ -1560,6 +1646,10 @@ impl RubyHost {
                         x.len() == y.len()
                             && x.iter()
                                 .all(|(k, v)| y.get(k).is_some_and(|w| self.eq_values(v, w)))
+                    }
+                    // Set equality is order-independent membership equality.
+                    (Some(RObj::Set(x)), Some(RObj::Set(y))) => {
+                        x.len() == y.len() && x.keys().all(|k| y.contains_key(k))
                     }
                     _ => matches!((a, b), (Value::Obj(i), Value::Obj(j)) if i == j),
                 }

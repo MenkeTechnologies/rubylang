@@ -1937,6 +1937,40 @@ fn float_to_s_matches_ruby() {
 }
 
 #[test]
+fn set_type() {
+    eq("Set.new([1, 2, 3, 2, 1]).to_a", "[1, 2, 3]");
+    eq("Set[1, 2, 3]", "Set[1, 2, 3]");
+    eq(
+        "s = Set.new([1, 2]); s.add(3); s << 4; s.to_a",
+        "[1, 2, 3, 4]",
+    );
+    eq("Set[1, 2, 3].include?(2)", "true");
+    eq("Set[1, 2, 3] | Set[3, 4, 5]", "Set[1, 2, 3, 4, 5]");
+    eq("Set[1, 2, 3] & Set[2, 3, 4]", "Set[2, 3]");
+    eq("Set[1, 2, 3] - Set[2]", "Set[1, 3]");
+    eq("Set[1, 2, 3] ^ Set[2, 3, 4]", "Set[1, 4]");
+    eq("Set[1, 2].subset?(Set[1, 2, 3])", "true");
+    eq("Set[1, 2, 3].superset?(Set[1, 2])", "true");
+    eq("Set[1, 2, 3] == Set[3, 2, 1]", "true");
+    eq("Set[1, 2, 3].size", "3");
+    eq("Set[1, 2, 3].map { |x| x * 2 }", "[2, 4, 6]");
+    eq("Set[1, 2].disjoint?(Set[3, 4])", "true");
+}
+
+#[test]
+fn bitwise_operators_dispatch_by_type() {
+    // `&`/`|`/`^` are methods: Integer bit ops, Array/Set algebra, boolean logic.
+    eq("5 & 3", "1");
+    eq("5 | 2", "7");
+    eq("[1, 2, 3] & [2, 3, 4]", "[2, 3]");
+    eq("[1, 2] | [2, 3]", "[1, 2, 3]");
+    eq("[1, 2, 3, 2] - [2]", "[1, 3]");
+    eq("true & false", "false");
+    eq("true | false", "true");
+    eq("false ^ true", "true");
+}
+
+#[test]
 fn no_panic_on_edge_inputs() {
     // These all used to panic (abort the process); they must degrade gracefully.
     // Multibyte string content near operators (was a lexer char-boundary panic).
