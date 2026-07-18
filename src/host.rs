@@ -997,7 +997,7 @@ fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
     let mut vm = VM::new(chunk);
     crate::builtins::install(&mut vm);
     vm.set_numeric_hook(std::sync::Arc::new(|op, a, b| {
-        with_host(|h| h.num_op(op, a, b))
+        crate::builtins::numeric_hook(op, a, b)
     }));
     vm.enable_tracing_jit();
     let outcome = vm.run();

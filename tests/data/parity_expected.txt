@@ -167,3 +167,15 @@ https://example.com:8080
 APPLE, BANANA, CHERRY
 [:red, :green, :blue]
 ["three", "two", "one"]
+#==#
+true
+true
+v1, v2, v3
+v2
+#==#
+(4, 6)
+true
+#==#
+[3, 2, 1]
+["a", "bb", "ccc"]
+8

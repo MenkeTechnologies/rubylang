@@ -300,3 +300,29 @@ puts fruits.map(&:upcase).join(", ")
 syms = %i[red green blue]
 puts syms.inspect
 puts %w(one two three).reverse.inspect
+#==#
+class Version
+  include Comparable
+  attr_reader :n
+  def initialize(n); @n = n; end
+  def <=>(other); @n <=> other.n; end
+  def to_s; "v#{@n}"; end
+end
+puts Version.new(1) < Version.new(2)
+puts Version.new(3) >= Version.new(3)
+puts [Version.new(3), Version.new(1), Version.new(2)].sort.map(&:to_s).join(", ")
+puts [Version.new(5), Version.new(2)].min.to_s
+#==#
+class Vec
+  attr_reader :x, :y
+  def initialize(x, y); @x = x; @y = y; end
+  def +(o); Vec.new(@x + o.x, @y + o.y); end
+  def ==(o); @x == o.x && @y == o.y; end
+  def to_s; "(#{@x}, #{@y})"; end
+end
+puts (Vec.new(1, 2) + Vec.new(3, 4)).to_s
+puts Vec.new(1, 1) == Vec.new(1, 1)
+#==#
+puts [3, 1, 2].sort { |a, b| b <=> a }.inspect
+puts ["bb", "a", "ccc"].sort_by(&:length).inspect
+puts [5, 3, 8, 1].max { |a, b| a <=> b }

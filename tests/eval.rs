@@ -344,6 +344,40 @@ fn word_and_symbol_arrays() {
 }
 
 #[test]
+fn operator_methods_and_comparable() {
+    // User `+` overloading.
+    eq(
+        "class V; attr_reader :n; def initialize(n); @n = n; end; def +(o); V.new(@n + o.n); end; end; \
+         (V.new(2) + V.new(3)).n",
+        "5",
+    );
+    // Comparable: `<` / `>=` derived from `<=>`.
+    eq(
+        "class V; include Comparable; attr_reader :n; def initialize(n); @n = n; end; \
+         def <=>(o); @n <=> o.n; end; end; [V.new(1) < V.new(2), V.new(3) >= V.new(3)]",
+        "[true, true]",
+    );
+    // Sorting user objects through `<=>`.
+    eq(
+        "class V; include Comparable; attr_reader :n; def initialize(n); @n = n; end; \
+         def <=>(o); @n <=> o.n; end; end; [V.new(3), V.new(1), V.new(2)].sort.map(&:n)",
+        "[1, 2, 3]",
+    );
+}
+
+#[test]
+fn sort_min_max_with_block() {
+    eq("[3, 1, 2].sort { |a, b| b <=> a }", "[3, 2, 1]");
+    eq(
+        "[\"bb\", \"a\", \"ccc\"].sort_by(&:length)",
+        "[\"a\", \"bb\", \"ccc\"]",
+    );
+    eq("[5, 3, 8, 1].max { |a, b| a <=> b }", "8");
+    eq("(1 <=> 2)", "-1");
+    eq("(\"b\" <=> \"a\")", "1");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

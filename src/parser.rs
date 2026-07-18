@@ -409,6 +409,17 @@ impl Parser {
     fn method_name(&mut self) -> Result<String, String> {
         match self.advance() {
             Tok::Ident(s) | Tok::Const(s) | Tok::Keyword(s) => Ok(s),
+            // Operator method names: `def <=>`, `def +`, `def ==`, `def [](i)`,
+            // `def []=(i, v)`, etc.
+            Tok::Op(o) if o == "[" => {
+                self.expect_op("]")?;
+                if self.eat_op("=") {
+                    Ok("[]=".to_string())
+                } else {
+                    Ok("[]".to_string())
+                }
+            }
+            Tok::Op(o) if is_operator_method(&o) => Ok(o),
             other => Err(format!(
                 "line {}: expected method name, found '{}'",
                 self.line(),
@@ -1109,6 +1120,32 @@ impl Parser {
 }
 
 /// Map a comparison/bit operator string to its `BinOp`.
+/// Operator tokens that may be used as method names in a `def`.
+fn is_operator_method(op: &str) -> bool {
+    matches!(
+        op,
+        "+" | "-"
+            | "*"
+            | "/"
+            | "%"
+            | "**"
+            | "=="
+            | "!="
+            | "<"
+            | ">"
+            | "<="
+            | ">="
+            | "<=>"
+            | "==="
+            | "<<"
+            | ">>"
+            | "&"
+            | "|"
+            | "^"
+            | "~"
+    )
+}
+
 fn matchop(op: &str) -> BinOp {
     match op {
         "==" => BinOp::Eq,

@@ -16,8 +16,12 @@ chaining; `module` + `include` mixins; class methods (`def self.m`); `begin`/
 `rescue`/`ensure`, method-body and statement-modifier `rescue`, `raise` with a
 message or an exception class, typed `ZeroDivisionError`/`NoMethodError`/
 `ArgumentError`; default arguments; splat parameters (`def f(a, *rest)`); `&:sym`
-block-pass (`map(&:upcase)`); call-site/array/target splat (`f(*a)`, `[1, *a]`,
-`a, *b = …`); parallel assignment (`a, b = 1, 2`, swap); `case`/`when Class`
+block-pass (`map(&:upcase)`); keyword arguments (`def f(name:, x: 1)` + `f(name:
+"a")`); `%w[]`/`%i[]` word/symbol arrays; operator method definitions (`def +`,
+`def <=>`, `def [](i)`) and `Comparable` (`< > <= >= == between?` derived from
+`<=>`); block comparators (`sort { |a, b| … }`, `min`/`max` with a block);
+call-site/array/target splat (`f(*a)`, `[1, *a]`, `a, *b = …`); parallel
+assignment (`a, b = 1, 2`, swap); `case`/`when Class`
 (`when Integer`) and `is_a?`; `sprintf`/`format`/`String#%` with width/precision
 flags; a broad Enumerable/Hash surface (`partition`, `group_by`, `tally`, `zip`,
 `each_with_object`, `transform_values`, …); blocks/`yield`/closures with lexical

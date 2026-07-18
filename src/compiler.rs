@@ -449,16 +449,19 @@ impl Compiler {
         // `<<` and `>>` are `Array#<<`/`String#<<`/`Integer#<<` in Ruby, not the
         // VM's bit-shift; `**`/`/`/`%` need Ruby integer semantics. Route them
         // all through host method dispatch.
+        // `<=>` also routes through dispatch so a user `def <=>` and Comparable
+        // work; the native `Spaceship` op would not consult a user method.
         if matches!(
             op,
-            BinOp::Pow | BinOp::Div | BinOp::Mod | BinOp::Shl | BinOp::Shr
+            BinOp::Pow | BinOp::Div | BinOp::Mod | BinOp::Shl | BinOp::Shr | BinOp::Cmp
         ) {
             let name = match op {
                 BinOp::Pow => "**",
                 BinOp::Div => "/",
                 BinOp::Mod => "%",
                 BinOp::Shl => "<<",
-                _ => ">>",
+                BinOp::Shr => ">>",
+                _ => "<=>",
             };
             self.compile_expr(b, l)?;
             self.kstr(b, name);

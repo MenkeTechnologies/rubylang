@@ -679,6 +679,15 @@ fn dispatch_number(
             let (lo, hi) = (as_i(&args[0]), as_i(&args[1]));
             Ok(Value::Int(n.max(lo).min(hi)))
         }
+        "<=>" => {
+            let (x, y) = (as_f(recv), as_f(&args[0]));
+            Ok(match x.partial_cmp(&y) {
+                Some(std::cmp::Ordering::Less) => Value::Int(-1),
+                Some(std::cmp::Ordering::Equal) => Value::Int(0),
+                Some(std::cmp::Ordering::Greater) => Value::Int(1),
+                None => Value::Undef,
+            })
+        }
         "<<" => Ok(Value::Int(as_i(recv) << as_i(&args[0]))),
         ">>" => Ok(Value::Int(as_i(recv) >> as_i(&args[0]))),
         "&" => Ok(Value::Int(as_i(recv) & as_i(&args[0]))),
@@ -817,6 +826,14 @@ fn dispatch_string(
                 Ok(recv.clone())
             }
         }
+        "<=>" => match with_host(|h| h.as_str(&args[0])) {
+            Some(other) => Ok(Value::Int(match s.cmp(&other) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            })),
+            None => Ok(Value::Undef),
+        },
         "*" => Ok(new_str(s.repeat(as_i(&args[0]).max(0) as usize))),
         "%" => {
             // `"%d-%d" % [1, 2]` or `"%d" % 5`.
@@ -955,20 +972,37 @@ fn dispatch_array(
             Ok(new_str(parts.join(&sep)))
         }
         "sort" => {
-            let mut a = arr;
-            a.sort_by(cmp_values);
+            let a = match &block {
+                Some(bl) => sort_with_block(arr, bl)?,
+                None => {
+                    let mut a = arr;
+                    a.sort_by(cmp_values);
+                    a
+                }
+            };
             Ok(new_arr(a))
         }
-        "min" => Ok(arr
-            .iter()
-            .cloned()
-            .min_by(cmp_values)
-            .unwrap_or(Value::Undef)),
-        "max" => Ok(arr
-            .iter()
-            .cloned()
-            .max_by(cmp_values)
-            .unwrap_or(Value::Undef)),
+        "min" | "max" => {
+            if arr.is_empty() {
+                return Ok(Value::Undef);
+            }
+            let want_max = name == "max";
+            let mut best = arr[0].clone();
+            for x in &arr[1..] {
+                let c = match &block {
+                    Some(bl) => as_i(&call_proc(bl, &[x.clone(), best.clone()])?),
+                    None => match cmp_values(x, &best) {
+                        std::cmp::Ordering::Less => -1,
+                        std::cmp::Ordering::Equal => 0,
+                        std::cmp::Ordering::Greater => 1,
+                    },
+                };
+                if (want_max && c > 0) || (!want_max && c < 0) {
+                    best = x.clone();
+                }
+            }
+            Ok(best)
+        }
         "sum" => {
             let mut acc = args.first().cloned().unwrap_or(Value::Int(0));
             for x in &arr {
@@ -1909,6 +1943,58 @@ fn new_str(s: String) -> Value {
     with_host(|h| h.new_string(s))
 }
 
+/// The strict numeric hook: fusevm calls this when a native arithmetic or
+/// comparison op has a non-`Int`/`Float` operand. For a user object it dispatches
+/// to the operator method (`def +`, `def <=>`, …) or derives a comparison from a
+/// Comparable `<=>`; otherwise it defers to the host's String/Array semantics.
+/// Uses fine-grained borrows so a user operator method can re-enter the VM.
+pub fn numeric_hook(op: fusevm::NumOp, a: &Value, b: &Value) -> Result<Value, String> {
+    use fusevm::NumOp::*;
+    if let Some(cls) = with_host(|h| h.object_class(a)) {
+        let name = num_op_method(op);
+        if !name.is_empty() && with_host(|h| h.find_method_owner(&cls, name)).is_some() {
+            return call_instance_method(a.clone(), &cls, name, &[b.clone()], None);
+        }
+        // Comparable: derive `< > <= >= == !=` from a `<=>` method.
+        if matches!(op, Lt | Gt | Le | Ge | Eq | Ne)
+            && with_host(|h| h.find_method_owner(&cls, "<=>")).is_some()
+        {
+            let cmp = call_instance_method(a.clone(), &cls, "<=>", &[b.clone()], None)?;
+            let c = as_i(&cmp);
+            return Ok(Value::Bool(match op {
+                Lt => c < 0,
+                Gt => c > 0,
+                Le => c <= 0,
+                Ge => c >= 0,
+                Eq => c == 0,
+                Ne => c != 0,
+                _ => false,
+            }));
+        }
+    }
+    with_host(|h| h.num_op(op, a, b))
+}
+
+/// The method name for an operator `NumOp`, or `""` if it has none.
+fn num_op_method(op: fusevm::NumOp) -> &'static str {
+    use fusevm::NumOp::*;
+    match op {
+        Add => "+",
+        Sub => "-",
+        Mul => "*",
+        Div => "/",
+        Mod => "%",
+        Pow => "**",
+        Lt => "<",
+        Gt => ">",
+        Le => "<=",
+        Ge => ">=",
+        Eq => "==",
+        Ne => "!=",
+        _ => "",
+    }
+}
+
 /// Raise a typed exception: register the exception object (so `rescue Class` can
 /// match it) and return the message as the `Err` payload.
 fn raise_exc(class: &str, msg: &str) -> String {
@@ -1994,6 +2080,12 @@ fn add_values(a: &Value, b: &Value) -> Value {
 
 fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
+    // A user object compares through its `<=>` method (Comparable).
+    if with_host(|h| h.object_class(a)).is_some() {
+        if let Ok(v) = dispatch(a, "<=>", std::slice::from_ref(b), None) {
+            return as_i(&v).cmp(&0);
+        }
+    }
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
         (Value::Str(_), _) | (_, Value::Str(_)) | (Value::Obj(_), _) | (_, Value::Obj(_)) => {
@@ -2005,4 +2097,22 @@ fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         }
         _ => as_f(a).partial_cmp(&as_f(b)).unwrap_or(Ordering::Equal),
     }
+}
+
+/// Insertion sort using a block comparator (returns -1/0/1). Kept simple; block
+/// comparators run on modest arrays and correctness matters more than speed.
+fn sort_with_block(mut arr: Vec<Value>, bl: &Value) -> Result<Vec<Value>, String> {
+    for i in 1..arr.len() {
+        let mut j = i;
+        while j > 0 {
+            let c = as_i(&call_proc(bl, &[arr[j - 1].clone(), arr[j].clone()])?);
+            if c > 0 {
+                arr.swap(j - 1, j);
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+    Ok(arr)
 }
