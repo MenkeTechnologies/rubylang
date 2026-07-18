@@ -220,6 +220,17 @@ pub enum RObj {
         pre: String,
         post: String,
     },
+    /// A concrete `Enumerator`: the yielded values already materialized into a
+    /// buffer, plus an external-iteration cursor. Returned by block-less
+    /// `each`/`map`/`each_with_index`/… so the result answers both the
+    /// Enumerable surface (delegated to `buf`) and external iteration
+    /// (`next`/`peek`/`rewind`/`size`). MRI produces these lazily; we eagerly
+    /// materialize finite sources, which is faithful for everything except
+    /// endless generators.
+    Enumerator {
+        buf: Vec<Value>,
+        cursor: usize,
+    },
 }
 
 /// How a `Proc` value behaves when called. `Normal` runs its own template;
@@ -625,6 +636,43 @@ impl RubyHost {
         match self.obj(v) {
             Some(RObj::Lazy { source, ops }) => Some((source.clone(), ops.clone())),
             _ => None,
+        }
+    }
+    /// Build a concrete `Enumerator` from an already-materialized value buffer.
+    /// The cursor starts at 0 (rewound). Used for the block-less form of
+    /// `each`/`map`/`each_with_index`/… so the result supports both the
+    /// Enumerable surface and external iteration (`next`/`peek`).
+    pub fn new_enumerator(&mut self, buf: Vec<Value>) -> Value {
+        self.alloc(RObj::Enumerator { buf, cursor: 0 })
+    }
+    /// The buffered values of an `Enumerator`, if `v` is one.
+    pub fn enum_buf(&self, v: &Value) -> Option<Vec<Value>> {
+        match self.obj(v) {
+            Some(RObj::Enumerator { buf, .. }) => Some(buf.clone()),
+            _ => None,
+        }
+    }
+    /// External iteration: return the element at the cursor and advance it,
+    /// or `None` at the end (the caller raises `StopIteration`). `peek` reads
+    /// without advancing.
+    pub fn enum_next(&mut self, v: &Value, advance: bool) -> Option<Value> {
+        if let Some(RObj::Enumerator { buf, cursor }) = self.obj_mut(v) {
+            if *cursor >= buf.len() {
+                return None;
+            }
+            let out = buf[*cursor].clone();
+            if advance {
+                *cursor += 1;
+            }
+            Some(out)
+        } else {
+            None
+        }
+    }
+    /// Reset an `Enumerator`'s external-iteration cursor to the start.
+    pub fn enum_rewind(&mut self, v: &Value) {
+        if let Some(RObj::Enumerator { cursor, .. }) = self.obj_mut(v) {
+            *cursor = 0;
         }
     }
     /// The `(real, imaginary)` parts of a complex number, if `v` is one.
@@ -1539,6 +1587,9 @@ impl RubyHost {
                     format!("Set[{}]", inner.join(", "))
                 }
                 Some(RObj::Lazy { .. }) => "#<Enumerator::Lazy>".to_string(),
+                Some(RObj::Enumerator { buf, .. }) => {
+                    format!("#<Enumerator: {}>", self.inspect_array(&buf))
+                }
                 Some(RObj::Range { lo, hi, exclusive }) => {
                     format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
                 }
@@ -1667,6 +1718,7 @@ impl RubyHost {
                 Some(RObj::Rational(_)) => "Rational",
                 Some(RObj::Complex { .. }) => "Complex",
                 Some(RObj::Lazy { .. }) => "Enumerator::Lazy",
+                Some(RObj::Enumerator { .. }) => "Enumerator",
                 Some(RObj::Set(_)) => "Set",
                 Some(RObj::Array(_)) => "Array",
                 Some(RObj::Hash { .. }) => "Hash",

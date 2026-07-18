@@ -2244,6 +2244,39 @@ fn lazy_enumerators() {
 }
 
 #[test]
+fn enumerator_external_iteration() {
+    // Block-less `each` yields an Enumerator advanced by `next`.
+    eq("e = [1, 2, 3].each; [e.next, e.next, e.next]", "[1, 2, 3]");
+    // `peek` reads the pending element without advancing the cursor.
+    eq(
+        "e = [10, 20].each; [e.peek, e.next, e.peek]",
+        "[10, 10, 20]",
+    );
+    // `rewind` resets the cursor to the start.
+    eq("e = [1, 2, 3].each; e.next; e.rewind; e.next", "1");
+    // `size` reports the buffered length.
+    eq("[5, 6, 7].each.size", "3");
+    // Running off the end raises StopIteration.
+    eq(
+        "e = [1].each; e.next; begin; e.next; rescue StopIteration => x; x.message; end",
+        "\"iteration reached an end\"",
+    );
+    // Block-less `map` yields the original elements for external iteration.
+    eq("e = [1, 2, 3].map; [e.next, e.next]", "[1, 2]");
+    // Block-less `each_with_index` yields `[elem, index]` pairs.
+    eq(
+        "e = %w[a b].each_with_index; [e.next, e.next]",
+        "[[\"a\", 0], [\"b\", 1]]",
+    );
+    // Enumerable methods still delegate to the buffer.
+    eq("[1, 2, 3].each.to_a", "[1, 2, 3]");
+    eq(
+        "[1, 2, 3].each_with_index.map { |x, i| x * i }",
+        "[0, 2, 6]",
+    );
+}
+
+#[test]
 fn float_constants_and_leading_dot_chains() {
     eq("Float::INFINITY", "Infinity");
     eq("5 < Float::INFINITY", "true");

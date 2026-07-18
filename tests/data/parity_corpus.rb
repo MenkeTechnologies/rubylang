@@ -747,3 +747,26 @@ def total(*nums)
   nums.sum
 end
 puts total *[4, 5, 6]
+#==#
+e = [10, 20, 30].each
+puts e.next
+puts e.next
+puts e.peek
+puts e.next
+e.rewind
+puts e.next
+puts e.size
+begin
+  e.next
+  e.next
+  e.next
+  e.next
+rescue StopIteration => err
+  puts err.message
+end
+letters = %w[a b c].each_with_index
+p letters.next
+p letters.next
+squares = [1, 2, 3, 4].map
+puts squares.next
+puts squares.each_with_index.map { |x, i| x + i }.inspect

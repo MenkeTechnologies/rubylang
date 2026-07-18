@@ -74,8 +74,15 @@ capture, `&block` params + `block_given?`/`__method__`, lambdas (`->(x) { }`,
   the pattern, lookaround) are unavailable.
 - **`Object#class` returns a String** (the class name), not a `Class` object;
   `.class.name` and class-object identity are therefore unsupported.
-- **Enumerator without block.** `each_with_index.map` (an enumerator returned
-  from a block-less call) is not supported. (`&:sym` block-pass IS.)
+- **Enumerator.** A block-less `each`/`map`/`each_with_index` returns a concrete
+  `Enumerator` supporting external iteration (`next`, `peek`, `rewind`, `size`,
+  raising `StopIteration` at the end) as well as the full Enumerable surface
+  (`to_a`, `map`, `select`, `each_with_index.map { … }`, …), which delegates to
+  the materialized buffer. Finite sources are eagerly materialized (faithful for
+  everything except endless generators). Not yet: re-attachable block
+  enumerators (`arr.map.with_index { … }`, `arr.select.with_index { … }`) — the
+  reattach semantics differ per source method (`map` collects, `select` filters,
+  `each` returns the receiver) and the source method isn't tracked yet.
 - **Bignum.** Integers auto-promote to arbitrary precision on overflow, like
   MRI: values that fit stay `i64` immediates, and only the overflow path
   allocates a `BigInt` heap object (backed by `num-bigint`). Arithmetic, bit

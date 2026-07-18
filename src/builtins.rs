@@ -804,6 +804,7 @@ pub(crate) fn dispatch(
         "Regexp" => dispatch_regexp(recv, name, args),
         "MatchData" => dispatch_matchdata(recv, name, args),
         "Set" => dispatch_set(recv, name, args, block),
+        "Enumerator" => dispatch_enumerator(recv, name, args, block),
         "Enumerator::Lazy" => dispatch_lazy(recv, name, args, block),
         "Rational" => dispatch_rational(recv, name, args),
         "Complex" => dispatch_complex(recv, name, args),
@@ -3575,8 +3576,12 @@ fn dispatch_array(
                         break;
                     }
                 }
+                Ok(recv.clone())
+            } else {
+                // Block-less: an Enumerator yielding each element, so external
+                // iteration (`next`/`peek`) and chained Enumerable calls work.
+                Ok(with_host(|h| h.new_enumerator(arr)))
             }
-            Ok(recv.clone())
         }
         "each_with_index" => {
             if let Some(b) = &block {
@@ -3589,17 +3594,22 @@ fn dispatch_array(
                 }
                 Ok(recv.clone())
             } else {
-                // No Enumerator type yet: return `[elem, index]` pairs so the chain
-                // `each_with_index.map { |x, i| … }` / `.to_a` still works.
-                Ok(new_arr(
-                    arr.iter()
-                        .enumerate()
-                        .map(|(i, x)| new_arr(vec![x.clone(), Value::Int(i as i64)]))
-                        .collect(),
-                ))
+                // Block-less: an Enumerator of `[elem, index]` pairs, so both
+                // `each_with_index.next` and `each_with_index.map { … }` work.
+                let pairs = arr
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| new_arr(vec![x.clone(), Value::Int(i as i64)]))
+                    .collect();
+                Ok(with_host(|h| h.new_enumerator(pairs)))
             }
         }
         "map" | "collect" | "flat_map" => {
+            if block.is_none() {
+                // Block-less `map`/`collect` yields the original elements as an
+                // Enumerator (re-attaching a block later maps them).
+                return Ok(with_host(|h| h.new_enumerator(arr)));
+            }
             let mut out = Vec::with_capacity(arr.len());
             if let Some(b) = &block {
                 for x in &arr {
@@ -4661,6 +4671,43 @@ fn lazy_pull(
         }
     }
     Ok(out)
+}
+
+/// A concrete `Enumerator` (from a block-less `each`/`map`/…). External
+/// iteration (`next`/`peek`/`rewind`/`size`) reads the materialized buffer with
+/// a cursor; every other message is delegated to that buffer as an Array, so
+/// the full Enumerable surface (`map`, `to_a`, `with_index`, `select`, …) keeps
+/// working just as it did when these calls returned a bare array.
+fn dispatch_enumerator(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    let buf = with_host(|h| h.enum_buf(recv).unwrap_or_default());
+    match name {
+        "next" if args.is_empty() && block.is_none() => {
+            match with_host(|h| h.enum_next(recv, true)) {
+                Some(v) => Ok(v),
+                None => Err(raise_exc("StopIteration", "iteration reached an end")),
+            }
+        }
+        "peek" if args.is_empty() && block.is_none() => {
+            match with_host(|h| h.enum_next(recv, false)) {
+                Some(v) => Ok(v),
+                None => Err(raise_exc("StopIteration", "iteration reached an end")),
+            }
+        }
+        "rewind" if args.is_empty() && block.is_none() => {
+            with_host(|h| h.enum_rewind(recv));
+            Ok(recv.clone())
+        }
+        "size" | "length" if args.is_empty() && block.is_none() => Ok(Value::Int(buf.len() as i64)),
+        // Every non-iteration message is delegated to the buffered values as an
+        // Array, preserving the full Enumerable surface (`map`, `to_a`,
+        // `select`, …) that block-less calls exposed before Enumerator existed.
+        _ => dispatch_array(&new_arr(buf), name, args, block),
+    }
 }
 
 fn dispatch_set(
