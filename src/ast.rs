@@ -161,6 +161,8 @@ pub enum Expr {
     Yield(Vec<Expr>),
     /// `super` (args `None` = forward the current method's args) / `super(args)`.
     Super(Option<Vec<Expr>>),
+    /// A splat argument/element: `*expr` in a call or array literal.
+    Splat(Box<Expr>),
 }
 
 /// One segment of an interpolated string.

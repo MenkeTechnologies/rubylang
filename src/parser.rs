@@ -141,7 +141,11 @@ impl Parser {
         if self.is_op(",") {
             let mut targets = vec![e];
             while self.eat_op(",") {
-                targets.push(self.ternary()?);
+                if self.eat_op("*") {
+                    targets.push(Expr::Splat(Box::new(self.ternary()?)));
+                } else {
+                    targets.push(self.ternary()?);
+                }
             }
             self.expect_op("=")?;
             let mut values = vec![self.ternary()?];
@@ -437,6 +441,12 @@ impl Parser {
         args: &mut Vec<Expr>,
         amp_block: &mut Option<Block>,
     ) -> Result<(), String> {
+        // `*expr` — splat the array's elements into the argument list.
+        if self.is_op("*") {
+            self.advance();
+            args.push(Expr::Splat(Box::new(self.arg()?)));
+            return Ok(());
+        }
         if self.is_op("&") {
             if let Tok::Symbol(s) = self.toks[self.pos + 1].kind.clone() {
                 self.advance(); // &
@@ -1002,14 +1012,22 @@ impl Parser {
         self.expect_op("[")?;
         self.skip_terms();
         let mut items = Vec::new();
+        let elem = |p: &mut Self| -> Result<Expr, String> {
+            if p.is_op("*") {
+                p.advance();
+                Ok(Expr::Splat(Box::new(p.expr()?)))
+            } else {
+                p.expr()
+            }
+        };
         if !self.is_op("]") {
-            items.push(self.expr()?);
+            items.push(elem(self)?);
             while self.eat_op(",") {
                 self.skip_terms();
                 if self.is_op("]") {
                     break;
                 }
-                items.push(self.expr()?);
+                items.push(elem(self)?);
             }
         }
         self.skip_terms();

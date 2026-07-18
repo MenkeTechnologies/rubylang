@@ -143,10 +143,18 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::MKSYM, 1), 0);
             }
             Expr::Array(items) => {
-                for it in items {
-                    self.compile_expr(b, it)?;
+                if items.iter().any(|it| matches!(it, Expr::Splat(_))) {
+                    self.compile_spread(b, items)?;
+                } else {
+                    for it in items {
+                        self.compile_expr(b, it)?;
+                    }
+                    b.emit(Op::CallBuiltin(ops::MKARRAY, argc(items.len())?), 0);
                 }
-                b.emit(Op::CallBuiltin(ops::MKARRAY, argc(items.len())?), 0);
+            }
+            Expr::Splat(e) => {
+                // A bare splat outside a call/array just yields its array.
+                self.compile_expr(b, e)?;
             }
             Expr::Hash(pairs) => {
                 for (k, v) in pairs {
@@ -327,12 +335,55 @@ impl Compiler {
         };
         self.compile_assign(b, &Expr::Var(VarKind::Local, tmp.into()), &rhs)?;
         b.emit(Op::Pop, 0);
+        let tmp_var = || Expr::Var(VarKind::Local, tmp.into());
+        let splat_at = targets.iter().position(|t| matches!(t, Expr::Splat(_)));
         for (i, t) in targets.iter().enumerate() {
-            let idx = Expr::Index(
-                Box::new(Expr::Var(VarKind::Local, tmp.into())),
-                vec![Expr::Int(i as i64)],
-            );
-            self.compile_assign(b, t, &idx)?;
+            // Value expression the target is assigned from.
+            let (target, value): (&Expr, Expr) = match (splat_at, t) {
+                // The splat target collects `rhs[i .. len - after]` as an array.
+                (Some(si), Expr::Splat(inner)) if i == si => {
+                    let after = targets.len() - si - 1;
+                    // length = rhs.length - after - si
+                    let len_expr = Expr::Binary(
+                        BinOp::Sub,
+                        Box::new(Expr::Binary(
+                            BinOp::Sub,
+                            Box::new(Expr::Call {
+                                recv: Some(Box::new(tmp_var())),
+                                name: "length".into(),
+                                args: vec![],
+                                block: None,
+                            }),
+                            Box::new(Expr::Int(after as i64)),
+                        )),
+                        Box::new(Expr::Int(si as i64)),
+                    );
+                    let slice =
+                        Expr::Index(Box::new(tmp_var()), vec![Expr::Int(si as i64), len_expr]);
+                    (inner.as_ref(), slice)
+                }
+                // A target after the splat indexes from the end.
+                (Some(si), t) if i > si => {
+                    let from_end = targets.len() - i; // 1-based from the end
+                    let idx = Expr::Binary(
+                        BinOp::Sub,
+                        Box::new(Expr::Call {
+                            recv: Some(Box::new(tmp_var())),
+                            name: "length".into(),
+                            args: vec![],
+                            block: None,
+                        }),
+                        Box::new(Expr::Int(from_end as i64)),
+                    );
+                    (t, Expr::Index(Box::new(tmp_var()), vec![idx]))
+                }
+                // A plain positional target.
+                (_, t) => (
+                    t,
+                    Expr::Index(Box::new(tmp_var()), vec![Expr::Int(i as i64)]),
+                ),
+            };
+            self.compile_assign(b, target, &value)?;
             b.emit(Op::Pop, 0);
         }
         self.compile_var_read(b, VarKind::Local, tmp);
@@ -383,11 +434,19 @@ impl Compiler {
         // Ruby semantics: `Integer ** Integer` and `Integer / Integer` stay
         // Integer (fusevm's native ops produce a Float), and division/modulo
         // floor toward negative infinity (fusevm truncates).
-        if matches!(op, BinOp::Pow | BinOp::Div | BinOp::Mod) {
+        // `<<` and `>>` are `Array#<<`/`String#<<`/`Integer#<<` in Ruby, not the
+        // VM's bit-shift; `**`/`/`/`%` need Ruby integer semantics. Route them
+        // all through host method dispatch.
+        if matches!(
+            op,
+            BinOp::Pow | BinOp::Div | BinOp::Mod | BinOp::Shl | BinOp::Shr
+        ) {
             let name = match op {
                 BinOp::Pow => "**",
                 BinOp::Div => "/",
-                _ => "%",
+                BinOp::Mod => "%",
+                BinOp::Shl => "<<",
+                _ => ">>",
             };
             self.compile_expr(b, l)?;
             self.kstr(b, name);
@@ -583,6 +642,25 @@ impl Compiler {
             Some(bl) => Some(self.compile_proc(bl)?),
             None => None,
         };
+        // A call with a splat argument builds its argument array at runtime and
+        // uses the array-spreading call ops. (Block + splat together is not yet
+        // supported — tracked in BUGS.md.)
+        if args.iter().any(|a| matches!(a, Expr::Splat(_))) {
+            match recv {
+                Some(r) => {
+                    self.compile_expr(b, r)?;
+                    self.kstr(b, name);
+                    self.compile_spread(b, args)?;
+                    b.emit(Op::CallBuiltin(ops::CALL_METHOD_ARR, 3), 0);
+                }
+                None => {
+                    self.kstr(b, name);
+                    self.compile_spread(b, args)?;
+                    b.emit(Op::CallBuiltin(ops::CALL_ARR, 2), 0);
+                }
+            }
+            return Ok(());
+        }
         match recv {
             Some(r) => {
                 self.compile_expr(b, r)?;
@@ -626,6 +704,23 @@ impl Compiler {
 
     fn compile_proc(&mut self, block: &Block) -> Result<usize, String> {
         self.compile_proc_body(&block.body, &block.params)
+    }
+
+    /// Emit code leaving a single array on the stack that is `items` flattened
+    /// with splats expanded: each non-splat becomes a one-element array, each
+    /// `*expr` contributes its array, and `MKARGS` concatenates them all.
+    fn compile_spread(&mut self, b: &mut ChunkBuilder, items: &[Expr]) -> Result<(), String> {
+        for it in items {
+            match it {
+                Expr::Splat(e) => self.compile_expr(b, e)?,
+                other => {
+                    self.compile_expr(b, other)?;
+                    b.emit(Op::CallBuiltin(ops::MKARRAY, 1), 0);
+                }
+            }
+        }
+        b.emit(Op::CallBuiltin(ops::MKARGS, argc(items.len())?), 0);
+        Ok(())
     }
 
     /// Compile a body into a proc template with the given params; return its id.

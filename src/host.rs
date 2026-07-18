@@ -50,6 +50,9 @@ pub mod ops {
     pub const BEGIN: u16 = 29; // [begin_id] -> run begin/rescue/ensure
     pub const SUPER: u16 = 30; // [args...] argc=n -> super with explicit args
     pub const SUPER_FWD: u16 = 31; // [] -> super forwarding the current args
+    pub const MKARGS: u16 = 32; // [arrays...] argc=n -> concatenated array (splat)
+    pub const CALL_ARR: u16 = 33; // [name, args_array] -> self call, args spread
+    pub const CALL_METHOD_ARR: u16 = 34; // [recv, name, args_array] -> method call
 }
 
 /// A heap object — the Ruby reference types.
@@ -483,6 +486,67 @@ impl RubyHost {
             _ => None,
         }
     }
+    /// Whether `class` is an ancestor of (or equal to) `start` — walking the
+    /// superclass chain and included modules.
+    fn class_is_ancestor(&self, start: &str, class: &str) -> bool {
+        let mut cur = Some(start.to_string());
+        while let Some(name) = cur {
+            if name == class {
+                return true;
+            }
+            let Some(def) = self.classes.get(&name) else {
+                break;
+            };
+            if def.includes.iter().any(|m| m == class) {
+                return true;
+            }
+            cur = def.superclass.clone();
+        }
+        false
+    }
+    /// Ruby `is_a?` / `Class === obj`: does `v` belong to `class` (builtin type,
+    /// `Numeric`/`Object` super-types, or a user class/module ancestor)?
+    pub fn is_a(&self, v: &Value, class: &str) -> bool {
+        let actual = self.class_of(v);
+        if actual == class || class == "Object" || class == "BasicObject" {
+            return true;
+        }
+        if class == "Numeric" && (actual == "Integer" || actual == "Float") {
+            return true;
+        }
+        if class == "Comparable" && matches!(actual.as_str(), "Integer" | "Float" | "String") {
+            return true;
+        }
+        if class == "Enumerable" && matches!(actual.as_str(), "Array" | "Hash" | "Range") {
+            return true;
+        }
+        if let Some(oc) = self.object_class(v) {
+            return self.class_is_ancestor(&oc, class);
+        }
+        false
+    }
+    /// Whether `name` is a builtin class/type name (for constant resolution).
+    pub fn is_builtin_class(&self, name: &str) -> bool {
+        matches!(
+            name,
+            "Integer"
+                | "Float"
+                | "Numeric"
+                | "String"
+                | "Symbol"
+                | "Array"
+                | "Hash"
+                | "Range"
+                | "Proc"
+                | "Object"
+                | "BasicObject"
+                | "Comparable"
+                | "Enumerable"
+                | "NilClass"
+                | "TrueClass"
+                | "FalseClass"
+        )
+    }
     pub fn classref_name(&self, v: &Value) -> Option<String> {
         match self.obj(v) {
             Some(RObj::ClassRef(n)) => Some(n.clone()),
@@ -710,9 +774,13 @@ impl RubyHost {
         let parts: Vec<String> = map
             .iter()
             .map(|(k, v)| {
-                let ks = self.key_inspect(k);
                 let vs = self.inspect(v);
-                format!("{ks} => {vs}")
+                // Ruby 3.4+ prints a symbol key as `name: value`; every other
+                // key type keeps the `key => value` form.
+                match k {
+                    RKey::Sym(s) => format!("{s}: {vs}"),
+                    _ => format!("{} => {vs}", self.key_inspect(k)),
+                }
             })
             .collect();
         format!("{{{}}}", parts.join(", "))

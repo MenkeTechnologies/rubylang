@@ -16,8 +16,12 @@ chaining; `module` + `include` mixins; class methods (`def self.m`); `begin`/
 `rescue`/`ensure`, method-body and statement-modifier `rescue`, `raise` with a
 message or an exception class, typed `ZeroDivisionError`/`NoMethodError`/
 `ArgumentError`; default arguments; splat parameters (`def f(a, *rest)`); `&:sym`
-block-pass (`map(&:upcase)`); parallel assignment (`a, b = 1, 2`, array
-destructuring, swap); blocks/`yield`/closures with lexical capture.
+block-pass (`map(&:upcase)`); call-site/array/target splat (`f(*a)`, `[1, *a]`,
+`a, *b = …`); parallel assignment (`a, b = 1, 2`, swap); `case`/`when Class`
+(`when Integer`) and `is_a?`; `sprintf`/`format`/`String#%` with width/precision
+flags; a broad Enumerable/Hash surface (`partition`, `group_by`, `tally`, `zip`,
+`each_with_object`, `transform_values`, …); blocks/`yield`/closures with lexical
+capture.
 
 ## Language
 
@@ -26,9 +30,11 @@ destructuring, swap); blocks/`yield`/closures with lexical capture.
   superclass chain (module-`super` ordering is approximate).
 - **Class-body statements.** Only `def`, `attr_*`, and `include` in a class body
   take effect; constants and other executable statements are ignored.
-- **Keyword / block params.** `**kwargs` and an explicit `&block` parameter are
-  not supported (a splat `*rest` and `&:sym` block-pass are). Splat at a call
-  site (`f(*arr)`) is not yet supported.
+- **Keyword params / `&block` param.** `**kwargs` and an explicit `&block`
+  parameter are not supported. (Splat `*rest` params, call-site splat `f(*arr)`,
+  array splat `[1, *a]`, splat assignment targets `a, *b = …`, and `&:sym`
+  block-pass all are.) A block cannot be combined with call-site splat in one
+  call yet.
 - **Numeric literal / method binding.** `-7.abs` parses as `-(7.abs)` (operator
   precedence) rather than `(-7).abs`; MRI treats `-7` as a literal. Use
   `(-7).abs`.
@@ -48,8 +54,6 @@ destructuring, swap); blocks/`yield`/closures with lexical capture.
   replacement only.
 - **Enumerator without block.** `each_with_index.map` (an enumerator returned
   from a block-less call) is not supported. (`&:sym` block-pass IS.)
-- **`String#%` / full `sprintf`.** `format`/`sprintf` handle `%s %d %i %f %x %%`
-  but not width/precision flags (`%0.2f`) or the `String#%` operator.
 - **Bignum.** Integers are `i64`; there is no automatic promotion to arbitrary
   precision on overflow (unlike MRI).
 - **`rand`.** Seeded from the system clock (no `srand` determinism yet).

@@ -10,7 +10,7 @@
 use crate::host::ops;
 use crate::host::{
     call_instance_method, call_method, call_proc, current_block, has_pending_signal,
-    raise_signal_break, raise_signal_next, raise_signal_return, take_break, with_host,
+    raise_signal_break, raise_signal_next, raise_signal_return, take_break, with_host, RKey,
 };
 use fusevm::{Value, VM};
 use indexmap::IndexMap;
@@ -48,6 +48,45 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::BEGIN, b_begin);
     vm.register_builtin(ops::SUPER, b_super);
     vm.register_builtin(ops::SUPER_FWD, b_super_fwd);
+    vm.register_builtin(ops::MKARGS, b_mkargs);
+    vm.register_builtin(ops::CALL_ARR, b_call_arr);
+    vm.register_builtin(ops::CALL_METHOD_ARR, b_call_method_arr);
+}
+
+/// Concatenate `argc` arrays into one (splat argument/element building).
+fn b_mkargs(vm: &mut VM, argc: u8) -> Value {
+    let pieces = pop_n(vm, argc as usize);
+    let mut out = Vec::new();
+    for p in &pieces {
+        match with_host(|h| h.as_array(p)) {
+            Some(xs) => out.extend(xs),
+            None => out.push(p.clone()),
+        }
+    }
+    with_host(|h| h.new_array(out))
+}
+
+/// Self call with a spread argument array: stack `[name, args_array]`.
+fn b_call_arr(vm: &mut VM, _: u8) -> Value {
+    let arr = vm.pop();
+    let name = name_of(&vm.pop());
+    let args = with_host(|h| h.as_array(&arr).unwrap_or_default());
+    match dispatch_call(&name, &args, None) {
+        Ok(v) => propagate(vm, v),
+        Err(e) => abort(vm, e),
+    }
+}
+
+/// Method call with a spread argument array: stack `[recv, name, args_array]`.
+fn b_call_method_arr(vm: &mut VM, _: u8) -> Value {
+    let arr = vm.pop();
+    let name = name_of(&vm.pop());
+    let recv = vm.pop();
+    let args = with_host(|h| h.as_array(&arr).unwrap_or_default());
+    match dispatch(&recv, &name, &args, None) {
+        Ok(v) => propagate(vm, v),
+        Err(e) => abort(vm, e),
+    }
 }
 
 fn b_getself(_vm: &mut VM, _: u8) -> Value {
@@ -98,7 +137,12 @@ fn abort(vm: &mut VM, e: String) -> Value {
 }
 
 fn name_of(v: &Value) -> String {
-    with_host(|h| h.as_str(v).or_else(|| h.as_symbol(v)).unwrap_or_default())
+    with_host(|h| {
+        h.as_str(v)
+            .or_else(|| h.as_symbol(v))
+            .or_else(|| h.classref_name(v))
+            .unwrap_or_default()
+    })
 }
 
 // ---- variable builtins ----------------------------------------------------
@@ -163,7 +207,9 @@ fn b_getconst(vm: &mut VM, _: u8) -> Value {
     }
     // An unassigned constant that names a class (user-defined, or a builtin
     // exception like `RuntimeError`) resolves to a class reference.
-    if with_host(|h| h.class_exists(&name)) || is_builtin_exception(&name) {
+    if with_host(|h| h.class_exists(&name) || h.is_builtin_class(&name))
+        || is_builtin_exception(&name)
+    {
         return with_host(|h| h.class_ref(&name));
     }
     v
@@ -391,7 +437,10 @@ fn dispatch(
         "==" => return Ok(Value::Bool(with_host(|h| h.eq_values(recv, &args[0])))),
         "!=" => return Ok(Value::Bool(!with_host(|h| h.eq_values(recv, &args[0])))),
         "===" => {
-            // Case-equality: a Range covers, a Class matches, else `==`.
+            // Case-equality: a Class matches instances, a Range covers, else `==`.
+            if let Some(cls) = with_host(|h| h.classref_name(recv)) {
+                return Ok(Value::Bool(with_host(|h| h.is_a(&args[0], &cls))));
+            }
             if let Some((lo, hi, excl)) = with_host(|h| h.as_range(recv)) {
                 let n = as_i(&args[0]);
                 let end = if excl { hi } else { hi + 1 };
@@ -399,11 +448,13 @@ fn dispatch(
             }
             return Ok(Value::Bool(with_host(|h| h.eq_values(recv, &args[0]))));
         }
-        "is_a?" | "kind_of?" | "instance_of?" => {
+        "is_a?" | "kind_of?" => {
             let cls = name_of(&args[0]);
-            let actual = with_host(|h| h.class_of(recv).to_string());
-            let numeric = actual == "Integer" || actual == "Float";
-            return Ok(Value::Bool(actual == cls || (cls == "Numeric" && numeric)));
+            return Ok(Value::Bool(with_host(|h| h.is_a(recv, &cls))));
+        }
+        "instance_of?" => {
+            let cls = name_of(&args[0]);
+            return Ok(Value::Bool(with_host(|h| h.class_of(recv)) == cls));
         }
         "freeze" | "itself" | "dup" | "clone" | "tap" if name != "tap" => return Ok(recv.clone()),
         "frozen?" => return Ok(Value::Bool(false)),
@@ -467,6 +518,8 @@ fn dispatch_classref(
             Ok(obj)
         }
         "name" | "to_s" | "inspect" => Ok(new_str(cls.to_string())),
+        // `Class === obj` and `obj.is_a?(Class)` — case/when matching.
+        "===" => Ok(Value::Bool(with_host(|h| h.is_a(&args[0], cls)))),
         _ => {
             // A class method: `def self.m` runs with self bound to the class ref.
             if let Some(def) = with_host(|h| h.find_class_method(cls, name)) {
@@ -600,6 +653,41 @@ fn dispatch_number(
             h.new_string(c.to_string())
         })),
         "gcd" => Ok(Value::Int(gcd(as_i(recv), as_i(&args[0])))),
+        "lcm" => {
+            let (a, b) = (as_i(recv), as_i(&args[0]));
+            Ok(Value::Int(if a == 0 || b == 0 {
+                0
+            } else {
+                (a / gcd(a, b) * b).abs()
+            }))
+        }
+        "digits" => {
+            let mut n = as_i(recv).abs();
+            let base = args.first().map(as_i).unwrap_or(10).max(2);
+            let mut out = Vec::new();
+            if n == 0 {
+                out.push(Value::Int(0));
+            }
+            while n > 0 {
+                out.push(Value::Int(n % base));
+                n /= base;
+            }
+            Ok(new_arr(out))
+        }
+        "clamp" => {
+            let n = as_i(recv);
+            let (lo, hi) = (as_i(&args[0]), as_i(&args[1]));
+            Ok(Value::Int(n.max(lo).min(hi)))
+        }
+        "<<" => Ok(Value::Int(as_i(recv) << as_i(&args[0]))),
+        ">>" => Ok(Value::Int(as_i(recv) >> as_i(&args[0]))),
+        "&" => Ok(Value::Int(as_i(recv) & as_i(&args[0]))),
+        "|" => Ok(Value::Int(as_i(recv) | as_i(&args[0]))),
+        "^" => Ok(Value::Int(as_i(recv) ^ as_i(&args[0]))),
+        "between?" => {
+            let n = as_f(recv);
+            Ok(Value::Bool(n >= as_f(&args[0]) && n <= as_f(&args[1])))
+        }
         _ => Err(format!(
             "undefined method '{name}' for {}",
             with_host(|h| h.class_of(recv))
@@ -730,6 +818,12 @@ fn dispatch_string(
             }
         }
         "*" => Ok(new_str(s.repeat(as_i(&args[0]).max(0) as usize))),
+        "%" => {
+            // `"%d-%d" % [1, 2]` or `"%d" % 5`.
+            let fargs =
+                with_host(|h| h.as_array(&args[0])).unwrap_or_else(|| vec![args[0].clone()]);
+            Ok(new_str(sprintf(&s, &fargs)))
+        }
         "ljust" => Ok(new_str(pad(
             &s,
             as_i(&args[0]) as usize,
@@ -1063,7 +1157,143 @@ fn dispatch_array(
                 .skip(as_i(&args[0]).max(0) as usize)
                 .collect(),
         )),
-        _ => Err(format!("undefined method '{name}' for Array")),
+        "partition" => {
+            let (mut yes, mut no) = (Vec::new(), Vec::new());
+            if let Some(bl) = &block {
+                for x in &arr {
+                    let r = call_proc(bl, std::slice::from_ref(x))?;
+                    if with_host(|h| h.truthy(&r)) {
+                        yes.push(x.clone());
+                    } else {
+                        no.push(x.clone());
+                    }
+                }
+            }
+            let y = new_arr(yes);
+            let n = new_arr(no);
+            Ok(new_arr(vec![y, n]))
+        }
+        "group_by" => {
+            let mut groups: IndexMap<RKey, Vec<Value>> = IndexMap::new();
+            if let Some(bl) = &block {
+                for x in &arr {
+                    let k = call_proc(bl, std::slice::from_ref(x))?;
+                    let key = with_host(|h| h.value_to_key(&k));
+                    groups.entry(key).or_default().push(x.clone());
+                }
+            }
+            Ok(with_host(|h| {
+                let m: IndexMap<RKey, Value> = groups
+                    .into_iter()
+                    .map(|(k, v)| (k, h.new_array(v)))
+                    .collect();
+                h.new_hash(m)
+            }))
+        }
+        "tally" => {
+            let mut counts: IndexMap<RKey, i64> = IndexMap::new();
+            for x in &arr {
+                let key = with_host(|h| h.value_to_key(x));
+                *counts.entry(key).or_insert(0) += 1;
+            }
+            Ok(with_host(|h| {
+                let m: IndexMap<RKey, Value> = counts
+                    .into_iter()
+                    .map(|(k, n)| (k, Value::Int(n)))
+                    .collect();
+                h.new_hash(m)
+            }))
+        }
+        "each_with_object" => {
+            let memo = args[0].clone();
+            if let Some(bl) = &block {
+                for x in &arr {
+                    call_proc(bl, &[x.clone(), memo.clone()])?;
+                }
+            }
+            Ok(memo)
+        }
+        "zip" => {
+            let others: Vec<Vec<Value>> = args
+                .iter()
+                .map(|a| with_host(|h| h.as_array(a).unwrap_or_default()))
+                .collect();
+            let rows: Vec<Value> = arr
+                .iter()
+                .enumerate()
+                .map(|(i, x)| {
+                    let mut row = vec![x.clone()];
+                    for o in &others {
+                        row.push(o.get(i).cloned().unwrap_or(Value::Undef));
+                    }
+                    new_arr(row)
+                })
+                .collect();
+            Ok(new_arr(rows))
+        }
+        "take_while" => {
+            let mut out = Vec::new();
+            if let Some(bl) = &block {
+                for x in &arr {
+                    let r = call_proc(bl, std::slice::from_ref(x))?;
+                    if with_host(|h| h.truthy(&r)) {
+                        out.push(x.clone());
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Ok(new_arr(out))
+        }
+        "drop_while" => {
+            let mut out = Vec::new();
+            let mut dropping = true;
+            if let Some(bl) = &block {
+                for x in &arr {
+                    if dropping {
+                        let r = call_proc(bl, std::slice::from_ref(x))?;
+                        if with_host(|h| h.truthy(&r)) {
+                            continue;
+                        }
+                        dropping = false;
+                    }
+                    out.push(x.clone());
+                }
+            }
+            Ok(new_arr(out))
+        }
+        "rotate" => {
+            let n = args.first().map(as_i).unwrap_or(1);
+            let len = arr.len() as i64;
+            if len == 0 {
+                return Ok(new_arr(arr));
+            }
+            let k = ((n % len) + len) % len;
+            let mut out = arr[k as usize..].to_vec();
+            out.extend_from_slice(&arr[..k as usize]);
+            Ok(new_arr(out))
+        }
+        "each_slice" => {
+            let n = as_i(&args[0]).max(1) as usize;
+            let slices: Vec<Value> = arr.chunks(n).map(|c| new_arr(c.to_vec())).collect();
+            Ok(new_arr(slices))
+        }
+        "to_h" => {
+            let mut m = IndexMap::new();
+            for x in &arr {
+                if let Some(pair) = with_host(|h| h.as_array(x)) {
+                    if pair.len() == 2 {
+                        let k = with_host(|h| h.value_to_key(&pair[0]));
+                        m.insert(k, pair[1].clone());
+                    }
+                }
+            }
+            Ok(with_host(|h| h.new_hash(m)))
+        }
+        _ => Err(raise_exc(
+            "NoMethodError",
+            &format!("undefined method '{name}' for Array"),
+        )),
     }
 }
 
@@ -1232,20 +1462,92 @@ fn dispatch_hash(
             }
             Ok(new_arr(out))
         }
-        "select" | "filter" => {
+        "select" | "filter" | "reject" => {
+            let keep = name != "reject";
             let mut out = IndexMap::new();
             if let Some(b) = &block {
                 for (k, v) in &map {
                     let kv = with_host(|h| h.key_value(k));
                     let r = call_proc(b, &[kv, v.clone()])?;
-                    if with_host(|h| h.truthy(&r)) {
+                    if with_host(|h| h.truthy(&r)) == keep {
                         out.insert(k.clone(), v.clone());
                     }
                 }
             }
             Ok(with_host(|h| h.new_hash(out)))
         }
-        _ => Err(format!("undefined method '{name}' for Hash")),
+        "transform_values" => {
+            let mut out = IndexMap::new();
+            if let Some(b) = &block {
+                for (k, v) in &map {
+                    out.insert(k.clone(), call_proc(b, std::slice::from_ref(v))?);
+                }
+            }
+            Ok(with_host(|h| h.new_hash(out)))
+        }
+        "each_with_object" => {
+            let memo = args[0].clone();
+            if let Some(b) = &block {
+                for (k, v) in &map {
+                    let kv = with_host(|h| h.key_value(k));
+                    call_proc(b, &[kv, v.clone(), memo.clone()])?;
+                }
+            }
+            Ok(memo)
+        }
+        "sum" => {
+            let mut acc = args.first().cloned().unwrap_or(Value::Int(0));
+            if let Some(b) = &block {
+                for (k, v) in &map {
+                    let kv = with_host(|h| h.key_value(k));
+                    let r = call_proc(b, &[kv, v.clone()])?;
+                    acc = add_values(&acc, &r);
+                }
+            }
+            Ok(acc)
+        }
+        "any?" | "all?" | "none?" => {
+            if let Some(b) = &block {
+                for (k, v) in &map {
+                    let kv = with_host(|h| h.key_value(k));
+                    let r = call_proc(b, &[kv, v.clone()])?;
+                    let t = with_host(|h| h.truthy(&r));
+                    match name {
+                        "any?" if t => return Ok(Value::Bool(true)),
+                        "all?" if !t => return Ok(Value::Bool(false)),
+                        "none?" if t => return Ok(Value::Bool(false)),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Value::Bool(name != "any?"))
+        }
+        "min_by" | "max_by" | "sort_by" => {
+            let rows: Vec<Value> = with_host(|h| {
+                map.iter()
+                    .map(|(k, v)| {
+                        let kv = h.key_value(k);
+                        h.new_array(vec![kv, v.clone()])
+                    })
+                    .collect()
+            });
+            let tmp = with_host(|h| h.new_array(rows));
+            dispatch_array(&tmp, name, args, block)
+        }
+        "invert" => {
+            let mut out = IndexMap::new();
+            for (k, v) in &map {
+                let nk = with_host(|h| h.value_to_key(v));
+                let kv = with_host(|h| h.key_value(k));
+                out.insert(nk, kv);
+            }
+            Ok(with_host(|h| h.new_hash(out)))
+        }
+        "to_h" => Ok(recv.clone()),
+        _ => Err(raise_exc(
+            "NoMethodError",
+            &format!("undefined method '{name}' for Hash"),
+        )),
     }
 }
 
@@ -1284,12 +1586,13 @@ fn dispatch_range(
             }
             Ok(recv.clone())
         }
-        "map" | "collect" | "select" | "filter" | "reject" | "reduce" | "inject" | "sum_by" => {
+        // Everything else falls back to the eager Array implementation over the
+        // materialized elements (Range is Enumerable).
+        _ => {
             let arr: Vec<Value> = (lo..end).map(Value::Int).collect();
             let tmp = with_host(|h| h.new_array(arr));
             dispatch_array(&tmp, name, args, block)
         }
-        _ => Err(format!("undefined method '{name}' for Range")),
     }
 }
 
@@ -1405,7 +1708,7 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             None if matches!(args[0], Value::Undef) => with_host(|h| h.new_array(vec![])),
             None => with_host(|h| h.new_array(vec![args[0].clone()])),
         }),
-        "format" | "sprintf" => Ok(new_str(sprintf(args))),
+        "format" | "sprintf" => Ok(new_str(sprintf(&arg_str(&args[0]), &args[1..]))),
         "gets" => Ok(read_line()),
         "lambda" | "proc" => block.ok_or_else(|| "tried to create Proc without a block".into()),
         "loop" => {
@@ -1469,45 +1772,133 @@ fn read_line() -> Value {
 }
 
 /// Minimal `sprintf`/`format`: handles `%s %d %f %x %%` positionally.
-fn sprintf(args: &[Value]) -> String {
-    let fmt = arg_str(&args[0]);
+/// `format`/`sprintf`/`String#%` — handles `%[flags][width][.precision]conv`
+/// with flags `-`, `0`, `+`, ` `, and conversions d/i/f/e/g/s/x/X/o/b/c/%.
+fn sprintf(fmt: &str, args: &[Value]) -> String {
+    let bytes: Vec<char> = fmt.chars().collect();
     let mut out = String::new();
-    let mut ai = 1;
-    let mut chars = fmt.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '%' {
-            out.push(c);
+    let mut i = 0;
+    let mut ai = 0;
+    while i < bytes.len() {
+        if bytes[i] != '%' {
+            out.push(bytes[i]);
+            i += 1;
             continue;
         }
-        match chars.next() {
-            Some('%') => out.push('%'),
-            Some('s') => {
-                out.push_str(
-                    &args
-                        .get(ai)
-                        .map(|a| with_host(|h| h.to_s(a)))
-                        .unwrap_or_default(),
-                );
-                ai += 1;
+        i += 1;
+        if i < bytes.len() && bytes[i] == '%' {
+            out.push('%');
+            i += 1;
+            continue;
+        }
+        // flags
+        let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
+        while i < bytes.len() {
+            match bytes[i] {
+                '-' => left = true,
+                '0' => zero = true,
+                '+' => plus = true,
+                ' ' => space = true,
+                _ => break,
             }
-            Some('d') | Some('i') => {
-                out.push_str(&args.get(ai).map(as_i).unwrap_or(0).to_string());
-                ai += 1;
+            i += 1;
+        }
+        // width
+        let mut width = 0usize;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            width = width * 10 + (bytes[i] as usize - '0' as usize);
+            i += 1;
+        }
+        // precision
+        let mut prec: Option<usize> = None;
+        if i < bytes.len() && bytes[i] == '.' {
+            i += 1;
+            let mut p = 0usize;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                p = p * 10 + (bytes[i] as usize - '0' as usize);
+                i += 1;
             }
-            Some('f') => {
-                out.push_str(&format!("{:.6}", args.get(ai).map(as_f).unwrap_or(0.0)));
-                ai += 1;
+            prec = Some(p);
+        }
+        let conv = if i < bytes.len() { bytes[i] } else { '%' };
+        i += 1;
+        let arg = args.get(ai).cloned().unwrap_or(Value::Undef);
+        ai += 1;
+
+        // Render the value (body), then apply sign, zero-fill, and width.
+        let (mut body, numeric, negative) = match conv {
+            'd' | 'i' | 'u' => {
+                let n = as_i(&arg);
+                (n.unsigned_abs().to_string(), true, n < 0)
             }
-            Some('x') => {
-                out.push_str(&format!("{:x}", args.get(ai).map(as_i).unwrap_or(0)));
-                ai += 1;
+            'f' => {
+                let f = as_f(&arg);
+                (format!("{:.*}", prec.unwrap_or(6), f.abs()), true, f < 0.0)
             }
-            Some(other) => {
+            'e' => {
+                let f = as_f(&arg);
+                (format!("{:.*e}", prec.unwrap_or(6), f.abs()), true, f < 0.0)
+            }
+            'g' => {
+                let f = as_f(&arg);
+                (format!("{}", f.abs()), true, f < 0.0)
+            }
+            'x' => (format!("{:x}", as_i(&arg)), false, false),
+            'X' => (format!("{:X}", as_i(&arg)), false, false),
+            'o' => (format!("{:o}", as_i(&arg)), false, false),
+            'b' => (format!("{:b}", as_i(&arg)), false, false),
+            'c' => (
+                char::from_u32(as_i(&arg) as u32)
+                    .map(String::from)
+                    .unwrap_or_default(),
+                false,
+                false,
+            ),
+            's' => {
+                let mut s = with_host(|h| h.to_s(&arg));
+                if let Some(p) = prec {
+                    s.truncate(p);
+                }
+                (s, false, false)
+            }
+            other => {
                 out.push('%');
                 out.push(other);
+                ai -= 1;
+                continue;
             }
-            None => out.push('%'),
+        };
+
+        let sign = if negative {
+            "-"
+        } else if numeric && plus {
+            "+"
+        } else if numeric && space {
+            " "
+        } else {
+            ""
+        };
+        let total = sign.len() + body.len();
+        if width > total {
+            let pad = width - total;
+            if left {
+                out.push_str(sign);
+                out.push_str(&body);
+                out.extend(std::iter::repeat(' ').take(pad));
+            } else if zero && numeric {
+                out.push_str(sign);
+                out.extend(std::iter::repeat('0').take(pad));
+                out.push_str(&body);
+            } else {
+                out.extend(std::iter::repeat(' ').take(pad));
+                out.push_str(sign);
+                out.push_str(&body);
+            }
+        } else {
+            out.push_str(sign);
+            out.push_str(&body);
         }
+        let _ = &mut body;
     }
     out
 }

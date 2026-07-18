@@ -231,3 +231,46 @@ puts stats("empty")
 puts [1, 2, 3].map(&:to_s).inspect
 puts [1, 2, 3, 4].select(&:even?).inspect
 puts (1..5).map(&:to_s).join(",")
+#==#
+puts format("%-10s|%5d|%08.2f", "item", 42, 3.14159)
+puts "%x %X %o %b" % [255, 255, 64, 10]
+puts "total: %+d" % 7
+#==#
+[1, "two", :three, 4.5, [6]].each do |v|
+  case v
+  when Integer then puts "int #{v}"
+  when String then puts "str #{v}"
+  when Float then puts "float #{v}"
+  when Array then puts "arr #{v.inspect}"
+  else puts "other #{v.inspect}"
+  end
+end
+#==#
+puts 5.is_a?(Integer)
+puts 5.is_a?(Numeric)
+puts "x".is_a?(Comparable)
+class Base; end
+class Sub < Base; end
+puts Sub.new.is_a?(Base)
+#==#
+puts (1..10).partition(&:even?).inspect
+puts [1, 2, 3, 4, 5, 6].group_by { |n| n % 3 }.inspect
+puts "mississippi".chars.tally.inspect
+puts [1, 2, 3].zip([4, 5, 6]).inspect
+puts({ a: 1, b: 2, c: 3 }.transform_values { |v| v * 10 }.inspect)
+#==#
+acc = [1, 2, 3, 4].each_with_object([]) { |x, memo| memo << x * x }
+puts acc.inspect
+stack = []
+stack << 1 << 2 << 3
+puts stack.inspect
+#==#
+def add(a, b, c); a + b + c; end
+nums = [1, 2, 3]
+puts add(*nums)
+parts = [2, 3]
+puts [1, *parts, 4].inspect
+first, *rest = [10, 20, 30, 40]
+puts "#{first} / #{rest.inspect}"
+a, *mid, z = [1, 2, 3, 4, 5]
+puts "#{a} #{mid.inspect} #{z}"

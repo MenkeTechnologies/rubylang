@@ -251,6 +251,65 @@ fn symbol_to_proc_block_pass() {
 }
 
 #[test]
+fn sprintf_and_string_percent() {
+    eq("format(\"%05d\", 42)", "\"00042\"");
+    eq("\"%-6s|\" % \"hi\"", "\"hi    |\"");
+    eq("\"%+d\" % 7", "\"+7\"");
+    eq("\"%.2f\" % 3.14159", "\"3.14\"");
+}
+
+#[test]
+fn case_when_class_and_is_a() {
+    eq(
+        "case 42; when String then :s; when Integer then :i; end",
+        ":i",
+    );
+    eq("5.is_a?(Numeric)", "true");
+    eq("\"x\".is_a?(Comparable)", "true");
+    eq("class B; end; class S < B; end; S.new.is_a?(B)", "true");
+}
+
+#[test]
+fn enumerable_breadth() {
+    eq("(1..6).partition(&:even?)", "[[2, 4, 6], [1, 3, 5]]");
+    eq(
+        "[1, 2, 3, 4].group_by { |n| n.even? }",
+        "{false => [1, 3], true => [2, 4]}",
+    );
+    eq("\"aab\".chars.tally", "{\"a\" => 2, \"b\" => 1}");
+    eq("[1, 2, 3].zip([4, 5, 6])", "[[1, 4], [2, 5], [3, 6]]");
+    eq(
+        "[1, 2, 3, 4].each_with_object([]) { |x, m| m << x * x }",
+        "[1, 4, 9, 16]",
+    );
+    eq(
+        "{ a: 1, b: 2 }.transform_values { |v| v * 10 }",
+        "{a: 10, b: 20}",
+    );
+}
+
+#[test]
+fn shovel_operator_mutates() {
+    eq("a = []; a << 1 << 2 << 3; a", "[1, 2, 3]");
+    eq("s = \"ab\"; s << \"c\"; s", "\"abc\"");
+    eq("1 << 4", "16");
+}
+
+#[test]
+fn call_site_and_target_splat() {
+    eq("def f(a, b, c); a + b + c; end; f(*[1, 2, 3])", "6");
+    eq("p = [2, 3]; [1, *p, 4]", "[1, 2, 3, 4]");
+    eq(
+        "first, *rest = [1, 2, 3, 4]; [first, rest]",
+        "[1, [2, 3, 4]]",
+    );
+    eq(
+        "a, *mid, z = [1, 2, 3, 4, 5]; [a, mid, z]",
+        "[1, [2, 3, 4], 5]",
+    );
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
