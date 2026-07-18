@@ -807,6 +807,53 @@ fn object_model_batch() {
 }
 
 #[test]
+fn string_iter_batch() {
+    // chars / bytes / each_char
+    eq("\"abc\".chars", "[\"a\", \"b\", \"c\"]");
+    eq("\"abc\".bytes", "[97, 98, 99]");
+    eq("s = \"\"; \"abc\".each_char { |c| s << c.upcase }; s", "\"ABC\"");
+    // ord / chr
+    eq("\"A\".ord", "65");
+    eq("\"a\".ord", "97");
+    eq("\"hello\".chr", "\"h\"");
+    // succ / next
+    eq("\"az\".succ", "\"ba\"");
+    eq("\"az\".next", "\"ba\"");
+    eq("\"Az\".succ", "\"Ba\"");
+    eq("\"zz\".succ", "\"aaa\"");
+    eq("\"a9\".succ", "\"b0\"");
+    eq("\"Zz\".succ", "\"AAa\"");
+    eq("\"Az9\".succ", "\"Ba0\"");
+    eq("\"\".succ", "\"\"");
+    // insert / prepend (mutating)
+    eq("\"hello\".insert(2, \"XY\")", "\"heXYllo\"");
+    eq("\"hello\".insert(-1, \"!\")", "\"hello!\"");
+    eq("\"hello\".insert(-2, \"!\")", "\"hell!o\"");
+    eq("\"world\".prepend(\"hello \")", "\"hello world\"");
+    // slice (i,len) / slice(range) — same as []
+    eq("\"hello\".slice(1, 3)", "\"ell\"");
+    eq("\"hello\".slice(1..3)", "\"ell\"");
+    eq("\"hello\".slice(1...3)", "\"el\"");
+    eq("\"hello\"[1, 3]", "\"ell\"");
+    eq("\"hello\"[1..3]", "\"ell\"");
+    eq("\"hello\"[1...3]", "\"el\"");
+    // []= (int / int,len / range) mutating
+    eq("s = \"hello\"; s[1..3] = \"XYZ\"; s", "\"hXYZo\"");
+    eq("s = \"hello\"; s[1, 2] = \"Q\"; s", "\"hQlo\"");
+    eq("s = \"hello\"; s[0] = \"H\"; s", "\"Hello\"");
+    // index / rindex
+    eq("\"hello\".index(\"l\")", "2");
+    eq("\"hello\".rindex(\"l\")", "3");
+    eq("\"hello\".index(\"lo\")", "3");
+    eq("\"abcabc\".rindex(\"bc\")", "4");
+    eq("\"hello\".index(\"z\")", "nil");
+    // start_with? / end_with? multiple args
+    eq("\"file.rb\".start_with?(\".\", \"file\")", "true");
+    eq("\"file.rb\".end_with?(\".rb\", \".py\")", "true");
+    eq("\"file.rb\".end_with?(\".py\", \".c\")", "false");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

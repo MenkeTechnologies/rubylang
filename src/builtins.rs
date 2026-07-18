@@ -1089,8 +1089,12 @@ fn dispatch_string(
         "to_s" | "to_str" => Ok(recv.clone()),
         "to_sym" => Ok(with_host(|h| h.new_symbol(&s))),
         "include?" => Ok(Value::Bool(s.contains(&arg_str(&args[0])))),
-        "start_with?" => Ok(Value::Bool(s.starts_with(&arg_str(&args[0])))),
-        "end_with?" => Ok(Value::Bool(s.ends_with(&arg_str(&args[0])))),
+        "start_with?" => Ok(Value::Bool(args.iter().any(|a| match str_regex(a) {
+            // A Regexp prefix matches when it matches at the very start.
+            Some(re) => re.find(&s).map(|m| m.start() == 0).unwrap_or(false),
+            None => s.starts_with(&arg_str(a)),
+        }))),
+        "end_with?" => Ok(Value::Bool(args.iter().any(|a| s.ends_with(&arg_str(a))))),
         "match?" => {
             let m = str_regex(&args[0])
                 .map(|re| re.is_match(&s))
@@ -1192,8 +1196,129 @@ fn dispatch_string(
             Ok(recv.clone())
         }
         "[]" => Ok(str_index(&s, args)),
+        "slice" => Ok(str_index(&s, args)),
+        "ord" => match s.chars().next() {
+            Some(c) => Ok(Value::Int(c as i64)),
+            None => Err(raise_exc("ArgumentError", "empty string")),
+        },
+        "chr" => Ok(new_str(s.chars().next().map(|c| c.to_string()).unwrap_or_default())),
+        "succ" | "next" => Ok(new_str(str_succ(&s))),
+        "insert" => {
+            let mut chars: Vec<char> = s.chars().collect();
+            let i = as_i(&args[0]);
+            // Ruby inserts BEFORE index `i`; a negative index counts from the
+            // end and inserts AFTER that character (so -1 appends).
+            let at = if i < 0 {
+                (chars.len() as i64 + i + 1).max(0) as usize
+            } else {
+                i as usize
+            };
+            if at > chars.len() {
+                return Err(raise_exc(
+                    "IndexError",
+                    &format!("index {i} out of string"),
+                ));
+            }
+            chars.splice(at..at, arg_str(&args[1]).chars());
+            let out: String = chars.into_iter().collect();
+            with_host(|h| h.set_str(recv, out));
+            Ok(recv.clone())
+        }
+        "prepend" => {
+            let pre: String = args.iter().map(arg_str).collect();
+            with_host(|h| h.set_str(recv, format!("{pre}{s}")));
+            Ok(recv.clone())
+        }
+        "index" => Ok(str_find(&s, &arg_str(&args[0]), args.get(1).map(as_i), false)),
+        "rindex" => Ok(str_find(&s, &arg_str(&args[0]), args.get(1).map(as_i), true)),
+        "[]=" => str_index_set(recv, &s, args),
         _ => Err(format!("undefined method '{name}' for String")),
     }
+}
+
+/// Ruby `String#index`/`rindex`: the char offset of substring `needle`, or `nil`.
+/// `pos` is an optional start (index) or end (rindex) char offset; `rev` picks
+/// the last match instead of the first.
+fn str_find(s: &str, needle: &str, pos: Option<i64>, rev: bool) -> Value {
+    let byte_to_char = |b: usize| s[..b].chars().count() as i64;
+    let hit = if rev {
+        match pos {
+            Some(p) => {
+                let len = s.chars().count() as i64;
+                let end = if p < 0 { len + p } else { p };
+                if end < 0 {
+                    None
+                } else {
+                    // Search only the prefix up to (and including) char `end`.
+                    let cut: String = s.chars().take((end as usize) + 1).collect();
+                    cut.rfind(needle).map(byte_to_char)
+                }
+            }
+            None => s.rfind(needle).map(byte_to_char),
+        }
+    } else {
+        match pos {
+            Some(p) => {
+                let len = s.chars().count() as i64;
+                let start = if p < 0 { len + p } else { p };
+                if start < 0 || start > len {
+                    None
+                } else {
+                    let bstart = s
+                        .char_indices()
+                        .nth(start as usize)
+                        .map(|(b, _)| b)
+                        .unwrap_or(s.len());
+                    s[bstart..].find(needle).map(|b| byte_to_char(bstart + b))
+                }
+            }
+            None => s.find(needle).map(byte_to_char),
+        }
+    };
+    hit.map(Value::Int).unwrap_or(Value::Undef)
+}
+
+/// Ruby `String#[]=`: replace the char range selected by the index args (int,
+/// int+len, or Range) with the trailing replacement string, mutating `recv`.
+fn str_index_set(recv: &Value, s: &str, args: &[Value]) -> Result<Value, String> {
+    let (sel, repl) = args.split_at(args.len() - 1);
+    let val = arg_str(&repl[0]);
+    let mut chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let (start, end) = match sel {
+        [Value::Int(i)] => {
+            let k = match norm_idx(*i, len) {
+                Some(k) if k < len => k,
+                _ => return Err(raise_exc("IndexError", &format!("index {i} out of string"))),
+            };
+            (k, k + 1)
+        }
+        [Value::Int(i), Value::Int(n)] => {
+            let st = match norm_idx(*i, len) {
+                Some(k) if k <= len => k,
+                _ => return Err(raise_exc("IndexError", &format!("index {i} out of string"))),
+            };
+            let e = (st + (*n).max(0) as usize).min(len);
+            (st, e)
+        }
+        [rng] => match with_host(|h| h.as_range(rng)) {
+            Some((lo, hi, excl)) => {
+                let st = norm_idx(lo, len).unwrap_or(len).min(len);
+                let mut e = norm_idx(hi, len).unwrap_or(len);
+                if !excl {
+                    e += 1;
+                }
+                let e = e.clamp(st, len);
+                (st, e)
+            }
+            None => return Err("String#[]= bad index".to_string()),
+        },
+        _ => return Err("String#[]= bad index".to_string()),
+    };
+    chars.splice(start..end, val.chars());
+    let out: String = chars.into_iter().collect();
+    with_host(|h| h.set_str(recv, out));
+    Ok(repl[0].clone())
 }
 
 /// The compiled regex for a value that is a Regexp, else `None`.
@@ -1426,6 +1551,23 @@ fn str_index(s: &str, args: &[Value]) -> Value {
                 Value::Undef
             } else {
                 new_str(chars[start..end].iter().collect())
+            }
+        }
+        [rng] => {
+            if let Some((lo, hi, excl)) = with_host(|h| h.as_range(rng)) {
+                let start = norm_idx(lo, chars.len()).unwrap_or(chars.len());
+                let mut e = norm_idx(hi, chars.len()).unwrap_or(chars.len());
+                if !excl {
+                    e += 1;
+                }
+                let e = e.min(chars.len());
+                if start > chars.len() {
+                    Value::Undef
+                } else {
+                    new_str(chars[start..e.max(start)].iter().collect())
+                }
+            } else {
+                Value::Undef
             }
         }
         _ => Value::Undef,
