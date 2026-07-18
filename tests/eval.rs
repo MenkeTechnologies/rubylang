@@ -1439,6 +1439,40 @@ fn hash_more_batch() {
 }
 
 #[test]
+fn object_dup_freeze_batch() {
+    // dup makes a fresh shallow copy; mutating the copy never leaks back.
+    eq("[1, 2, 3].dup.push(4)", "[1, 2, 3, 4]");
+    eq("a = [1, 2]; b = a.dup; b << 3; a", "[1, 2]");
+    eq("h = {1 => 2}; g = h.dup; g[3] = 4; h", "{1 => 2}");
+    eq("s = \"x\"; t = s.dup; t << \"y\"; s", "\"x\"");
+    // freeze records the frozen flag; frozen? reports it.
+    eq("\"x\".frozen?", "false");
+    eq("\"a\".freeze.frozen?", "true");
+    eq("a = [1]; a.freeze; a.frozen?", "true");
+    // immediates and symbols are always frozen.
+    eq("5.frozen?", "true");
+    eq(":sym.frozen?", "true");
+    eq("nil.frozen?", "true");
+    eq("({}).frozen?", "false");
+    // clone preserves frozen state; dup never does.
+    eq("\"abc\".clone.frozen?", "false");
+    eq("a = [1].freeze; b = a.clone; b.frozen?", "true");
+    eq("a = [1].freeze; a.dup.frozen?", "false");
+    // tap yields self and returns self; itself returns self.
+    eq("5.tap { |x| x }.itself", "5");
+    eq("5.itself", "5");
+    // then / yield_self pass self to the block and return its result.
+    eq("5.then { |x| x + 1 }", "6");
+    eq("5.yield_self { |x| x * 2 }", "10");
+    // equal? is object identity; instance_of? tests the exact class.
+    eq("5.equal?(5)", "true");
+    eq("5.equal?(6)", "false");
+    eq("\"a\".equal?(\"a\")", "false");
+    eq("a = [1]; a.equal?(a)", "true");
+    eq("[1].instance_of?(Array)", "true");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

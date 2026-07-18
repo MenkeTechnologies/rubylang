@@ -531,20 +531,42 @@ fn dispatch(
             let cls = name_of(&args[0]);
             return Ok(Value::Bool(with_host(|h| h.class_of(recv)) == cls));
         }
-        "freeze" | "itself" => return Ok(recv.clone()),
-        // `dup`/`clone` make a fresh shallow copy so mutating the copy does not
-        // leak back to the original (Ruby's shallow-copy semantics).
-        "dup" | "clone" => return Ok(with_host(|h| h.dup_value(recv))),
-        // Immediates (Integer/Float/true/false/nil) and Symbols are always frozen
-        // in Ruby; freeze itself is a best-effort no-op so mutable reference types
-        // report unfrozen.
-        "frozen?" => {
-            let frozen = match recv {
-                Value::Obj(_) => with_host(|h| h.as_symbol(recv).is_some()),
-                _ => true,
-            };
-            return Ok(Value::Bool(frozen));
+        "itself" => return Ok(recv.clone()),
+        // `freeze` records the receiver as frozen and returns it (Ruby freezes in
+        // place; immutability is not enforced here but `frozen?` reports it).
+        "freeze" => {
+            with_host(|h| h.freeze_value(recv));
+            return Ok(recv.clone());
         }
+        // `equal?` is object identity: true only for the very same object (same
+        // heap handle) or the same immediate value.
+        "equal?" => {
+            let same = match (recv, &args[0]) {
+                (Value::Obj(i), Value::Obj(j)) => i == j,
+                (Value::Int(i), Value::Int(j)) => i == j,
+                (Value::Float(i), Value::Float(j)) => i == j,
+                (Value::Bool(i), Value::Bool(j)) => i == j,
+                (Value::Undef, Value::Undef) => true,
+                _ => false,
+            };
+            return Ok(Value::Bool(same));
+        }
+        // `dup` makes a fresh shallow copy so mutating the copy does not leak back
+        // to the original; the copy is never frozen. `clone` also shallow-copies
+        // but preserves the frozen state of the original.
+        "dup" => return Ok(with_host(|h| h.dup_value(recv))),
+        "clone" => {
+            return Ok(with_host(|h| {
+                let copy = h.dup_value(recv);
+                if h.is_frozen(recv) {
+                    h.freeze_value(&copy);
+                }
+                copy
+            }));
+        }
+        // Immediates (Integer/Float/true/false/nil) and Symbols are always frozen
+        // in Ruby; a mutable reference type reports frozen only after `freeze`.
+        "frozen?" => return Ok(Value::Bool(with_host(|h| h.is_frozen(recv)))),
         "instance_variable_get" => {
             let raw = name_of(&args[0]);
             let key = raw.strip_prefix('@').unwrap_or(&raw);

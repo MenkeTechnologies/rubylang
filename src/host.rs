@@ -17,6 +17,7 @@
 use fusevm::{Chunk, NumOp, VMResult, Value, VM};
 use indexmap::IndexMap;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 /// A local-variable environment, shared (by `Rc`) between a frame and any block
@@ -285,6 +286,10 @@ pub struct RubyHost {
     /// method body / top level); `Some(scope)` = a captured scope while a block
     /// or lambda that captured it is running.
     active_scope: Option<Scope>,
+    /// Heap ids of objects that have been `freeze`d. Ruby's `freeze` records an
+    /// object as frozen (and `frozen?` reports it); immutability itself is not
+    /// enforced here, but the recorded flag is faithful to `Object#frozen?`.
+    frozen: HashSet<u32>,
 }
 
 thread_local! {
@@ -332,6 +337,25 @@ impl RubyHost {
             pending_exc: None,
             signal: None,
             active_scope: None,
+            frozen: HashSet::new(),
+        }
+    }
+
+    /// Record `v` as frozen (`Object#freeze`). Immediates and symbols are
+    /// already frozen, so only heap objects need tracking.
+    pub fn freeze_value(&mut self, v: &Value) {
+        if let Value::Obj(id) = v {
+            self.frozen.insert(*id);
+        }
+    }
+
+    /// Whether `v` is frozen (`Object#frozen?`). Immediates (Integer, Float,
+    /// true, false, nil) and interned Symbols are always frozen; a heap object
+    /// is frozen only once `freeze` has recorded it.
+    pub fn is_frozen(&self, v: &Value) -> bool {
+        match v {
+            Value::Obj(id) => self.as_symbol(v).is_some() || self.frozen.contains(id),
+            _ => true,
         }
     }
 
