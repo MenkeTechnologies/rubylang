@@ -13,7 +13,8 @@ Classes with `initialize`/`attr_*`/instance methods, single inheritance, `super`
 (bare-forwarding and explicit-args), method resolution through the ancestor chain
 (own → included modules → superclass), `self`, instance variables, method
 chaining; endless method definitions (`def square(x) = x * x`, including
-`def self.m(x) = …`); `module` + `include` mixins; class methods (`def self.m`); `begin`/
+`def self.m(x) = …`); `module` + `include` mixins; `extend`/`prepend`/`class << self`;
+class methods (`def self.m`); `begin`/
 `rescue`/`ensure`, method-body and statement-modifier `rescue`, `raise` with a
 message or an exception class, typed `ZeroDivisionError`/`NoMethodError`/
 `ArgumentError`; default arguments; splat parameters (`def f(a, *rest)`); `&:sym`
@@ -37,9 +38,17 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
 
 ## Language
 
-- **`extend` / `prepend` / `class << self`.** Only `include` and `def self.m` are
-  modeled; other mixin/singleton forms are not. `super` resolves through the
-  superclass chain (module-`super` ordering is approximate).
+- **`extend` / `prepend` / `class << self`.** `extend M` in a class/module body
+  mixes `M`'s instance methods in as class methods; `prepend M` inserts `M`
+  ahead of the class in the ancestor chain (so its methods override and `super`
+  reaches the class); `class << self … end` defs register as class methods, the
+  same as `def self.x`. `super` resolves through the receiver's linearized
+  `Module#ancestors` order, so module-`super` (from a prepended or included
+  module) reaches the next method correctly. Not modeled: runtime instance
+  `obj.extend(M)`, and `super` from inside a class method.
+- **Class-level instance variables** (`@n` inside a `def self.m` / an `extend`ed
+  method) do not persist across calls — the class object has no per-instance
+  variable store yet, so `@n ||= 0; @n += 1` restarts each call.
 - **Class-body statements** run at definition time with `self` bound to the
   class, so `def`, `attr_*`, `include`, class variables (`@@x = 0`), constants,
   and other executable statements all take effect. (Constants are stored
@@ -48,16 +57,17 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   parsed — the parser rejects `class`/`def`/`end`/etc. as a parameter name. A
   paren-less call *carrying* keyword args (`greet name: "x"`, `opts 9, **h`,
   `total *a`) does parse.
-- **Numeric literal / method binding.** `-7.abs` parses as `-(7.abs)` (operator
-  precedence) rather than `(-7).abs`; MRI treats `-7` as a literal. Use
-  `(-7).abs`.
-- **Expression-level modifier `rescue`.** `x = expr rescue fallback` binds the
-  rescue at statement level (`(x = expr) rescue fallback`) rather than MRI's
-  `x = (expr rescue fallback)`. A standalone `stmt rescue stmt` works.
+- **Modifier `rescue` inside call-args / array literals.** Numeric-literal
+  binding (`-7.abs` → `(-7).abs`, with `-2**2` → `-(2**2)`) and modifier
+  `rescue` precedence (`x = a rescue b` → `x = (a rescue b)`, plus grouping
+  parens and statement-level) both match MRI now. The one residual divergence:
+  MRI rejects a bare modifier `rescue` directly in method-call arguments
+  (`p(1/0 rescue 5)`) and array elements (`[1/0 rescue 5]`); this parser accepts
+  them (a permissive superset — no valid MRI program breaks).
 
 ## Lexer
 
-- **Not lexed:** `__END__`. Heredocs (`<<END`, `<<~SQL`, `<<-EOT`, `<<'RAW'`),
+- **Not lexed:** (nothing outstanding here). Heredocs (`<<END`, `<<~SQL`, `<<-EOT`, `<<'RAW'`),
   `%w[]` / `%i[]` word/symbol arrays (and the `()`/`{}`/`<>` delimiter variants),
   double-quoted `#{}` interpolation, `?c` character literals, regex literals
   (`/pat/flags`, with `i`/`m`/`x` flags), radix integer literals
@@ -67,11 +77,16 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   `[]`/`<>` nesting) **are** lexed. Double-quoted string escapes cover
   `\a\b\t\n\v\f\r\e\s\0\\\"\#`, `\xHH` (hex byte), and `\uHHHH`/`\u{H…}`
   (Unicode). `String#inspect` renders these Ruby-faithfully — named escapes,
-  `\uXXXX` (uppercase) for other control chars, and `\#` before `{`/`@`/`$`. Not
-  yet: the bare `%(…)` string form (its disambiguation from the modulo operator
-  is skipped; use `%Q(…)`), and an unknown escape like `"\d"` keeps its
-  backslash rather than dropping it as MRI does (deliberate, for regex-source
-  strings).
+  `\uXXXX` (uppercase) for other control chars, and `\#` before `{`/`@`/`$`. The
+  bare `%(…)` / `%{…}` / `%[…]` / `%<…>` string form is lexed (double-quoted,
+  like `%Q`); it reads as a string at an expression start or after a spaced bare
+  method name (`p %(x)`), and as the modulo operator after a value (`10 %(3)`,
+  `a % b`). A bare local variable that MRI would treat as modulo (`foo %(3)`
+  where `foo` is a local) is read as a string command arg here, since this lexer
+  has no local-variable table. `__END__` alone on a line stops the program (the
+  trailing DATA section is out of scope). Not yet: an unknown escape like `"\d"`
+  keeps its backslash rather than dropping it as MRI does (deliberate, for
+  regex-source strings).
 
 ## Runtime / methods
 
@@ -118,6 +133,10 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   allocates a `BigInt` heap object (backed by `num-bigint`). Arithmetic, bit
   ops, `**`, comparison, `to_s(base)`, `bit_length`, and `digits` all cross the
   boundary transparently.
+- **`Integer#pow(e, m)`.** Modular exponentiation for `e >= 0`. A negative
+  exponent with a modulus raises `RangeError` (`Integer#pow() 1st argument
+  cannot be negative when 2nd argument specified`), matching MRI — no modular
+  inverse is computed.
 - **Numeric conversions.** `Integer#to_r` / `Float#to_r` (the *exact* rational
   an f64 represents), `String#to_r` (leading `a/b` or decimal), `#to_c`
   (`(n+0i)`), and `Float#rationalize([eps])` (simplest rational within a
@@ -160,10 +179,15 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
 - **`Math` module.** `Math.sqrt`/`cbrt`/`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/
   `atan2`/`sinh`/`cosh`/`tanh`/`exp`/`log`(with optional base)/`log2`/`log10`/
   `hypot`/`ldexp` and the constants `Math::PI` / `Math::E` are implemented over
-  `f64`. `Math.gamma`/`erf` are not (they need approximations that would not
-  match MRI bit-for-bit). `Math.class` reports `Class` rather than `Module`
-  (modules aren't distinguished from classes yet).
-- **`rand`.** Seeded from the system clock (no `srand` determinism yet).
+  `f64`. `Math.gamma` (Lanczos) and `Math.erf`/`erfc` (Abramowitz-Stegun
+  7.1.26) are implemented approximately: gamma to ~1e-9, erf to ~1.5e-7. These
+  do NOT match MRI's libm output in the trailing digits, so they are excluded
+  from the parity corpus and tested only with a tolerance. `Math.class` reports
+  `Class` rather than `Module` (modules aren't distinguished from classes yet).
+- **`rand`.** Backed by a thread-local SplitMix64. `srand(seed)` reseeds it so
+  `rand`/`rand(n)` are reproducible within a run and returns the previous seed
+  (MRI semantics); the MRI-exact sequence and MRI's random startup seed are not
+  matched. `srand` with no argument reseeds from the system clock.
 - **Method surface.** The Enumerable/String/Hash/Range surface is broad but not
   exhaustive; an unimplemented method raises a `NoMethodError` whose message uses
   the Ruby-4.0 form — `undefined method '<name>' for an instance of <Class>` for
@@ -177,10 +201,14 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   covers, `Class` matches instances, `Regexp` matches a string) rather than
   `==`, so `case`/`when` over ranges and classes works.
 - **Pattern matching (`case/in`).** Array/hash/find-by-key patterns, class
-  patterns (`Integer`, `Point[...]`), variable/`_` binding, `=> name`, `^pin`,
-  `|` alternatives, `*rest` splats, and `if`/`unless` guards work. Not yet: the
-  two-sided find pattern (`[*, x, *]`), `**nil` exact-key enforcement, and
-  variable bindings *inside* an `|` alternative.
+  patterns (`Integer`, `Point[...]`), variable/`_` binding, `=> name` (chained
+  and binding a whole `|` alternation), `^pin`, `|` alternatives (a bare `|` in a
+  value pattern is alternation, not bitwise-or), `*rest` splats, the two-sided
+  find pattern (`[*, x, *]`), `**nil` exact-key enforcement, and `if`/`unless`
+  guards work. As in MRI, a variable binding inside an `|` branch is rejected
+  ("variable capture in alternative pattern"). Not yet: the `deconstruct` /
+  `deconstruct_keys` protocol on user objects (array and hash patterns test
+  `is_a?(Array)` / `is_a?(Hash)` directly), and binding a hash `**rest` name.
 
 ## Tooling
 

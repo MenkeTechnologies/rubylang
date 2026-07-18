@@ -663,6 +663,51 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     space: false,
                 });
             }
+            // Bare `%(…)` / `%{…}` / `%[…]` / `%<…>` — a double-quoted string
+            // (same as `%Q`). Only in value / command-argument position (see
+            // `percent_string_start`), so the binary modulo operator (`a % b`,
+            // `10 %(3)`, `v % 3`) is left to the operator arm. Requires the
+            // delimiter immediately after `%` (a space means modulo).
+            b'%' if i + 1 < b.len()
+                && matches!(b[i + 1], b'(' | b'{' | b'[' | b'<')
+                && percent_string_start(&out, sp) =>
+            {
+                let open = b[i + 1];
+                let close = match open {
+                    b'[' => b']',
+                    b'(' => b')',
+                    b'{' => b'}',
+                    _ => b'>',
+                };
+                i += 2;
+                let start = i;
+                let mut depth = 1u32;
+                while i < b.len() {
+                    if b[i] == b'\\' && i + 1 < b.len() {
+                        i += 2; // an escaped char is never a delimiter
+                        continue;
+                    }
+                    if b[i] == b'\n' {
+                        line += 1;
+                    }
+                    if b[i] == open && open != close {
+                        depth += 1;
+                    } else if b[i] == close {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                let body = src[start..i.min(b.len())].to_string();
+                i += 1; // consume the closing delimiter
+                out.push(Token {
+                    kind: Tok::Str(body, true),
+                    line,
+                    space: core::mem::take(&mut sp),
+                });
+            }
             // `?c` character literal → a one-char string. Only when `?` is at an
             // expression start (leading space) and directly followed by an escape
             // (`?\n`) or a lone alnum char (not `?ab`, and not the `? :` ternary).
@@ -737,6 +782,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     line,
                     space: core::mem::take(&mut sp),
                 });
+            }
+            // `__END__` alone on a line ends the program; everything after it is
+            // the DATA section (out of scope), so lexing stops here. Must sit at
+            // column 0 (start of file or right after a newline) and be the whole
+            // line (followed by EOF, `\n`, or `\r\n`).
+            b'_' if (i == 0 || b[i - 1] == b'\n')
+                && src[i..].starts_with("__END__")
+                && matches!(b.get(i + 7), None | Some(b'\n') | Some(b'\r')) =>
+            {
+                break;
             }
             _ if c.is_ascii_alphabetic() || c == b'_' => {
                 let start = i;
@@ -965,6 +1020,24 @@ const OP_SYMBOLS: &[&str] = &[
 /// The operator symbol beginning `s` (text right after `:`), or `None`.
 fn op_symbol_at(s: &str) -> Option<&'static str> {
     OP_SYMBOLS.iter().find(|op| s.starts_with(**op)).copied()
+}
+
+/// Whether a `%` here begins a `%(…)`-style double-quoted string rather than
+/// the modulo operator. True at an expression start (prev token is not a value),
+/// and — like a command-argument regex — after a bare method name (`p %(x)`,
+/// `puts %(x)`) with a leading space. After a literal value (number, string,
+/// `)`, `]`, ivar/gvar) it stays modulo. MRI additionally treats a bare *local
+/// variable* (`foo %(3)` where `foo` is assigned) as modulo via its
+/// local-variable table; this lexer has none, so a spaced identifier is always
+/// read as a command call (see BUGS.md for the edge cost).
+fn percent_string_start(out: &[Token], sp: bool) -> bool {
+    let prev = out.iter().rev().find(|t| t.kind != Tok::Newline);
+    match prev.map(|t| &t.kind) {
+        // Bare method name in command position: `p %(x)`.
+        Some(Tok::Ident(_)) | Some(Tok::Const(_)) => sp,
+        // Otherwise: string at an expression start, modulo after a value.
+        _ => !prev_is_value(out),
+    }
 }
 
 /// Whether the last significant token is a value (so a following `:op` is a

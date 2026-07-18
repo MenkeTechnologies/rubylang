@@ -3000,3 +3000,194 @@ fn no_panic_on_edge_inputs() {
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }
+
+// --- Fanout completion: numeric / Math -------------------------------------
+
+#[test]
+fn srand_makes_rand_reproducible() {
+    // Reseeding with the same value replays the sequence; srand returns the
+    // previous seed (MRI semantics), and rand(n) stays in range.
+    eq("srand(1); a = rand; srand(1); b = rand; a == b", "true");
+    eq("srand(5); srand(10)", "5");
+    eq("srand(42); r = rand(10); r >= 0 && r < 10", "true");
+}
+
+#[test]
+fn integer_pow_with_modulus() {
+    eq("3.pow(4, 5)", "1"); // 81 % 5
+    eq("2.pow(10, 1000)", "24"); // 1024 % 1000
+    // MRI raises RangeError for a negative exponent with a modulus (no inverse).
+    eq(
+        "begin; 3.pow(-1, 7); rescue RangeError; :raised; end",
+        ":raised",
+    );
+    eq(
+        "begin; 2.pow(-1, 4); rescue RangeError; :raised; end",
+        ":raised",
+    );
+}
+
+#[test]
+fn clamp_with_open_ranges() {
+    eq("15.clamp(..10)", "10");
+    eq("1.clamp(3..)", "3");
+    eq("5.clamp(3..10)", "5");
+    eq("5.clamp(..10)", "5");
+    eq("5.clamp(3..)", "5");
+}
+
+#[test]
+fn math_gamma_and_erf_approximate() {
+    // Approximations (Lanczos / Abramowitz-Stegun) don't match MRI's libm to
+    // the last bit, so assert within tolerance rather than exact inspect form.
+    eq("(Math.gamma(5) - 24.0).abs < 1e-6", "true");
+    eq("(Math.gamma(10) - 362880.0).abs < 1e-3", "true");
+    eq("(Math.erf(1.0) - 0.8427007929497148).abs < 1e-6", "true");
+    eq("(Math.erfc(1.0) - 0.15729920705028516).abs < 1e-6", "true");
+}
+
+// --- Fanout completion: lexer ----------------------------------------------
+
+#[test]
+fn bare_percent_string_literal() {
+    eq("%(hi)", "\"hi\"");
+    eq("%{a}", "\"a\"");
+    eq("%[a]", "\"a\"");
+    eq("%<a>", "\"a\"");
+    eq("x = %(a#{1 + 1}b); x", "\"a2b\"");
+    // After a value, `%` stays the modulo operator.
+    eq("10 %(3)", "1");
+    eq("v = 10; v % 3", "1");
+}
+
+#[test]
+fn end_marker_stops_the_program() {
+    // Everything after a line of `__END__` is the DATA section and is not lexed.
+    eq("1\n__END__\nboom(", "1");
+}
+
+// --- Fanout completion: parser (numeric-literal binding, modifier rescue) ---
+
+#[test]
+fn negative_literal_method_binding() {
+    eq("-7.abs", "7"); // (-7).abs, not -(7.abs)
+    eq("-2.abs", "2");
+    eq("-7.5.abs", "7.5");
+    eq("-3.5e2.abs", "350.0");
+    eq("-0xff.abs", "255");
+    eq("-2**2", "-4"); // ** binds tighter than the sign
+    eq("-2.abs**2", "4"); // fuse, method, then power
+    eq("-2**2.abs", "-4");
+    eq("(-7).abs", "7");
+    eq("1 - 2.abs", "-1"); // binary minus untouched
+    eq("-7 / 2", "-4");
+    eq("x = 5\n-x.abs", "-5"); // a variable stays -(x.abs)
+}
+
+#[test]
+fn modifier_rescue_binds_inside_assignment() {
+    eq("x = 1/0 rescue 99", "99"); // x = (1/0 rescue 99)
+    eq("x = 1/0 rescue 99\nx", "99");
+    eq("y = (1/0 rescue 5)\ny", "5"); // grouping-paren rescue parses
+    eq("1/0 rescue 42", "42"); // statement-level still works
+    eq("foo = 1 rescue 2\nfoo", "1"); // non-raising RHS unaffected
+}
+
+// --- Fanout completion: mixins (extend / prepend / class << self) ----------
+
+#[test]
+fn extend_adds_module_methods_as_class_methods() {
+    eq(
+        "module Greet; def hello; \"hi\"; end; end; \
+         class C; extend Greet; end; C.hello",
+        "\"hi\"",
+    );
+}
+
+#[test]
+fn prepend_overrides_and_super_reaches_class() {
+    eq(
+        "module Loud; def name; super.upcase; end; end; \
+         class C; prepend Loud; def name; \"bob\"; end; end; C.new.name",
+        "\"BOB\"",
+    );
+}
+
+#[test]
+fn prepend_and_include_super_chain() {
+    eq(
+        "module P; def who; \"P(\" + super + \")\"; end; end; \
+         module M; def who; \"M\"; end; end; \
+         class C; prepend P; include M; end; C.new.who",
+        "\"P(M)\"",
+    );
+    eq(
+        "module P; end; class C; prepend P; end; C.ancestors.map(&:to_s)",
+        "[\"P\", \"C\", \"Object\", \"Kernel\", \"BasicObject\"]",
+    );
+}
+
+#[test]
+fn prepend_super_reaches_superclass_method() {
+    eq(
+        "module P; def val; \"P>\" + super; end; end; \
+         class B; def val; \"B\"; end; end; \
+         class C < B; prepend P; end; C.new.val",
+        "\"P>B\"",
+    );
+}
+
+#[test]
+fn singleton_class_defs_are_class_methods() {
+    eq(
+        "class C; class << self; def build; \"b\"; end; def kind; \"k\"; end; end; end; \
+         C.build + C.kind",
+        "\"bk\"",
+    );
+    eq(
+        "class C; def self.a; \"A\"; end; class << self; def b; \"B\"; end; end; end; \
+         C.a + C.b",
+        "\"AB\"",
+    );
+}
+
+// --- Fanout completion: pattern matching (find pattern, **nil, alternation) -
+
+#[test]
+fn find_pattern_two_sided() {
+    eq("case [1, 2, 3, 4]; in [*, x, *]; x; end", "1");
+    eq(
+        "case [1, 2, 3, 4, 5]; in [*a, 3, *b]; [a, 3, b]; end",
+        "[[1, 2], 3, [4, 5]]",
+    );
+    eq("case [1, 2, 3, 4]; in [*, x, y, *]; [x, y]; end", "[1, 2]");
+    eq("case [1, 2, 2, 3]; in [*, 2 => x, *]; x; end", "2");
+    // Empty / too-short array does not match a find pattern.
+    assert!(ev("case []; in [*, x, *]; x; end").is_err());
+}
+
+#[test]
+fn hash_pattern_exact_key_enforcement() {
+    eq("case {a: 1}; in {a:, **nil}; a; end", "1");
+    eq(
+        "case {a: 1, b: 2}; in {a:, **nil}; :m; else; :no; end",
+        ":no",
+    );
+    eq("case {}; in {**nil}; :m; else; :no; end", ":m");
+    eq("case {a: 1}; in {}; :m; else; :no; end", ":no");
+    eq("case {}; in {}; :m; end", ":m");
+}
+
+#[test]
+fn alternation_binding_and_capture_rejection() {
+    // `=>` binds the whole alternation (looser than `|`).
+    eq("case 5; in Integer | Float => n; n; end", "5");
+    eq("case 2.5; in Integer | Float => n; n; end", "2.5");
+    eq("case 5; in 1 | Integer => n; n; end", "5");
+    // A bare `|` in a value pattern is alternation, not bitwise-or.
+    eq("case 2; in 1 | 2; :m; end", ":m");
+    // Chained `=>` binds the subject repeatedly.
+    eq("case 5; in Integer => a => b; [a, b]; end", "[5, 5]");
+    // Variable capture inside an alternation branch is rejected (MRI SyntaxError).
+    assert!(ev("case 5; in a | Integer; :x; end").is_err());
+}

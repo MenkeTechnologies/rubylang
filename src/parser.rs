@@ -45,6 +45,14 @@ impl Parser {
     fn cur_space(&self) -> bool {
         self.toks[self.pos].space
     }
+    /// Whether the current `-` is immediately followed (no intervening space) by
+    /// a numeric literal — Ruby's `tUMINUS_NUM` trigger for `-7.abs` → `(-7).abs`.
+    fn neg_num_adjacent(&self) -> bool {
+        match self.toks.get(self.pos + 1) {
+            Some(t) => !t.space && matches!(t.kind, Tok::Int(_) | Tok::Float(_)),
+            None => false,
+        }
+    }
     fn advance(&mut self) -> Tok {
         let t = self.toks[self.pos].kind.clone();
         if self.pos < self.toks.len() - 1 {
@@ -287,19 +295,42 @@ impl Parser {
             let e = self.low_kw()?;
             return Ok(Expr::Unary(UnOp::Not, Box::new(e)));
         }
-        let mut lhs = self.ternary()?;
+        let mut lhs = self.rescue_mod()?;
         loop {
             if self.eat_kw("and") {
-                let rhs = self.ternary()?;
+                let rhs = self.rescue_mod()?;
                 lhs = Expr::Binary(BinOp::And, Box::new(lhs), Box::new(rhs));
             } else if self.eat_kw("or") {
-                let rhs = self.ternary()?;
+                let rhs = self.rescue_mod()?;
                 lhs = Expr::Binary(BinOp::Or, Box::new(lhs), Box::new(rhs));
             } else {
                 break;
             }
         }
         Ok(lhs)
+    }
+
+    /// Modifier `rescue`: `expr rescue fallback` binds tighter than assignment
+    /// but looser than the ternary `?:`, so `x = a rescue b` parses as
+    /// `x = (a rescue b)`. Left-associative. A `rescue` that begins a fresh line
+    /// or statement (preceded by a newline / `;`) is a `begin`/`def` rescue
+    /// clause, not a modifier — `eat_kw` never crosses a terminator, so those are
+    /// left for the statement-level handler.
+    fn rescue_mod(&mut self) -> Result<Expr, String> {
+        let mut e = self.ternary()?;
+        while self.eat_kw("rescue") {
+            let handler = self.ternary()?;
+            e = Expr::Begin {
+                body: vec![e],
+                rescues: vec![Rescue {
+                    classes: vec![],
+                    binding: None,
+                    body: vec![handler],
+                }],
+                ensure: None,
+            };
+        }
+        Ok(e)
     }
 
     fn ternary(&mut self) -> Result<Expr, String> {
@@ -339,6 +370,38 @@ impl Parser {
                 None
             } else {
                 Some(Box::new(self.binary(0)?))
+            };
+            return Ok(Expr::Range {
+                lo: Some(Box::new(lo)),
+                hi,
+                exclusive,
+            });
+        }
+        Ok(lo)
+    }
+
+    /// A value/range pattern for `case/in`, parsed so a bare `|` stays the
+    /// alternation operator: binding power 6 excludes `|`/`^` (bp 5), so
+    /// `in 1 | Integer` is `Value(1) | Const(Integer)`, not `Value(1 | Integer)`.
+    fn pattern_value(&mut self) -> Result<Expr, String> {
+        if self.is_op("..") || self.is_op("...") {
+            let exclusive = self.is_op("...");
+            self.advance();
+            let hi = self.binary(6)?;
+            return Ok(Expr::Range {
+                lo: None,
+                hi: Some(Box::new(hi)),
+                exclusive,
+            });
+        }
+        let lo = self.binary(6)?;
+        if self.is_op("..") || self.is_op("...") {
+            let exclusive = self.is_op("...");
+            self.advance();
+            let hi = if self.range_end_follows() {
+                None
+            } else {
+                Some(Box::new(self.binary(6)?))
             };
             return Ok(Expr::Range {
                 lo: Some(Box::new(lo)),
@@ -392,7 +455,37 @@ impl Parser {
     }
 
     fn unary(&mut self) -> Result<Expr, String> {
-        if self.eat_op("-") {
+        if self.is_op("-") {
+            // Ruby's `tUMINUS_NUM`: a `-` written directly against a numeric
+            // literal (no space) fuses into a negative literal that then receives
+            // any method call — `-7.abs` is `(-7).abs`, not `-(7.abs)`. A spaced
+            // `- 7.abs` keeps the ordinary `-(7.abs)` reading.
+            if self.neg_num_adjacent() {
+                self.advance(); // consume '-'
+                // `**` binds tighter than the sign, so `-2**2` is `-(2**2)` and
+                // `-2**2.abs` is `-(2 ** 2.abs)`: the minus wraps the whole power
+                // instead of fusing into the literal. Detected by `**` sitting
+                // immediately after the number (before any `.method`).
+                if matches!(
+                    self.toks.get(self.pos + 1).map(|t| &t.kind),
+                    Some(Tok::Op(o)) if o == "**"
+                ) {
+                    let power = self.pow()?;
+                    return Ok(Expr::Unary(UnOp::Neg, Box::new(power)));
+                }
+                // Otherwise fuse `-N` into a negative literal, then apply the
+                // postfix chain and any trailing `**` on top, so `-2.abs**2` is
+                // `((-2).abs) ** 2`.
+                let lit = self.primary()?;
+                let base = Expr::Unary(UnOp::Neg, Box::new(lit));
+                let base = self.postfix_chain(base)?;
+                if self.eat_op("**") {
+                    let exp = self.unary()?;
+                    return Ok(Expr::Binary(BinOp::Pow, Box::new(base), Box::new(exp)));
+                }
+                return Ok(base);
+            }
+            self.advance(); // consume '-'
             return Ok(Expr::Unary(UnOp::Neg, Box::new(self.unary()?)));
         }
         if self.eat_op("!") {
@@ -419,7 +512,13 @@ impl Parser {
 
     /// Primary followed by any chain of `.method(args){block}`, `[index]`.
     fn postfix(&mut self) -> Result<Expr, String> {
-        let mut e = self.primary()?;
+        let e = self.primary()?;
+        self.postfix_chain(e)
+    }
+
+    /// Apply the postfix chain (`.method(args){block}`, `[index]`, `::Const`) to
+    /// an already-parsed base expression.
+    fn postfix_chain(&mut self, mut e: Expr) -> Result<Expr, String> {
         loop {
             let safe = self.is_op("&.");
             if self.eat_op(".") || self.eat_op("&.") {
@@ -1224,23 +1323,50 @@ impl Parser {
     /// A full pattern: alternatives joined by `|`, with an optional `=> name`
     /// binding of the whole match.
     fn parse_pattern(&mut self) -> Result<Pattern, String> {
-        let mut alts = vec![self.parse_pattern_binding()?];
+        // Alternation binds tighter than a trailing `=> name`, so `A | B => n`
+        // captures the whole alternative. A branch may not itself contain a
+        // binding (MRI: "variable capture in alternative pattern").
+        let mut alts = vec![self.parse_pattern_primary()?];
         while self.eat_op("|") {
-            alts.push(self.parse_pattern_binding()?);
+            alts.push(self.parse_pattern_primary()?);
         }
-        if alts.len() == 1 {
-            Ok(alts.pop().unwrap())
+        let mut p = if alts.len() == 1 {
+            alts.pop().unwrap()
         } else {
-            Ok(Pattern::Or(alts))
+            if alts.iter().any(Self::pattern_captures) {
+                return Err(format!(
+                    "line {}: variable capture in alternative pattern",
+                    self.line()
+                ));
+            }
+            Pattern::Or(alts)
+        };
+        // A trailing `=> name` (chainable) binds the whole pattern.
+        while self.eat_op("=>") {
+            p = Pattern::As(Box::new(p), self.ident_name()?);
         }
+        Ok(p)
     }
 
-    fn parse_pattern_binding(&mut self) -> Result<Pattern, String> {
-        let p = self.parse_pattern_primary()?;
-        if self.eat_op("=>") {
-            Ok(Pattern::As(Box::new(p), self.ident_name()?))
-        } else {
-            Ok(p)
+    /// Whether a pattern binds any variable — used to reject captures inside an
+    /// alternation branch, which MRI forbids.
+    fn pattern_captures(p: &Pattern) -> bool {
+        match p {
+            Pattern::Bind(n) => n != "_",
+            Pattern::As(..) | Pattern::Splat(Some(_)) => true,
+            Pattern::Splat(None) | Pattern::Value(_) | Pattern::Pin(_) => false,
+            Pattern::Const(_, None) => false,
+            Pattern::Const(_, Some(inner)) => Self::pattern_captures(inner),
+            Pattern::Array(elems) | Pattern::Or(elems) => {
+                elems.iter().any(Self::pattern_captures)
+            }
+            Pattern::Hash(pairs, rest) => {
+                matches!(rest, HashRest::Splat(Some(_)))
+                    || pairs.iter().any(|(_, sub)| match sub {
+                        None => true,
+                        Some(p) => Self::pattern_captures(p),
+                    })
+            }
         }
     }
 
@@ -1293,7 +1419,7 @@ impl Parser {
                 Ok(Pattern::Bind(n))
             }
             // Everything else is a literal / range value matched with `===`.
-            _ => Ok(Pattern::Value(self.range()?)),
+            _ => Ok(Pattern::Value(self.pattern_value()?)),
         }
     }
 
@@ -1317,17 +1443,24 @@ impl Parser {
 
     /// `key:`, `key: subpattern`, and a trailing `**rest`/`**nil`, until `}`.
     #[allow(clippy::type_complexity)]
-    fn parse_hash_pattern(&mut self) -> Result<(Vec<(String, Option<Pattern>)>, bool), String> {
+    fn parse_hash_pattern(
+        &mut self,
+    ) -> Result<(Vec<(String, Option<Pattern>)>, HashRest), String> {
         let mut pairs = Vec::new();
-        let mut rest = false;
+        let mut rest = HashRest::None;
         self.skip_terms();
         while !self.is_op("}") {
             if self.eat_op("**") {
-                // `**rest` / `**nil` — both just mean "allow other keys".
-                if matches!(self.peek(), Tok::Ident(_)) || self.is_kw("nil") {
+                // `**nil` forbids other keys; `**` / `**name` allows them.
+                if self.is_kw("nil") {
                     self.advance();
+                    rest = HashRest::Nil;
+                } else if let Tok::Ident(n) = self.peek().clone() {
+                    self.advance();
+                    rest = HashRest::Splat(Some(n));
+                } else {
+                    rest = HashRest::Splat(None);
                 }
-                rest = true;
             } else {
                 let key = match self.advance() {
                     Tok::Ident(k) | Tok::Const(k) => k,
@@ -1359,6 +1492,16 @@ impl Parser {
 
     fn class_expr(&mut self) -> Result<Expr, String> {
         self.advance(); // class
+        // `class << self … end` — a singleton-class body (`<<` lexes as the
+        // left-shift op here: the char after it is a space, not a heredoc
+        // marker). Only the `self` receiver is supported.
+        if self.is_op("<<") {
+            self.advance(); // <<
+            self.expect_kw("self")?;
+            let body = self.body_until(&["end"])?;
+            self.expect_kw("end")?;
+            return Ok(Expr::SingletonClass(body));
+        }
         let name = match self.advance() {
             Tok::Const(s) => s,
             other => {

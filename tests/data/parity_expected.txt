@@ -636,3 +636,37 @@ method
 {"key\t1" => "val\e2"}
 "field1\u001Ffield2\u001Efield3"
 ["field1", "field2\u001Efield3"]
+#==#
+7
+2
+-4
+4
+99
+42
+#==#
+hi 2
+braces
+brackets
+1
+1
+#==#
+hi
+QUIET
+built
+#==#
+P(M)
+["P", "C", "M", "Object", "Kernel", "BasicObject"]
+#==#
+[[1, 2], 3, [4, 5]]
+1
+open
+5
+alt
+#==#
+1
+24
+10
+3
+5
+true
+range error

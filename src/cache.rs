@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 /// Bump on any incompatible change to `CProg` / the lowering.
-const SCHEMA: u64 = 1;
+const SCHEMA: u64 = 2;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
@@ -44,11 +44,13 @@ type CMethod = (
     Option<String>,
     Chunk,
 );
-/// (name, superclass, methods, includes, class methods) — a serde-flat class.
+/// (name, superclass, methods, includes, prepends, extends, class methods).
 type CClass = (
     String,
     Option<String>,
     Vec<CMethod>,
+    Vec<String>,
+    Vec<String>,
     Vec<String>,
     Vec<CMethod>,
 );
@@ -161,6 +163,8 @@ fn to_cprog(prog: &Program) -> CProg {
                     c.superclass.clone(),
                     methods,
                     c.includes.clone(),
+                    c.prepends.clone(),
+                    c.extends.clone(),
                     class_methods,
                 )
             })
@@ -192,19 +196,23 @@ fn from_cprog(cp: CProg) -> Program {
         classes: cp
             .classes
             .into_iter()
-            .map(|(n, superclass, methods, includes, class_methods)| {
-                let methods = methods.into_iter().map(m_from).collect();
-                let class_methods = class_methods.into_iter().map(m_from).collect();
-                (
-                    n,
-                    ClassDef {
-                        superclass,
-                        methods,
-                        includes,
-                        class_methods,
-                    },
-                )
-            })
+            .map(
+                |(n, superclass, methods, includes, prepends, extends, class_methods)| {
+                    let methods = methods.into_iter().map(m_from).collect();
+                    let class_methods = class_methods.into_iter().map(m_from).collect();
+                    (
+                        n,
+                        ClassDef {
+                            superclass,
+                            methods,
+                            includes,
+                            prepends,
+                            extends,
+                            class_methods,
+                        },
+                    )
+                },
+            )
             .collect(),
         begins: cp
             .begins

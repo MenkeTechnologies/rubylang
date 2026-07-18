@@ -1093,6 +1093,9 @@ fn dispatch_classref(
             "log10" => Some(x().log10()),
             "hypot" => Some(x().hypot(y())),
             "ldexp" => Some(x() * 2f64.powi(as_i(&args[1]) as i32)),
+            "gamma" => Some(math_gamma(x())),
+            "erf" => Some(math_erf(x())),
+            "erfc" => Some(1.0 - math_erf(x())),
             _ => None,
         };
         if let Some(v) = f {
@@ -1628,7 +1631,9 @@ fn now_epoch_secs() -> f64 {
 /// Resolve the `(lo, hi)` bounds for a numeric `clamp`, accepting either the
 /// two-argument form `clamp(lo, hi)` or the single-`Range` form `clamp(1..5)`.
 /// An exclusive range is rejected, matching Ruby's `Comparable#clamp`.
-fn clamp_bounds(args: &[Value]) -> Result<(Value, Value), String> {
+/// Resolve clamp bounds. Either side is `None` for a beginless/endless range
+/// (`5.clamp(..10)`, `5.clamp(3..)`), decoded from the range sentinels.
+fn clamp_bounds(args: &[Value]) -> Result<(Option<Value>, Option<Value>), String> {
     if args.len() == 1 {
         if let Some((lo, hi, exclusive)) = with_host(|h| h.as_range(&args[0])) {
             if exclusive {
@@ -1637,11 +1642,13 @@ fn clamp_bounds(args: &[Value]) -> Result<(Value, Value), String> {
                     "cannot clamp with an exclusive range",
                 ));
             }
-            return Ok((Value::Int(lo), Value::Int(hi)));
+            let lo = (lo != crate::host::RANGE_BEGINLESS).then_some(Value::Int(lo));
+            let hi = (hi != crate::host::RANGE_ENDLESS).then_some(Value::Int(hi));
+            return Ok((lo, hi));
         }
         return Err(raise_exc("TypeError", "wrong argument type"));
     }
-    Ok((args[0].clone(), args[1].clone()))
+    Ok((Some(args[0].clone()), Some(args[1].clone())))
 }
 
 // ---- Integer / Float ------------------------------------------------------
@@ -1772,8 +1779,12 @@ fn dispatch_number(
                     if *exp >= 0 {
                         return Ok(Value::Int(mod_pow(*base, *exp, *m)));
                     }
-                    // TODO: negative exponent needs a modular inverse (gcd == 1);
-                    // not yet implemented, fall through to the plain-pow path.
+                    // MRI rejects a negative exponent when a modulus is given
+                    // (it does not compute a modular inverse).
+                    return Err(raise_exc(
+                        "RangeError",
+                        "Integer#pow() 1st argument cannot be negative when 2nd argument specified",
+                    ));
                 }
             }
             // Integer ** non-negative Integer stays an exact Integer (promoting
@@ -2098,19 +2109,22 @@ fn dispatch_number(
         "clamp" => {
             // Ruby returns the receiver when in range, otherwise the bound
             // itself (preserving its type, so `(-2.7).clamp(-1.0, 1.0)` is a Float).
-            // Accepts `clamp(lo, hi)` or `clamp(range)`; an exclusive range is
-            // rejected exactly like `Comparable#clamp`.
-            // TODO: beginless/endless ranges (`clamp(3..)`) aren't representable
-            // as a `Range` in rubylang yet, so single-sided clamps are unhandled.
+            // Accepts `clamp(lo, hi)` or `clamp(range)`; a beginless/endless range
+            // clamps only one side. An exclusive range is rejected like
+            // `Comparable#clamp`.
             let (lo, hi) = clamp_bounds(args)?;
             let x = as_f(recv);
-            if x < as_f(&lo) {
-                Ok(lo)
-            } else if x > as_f(&hi) {
-                Ok(hi)
-            } else {
-                Ok(recv.clone())
+            if let Some(lo) = &lo {
+                if x < as_f(lo) {
+                    return Ok(lo.clone());
+                }
             }
+            if let Some(hi) = &hi {
+                if x > as_f(hi) {
+                    return Ok(hi.clone());
+                }
+            }
+            Ok(recv.clone())
         }
         "<=>" => {
             let (x, y) = (as_f(recv), as_f(&args[0]));
@@ -2315,6 +2329,48 @@ fn mod_pow(base: i64, exp: i64, m: i64) -> i64 {
         }
     }
     r as i64
+}
+
+/// Gamma function via the Lanczos approximation (g=7, n=9) with the reflection
+/// formula for x < 0.5. Accurate to ~1e-9 on the tested domain; does NOT match
+/// MRI's libm gamma bit-for-bit (excluded from the parity corpus).
+fn math_gamma(x: f64) -> f64 {
+    const G: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.5203681218851,
+        -1259.1392167224028,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507343278686905,
+        -0.13857109526572012,
+        9.984_369_578_019_572e-6,
+        1.5056327351493116e-7,
+    ];
+    if x < 0.5 {
+        std::f64::consts::PI / ((std::f64::consts::PI * x).sin() * math_gamma(1.0 - x))
+    } else {
+        let x = x - 1.0;
+        let t = x + 7.5;
+        let mut a = G[0];
+        for (i, g) in G.iter().enumerate().skip(1) {
+            a += g / (x + i as f64);
+        }
+        (2.0 * std::f64::consts::PI).sqrt() * t.powf(x + 0.5) * (-t).exp() * a
+    }
+}
+
+/// Error function via Abramowitz & Stegun 7.1.26 (max abs error ~1.5e-7). Does
+/// NOT match MRI's libm erf bit-for-bit (excluded from the parity corpus).
+fn math_erf(x: f64) -> f64 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let y = 1.0
+        - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t
+            + 0.254829592)
+            * t)
+            * (-x * x).exp();
+    sign * y
 }
 
 // ---- String ---------------------------------------------------------------
@@ -6726,7 +6782,17 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             Err(message)
         }
         "rand" => Ok(kernel_rand(args)),
-        "srand" | "sleep" => Ok(Value::Int(0)),
+        "sleep" => Ok(Value::Int(0)),
+        "srand" => {
+            let seed = match args.first() {
+                Some(Value::Int(n)) => *n,
+                _ => std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0),
+            };
+            Ok(Value::Int(rng_srand(seed)))
+        }
         "Integer" => {
             // `Integer(str, base=0)` / `Integer(numeric)`. A base is only valid
             // for a string receiver; auto-detect (base 0) honours radix prefixes
@@ -6933,20 +6999,36 @@ fn puts_one(v: &Value) {
     }
 }
 
-fn kernel_rand(args: &[Value]) -> Value {
-    // Deterministic-free RNG is out of scope; use a cheap counter-free splitmix
-    // seeded from the OS time so scripts that call rand get varied values.
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let mut z = seed.wrapping_add(0x9E3779B97F4A7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+thread_local! {
+    // SplitMix64 state driving `rand`, plus the last seed `srand` returns.
+    static RNG_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0x2545F4914F6CDD1D) };
+    static RNG_SEED: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Advance the thread-local SplitMix64 state and return the next 64-bit word.
+fn rng_next() -> u64 {
+    let z = RNG_STATE.with(|c| {
+        let z = c.get().wrapping_add(0x9E3779B97F4A7C15);
+        c.set(z);
+        z
+    });
+    let mut z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^= z >> 31;
+    z ^ (z >> 31)
+}
+
+/// Reseed the PRNG from `seed`; return the PREVIOUS seed (MRI `srand` semantics).
+fn rng_srand(seed: i64) -> i64 {
+    RNG_STATE.with(|c| c.set(seed as u64));
+    RNG_SEED.with(|c| c.replace(seed))
+}
+
+fn kernel_rand(args: &[Value]) -> Value {
+    let z = rng_next();
     match args.first() {
         Some(Value::Int(n)) if *n > 0 => Value::Int((z % (*n as u64)) as i64),
-        _ => Value::Float((z as f64 / u64::MAX as f64).abs()),
+        // Top 53 bits give a uniform double in [0, 1), like Ruby's `rand`.
+        _ => Value::Float((z >> 11) as f64 / (1u64 << 53) as f64),
     }
 }
 

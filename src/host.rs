@@ -333,12 +333,16 @@ pub enum ProcKind {
 
 /// A user-defined class: its optional superclass, its instance methods, the
 /// modules it `include`s (searched after own methods, before the superclass),
-/// and its class methods (`def self.m`).
+/// the modules it `prepend`s (searched BEFORE own methods), the modules it
+/// `extend`s (their instance methods become class methods), and its class
+/// methods (`def self.m`).
 #[derive(Clone, Default)]
 pub struct ClassDef {
     pub superclass: Option<String>,
     pub methods: IndexMap<String, MethodDef>,
     pub includes: Vec<String>,
+    pub prepends: Vec<String>,
+    pub extends: Vec<String>,
     pub class_methods: IndexMap<String, MethodDef>,
 }
 
@@ -1521,6 +1525,12 @@ impl RubyHost {
                     let mut out = Vec::new();
                     let mut cur = Some(name.to_string());
                     while let Some(n) = cur {
+                        // Prepended modules precede the class in the chain.
+                        if let Some(def) = self.classes.get(&n) {
+                            for m in def.prepends.iter().rev() {
+                                out.push(m.clone());
+                            }
+                        }
                         out.push(n.clone());
                         match self.classes.get(&n) {
                             Some(def) => {
@@ -1636,6 +1646,15 @@ impl RubyHost {
         let mut cur = Some(class.to_string());
         while let Some(name) = cur {
             let def = self.classes.get(&name)?;
+            // Prepended modules sit ahead of the class's own methods (last
+            // prepend wins, matching Ruby's reverse-order ancestor insertion).
+            for module in def.prepends.iter().rev() {
+                if let Some(md) = self.classes.get(module) {
+                    if let Some(m) = md.methods.get(method) {
+                        return Some((m.clone(), module.clone()));
+                    }
+                }
+            }
             if let Some(m) = def.methods.get(method) {
                 return Some((m.clone(), name.clone()));
             }
@@ -1656,11 +1675,31 @@ impl RubyHost {
     pub fn find_method(&self, class: &str, method: &str) -> Option<MethodDef> {
         self.find_method_owner(class, method).map(|(m, _)| m)
     }
-    /// Resolve a `super` call: find `method` in the ancestors *above* `def_class`
-    /// (its superclass chain), returning the method and its owner.
-    pub fn find_super(&self, def_class: &str, method: &str) -> Option<(MethodDef, String)> {
-        let sup = self.classes.get(def_class)?.superclass.clone()?;
-        self.find_method_owner(&sup, method)
+    /// Resolve a `super` call: find `method` in the receiver's linearized
+    /// ancestry *after* the position of `def_class` (the current method's
+    /// owner). Walking the receiver's full ancestry — not just `def_class`'s
+    /// superclass — is what makes `prepend`/`include` super reach the class
+    /// method that follows in `Module#ancestors` order.
+    pub fn find_super(
+        &self,
+        recv_class: &str,
+        def_class: &str,
+        method: &str,
+    ) -> Option<(MethodDef, String)> {
+        let anc = self.class_ancestry(recv_class);
+        let start = anc
+            .iter()
+            .position(|c| c == def_class)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        for name in anc.iter().skip(start) {
+            if let Some(def) = self.classes.get(name) {
+                if let Some(m) = def.methods.get(method) {
+                    return Some((m.clone(), name.clone()));
+                }
+            }
+        }
+        None
     }
     /// A class method (`def self.m`), walking the superclass chain.
     pub fn find_class_method(&self, class: &str, method: &str) -> Option<MethodDef> {
@@ -1669,6 +1708,15 @@ impl RubyHost {
             let def = self.classes.get(&name)?;
             if let Some(m) = def.class_methods.get(method) {
                 return Some(m.clone());
+            }
+            // `extend M` adds M's *instance* methods as class methods, after
+            // the class's own `def self.m` (last extend wins).
+            for module in def.extends.iter().rev() {
+                if let Some(md) = self.classes.get(module) {
+                    if let Some(m) = md.methods.get(method) {
+                        return Some(m.clone());
+                    }
+                }
             }
             cur = def.superclass.clone();
         }
@@ -2759,7 +2807,12 @@ pub fn call_super(explicit_args: Option<Vec<Value>>) -> Result<Value, String> {
     let (Some(method), Some(def_class)) = (method, def_class) else {
         return Err("super called outside of a method".to_string());
     };
-    let Some((def, owner)) = with_host(|h| h.find_super(&def_class, &method)) else {
+    // Linearize from the receiver's actual class so prepend/include super hits
+    // the next method in ancestry order; class-method super (self_obj is a class
+    // ref, no object class) falls back to the owner's chain.
+    let recv_class =
+        with_host(|h| h.object_class(&self_obj)).unwrap_or_else(|| def_class.clone());
+    let Some((def, owner)) = with_host(|h| h.find_super(&recv_class, &def_class, &method)) else {
         return Err(format!("super: no superclass method '{method}'"));
     };
     let args = explicit_args.unwrap_or(cur_args);

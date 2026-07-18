@@ -195,6 +195,9 @@ pub enum Expr {
     Lambda(Block),
     /// A regex literal `/pattern/flags`.
     Regex(String, String),
+    /// `class << self … end` — a singleton-class body. Its `def`s become class
+    /// (singleton) methods of the enclosing class, equivalent to `def self.x`.
+    SingletonClass(Vec<Expr>),
 }
 
 /// One `in pattern [if/unless guard]` clause of a `case/in`.
@@ -220,8 +223,9 @@ pub enum Pattern {
     /// `[p0, p1, *rest, pk]`.
     Array(Vec<Pattern>),
     /// `{key: subpattern, key2:, **rest}` — a `None` subpattern is the `key:`
-    /// shorthand that binds `key`. `bool` = whether a `**rest`/`**` is present.
-    Hash(Vec<(String, Option<Pattern>)>, bool),
+    /// shorthand that binds `key`. The [`HashRest`] records the trailing
+    /// `**rest` / `**` / `**nil` (or its absence).
+    Hash(Vec<(String, Option<Pattern>)>, HashRest),
     /// A class match (`in Integer`); the optional inner pattern is `Const[...]` /
     /// `Const(...)` deconstruction.
     Const(String, Option<Box<Pattern>>),
@@ -229,6 +233,18 @@ pub enum Pattern {
     As(Box<Pattern>, String),
     /// `p1 | p2 | …` — alternative patterns.
     Or(Vec<Pattern>),
+}
+
+/// The trailing double-splat of a hash pattern.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HashRest {
+    /// No `**` at all. Closed (no other keys) only when the pattern is empty
+    /// (`{}`); otherwise extra keys are allowed.
+    None,
+    /// `**` or `**name` — other keys are allowed (and would collect into `name`).
+    Splat(Option<String>),
+    /// `**nil` — no keys other than those listed may be present.
+    Nil,
 }
 
 /// One segment of an interpolated string.

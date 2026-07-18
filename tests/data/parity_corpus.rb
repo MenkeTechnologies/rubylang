@@ -1111,3 +1111,106 @@ puts({"key\t1" => "val\e2"}.inspect)
 data = "field1\x1ffield2\x1efield3"
 puts data.inspect
 puts data.split("\x1f").inspect
+#==#
+puts(-7.abs)
+puts(-2.abs)
+puts(-2**2)
+puts(-2.abs**2)
+x = 1/0 rescue 99
+puts x
+puts((1/0 rescue 42))
+#==#
+puts %(hi #{1 + 1})
+puts %{braces}
+puts %[brackets]
+v = 10
+puts v % 3
+puts 1
+__END__
+this is data, ignored
+#==#
+module Greet
+  def hello
+    "hi"
+  end
+end
+class C
+  extend Greet
+end
+puts C.hello
+module Loud
+  def shout
+    super.upcase
+  end
+end
+class D
+  prepend Loud
+  def shout
+    "quiet"
+  end
+end
+puts D.new.shout
+class E
+  class << self
+    def build
+      "built"
+    end
+  end
+end
+puts E.build
+#==#
+module P
+  def who
+    "P(" + super + ")"
+  end
+end
+module M
+  def who
+    "M"
+  end
+end
+class C
+  prepend P
+  include M
+end
+puts C.new.who
+puts C.ancestors.map(&:to_s).inspect
+#==#
+case [1, 2, 3, 4, 5]
+in [*a, 3, *b]
+  puts [a, 3, b].inspect
+end
+case {a: 1}
+in {a:, **nil}
+  puts a
+end
+case {a: 1, b: 2}
+in {a:, **nil}
+  puts "closed"
+else
+  puts "open"
+end
+case 5
+in Integer | Float => n
+  puts n
+end
+case 2
+in 1 | 2
+  puts "alt"
+end
+#==#
+puts 3.pow(4, 5)
+puts 2.pow(10, 1000)
+puts 15.clamp(..10)
+puts 1.clamp(3..)
+puts 5.clamp(3..10)
+srand(1)
+a = rand
+srand(1)
+b = rand
+puts a == b
+begin
+  3.pow(-1, 7)
+rescue RangeError
+  puts "range error"
+end

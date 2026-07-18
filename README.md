@@ -207,8 +207,10 @@ method-intercept registry, and the LSP server are all in the tree.
 The DAP adapter is partial (handshake + run-to-completion; stepping pending).
 Regex literals (`/pat/flags`), `=~`/`!~`, `String#{match,scan,match?,sub,gsub}`
 with `Regexp`, `MatchData`, and arbitrary-precision `Integer` (auto-promotion on
-overflow) are supported. `extend` / `prepend` are planned. See
-[`BUGS.md`](BUGS.md) for the full known-gaps list.
+overflow) are supported. `extend` / `prepend` / `class << self`, the full
+`case/in` pattern surface (two-sided find patterns, `**nil` exact-key matching,
+alternation binding), bare `%(…)` strings, and `__END__` are all implemented.
+See [`BUGS.md`](BUGS.md) for the full known-gaps list.
 
 ---
 

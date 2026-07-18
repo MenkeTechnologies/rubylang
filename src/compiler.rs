@@ -276,6 +276,11 @@ impl Compiler {
                 body,
             } => self.compile_class(b, name, superclass, body)?,
             Expr::Module { name, body } => self.compile_class(b, name, &None, body)?,
+            // A top-level `class << self` (singleton of `main`) is unsupported;
+            // it evaluates to nil rather than aborting compilation.
+            Expr::SingletonClass(_) => {
+                b.emit(Op::LoadUndef, 0);
+            }
             Expr::SelfExpr => {
                 b.emit(Op::CallBuiltin(ops::GETSELF, 0), 0);
             }
@@ -945,6 +950,8 @@ impl Compiler {
         let mut methods: indexmap::IndexMap<String, MethodDef> = indexmap::IndexMap::new();
         let mut class_methods: indexmap::IndexMap<String, MethodDef> = indexmap::IndexMap::new();
         let mut includes: Vec<String> = Vec::new();
+        let mut prepends: Vec<String> = Vec::new();
+        let mut extends: Vec<String> = Vec::new();
         // Class-body statements that aren't defs/attrs/includes (e.g. `@@x = 0`,
         // constant assignments) run at class-definition time with `self` bound to
         // the class.
@@ -994,6 +1001,45 @@ impl Compiler {
                         }
                     }
                 }
+                // `prepend ModuleName` — record a module that precedes the class.
+                Expr::Call {
+                    recv: None,
+                    name: m,
+                    args,
+                    ..
+                } if m == "prepend" => {
+                    for a in args {
+                        if let Expr::Var(VarKind::Const, module) = a {
+                            prepends.push(module.clone());
+                        }
+                    }
+                }
+                // `extend ModuleName` — mix the module's instance methods in as
+                // class methods.
+                Expr::Call {
+                    recv: None,
+                    name: m,
+                    args,
+                    ..
+                } if m == "extend" => {
+                    for a in args {
+                        if let Expr::Var(VarKind::Const, module) = a {
+                            extends.push(module.clone());
+                        }
+                    }
+                }
+                // `class << self … end` — its `def`s are class (singleton)
+                // methods, the same as `def self.x`.
+                Expr::SingletonClass(inner) => {
+                    for s in inner {
+                        if let Expr::Def {
+                            name, params, body, ..
+                        } = s
+                        {
+                            class_methods.insert(name.clone(), self.compile_method(params, body)?);
+                        }
+                    }
+                }
                 other => init_body.push(other.clone()),
             }
         }
@@ -1011,6 +1057,8 @@ impl Compiler {
                 superclass: superclass.clone(),
                 methods,
                 includes,
+                prepends,
+                extends,
                 class_methods,
             },
         ));
@@ -1224,6 +1272,22 @@ fn pindex(subj: &Expr, i: i64) -> Expr {
     Expr::Index(Box::new(subj.clone()), vec![Expr::Int(i)])
 }
 
+/// `subj[idx]` with a runtime index expression.
+fn pindex_expr(subj: &Expr, idx: Expr) -> Expr {
+    Expr::Index(Box::new(subj.clone()), vec![idx])
+}
+
+/// `e + n` / `e - n` as fusevm arithmetic.
+fn padd(e: Expr, n: i64) -> Expr {
+    Expr::Binary(BinOp::Add, Box::new(e), Box::new(Expr::Int(n)))
+}
+fn psub(e: Expr, n: i64) -> Expr {
+    Expr::Binary(BinOp::Sub, Box::new(e), Box::new(Expr::Int(n)))
+}
+
+/// Unique-name source for find-pattern scan temporaries.
+static FIND_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Lower a pattern against a subject expression into `(test, bindings)`: a
 /// boolean test expression, and the assignments to run when the shape matches
 /// (before any guard). Bindings are plain `Expr::Assign`s to local variables.
@@ -1283,11 +1347,22 @@ fn lower_pattern(pat: &Pattern, subj: &Expr) -> (Expr, Vec<Expr>) {
         }
         Pattern::Splat(_) => (Expr::True, vec![]), // handled inside Array
         Pattern::Array(elems) => lower_array_pattern(elems, subj),
-        Pattern::Hash(pairs, _rest) => lower_hash_pattern(pairs, subj),
+        Pattern::Hash(pairs, rest) => lower_hash_pattern(pairs, rest, subj),
     }
 }
 
 fn lower_array_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
+    // Two-sided find pattern `[*pre, mid…, *post]`: leading and trailing splats
+    // with ≥1 non-splat between them and no other splats.
+    if elems.len() >= 3
+        && matches!(elems.first(), Some(Pattern::Splat(_)))
+        && matches!(elems.last(), Some(Pattern::Splat(_)))
+        && !elems[1..elems.len() - 1]
+            .iter()
+            .any(|p| matches!(p, Pattern::Splat(_)))
+    {
+        return lower_find_pattern(elems, subj);
+    }
     let is_arr = pcall(
         subj.clone(),
         "is_a?",
@@ -1360,7 +1435,99 @@ fn lower_array_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
     (test, binds)
 }
 
-fn lower_hash_pattern(pairs: &[(String, Option<Pattern>)], subj: &Expr) -> (Expr, Vec<Expr>) {
+/// Lower a two-sided find pattern `[*pre, mid…, *post]`. Scan for the first
+/// start index where every middle pattern matches, then bind `pre`/`post` to
+/// the surrounding slices and re-run the middle bindings at that index.
+fn lower_find_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
+    let pre = &elems[0];
+    let post = &elems[elems.len() - 1];
+    let mids = &elems[1..elems.len() - 1];
+    let k = mids.len() as i64;
+
+    let uid = FIND_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let idx = Expr::Var(VarKind::Local, format!("__find_i{uid}__"));
+    let s_name = format!("__find_s{uid}__");
+    let s = Expr::Var(VarKind::Local, s_name.clone());
+    let len = || pcall(subj.clone(), "length", vec![]);
+
+    // Predicate over a candidate start `s`: every middle matches at `subj[s+j]`.
+    let pred = mids
+        .iter()
+        .enumerate()
+        .map(|(j, m)| lower_pattern(m, &pindex_expr(subj, padd(s.clone(), j as i64))).0)
+        .reduce(pand)
+        .unwrap_or(Expr::True);
+
+    // idx = nil
+    // (0..(len - k)).each { |s| idx = s if idx.nil? && pred }
+    // idx != nil
+    let scan = Expr::If {
+        cond: Box::new(pand(pcall(idx.clone(), "nil?", vec![]), pred)),
+        then: vec![Expr::Assign(Box::new(idx.clone()), Box::new(s.clone()))],
+        elifs: vec![],
+        els: None,
+    };
+    let range = Expr::Range {
+        lo: Some(Box::new(Expr::Int(0))),
+        hi: Some(Box::new(psub(len(), k))),
+        exclusive: false,
+    };
+    let each = Expr::Call {
+        recv: Some(Box::new(range)),
+        name: "each".into(),
+        args: vec![],
+        block: Some(Block {
+            params: vec![s_name],
+            splat: None,
+            body: vec![scan],
+        }),
+    };
+    let found = Expr::Begin {
+        body: vec![
+            Expr::Assign(Box::new(idx.clone()), Box::new(Expr::Nil)),
+            each,
+            Expr::Binary(BinOp::Ne, Box::new(idx.clone()), Box::new(Expr::Nil)),
+        ],
+        rescues: vec![],
+        ensure: None,
+    };
+    let is_arr = pcall(
+        subj.clone(),
+        "is_a?",
+        vec![Expr::Var(VarKind::Const, "Array".into())],
+    );
+    let test = pand(is_arr, found);
+
+    // Bindings run once `idx` holds the first matching start position.
+    let mut binds = Vec::new();
+    if let Pattern::Splat(Some(name)) = pre {
+        binds.push(Expr::Assign(
+            Box::new(Expr::Var(VarKind::Local, name.clone())),
+            Box::new(Expr::Index(
+                Box::new(subj.clone()),
+                vec![Expr::Int(0), idx.clone()],
+            )),
+        ));
+    }
+    for (j, m) in mids.iter().enumerate() {
+        binds.extend(lower_pattern(m, &pindex_expr(subj, padd(idx.clone(), j as i64))).1);
+    }
+    if let Pattern::Splat(Some(name)) = post {
+        let start = padd(idx.clone(), k);
+        let count = Expr::Binary(BinOp::Sub, Box::new(len()), Box::new(start.clone()));
+        binds.push(Expr::Assign(
+            Box::new(Expr::Var(VarKind::Local, name.clone())),
+            Box::new(Expr::Index(Box::new(subj.clone()), vec![start, count])),
+        ));
+    }
+    (test, binds)
+}
+
+fn lower_hash_pattern(
+    pairs: &[(String, Option<Pattern>)],
+    rest: &HashRest,
+    subj: &Expr,
+) -> (Expr, Vec<Expr>) {
     let mut test = pcall(
         subj.clone(),
         "is_a?",
@@ -1384,6 +1551,20 @@ fn lower_hash_pattern(pairs: &[(String, Option<Pattern>)], subj: &Expr) -> (Expr
                 binds.extend(bs);
             }
         }
+    }
+    // `**nil` (or a bare `{}`) forbids any other keys: the subject must contain
+    // exactly the listed keys.
+    let exact = matches!(rest, HashRest::Nil)
+        || (matches!(rest, HashRest::None) && pairs.is_empty());
+    if exact {
+        test = pand(
+            test,
+            Expr::Binary(
+                BinOp::Eq,
+                Box::new(pcall(subj.clone(), "length", vec![])),
+                Box::new(Expr::Int(pairs.len() as i64)),
+            ),
+        );
     }
     (test, binds)
 }
