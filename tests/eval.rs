@@ -2358,6 +2358,39 @@ fn time_utc() {
 }
 
 #[test]
+fn endless_method_definitions() {
+    // `def name(params) = expression` (Ruby 3+): single-expression body, no end.
+    eq("def square(x) = x * x; square(5)", "25");
+    eq("def greeting = \"hi\"; greeting", "\"hi\"");
+    eq("def add(a, b) = a + b; add(3, 4)", "7");
+    eq(
+        "def double(x) = x * 2; [1, 2, 3].map { |n| double(n) }",
+        "[2, 4, 6]",
+    );
+    // A ternary body and self-recursion.
+    eq(
+        "def fib(n) = n < 2 ? n : fib(n - 1) + fib(n - 2); fib(10)",
+        "55",
+    );
+    // Inside a class, and a singleton (`def self.`) endless def.
+    eq(
+        "class C; def area(w, h) = w * h; end; C.new.area(3, 4)",
+        "12",
+    );
+    eq(
+        "class C; def self.build(n) = new; end; C.build(1).class == C",
+        "true",
+    );
+    // Default arguments in an endless def.
+    eq("def compute(x, y = 10) = x + y; compute(5)", "15");
+    // Mixed with a normal def in the same class.
+    eq(
+        "class T; def initialize(c) = @c = c; def f = @c * 2; end; T.new(21).f",
+        "42",
+    );
+}
+
+#[test]
 fn percent_literals() {
     // %q — single-quoted (no interpolation), various delimiters.
     eq("%q(hello world)", "\"hello world\"");

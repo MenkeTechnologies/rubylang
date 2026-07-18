@@ -1040,3 +1040,28 @@ text = "The year 2024 and month 03"
 puts text.scan(%r{\d+}).inspect
 puts(%r{^\d{4}$}.match?("2024"))
 puts %s(symbol).class
+#==#
+def celsius_to_f(c) = c * 9.0 / 5 + 32
+puts celsius_to_f(100)
+puts celsius_to_f(0)
+def factorial(n) = n <= 1 ? 1 : n * factorial(n - 1)
+puts factorial(6)
+class Point
+  def initialize(x, y)
+    @x = x
+    @y = y
+  end
+  def sum = @x + @y
+  def to_s = "(#{@x}, #{@y})"
+end
+pt = Point.new(3, 4)
+puts pt.sum
+puts pt
+def pipeline(x) = [x, x * 2, x * 3]
+puts (1..3).flat_map { |n| pipeline(n) }.inspect
+class Calc
+  def self.pi = 3.14159
+  def square(n) = n * n
+end
+puts Calc.pi
+puts Calc.new.square(9)

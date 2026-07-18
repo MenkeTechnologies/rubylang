@@ -1448,12 +1448,23 @@ impl Parser {
                 }
             }
             self.expect_op(")")?;
-        } else if !matches!(self.peek(), Tok::Newline | Tok::Semicolon) {
-            // paren-less params
+        } else if !matches!(self.peek(), Tok::Newline | Tok::Semicolon) && !self.is_op("=") {
+            // paren-less params (but `def name = expr` is an endless def, not a param)
             params.push(self.param()?);
             while self.eat_op(",") {
                 params.push(self.param()?);
             }
+        }
+        // Endless method definition (Ruby 3+): `def name(params) = expression`.
+        // The body is a single expression and there is no `end`.
+        if self.eat_op("=") {
+            let expr = self.statement()?;
+            return Ok(Expr::Def {
+                name,
+                params,
+                body: vec![expr],
+                singleton,
+            });
         }
         let body = self.body_with_rescue()?;
         self.expect_kw("end")?;

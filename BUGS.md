@@ -12,7 +12,8 @@ unimplemented method raises `undefined method`.
 Classes with `initialize`/`attr_*`/instance methods, single inheritance, `super`
 (bare-forwarding and explicit-args), method resolution through the ancestor chain
 (own → included modules → superclass), `self`, instance variables, method
-chaining; `module` + `include` mixins; class methods (`def self.m`); `begin`/
+chaining; endless method definitions (`def square(x) = x * x`, including
+`def self.m(x) = …`); `module` + `include` mixins; class methods (`def self.m`); `begin`/
 `rescue`/`ensure`, method-body and statement-modifier `rescue`, `raise` with a
 message or an exception class, typed `ZeroDivisionError`/`NoMethodError`/
 `ArgumentError`; default arguments; splat parameters (`def f(a, *rest)`); `&:sym`
