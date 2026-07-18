@@ -1168,6 +1168,30 @@ fn comparable_batch() {
 }
 
 #[test]
+fn op_assign_batch() {
+    // ||= and &&= (conditional assignment).
+    eq("x = nil; x ||= 5; x", "5");
+    eq("x = 3; x ||= 5; x", "3");
+    eq("y = nil; y &&= 10; y", "nil");
+    eq("z = 4; z &&= 10; z", "10");
+    // Arithmetic op-assign on a local, chained.
+    eq("n = 5; n += 2; n -= 1; n *= 3; n", "18");
+    // On an instance variable.
+    eq("@c = 0; @c += 5; @c", "5");
+    // On array elements, including nested.
+    eq("a = [1,2,3]; a[0] += 10; a", "[11, 2, 3]");
+    eq("a = [1,2,3]; a[1] *= 2; a", "[1, 4, 3]");
+    eq("a = [[1,2],[3,4]]; a[0][1] += 100; a", "[[1, 102], [3, 4]]");
+    // On hash elements.
+    eq("h = {n: 1}; h[:n] *= 3; h[:n]", "3");
+    eq("h = {a: 1, b: 2}; h[:a] += h[:b]; h", "{a: 3, b: 2}");
+    // Hash.new(0) default drives the counter idiom.
+    eq("h = Hash.new(0); h[:x] += 1; h[:x] += 1; h[:x]", "2");
+    eq("h = Hash.new(0); h[\"z\"] == 0", "true");
+    eq(r#"h = Hash.new(0); "aab".chars.each { |c| h[c] += 1 }; h"#, r#"{"a" => 2, "b" => 1}"#);
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

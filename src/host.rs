@@ -111,7 +111,12 @@ pub mod ops {
 pub enum RObj {
     Str(String),
     Array(Vec<Value>),
-    Hash(IndexMap<RKey, Value>),
+    /// A Hash: its ordered entries plus the value returned for a missing key
+    /// (`Hash.new(0)` stores `Int(0)`; a plain `{}` stores `Undef`/nil).
+    Hash {
+        map: IndexMap<RKey, Value>,
+        default: Value,
+    },
     Symbol(String),
     Range {
         lo: i64,
@@ -395,7 +400,21 @@ impl RubyHost {
         self.alloc(RObj::Array(items))
     }
     pub fn new_hash(&mut self, map: IndexMap<RKey, Value>) -> Value {
-        self.alloc(RObj::Hash(map))
+        self.alloc(RObj::Hash {
+            map,
+            default: Value::Undef,
+        })
+    }
+    /// `Hash.new(default)` — a hash whose `[]` returns `default` for absent keys.
+    pub fn new_hash_with_default(&mut self, map: IndexMap<RKey, Value>, default: Value) -> Value {
+        self.alloc(RObj::Hash { map, default })
+    }
+    /// The value `Hash#[]` yields for a missing key (nil unless `Hash.new(d)`).
+    pub fn hash_default(&self, v: &Value) -> Value {
+        match self.obj(v) {
+            Some(RObj::Hash { default, .. }) => default.clone(),
+            _ => Value::Undef,
+        }
     }
     pub fn new_range(&mut self, lo: i64, hi: i64, exclusive: bool) -> Value {
         self.alloc(RObj::Range { lo, hi, exclusive })
@@ -592,13 +611,13 @@ impl RubyHost {
     }
     pub fn as_hash(&self, v: &Value) -> Option<IndexMap<RKey, Value>> {
         match self.obj(v) {
-            Some(RObj::Hash(m)) => Some(m.clone()),
+            Some(RObj::Hash { map, .. }) => Some(map.clone()),
             _ => None,
         }
     }
     pub fn set_hash(&mut self, v: &Value, m: IndexMap<RKey, Value>) {
-        if let Some(RObj::Hash(slot)) = self.obj_mut(v) {
-            *slot = m;
+        if let Some(RObj::Hash { map, .. }) = self.obj_mut(v) {
+            *map = m;
         }
     }
     pub fn as_range(&self, v: &Value) -> Option<(i64, i64, bool)> {
@@ -971,7 +990,7 @@ impl RubyHost {
         let wants_kw = !kwparams.is_empty() || kwsplat.is_some();
         let (positional, kwhash): (&[Value], Option<IndexMap<RKey, Value>>) = if wants_kw {
             match args.last() {
-                Some(v) if matches!(self.obj(v), Some(RObj::Hash(_))) => {
+                Some(v) if matches!(self.obj(v), Some(RObj::Hash { .. })) => {
                     (&args[..args.len() - 1], self.as_hash(v))
                 }
                 _ => (args, None),
@@ -1115,7 +1134,7 @@ impl RubyHost {
                     format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
                 }
                 Some(RObj::Array(items)) => self.inspect_array(&items),
-                Some(RObj::Hash(map)) => self.inspect_hash(&map),
+                Some(RObj::Hash { map, .. }) => self.inspect_hash(&map),
                 Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) => "#<Proc>".to_string(),
                 Some(RObj::Regexp { source, .. }) => format!("(?-mix:{source})"),
                 // MatchData#to_s is the whole matched substring (group 0).
@@ -1146,7 +1165,7 @@ impl RubyHost {
                 Some(RObj::Str(s)) => format!("{s:?}"),
                 Some(RObj::Symbol(s)) => format!(":{s}"),
                 Some(RObj::Array(items)) => self.inspect_array(&items),
-                Some(RObj::Hash(map)) => self.inspect_hash(&map),
+                Some(RObj::Hash { map, .. }) => self.inspect_hash(&map),
                 Some(RObj::Regexp { source, .. }) => format!("/{source}/"),
                 // A String range inspects its endpoints with quotes: `"a".."e"`.
                 Some(RObj::StrRange { lo, hi, exclusive }) => {
@@ -1212,7 +1231,7 @@ impl RubyHost {
             Value::Obj(_) => match self.obj(v) {
                 Some(RObj::Str(_)) => "String",
                 Some(RObj::Array(_)) => "Array",
-                Some(RObj::Hash(_)) => "Hash",
+                Some(RObj::Hash { .. }) => "Hash",
                 Some(RObj::Symbol(_)) => "Symbol",
                 Some(RObj::Range { .. }) => "Range",
                 Some(RObj::StrRange { .. }) => "Range",

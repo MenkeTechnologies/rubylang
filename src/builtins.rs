@@ -619,6 +619,13 @@ fn dispatch_classref(
 ) -> Result<Value, String> {
     match name {
         "new" => {
+            // `Hash.new(default)` builds a real Hash whose `[]` returns `default`
+            // for a missing key (the counter idiom `Hash.new(0)`). A block form
+            // (`Hash.new { |h,k| ... }`) is not yet supported.
+            if cls == "Hash" {
+                let default = args.first().cloned().unwrap_or(Value::Undef);
+                return Ok(with_host(|h| h.new_hash_with_default(IndexMap::new(), default)));
+            }
             // A user `initialize` wins. Otherwise an exception class's default
             // `new(msg)` stores the message (defaulting to the class name).
             if with_host(|h| h.find_method(cls, "initialize")).is_some() {
@@ -2820,7 +2827,11 @@ fn dispatch_hash(
         )),
         "[]" => {
             let k = with_host(|h| h.value_to_key(&args[0]));
-            Ok(map.get(&k).cloned().unwrap_or(Value::Undef))
+            // A missing key yields the hash's default (nil unless `Hash.new(d)`).
+            match map.get(&k).cloned() {
+                Some(v) => Ok(v),
+                None => Ok(with_host(|h| h.hash_default(recv))),
+            }
         }
         "fetch" => {
             let k = with_host(|h| h.value_to_key(&args[0]));
