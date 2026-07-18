@@ -1617,6 +1617,39 @@ fn array_zip_flat_batch() {
 }
 
 #[test]
+fn array_search_batch() {
+    // bsearch: find-minimum (block returns bool) and find-any (block returns Integer)
+    eq("[1,2,3,4,5].bsearch { |x| x >= 3 }", "3");
+    eq("[1,2,3,4,5].bsearch { |x| x > 10 }", "nil");
+    eq("[1,4,4,4,5,7,10,12].bsearch { |x| 4 <=> x }", "4");
+    // values_at with ints, negatives, and ranges
+    eq("[10,20,30].values_at(0,2)", "[10, 30]");
+    eq("[1,2,3,4,5].values_at(1,3,4)", "[2, 4, 5]");
+    eq("[1,2,3,4,5].values_at(-1,-2)", "[5, 4]");
+    eq("[1,2,3].values_at(1..2)", "[2, 3]");
+    eq("[].values_at(0,1)", "[nil, nil]");
+    // each_index returns the receiver with a block, indices without
+    eq("[10,20,30].each_index { |i| }", "[10, 20, 30]");
+    eq("[10,20,30].each_index.to_a", "[0, 1, 2]");
+    // deep dig
+    eq("[[1,[2]]].dig(0,1,0)", "2");
+    // rotate! mutates in place and returns self
+    eq("[1,2,3].rotate!(1)", "[2, 3, 1]");
+    eq("a = [1,2,3]; a.rotate!(-1); a", "[3, 1, 2]");
+    // sum with an initial value
+    eq("[1,2,3,4].sum(100)", "110");
+    // index / rindex with a block
+    eq("[1,2,3].index { |x| x > 1 }", "1");
+    eq("[1,2,3,2,1].rindex(2)", "3");
+    eq("[\"a\",\"bb\",\"ccc\"].rindex { |s| s.length < 3 }", "1");
+    // flatten! / compact! return self on change, nil when nothing changed
+    eq("[1,[2,[3]]].flatten!", "[1, 2, 3]");
+    eq("[1,2,3].flatten!", "nil");
+    eq("[1,nil,2,nil].compact!", "[1, 2]");
+    eq("[1,2,3].compact!", "nil");
+}
+
+#[test]
 fn undefined_method_is_an_error() {
     assert!(ev("no_such_method_here(1)").is_err());
 }

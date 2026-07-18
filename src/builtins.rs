@@ -2400,6 +2400,152 @@ fn dispatch_array(
             };
             Ok(pos.map(|p| Value::Int(p as i64)).unwrap_or(Value::Undef))
         }
+        "rindex" => {
+            let pos = if let Some(bl) = &block {
+                let mut found = None;
+                for (i, x) in arr.iter().enumerate().rev() {
+                    let r = call_proc(bl, std::slice::from_ref(x))?;
+                    if with_host(|h| h.truthy(&r)) {
+                        found = Some(i);
+                        break;
+                    }
+                }
+                found
+            } else {
+                arr.iter()
+                    .rposition(|x| with_host(|h| h.eq_values(x, &args[0])))
+            };
+            Ok(pos.map(|p| Value::Int(p as i64)).unwrap_or(Value::Undef))
+        }
+        "bsearch" => {
+            // Binary search over a partitioned array. A block returning true/false
+            // selects find-minimum mode (smallest element satisfying the block);
+            // a block returning an Integer selects find-any mode (0 == match,
+            // negative => search left, positive => search right). Returns nil when
+            // nothing is found. Assumes the receiver is already sorted/partitioned.
+            let bl = match &block {
+                Some(b) => b,
+                // No Enumerator type yet: mirror MRI's find-minimum shape by
+                // returning the receiver so a subsequent chain still sees the data.
+                None => return Ok(recv.clone()),
+            };
+            let mut lo = 0usize;
+            let mut hi = arr.len();
+            let mut satisfied: Option<usize> = None;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let r = call_proc(bl, std::slice::from_ref(&arr[mid]))?;
+                match r {
+                    Value::Int(n) => {
+                        if n == 0 {
+                            return Ok(arr[mid].clone());
+                        } else if n < 0 {
+                            hi = mid;
+                        } else {
+                            lo = mid + 1;
+                        }
+                    }
+                    Value::Float(f) => {
+                        if f == 0.0 {
+                            return Ok(arr[mid].clone());
+                        } else if f < 0.0 {
+                            hi = mid;
+                        } else {
+                            lo = mid + 1;
+                        }
+                    }
+                    other => {
+                        if with_host(|h| h.truthy(&other)) {
+                            satisfied = Some(mid);
+                            hi = mid;
+                        } else {
+                            lo = mid + 1;
+                        }
+                    }
+                }
+            }
+            Ok(satisfied.map(|i| arr[i].clone()).unwrap_or(Value::Undef))
+        }
+        "values_at" => {
+            let mut out = Vec::new();
+            for a in args {
+                if let Some((lo, hi, excl)) = with_host(|h| h.as_range(a)) {
+                    let s = norm_idx(lo, arr.len()).unwrap_or(arr.len());
+                    let mut e = norm_idx(hi, arr.len()).unwrap_or(arr.len());
+                    if !excl {
+                        e += 1;
+                    }
+                    let e = e.min(arr.len());
+                    for k in s..e.max(s) {
+                        out.push(arr.get(k).cloned().unwrap_or(Value::Undef));
+                    }
+                } else {
+                    let v = norm_idx(as_i(a), arr.len())
+                        .and_then(|k| arr.get(k))
+                        .cloned()
+                        .unwrap_or(Value::Undef);
+                    out.push(v);
+                }
+            }
+            Ok(new_arr(out))
+        }
+        "each_index" => {
+            if let Some(b) = &block {
+                for i in 0..arr.len() {
+                    call_proc(b, &[Value::Int(i as i64)])?;
+                    if has_pending_signal() {
+                        if let Some(bv) = take_break() {
+                            return Ok(bv);
+                        }
+                        break;
+                    }
+                }
+                Ok(recv.clone())
+            } else {
+                // No Enumerator type yet: return the indices array so a subsequent
+                // `.to_a`/`.map`/`.each` chain still works.
+                Ok(new_arr((0..arr.len() as i64).map(Value::Int).collect()))
+            }
+        }
+        "rotate!" => {
+            let n = args.first().map(as_i).unwrap_or(1);
+            let len = arr.len() as i64;
+            if len == 0 {
+                return Ok(recv.clone());
+            }
+            let k = ((n % len) + len) % len;
+            let mut out = arr[k as usize..].to_vec();
+            out.extend_from_slice(&arr[..k as usize]);
+            with_host(|h| h.set_array(recv, out));
+            Ok(recv.clone())
+        }
+        "flatten!" => {
+            let depth = match args.first() {
+                Some(Value::Undef) | None => -1,
+                Some(n) => as_i(n),
+            };
+            // Only flatten (and report a change) if a nested array is present.
+            let has_nested = arr.iter().any(|x| with_host(|h| h.as_array(x)).is_some());
+            if !has_nested {
+                return Ok(Value::Undef);
+            }
+            let mut out = Vec::new();
+            flatten_depth_into(&arr, depth, &mut out);
+            with_host(|h| h.set_array(recv, out));
+            Ok(recv.clone())
+        }
+        "compact!" => {
+            let had_nil = arr.iter().any(|x| matches!(x, Value::Undef));
+            if !had_nil {
+                return Ok(Value::Undef);
+            }
+            let out: Vec<Value> = arr
+                .into_iter()
+                .filter(|x| !matches!(x, Value::Undef))
+                .collect();
+            with_host(|h| h.set_array(recv, out));
+            Ok(recv.clone())
+        }
         "join" => {
             let sep = args.first().map(arg_str).unwrap_or_default();
             let parts: Vec<String> = arr.iter().map(|x| with_host(|h| h.to_s(x))).collect();
