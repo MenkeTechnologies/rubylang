@@ -916,32 +916,89 @@ fn dispatch_number(
             }
         },
         "step" => {
-            let limit = as_i(&args[0]);
-            let by = args.get(1).map(as_i).unwrap_or(1);
-            if by != 0 {
-                if let Some(bl) = &block {
+            // All-Integer receiver/limit/step iterate over Integers; any Float
+            // participant switches to Float stepping (matching Numeric#step).
+            let all_int = matches!(recv, Value::Int(_))
+                && matches!(&args[0], Value::Int(_))
+                && args.get(1).map(|v| matches!(v, Value::Int(_))).unwrap_or(true);
+            if all_int {
+                let limit = as_i(&args[0]);
+                let by = args.get(1).map(as_i).unwrap_or(1);
+                if by != 0 {
+                    if let Some(bl) = &block {
+                        let mut i = as_i(recv);
+                        while (by > 0 && i <= limit) || (by < 0 && i >= limit) {
+                            call_proc(bl, &[Value::Int(i)])?;
+                            if has_pending_signal() {
+                                if let Some(bv) = take_break() {
+                                    return Ok(bv);
+                                }
+                                break;
+                            }
+                            i += by;
+                        }
+                        return Ok(recv.clone());
+                    }
+                    // No Enumerator type yet: return the stepped values as an array so
+                    // `n.step(lim, by).to_a` / `.map` still work.
+                    let mut vals = Vec::new();
                     let mut i = as_i(recv);
                     while (by > 0 && i <= limit) || (by < 0 && i >= limit) {
-                        call_proc(bl, &[Value::Int(i)])?;
-                        if has_pending_signal() {
-                            if let Some(bv) = take_break() {
-                                return Ok(bv);
-                            }
-                            break;
-                        }
+                        vals.push(Value::Int(i));
                         i += by;
                     }
-                    return Ok(recv.clone());
+                    return Ok(new_arr(vals));
                 }
-                // No Enumerator type yet: return the stepped values as an array so
-                // `n.step(lim, by).to_a` / `.map` still work.
-                let mut vals = Vec::new();
-                let mut i = as_i(recv);
-                while (by > 0 && i <= limit) || (by < 0 && i >= limit) {
-                    vals.push(Value::Int(i));
-                    i += by;
+            } else {
+                let from = as_f(recv);
+                let to = as_f(&args[0]);
+                let by = args.get(1).map(as_f).unwrap_or(1.0);
+                if by != 0.0 && by.is_finite() {
+                    // Ruby's float-step count: floor((to-from)/by + err) + 1,
+                    // yielding `from + i*by` with the final value clamped to `to`.
+                    let mut err =
+                        (from.abs() + to.abs() + (to - from).abs()) / by.abs() * f64::EPSILON;
+                    if err > 0.5 {
+                        err = 0.5;
+                    }
+                    let n = ((to - from) / by + err).floor() + 1.0;
+                    let clamp = |i: f64| -> f64 {
+                        let d = i * by + from;
+                        if by >= 0.0 {
+                            if d > to {
+                                to
+                            } else {
+                                d
+                            }
+                        } else if d < to {
+                            to
+                        } else {
+                            d
+                        }
+                    };
+                    if let Some(bl) = &block {
+                        let mut i = 0.0f64;
+                        while i < n {
+                            call_proc(bl, &[Value::Float(clamp(i))])?;
+                            if has_pending_signal() {
+                                if let Some(bv) = take_break() {
+                                    return Ok(bv);
+                                }
+                                break;
+                            }
+                            i += 1.0;
+                        }
+                        return Ok(recv.clone());
+                    }
+                    // Blockless: materialize the stepped floats as an array.
+                    let mut vals = Vec::new();
+                    let mut i = 0.0f64;
+                    while i < n {
+                        vals.push(Value::Float(clamp(i)));
+                        i += 1.0;
+                    }
+                    return Ok(new_arr(vals));
                 }
-                return Ok(new_arr(vals));
             }
             Ok(recv.clone())
         }
@@ -961,6 +1018,15 @@ fn dispatch_number(
         }
         "to_i" | "to_int" | "floor" if name != "floor" => Ok(Value::Int(as_i(recv))),
         "to_f" => Ok(Value::Float(as_f(recv))),
+        "coerce" => match (recv, &args[0]) {
+            // Integer#coerce keeps both as Integer when the other is an Integer,
+            // otherwise both become Float (matching Numeric#coerce).
+            (Value::Int(a), Value::Int(b)) => Ok(new_arr(vec![Value::Int(*b), Value::Int(*a)])),
+            _ => Ok(new_arr(vec![
+                Value::Float(as_f(&args[0])),
+                Value::Float(as_f(recv)),
+            ])),
+        },
         "abs" | "magnitude" => Ok(match recv {
             Value::Int(n) => Value::Int(n.abs()),
             Value::Float(f) => Value::Float(f.abs()),
