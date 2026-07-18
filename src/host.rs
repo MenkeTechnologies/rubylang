@@ -369,6 +369,14 @@ pub enum RKey {
     /// A class/module reference used as a Hash key (`group_by(&:class)`), keyed
     /// by class name so it compares by value and round-trips to a class ref.
     Class(String),
+    /// An Array used as a Hash key (`{[1, 2] => v}`), keyed structurally by its
+    /// elements (recursively) so equal arrays hash together and round-trip.
+    Array(Vec<RKey>),
+    /// A Range used as a Hash key: `(lo, hi, exclusive)` for an Integer range,
+    /// or the String/Float endpoint variants.
+    Range(i64, i64, bool),
+    StrRange(String, String, bool),
+    FloatRange(u64, u64, bool),
 }
 
 /// A compiled method: positional parameter names, the index of a splat
@@ -1986,6 +1994,20 @@ impl RubyHost {
             RKey::Nil => "nil".to_string(),
             RKey::FloatBits(b) => fmt_float(f64::from_bits(*b)),
             RKey::Class(n) => n.clone(),
+            RKey::Array(ks) => {
+                let parts: Vec<String> = ks.clone().iter().map(|k| self.key_inspect(k)).collect();
+                format!("[{}]", parts.join(", "))
+            }
+            RKey::Range(lo, hi, excl) => format!("{lo}{}{hi}", if *excl { "..." } else { ".." }),
+            RKey::StrRange(lo, hi, excl) => {
+                format!("{lo:?}{}{hi:?}", if *excl { "..." } else { ".." })
+            }
+            RKey::FloatRange(lo, hi, excl) => format!(
+                "{}{}{}",
+                fmt_float(f64::from_bits(*lo)),
+                if *excl { "..." } else { ".." },
+                fmt_float(f64::from_bits(*hi))
+            ),
         }
     }
 
@@ -2036,6 +2058,16 @@ impl RubyHost {
                 Some(RObj::Str(s)) => RKey::Str(s.clone()),
                 Some(RObj::Symbol(s)) => RKey::Sym(s.clone()),
                 Some(RObj::ClassRef(n)) => RKey::Class(n.clone()),
+                Some(RObj::Array(items)) => {
+                    RKey::Array(items.iter().map(|e| self.to_key(e)).collect())
+                }
+                Some(RObj::Range { lo, hi, exclusive }) => RKey::Range(*lo, *hi, *exclusive),
+                Some(RObj::StrRange { lo, hi, exclusive }) => {
+                    RKey::StrRange(lo.clone(), hi.clone(), *exclusive)
+                }
+                Some(RObj::FloatRange { lo, hi, exclusive }) => {
+                    RKey::FloatRange(lo.to_bits(), hi.to_bits(), *exclusive)
+                }
                 _ => RKey::Str(format!("{v:?}")),
             },
             _ => RKey::Nil,
@@ -2050,6 +2082,15 @@ impl RubyHost {
             RKey::Nil => Value::Undef,
             RKey::FloatBits(b) => Value::Float(f64::from_bits(*b)),
             RKey::Class(n) => self.class_ref(n),
+            RKey::Array(ks) => {
+                let items: Vec<Value> = ks.clone().iter().map(|k| self.key_to_value(k)).collect();
+                self.new_array(items)
+            }
+            RKey::Range(lo, hi, excl) => self.new_range(*lo, *hi, *excl),
+            RKey::StrRange(lo, hi, excl) => self.new_str_range(lo.clone(), hi.clone(), *excl),
+            RKey::FloatRange(lo, hi, excl) => {
+                self.new_float_range(f64::from_bits(*lo), f64::from_bits(*hi), *excl)
+            }
         }
     }
 

@@ -83,9 +83,12 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   and the `<`/`<=`/`>`/`>=` class relations return `true`/`false`/`nil` like
   Ruby (`Integer < Numeric` → true, `String < Numeric` → nil). A Class object
   is usable as a Hash key or Set member (keyed by class name), so
-  `group_by(&:class)` and counting-by-class work. Not yet: `Array`/`Range`/
-  other composite objects as Hash keys still key by heap identity (only
-  primitives, symbols, strings, and class objects round-trip).
+  `group_by(&:class)` and counting-by-class work.
+- **Composite Hash keys.** Arrays (`{[1, 2] => v}`, nested), Ranges
+  (`{(1..3) => v}`, Integer/String/Float endpoints), and class objects work as
+  Hash keys and Set members — keyed structurally by value, so equal keys hash
+  together and round-trip through `.keys`/`.inspect`. (Only a user object with a
+  custom `hash`/`eql?` still keys by heap identity.)
 - **Enumerator.** A block-less `each`/`map`/`select`/`reject`/`each_with_index`
   (on arrays), `String#each_char`/`each_byte`/`each_line`, and
   `Integer#times`/`upto`/`downto`/`step`

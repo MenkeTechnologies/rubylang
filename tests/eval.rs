@@ -2358,6 +2358,35 @@ fn time_utc() {
 }
 
 #[test]
+fn composite_hash_keys() {
+    // Arrays as Hash keys — structural equality, round-trip, nesting.
+    eq("{[1, 2] => \"a\", [3, 4] => \"b\"}[[3, 4]]", "\"b\"");
+    eq("{[1, [2, 3]] => \"nested\"}[[1, [2, 3]]]", "\"nested\"");
+    eq("{[1, 2] => \"x\"}.keys", "[[1, 2]]");
+    eq("{[1, 2] => \"x\"}.inspect", "\"{[1, 2] => \\\"x\\\"}\"");
+    eq("{[:a, :b] => 1}[[:a, :b]]", "1");
+    // A default-0 hash counted by array key.
+    eq("h = {}; h[[1, 2]] = 1; h[[1, 2]] += 1; h", "{[1, 2] => 2}");
+    // group_by(&:itself) over arrays dedups equal arrays.
+    eq(
+        "[[1, 2], [1, 2], [3, 4]].group_by(&:itself)",
+        "{[1, 2] => [[1, 2], [1, 2]], [3, 4] => [[3, 4]]}",
+    );
+    // Ranges as Hash keys.
+    eq("{(1..3) => \"r\"}[(1..3)]", "\"r\"");
+    eq("{(1..3) => \"x\"}.keys", "[1..3]");
+    eq("{(1...5) => \"e\"}.inspect", "\"{1...5 => \\\"e\\\"}\"");
+    eq("{(\"a\"..\"c\") => 1}[(\"a\"..\"c\")]", "1");
+    // Duplicate literal keys keep the last value.
+    eq("{[1, 2] => 1, [1, 2] => 2}", "{[1, 2] => 2}");
+    // Memoization keyed by an argument array.
+    eq(
+        "cache = {}; f = ->(a, b) { cache[[a, b]] ||= a + b }; [f.call(1, 2), f.call(1, 2), cache.size]",
+        "[3, 3, 1]",
+    );
+}
+
+#[test]
 fn class_objects_as_hash_keys() {
     // A Class object works as a Hash key (compares by class, round-trips).
     eq("{Integer => 1, String => 2}[Integer]", "1");

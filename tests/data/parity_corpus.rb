@@ -985,3 +985,26 @@ puts tally.map { |cls, n| "#{cls}=#{n}" }.sort.inspect
 type_map = {Integer => :whole, Float => :decimal, String => :text}
 puts data.map { |v| type_map[v.class] || :unknown }.inspect
 puts({Integer => 1, Float => 2}.fetch(2.0.class))
+#==#
+grid = {}
+grid[[0, 0]] = "origin"
+grid[[1, 2]] = "point"
+grid[[1, 2]] = "updated"
+puts grid[[1, 2]]
+puts grid.size
+puts grid.keys.inspect
+moves = [[0, 1], [1, 0], [0, 1], [-1, 0], [1, 0]]
+freq = Hash.new(0)
+moves.each { |m| freq[m] += 1 }
+puts freq.sort_by { |k, v| [-v, k] }.inspect
+buckets = {(0..9) => "low", (10..19) => "mid", (20..29) => "high"}
+puts buckets[(10..19)]
+puts buckets.keys.inspect
+paths = [[1, 2, 3], [1, 2, 3], [4, 5]]
+puts paths.group_by(&:itself).transform_values(&:size).inspect
+memo = {}
+fib = lambda do |n|
+  memo[[:fib, n]] ||= n < 2 ? n : fib.call(n - 1) + fib.call(n - 2)
+end
+puts fib.call(10)
+puts memo.size

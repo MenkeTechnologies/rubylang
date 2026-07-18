@@ -559,3 +559,13 @@ Symbol: [:sym, :other]
 ["Float=2", "Integer=2", "String=2", "Symbol=2"]
 [:whole, :decimal, :text, :unknown, :whole, :text, :decimal, :unknown]
 2
+#==#
+updated
+2
+[[0, 0], [1, 2]]
+[[[0, 1], 2], [[1, 0], 2], [[-1, 0], 1]]
+mid
+[0..9, 10..19, 20..29]
+{[1, 2, 3] => 2, [4, 5] => 1}
+55
+11
