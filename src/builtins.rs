@@ -4516,9 +4516,18 @@ fn dispatch_array(
             Ok(acc)
         }
         "uniq" => {
+            // With a block, uniqueness is by the block's return value (the key);
+            // without one, by the element itself. The first element for each key
+            // is kept, in original order.
             let mut out: Vec<Value> = Vec::new();
+            let mut keys: Vec<Value> = Vec::new();
             for x in arr {
-                if !out.iter().any(|y| with_host(|h| h.eq_values(&x, y))) {
+                let key = match &block {
+                    Some(b) => call_proc(b, std::slice::from_ref(&x))?,
+                    None => x.clone(),
+                };
+                if !keys.iter().any(|k| with_host(|h| h.eq_values(&key, k))) {
+                    keys.push(key);
                     out.push(x);
                 }
             }

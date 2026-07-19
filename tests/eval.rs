@@ -4277,3 +4277,99 @@ fn erb_templating() {
         "true",
     );
 }
+
+#[test]
+fn splat_only_params_parse_and_collect() {
+    // Anonymous and named splat-only params on lambdas, blocks, and methods.
+    eq("->(*a) { a }.call(1, 2)", "[1, 2]");
+    eq("->(*) { 42 }.call(1, 2)", "42");
+    eq("proc { |*x| x }.call(1, 2)", "[1, 2]");
+    eq("proc { |*| :ok }.call(1, 2)", ":ok");
+    eq("def m1(*); 9; end; m1(1, 2)", "9");
+    eq("def m2(**); :kw; end; m2(a: 1)", ":kw");
+    eq("def m3(*, **); :both; end; m3(1, a: 2)", ":both");
+    // Arity of a splat block is -(required + 1), negative like MRI.
+    eq("proc { |a, *b| }.arity", "-2");
+    eq("proc { |*| }.arity", "-1");
+    eq("->(a, *b) {}.arity", "-2");
+}
+
+#[test]
+fn reopening_a_class_merges_methods() {
+    // Both methods survive a reopening (MRI keeps `a` and `b`).
+    eq(
+        "class A1; def a; 1; end; end; class A1; def b; 2; end; end; [A1.new.a, A1.new.b]",
+        "[1, 2]",
+    );
+    // Reopening a module and mixing it in exposes methods from both openings.
+    eq(
+        "module M1; def m1; :one; end; end; module M1; def m2; :two; end; end; \
+         class C1; include M1; end; [C1.new.m1, C1.new.m2]",
+        "[:one, :two]",
+    );
+    // Constants accumulate across reopenings.
+    eq(
+        "class E1; X = 1; end; class E1; Y = 2; end; [E1::X, E1::Y]",
+        "[1, 2]",
+    );
+    // Each opening's class body runs (separate `__class_body__` entries).
+    eq(
+        "class D1; @@log = []; def self.log; @@log; end; @@log << :first; end; \
+         class D1; @@log << :second; end; D1.log",
+        "[:first, :second]",
+    );
+    // Class methods merge too.
+    eq(
+        "class F1; def self.a; 1; end; end; class F1; def self.b; 2; end; end; [F1.a, F1.b]",
+        "[1, 2]",
+    );
+}
+
+#[test]
+fn shift_operator_versus_heredoc_disambiguation() {
+    // `s<<"x"` glued to a value is String#<< append, not a heredoc start.
+    eq("s = \"a\"; s << \"b\"", "\"ab\"");
+    eq("s = \"a\"; s<<\"b\"; s", "\"ab\"");
+    eq("a = []; a<<1; a", "[1]");
+    // A quoted heredoc still works in value position.
+    eq("x = <<\"E\"\nhi\nE\nx", "\"hi\\n\"");
+}
+
+#[test]
+fn label_colon_glued_to_keyword_or_constant_value() {
+    // `key:value` with no space, where the value is a keyword/constant, is a
+    // label (was mis-lexed as a symbol like `:true`).
+    eq("def f(x:); x; end; f(x:true)", "true");
+    eq("def f(x:); x; end; f(x:nil)", "nil");
+    eq("{a:true}", "{a: true}");
+    eq("{k:String}", "{k: String}");
+    eq("S = Struct.new(:a, keyword_init:true); S.new(a: 5).a", "5");
+    // Bare symbols in value position are unaffected.
+    eq("[:a, :b]", "[:a, :b]");
+    eq("{a: :b}", "{a: :b}");
+}
+
+#[test]
+fn parallel_assignment_with_leading_splat() {
+    eq("*x, y = 1, 2, 3; [x, y]", "[[1, 2], 3]");
+    eq("*x = 1, 2, 3; x", "[1, 2, 3]");
+    eq("a, *b, c = 1, 2, 3, 4, 5; [a, b, c]", "[1, [2, 3, 4], 5]");
+    eq("a, *b = 1, 2, 3; [a, b]", "[1, [2, 3]]");
+}
+
+#[test]
+fn lambda_literal_as_command_argument() {
+    // `p ->(x){ }` — a lambda literal begins a command argument (was rejected
+    // with "unexpected '->'"). `p` returns its argument, so the last-expression
+    // value is the lambda-call result.
+    eq("p ->(x) { x + 1 }.call(5)", "6");
+    eq("p ->(*a) { a }.call(1, 2)", "[1, 2]");
+    eq("->(a, b) {}.arity", "2");
+}
+
+#[test]
+fn array_uniq_with_block_uses_key() {
+    eq("[1, 2, 3, 4].uniq { |x| x % 2 }", "[1, 2]");
+    eq("%w[a bb cc ddd].uniq(&:length)", "[\"a\", \"bb\", \"ddd\"]");
+    eq("[1, 1, 2, 3, 3].uniq", "[1, 2, 3]");
+}

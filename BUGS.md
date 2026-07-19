@@ -60,6 +60,20 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   MRI rejects a bare modifier `rescue` directly in method-call arguments
   (`p(1/0 rescue 5)`) and array elements (`[1/0 rescue 5]`); this parser accepts
   them (a permissive superset — no valid MRI program breaks).
+- **Splat-only / anonymous params.** A bare `*` splat, a `*name` splat, and a
+  bare `**` keyword-splat parse as the sole (or any) parameter of a method,
+  block, or lambda: `def f(*)`, `def f(**)`, `def f(*, **)`, `->(*) { }`,
+  `->(*a) { a }`, `proc { |*| }`, `proc { |*x| x }`. A splat block/lambda's
+  `arity` is `-(required + 1)`, negative like MRI.
+- **Parallel assignment with a leading splat.** `*x, y = 1, 2, 3` and `*x = 1, 2`
+  (splat as the first target) parse now, alongside the already-supported trailing
+  (`a, *b =`) and middle (`a, *b, c =`) splat positions.
+- **Lambda literal as a command argument.** `p ->(x) { x }` (a `->` lambda
+  directly after a spaced command name) parses. Still not parsed: nested
+  destructuring targets in a parallel assignment LHS (`(a, (b, c)), d = …`).
+- **Numbered / `it` implicit block params.** `_1`.`_9` and Ruby 3.4's `it`
+  are not bound (they read as `nil`); implementing them needs a nested-block-aware
+  body walk. Use explicit `{ |x| … }` params.
 
 ## Metaprogramming / reflection / eval
 
@@ -99,8 +113,18 @@ Implemented and verified against the reference `ruby`:
   than tracking a separate `[A::B, A]` nesting list (identical for the common
   `module A; module B` shape); and `Module.nesting` is best-effort — it returns
   `[]` (correct at the top level) because the runtime does not carry the
-  lexical nesting of the call site. Reopening a class/module still replaces the
-  prior definition (a pre-existing limitation, independent of namespacing).
+  lexical nesting of the call site.
+- **Class/module reopening merges.** A second `class A … end` (or `module M … end`)
+  adds to the existing definition instead of replacing it: new instance methods,
+  class methods, and constants are merged in, a redefined name replaces the
+  earlier body, and `include`/`prepend`/`extend` mixins accumulate. Each opening's
+  class body runs (they are stored under distinct synthetic `__class_body__N`
+  names, so side effects from every reopening fire). Caveat: rubylang installs all
+  class/method definitions at load time (methods and classes are usable before
+  their textual position — a pre-existing hoisting deviation from MRI), so when a
+  later reopening *redefines* a method the last definition wins for the whole run
+  rather than only after its textual point. Additive reopenings (distinct method
+  names) match MRI exactly.
 - **Top-level `self`.** Fixed to `main`, an ordinary `Object`, so
   `self.class.name == "Object"` (was `"NilClass"`). Top-level instance variables
   now live on that object.
@@ -136,6 +160,14 @@ Honest limitations of this surface:
   `prepended` after), which is correct for observing *which* class triggered the
   hook; exact interleaving with surrounding output can differ because class
   bodies are otherwise hoisted.
+- **`respond_to?` on builtin receivers is permissive.** A user object reports
+  accurately (its class's methods, `respond_to_missing?`, Struct/OpenStruct
+  attributes). For builtin receivers (`String`, `Integer`, `Array`, `Hash`,
+  `Symbol`, …) `respond_to?` returns `true` for any name except the
+  pattern-match deconstruction protocol, because there is no enumerable registry
+  of the builtin method surface — so `"s".respond_to?(:no_such)` is `true` where
+  MRI is `false`. Accurate builtin `respond_to?` needs a per-type method-name
+  registry (deep substrate, not yet built).
 
 ## Lexer
 
@@ -159,6 +191,15 @@ Honest limitations of this surface:
   trailing DATA section is out of scope). Not yet: an unknown escape like `"\d"`
   keeps its backslash rather than dropping it as MRI does (deliberate, for
   regex-source strings).
+- **`<<` heredoc vs left-shift.** A `<<` glued to the right of a value with no
+  preceding space (`s<<"b"`, `arr<<CONST`) is the shift/append operator, not a
+  heredoc — the quoted (`<<"X"`) and bare-uppercase (`<<END`) heredoc forms are
+  recognized only at an expression start or as a command argument (`puts <<"EOF"`:
+  space before, none after). `<<~`/`<<-` are always heredocs.
+- **`key:value` label vs symbol.** A `:` glued to the right of a value where the
+  value that follows is a keyword or constant (`x:true`, `k:String`,
+  `keyword_init:true`) is a label colon, not a symbol start. Expression-start and
+  spaced-command-arg symbols (`:foo`, `p :bar`, `[:a, :b]`) are unaffected.
 
 ## Runtime / methods
 

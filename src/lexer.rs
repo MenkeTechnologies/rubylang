@@ -169,28 +169,31 @@ fn next_line_leading_dot(b: &[u8], mut j: usize) -> bool {
 /// Whether a `<<` here begins a heredoc rather than a left-shift: true after a
 /// value is NOT on the stack (start of expression, after an operator/`(`/`,`),
 /// or whenever an unambiguous form (`<<~`/`<<-`/`<<"`/`<<'`) is used.
-fn heredoc_here(out: &[Token], after: &[u8]) -> bool {
-    let unambiguous = matches!(
-        after.first(),
-        Some(b'~') | Some(b'-') | Some(b'"') | Some(b'\'')
-    );
-    if unambiguous {
+fn heredoc_here(out: &[Token], after: &[u8], space_before: bool) -> bool {
+    // `<<~`/`<<-` are always heredocs — no left-shift form uses them.
+    if matches!(after.first(), Some(b'~') | Some(b'-')) {
         return true;
     }
-    // A bare `<<IDENT` heredoc must start with an uppercase letter or `_` and
-    // appear in value position (not after a value that would make it a shift).
+    // Quoted (`<<"X"`/`<<'X'`) or bare uppercase/`_` (`<<END`) delimiters are the
+    // only heredoc candidates. `<< x` with a space (or any other char) after is a
+    // left-shift, handled by the general operator path.
+    let quoted = matches!(after.first(), Some(b'"') | Some(b'\''));
     let bare_ok = matches!(after.first(), Some(c) if c.is_ascii_uppercase() || *c == b'_');
-    if !bare_ok {
+    if !quoted && !bare_ok {
         return false;
     }
+    // Position test. A heredoc sits where a value would: at expression start
+    // (nothing before, or after an operator/keyword), or as a command argument
+    // (`puts <<"EOF"` — a space before the `<<` and none after). After a value
+    // token with NO preceding space, `<<` is the shift/append operator, so
+    // `s<<"b"` and `arr<<CONST` are shifts, not heredocs.
     match out.iter().rev().find(|t| t.kind != Tok::Newline) {
         None => true,
-        Some(t) => {
-            matches!(
-                &t.kind,
-                Tok::Op(o) if o != ")" && o != "]" && o != "}"
-            ) || matches!(&t.kind, Tok::Keyword(_))
-        }
+        Some(t) => match &t.kind {
+            Tok::Op(o) if o != ")" && o != "]" && o != "}" => true,
+            Tok::Keyword(_) => true,
+            _ => space_before,
+        },
     }
 }
 
@@ -764,7 +767,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 });
             }
             b':' if i + 1 < b.len()
-                && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_' || b[i + 1] == b'@') =>
+                && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_' || b[i + 1] == b'@')
+                // A `:` glued to the right of a value (`x:true`, `key:String`) is a
+                // label colon, not a symbol start — the same disambiguation the
+                // operator-symbol case above uses. `foo :bar` (spaced) and
+                // expression-start `:bar` still lex as symbols.
+                && (!prev_is_value(&out) || sp) =>
             {
                 i += 1;
                 let start = i;
@@ -856,7 +864,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     space: core::mem::take(&mut sp),
                 });
             }
-            b'<' if i + 2 < b.len() && b[i + 1] == b'<' && heredoc_here(&out, &b[i + 2..]) => {
+            b'<' if i + 2 < b.len() && b[i + 1] == b'<' && heredoc_here(&out, &b[i + 2..], sp) => {
                 // A heredoc marker: `<<DELIM`, `<<~DELIM`, `<<-DELIM`, or a quoted
                 // delimiter. Consume the marker; the body is filled in when the
                 // line's newline is reached.

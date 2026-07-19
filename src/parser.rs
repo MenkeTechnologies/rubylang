@@ -157,11 +157,19 @@ impl Parser {
     /// A statement is an expression optionally followed by a trailing modifier
     /// (`expr if cond`, `expr while cond`, …).
     fn statement(&mut self) -> Result<Expr, String> {
-        let mut e = self.expr()?;
+        // A leading `*` begins a parallel assignment whose first target is a
+        // splat (`*x, y = 1, 2, 3` or `*x = 1, 2`); `expr()` cannot start with `*`.
+        let leading_splat = self.is_op("*");
+        let mut e = if leading_splat {
+            self.advance();
+            Expr::Splat(Box::new(self.ternary()?))
+        } else {
+            self.expr()?
+        };
         // Parallel assignment is a statement-level form: `a, b = 1, 2`. A comma
         // after a bare lvalue (not consumed by a command call) starts the target
         // list. (Detecting this in `assign()` would misfire on array elements.)
-        if self.is_op(",") {
+        if leading_splat || self.is_op(",") {
             let mut targets = vec![e];
             while self.eat_op(",") {
                 if self.eat_op("*") {
@@ -877,6 +885,15 @@ impl Parser {
         }
         if self.eat_op("*") {
             *splat = Some(params.len());
+            // Anonymous splat `->(*) { }` / `{ |*| }` — no binding name.
+            if self.is_op(")")
+                || self.is_op("|")
+                || self.is_op(",")
+                || matches!(self.peek(), Tok::Newline | Tok::Semicolon)
+            {
+                params.push("*".to_string());
+                return Ok(());
+            }
         }
         params.push(self.ident_name()?);
         Ok(())
@@ -1124,7 +1141,9 @@ impl Parser {
             Tok::Op(o) if o == "*" || o == "**" || o == "&" => {
                 !self.toks.get(self.pos + 1).map(|t| t.space).unwrap_or(true)
             }
-            Tok::Op(o) => o == "[" || o == "(",
+            // A lambda literal (`p ->(x){ x }`), an array/paren group, or a
+            // symbol-array percent literal all begin a command argument.
+            Tok::Op(o) => o == "[" || o == "(" || o == "->",
             _ => false,
         }
     }
@@ -1792,9 +1811,17 @@ impl Parser {
                 block: true,
             });
         }
-        // `**opts` — a keyword-splat collector.
+        // `**opts` — a keyword-splat collector. A bare `**` is an anonymous
+        // keyword splat (`def f(**)`); give it a synthetic non-colliding name.
         if self.eat_op("**") {
-            let name = self.ident_name()?;
+            let name = if self.is_op(")")
+                || self.is_op(",")
+                || matches!(self.peek(), Tok::Newline | Tok::Semicolon)
+            {
+                "**".to_string()
+            } else {
+                self.ident_name()?
+            };
             return Ok(Param {
                 name,
                 default: None,
@@ -1805,6 +1832,20 @@ impl Parser {
             });
         }
         let splat = self.eat_op("*");
+        // Anonymous splat `def f(*)` — collects surplus positional args with no
+        // binding. Give it a synthetic name that can never collide with a real
+        // identifier so downstream compilation still records the splat position.
+        if splat && (self.is_op(")") || self.is_op(",") || matches!(self.peek(), Tok::Newline | Tok::Semicolon))
+        {
+            return Ok(Param {
+                name: "*".to_string(),
+                default: None,
+                splat: true,
+                keyword: false,
+                kwsplat: false,
+                block: false,
+            });
+        }
         // A keyword parameter's label may be any reserved word (`def f(class: 1)`,
         // `def f(in:)`), recognized when a keyword is immediately followed by `:`.
         // The `:` is left in place for the keyword-parameter check below.

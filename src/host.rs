@@ -823,7 +823,7 @@ pub fn eval_in_place(src: &str) -> Result<Value, String> {
             h.methods.insert(name, def);
         }
         for (name, def) in prog.classes {
-            h.classes.insert(name, def);
+            merge_class(&mut h.classes, name, def);
         }
         h.begins.extend(prog.begins);
         h.procs.extend(prog.procs);
@@ -849,6 +849,45 @@ pub fn call_singleton(
         Some(name.into()),
         Some(def_class),
     )
+}
+
+/// Merge a class/module definition into the store, implementing Ruby's
+/// "reopening adds to the class" semantics. A second `class A … end` (or
+/// `module M … end`) does NOT replace the first: its methods and class methods
+/// are added (a redefined name replaces the earlier body, as in MRI), and its
+/// `include`/`prepend`/`extend` mixins accumulate. Synthetic `__class_body__N`
+/// entries are already uniquely named per opening, so they coexist. If no class
+/// of this name exists yet, the definition is installed as-is.
+fn merge_class(classes: &mut IndexMap<String, ClassDef>, name: String, def: ClassDef) {
+    let Some(existing) = classes.get_mut(&name) else {
+        classes.insert(name, def);
+        return;
+    };
+    // A reopening usually omits the superclass; adopt a new one only if given.
+    if def.superclass.is_some() {
+        existing.superclass = def.superclass;
+    }
+    for (k, v) in def.methods {
+        existing.methods.insert(k, v);
+    }
+    for (k, v) in def.class_methods {
+        existing.class_methods.insert(k, v);
+    }
+    for m in def.includes {
+        if !existing.includes.contains(&m) {
+            existing.includes.push(m);
+        }
+    }
+    for m in def.prepends {
+        if !existing.prepends.contains(&m) {
+            existing.prepends.push(m);
+        }
+    }
+    for m in def.extends {
+        if !existing.extends.contains(&m) {
+            existing.extends.push(m);
+        }
+    }
 }
 
 impl Default for RubyHost {
@@ -947,7 +986,7 @@ impl RubyHost {
             self.methods.insert(name, def);
         }
         for (name, def) in classes {
-            self.classes.insert(name, def);
+            merge_class(&mut self.classes, name, def);
         }
         // Append, never replace: a `require`/`load` (or each REPL line) merges a
         // second program onto the live host. Its ids were already rebased above
@@ -1522,7 +1561,17 @@ impl RubyHost {
             Some(RObj::Proc { kind, template, .. }) => match kind {
                 ProcKind::Curried { .. } | ProcKind::Composed { .. } => Some(-1),
                 ProcKind::Collect(_) | ProcKind::Around(_) => Some(1),
-                ProcKind::Normal => Some(self.procs[*template].params.len() as i64),
+                ProcKind::Normal => {
+                    let def = &self.procs[*template];
+                    if def.splat.is_some() {
+                        // A block/lambda with a splat has arity -(required + 1),
+                        // the required count being all positional params bar the
+                        // splat itself.
+                        Some(-(def.params.len().saturating_sub(1) as i64 + 1))
+                    } else {
+                        Some(def.params.len() as i64)
+                    }
+                }
             },
             _ => None,
         }

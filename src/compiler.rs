@@ -1309,12 +1309,13 @@ impl Compiler {
             }
         }
         // Compile the leftover body as a synthetic class method so it can run with
-        // `self` = the class.
+        // `self` = the class. Each class opening (including reopenings of the same
+        // name) gets a *unique* body name so a later reopening's `__class_body__`
+        // never clobbers an earlier one after the two ClassDefs are merged.
+        let body_name = format!("__class_body__{}", self.def_ctr);
+        self.def_ctr += 1;
         if !init_body.is_empty() {
-            class_methods.insert(
-                "__class_body__".to_string(),
-                self.compile_method(&[], &init_body)?,
-            );
+            class_methods.insert(body_name.clone(), self.compile_method(&[], &init_body)?);
         }
         // Capture the mixin lists for hook firing before they move into ClassDef.
         let hook_includes = includes.clone();
@@ -1344,7 +1345,7 @@ impl Compiler {
         if !init_body.is_empty() {
             self.kstr(b, &qname);
             b.emit(Op::CallBuiltin(ops::GETCONST, 1), 0);
-            self.kstr(b, "__class_body__");
+            self.kstr(b, &body_name);
             b.emit(Op::CallBuiltin(ops::CALL_METHOD, 2), 0);
             b.emit(Op::Pop, 0);
         }
