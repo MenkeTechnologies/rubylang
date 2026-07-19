@@ -63,6 +63,85 @@ pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
     })
 }
 
+/// Rewrite every proc-id and begin-id reference in `prog` so its ids sit above
+/// the ids already loaded on the host (`proc_off`/`begin_off` = the host's
+/// current `procs.len()`/`begins.len()`). Without this, a second file's ids
+/// start at 0 and alias the first file's already-loaded procs/begins, so the
+/// wrong block/begin body would run at dispatch time. Proc ids appear as the
+/// `Op::LoadInt` immediately before a `CallBuiltin(MKPROC|MKLAMBDA, 1)`, begin
+/// ids as the `LoadInt` before `CallBuiltin(BEGIN, 1)`; a `BeginDef`'s
+/// `body`/`ensure`/rescue-`body` fields hold proc ids directly (not in a chunk).
+pub fn rebase_program(prog: &mut Program, proc_off: usize, begin_off: usize) {
+    if proc_off == 0 && begin_off == 0 {
+        return;
+    }
+    rebase_chunk(&mut prog.main, proc_off, begin_off);
+    for (_, m) in &mut prog.methods {
+        rebase_chunk(&mut m.chunk, proc_off, begin_off);
+    }
+    for (_, c) in &mut prog.classes {
+        for (_, m) in &mut c.methods {
+            rebase_chunk(&mut m.chunk, proc_off, begin_off);
+        }
+        for (_, m) in &mut c.class_methods {
+            rebase_chunk(&mut m.chunk, proc_off, begin_off);
+        }
+    }
+    for p in &mut prog.procs {
+        rebase_chunk(&mut p.chunk, proc_off, begin_off);
+    }
+    for bd in &mut prog.begins {
+        bd.body += proc_off;
+        if let Some(e) = &mut bd.ensure {
+            *e += proc_off;
+        }
+        for r in &mut bd.rescues {
+            r.body += proc_off;
+        }
+    }
+}
+
+/// Add the offsets to the proc/begin id operands inside one chunk (and, for
+/// completeness, any fusevm sub-chunks — rubylang never emits them, but the
+/// recursion keeps this correct if that ever changes). The proc/begin id is
+/// always the `Op::LoadInt` immediately preceding the consuming builtin, by
+/// construction of the compiler.
+fn rebase_chunk(chunk: &mut Chunk, proc_off: usize, begin_off: usize) {
+    let mut changed = false;
+    for i in 1..chunk.ops.len() {
+        if let Op::CallBuiltin(id, 1) = chunk.ops[i] {
+            let off = if id == ops::MKPROC || id == ops::MKLAMBDA {
+                proc_off
+            } else if id == ops::BEGIN {
+                begin_off
+            } else {
+                continue;
+            };
+            if off == 0 {
+                continue;
+            }
+            if let Op::LoadInt(v) = &mut chunk.ops[i - 1] {
+                *v += off as i64;
+                changed = true;
+            }
+        }
+    }
+    for sub in &mut chunk.sub_chunks {
+        rebase_chunk(sub, proc_off, begin_off);
+    }
+    if changed {
+        // The op hash is the JIT-cache key (`#[serde(skip)]`, computed at build
+        // time from ops + constants). Recompute it so the rewritten chunk keys
+        // to its actual ops and never collides with a different chunk.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        chunk.ops.hash(&mut h);
+        chunk.constants.hash(&mut h);
+        chunk.op_hash = h.finish();
+    }
+}
+
 impl Compiler {
     /// Compile a sequence of statements as a body: each value but the last is
     /// popped; the last is left on the stack (Ruby's "value is the last expr").

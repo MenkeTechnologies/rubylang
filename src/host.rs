@@ -629,6 +629,33 @@ pub fn with_host<R>(f: impl FnOnce(&mut RubyHost) -> R) -> R {
 pub fn reset_host() {
     with_host(|h| *h = RubyHost::new());
     crate::intercepts::clear();
+    FILE_DIR_STACK.with(|s| s.borrow_mut().clear());
+}
+
+thread_local! {
+    /// The directory of the file currently being run, as a stack: pushed before a
+    /// `require`/`require_relative`/`load`d file runs and popped after, plus the
+    /// top-level script's dir at the bottom. `require_relative` resolves against
+    /// the top entry (the requiring file's dir).
+    static FILE_DIR_STACK: RefCell<Vec<std::path::PathBuf>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Push the directory of the file about to run (see `FILE_DIR_STACK`).
+pub fn push_file_dir(dir: std::path::PathBuf) {
+    FILE_DIR_STACK.with(|s| s.borrow_mut().push(dir));
+}
+
+/// Pop after a required/loaded file finishes running.
+pub fn pop_file_dir() {
+    FILE_DIR_STACK.with(|s| {
+        s.borrow_mut().pop();
+    });
+}
+
+/// The directory of the file currently running (top of the stack), for
+/// `require_relative` resolution.
+pub fn current_file_dir() -> Option<std::path::PathBuf> {
+    FILE_DIR_STACK.with(|s| s.borrow().last().cloned())
 }
 
 impl Default for RubyHost {
@@ -722,8 +749,33 @@ impl RubyHost {
         for (name, def) in classes {
             self.classes.insert(name, def);
         }
-        self.begins = begins;
-        self.procs = procs;
+        // Append, never replace: a `require`/`load` (or each REPL line) merges a
+        // second program onto the live host. Its ids were already rebased above
+        // the current lengths by `compiler::rebase_program`, so appending keeps
+        // every already-loaded proc/begin id valid.
+        self.begins.extend(begins);
+        self.procs.extend(procs);
+    }
+
+    /// The base a freshly compiled program must be rebased by before it is merged
+    /// so its proc/begin ids don't collide with what is already loaded:
+    /// (`procs.len()`, `begins.len()`). See `compiler::rebase_program`.
+    pub fn program_offsets(&self) -> (usize, usize) {
+        (self.procs.len(), self.begins.len())
+    }
+
+    /// Seed `$LOAD_PATH`/`$:` (an Array holding `dir`) and `$LOADED_FEATURES`/`$"`
+    /// (an empty Array). Each alias pair points at the *same* heap Array object so
+    /// a push through either name is visible through the other, matching Ruby's
+    /// `$LOAD_PATH.equal?($:)`.
+    pub fn init_load_path(&mut self, dir: &str) {
+        let d = self.new_string(dir.to_string());
+        let load_path = self.new_array(vec![d]);
+        self.set_global("LOAD_PATH", load_path.clone());
+        self.set_global(":", load_path);
+        let features = self.new_array(Vec::new());
+        self.set_global("LOADED_FEATURES", features.clone());
+        self.set_global("\"", features);
     }
 
     pub fn take_error(&mut self) -> Option<String> {
@@ -3206,6 +3258,37 @@ pub fn run_main(chunk: Chunk) -> Result<Value, String> {
     if let Some(tag) = uncaught {
         return Err(format!("uncaught throw {tag} (UncaughtThrowError)"));
     }
+    r
+}
+
+/// Run a `require`/`load`d file's top-level chunk in its own fresh top-level
+/// scope, so the required file's local variables neither leak into nor read from
+/// the requiring file's locals (MRI evaluates a required file at the top-level
+/// `main` binding, not the caller's). Constants, classes, methods, and globals
+/// still persist on the shared host — they are not frame-local. A leftover
+/// top-level control signal from the required file is cleared (its `return`/
+/// `throw` just ends that file's evaluation).
+pub fn run_required_main(chunk: Chunk) -> Result<Value, String> {
+    let saved_active = with_host(|h| {
+        h.frames.push(Frame {
+            scope: Scope {
+                locals: new_env(),
+                block: None,
+                self_obj: Value::Undef,
+                method_name: None,
+                def_class: None,
+            },
+            args: Vec::new(),
+            line: 0,
+        });
+        h.active_scope.take()
+    });
+    let r = run_chunk_on(chunk);
+    with_host(|h| {
+        h.frames.pop();
+        h.active_scope = saved_active;
+        h.signal.take();
+    });
     r
 }
 

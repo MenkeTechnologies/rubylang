@@ -321,6 +321,57 @@ an explicit base or the cwd). IO instance: `read`/`write`/`gets`/`puts`/
 - **`.localtime`/timezones** are unmodeled elsewhere (see Runtime); file mtimes
   are not surfaced as `Time` objects.
 
+## Loading files (`require` / `require_relative` / `load`)
+
+- **`require`, `require_relative`, and `load` actually read, parse, compile, and
+  run files** on the live host, so a required file's constants, classes,
+  methods, and globals persist into the caller. `require(path)` resolves against
+  `$LOAD_PATH` (`$:`) trying `path` then `path.rb` (absolute paths and a
+  current-directory fallback too); `require_relative(path)` resolves against the
+  directory of the file currently running (an internal file-dir stack pushed
+  before a required/loaded file runs, popped after); `load(path)` searches
+  `$LOAD_PATH` without appending `.rb`. `require`/`require_relative` dedup on the
+  resolved absolute path — first load returns `true`, an already-loaded feature
+  returns `false` without re-running — and record the path in `$LOADED_FEATURES`
+  (`$"`) *before* running the body, so a circular `require` sees it loaded and
+  returns `false` instead of recursing. `load` always re-runs and never dedups.
+  A missing file raises a catchable `LoadError` (`cannot load such file --
+  <path>`); a syntax error in the target raises `SyntaxError`.
+- **`$LOAD_PATH`/`$:` and `$LOADED_FEATURES`/`$"`** are real, pushable Arrays,
+  seeded with the running script's directory (or the current directory for `-e`
+  / stdin). Each alias pair (`$LOAD_PATH`/`$:`, `$LOADED_FEATURES`/`$"`) points
+  at the *same* Array object, so `$LOAD_PATH.equal?($:)` is true and a push
+  through either name is visible through the other. Re-*assigning* one alias
+  (`$: = [...]`) does not repoint the other (only mutation is shared); read the
+  canonical name after such a reassignment.
+- **Proc/begin id merge.** Each file compiles to its own program with `procs` /
+  `begins` Vecs indexed from 0; merging a second program onto the host would
+  collide those ids with the first program's. Before merge, every proc-id and
+  begin-id operand in the new program (in the main chunk, method chunks, class
+  method chunks, proc chunks, and the `BeginDef` body/ensure/rescue fields) is
+  rebased above the host's current `procs.len()`/`begins.len()`, and the vecs are
+  appended (never replaced). This also fixes a latent REPL bug where each line
+  replaced the proc/begin tables, dangling ids captured by earlier-line
+  closures. A required method whose body uses a block or `begin`/`rescue` now
+  dispatches to its own body, not a same-id body from another file.
+- **Builtin libraries stay no-ops.** `require` of a known standard-library name
+  the runtime provides natively or ignores (`set`, `json`, `date`, `time`,
+  `securerandom`, and a fixed list of common stdlib names) returns `true`
+  without a file search, so those names never map to a `.rb` on disk.
+- **`__dir__`** returns the directory of the file currently running (from the
+  same file-dir stack), a String; under `-e`/stdin it returns the seeded current
+  directory (MRI returns the relative `"."` there).
+- **Limitations.** `require` does not use `RUBYLIB`, gem paths, or a real stdlib
+  tree — only `$LOAD_PATH` (script dir + whatever the program pushes) plus the
+  builtin no-op list. Autoload, `require` of a `.so`/`.bundle`, and thread-safe
+  concurrent require are out of scope. A required file's top-level *locals* are
+  isolated from the caller's (MRI-faithful), but its top-level `self` is the same
+  shared main object rather than a per-file binding. The punctuation globals
+  `$"` and `$:` can't appear inside a `#{...}` string interpolation (the interp
+  scanner reads the quote/colon as a delimiter — the same pre-existing limitation
+  noted for `` $` ``/`$'`); reference them outside interpolation.
+
+
 ## Tooling
 
 - **DAP debugger (`ruby --dap`).** Source-line breakpoints fire inside method,

@@ -36,14 +36,25 @@ pub fn compile_debug(src: &str) -> Result<compiler::Program, String> {
 }
 
 /// Parse, compile, load, and run a Ruby source string on a fresh host; return
-/// the value of the last top-level expression.
+/// the value of the last top-level expression. `$LOAD_PATH`/`$LOADED_FEATURES`
+/// and the `require` file-dir stack are seeded with the current directory so a
+/// `require`/`require_relative` from a `-e` one-liner resolves against it.
 pub fn eval_str(src: &str) -> Result<Value, String> {
     host::reset_host();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    host::with_host(|h| h.init_load_path(&cwd.to_string_lossy()));
+    host::push_file_dir(cwd);
     run_compiled(compile(src)?)
 }
 
-/// Run an already-compiled program on the current (freshly reset) host.
-pub fn run_compiled(prog: compiler::Program) -> Result<Value, String> {
+/// Merge an already-compiled program onto the current host: rebase its
+/// proc/begin ids above what is already loaded (so ids never collide — see
+/// `compiler::rebase_program`), install its methods/classes/begins/procs, and
+/// return the (rebased) main chunk for the caller to run. Shared by the initial
+/// script run, each REPL line, and every `require`/`load`.
+pub fn load_merged(mut prog: compiler::Program) -> fusevm::Chunk {
+    let (proc_off, begin_off) = host::with_host(|h| h.program_offsets());
+    compiler::rebase_program(&mut prog, proc_off, begin_off);
     let compiler::Program {
         main,
         methods,
@@ -52,13 +63,29 @@ pub fn run_compiled(prog: compiler::Program) -> Result<Value, String> {
         procs,
     } = prog;
     host::with_host(|h| h.load_program(methods, classes, begins, procs));
-    host::run_main(main)
+    main
 }
 
-/// Read and run a `.rb` file.
+/// Run an already-compiled program on the current host (rebasing + merging it
+/// first, then running its main chunk at the top level).
+pub fn run_compiled(prog: compiler::Program) -> Result<Value, String> {
+    host::run_main(load_merged(prog))
+}
+
+/// Read and run a `.rb` file. Seeds `$LOAD_PATH`/`$LOADED_FEATURES` and the
+/// `require` file-dir stack with the script's own directory (MRI seeds the
+/// running script's dir), so `require`/`require_relative` resolve against it.
 pub fn eval_file(path: &str) -> Result<Value, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    eval_str(&src)
+    host::reset_host();
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+    let dir = abs
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    host::with_host(|h| h.init_load_path(&dir.to_string_lossy()));
+    host::push_file_dir(dir);
+    run_compiled(compile(&src)?)
 }
 
 /// Read and run a `.rb` file under the DAP debugger: compile with per-statement

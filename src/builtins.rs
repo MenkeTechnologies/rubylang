@@ -289,6 +289,15 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
                 }
             })
         }
+        // The directory of the file currently running (the top of the require
+        // file-dir stack), as a String. For a `-e` one-liner or piped stdin the
+        // stack is seeded with the current directory, so `__dir__` returns that.
+        "__dir__" => {
+            return match crate::host::current_file_dir() {
+                Some(d) => new_str(d.to_string_lossy().to_string()),
+                None => Value::Undef,
+            }
+        }
         _ => {}
     }
     // A bare name that is not a local is a zero-arg call: a method on `self` /
@@ -7884,7 +7893,9 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
         // `Kernel#open(path, mode="r")` delegates to `File.open` for a plain
         // path (no pipe/`|command` support).
         "open" => file_open(args, block),
-        "require" | "require_relative" | "load" => Ok(Value::Bool(true)),
+        "require" => do_require(args, ReqMode::Require),
+        "require_relative" => do_require(args, ReqMode::Relative),
+        "load" => do_require(args, ReqMode::Load),
         // AOP: `intercept(pattern, kind, handler)` registers `handler` (a method
         // name) to run as :before/:after/:around advice on any called method whose
         // name matches the glob `pattern`.
@@ -9089,6 +9100,218 @@ fn num_op_method(op: fusevm::NumOp) -> &'static str {
 
 /// Raise a typed exception: register the exception object (so `rescue Class` can
 /// match it) and return the message as the `Err` payload.
+/// Which of `require` / `require_relative` / `load` a call is.
+#[derive(Clone, Copy, PartialEq)]
+enum ReqMode {
+    Require,
+    Relative,
+    Load,
+}
+
+/// Standard-library names the runtime provides natively (or intentionally
+/// ignores), so `require '<name>'` is a no-op returning true rather than a file
+/// search. These never map to a `.rb` on disk.
+fn is_builtin_lib(name: &str) -> bool {
+    let n = name.strip_suffix(".rb").unwrap_or(name);
+    matches!(
+        n,
+        "set"
+            | "json"
+            | "date"
+            | "time"
+            | "securerandom"
+            | "digest"
+            | "base64"
+            | "bigdecimal"
+            | "pp"
+            | "prettyprint"
+            | "ostruct"
+            | "forwardable"
+            | "singleton"
+            | "comparable"
+            | "enumerable"
+            | "benchmark"
+            | "stringio"
+            | "strscan"
+            | "pathname"
+            | "fileutils"
+            | "tmpdir"
+            | "tempfile"
+            | "uri"
+            | "cgi"
+            | "erb"
+            | "yaml"
+            | "csv"
+            | "logger"
+            | "optparse"
+            | "open3"
+            | "socket"
+            | "io/console"
+            | "abbrev"
+            | "delegate"
+    )
+}
+
+/// A path exists as a regular file: return its canonical (absolute) form.
+fn try_file(p: &std::path::Path) -> Option<std::path::PathBuf> {
+    if p.is_file() {
+        std::fs::canonicalize(p).ok()
+    } else {
+        None
+    }
+}
+
+/// The current `$LOAD_PATH` entries as strings (reading the `$LOAD_PATH` alias,
+/// falling back to `$:`).
+fn load_path_dirs() -> Vec<String> {
+    with_host(|h| {
+        let lp = match h.get_global("LOAD_PATH") {
+            Value::Undef => h.get_global(":"),
+            v => v,
+        };
+        h.as_array(&lp)
+            .map(|xs| xs.iter().filter_map(|v| h.as_str(v)).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// Try `base/raw` and, unless it already ends in `.rb`, `base/raw.rb`.
+fn resolve_in(base: &std::path::Path, raw: &str) -> Option<std::path::PathBuf> {
+    if let Some(f) = try_file(&base.join(raw)) {
+        return Some(f);
+    }
+    if !raw.ends_with(".rb") {
+        if let Some(f) = try_file(&base.join(format!("{raw}.rb"))) {
+            return Some(f);
+        }
+    }
+    None
+}
+
+/// `require` resolution: an absolute path (with/without `.rb`), else every
+/// `$LOAD_PATH` entry, else the current directory.
+fn resolve_require(raw: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(raw);
+    if p.is_absolute() {
+        if let Some(f) = try_file(p) {
+            return Some(f);
+        }
+        if !raw.ends_with(".rb") {
+            return try_file(std::path::Path::new(&format!("{raw}.rb")));
+        }
+        return None;
+    }
+    for dir in load_path_dirs() {
+        if let Some(f) = resolve_in(std::path::Path::new(&dir), raw) {
+            return Some(f);
+        }
+    }
+    resolve_in(std::path::Path::new("."), raw)
+}
+
+/// `require_relative` resolution: relative to the requiring file's directory
+/// (the top of the file-dir stack), else the current directory.
+fn resolve_relative(raw: &str) -> Option<std::path::PathBuf> {
+    let base = crate::host::current_file_dir()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    resolve_in(&base, raw)
+}
+
+/// `load` resolution: an explicit path (absolute or `./`/`../`) relative to cwd
+/// or the current file's dir, else searched in `$LOAD_PATH`, then cwd. `load`
+/// never appends `.rb` — the name must include its extension.
+fn resolve_load(raw: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(raw);
+    if p.is_absolute() || raw.starts_with("./") || raw.starts_with("../") {
+        return try_file(p)
+            .or_else(|| crate::host::current_file_dir().and_then(|d| try_file(&d.join(raw))));
+    }
+    for dir in load_path_dirs() {
+        if let Some(f) = try_file(&std::path::Path::new(&dir).join(raw)) {
+            return Some(f);
+        }
+    }
+    try_file(p)
+}
+
+/// Whether `$LOADED_FEATURES` already contains `abs`.
+fn feature_loaded(abs: &str) -> bool {
+    with_host(|h| {
+        h.as_array(&h.get_global("LOADED_FEATURES"))
+            .map(|xs| xs.iter().any(|v| h.as_str(v).as_deref() == Some(abs)))
+            .unwrap_or(false)
+    })
+}
+
+/// Append `abs` to the `$LOADED_FEATURES` Array (in place, so the `$"` alias
+/// sees it too).
+fn record_feature(abs: &str) {
+    with_host(|h| {
+        let lf = h.get_global("LOADED_FEATURES");
+        if let Some(mut xs) = h.as_array(&lf) {
+            let s = h.new_string(abs.to_string());
+            xs.push(s);
+            h.set_array(&lf, xs);
+        }
+    });
+}
+
+/// Implement `require` / `require_relative` / `load`: resolve the path, dedup
+/// (`require`/`require_relative` only), read + compile, merge onto the host
+/// (rebasing proc/begin ids), and run the file's top level in its own scope
+/// while tracking its directory for nested `require_relative`.
+fn do_require(args: &[Value], mode: ReqMode) -> Result<Value, String> {
+    let raw = match args.first() {
+        Some(v) => with_host(|h| h.as_str(v)).unwrap_or_else(|| with_host(|h| h.to_s(v))),
+        None => {
+            return Err(raise_exc(
+                "ArgumentError",
+                "wrong number of arguments (given 0, expected 1)",
+            ))
+        }
+    };
+
+    // A known builtin library name is a no-op that reports success.
+    if mode == ReqMode::Require && is_builtin_lib(&raw) {
+        return Ok(Value::Bool(true));
+    }
+
+    let abs = match mode {
+        ReqMode::Require => resolve_require(&raw),
+        ReqMode::Relative => resolve_relative(&raw),
+        ReqMode::Load => resolve_load(&raw),
+    }
+    .ok_or_else(|| raise_exc("LoadError", &format!("cannot load such file -- {raw}")))?;
+    let abs_str = abs.to_string_lossy().to_string();
+
+    // `require`/`require_relative` dedup on the absolute path; `load` never does.
+    if mode != ReqMode::Load && feature_loaded(&abs_str) {
+        return Ok(Value::Bool(false));
+    }
+
+    let src = std::fs::read_to_string(&abs).map_err(|e| {
+        raise_exc("LoadError", &format!("cannot load such file -- {abs_str} ({e})"))
+    })?;
+    let prog = crate::compile(&src).map_err(|e| raise_exc("SyntaxError", &e))?;
+
+    // Record the feature before running the body so a circular `require` sees it
+    // already loaded and returns false instead of recursing (MRI behavior).
+    if mode != ReqMode::Load {
+        record_feature(&abs_str);
+    }
+
+    let main = crate::load_merged(prog);
+    let dir = abs
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    crate::host::push_file_dir(dir);
+    let r = crate::host::run_required_main(main);
+    crate::host::pop_file_dir();
+    r?;
+    Ok(Value::Bool(true))
+}
+
 pub(crate) fn raise_exc(class: &str, msg: &str) -> String {
     let exc = with_host(|h| h.new_exception(class, msg));
     with_host(|h| h.set_pending_exc(exc));

@@ -516,12 +516,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 // `$&` (whole match), `` $` `` (pre-match), `$'` (post-match),
                 // `$+` (last group), `$,` (output field separator), `$\` (output
                 // record separator), `$;` (input field separator), `$/` (input
-                // record separator), `$!` (last error). Otherwise an
-                // alphanumeric/underscore name.
+                // record separator), `$!` (last error), `$:` (load path, alias of
+                // `$LOAD_PATH`), `$"` (loaded features, alias of
+                // `$LOADED_FEATURES`). Otherwise an alphanumeric/underscore name.
                 if i < b.len()
                     && matches!(
                         b[i],
                         b'~' | b'&' | b'`' | b'\'' | b'+' | b',' | b'\\' | b';' | b'/' | b'!'
+                            | b':' | b'"'
                     )
                 {
                     i += 1;

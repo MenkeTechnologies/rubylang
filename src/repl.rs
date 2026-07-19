@@ -33,7 +33,7 @@ use reedline::{
     PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, Suggestion, Vi,
 };
 
-use crate::{banner, compiler::Program, host, lsp};
+use crate::{banner, host, lsp};
 
 const RUBY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -576,14 +576,9 @@ fn eval_line(line: &str) {
             return;
         }
     };
-    let Program {
-        main,
-        methods,
-        classes,
-        begins,
-        procs,
-    } = prog;
-    host::with_host(|h| h.load_program(methods, classes, begins, procs));
+    // Rebase + merge this line's program onto the live host so its proc/begin
+    // ids don't collide with earlier lines' already-loaded ids.
+    let main = crate::load_merged(prog);
     match host::run_main(main) {
         Ok(v) => {
             let s = host::with_host(|h| h.inspect(&v));
