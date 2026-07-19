@@ -1,0 +1,33 @@
+=== AppKit app driven in-process ===
+
+GET /users/42
+  status:  200
+  headers: {"X-Powered-By" => "AppKit/rubylang", "Content-Type" => "text/html"}
+  body:    "<!doctype html>\n<html>\n  <head><title>User 42</title></head>\n  <body>\n    <header>AppKit demo</header>\n    <main><article>\n  <h1>User 42</h1>\n  <p>User #42 is named user_42.</p>\n  <ul>\n  \n    <li>reader</li>\n  \n    <li>writer</li>\n  \n  </ul>\n</article>\n</main>\n    <footer>powered by rubylang</footer>\n  </body>\n</html>\n"
+
+GET /greet/Ada
+  status:  200
+  headers: {"X-Powered-By" => "AppKit/rubylang", "Content-Type" => "text/html"}
+  body:    "<p>Hello, Ada!</p>"
+
+GET /api/users/7
+  status:  200
+  headers: {"X-Powered-By" => "AppKit/rubylang", "Content-Type" => "application/json"}
+  body:    "{\"id\":7,\"name\":\"user_7\",\"active\":true}"
+
+GET /old (redirect)
+  status:  302
+  headers: {"X-Powered-By" => "AppKit/rubylang", "Location" => "/users/1"}
+  body:    ""
+
+POST /users (form body)
+  status:  201
+  headers: {"X-Powered-By" => "AppKit/rubylang", "Content-Type" => "text/html"}
+  body:    "created user: Grace"
+
+GET /missing (not_found)
+  status:  404
+  headers: {"X-Powered-By" => "AppKit/rubylang", "Content-Type" => "text/plain"}
+  body:    "no such page"
+
+=== done ===
