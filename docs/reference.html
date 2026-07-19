@@ -70,12 +70,55 @@
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>BUILTIN REFERENCE</h2>
-      <p class="tutorial-subtitle">Every builtin method the current rubylang build dispatches, grouped by class and module. This page is generated from the language-server corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it stays in sync with what the runtime and editor tooling actually know about. Each row mirrors a real dispatch arm in <code>src/builtins.rs</code>.</p>
+      <p class="tutorial-subtitle">Every reserved keyword and builtin method the current rubylang build recognizes, grouped by keyword set then class and module. This page is generated from the language-server corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it stays in sync with what the runtime and editor tooling actually know about. Keywords mirror <code>lexer.rs</code>; each method row mirrors a real dispatch arm in <code>src/builtins.rs</code>.</p>
 
       <div class="stat-grid">
-        <div class="stat-card"><div class="stat-val">837</div><div class="stat-label">Documented methods</div></div>
-        <div class="stat-card"><div class="stat-val accent">29</div><div class="stat-label">Classes &amp; modules</div></div>
+        <div class="stat-card"><div class="stat-val">871</div><div class="stat-label">Documented entries</div></div>
+        <div class="stat-card"><div class="stat-val accent">30</div><div class="stat-label">Keyword &amp; class sections</div></div>
       </div>
+
+      <section class="tutorial-section" id="ch-keyword">
+        <h2>Keyword</h2>
+        <table class="file-table">
+          <thead><tr><th>Method</th><th>Description</th></tr></thead>
+          <tbody>
+<tr><td><code>def</code></td><td>define a method; body runs on call, returns the last expression</td></tr>
+<tr><td><code>end</code></td><td>close a def/class/module/do/if/case/begin block</td></tr>
+<tr><td><code>class</code></td><td>open or reopen a class; `class A &lt; B` sets the superclass</td></tr>
+<tr><td><code>module</code></td><td>open or reopen a module (namespace / mixin)</td></tr>
+<tr><td><code>self</code></td><td>the current receiver object</td></tr>
+<tr><td><code>super</code></td><td>call the same method in the superclass (bare = pass same args)</td></tr>
+<tr><td><code>if</code></td><td>conditional; also the `expr if cond` statement modifier</td></tr>
+<tr><td><code>elsif</code></td><td>additional condition branch inside an if</td></tr>
+<tr><td><code>else</code></td><td>fallback branch of an if/unless/case/begin</td></tr>
+<tr><td><code>unless</code></td><td>negated conditional; also the `expr unless cond` modifier</td></tr>
+<tr><td><code>case</code></td><td>multi-way branch matched by `when` via `===`</td></tr>
+<tr><td><code>when</code></td><td>a case branch; matches its value against the subject with `===`</td></tr>
+<tr><td><code>while</code></td><td>loop while the condition is truthy; also a statement modifier</td></tr>
+<tr><td><code>until</code></td><td>loop until the condition is truthy; also a statement modifier</td></tr>
+<tr><td><code>for</code></td><td>iterate `for x in enumerable` without a new scope</td></tr>
+<tr><td><code>in</code></td><td>the `for x in …` separator and case/in pattern-match clause</td></tr>
+<tr><td><code>do</code></td><td>open a block (`each do |x| … end`) or a while/for body</td></tr>
+<tr><td><code>then</code></td><td>optional separator after an if/when condition</td></tr>
+<tr><td><code>yield</code></td><td>invoke the block passed to the current method</td></tr>
+<tr><td><code>return</code></td><td>return a value from the current method (nil if omitted)</td></tr>
+<tr><td><code>break</code></td><td>exit the nearest loop/block, optionally with a value</td></tr>
+<tr><td><code>next</code></td><td>skip to the next loop/block iteration, optionally with a value</td></tr>
+<tr><td><code>retry</code></td><td>re-run the begin body from a rescue clause</td></tr>
+<tr><td><code>begin</code></td><td>open an exception-handling block (rescue/ensure/else)</td></tr>
+<tr><td><code>rescue</code></td><td>handle a raised exception; also the `expr rescue fallback` modifier</td></tr>
+<tr><td><code>ensure</code></td><td>block that always runs whether or not an exception was raised</td></tr>
+<tr><td><code>and</code></td><td>low-precedence logical AND (short-circuits)</td></tr>
+<tr><td><code>or</code></td><td>low-precedence logical OR (short-circuits)</td></tr>
+<tr><td><code>not</code></td><td>low-precedence logical negation</td></tr>
+<tr><td><code>nil</code></td><td>the sole NilClass instance; the only falsey object besides false</td></tr>
+<tr><td><code>true</code></td><td>the sole TrueClass instance</td></tr>
+<tr><td><code>false</code></td><td>the sole FalseClass instance (falsey)</td></tr>
+<tr><td><code>alias</code></td><td>give a method a second name: `alias new old`</td></tr>
+<tr><td><code>defined?</code></td><td>describe the expression's kind ("method"/"expression"/…) or nil</td></tr>
+          </tbody>
+        </table>
+      </section>
 
       <section class="tutorial-section" id="ch-kernel">
         <h2>Kernel</h2>

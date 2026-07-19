@@ -46,8 +46,8 @@ fn build_body(corpus: &[(&str, &str, &str)], chapter_count: usize) -> String {
     let _ = write!(
         out,
         "\n      <div class=\"stat-grid\">\n\
-         \x20       <div class=\"stat-card\"><div class=\"stat-val\">{methods}</div><div class=\"stat-label\">Documented methods</div></div>\n\
-         \x20       <div class=\"stat-card\"><div class=\"stat-val accent\">{chapters}</div><div class=\"stat-label\">Classes &amp; modules</div></div>\n\
+         \x20       <div class=\"stat-card\"><div class=\"stat-val\">{methods}</div><div class=\"stat-label\">Documented entries</div></div>\n\
+         \x20       <div class=\"stat-card\"><div class=\"stat-val accent\">{chapters}</div><div class=\"stat-label\">Keyword &amp; class sections</div></div>\n\
          \x20     </div>\n",
         methods = corpus.len(),
         chapters = chapter_count,
@@ -184,7 +184,7 @@ const HEAD: &str = r#"<!DOCTYPE html>
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>BUILTIN REFERENCE</h2>
-      <p class="tutorial-subtitle">Every builtin method the current rubylang build dispatches, grouped by class and module. This page is generated from the language-server corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it stays in sync with what the runtime and editor tooling actually know about. Each row mirrors a real dispatch arm in <code>src/builtins.rs</code>.</p>
+      <p class="tutorial-subtitle">Every reserved keyword and builtin method the current rubylang build recognizes, grouped by keyword set then class and module. This page is generated from the language-server corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it stays in sync with what the runtime and editor tooling actually know about. Keywords mirror <code>lexer.rs</code>; each method row mirrors a real dispatch arm in <code>src/builtins.rs</code>.</p>
 "#;
 
 const FOOT: &str = r#"
