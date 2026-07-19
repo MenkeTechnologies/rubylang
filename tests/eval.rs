@@ -3222,7 +3222,7 @@ fn aop_intercept_weave() {
         $log = []
         def audit(*a); $log << :before; end
         def note(r);   $log << :after;  end
-        def double(r); r * 2; end
+        def double(*a); r = yield; r * 2; end
         def compute(x); x + 1; end
         intercept("compute", :before, :audit)
         intercept("compute", :after,  :note)
@@ -3242,6 +3242,79 @@ fn aop_intercept_weave() {
         plain(41)
         "#,
         "42",
+    );
+}
+
+#[test]
+fn aop_true_around_advice() {
+    // around handler that yields: before/after side effects fire and the
+    // original result passes through unchanged.
+    eq(
+        r#"
+        $log = []
+        def wrap(*a)
+          $log << :in
+          r = yield
+          $log << :out
+          r
+        end
+        def compute(x); x + 1; end
+        intercept("compute", :around, :wrap)
+        r = compute(10)
+        [r, $log]
+        "#,
+        "[11, [:in, :out]]",
+    );
+
+    // around handler transforms the yielded result.
+    eq(
+        r#"
+        def wrap(*a); r = yield; r * 3; end
+        def compute(x); x + 1; end
+        intercept("compute", :around, :wrap)
+        compute(4)
+        "#,
+        "15",
+    );
+
+    // around handler receives the ORIGINAL call args.
+    eq(
+        r#"
+        def wrap(x); r = yield; r + x; end
+        def compute(y); y * 2; end
+        intercept("compute", :around, :wrap)
+        compute(5)
+        "#,
+        "15",
+    );
+
+    // around handler that does NOT yield: the original body never runs
+    // (side-effect flag stays false) and the handler's own value is the result.
+    eq(
+        r#"
+        $ran = false
+        def wrap(*a); 99; end
+        def compute(x); $ran = true; x + 1; end
+        intercept("compute", :around, :wrap)
+        r = compute(10)
+        [r, $ran]
+        "#,
+        "[99, false]",
+    );
+
+    // before/after advice unchanged when no around is present: body runs, both fire.
+    eq(
+        r#"
+        $log = []
+        def audit(*a); $log << :before; end
+        def note(r);   $log << :after;  end
+        def compute(x); x + 1; end
+        intercept("compute", :before, :audit)
+        intercept("compute", :after,  :note)
+        r = compute(10)
+        [r, $log]
+        "#,
+        "[11, [:before, :after]]",
     );
 }
 
@@ -3400,4 +3473,52 @@ fn case_in_deconstruct_protocol() {
     eq("case({a:1}); in {a:}; a; end", "1");
     eq("case 5; in [a,b]; 1; else; :no; end", ":no");
     eq("case 5; in {a:}; 1; else; :no; end", ":no");
+}
+
+// --- Fanout round 3: Enumerator.new generators + cycle ---------------------
+
+#[test]
+fn enumerator_new_block_generators() {
+    // Finite generator: to_a collects every yielded value.
+    eq("Enumerator.new { |y| y << 1; y << 2; y << 3 }.to_a", "[1, 2, 3]");
+    // `Yielder#yield` is an alias of `<<` (parenthesized: rubylang has no
+    // paren-less command calls on dot-receivers).
+    eq("Enumerator.new { |y| y.yield(1); y.yield(2) }.to_a", "[1, 2]");
+    // first(n) with an explicit count returns an array.
+    eq("Enumerator.new { |y| y << 10; y << 20; y << 30 }.first(2)", "[10, 20]");
+    // Bare next on a finite generator (materialize + cursor).
+    eq("Enumerator.new { |y| y << 1 }.next", "1");
+    // Infinite fib generator bounded by first(n) via the loop{} early-stop.
+    eq(
+        "fib = Enumerator.new { |y| a,b=0,1; loop { y << a; a,b = b,a+b } }; fib.first(8)",
+        "[0, 1, 1, 2, 3, 5, 8, 13]",
+    );
+    // Non-terminal Enumerable method over a finite generator delegates to Array.
+    eq("Enumerator.new { |y| y << 1; y << 2 }.map { |x| x * 10 }", "[10, 20]");
+}
+
+#[test]
+fn enumerator_new_infinite_lazy() {
+    // Infinite generator + lazy pipeline, bounded by first(n).
+    eq(
+        "g = Enumerator.new { |y| a=0; loop { y << a; a+=1 } }; g.lazy.map { |x| x*2 }.first(3)",
+        "[0, 2, 4]",
+    );
+}
+
+#[test]
+fn array_cycle_count() {
+    eq("[1, 2].cycle(3).to_a", "[1, 2, 1, 2, 1, 2]");
+    eq("[1, 2].cycle(0).to_a", "[]");
+    eq("[].cycle(3).to_a", "[]");
+    // Block form (already worked) — regression guard.
+    eq("s = 0; [1, 2].cycle(2) { |x| s += x }; s", "6");
+}
+
+#[test]
+fn enumerator_block_less_still_works() {
+    // Guard: block-less each/lazy on real collections is unaffected.
+    eq("[1, 2, 3].each.to_a", "[1, 2, 3]");
+    eq("(1..Float::INFINITY).lazy.map { |x| x * x }.first(3)", "[1, 4, 9]");
+    eq("[10, 20, 30].each.next", "10");
 }

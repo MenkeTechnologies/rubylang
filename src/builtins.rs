@@ -837,8 +837,11 @@ pub(crate) fn dispatch(
         // `.lazy` wraps an enumerable in a lazy pipeline. A range (possibly
         // endless) stays a range source; anything else materializes to an array.
         "lazy" if with_host(|h| h.lazy_parts(recv)).is_none() => {
-            let source = if with_host(|h| h.as_range(recv).is_some() || h.as_array(recv).is_some())
-            {
+            let source = if with_host(|h| {
+                h.as_range(recv).is_some()
+                    || h.as_array(recv).is_some()
+                    || h.generator_block(recv).is_some()
+            }) {
                 recv.clone()
             } else {
                 new_arr(with_host(|h| h.as_array(recv)).unwrap_or_default())
@@ -919,6 +922,7 @@ pub(crate) fn dispatch(
         "DateTime" => dispatch_datetime(recv, name, args),
         "Enumerator" => dispatch_enumerator(recv, name, args, block),
         "Enumerator::Lazy" => dispatch_lazy(recv, name, args, block),
+        "Enumerator::Yielder" => dispatch_yielder(recv, name, args),
         "Rational" => dispatch_rational(recv, name, args),
         "Complex" => dispatch_complex(recv, name, args),
         "TrueClass" | "FalseClass" | "NilClass" => dispatch_bool(recv, name, args),
@@ -998,6 +1002,14 @@ fn dispatch_classref(
                 .collect();
             return Ok(new_arr(syms));
         }
+    }
+    // `Enumerator.new { |y| ... }` — a block-based generator. The block drives
+    // the enumerator by sending `<<`/`yield` to the yielder it receives.
+    if cls == "Enumerator" && name == "new" {
+        let b = block.ok_or_else(|| {
+            raise_exc("ArgumentError", "tried to create Enumerator without a block")
+        })?;
+        return Ok(with_host(|h| h.new_generator(b)));
     }
     // `Set.new(enum)` / `Set[a, b, c]` — a deduplicated collection.
     if cls == "Set" {
@@ -4684,8 +4696,22 @@ fn dispatch_array(
         }
         "cycle" => {
             let Some(bl) = &block else {
-                // Without a block MRI returns an Enumerator; no Enumerator type yet.
-                return Ok(Value::Undef);
+                // Block-less `cycle(n)` is a finite Enumerator over the elements
+                // repeated `n` times (`[1,2].cycle(3).to_a == [1,2,1,2,1,2]`).
+                // Block-less endless `cycle` (no count) is an infinite Enumerator
+                // that cannot be eagerly materialized — no generator source here,
+                // so it stays nil (external iteration over it is unsupported).
+                return match args.first() {
+                    Some(n) => {
+                        let times = as_i(n).max(0) as usize;
+                        let mut out: Vec<Value> = Vec::with_capacity(arr.len() * times);
+                        for _ in 0..times {
+                            out.extend(arr.iter().cloned());
+                        }
+                        Ok(with_host(|h| h.new_enumerator(out, "each")))
+                    }
+                    None => Ok(Value::Undef),
+                };
             };
             match args.first() {
                 Some(n) => {
@@ -5177,6 +5203,37 @@ fn lazy_pull(
             }
             n += 1;
         }
+    } else if let Some(gblock) = with_host(|h| h.generator_block(source)) {
+        // A generator source: drive it in growing raw-value batches, feeding
+        // each value through the pipeline, until it yields `limit` outputs or the
+        // generator is exhausted. Re-driving re-runs the (pure) block from the
+        // start. A pipeline that never reaches `limit` over an infinite generator
+        // (e.g. `.select { false }.first(1)`) loops forever, matching MRI.
+        let mut raw_bound = limit.saturating_mul(2).max(16);
+        loop {
+            out.clear();
+            for (op, st) in ops.iter().zip(state.iter_mut()) {
+                *st = match op {
+                    LazyOp::Take(n) => LazyState::Take(*n),
+                    LazyOp::Drop(n) => LazyState::Drop(*n),
+                    LazyOp::DropWhile(_) => LazyState::Dropping(true),
+                    _ => LazyState::None,
+                };
+            }
+            let raws = drive_generator(&gblock, raw_bound)?;
+            let produced = raws.len();
+            let mut stopped = false;
+            for elem in raws {
+                if !lazy_feed(ops, &mut state, 0, elem, &mut out, limit)? {
+                    stopped = true;
+                    break;
+                }
+            }
+            if out.len() >= limit || produced < raw_bound || stopped {
+                break;
+            }
+            raw_bound = raw_bound.saturating_mul(2);
+        }
     }
     Ok(out)
 }
@@ -5192,6 +5249,9 @@ fn dispatch_enumerator(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    if let Some(gblock) = with_host(|h| h.generator_block(recv)) {
+        return dispatch_generator(recv, &gblock, name, args, block);
+    }
     let buf = with_host(|h| h.enum_buf(recv).unwrap_or_default());
     match name {
         "next" if args.is_empty() && block.is_none() => {
@@ -5276,6 +5336,103 @@ fn dispatch_enumerator(
         // Array, preserving the full Enumerable surface (`map`, `to_a`,
         // `select`, …) that block-less calls exposed before Enumerator existed.
         _ => remap_array_delegate(dispatch_array(&new_arr(buf), name, args, block), recv, name),
+    }
+}
+
+/// The native `Enumerator::Yielder` handed to a generator block as `|y|`.
+/// `<<`/`yield` push into the yielder's collector; hitting the drive's `limit`
+/// raises a break signal that unwinds the generator body (bounding infinite
+/// `loop {}` generators for `first(n)`/`take(n)`).
+fn dispatch_yielder(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "<<" | "yield" => {
+            let v = match args {
+                [single] => single.clone(),
+                many => new_arr(many.to_vec()),
+            };
+            if with_host(|h| h.yielder_push(recv, v)) {
+                raise_signal_break(Value::Undef);
+            }
+            // `<<` returns the yielder (so `y << 1 << 2` chains); `yield` returns
+            // nil in MRI, but generator blocks discard it, so `recv` is faithful.
+            Ok(recv.clone())
+        }
+        _ => Err(no_method_error(recv, name)),
+    }
+}
+
+/// Run a generator block, collecting yielded values, stopping once `limit`
+/// values are produced. `usize::MAX` runs the block to completion (finite
+/// generators / `to_a`). The yielder's limiter raises a break signal to unwind
+/// infinite `loop {}`/`while` generators; that break is expected and cleared.
+fn drive_generator(gblock: &Value, limit: usize) -> Result<Vec<Value>, String> {
+    let yielder = with_host(|h| h.new_yielder(limit));
+    let r = call_proc(gblock, std::slice::from_ref(&yielder));
+    let buf = with_host(|h| h.take_enum_sink());
+    // Clear the limiter's break (a generator block never breaks on its own).
+    take_break();
+    r?;
+    Ok(buf)
+}
+
+/// A block-based generator (`Enumerator.new { |y| ... }`). Terminal operations
+/// re-drive the block; `next`/`peek` materialize it to completion once.
+fn dispatch_generator(
+    recv: &Value,
+    gblock: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    match name {
+        "first" => {
+            let n = args.first().map(|v| as_i(v).max(0) as usize);
+            let out = drive_generator(gblock, n.unwrap_or(1))?;
+            match n {
+                Some(_) => Ok(new_arr(out)),
+                None => Ok(out.into_iter().next().unwrap_or(Value::Undef)),
+            }
+        }
+        "take" => {
+            let n = args.first().map(|v| as_i(v).max(0) as usize).unwrap_or(0);
+            Ok(new_arr(drive_generator(gblock, n)?))
+        }
+        "to_a" | "force" | "entries" => Ok(new_arr(drive_generator(gblock, usize::MAX)?)),
+        "each" if block.is_some() => {
+            let bl = block.unwrap();
+            for v in drive_generator(gblock, usize::MAX)? {
+                call_proc(&bl, std::slice::from_ref(&v))?;
+            }
+            Ok(recv.clone())
+        }
+        // `.lazy` keeps the generator as the pipeline source (see `lazy_pull`).
+        "lazy" => Ok(with_host(|h| h.new_lazy(recv.clone(), vec![]))),
+        // External iteration: materialize to completion on first use, then
+        // cursor. An infinite generator here runs forever — there are no fibers.
+        "next" | "peek" if args.is_empty() && block.is_none() => {
+            let need = with_host(|h| h.generator_unmaterialized(recv));
+            if need {
+                let buf = drive_generator(gblock, usize::MAX)?;
+                with_host(|h| h.set_generator_materialized(recv, buf));
+            }
+            match with_host(|h| h.generator_next(recv, name == "next")) {
+                Some(v) => Ok(v),
+                None => Err(raise_exc("StopIteration", "iteration reached an end")),
+            }
+        }
+        "rewind" if args.is_empty() => {
+            with_host(|h| h.generator_rewind(recv));
+            Ok(recv.clone())
+        }
+        // MRI returns nil for a generator's size (unknown without running it).
+        "size" => Ok(Value::Undef),
+        // Everything else (`map`, `select`, `reduce`, …): materialize fully and
+        // delegate to Array. Faithful for finite generators; an infinite one
+        // hangs here exactly as it does in MRI.
+        _ => {
+            let buf = drive_generator(gblock, usize::MAX)?;
+            dispatch_array(&new_arr(buf), name, args, block)
+        }
     }
 }
 

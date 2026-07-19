@@ -248,6 +248,25 @@ pub enum RObj {
         /// returns the receiver.
         method: String,
     },
+    /// A block-based generator (`Enumerator.new { |y| ... }`): the user block
+    /// that drives it by sending `<<`/`yield` to a yielder. Driven on demand by
+    /// `to_a`/`first`/`take`/`lazy`; each drive re-runs the block from the start
+    /// (blocks are pure/re-runnable). `materialized` caches external-iteration
+    /// state — `None` until the first `next`/`peek`, which runs the block to
+    /// completion (so `.next` on an *infinite* generator runs forever: there are
+    /// no fibers/coroutines here, so external iteration cannot pause a block).
+    Generator {
+        block: Value,
+        materialized: Option<(Vec<Value>, usize)>,
+    },
+    /// The native `Enumerator::Yielder` passed to a generator block as `|y|`.
+    /// `<<`/`yield` push into the collector `enum_sinks[sink]`; once the buffer
+    /// reaches `limit`, `<<`/`yield` raise a break signal to unwind the block,
+    /// bounding infinite `loop {}`/`while` generators for `first(n)`/`take(n)`.
+    Yielder {
+        sink: usize,
+        limit: usize,
+    },
     /// A `Time`, stored as seconds since the Unix epoch (a float, so
     /// sub-second precision and `Time - Time` Float differences are faithful).
     /// Always interpreted as UTC — the local-timezone offset is not modeled
@@ -338,6 +357,11 @@ pub enum ProcKind {
     /// `Enumerable`'s elements: calling it appends its argument to
     /// `enum_sinks[usize]` and returns nil. Never escapes to user code.
     Collect(usize),
+    /// A native around-advice block (no template): calling it (via `yield` in an
+    /// around handler) runs the intercepted method's original body once,
+    /// un-advised. `usize` indexes the host's `around_stack`. Never escapes to
+    /// user code as a normal proc.
+    Around(usize),
 }
 
 /// A user-defined class: its optional superclass, its instance methods, the
@@ -438,6 +462,20 @@ enum Signal {
     Throw(Value, Value),
 }
 
+/// A pending around-advice weave: the intercepted call captured so a native
+/// `ProcKind::Around` block can re-run it once, plus the around handlers still
+/// to be applied (outermost first). Nested arounds each carry the remainder.
+#[derive(Clone)]
+struct AroundCall {
+    handlers: Vec<String>,
+    def: MethodDef,
+    self_obj: Value,
+    args: Vec<Value>,
+    block: Option<Value>,
+    method_name: Option<String>,
+    def_class: Option<String>,
+}
+
 /// The Ruby runtime.
 pub struct RubyHost {
     heap: Vec<RObj>,
@@ -467,6 +505,10 @@ pub struct RubyHost {
     /// value here, and `take_enum_sink` reclaims the buffer. A stack (not a single
     /// buffer) so a nested enumerable call inside `each` can't clobber the outer one.
     enum_sinks: Vec<Vec<Value>>,
+    /// A LIFO stack of pending around-advice weaves (see `AroundCall`). A native
+    /// `ProcKind::Around(idx)` block references `around_stack[idx]`; entries are
+    /// valid only for the duration of the top-level around weave that pushed them.
+    around_stack: Vec<AroundCall>,
     /// `Struct.new(:a, :b)` definitions: class name → (member names, keyword_init).
     /// Anonymous structs start as `Struct:N` and are renamed when first assigned
     /// to a constant (`Point = Struct.new(...)`).
@@ -529,6 +571,7 @@ impl RubyHost {
             active_scope: None,
             frozen: HashSet::new(),
             enum_sinks: Vec::new(),
+            around_stack: Vec::new(),
             struct_defs: IndexMap::new(),
             struct_counter: 0,
             class_vars: IndexMap::new(),
@@ -753,6 +796,82 @@ impl RubyHost {
             cursor: 0,
             method: method.to_string(),
         })
+    }
+    /// Build a block-based generator (`Enumerator.new { |y| ... }`).
+    pub fn new_generator(&mut self, block: Value) -> Value {
+        self.alloc(RObj::Generator {
+            block,
+            materialized: None,
+        })
+    }
+    /// The driving block of a `Generator`, if `v` is one.
+    pub fn generator_block(&self, v: &Value) -> Option<Value> {
+        match self.obj(v) {
+            Some(RObj::Generator { block, .. }) => Some(block.clone()),
+            _ => None,
+        }
+    }
+    /// Whether `v` is a generator that has not yet been materialized.
+    pub fn generator_unmaterialized(&self, v: &Value) -> bool {
+        matches!(self.obj(v), Some(RObj::Generator { materialized: None, .. }))
+    }
+    /// Open a fresh sink and return a `Yielder` bound to it that stops the
+    /// generator after `limit` values (`usize::MAX` = run to completion). Pair
+    /// with `take_enum_sink` once the drive returns.
+    pub fn new_yielder(&mut self, limit: usize) -> Value {
+        let sink = self.enum_sinks.len();
+        self.enum_sinks.push(Vec::new());
+        self.alloc(RObj::Yielder { sink, limit })
+    }
+    /// Push a value produced by a `Yielder`'s `<<`/`yield`. Returns `true` when
+    /// the sink has reached its limit (the caller raises a break signal).
+    pub fn yielder_push(&mut self, v: &Value, val: Value) -> bool {
+        if let Some(RObj::Yielder { sink, limit }) = self.obj(v).cloned() {
+            let len = self.enum_sinks.get(sink).map(|s| s.len()).unwrap_or(0);
+            if len >= limit {
+                return true;
+            }
+            if let Some(s) = self.enum_sinks.get_mut(sink) {
+                s.push(val);
+            }
+            return len + 1 >= limit;
+        }
+        false
+    }
+    /// Cache a `Generator`'s fully-materialized buffer for external iteration.
+    pub fn set_generator_materialized(&mut self, v: &Value, buf: Vec<Value>) {
+        if let Some(RObj::Generator { materialized, .. }) = self.obj_mut(v) {
+            *materialized = Some((buf, 0));
+        }
+    }
+    /// External iteration over a materialized generator; `None` past the end.
+    pub fn generator_next(&mut self, v: &Value, advance: bool) -> Option<Value> {
+        if let Some(RObj::Generator {
+            materialized: Some((buf, cursor)),
+            ..
+        }) = self.obj_mut(v)
+        {
+            if *cursor >= buf.len() {
+                return None;
+            }
+            let out = buf[*cursor].clone();
+            if advance {
+                *cursor += 1;
+            }
+            Some(out)
+        } else {
+            None
+        }
+    }
+    /// Reset a materialized generator's external-iteration cursor.
+    pub fn generator_rewind(&mut self, v: &Value) {
+        if let Some(RObj::Generator {
+            materialized: Some((_, cursor)),
+            ..
+        }) = self.obj_mut(v)
+        {
+            *cursor = 0;
+        }
     }
     /// The buffered values of an `Enumerator`, if `v` is one.
     pub fn enum_buf(&self, v: &Value) -> Option<Vec<Value>> {
@@ -1041,7 +1160,7 @@ impl RubyHost {
         match self.obj(v) {
             Some(RObj::Proc { kind, template, .. }) => match kind {
                 ProcKind::Curried { .. } | ProcKind::Composed { .. } => Some(-1),
-                ProcKind::Collect(_) => Some(1),
+                ProcKind::Collect(_) | ProcKind::Around(_) => Some(1),
                 ProcKind::Normal => Some(self.procs[*template].params.len() as i64),
             },
             _ => None,
@@ -1059,7 +1178,9 @@ impl RubyHost {
             }) => {
                 let arity = match kind {
                     ProcKind::Curried { arity, .. } => arity,
-                    ProcKind::Composed { .. } | ProcKind::Collect(_) => return Some(v.clone()),
+                    ProcKind::Composed { .. } | ProcKind::Collect(_) | ProcKind::Around(_) => {
+                        return Some(v.clone())
+                    }
                     ProcKind::Normal => self.procs[template].params.len(),
                 };
                 Some(self.alloc(RObj::Proc {
@@ -1108,6 +1229,52 @@ impl RubyHost {
     /// Reclaim the most recently opened collector buffer (LIFO with `new_enum_sink`).
     pub fn take_enum_sink(&mut self) -> Vec<Value> {
         self.enum_sinks.pop().unwrap_or_default()
+    }
+    /// Push a pending around weave and return its index (for a `ProcKind::Around` block).
+    #[allow(clippy::too_many_arguments)]
+    fn push_around(
+        &mut self,
+        handlers: Vec<String>,
+        def: MethodDef,
+        self_obj: Value,
+        args: Vec<Value>,
+        block: Option<Value>,
+        method_name: Option<String>,
+        def_class: Option<String>,
+    ) -> usize {
+        let idx = self.around_stack.len();
+        self.around_stack.push(AroundCall {
+            handlers,
+            def,
+            self_obj,
+            args,
+            block,
+            method_name,
+            def_class,
+        });
+        idx
+    }
+    /// Clone the around weave at `idx` (a native `ProcKind::Around` block target).
+    fn around_call(&self, idx: usize) -> AroundCall {
+        self.around_stack[idx].clone()
+    }
+    /// Current around-stack depth (checkpoint for `truncate_around`).
+    fn around_len(&self) -> usize {
+        self.around_stack.len()
+    }
+    /// Drop around weaves pushed since a checkpoint (bounds the stack per call).
+    fn truncate_around(&mut self, n: usize) {
+        self.around_stack.truncate(n);
+    }
+    /// Allocate a native around-advice block bound to `around_stack[idx]`.
+    fn new_around_block(&mut self, idx: usize) -> Value {
+        let scope = self.cur_scope().clone();
+        self.alloc(RObj::Proc {
+            template: 0,
+            scope,
+            is_lambda: false,
+            kind: ProcKind::Around(idx),
+        })
     }
     /// Allocate the native proc backing `Symbol#to_proc`.
     pub fn new_sym_proc(&mut self, sym: &str) -> Value {
@@ -1673,6 +1840,7 @@ impl RubyHost {
                 | "FalseClass"
                 | "Set"
                 | "Struct"
+                | "Enumerator"
                 | "Time"
                 | "Date"
                 | "DateTime"
@@ -1970,6 +2138,10 @@ impl RubyHost {
                 Some(RObj::Enumerator { buf, .. }) => {
                     format!("#<Enumerator: {}>", self.inspect_array(&buf))
                 }
+                Some(RObj::Generator { .. }) => {
+                    "#<Enumerator: #<Enumerator::Generator>:each>".to_string()
+                }
+                Some(RObj::Yielder { .. }) => "#<Enumerator::Yielder>".to_string(),
                 Some(RObj::Range { lo, hi, exclusive }) => {
                     format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
                 }
@@ -2124,6 +2296,8 @@ impl RubyHost {
                 Some(RObj::Complex { .. }) => "Complex",
                 Some(RObj::Lazy { .. }) => "Enumerator::Lazy",
                 Some(RObj::Enumerator { .. }) => "Enumerator",
+                Some(RObj::Generator { .. }) => "Enumerator",
+                Some(RObj::Yielder { .. }) => "Enumerator::Yielder",
                 Some(RObj::Time { .. }) => "Time",
                 Some(RObj::Date { .. }) => "Date",
                 Some(RObj::DateTime { .. }) => "DateTime",
@@ -2805,6 +2979,78 @@ fn fire_advice(handler: &str, args: &[Value]) -> Result<Value, String> {
     r
 }
 
+/// Like `fire_advice`, but hands the handler a block (for true around-advice: the
+/// block, when yielded, re-runs the intercepted method's original body).
+fn fire_advice_block(handler: &str, args: &[Value], block: Option<Value>) -> Result<Value, String> {
+    IN_ADVICE.with(|f| f.set(f.get() + 1));
+    let r = call_method(handler, args, block);
+    IN_ADVICE.with(|f| f.set(f.get() - 1));
+    r
+}
+
+/// Run the around-advice chain for an intercepted call: each handler runs in
+/// place of the body and receives the original args plus a block that runs the
+/// next inner layer (another around handler, or finally the real body) once.
+/// The outermost handler's return value is the call's result.
+#[allow(clippy::too_many_arguments)]
+fn run_around(
+    handlers: &[String],
+    def: &MethodDef,
+    self_obj: &Value,
+    args: &[Value],
+    block: &Option<Value>,
+    method_name: &Option<String>,
+    def_class: &Option<String>,
+) -> Result<Value, String> {
+    let base = with_host(|h| h.around_len());
+    let idx = with_host(|h| {
+        h.push_around(
+            handlers.to_vec(),
+            def.clone(),
+            self_obj.clone(),
+            args.to_vec(),
+            block.clone(),
+            method_name.clone(),
+            def_class.clone(),
+        )
+    });
+    let r = drive_around(idx);
+    with_host(|h| h.truncate_around(base));
+    r
+}
+
+/// Advance one layer of an around weave. With handlers remaining, fire the next
+/// one with a fresh native block bound to the rest; with none left, run the real
+/// method body once (un-advised — `IN_ADVICE` is nonzero while a handler runs).
+fn drive_around(idx: usize) -> Result<Value, String> {
+    let call = with_host(|h| h.around_call(idx));
+    match call.handlers.split_first() {
+        None => run_method(
+            &call.def,
+            call.self_obj,
+            &call.args,
+            call.block,
+            call.method_name,
+            call.def_class,
+        ),
+        Some((handler, rest)) => {
+            let child = with_host(|h| {
+                h.push_around(
+                    rest.to_vec(),
+                    call.def.clone(),
+                    call.self_obj.clone(),
+                    call.args.clone(),
+                    call.block.clone(),
+                    call.method_name.clone(),
+                    call.def_class.clone(),
+                )
+            });
+            let blk = with_host(|h| h.new_around_block(child));
+            fire_advice_block(handler, &call.args, Some(blk))
+        }
+    }
+}
+
 /// Run a resolved method: push a fresh frame bound to `self_obj`, bind args, and
 /// run the body with locals targeting that new top frame.
 #[allow(clippy::too_many_arguments)]
@@ -2832,6 +3078,34 @@ fn run_method(
             if *kind == Advice::Before {
                 fire_advice(handler, args)?;
             }
+        }
+        // True around-advice: the handler runs INSTEAD of the body. It receives
+        // the original call args and a block that, when yielded, runs the real
+        // method body once — un-advised, because the IN_ADVICE guard set while a
+        // handler runs suppresses re-weaving. The handler's return value is the
+        // call's result whether or not it yielded (MRI around semantics). `after`
+        // advice observes that final result.
+        let arounds: Vec<String> = adv
+            .iter()
+            .filter(|(k, _)| *k == Advice::Around)
+            .map(|(_, h)| h.clone())
+            .collect();
+        if !arounds.is_empty() {
+            let val = run_around(
+                &arounds,
+                def,
+                &self_obj,
+                args,
+                &block,
+                &method_name,
+                &def_class,
+            )?;
+            for (kind, handler) in adv {
+                if *kind == Advice::After {
+                    fire_advice(handler, std::slice::from_ref(&val))?;
+                }
+            }
+            return Ok(val);
         }
     }
     let saved_active = with_host(|h| {
@@ -2883,16 +3157,12 @@ fn run_method(
         return result;
     };
     match result {
-        Ok(mut val) => {
+        Ok(val) => {
+            // `around` never reaches here (handled above, before the body ran);
+            // only `after` observes the raw-body result.
             for (kind, handler) in &adv {
-                match kind {
-                    Advice::After => {
-                        fire_advice(handler, std::slice::from_ref(&val))?;
-                    }
-                    Advice::Around => {
-                        val = fire_advice(handler, std::slice::from_ref(&val))?;
-                    }
-                    Advice::Before => {}
+                if *kind == Advice::After {
+                    fire_advice(handler, std::slice::from_ref(&val))?;
                 }
             }
             Ok(val)
@@ -3155,6 +3425,12 @@ pub fn call_proc_self(
             };
             with_host(|h| h.enum_sinks[idx].push(elem));
             return Ok(Value::Undef);
+        }
+        ProcKind::Around(idx) => {
+            // A native around block: `yield` in an around handler re-runs the
+            // intercepted method's original body once. Yield args are ignored —
+            // the original runs with its own captured arguments (MRI around).
+            return drive_around(idx);
         }
         ProcKind::Normal => {}
     }

@@ -1265,3 +1265,13 @@ puts d.to_date.to_s
 puts DateTime.parse("2019-06-15T08:00:00").to_s
 puts [d, DateTime.new(2019, 1, 1), DateTime.new(2020, 1, 5)].sort.map(&:to_s).inspect
 puts d.is_a?(Date)
+#==#
+p Enumerator.new { |y| y << 1; y << 2; y << 3 }.to_a
+p Enumerator.new { |y| y.yield(10); y.yield(20) }.to_a
+p Enumerator.new { |y| y << 100; y << 200; y << 300 }.first(2)
+fib = Enumerator.new { |y| a, b = 0, 1; loop { y << a; a, b = b, a + b } }
+p fib.first(10)
+g = Enumerator.new { |y| n = 0; loop { y << n; n += 1 } }
+p g.lazy.map { |x| x * x }.select { |x| x.even? }.first(4)
+p [1, 2, 3].cycle(3).to_a
+p Enumerator.new { |y| y << :a; y << :b }.map { |s| s.to_s.upcase }

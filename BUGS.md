@@ -53,6 +53,11 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   class, so `def`, `attr_*`, `include`, class variables (`@@x = 0`), constants,
   and other executable statements all take effect. (Constants are stored
   globally rather than namespaced under the class.)
+- **`yield` directly before `+`/`-` with no space** (`"[" + yield+"]"`) misparses
+  the operator as an argument to `yield` (`yield(+"]")`), dropping the trailing
+  term. Add a space (`yield + "]"`) or parenthesize (`(yield)`); the same
+  spacing rule already applies in MRI to `foo +1` vs `foo + 1`, but rubylang
+  mis-splits this particular `yield` case.
 - **Modifier `rescue` inside call-args / array literals.** Numeric-literal
   binding (`-7.abs` → `(-7).abs`, with `-2**2` → `-(2**2)`) and modifier
   `rescue` precedence (`x = a rescue b` → `x = (a rescue b)`, plus grouping
@@ -122,8 +127,21 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   and `with_object(memo)`. `with_index` honors the source method — `map`/
   `flat_map` collect the block's results, `select`/`reject` filter, `each`
   returns the elements; `with_object` threads the memo and returns it. Finite
-  sources are eagerly materialized (faithful for everything except endless
-  generators, which are not modeled).
+  block-less sources are eagerly materialized.
+- **Block-based generators.** `Enumerator.new { |y| ... }` drives the block with
+  a native `Enumerator::Yielder`; `y << v` and its alias `y.yield(v)` push
+  yielded values. `to_a`/`first(n)`/`take(n)`/`each`/`lazy` re-run the block on
+  demand. Infinite generators (`loop { y << ... }`) are bounded by `first(n)`,
+  `take(n)`, and lazy pipelines (`gen.lazy.map { ... }.first(n)`): the yielder
+  raises a break signal once the requested count is reached, unwinding the loop
+  (the same early-stop mechanism as endless-range `.lazy`). `Array#cycle(n)`
+  (block-less) returns a finite Enumerator over the elements repeated `n` times.
+  Limits: external iteration (`next`/`peek`) materializes the block to completion
+  on first use, so it works only for *finite* generators — an infinite
+  generator's `.next` runs forever (no fibers/coroutines to pause a block);
+  `y.yield` must be called with parentheses (`y.yield(v)`), as paren-less command
+  calls on a dot-receiver are not parsed; and block-less endless `cycle` (no
+  count) stays `nil` (it would need an infinite external-iteration enumerator).
 - **Bignum.** Integers auto-promote to arbitrary precision on overflow, like
   MRI: values that fit stay `i64` immediates, and only the overflow path
   allocates a `BigInt` heap object (backed by `num-bigint`). Arithmetic, bit
@@ -225,12 +243,17 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   runs the program to completion with stdout capture, but breakpoints and
   stepping are not wired yet.
 - **AOP weave.** `before`/`after`/`around` advice registered via the Ruby-facing
-  `intercept(pattern, kind, handler)` builtin now fires from the `run_method`
-  dispatch choke point: `before` runs pre-call with the call args, `after` runs
-  post-call with the result (observe-only), `around` runs post-call and replaces
-  the result. Weaving is gated on an O(1) `intercepts::any()` check, so calls with
-  no registered advice are unaffected, and a reentrancy guard prevents handlers
-  from advising themselves. Not yet supported: true "call the original from inside
-  the handler" wrapping — the registry stores only a handler name and there is no
-  native proc that re-invokes the original body, so `around` is a post-transform
-  rather than a sandwich. Adding that needs an original-as-block substrate.
+  `intercept(pattern, kind, handler)` builtin fires from the `run_method` dispatch
+  choke point: `before` runs pre-call with the call args, `after` runs post-call
+  with the final result (observe-only), and `around` is a true sandwich — the
+  handler runs INSTEAD of the body, receiving the original call args plus a block
+  that, when yielded, runs the real body once. The block is a native
+  `ProcKind::Around` proc backed by the host `around_stack`; re-entering
+  `run_method` under the `IN_ADVICE` guard runs the original un-advised (no
+  infinite recursion). The handler's return value is the call's result whether or
+  not it yielded (MRI around semantics); stacked around handlers nest. Weaving is
+  gated on an O(1) `intercepts::any()` check, so calls with no registered advice
+  are unaffected. Limitations: yield args to the around block are ignored (the
+  original always runs with its captured args), and the native block is valid only
+  during the weave that created it (capturing it and calling it after the
+  intercepted call returns is unsupported — stale `around_stack` index).
