@@ -40,18 +40,8 @@ fn main() {
 }
 
 /// Render the stat grid plus one section/table per chapter, in corpus order.
-fn build_body(corpus: &[(&str, &str, &str)], chapter_count: usize) -> String {
+fn build_body(corpus: &[(&str, &str, &str)], _chapter_count: usize) -> String {
     let mut out = String::new();
-
-    let _ = write!(
-        out,
-        "\n      <div class=\"stat-grid\">\n\
-         \x20       <div class=\"stat-card\"><div class=\"stat-val\">{methods}</div><div class=\"stat-label\">Documented entries</div></div>\n\
-         \x20       <div class=\"stat-card\"><div class=\"stat-val accent\">{chapters}</div><div class=\"stat-label\">Keyword &amp; class sections</div></div>\n\
-         \x20     </div>\n",
-        methods = corpus.len(),
-        chapters = chapter_count,
-    );
 
     // Walk the corpus once, opening a new section each time the chapter changes.
     let mut current: Option<&str> = None;
