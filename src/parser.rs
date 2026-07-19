@@ -969,7 +969,9 @@ impl Parser {
             return None;
         }
         match self.peek() {
-            Tok::Ident(s) | Tok::Keyword(s) => Some(s.clone()),
+            // A capitalized label (`{ Ruby: 5 }`, `foo(Type: x)`) lexes as a
+            // Const but is a symbol-key label, not a constant reference.
+            Tok::Ident(s) | Tok::Keyword(s) | Tok::Const(s) => Some(s.clone()),
             _ => None,
         }
     }

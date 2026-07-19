@@ -4751,3 +4751,53 @@ fn array_spaceship_operator() {
     // Non-array operand → nil.
     eq("([1, 2] <=> 5).inspect", "\"nil\"");
 }
+
+/// Fuzzer-found parity fixes (differential MRI fuzz across arith/reduce/slice/
+/// sorting/symbols). Every expected value confirmed against ruby 4.0.6.
+#[test]
+fn reduce_symbol_promotes_and_never_panics() {
+    // reduce(:*) factorial promotes to BigInt instead of panicking on overflow.
+    eq("(1..25).reduce(:*)", "15511210043330985984000000");
+    eq("(1..25).reduce(1, :*)", "15511210043330985984000000");
+    eq("[100, 2, 5].reduce(:/)", "10");
+    eq("[17, 5].reduce(:%)", "2");
+    eq("[2, 3, 2].reduce(:**)", "64");
+    eq("[1.5, 2.0].reduce(:*)", "3.0");
+}
+
+#[test]
+fn negation_of_heap_numbers() {
+    // Negating a BigInt or Rational (the VM forwards Negate for heap numbers).
+    eq("-(2 ** 70)", "-1180591620717411303424");
+    eq("-2 ** -7", "(-1/128)");
+    eq("-9 ** 2", "-81");
+}
+
+#[test]
+fn integer_pow_edge_cases() {
+    // |base| == 1 short-circuits at any exponent; base 0 has 0**0==1, 0**+ ==0.
+    eq("1 ** -7", "1");
+    eq("(-1) ** -7", "-1");
+    eq("(-1) ** -8", "1");
+    eq("1 ** -3 ** -1", "(1/1)"); // Rational exponent -> Rational (1/1)
+    eq("0 ** 42 ** 42", "0");
+    eq("0 ** 0", "1");
+    // Rational contagion through % and mixed integer division.
+    eq("10 ** -3 % 5", "(1/1000)");
+    eq("10 % 9 ** -3", "(0/1)");
+    eq("7 / 42 ** 42", "0");
+}
+
+#[test]
+fn max_by_returns_first_on_tie() {
+    // Ruby max_by returns the FIRST element on a key tie (Rust's returns last).
+    eq("[5, -7, 7, 2].max_by { |x| x.abs }", "-7");
+    eq("[-7, 7].max_by { |x| x.abs }", "-7");
+    eq("[-7, 7].min_by { |x| x.abs }", "-7");
+}
+
+#[test]
+fn capitalized_symbol_hash_keys() {
+    eq("h = { Ruby: 5 }; h[:Ruby]", "5");
+    eq("{ Lang: 10, Ruby: 2 }", "{Lang: 10, Ruby: 2}");
+}

@@ -3185,6 +3185,26 @@ impl RubyHost {
             Ne => return Ok(Value::Bool(!self.eq_values(a, b))),
             _ => {}
         }
+        // Unary negation: the VM's `Negate` op forwards a heap number (BigInt or
+        // Rational — the native Int/Float paths negate in-VM) here as
+        // `(Neg, x, Undef)`. Preserve the operand's type.
+        if matches!(op, Neg) {
+            let rat = match self.obj(a) {
+                Some(RObj::Rational(r)) => Some(r.clone()),
+                _ => None,
+            };
+            if let Some(r) = rat {
+                return Ok(self.new_rational(-r));
+            }
+            if let Some(x) = self.as_bigint(a) {
+                return Ok(self.new_bigint(-x));
+            }
+            return match a {
+                Value::Int(n) => Ok(Value::Int(n.wrapping_neg())),
+                Value::Float(f) => Ok(Value::Float(-*f)),
+                _ => Err(format!("undefined method '-@' for {}", self.class_name(a))),
+            };
+        }
         // Integer arithmetic that overflowed `i64`, or that involves a value
         // already promoted to `BigInt`. Division/modulo floor toward negative
         // infinity, matching Ruby.
@@ -3245,6 +3265,11 @@ impl RubyHost {
                     Sub => Some(x.clone() - &y),
                     Mul => Some(x.clone() * &y),
                     Div if !y.is_zero() => Some(x.clone() / &y),
+                    // Ruby Rational#%: a - b*(a/b).floor (floored modulo).
+                    Mod if !y.is_zero() => {
+                        let q = (x.clone() / &y).floor();
+                        Some(x.clone() - &y * q)
+                    }
                     _ => None,
                 };
                 if let Some(v) = r {

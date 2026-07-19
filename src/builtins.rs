@@ -2255,7 +2255,12 @@ fn as_f(v: &Value) -> f64 {
     match v {
         Value::Int(n) => *n as f64,
         Value::Float(f) => *f,
-        _ => 0.0,
+        // A heap number (BigInt / Rational) coerces to its f64 value, not 0 —
+        // e.g. a Rational exponent in `5 ** (1/100**7r)`.
+        _ => with_host(|h| {
+            use num_traits::ToPrimitive as _;
+            h.as_rational(v).and_then(|r| r.to_f64()).unwrap_or(0.0)
+        }),
     }
 }
 
@@ -2514,6 +2519,54 @@ fn dispatch_number(
                     ));
                 }
             }
+            // |base| == 1 short-circuits at any exponent magnitude/type (Ruby):
+            // 1 ** x == 1 (Rational (1/1) for a Rational exponent); (-1) ** integer
+            // is ±1 by parity. This also covers bignum exponents too big for i64.
+            // A base of magnitude >= 2 raised to an integer exponent that overflows
+            // i64 is rejected by Ruby — the result can't be materialized.
+            if let Some(base) = with_host(|h| h.as_bigint(recv)) {
+                use num_integer::Integer as _;
+                use num_traits::{Signed as _, Zero as _};
+                let one = || num_bigint::BigInt::from(1);
+                // 0 ** 0 == 1; 0 ** positive == 0; 0 ** negative raises (a
+                // negative Rational exponent too — `0 ** (-1/7r)`).
+                if base.is_zero() {
+                    if let Some(e) = with_host(|h| h.as_bigint(&args[0])) {
+                        if e.is_zero() {
+                            return Ok(Value::Int(1));
+                        }
+                        if e.is_positive() {
+                            return Ok(Value::Int(0));
+                        }
+                        return Err(raise_exc("ZeroDivisionError", "divided by 0"));
+                    }
+                    if let Some(r) = with_host(|h| h.as_rational(&args[0])) {
+                        if r.is_negative() {
+                            return Err(raise_exc("ZeroDivisionError", "divided by 0"));
+                        }
+                    }
+                }
+                if base == one() {
+                    if with_host(|h| h.as_bigint(&args[0]).is_some()) {
+                        return Ok(Value::Int(1));
+                    }
+                    if with_host(|h| h.as_rational(&args[0]).is_some()) {
+                        let r = num_rational::BigRational::new(one(), one());
+                        return Ok(with_host(|h| h.new_rational(r)));
+                    }
+                }
+                if base == num_bigint::BigInt::from(-1) {
+                    if let Some(e) = with_host(|h| h.as_bigint(&args[0])) {
+                        return Ok(Value::Int(if e.is_even() { 1 } else { -1 }));
+                    }
+                }
+                if (base > one() || base < num_bigint::BigInt::from(-1))
+                    && int_arg(&args[0]).is_none()
+                    && with_host(|h| h.as_bigint(&args[0]).map(|e| e > one()).unwrap_or(false))
+                {
+                    return Err(raise_exc("ArgumentError", "exponent is too large"));
+                }
+            }
             // Integer ** non-negative Integer stays an exact Integer (promoting
             // to BigInt on overflow), like Ruby.
             if let (Some(base), Some(exp)) = (with_host(|h| h.as_bigint(recv)), int_arg(&args[0])) {
@@ -2526,6 +2579,14 @@ fn dispatch_number(
                 if base == num_bigint::BigInt::from(0) {
                     return Err(raise_exc("ZeroDivisionError", "divided by 0"));
                 }
+                // |base| == 1 yields an exact Integer ±1 (Ruby returns Integer,
+                // not a Rational): 1 ** -n == 1, (-1) ** -n == 1 if n even else -1.
+                if base == num_bigint::BigInt::from(1) {
+                    return Ok(Value::Int(1));
+                }
+                if base == num_bigint::BigInt::from(-1) {
+                    return Ok(Value::Int(if exp % 2 == 0 { 1 } else { -1 }));
+                }
                 let denom = base.pow((-exp) as u32);
                 let r = num_rational::BigRational::new(num_bigint::BigInt::from(1), denom);
                 return Ok(with_host(|h| h.new_rational(r)));
@@ -2535,24 +2596,25 @@ fn dispatch_number(
         "/" => match (recv, &args[0]) {
             (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(floor_div(*a, *b))),
-            // `Integer / Rational` stays exact (`3 / 4r == (3/4)`).
+            // A numeric heap operand: `Integer / Rational` stays exact
+            // (`3 / 4r == (3/4)`); `Integer / BigInt` is Integer floor division
+            // (`7 / (42**42) == 0`). num_op picks the right one by operand type.
             _ if with_host(|h| h.as_rational(&args[0])).is_some()
                 && matches!(recv, Value::Int(_)) =>
             {
-                let x = with_host(|h| h.as_rational(recv)).unwrap();
-                let y = with_host(|h| h.as_rational(&args[0])).unwrap();
-                use num_traits::Zero as _;
-                if y.is_zero() {
-                    Err(raise_exc("ZeroDivisionError", "divided by 0"))
-                } else {
-                    Ok(with_host(|h| h.new_rational(x / y)))
-                }
+                with_host(|h| h.num_op(fusevm::NumOp::Div, recv, &args[0]))
             }
             _ => Ok(Value::Float(as_f(recv) / as_f(&args[0]))),
         },
         "%" | "modulo" => match (recv, &args[0]) {
             (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(floor_mod(*a, *b))),
+            // `Integer % Rational` stays exact (`10 % (1/729r) == (0/1)`), like `/`.
+            _ if with_host(|h| h.as_rational(&args[0])).is_some()
+                && matches!(recv, Value::Int(_)) =>
+            {
+                with_host(|h| h.num_op(fusevm::NumOp::Mod, recv, &args[0]))
+            }
             _ => {
                 let (x, y) = (as_f(recv), as_f(&args[0]));
                 Ok(Value::Float(x - (x / y).floor() * y))
@@ -4234,12 +4296,15 @@ fn str_index(s: &str, args: &[Value]) -> Value {
                 .unwrap_or(Value::Undef)
         }
         [Value::Int(i), Value::Int(len)] => {
-            let start = norm_idx(*i, chars.len()).unwrap_or(chars.len());
-            let end = (start + (*len).max(0) as usize).min(chars.len());
-            if start > chars.len() {
-                Value::Undef
-            } else {
-                new_str(chars[start..end].iter().collect())
+            // `str[start, len]` is nil when start is out of range (a negative
+            // start that underflows past 0, or start > length) or len < 0.
+            // start == length is valid and yields "".
+            match norm_idx(*i, chars.len()) {
+                Some(start) if start <= chars.len() && *len >= 0 => {
+                    let end = (start + *len as usize).min(chars.len());
+                    new_str(chars[start..end].iter().collect())
+                }
+                _ => Value::Undef,
             }
         }
         [rng] => {
@@ -5601,8 +5666,12 @@ fn sort_by_family(
             .min_by(|a, c| cmp_values(&a.0, &c.0))
             .map(|p| p.1)
             .unwrap_or(Value::Undef)),
+        // Ruby's max_by returns the FIRST element on a key tie; Rust's `max_by`
+        // returns the last. Iterating reversed makes the last-of-ties the first
+        // in original order. (min_by already returns first-of-ties, like Ruby.)
         "max_by" => Ok(keyed
             .into_iter()
+            .rev()
             .max_by(|a, c| cmp_values(&a.0, &c.0))
             .map(|p| p.1)
             .unwrap_or(Value::Undef)),
@@ -5614,6 +5683,7 @@ fn sort_by_family(
                 .unwrap_or(Value::Undef);
             let hi = keyed
                 .iter()
+                .rev()
                 .max_by(|a, c| cmp_values(&a.0, &c.0))
                 .map(|p| p.1.clone())
                 .unwrap_or(Value::Undef);
@@ -5782,11 +5852,12 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
         "integer?" => Ok(Value::Bool(r.is_integer())),
         // The arithmetic/comparison operators reach here when invoked as methods
         // (`r.+(x)`, e.g. `reduce(:+)`); delegate to the numeric hook.
-        "+" | "-" | "*" | "==" | "<" | ">" | "<=" | ">=" => {
+        "+" | "-" | "*" | "%" | "==" | "<" | ">" | "<=" | ">=" => {
             let op = match name {
                 "+" => fusevm::NumOp::Add,
                 "-" => fusevm::NumOp::Sub,
                 "*" => fusevm::NumOp::Mul,
+                "%" => fusevm::NumOp::Mod,
                 "==" => fusevm::NumOp::Eq,
                 "<" => fusevm::NumOp::Lt,
                 ">" => fusevm::NumOp::Gt,
@@ -12029,51 +12100,56 @@ fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
 /// evaluated directly (the VM handles these opcodes, not per-type dispatch);
 /// everything else is a normal method send (so string `:+`, `:concat`, … work).
 fn reduce_sym(acc: &Value, op: &str, x: &Value) -> Result<Value, String> {
-    let both_num = matches!(acc, Value::Int(_) | Value::Float(_))
-        && matches!(x, Value::Int(_) | Value::Float(_));
-    if both_num {
-        let int_pair = match (acc, x) {
-            (Value::Int(a), Value::Int(b)) => Some((*a, *b)),
+    let numeric = |v: &Value| {
+        matches!(v, Value::Int(_) | Value::Float(_))
+            || with_host(|h| h.as_bigint(v).is_some() || h.as_rational(v).is_some())
+    };
+    // Float arithmetic (either operand a Float; a Rational operand demotes to
+    // Float, matching Ruby). Native float ops — num_op only covers heap numbers.
+    if numeric(acc) && numeric(x) && (matches!(acc, Value::Float(_)) || matches!(x, Value::Float(_)))
+    {
+        let (a, b) = (as_f(acc), as_f(x));
+        return Ok(match op {
+            "+" => Value::Float(a + b),
+            "-" => Value::Float(a - b),
+            "*" => Value::Float(a * b),
+            "/" => Value::Float(a / b),
+            "%" => Value::Float(a - (a / b).floor() * b),
+            "**" => Value::Float(a.powf(b)),
+            _ => return dispatch(acc, op, std::slice::from_ref(x), None),
+        });
+    }
+    // Native small-Int floor division/modulo — stay Integer-typed, floor toward
+    // negative infinity (Ruby semantics).
+    if let (Value::Int(a), Value::Int(b)) = (acc, x) {
+        match op {
+            "/" | "%" if *b == 0 => {
+                return Err(raise_exc("ZeroDivisionError", "divided by 0"))
+            }
+            "/" => return Ok(Value::Int(floor_div(*a, *b))),
+            "%" => return Ok(Value::Int(floor_mod(*a, *b))),
+            _ => {}
+        }
+    }
+    // Integer / BigInt / Rational +,-,*,/,% via the host numeric op, so results
+    // promote to BigInt on overflow (reduce(:*) factorials), keep BigInt/Rational
+    // accumulators exact, and never panic. `**` routes to Integer#** (bignum base,
+    // negative-exponent Rational). The accumulator may already be a heap number
+    // from a prior overflow, so this can't be gated to native Int only.
+    if numeric(acc) && numeric(x) {
+        let nop = match op {
+            "+" => Some(fusevm::NumOp::Add),
+            "-" => Some(fusevm::NumOp::Sub),
+            "*" => Some(fusevm::NumOp::Mul),
+            "/" => Some(fusevm::NumOp::Div),
+            "%" => Some(fusevm::NumOp::Mod),
             _ => None,
         };
-        match op {
-            "+" => return Ok(add_values(acc, x)),
-            "-" => {
-                return Ok(match int_pair {
-                    Some((a, b)) => Value::Int(a - b),
-                    None => Value::Float(as_f(acc) - as_f(x)),
-                })
-            }
-            "*" => {
-                return Ok(match int_pair {
-                    Some((a, b)) => Value::Int(a * b),
-                    None => Value::Float(as_f(acc) * as_f(x)),
-                })
-            }
-            "/" => {
-                return match int_pair {
-                    Some((_, 0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
-                    Some((a, b)) => Ok(Value::Int(floor_div(a, b))),
-                    None => Ok(Value::Float(as_f(acc) / as_f(x))),
-                }
-            }
-            "%" => {
-                return match int_pair {
-                    Some((_, 0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
-                    Some((a, b)) => Ok(Value::Int(floor_mod(a, b))),
-                    None => {
-                        let (a, b) = (as_f(acc), as_f(x));
-                        Ok(Value::Float(a - (a / b).floor() * b))
-                    }
-                }
-            }
-            "**" => {
-                return Ok(match int_pair {
-                    Some((a, b)) if b >= 0 => Value::Int(a.pow(b as u32)),
-                    _ => Value::Float(as_f(acc).powf(as_f(x))),
-                })
-            }
-            _ => {}
+        if let Some(nop) = nop {
+            return with_host(|h| h.num_op(nop, acc, x));
+        }
+        if op == "**" {
+            return dispatch(acc, "**", std::slice::from_ref(x), None);
         }
     }
     dispatch(acc, op, std::slice::from_ref(x), None)
