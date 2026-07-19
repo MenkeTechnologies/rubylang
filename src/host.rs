@@ -771,6 +771,45 @@ pub fn eval_string_scoped(
     r
 }
 
+/// Evaluate ERB-compiled `src` in a fresh, isolated top-level scope with
+/// `locals` pre-bound. Used by `ERB#result_with_hash`, whose hash keys become
+/// template locals in a binding that does not see (or pollute) the caller's
+/// variables. `self` is a blank `Object`, so the template's instance-variable
+/// reads start empty — matching MRI's `result_with_hash` (a new binding).
+pub fn eval_erb_with_locals(
+    src: &str,
+    locals: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    let self_obj = with_host(|h| h.new_object("Object"));
+    let env = new_env();
+    {
+        let mut e = env.borrow_mut();
+        for (k, v) in locals {
+            e.vars.insert(k, v);
+        }
+    }
+    with_host(|h| {
+        h.frames.push(Frame {
+            scope: Scope {
+                locals: env,
+                block: None,
+                self_obj,
+                method_name: None,
+                def_class: None,
+            },
+            args: Vec::new(),
+            line: 0,
+        });
+    });
+    let saved_active = with_host(|h| h.active_scope.take());
+    let r = eval_in_place(src);
+    with_host(|h| {
+        h.frames.pop();
+        h.active_scope = saved_active;
+    });
+    r
+}
+
 /// `eval("code")` at top level / current self: compile `src` into the running
 /// host (its proc/begin templates appended at the right offset) and run its main
 /// chunk in the current frame. Definitions persist; returns the last value.
@@ -2266,6 +2305,7 @@ impl RubyHost {
                 | "DateTime"
                 | "Math"
                 | "JSON"
+                | "ERB"
                 | "Fiber"
                 | "File"
                 | "Dir"

@@ -4203,3 +4203,77 @@ fn openstruct_dynamic_attributes() {
         "5",
     );
 }
+
+/// ERB templating: `ERB.new(...).result` / `#result_with_hash`, tag syntax
+/// (`<%= %>`, `<% %>`, `<%# %>`), `<%%` escaping, and the `"-"` trim mode. Every
+/// expected value was confirmed byte-for-byte against MRI (`ruby -rerb`).
+#[test]
+fn erb_templating() {
+    // `<%= expr %>` evaluates and inserts; `result` returns the buffer String.
+    eq(r#"require "erb"; ERB.new("<%= 1+1 %>").result"#, "\"2\"");
+    // Literal text passthrough around an interpolation tag.
+    eq(
+        r#"require "erb"; ERB.new("Hello, <%= 2*3 %>!").result"#,
+        "\"Hello, 6!\"",
+    );
+    // `<% code %>` drives a loop without inserting; `<%= %>` inserts each pass.
+    eq(
+        r#"require "erb"; ERB.new("<% 3.times do |i| %>row<%= i %> <% end %>").result"#,
+        "\"row0 row1 row2 \"",
+    );
+    // `<%# comment %>` is dropped entirely.
+    eq(
+        r#"require "erb"; ERB.new("a<%# note %>b").result"#,
+        "\"ab\"",
+    );
+    // `<%%` is an escaped literal `<%` (the trailing `%>` stays literal text).
+    eq(
+        r#"require "erb"; ERB.new("<%% literal %>").result"#,
+        "\"<% literal %>\"",
+    );
+    // `result_with_hash` binds hash keys as template locals.
+    eq(
+        r#"require "erb"; ERB.new("Hi <%= name %>").result_with_hash(name: "Ann")"#,
+        "\"Hi Ann\"",
+    );
+    eq(
+        r#"require "erb"; ERB.new("<%= a %>-<%= b %>").result_with_hash(a: 10, b: 20)"#,
+        "\"10-20\"",
+    );
+    // `result` sees the caller's instance variables (evaluated in current scope).
+    eq(
+        r#"require "erb"; @x = 42; ERB.new("x=<%= @x %>").result"#,
+        "\"x=42\"",
+    );
+    // `result` sees caller-defined methods too.
+    eq(
+        r#"require "erb"; def greet(n); "Hi #{n}"; end; ERB.new("<%= greet('Bo') %>").result"#,
+        "\"Hi Bo\"",
+    );
+    // Template text keeps MRI's `#{...}` interpolation (embedded in a Ruby string).
+    eq(
+        r#"require "erb"; ERB.new("a #{1+1} b").result"#,
+        "\"a 2 b\"",
+    );
+    // `"-"` trim mode: `-%>` chomps the trailing newline, so only the `L<%= i %>`
+    // lines survive — output is "L1\nL2\n".
+    eq(
+        r#"require "erb"; ERB.new("<% [1,2].each do |i| -%>\nL<%= i %>\n<% end -%>\n", trim_mode: "-").result"#,
+        "\"L1\\nL2\\n\"",
+    );
+    // Without trim mode, the newline after `%>` is preserved.
+    eq(
+        r#"require "erb"; ERB.new("<% x=1 %>\nB").result"#,
+        "\"\\nB\"",
+    );
+    // A full HTML fragment: a loop over an array rendered into list items.
+    eq(
+        r#"require "erb"; ERB.new("<ul>\n<% %w[a b].each do |it| -%>\n<li><%= it %></li>\n<% end -%>\n</ul>", trim_mode: "-").result"#,
+        "\"<ul>\\n<li>a</li>\\n<li>b</li>\\n</ul>\"",
+    );
+    // `#src` exposes the generated buffer-building Ruby source.
+    eq(
+        r#"require "erb"; ERB.new("hi").src.include?("_erbout")"#,
+        "true",
+    );
+}

@@ -1349,6 +1349,31 @@ fn dispatch_classref(
             _ => {}
         }
     }
+    // `ERB.new(template, trim_mode: "-")` — compile a template into a buffer-
+    // building Ruby program (stored in the `@src` ivar) and return an ERB
+    // instance. `#result`/`#result_with_hash` later evaluate that program.
+    if cls == "ERB" && name == "new" {
+        let template = arg_str(&args[0]);
+        // The trim mode may arrive as a `trim_mode:` keyword (modern form) or as
+        // the deprecated 2nd/3rd positional string. Dash-trim is on when the mode
+        // string contains '-'.
+        let mode = args
+            .iter()
+            .skip(1)
+            .find_map(|a| {
+                with_host(|h| h.as_hash(a))
+                    .and_then(|m| m.get(&RKey::Sym("trim_mode".into())).cloned())
+                    .and_then(|v| with_host(|h| h.as_str(&v)))
+            })
+            .or_else(|| args.get(2).and_then(|a| with_host(|h| h.as_str(a))))
+            .unwrap_or_default();
+        let dash_trim = mode.contains('-');
+        let src = erb_compile(&template, dash_trim);
+        let src_val = new_str(src);
+        let obj = with_host(|h| h.new_object("ERB"));
+        with_host(|h| h.set_ivar_of(&obj, "src", src_val));
+        return Ok(obj);
+    }
     // The `Math` module: floating-point functions and the constants `PI`/`E`,
     // reached as `Math.sqrt(x)` and `Math::PI` (both a method send on the ref).
     if cls == "Math" {
@@ -1858,6 +1883,13 @@ fn dispatch_object(
     // stored as the object's ivars. An unknown reader returns nil (never raises).
     if cls == "OpenStruct" {
         if let Some(r) = openstruct_method(recv, name, args, block.clone())? {
+            return Ok(r);
+        }
+    }
+    // ERB instance: `result`/`result_with_hash` evaluate the compiled template,
+    // `src` returns the generated Ruby source.
+    if cls == "ERB" {
+        if let Some(r) = erb_method(recv, name, args)? {
             return Ok(r);
         }
     }
@@ -9760,6 +9792,172 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
 
 fn new_str(s: String) -> Value {
     with_host(|h| h.new_string(s))
+}
+
+// ---- ERB (dependency-free template engine over the host value model) --------
+
+/// Instance methods on an `ERB` object (its compiled Ruby source lives in the
+/// `@src` ivar). Returns `Ok(None)` for a name ERB does not handle, so the caller
+/// can fall through to the generic object dispatch.
+///
+/// - `result` / `result(binding)` — evaluate the compiled template in the
+///   caller's current scope (its top-level locals, instance variables, and
+///   methods are visible). An explicit `Binding` argument is accepted but not
+///   modeled; evaluation always uses the current scope.
+/// - `result_with_hash(hash)` — evaluate in a fresh, isolated scope with the
+///   hash keys bound as template locals.
+/// - `src` — the generated buffer-building Ruby source (matches MRI's `#src`).
+fn erb_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+    let src = || {
+        let v = with_host(|h| h.ivar_of(recv, "src"));
+        with_host(|h| h.as_str(&v)).unwrap_or_default()
+    };
+    match name {
+        "result" => Ok(Some(crate::host::eval_in_place(&src())?)),
+        "result_with_hash" => {
+            let hash = args
+                .first()
+                .and_then(|a| with_host(|h| h.as_hash(a)))
+                .unwrap_or_default();
+            let mut locals = Vec::with_capacity(hash.len());
+            for (k, v) in hash {
+                let kv = with_host(|h| h.key_value(&k));
+                locals.push((name_of(&kv), v));
+            }
+            Ok(Some(crate::host::eval_erb_with_locals(&src(), locals)?))
+        }
+        "src" => Ok(Some(new_str(src()))),
+        // `run`/`run_with_hash` evaluate and print the result (MRI writes to $stdout).
+        "run" => {
+            let r = crate::host::eval_in_place(&src())?;
+            print!("{}", with_host(|h| h.to_s(&r)));
+            Ok(Some(Value::Undef))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Compile an ERB template into Ruby source that builds a `_erbout` buffer and
+/// evaluates to it. Each literal run becomes `_erbout << "..."`, each `<%= e %>`
+/// becomes `_erbout << (e).to_s`, and each `<% c %>` emits `c` verbatim (so
+/// loops/conditionals wrap the appends). `<%# ... %>` is dropped and `<%%`
+/// yields a literal `<%`.
+///
+/// `dash_trim` enables the `"-"` trim mode: `-%>` chomps the following newline
+/// and `<%-` strips leading blanks on its line. Template text is embedded in a
+/// double-quoted Ruby string, so `#{...}` in text interpolates — matching MRI.
+fn erb_compile(template: &str, dash_trim: bool) -> String {
+    enum Tag {
+        Expr,
+        Comment,
+        Code,
+        CodeTrimLead,
+    }
+
+    /// Flush pending literal `text` as an `_erbout << "..."` append, escaping the
+    /// characters that are special inside a Ruby double-quoted string. `#` is
+    /// left unescaped so `#{...}` in template text interpolates (MRI behavior).
+    fn flush(out: &mut String, text: &mut String) {
+        if text.is_empty() {
+            return;
+        }
+        out.push_str("_erbout << \"");
+        for ch in text.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c => out.push(c),
+            }
+        }
+        out.push_str("\"\n");
+        text.clear();
+    }
+
+    let mut out = String::from("_erbout = +\"\"\n");
+    let mut text = String::new();
+    let bytes = template.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+
+    while i < n {
+        let rest = &template[i..];
+        // `<%%` is an escaped literal `<%`.
+        if rest.starts_with("<%%") {
+            text.push_str("<%");
+            i += 3;
+            continue;
+        }
+        if rest.starts_with("<%") {
+            let mut p = i + 2;
+            let tag = match bytes.get(p) {
+                Some(b'=') => {
+                    p += 1;
+                    Tag::Expr
+                }
+                Some(b'#') => {
+                    p += 1;
+                    Tag::Comment
+                }
+                Some(b'-') if dash_trim => {
+                    p += 1;
+                    Tag::CodeTrimLead
+                }
+                _ => Tag::Code,
+            };
+            // `<%-` trims trailing blanks accumulated on the current line.
+            if matches!(tag, Tag::CodeTrimLead) {
+                while text.ends_with(' ') || text.ends_with('\t') {
+                    text.pop();
+                }
+            }
+            // Find the closing `%>`; if absent, treat the remainder as literal text.
+            let Some(rel) = template[p..].find("%>") else {
+                flush(&mut out, &mut text);
+                text.push_str(&template[i..]);
+                break;
+            };
+            let close = p + rel;
+            let (content_end, trailing_trim) = if dash_trim && close > p && bytes[close - 1] == b'-'
+            {
+                (close - 1, true)
+            } else {
+                (close, false)
+            };
+            let content = template[p..content_end].trim();
+            flush(&mut out, &mut text);
+            match tag {
+                Tag::Expr => {
+                    out.push_str("_erbout << (");
+                    out.push_str(content);
+                    out.push_str(").to_s\n");
+                }
+                Tag::Comment => {}
+                Tag::Code | Tag::CodeTrimLead => {
+                    out.push_str(content);
+                    out.push('\n');
+                }
+            }
+            i = close + 2;
+            // `-%>` chomps the immediately following newline.
+            if trailing_trim {
+                if template[i..].starts_with("\r\n") {
+                    i += 2;
+                } else if template[i..].starts_with('\n') {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        text.push(ch);
+        i += ch.len_utf8();
+    }
+    flush(&mut out, &mut text);
+    out.push_str("_erbout\n");
+    out
 }
 
 // ---- JSON (dependency-free, hand-written over the host value model) ---------

@@ -322,6 +322,38 @@ Honest limitations of this surface:
   explicit-constant rescue). `Rational`/`Complex`/`Time` encode as their quoted
   `to_s` (MRI's default `Object#to_json`), so those are excluded from the exact
   parity corpus.
+- **`ERB` (dependency-free templating).** `require "erb"` is a no-op; the class is
+  always available. `ERB.new(template, trim_mode: "-")` compiles the template into
+  a `_erbout`-building Ruby program (kept in the `@src` ivar, exposed by `#src`
+  like MRI) using a hand-written scanner over `<% %>` tags: `<%= e %>` →
+  `_erbout << (e).to_s`, `<% c %>` emits `c` verbatim (so loops/conditionals
+  wrap the appends), `<%# … %>` is dropped, literal text is embedded in a
+  double-quoted Ruby string, and `<%%` yields a literal `<%`. Because text is
+  embedded in a real Ruby double-quoted string, `#{…}` in template text
+  interpolates — matching MRI 6.x byte-for-byte, not "literal passthrough".
+  `#result` / `#result(binding)` evaluates the compiled program via the host
+  `eval_in_place` machinery **in the caller's current scope**, so the template
+  sees the caller's top-level locals, instance variables (`<%= @x %>`), and
+  methods; this matches MRI at top level (where the default binding's `self` is
+  also `main`). `#result_with_hash(hash)` evaluates in a fresh, isolated scope
+  with the hash keys pre-bound as template locals (self is a blank object, so it
+  does not see or pollute caller state). Trim mode: `"-"` is implemented —
+  `-%>` chomps the immediately following newline, `<%-` strips leading blanks on
+  its line; `dash_trim` is enabled when the mode string contains `-`. All the
+  above are verified byte-for-byte against MRI (`ruby -rerb`). **Limitations:**
+  (1) an explicit `Binding` argument to `#result` is accepted but not modeled —
+  evaluation always uses the current scope, so `#result(some_other_binding)` does
+  not switch scopes (same limit as the `eval` builtin). Inside a method body,
+  `#result` sees that method's scope rather than a fresh top-level binding, which
+  is broader access than MRI's default `new_toplevel_binding`. (2) The other MRI
+  trim modes (`">"`, `"<>"`, `"%"`) are not implemented — only `"-"` (and the
+  default no-trim). (3) The `%%>` → `%>` escape is not special-cased: `%%>` in
+  template text stays literal (which is what MRI 6.x does in text); inside a tag
+  the first `%>` closes it, so a literal `%>` cannot be embedded in a tag body.
+  (4) `#result_with_hash` binds arbitrary runtime values directly (no
+  serialization), so any object works as a template local. (5) Legacy positional
+  `safe_level`/`eoutvar` args to `ERB.new` are ignored; the deprecated positional
+  trim-mode (3rd arg) is still honored.
 - **`rand`.** Backed by a thread-local SplitMix64. `srand(seed)` reseeds it so
   `rand`/`rand(n)` are reproducible within a run and returns the previous seed
   (MRI semantics); the MRI-exact sequence and MRI's random startup seed are not
