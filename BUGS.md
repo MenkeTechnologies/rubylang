@@ -560,6 +560,61 @@ end-to-end (`tests/socket.rs`, incl. a raw `std::net` client and `curl`).
 - **No separator/limit args** to `gets`/`readlines`; `gets` is `\n`-terminated.
 - `TCPServer`/`TCPSocket` are not user-subclassable.
 
+## Database persistence (`SQLite3::Database`)
+
+`require "sqlite3"` is a no-op returning true (the classes are always present).
+`SQLite3::Database` is backed by the `rusqlite` crate with the `bundled` feature,
+so SQLite is compiled in-tree — no external `sqlite3` gem, no libsqlite3/FFI, no
+system package. This is real on-disk persistence: rows written to a file DB
+survive the connection closing and are read back by a fresh process (verified by
+`tests/sqlite.rs` reopening a tempfile in a reset interpreter, and by
+`examples/sqlite_persistence.rb`). Each open `rusqlite::Connection` (not `Clone`)
+lives in the host `db_handles` side table, exactly like `File`/`TCPServer` do in
+`io_handles`; the Ruby value is an `RObj::Db` handle.
+
+Implemented (the core sqlite3-gem shape):
+- `SQLite3::Database.new(path)` / `.open` (alias), `":memory:"` (and `""`) for an
+  in-memory DB; the block form `SQLite3::Database.new(path) { |db| … }` yields the
+  handle, closes it afterward (even on error), and returns the block's value. An
+  options hash honors `results_as_hash: true`.
+- `db.execute(sql[, bind])` — a SELECT returns an Array of rows (each an Array of
+  column values); DDL/DML returns `[]`. A block yields each row and returns nil.
+  Binds follow the gem's `execute(sql, bind_vars = [])` signature: a single Array
+  (`["a", 1]`), or a lone scalar auto-wrapped; a placeholder with no supplied
+  bind is left NULL (the gem's lenient behavior).
+- `db.execute2(sql[, bind])` — same, with a header row of column names prepended.
+- `db.query(sql[, bind])` — returns rows like `execute` (no streaming `ResultSet`).
+- `db.get_first_row(sql, *binds)`, `db.get_first_value(sql, *binds)` (varargs binds).
+- `db.last_insert_row_id`, `db.changes`.
+- `db.results_as_hash = true` / `db.results_as_hash` — rows become Hashes keyed by
+  column name (String keys).
+- `db.close`, `db.closed?`, `db.open?`. `SQLite3::SQLITE_VERSION` (the linked lib).
+- Type map: INTEGER→Integer, REAL→Float, TEXT→String, NULL→nil, BLOB→String.
+- SQL errors raise `SQLite3::SQLException` (a `StandardError` — caught by a bare
+  `rescue` and by `rescue SQLite3::SQLException`), carrying the sqlite message.
+
+**Known gaps / divergences:**
+- **BLOB → String is lossy for non-UTF-8 bytes.** Host Strings are Rust `String`
+  (UTF-8), so a BLOB is decoded with `from_utf8_lossy` — exact for text/UTF-8
+  blobs, but raw binary with invalid sequences gets U+FFFD replacement. There is
+  no separate `SQLite3::Blob` type, and bind values are typed by their Ruby class
+  (String→TEXT), so a String bind is stored as TEXT, not BLOB.
+- **Positional binds only.** No named parameters (`:name` / `$name` /
+  `db.execute(sql, "name" => v)`); only `?` placeholders bound by position.
+- **No streaming `ResultSet` / prepared-statement object.** `db.prepare` and the
+  `Statement`/`ResultSet` API are not implemented — `execute`/`query` prepare,
+  run, and materialize all rows eagerly.
+- **One exception class.** Every SQL error is a `SQLite3::SQLException` carrying
+  the raw sqlite message; the gem's finer subclasses (`CantOpenException`,
+  `BusyException`, `ConstraintException`, …) resolve as class refs but are not
+  raised distinctly. The message text comes from `rusqlite`/SQLite and differs
+  verbatim from the gem's (which appends the offending SQL) — assert on content,
+  not the exact string.
+- **No transaction/pragma helpers.** No `db.transaction`/`commit`/`rollback`
+  block API, `db.busy_timeout`, `db.trace`, `db.function` (custom SQL functions),
+  or `db.type_translation`. Raw `BEGIN`/`COMMIT` via `execute` work.
+- `SQLite3::Database` is not user-subclassable.
+
 ## Loading files (`require` / `require_relative` / `load`)
 
 - **`require`, `require_relative`, and `load` actually read, parse, compile, and

@@ -1114,6 +1114,7 @@ pub(crate) fn dispatch(
         "IO" | "File" => dispatch_io(recv, name, args, block),
         "TCPServer" => dispatch_tcp_server(recv, name, args, block),
         "TCPSocket" => dispatch_tcp_socket(recv, name, args, block),
+        "SQLite3::Database" => dispatch_sqlite_db(recv, name, args, block),
         "Enumerator::Lazy" => dispatch_lazy(recv, name, args, block),
         "Enumerator::Yielder" => dispatch_yielder(recv, name, args),
         "Rational" => dispatch_rational(recv, name, args),
@@ -1468,6 +1469,27 @@ fn dispatch_classref(
     // `TCPServer.new([host,] port)` / `TCPSocket.new(host, port)` over std::net.
     if (cls == "TCPServer" || cls == "TCPSocket") && (name == "new" || name == "open") {
         return tcp_class_new(cls, args, block);
+    }
+    // SQLite3 — real database persistence via a bundled rusqlite. The `SQLite3`
+    // module namespace resolves its sub-classes to class refs (mirroring the
+    // `Digest` namespace); `SQLite3::Database.new`/`.open` open a connection.
+    if cls == "SQLite3" {
+        match name {
+            "Database" => return Ok(with_host(|h| h.class_ref("SQLite3::Database"))),
+            // The exception namespace: `SQLite3::SQLException` etc. resolve to a
+            // class ref so `rescue SQLite3::SQLException` and `SQLite3::SQLException.new`
+            // both work. `SQLException` is the base SQL error the runtime raises.
+            "SQLException" | "Exception" | "CantOpenException" | "BusyException"
+            | "ConstraintException" => {
+                return Ok(with_host(|h| h.class_ref(&format!("SQLite3::{name}"))))
+            }
+            // The linked sqlite library version (`SQLite3::SQLITE_VERSION`).
+            "SQLITE_VERSION" => return Ok(new_str(rusqlite::version().to_string())),
+            _ => {}
+        }
+    }
+    if cls == "SQLite3::Database" && (name == "new" || name == "open") {
+        return sqlite_db_new(args, block);
     }
     match name {
         "new" => {
@@ -6386,6 +6408,200 @@ fn tcp_puts_arg(recv: &Value, v: &Value) -> Result<(), String> {
     Ok(())
 }
 
+// ---- SQLite3::Database ------------------------------------------------------
+
+use crate::host::SqlVal;
+
+/// Raise a `SQLite3::SQLException` (a `StandardError` — a bare `rescue` catches
+/// it, as does `rescue SQLite3::SQLException`). Carries the sqlite error text.
+fn sqlite_err(msg: &str) -> String {
+    raise_exc("SQLite3::SQLException", msg)
+}
+
+/// `SQLite3::Database.new(path[, opts])` / `.open`. `path` defaults to an
+/// in-memory DB. The block form `Database.new(path) { |db| ... }` yields the
+/// handle, closes it afterward (even on error), and returns the block's value.
+fn sqlite_db_new(args: &[Value], block: Option<Value>) -> Result<Value, String> {
+    let path = args
+        .first()
+        .map(arg_str)
+        .unwrap_or_else(|| ":memory:".to_string());
+    let db = crate::host::db_open(&path).map_err(|e| sqlite_err(&e))?;
+    // An options hash (`results_as_hash: true`) is honored; other keys ignored.
+    if let Some(opts) = args.get(1).and_then(|a| with_host(|h| h.as_hash(a))) {
+        if let Some(v) = opts.get(&RKey::Sym("results_as_hash".into())) {
+            crate::host::db_set_results_as_hash(&db, with_host(|h| h.truthy(v)));
+        }
+    }
+    if let Some(b) = block {
+        let r = call_proc(&b, std::slice::from_ref(&db));
+        crate::host::db_close(&db);
+        return r;
+    }
+    Ok(db)
+}
+
+/// One sqlite column value → Ruby: INTEGER→Integer, REAL→Float, TEXT→String,
+/// NULL→nil, BLOB→String (bytes, lossily decoded as UTF-8 since host Strings are
+/// UTF-8).
+fn sqlval_to_ruby(v: &SqlVal) -> Value {
+    match v {
+        SqlVal::Null => Value::Undef,
+        SqlVal::Integer(n) => Value::Int(*n),
+        SqlVal::Real(f) => Value::Float(*f),
+        SqlVal::Text(s) => new_str(s.clone()),
+        SqlVal::Blob(b) => new_str(String::from_utf8_lossy(b).into_owned()),
+    }
+}
+
+/// One Ruby bind value → sqlite: nil→NULL, Integer→INTEGER, Float→REAL,
+/// true/false→INTEGER 1/0, String→TEXT, anything else→its `to_s` as TEXT.
+fn ruby_to_sqlval(v: &Value) -> SqlVal {
+    match v {
+        Value::Undef => SqlVal::Null,
+        Value::Bool(b) => SqlVal::Integer(if *b { 1 } else { 0 }),
+        Value::Int(n) => SqlVal::Integer(*n),
+        Value::Float(f) => SqlVal::Real(*f),
+        Value::Str(s) => SqlVal::Text(s.to_string()),
+        _ => match with_host(|h| h.as_str(v)) {
+            Some(s) => SqlVal::Text(s),
+            None => SqlVal::Text(with_host(|h| h.to_s(v))),
+        },
+    }
+}
+
+/// The bind values for `execute`/`execute2`/`query`, whose gem signature is
+/// `execute(sql, bind_vars = [])` — a single container, not varargs. An Array is
+/// used as-is; a lone scalar is auto-wrapped to a single bind; absent is empty.
+fn binds_from_one(arg: Option<&Value>) -> Vec<SqlVal> {
+    let flat: Vec<Value> = match arg {
+        Some(a) => with_host(|h| h.as_array(a)).unwrap_or_else(|| vec![a.clone()]),
+        None => Vec::new(),
+    };
+    flat.iter().map(ruby_to_sqlval).collect()
+}
+
+/// The bind values for `get_first_row`/`get_first_value`, whose gem signature is
+/// `(sql, *bind_vars)` — trailing varargs. A single Array argument is still
+/// treated as the bind list (gem-compatible).
+fn collect_binds(rest: &[Value]) -> Vec<SqlVal> {
+    let flat: Vec<Value> = match rest {
+        [only] => with_host(|h| h.as_array(only)).unwrap_or_else(|| vec![only.clone()]),
+        many => many.to_vec(),
+    };
+    flat.iter().map(ruby_to_sqlval).collect()
+}
+
+/// Build one Ruby result row: an Array of column values, or (when
+/// `results_as_hash`) a Hash keyed by column name.
+fn build_row(cols: &[String], row: &[SqlVal], as_hash: bool) -> Value {
+    if as_hash {
+        let mut map = IndexMap::new();
+        for (c, val) in cols.iter().zip(row.iter()) {
+            map.insert(RKey::Str(c.clone()), sqlval_to_ruby(val));
+        }
+        with_host(|h| h.new_hash(map))
+    } else {
+        new_arr(row.iter().map(sqlval_to_ruby).collect())
+    }
+}
+
+/// `db.execute` / `db.execute2`. Prepares, binds, runs, and returns an Array of
+/// rows (empty for DDL/DML). With a block, yields each row and returns nil.
+/// `execute2` prepends a header row of the column names.
+fn sqlite_execute(
+    recv: &Value,
+    args: &[Value],
+    block: Option<Value>,
+    with_headers: bool,
+) -> Result<Value, String> {
+    let sql = args.first().map(arg_str).unwrap_or_default();
+    let binds = binds_from_one(args.get(1));
+    let (cols, rows) = crate::host::db_execute(recv, &sql, &binds).map_err(|e| sqlite_err(&e))?;
+    let as_hash = crate::host::db_results_as_hash(recv);
+    let mut ruby_rows: Vec<Value> = rows.iter().map(|r| build_row(&cols, r, as_hash)).collect();
+    if with_headers {
+        // `execute2`'s first row is the column names (always an Array of strings,
+        // matching the gem even when results_as_hash is on).
+        let header = new_arr(cols.iter().map(|c| new_str(c.clone())).collect());
+        ruby_rows.insert(0, header);
+    }
+    if let Some(b) = block {
+        for row in &ruby_rows {
+            call_proc(&b, std::slice::from_ref(row))?;
+        }
+        return Ok(Value::Undef);
+    }
+    Ok(new_arr(ruby_rows))
+}
+
+/// Instance methods on a `SQLite3::Database` handle.
+fn dispatch_sqlite_db(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    match name {
+        // `query` is the gem's low-level statement runner; here it returns rows
+        // like `execute` (we do not model the streaming `ResultSet` object).
+        "execute" | "query" => sqlite_execute(recv, args, block, false),
+        "execute2" => sqlite_execute(recv, args, block, true),
+        // `execute_batch` runs multiple `;`-separated statements, no result rows.
+        "execute_batch" => {
+            let sql = args.first().map(arg_str).unwrap_or_default();
+            for stmt in sql.split(';') {
+                if stmt.trim().is_empty() {
+                    continue;
+                }
+                crate::host::db_execute(recv, stmt, &[]).map_err(|e| sqlite_err(&e))?;
+            }
+            Ok(Value::Undef)
+        }
+        "get_first_row" => {
+            let sql = args.first().map(arg_str).unwrap_or_default();
+            let binds = collect_binds(&args[1.min(args.len())..]);
+            let (cols, rows) =
+                crate::host::db_execute(recv, &sql, &binds).map_err(|e| sqlite_err(&e))?;
+            let as_hash = crate::host::db_results_as_hash(recv);
+            Ok(rows
+                .first()
+                .map(|r| build_row(&cols, r, as_hash))
+                .unwrap_or(Value::Undef))
+        }
+        "get_first_value" => {
+            let sql = args.first().map(arg_str).unwrap_or_default();
+            let binds = collect_binds(&args[1.min(args.len())..]);
+            let (_cols, rows) =
+                crate::host::db_execute(recv, &sql, &binds).map_err(|e| sqlite_err(&e))?;
+            Ok(rows
+                .first()
+                .and_then(|r| r.first())
+                .map(sqlval_to_ruby)
+                .unwrap_or(Value::Undef))
+        }
+        "last_insert_row_id" => Ok(Value::Int(crate::host::db_last_insert_rowid(recv))),
+        "changes" => Ok(Value::Int(crate::host::db_changes(recv))),
+        "results_as_hash=" => {
+            let on = with_host(|h| h.truthy(&args[0]));
+            crate::host::db_set_results_as_hash(recv, on);
+            Ok(args.first().cloned().unwrap_or(Value::Undef))
+        }
+        "results_as_hash" => Ok(Value::Bool(crate::host::db_results_as_hash(recv))),
+        "close" => {
+            crate::host::db_close(recv);
+            Ok(Value::Undef)
+        }
+        "closed?" => Ok(Value::Bool(crate::host::db_closed(recv))),
+        "open?" => Ok(Value::Bool(!crate::host::db_closed(recv))),
+        "inspect" | "to_s" => Ok(new_str(with_host(|h| h.to_s(recv)))),
+        _ => {
+            let _ = block;
+            Err(no_method_error(recv, name))
+        }
+    }
+}
+
 /// `IO#puts` for one argument: arrays flatten (each element on its own line),
 /// scalars get a trailing `\n` only if their string form lacks one.
 fn io_puts_arg(recv: &Value, v: &Value) -> Result<(), String> {
@@ -10379,6 +10595,7 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "io/console"
             | "abbrev"
             | "delegate"
+            | "sqlite3"
     )
 }
 

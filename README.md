@@ -146,6 +146,18 @@ Implemented and checked against the reference `ruby`:
   destructuring, swap), block-parameter destructuring (`map { |(a, b), i| … }`,
   nested and splat groups, `->((a, b)) { }`), default arguments.
 - **String interpolation** — double-quoted `#{}` interpolation.
+- **Standard library** — `require`-able builtin libs including `json`, `set`,
+  `date`/`time`, `securerandom`, `digest`, `base64`, `ostruct`, `socket`
+  (`TCPServer`/`TCPSocket`), and `sqlite3`.
+- **Database persistence** — `require "sqlite3"` gives a real, on-disk
+  `SQLite3::Database` backed by a bundled SQLite (compiled in-tree, no external
+  gem or FFI). The core sqlite3-gem shape: `SQLite3::Database.new(path)` /
+  `.open` (and `":memory:"`), block form that auto-closes, `execute` /
+  `execute2` with positional binds, rows as Arrays or (with
+  `results_as_hash = true`) Hashes, `get_first_row` / `get_first_value`,
+  `last_insert_row_id` / `changes`, and rescuable `SQLite3::SQLException`. The
+  sqlite→Ruby type map is INTEGER→Integer, REAL→Float, TEXT→String, NULL→nil,
+  BLOB→String. See [`examples/sqlite_persistence.rb`](examples/sqlite_persistence.rb).
 
 ---
 

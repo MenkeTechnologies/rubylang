@@ -123,5 +123,11 @@ num-traits = "0.2"
 # Exact rational numbers (`Rational(1, 2)`, `1r`) built on the bignum types.
 num-rational = "0.4"
 
+# Real SQLite persistence for `SQLite3::Database` (the sqlite3-gem API shape).
+# The `bundled` feature compiles the SQLite amalgamation in-tree, so there is no
+# external libsqlite3/FFI dependency — self-contained across macOS/Linux, no
+# system package required.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 [dev-dependencies]
 tempfile = "3"

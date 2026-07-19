@@ -318,6 +318,13 @@ pub enum RObj {
     DateTime {
         secs: f64,
     },
+    /// A `SQLite3::Database` handle. Holds only an index into
+    /// `RubyHost.db_handles`; the underlying `rusqlite::Connection` is neither
+    /// `Clone` nor storable inline in this `#[derive(Clone)]` enum, so it lives
+    /// in the side table exactly like `File`/`TCPServer` in `io_handles`.
+    Db {
+        id: u32,
+    },
 }
 
 /// Julian Day Number of the Unix epoch (1970-01-01), so `jd = days + this`.
@@ -565,7 +572,27 @@ pub struct RubyHost {
     /// Live `IO`/`File` objects, indexed by `RObj::IoHandle.id`. Slots 0/1/2 are
     /// pre-seeded with the standard streams (`STDOUT`/`STDERR`/`STDIN`).
     io_handles: Vec<IoCell>,
+    /// Live `SQLite3::Database` handles, indexed by `RObj::Db.id`. `None` once
+    /// closed. The `rusqlite::Connection` is not `Clone` (and holds a raw
+    /// sqlite3 pointer), so — like `io_handles` — it lives here, never inline in
+    /// the `RObj` value enum.
+    db_handles: Vec<Option<DbCell>>,
 }
+
+/// One live `SQLite3::Database`, indexed by `RObj::Db.id`. Wraps the owned
+/// `rusqlite::Connection` plus the `results_as_hash` flag (`db.results_as_hash =
+/// true` makes `execute` return each row as a Hash keyed by column name instead
+/// of an Array).
+pub struct DbCell {
+    conn: rusqlite::Connection,
+    pub results_as_hash: bool,
+}
+
+/// A column value carried between the `rusqlite` layer and the Ruby object heap.
+/// Re-exports `rusqlite::types::Value` (Null/Integer/Real/Text/Blob) so the SQL
+/// execution in [`RubyHost::db_execute`] never touches `Value`/the heap (which
+/// would require a second `&mut self` borrow while the connection is borrowed).
+pub type SqlVal = rusqlite::types::Value;
 
 /// One live `IO`/`File` object, indexed by `RObj::IoHandle.id`. The three
 /// standard streams are represented structurally (they route to the process
@@ -933,6 +960,7 @@ impl RubyHost {
             around_stack: Vec::new(),
             fibers: Vec::new(),
             io_handles: vec![IoCell::Stdout, IoCell::Stderr, IoCell::Stdin],
+            db_handles: Vec::new(),
             struct_defs: IndexMap::new(),
             struct_counter: 0,
             class_vars: IndexMap::new(),
@@ -2368,6 +2396,8 @@ impl RubyHost {
                 | "Digest::SHA1"
                 | "Digest::SHA256"
                 | "OpenStruct"
+                | "SQLite3"
+                | "SQLite3::Database"
         )
     }
     pub fn classref_name(&self, v: &Value) -> Option<String> {
@@ -2732,6 +2762,7 @@ impl RubyHost {
                 Some(RObj::Time { secs }) => self.time_to_s(secs, false),
                 Some(RObj::Date { days }) => self.date_to_s(days),
                 Some(RObj::DateTime { secs }) => self.datetime_to_s(secs),
+                Some(RObj::Db { .. }) => "#<SQLite3::Database>".to_string(),
                 Some(RObj::Lazy { .. }) => "#<Enumerator::Lazy>".to_string(),
                 Some(RObj::Enumerator { buf, .. }) => {
                     format!("#<Enumerator: {}>", self.inspect_array(&buf))
@@ -2825,6 +2856,7 @@ impl RubyHost {
                 Some(RObj::Time { secs }) => self.time_to_s(secs, true),
                 Some(RObj::Date { days }) => self.date_inspect(days),
                 Some(RObj::DateTime { secs }) => self.datetime_inspect(secs),
+                Some(RObj::Db { .. }) => "#<SQLite3::Database>".to_string(),
                 // A String range inspects its endpoints with quotes: `"a".."e"`.
                 Some(RObj::StrRange { lo, hi, exclusive }) => {
                     format!("{lo:?}{}{hi:?}", if exclusive { "..." } else { ".." })
@@ -2931,6 +2963,7 @@ impl RubyHost {
                 Some(RObj::Time { .. }) => "Time",
                 Some(RObj::Date { .. }) => "Date",
                 Some(RObj::DateTime { .. }) => "DateTime",
+                Some(RObj::Db { .. }) => "SQLite3::Database",
                 Some(RObj::Set(_)) => "Set",
                 Some(RObj::Array(_)) => "Array",
                 Some(RObj::Hash { .. }) => "Hash",
@@ -4201,6 +4234,154 @@ pub fn fiber_alive(fiber: &Value) -> bool {
     match with_host(|h| h.obj(fiber).cloned()) {
         Some(RObj::Fiber { id }) => with_host(|h| !h.fibers[id as usize].done),
         _ => false,
+    }
+}
+
+// ---- SQLite3 side table ---------------------------------------------------
+
+/// Open a `SQLite3::Database` on `path` (`":memory:"` — or the empty string — for
+/// an in-memory DB), registering the owned `rusqlite::Connection` in the host
+/// side table and returning a fresh `RObj::Db` handle. The connection is opened
+/// before the host borrow so no nested `with_host` is held. Errors (bad path,
+/// permissions) surface as the message for a `SQLite3::SQLException`.
+pub fn db_open(path: &str) -> Result<Value, String> {
+    let conn = if path == ":memory:" || path.is_empty() {
+        rusqlite::Connection::open_in_memory()
+    } else {
+        rusqlite::Connection::open(path)
+    }
+    .map_err(|e| e.to_string())?;
+    Ok(with_host(|h| {
+        let id = h.db_handles.len() as u32;
+        h.db_handles.push(Some(DbCell {
+            conn,
+            results_as_hash: false,
+        }));
+        h.alloc(RObj::Db { id })
+    }))
+}
+
+/// The `db_handles` index behind a `Db` value, if `v` is one.
+fn db_id(v: &Value) -> Option<u32> {
+    match with_host(|h| h.obj(v).cloned()) {
+        Some(RObj::Db { id }) => Some(id),
+        _ => None,
+    }
+}
+
+/// Prepare `sql`, bind the positional `binds`, run it, and collect the result as
+/// `(column_names, rows)` where each row is the raw sqlite column values. The
+/// whole prepare/step loop runs inside a single `with_host` borrow because a
+/// `SqlVal` (`rusqlite::types::Value`) is owned native data that never touches
+/// the object heap — the caller converts to Ruby `Value`s afterward, avoiding a
+/// second `&mut self` borrow while the connection is live. Non-SELECT statements
+/// (DDL/DML) execute here too and simply return zero rows.
+pub fn db_execute(
+    v: &Value,
+    sql: &str,
+    binds: &[SqlVal],
+) -> Result<(Vec<String>, Vec<Vec<SqlVal>>), String> {
+    let id = db_id(v).ok_or_else(|| "not a database handle".to_string())?;
+    with_host(|h| {
+        let cell = h
+            .db_handles
+            .get(id as usize)
+            .and_then(|c| c.as_ref())
+            .ok_or_else(|| "cannot use a closed database".to_string())?;
+        let mut stmt = cell.conn.prepare(sql).map_err(|e| e.to_string())?;
+        let ncol = stmt.column_count();
+        let cols: Vec<String> = stmt
+            .column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // The sqlite3 gem leaves any placeholder with no supplied bind as NULL
+        // (`execute(sql, "one")` against two `?`s binds the second to NULL). Pad
+        // to the statement's parameter count so rusqlite's strict count check
+        // matches that lenient behavior.
+        let nparams = stmt.parameter_count();
+        let mut binds = binds.to_vec();
+        binds.resize(binds.len().max(nparams), SqlVal::Null);
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(binds.iter()))
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let mut r = Vec::with_capacity(ncol);
+            for i in 0..ncol {
+                let val: SqlVal = row.get(i).map_err(|e| e.to_string())?;
+                r.push(val);
+            }
+            out.push(r);
+        }
+        Ok((cols, out))
+    })
+}
+
+/// `db.last_insert_row_id` — the rowid of the most recent successful INSERT.
+pub fn db_last_insert_rowid(v: &Value) -> i64 {
+    match db_id(v) {
+        Some(id) => with_host(|h| {
+            h.db_handles
+                .get(id as usize)
+                .and_then(|c| c.as_ref())
+                .map(|c| c.conn.last_insert_rowid())
+                .unwrap_or(0)
+        }),
+        None => 0,
+    }
+}
+
+/// `db.changes` — rows modified by the most recent INSERT/UPDATE/DELETE.
+pub fn db_changes(v: &Value) -> i64 {
+    match db_id(v) {
+        Some(id) => with_host(|h| {
+            h.db_handles
+                .get(id as usize)
+                .and_then(|c| c.as_ref())
+                .map(|c| c.conn.changes() as i64)
+                .unwrap_or(0)
+        }),
+        None => 0,
+    }
+}
+
+/// `db.close` — drop the connection (closing the file), leaving the handle
+/// closed. Idempotent.
+pub fn db_close(v: &Value) {
+    if let Some(id) = db_id(v) {
+        with_host(|h| {
+            if let Some(slot) = h.db_handles.get_mut(id as usize) {
+                *slot = None;
+            }
+        });
+    }
+}
+
+/// `db.closed?` — true once `close` has run (or `v` is not a live handle).
+pub fn db_closed(v: &Value) -> bool {
+    match db_id(v) {
+        Some(id) => with_host(|h| !matches!(h.db_handles.get(id as usize), Some(Some(_)))),
+        None => true,
+    }
+}
+
+/// `db.results_as_hash = flag`.
+pub fn db_set_results_as_hash(v: &Value, on: bool) {
+    if let Some(id) = db_id(v) {
+        with_host(|h| {
+            if let Some(Some(cell)) = h.db_handles.get_mut(id as usize) {
+                cell.results_as_hash = on;
+            }
+        });
+    }
+}
+
+/// Whether `db.results_as_hash` is set (rows returned as Hashes).
+pub fn db_results_as_hash(v: &Value) -> bool {
+    match db_id(v) {
+        Some(id) => with_host(|h| matches!(h.db_handles.get(id as usize), Some(Some(c)) if c.results_as_hash)),
+        None => false,
     }
 }
 

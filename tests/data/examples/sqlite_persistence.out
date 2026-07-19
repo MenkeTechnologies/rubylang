@@ -1,0 +1,8 @@
+inserted ids: 1, 2
+count before close: 2
+count after reopen: 2
+user #1: Alice (age 30)
+user #2: Bob (age 25)
+oldest: Alice at 30
+handled SQLite3::SQLException: true
+OK
