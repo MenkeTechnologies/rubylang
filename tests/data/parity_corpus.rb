@@ -1275,3 +1275,32 @@ g = Enumerator.new { |y| n = 0; loop { y << n; n += 1 } }
 p g.lazy.map { |x| x * x }.select { |x| x.even? }.first(4)
 p [1, 2, 3].cycle(3).to_a
 p Enumerator.new { |y| y << :a; y << :b }.map { |s| s.to_s.upcase }
+#==#
+def wrap; "[" + yield + "]"; end
+p wrap { "core" }
+def tight; "<"+yield+">"; end
+p tight { "x" }
+p [:mm, :bb, :a].sort
+p %i[banana apple cherry].sort
+S = Struct.new(:x, :y)
+pt = S.new(3, 4)
+case pt
+in [a, b]
+  p [a, b]
+end
+case pt
+in {x:, y:}
+  p({x: x, y: y})
+end
+p pt.deconstruct_keys([:y, :x])
+class Animal
+  def speak; end
+  def name; end
+end
+class Dog < Animal
+  def bark; end
+end
+p Dog.instance_methods(false).sort
+p Dog.method_defined?(:speak)
+p Dog.method_defined?(:bark)
+p Dog.method_defined?(:meow)

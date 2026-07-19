@@ -141,6 +141,22 @@ fn yield_invokes_the_block() {
 }
 
 #[test]
+fn yield_operator_spacing_matches_mri() {
+    // `yield` before a tight `+`/`-` is the binary operator, not a yield arg,
+    // unless a space precedes and none follows (MRI's `foo +1` command-arg rule).
+    eq(r#"def m; "["+yield+"]"; end; m { "X" }"#, r#""[X]""#);
+    eq(r#"def m; "[" + yield + "]"; end; m { "X" }"#, r#""[X]""#);
+    eq("def m; yield+1; end; m { 5 }", "6");
+    eq("def m; yield + 1; end; m { 5 }", "6");
+    // Guards — unchanged behavior:
+    eq("def m; yield +1; end; m { 5 }", "5"); // space-before/none-after => yield(+1); block ignores arg
+    eq("def m; yield 1; end; m { |x| x }", "1");
+    eq("def m; yield(1, 2); end; m { |a, b| a + b }", "3");
+    eq("def m; yield; end; m { 42 }", "42");
+    eq("def m; x = yield; x; end; m { 7 }", "7");
+}
+
+#[test]
 fn while_with_break() {
     eq("i = 0; while true; i += 1; break if i > 5; end; i", "6");
 }
@@ -3521,4 +3537,110 @@ fn enumerator_block_less_still_works() {
     eq("[1, 2, 3].each.to_a", "[1, 2, 3]");
     eq("(1..Float::INFINITY).lazy.map { |x| x * x }.first(3)", "[1, 4, 9]");
     eq("[10, 20, 30].each.next", "10");
+}
+
+// --- Fanout round 4: Struct patterns, reflection, symbol sort --------------
+
+#[test]
+fn struct_deconstruct_patterns() {
+    // Struct instances honour the deconstruction protocol in patterns.
+    eq(
+        "S = Struct.new(:a, :b); case S.new(1, 2); in [x, y]; [x, y]; end",
+        "[1, 2]",
+    );
+    eq(
+        "S = Struct.new(:a, :b); case S.new(1, 2); in {a:, b:}; [a, b]; end",
+        "[1, 2]",
+    );
+    // A hash-pattern subset requests only some keys.
+    eq("S = Struct.new(:a, :b); case S.new(1, 2); in {a:}; a; end", "1");
+    // The class/find pattern deconstructs positionally.
+    eq(
+        "S = Struct.new(:a, :b); case S.new(1, 2); in S[x, y]; [x, y]; end",
+        "[1, 2]",
+    );
+    // deconstruct_keys filters to the requested keys (in request order); nil = all.
+    eq(
+        "S = Struct.new(:a, :b); S.new(1, 2).deconstruct_keys([:a])",
+        "{a: 1}",
+    );
+    eq(
+        "S = Struct.new(:a, :b); S.new(1, 2).deconstruct_keys([:b, :a])",
+        "{b: 2, a: 1}",
+    );
+    eq(
+        "S = Struct.new(:a, :b); S.new(1, 2).deconstruct_keys(nil)",
+        "{a: 1, b: 2}",
+    );
+    // Guard: plain Array/Hash and user-object deconstruct patterns still work.
+    eq("case [1, 2]; in [x, y]; [x, y]; end", "[1, 2]");
+    eq(
+        "class C; def deconstruct; [7, 8]; end; end; case C.new; in [a, b]; [a, b]; end",
+        "[7, 8]",
+    );
+    eq("case 5; in [a, b]; :bad; else; :ok; end", ":ok");
+}
+
+#[test]
+fn instance_methods_reflection() {
+    eq(
+        "class Foo; def a; end; def b; end; end; Foo.instance_methods(false).sort",
+        "[:a, :b]",
+    );
+    // inherited=true walks superclass + included module (user-defined portion;
+    // rubylang does not enumerate builtin Kernel methods).
+    eq(
+        "module M; def mm; end; end; \
+         class Base; def bb; end; end; \
+         class Foo < Base; include M; def a; end; def b; end; end; \
+         Foo.instance_methods(true).sort",
+        "[:a, :b, :bb, :mm]",
+    );
+    // no-arg defaults to inherited=true
+    eq(
+        "module M; def mm; end; end; \
+         class Base; def bb; end; end; \
+         class Foo < Base; include M; def a; end; def b; end; end; \
+         Foo.instance_methods.sort",
+        "[:a, :b, :bb, :mm]",
+    );
+    // attr_accessor generated methods appear as own methods
+    eq(
+        "class Foo; attr_accessor :x; end; Foo.instance_methods(false).sort",
+        "[:x, :x=]",
+    );
+    // instance-side Object#methods
+    eq(
+        "module M; def mm; end; end; \
+         class Base; def bb; end; end; \
+         class Foo < Base; include M; def a; end; def b; end; end; \
+         Foo.new.methods.sort",
+        "[:a, :b, :bb, :mm]",
+    );
+    // synthetic __class_body__ never leaks into instance_methods
+    eq(
+        "class C; X = 1; def a; end; end; C.instance_methods(false)",
+        "[:a]",
+    );
+}
+
+#[test]
+fn method_defined_predicate() {
+    eq(
+        "module M; def mm; end; end; \
+         class Base; def bb; end; end; \
+         class Foo < Base; include M; def a; end; end; \
+         [Foo.method_defined?(:a), Foo.method_defined?(:bb), \
+          Foo.method_defined?(:mm), Foo.method_defined?(:nope)]",
+        "[true, true, true, false]",
+    );
+    eq("class Foo; def a; end; end; Foo.method_defined?(\"a\")", "true");
+}
+
+#[test]
+fn symbols_sort_by_name() {
+    eq("[:mm, :bb, :a].sort", "[:a, :bb, :mm]");
+    eq("%i[x y a].sort", "[:a, :x, :y]");
+    eq("[:c, :a, :b].min", ":a");
+    eq("[:c, :a, :b].max", ":c");
 }

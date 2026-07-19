@@ -1135,7 +1135,7 @@ impl Parser {
                 self.advance();
                 let (args, _) = if self.is_op("(") {
                     self.call_tail()?
-                } else if self.starts_command_arg() {
+                } else if self.cur_space() && self.starts_command_arg() {
                     let mut a = vec![self.arg()?];
                     while self.eat_op(",") {
                         a.push(self.arg()?);

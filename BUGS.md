@@ -53,11 +53,6 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   class, so `def`, `attr_*`, `include`, class variables (`@@x = 0`), constants,
   and other executable statements all take effect. (Constants are stored
   globally rather than namespaced under the class.)
-- **`yield` directly before `+`/`-` with no space** (`"[" + yield+"]"`) misparses
-  the operator as an argument to `yield` (`yield(+"]")`), dropping the trailing
-  term. Add a space (`yield + "]"`) or parenthesize (`(yield)`); the same
-  spacing rule already applies in MRI to `foo +1` vs `foo + 1`, but rubylang
-  mis-splits this particular `yield` case.
 - **Modifier `rescue` inside call-args / array literals.** Numeric-literal
   binding (`-7.abs` → `(-7).abs`, with `-2**2` → `-(2**2)`) and modifier
   `rescue` precedence (`x = a rescue b` → `x = (a rescue b)`, plus grouping
@@ -112,6 +107,19 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   Ruby (`Integer < Numeric` → true, `String < Numeric` → nil). A Class object
   is usable as a Hash key or Set member (keyed by class name), so
   `group_by(&:class)` and counting-by-class work.
+- **Class/module reflection.** `Module#instance_methods([inherited])`,
+  `#public_instance_methods`, `#method_defined?`/`#public_method_defined?`, and
+  the instance-side `Object#methods` return method names as symbols.
+  `instance_methods(false)` is the class's own methods (including
+  `attr_accessor`/`attr_reader`/`attr_writer` accessors and `define_method`
+  methods); `instance_methods` / `instance_methods(true)` add every user-defined
+  ancestor (included modules and superclasses) via the ancestor chain. Builtin
+  ancestors (`Object`/`Kernel`/`Comparable`/`Enumerable`) are NOT enumerated —
+  the inherited set is bounded to the user-defined portion of the chain, so it
+  omits MRI's builtin Kernel methods. Method visibility (public/private/
+  protected) is not modeled, so `public_instance_methods` equals
+  `instance_methods` and `public_method_defined?` equals `method_defined?`. The
+  synthetic `__class_body__` (and any `__`-prefixed internal name) is excluded.
 - **Composite Hash keys.** Arrays (`{[1, 2] => v}`, nested), Ranges
   (`{(1..3) => v}`, Integer/String/Float endpoints), and class objects work as
   Hash keys and Set members — keyed structurally by value, so equal keys hash
@@ -236,6 +244,10 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   responding to `deconstruct` (called once, must return an Array), a hash pattern
   any object responding to `deconstruct_keys` (passed the requested symbol keys,
   or `nil` for `**rest`/`**nil`/`{}`); binding a hash `**rest` name is supported.
+  Struct instances participate fully: they report `respond_to?` true for both
+  protocol methods, `deconstruct` yields the member values, and
+  `deconstruct_keys` honours a requested-key filter (returning only the named
+  members, in the requested order) or all members when passed `nil`.
 
 ## Tooling
 

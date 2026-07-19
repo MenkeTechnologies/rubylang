@@ -690,6 +690,7 @@ fn is_universal_object_method(name: &str) -> bool {
             | "frozen?"
             | "dup"
             | "clone"
+            | "methods"
     )
 }
 
@@ -848,6 +849,19 @@ pub(crate) fn dispatch(
             };
             return Ok(with_host(|h| h.new_lazy(source, vec![])));
         }
+        // `Object#methods` — the receiver's instance methods (own + user-defined
+        // ancestors) as symbols. Bounded to user-defined method surface; builtin
+        // Kernel methods are not enumerated.
+        "methods" if args.is_empty() => {
+            if let Some(cls) = with_host(|h| h.object_class(recv)) {
+                return Ok(with_host(|h| {
+                    let names = h.instance_method_names(&cls, true);
+                    let syms: Vec<Value> = names.iter().map(|n| h.new_symbol(n)).collect();
+                    h.new_array(syms)
+                }));
+            }
+            return Ok(new_arr(vec![]));
+        }
         "send" | "__send__" | "public_send" => {
             let m = name_of(&args[0]);
             return dispatch(recv, &m, &args[1..], block);
@@ -876,6 +890,14 @@ pub(crate) fn dispatch(
                         &[sym, include_private],
                         None,
                     );
+                }
+                // Struct instances respond to the deconstruction protocol even
+                // though those methods are Struct-provided, not user-defined; the
+                // pattern-match gate depends on this being true.
+                if with_host(|h| h.struct_def(&cls)).is_some()
+                    && matches!(m.as_str(), "deconstruct" | "deconstruct_keys")
+                {
+                    return Ok(Value::Bool(true));
                 }
                 return Ok(Value::Bool(false));
             }
@@ -1221,6 +1243,28 @@ fn dispatch_classref(
                 .collect();
             h.new_array(refs)
         })),
+        // `Module#instance_methods([include_inherited=true])` — the instance
+        // method names as symbols. `false` gives only the class's own methods;
+        // `true`/no arg walks the user-defined ancestor chain. Visibility is not
+        // modeled, so `public_instance_methods` is the same set.
+        "instance_methods" | "public_instance_methods" => {
+            let inherited = args
+                .first()
+                .map(|a| with_host(|h| h.truthy(a)))
+                .unwrap_or(true);
+            Ok(with_host(|h| {
+                let names = h.instance_method_names(cls, inherited);
+                let syms: Vec<Value> = names.iter().map(|n| h.new_symbol(n)).collect();
+                h.new_array(syms)
+            }))
+        }
+        // `Module#method_defined?(sym)` — true if the method is defined on the
+        // class or any ancestor. Visibility is not modeled, so this also serves
+        // `public_method_defined?`.
+        "method_defined?" | "public_method_defined?" => {
+            let m = name_of(&args[0]);
+            Ok(Value::Bool(with_host(|h| h.is_method_defined(cls, &m))))
+        }
         // Numeric class constants (`Float::INFINITY`, `Float::NAN`, …), reached
         // via `::` (which lowers to a method call on the class reference).
         "INFINITY" if cls == "Float" => Ok(Value::Float(f64::INFINITY)),
@@ -1303,10 +1347,34 @@ fn struct_method(
                 .collect(),
         ),
         "size" | "length" => Value::Int(members.len() as i64),
-        "to_h" | "deconstruct_keys" => {
+        "to_h" => {
             let mut map = IndexMap::new();
             for (m, v) in members.iter().zip(values()) {
                 map.insert(RKey::Sym(m.clone()), v);
+            }
+            with_host(|h| h.new_hash(map))
+        }
+        "deconstruct_keys" => {
+            let mut map = IndexMap::new();
+            match args.first().and_then(|a| with_host(|h| h.as_array(a))) {
+                // An Array of symbols selects those members, in the requested
+                // order; unknown keys are skipped. Matches MRI `deconstruct_keys`.
+                Some(req) => {
+                    for k in req {
+                        if let Some(m) = with_host(|h| h.as_symbol(&k)) {
+                            if members.contains(&m) {
+                                let v = with_host(|h| h.ivar_of(recv, &m));
+                                map.insert(RKey::Sym(m), v);
+                            }
+                        }
+                    }
+                }
+                // `nil` (or no argument) returns every member in declaration order.
+                None => {
+                    for (m, v) in members.iter().zip(values()) {
+                        map.insert(RKey::Sym(m.clone()), v);
+                    }
+                }
             }
             with_host(|h| h.new_hash(map))
         }
@@ -8293,6 +8361,10 @@ fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     // Two DateTimes order by their epoch seconds.
     if let (Some(x), Some(y)) = with_host(|h| (h.datetime_secs(a), h.datetime_secs(b))) {
         return x.total_cmp(&y);
+    }
+    // Two Symbols order lexicographically by name (`[:b, :a].sort == [:a, :b]`).
+    if let (Some(x), Some(y)) = with_host(|h| (h.as_symbol(a), h.as_symbol(b))) {
+        return x.cmp(&y);
     }
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),

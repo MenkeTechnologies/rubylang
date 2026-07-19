@@ -1889,6 +1889,49 @@ impl RubyHost {
     pub fn find_method(&self, class: &str, method: &str) -> Option<MethodDef> {
         self.find_method_owner(class, method).map(|(m, _)| m)
     }
+    /// Enumerate the instance-method names of a class for reflection
+    /// (`Module#instance_methods`, `#public_instance_methods`). With
+    /// `inherited == false`, only the class's own methods; with `true`, own plus
+    /// every *user-defined* ancestor (included modules and superclasses) walked
+    /// via `class_ancestry`. Builtin ancestors (`Object`/`Kernel`/`Comparable`/…)
+    /// are not enumerable here, so the `true` set is bounded to the user-defined
+    /// portion of the chain — it does not include MRI's builtin Kernel methods.
+    /// `define_method`-created methods are included; synthetic/internal names
+    /// (`__class_body__` and anything starting with `__`) are excluded. Names are
+    /// deduplicated, keeping the first (nearest) occurrence.
+    pub fn instance_method_names(&self, class: &str, inherited: bool) -> Vec<String> {
+        let chain: Vec<String> = if inherited {
+            self.class_ancestry(class)
+        } else {
+            vec![class.to_string()]
+        };
+        let mut out = Vec::new();
+        for n in &chain {
+            if let Some(def) = self.classes.get(n) {
+                for k in def.methods.keys() {
+                    if !k.starts_with("__") {
+                        out.push(k.clone());
+                    }
+                }
+            }
+            if let Some(dm) = self.define_methods.get(n) {
+                for k in dm.keys() {
+                    if !k.starts_with("__") {
+                        out.push(k.clone());
+                    }
+                }
+            }
+        }
+        dedup_keep_first(out)
+    }
+    /// `Module#method_defined?` — whether `method` is defined on `class` or any
+    /// ancestor (own methods, included modules, superclasses, and
+    /// `define_method`-created methods). Visibility is not modeled, so this also
+    /// serves `public_method_defined?`.
+    pub fn is_method_defined(&self, class: &str, method: &str) -> bool {
+        self.find_method_owner(class, method).is_some()
+            || self.find_define_method(class, method).is_some()
+    }
     /// Resolve a `super` call: find `method` in the receiver's linearized
     /// ancestry *after* the position of `def_class` (the current method's
     /// owner). Walking the receiver's full ancestry — not just `def_class`'s
