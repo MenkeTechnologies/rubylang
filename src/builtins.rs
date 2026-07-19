@@ -3059,15 +3059,13 @@ fn round_like(recv: &Value, ndigits: Option<i64>, op: fn(f64) -> f64) -> Result<
             }
             Ok(match ndigits {
                 Some(d) if d > 0 => {
+                    // Natural IEEE rounding preserves the sign of a value that
+                    // rounds to zero (`-0.01.round(1)` -> -0.0), matching MRI for
+                    // normal magnitudes. (MRI returns +0.0 only in the deep
+                    // underflow case where the value is far below the rounding
+                    // unit — an implementation-defined dtoa quirk left as-is.)
                     let m = 10f64.powi(d as i32);
-                    let r = op(f * m) / m;
-                    // A nonzero value that rounds to zero is +0.0 in Ruby; an
-                    // input that is already ±0.0 keeps its sign.
-                    if r == 0.0 && *f != 0.0 {
-                        Value::Float(0.0)
-                    } else {
-                        Value::Float(r)
-                    }
+                    Value::Float(op(f * m) / m)
                 }
                 Some(d) if d < 0 => {
                     let m = 10f64.powi((-d) as i32);

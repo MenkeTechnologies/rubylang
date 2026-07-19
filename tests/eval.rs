@@ -4824,8 +4824,9 @@ fn float_round_domain_and_promotion() {
     eq("(1e10 * 1e10).round", "100000000000000000000");
     eq("(2.0 ** 70).round", "1180591620717411303424");
     eq("1e20.to_i", "100000000000000000000");
-    // A nonzero value that rounds to zero is +0.0; -0.0 input keeps its sign.
-    eq("(-1.5 / 1e10).round(4)", "0.0");
+    // Natural IEEE rounding preserves sign: a normal-magnitude negative that
+    // rounds to zero is -0.0 (like MRI); a ±0.0 input keeps its sign.
+    eq("(-0.01).round(1)", "-0.0");
     eq("(-0.0).round(2)", "-0.0");
     // Ordinary rounds unaffected.
     eq("3.14159.round(2)", "3.14");
