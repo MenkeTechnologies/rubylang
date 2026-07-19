@@ -4604,3 +4604,116 @@ fn enumerable_chunk_and_slice_when_via_user_each() {
         "[[1, 2], [4, 5]]",
     );
 }
+
+#[test]
+fn respond_to_consults_user_method_table() {
+    // Own instance method, included-module method, define_method'd method,
+    // alias, and per-object singleton all report true; an undefined name false.
+    let prelude = "module M; def mixed; end; end; \
+                   class C; def foo; end; include M; \
+                   define_method(:dyn) { 42 }; alias_method :dyn2, :dyn; end; ";
+    eq(&format!("{prelude}C.new.respond_to?(:foo)"), "true");
+    eq(&format!("{prelude}C.new.respond_to?(:mixed)"), "true");
+    eq(&format!("{prelude}C.new.respond_to?(:dyn)"), "true");
+    eq(&format!("{prelude}C.new.respond_to?(:dyn2)"), "true");
+    eq(&format!("{prelude}C.new.respond_to?(:nope)"), "false");
+    eq(
+        "o = Object.new; def o.sing; end; o.respond_to?(:sing)",
+        "true",
+    );
+    // Inherited user method (through the superclass chain) also responds.
+    eq(
+        "class A; def a; end; end; class B < A; end; B.new.respond_to?(:a)",
+        "true",
+    );
+}
+
+#[test]
+fn super_in_exception_initialize_sets_message() {
+    let prelude = "class E < StandardError; def initialize(x); super(\"boom: #{x}\"); end; end; ";
+    eq(&format!("{prelude}E.new(5).message"), "\"boom: 5\"");
+    eq(
+        &format!("{prelude}begin; raise E.new(7); rescue => e; e.message; end"),
+        "\"boom: 7\"",
+    );
+    // `raise E, 9` routes through the user initialize (message becomes "boom: 9").
+    eq(
+        &format!("{prelude}begin; raise E, 9; rescue => e; e.message; end"),
+        "\"boom: 9\"",
+    );
+    // A plain builtin raise still carries its message.
+    eq(
+        "begin; raise ArgumentError, \"bad\"; rescue => e; e.message; end",
+        "\"bad\"",
+    );
+}
+
+#[test]
+fn hash_merge_bang_and_update() {
+    eq("h = {a: 1, b: 2}; h.merge!({b: 3, c: 4}); h", "{a: 1, b: 3, c: 4}");
+    // Returns the receiver (same object).
+    eq("h = {a: 1}; h.merge!({b: 2}).equal?(h)", "true");
+    // Block resolves collisions; `update` is the alias.
+    eq(
+        "h = {a: 1, b: 2}; h.update({b: 10}) { |k, old, new| old + new }; h",
+        "{a: 1, b: 12}",
+    );
+    // Multiple hash arguments, left-to-right.
+    eq("h = {a: 1}; h.merge!({b: 2}, {c: 3}); h", "{a: 1, b: 2, c: 3}");
+    // Non-bang merge with a block is unaffected.
+    eq("{x: 1}.merge({x: 2, y: 3}) { |k, o, n| o + n }", "{x: 3, y: 3}");
+}
+
+#[test]
+fn stringio_read_write_buffer() {
+    let req = "require \"stringio\"; ";
+    eq(
+        &format!("{req}io = StringIO.new; io.write(\"a\"); io << \"b\"; io.puts(\"c\"); io.string"),
+        "\"abc\\n\"",
+    );
+    eq(
+        &format!("{req}r = StringIO.new(\"x\\ny\\n\"); r.gets"),
+        "\"x\\n\"",
+    );
+    eq(
+        &format!("{req}r = StringIO.new(\"abcdef\"); r.read(3)"),
+        "\"abc\"",
+    );
+    // read advances the cursor; pos and rewind track it.
+    eq(
+        &format!("{req}r = StringIO.new(\"abc\"); r.read(2); r.pos"),
+        "2",
+    );
+    eq(
+        &format!("{req}r = StringIO.new(\"abc\"); r.read; r.rewind; r.read"),
+        "\"abc\"",
+    );
+    // write returns the byte count.
+    eq(&format!("{req}StringIO.new.write(\"12345\")"), "5");
+}
+
+#[test]
+fn array_pack_and_string_unpack_round_trip() {
+    eq("[72, 105].pack(\"C*\")", "\"Hi\"");
+    eq("\"ABC\".unpack(\"C*\")", "[65, 66, 67]");
+    eq("\"Hi\".unpack1(\"a*\")", "\"Hi\"");
+    // Hex directive (used by digests): decode then re-encode.
+    eq("[\"deadbeef\"].pack(\"H*\").unpack1(\"H*\")", "\"deadbeef\"");
+    // Big/little-endian fixed-width integers.
+    eq("[1].pack(\"N\").unpack1(\"N\")", "1");
+    eq("[65535].pack(\"n\").unpack1(\"n\")", "65535");
+    eq("[1].pack(\"V\").unpack1(\"V\")", "1");
+    eq("[513].pack(\"v\").unpack1(\"v\")", "513");
+    // Every byte value round-trips (the crypto/web property).
+    eq("(0..255).to_a.pack(\"C*\").unpack(\"C*\") == (0..255).to_a", "true");
+    // Integer#chr for a high byte round-trips through unpack.
+    eq("200.chr.unpack(\"C*\")", "[200]");
+    eq("[\"hi\"].pack(\"A5\")", "\"hi   \"");
+}
+
+#[test]
+fn script_file_constant_reports_running_file() {
+    // Under `-e`-style evaluation MRI reports `__FILE__` as "-e".
+    eq("__FILE__", "\"-e\"");
+    eq("File.dirname(__FILE__)", "\".\"");
+}

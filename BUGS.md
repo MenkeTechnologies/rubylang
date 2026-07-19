@@ -172,13 +172,16 @@ Honest limitations of this surface:
   hook; exact interleaving with surrounding output can differ because class
   bodies are otherwise hoisted.
 - **`respond_to?` on builtin receivers is permissive.** A user object reports
-  accurately (its class's methods, `respond_to_missing?`, Struct/OpenStruct
-  attributes). For builtin receivers (`String`, `Integer`, `Array`, `Hash`,
-  `Symbol`, …) `respond_to?` returns `true` for any name except the
-  pattern-match deconstruction protocol, because there is no enumerable registry
-  of the builtin method surface — so `"s".respond_to?(:no_such)` is `true` where
-  MRI is `false`. Accurate builtin `respond_to?` needs a per-type method-name
-  registry (deep substrate, not yet built).
+  accurately: it consults the receiver's class method table (own methods,
+  inherited methods, included/prepended-module methods, `define_method` blocks,
+  `alias_method` aliases, and per-object singleton methods), then
+  `respond_to_missing?`, then Struct/OpenStruct attributes. For builtin receivers
+  (`String`, `Integer`, `Array`, `Hash`, `Symbol`, …) `respond_to?` returns
+  `true` for any name except the pattern-match deconstruction protocol, because
+  there is no enumerable registry of the builtin method surface — so
+  `"s".respond_to?(:no_such)` is `true` where MRI is `false`. Accurate builtin
+  `respond_to?` needs a per-type method-name registry (deep substrate, not yet
+  built).
 
 ## Lexer
 
@@ -337,12 +340,22 @@ Honest limitations of this surface:
   UTC-only calendar. Because the model is UTC-only, `DateTime#to_time.to_s`
   renders the zone as `UTC` rather than MRI's `+0000`, and fractional-second /
   `DateTime.now` sub-second values are not bit-for-bit faithful (f64 storage).
-- **`Array#pack` / `String#unpack`** are not implemented: strings are UTF-8
-  (`String`, not a byte buffer), so the binary directives (`N`/`n`/`V`/`v`/`H`,
-  high `C` bytes) cannot round-trip. This is a durable encoding limitation, not a
-  temporary gap. Same root cause: `Integer#chr` for a value in `128..255` returns
-  the UTF-8 code point `U+00NN` (a two-byte `String`) rather than MRI's single
-  ASCII-8BIT byte whose `inspect` is `"\xNN"` — there is no binary-string type.
+- **`Array#pack` / `String#unpack` / `#unpack1`** are implemented for the common
+  web/crypto directives — `C`/`c` (bytes), `a`/`A` (string, NUL/space pad), `N`/
+  `n`/`V`/`v` (big/little-endian 16/32-bit ints), `H`/`h` (hex, high/low nibble
+  first). Because strings are UTF-8 (`String`, not a byte buffer), a binary string
+  is modeled with the Latin-1 convention: a "byte" is a code point in
+  `U+0000..=U+00FF` (its low 8 bits). `pack` produces such a string and `unpack`
+  reads it back the same way, so any `pack`-produced binary string round-trips
+  (`bytes.pack("C*").unpack("C*")`, `(0..255).to_a.pack("C*").unpack("C*")`), and
+  `Integer#chr` (`n & 0xff → U+00nn`) round-trips through `unpack("C*")` too. Two
+  documented divergences remain from the lack of a true ASCII-8BIT type: (1)
+  `unpack` on a *genuine* multibyte-UTF-8 text string reads code points, not the
+  raw UTF-8 bytes MRI would — `"é".unpack("C*")` is `[233]` here vs `[195, 169]`
+  in MRI; (2) `String#bytes`/`#ord` keep real-UTF-8 semantics, so `255.chr.bytes`
+  is `[195, 191]` here vs `[255]` in MRI, and `255.chr.inspect` is the `U+00FF`
+  code point rather than MRI's `"\xFF"`. For ASCII and every `pack`-produced
+  binary string the two models coincide.
 - **`defined?`.** The `defined?(expr)` / `defined? expr` operator returns the
   Ruby description string (`"local-variable"`, `"instance-variable"`,
   `"global-variable"`, `"constant"`, `"method"`, `"assignment"`, `"expression"`,
@@ -408,6 +421,14 @@ Honest limitations of this surface:
   serialization), so any object works as a template local. (5) Legacy positional
   `safe_level`/`eoutvar` args to `ERB.new` are ignored; the deprecated positional
   trim-mode (3rd arg) is still honored.
+- **`StringIO` (dependency-free).** `require "stringio"` is a no-op; the class is
+  always available. `StringIO.new(initial = "")` is a String-backed IO: the
+  buffer and read cursor live in the object's `buf`/`pos` ivars. `#string`
+  returns the accumulated buffer; `#write`/`#<<`/`#print`/`#puts` append (the
+  common output/log-sink and input-buffer patterns only ever append or read),
+  with `#write` returning the byte count and `#<<` returning self; `#read([len])`,
+  `#gets`, and `#each_line` read from the cursor; `#rewind`, `#pos`/`#pos=`,
+  `#tell`/`#seek`, `#eof?` track it. Used by Rack for input and log sinks.
 - **`rand`.** Backed by a thread-local SplitMix64. `srand(seed)` reseeds it so
   `rand`/`rand(n)` are reproducible within a run and returns the previous seed
   (MRI semantics); the MRI-exact sequence and MRI's random startup seed are not
@@ -668,6 +689,11 @@ Implemented (the core sqlite3-gem shape):
 - **`__dir__`** returns the directory of the file currently running (from the
   same file-dir stack), a String; under `-e`/stdin it returns the seeded current
   directory (MRI returns the relative `"."` there).
+- **`__FILE__`** returns the path of the file currently running (a parallel
+  file-path stack): the script path exactly as given on the command line for the
+  top-level script (not canonicalized, matching MRI), the required file's own
+  absolute path inside a `require`d file, and `"-e"` for a one-liner. So
+  `File.dirname(__FILE__)` behaves like `__dir__`.
 - **Limitations.** `require` does not use `RUBYLIB`, gem paths, or a real stdlib
   tree — only `$LOAD_PATH` (script dir + whatever the program pushes) plus the
   builtin no-op list. Autoload, `require` of a `.so`/`.bundle`, and thread-safe

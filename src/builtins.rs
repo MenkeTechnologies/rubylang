@@ -304,6 +304,15 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
                 None => Value::Undef,
             }
         }
+        // The path of the file currently running (top of the file-path stack) —
+        // the script path as given for the top-level script, the required file's
+        // own path inside a required file, and "-e" for a one-liner.
+        "__FILE__" => {
+            return match crate::host::current_file_path() {
+                Some(p) => new_str(p),
+                None => Value::Undef,
+            }
+        }
         _ => {}
     }
     // A bare name that is not a local is a zero-arg call: a method on `self` /
@@ -1032,12 +1041,22 @@ pub(crate) fn dispatch(
             return Ok(with_host(|h| h.new_method(recv.clone(), &m)));
         }
         "respond_to?" => {
-            // For a user object, a method responds if the class defines it or its
-            // `respond_to_missing?` returns true. Built-in receivers stay
-            // permissive (their method surface is not enumerable here).
+            // For a user object, a method responds if the class (or an included/
+            // prepended module or superclass) defines it as a normal method, a
+            // `define_method` block, or an alias; a per-object singleton method
+            // also responds; or its `respond_to_missing?` returns true. Built-in
+            // receivers stay permissive (their surface is not enumerable here).
+            let m = name_of(&args[0]);
+            if with_host(|h| h.find_singleton_method(recv, &m)).is_some()
+                || with_host(|h| h.find_singleton_define_method(recv, &m)).is_some()
+            {
+                return Ok(Value::Bool(true));
+            }
             if let Some(cls) = with_host(|h| h.object_class(recv)) {
-                let m = name_of(&args[0]);
-                if with_host(|h| h.find_method_owner(&cls, &m)).is_some() {
+                if with_host(|h| h.find_method_owner(&cls, &m)).is_some()
+                    || with_host(|h| h.find_define_method(&cls, &m)).is_some()
+                    || with_host(|h| h.find_alias(&cls, &m)).is_some()
+                {
                     return Ok(Value::Bool(true));
                 }
                 if with_host(|h| h.find_method_owner(&cls, "respond_to_missing?")).is_some() {
@@ -1202,6 +1221,18 @@ fn dispatch_classref(
     // `ENV` — the process environment as a hash-like object (backed by std::env).
     if cls == "ENV" {
         return dispatch_env(name, args, block);
+    }
+    // `StringIO.new(initial="")` — a String-backed IO. The buffer and read cursor
+    // live in the `buf`/`pos` ivars (see `stringio_method`).
+    if cls == "StringIO" && name == "new" {
+        let init = args.first().map(arg_str).unwrap_or_default();
+        return Ok(with_host(|h| {
+            let obj = h.new_object("StringIO");
+            let sv = h.new_string(init);
+            h.set_ivar_of(&obj, "buf", sv);
+            h.set_ivar_of(&obj, "pos", Value::Int(0));
+            obj
+        }));
     }
     // `Struct.new(:a, :b [, keyword_init: true])` defines a new struct class and
     // returns a reference to it (usually assigned to a constant).
@@ -2029,6 +2060,10 @@ fn dispatch_object(
         if let Some(r) = erb_method(recv, name, args)? {
             return Ok(r);
         }
+    }
+    // StringIO: a String-backed IO (buffer + read cursor in the `buf`/`pos` ivars).
+    if cls == "StringIO" {
+        return stringio_method(recv, name, args, block);
     }
     match name {
         "message" | "to_s" => {
@@ -3152,6 +3187,18 @@ fn dispatch_string(
         }
         "chars" => Ok(new_arr(s.chars().map(|c| new_str(c.to_string())).collect())),
         "bytes" => Ok(new_arr(s.bytes().map(|b| Value::Int(b as i64)).collect())),
+        // `String#unpack(fmt)` / `#unpack1(fmt)` — the inverse of `Array#pack`.
+        // The string is read as a byte sequence via the Latin-1 convention (each
+        // codepoint's low byte), so a `pack`-produced binary string round-trips.
+        "unpack" => {
+            let fmt = arg_str(&args[0]);
+            Ok(new_arr(unpack_bytes(&binstr_to_bytes(&s), &fmt)?))
+        }
+        "unpack1" => {
+            let fmt = arg_str(&args[0]);
+            let out = unpack_bytes(&binstr_to_bytes(&s), &fmt)?;
+            Ok(out.into_iter().next().unwrap_or(Value::Undef))
+        }
         // Number of bytes in the UTF-8 encoding (not the character count).
         "bytesize" => Ok(Value::Int(s.len() as i64)),
         // With a block, yield each byte and return self; without a block, yield
@@ -4571,6 +4618,15 @@ fn dispatch_array(
             let sep = args.first().map(arg_str).unwrap_or_default();
             let parts: Vec<String> = arr.iter().map(|x| with_host(|h| h.to_s(x))).collect();
             Ok(new_str(parts.join(&sep)))
+        }
+        // `Array#pack(fmt)` — serialize elements to a byte string per the template
+        // directives (C/c a/A N/n V/v H/h). Bytes are stored as Latin-1 codepoints
+        // (byte b => char U+00xx), so the result round-trips through `String#unpack`
+        // (see `pack_bytes`/`unpack_bytes`).
+        "pack" => {
+            let fmt = arg_str(&args[0]);
+            let bytes = pack_bytes(&arr, &fmt)?;
+            Ok(new_str(bytes_to_binstr(&bytes)))
         }
         "sort" | "sort!" => {
             let a = match &block {
@@ -7956,6 +8012,31 @@ fn dispatch_hash(
             }
             Ok(with_host(|h| h.new_hash(m)))
         }
+        // `merge!` / `update` — the in-place form of `merge`: each hash argument
+        // is merged into the receiver left-to-right, a block resolves collisions
+        // by `block.call(key, old, new)`, and the receiver itself is returned.
+        "merge!" | "update" => {
+            let mut m = map;
+            for a in args {
+                if let Some(other) = with_host(|h| h.as_hash(a)) {
+                    if let Some(b) = &block {
+                        for (k, v) in other {
+                            if let Some(old) = m.get(&k) {
+                                let kv = with_host(|h| h.key_value(&k));
+                                let merged = call_proc(b, &[kv, old.clone(), v.clone()])?;
+                                m.insert(k, merged);
+                            } else {
+                                m.insert(k, v);
+                            }
+                        }
+                    } else {
+                        m.extend(other);
+                    }
+                }
+            }
+            with_host(|h| h.set_hash(recv, m));
+            Ok(recv.clone())
+        }
         "to_a" => Ok(with_host(|h| {
             let rows: Vec<Value> = map
                 .iter()
@@ -8978,29 +9059,49 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
         }
         "raise" | "fail" => {
             // Forms: `raise` / `raise "msg"` / `raise SomeError` /
-            // `raise SomeError, "msg"` / `raise instance`.
-            let (class, message) = match args {
-                [] => ("RuntimeError".to_string(), "RuntimeError".to_string()),
-                [a] => {
-                    if let Some(cls) = with_host(|h| h.classref_name(a)) {
-                        (cls.clone(), cls)
-                    } else if let Some(cls) = with_host(|h| h.object_class(a)) {
-                        // Re-raising an existing exception instance.
-                        let m = with_host(|h| h.to_s(a));
-                        with_host(|h| h.set_pending_exc(a.clone()));
-                        return Err(if m.is_empty() { cls } else { m });
-                    } else {
-                        let m = with_host(|h| h.to_s(a));
-                        ("RuntimeError".to_string(), m)
-                    }
-                }
-                [cls, msg, ..] => {
-                    let clsname = with_host(|h| h.classref_name(cls))
-                        .unwrap_or_else(|| with_host(|h| h.to_s(cls)));
-                    (clsname, with_host(|h| h.to_s(msg)))
+            // `raise SomeError, "msg"` / `raise instance`. When the named class
+            // defines its own `initialize`, build the exception through `new` so
+            // a user `initialize` (and its `super("msg")`) runs — otherwise fall
+            // back to the default `new_exception(class, message)`.
+            let build = |cls: &str, ctor_args: &[Value]| -> Result<Value, String> {
+                if with_host(|h| h.find_method(cls, "initialize")).is_some() {
+                    dispatch_classref(cls, "new", ctor_args, None)
+                } else {
+                    let message = match ctor_args.first() {
+                        Some(a) => with_host(|h| h.to_s(a)),
+                        None => cls.to_string(),
+                    };
+                    Ok(with_host(|h| h.new_exception(cls, &message)))
                 }
             };
-            let exc = with_host(|h| h.new_exception(&class, &message));
+            let exc = match args {
+                [] => with_host(|h| h.new_exception("RuntimeError", "RuntimeError")),
+                [a] => {
+                    if let Some(cls) = with_host(|h| h.classref_name(a)) {
+                        build(&cls, &[])?
+                    } else if with_host(|h| h.object_class(a)).is_some() {
+                        // Re-raising an existing exception instance.
+                        a.clone()
+                    } else {
+                        let m = with_host(|h| h.to_s(a));
+                        with_host(|h| h.new_exception("RuntimeError", &m))
+                    }
+                }
+                [cls, rest @ ..] => {
+                    if let Some(clsname) = with_host(|h| h.classref_name(cls)) {
+                        build(&clsname, rest)?
+                    } else {
+                        let m = with_host(|h| h.to_s(cls));
+                        with_host(|h| h.new_exception("RuntimeError", &m))
+                    }
+                }
+            };
+            // The propagated Err string is the exception's message (its `message`
+            // ivar if set, else its class name) — used only if unrescued.
+            let message = with_host(|h| match h.ivar_of(&exc, "message") {
+                Value::Undef => h.class_of(&exc).to_string(),
+                m => h.to_s(&m),
+            });
             with_host(|h| h.set_pending_exc(exc));
             Err(message)
         }
@@ -11112,10 +11213,421 @@ fn do_require(args: &[Value], mode: ReqMode) -> Result<Value, String> {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     crate::host::push_file_dir(dir);
+    // `__FILE__` inside a required file is that file's own (absolute) path.
+    crate::host::push_file_path(abs_str.clone());
     let r = crate::host::run_required_main(main);
     crate::host::pop_file_dir();
     r?;
     Ok(Value::Bool(true))
+}
+
+// ---- Array#pack / String#unpack -----------------------------------------
+//
+// Ruby strings here are UTF-8-backed (`RObj::Str` is a Rust `String`), so a true
+// ASCII-8BIT/binary string is modeled with the Latin-1 convention: a "byte" is a
+// codepoint in `U+0000..=U+00FF` and its value is the char's low 8 bits. `pack`
+// turns bytes into such a string and `unpack` reads it back the same way, so any
+// `pack`-produced binary string round-trips (`bytes.pack("C*").unpack("C*")`),
+// and `Integer#chr` (which maps `n & 0xff` to `U+00nn`) round-trips through
+// `unpack("C*")` too. The documented divergence: `unpack` on a *genuine*
+// multibyte-UTF-8 text string reads codepoints (Latin-1), not the raw UTF-8
+// bytes MRI would — e.g. `"é".unpack("C*")` is `[233]` here vs `[195, 169]` in
+// MRI. `String#bytes`/`#ord` keep their real-UTF-8 semantics, so `255.chr.bytes`
+// is `[195, 191]` here vs `[255]` in MRI (a pack-free path). For ASCII and every
+// pack-produced binary string the two models coincide.
+
+/// Encode a byte slice as a Latin-1 binary string (`byte b` -> `char U+00xx`).
+fn bytes_to_binstr(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
+}
+
+/// Decode a binary string to its byte sequence (each codepoint's low 8 bits).
+fn binstr_to_bytes(s: &str) -> Vec<u8> {
+    s.chars().map(|c| (c as u32 & 0xff) as u8).collect()
+}
+
+/// A parsed pack/unpack directive: the type char and its count (`Some(n)`, or
+/// `None` for the `*` "all/rest" form; a bare directive is `Some(1)`).
+struct PackDir {
+    kind: char,
+    count: Option<usize>,
+}
+
+/// Parse a pack/unpack template into directives, ignoring whitespace (MRI does).
+fn parse_pack_template(fmt: &str) -> Vec<PackDir> {
+    let mut dirs = Vec::new();
+    let mut it = fmt.chars().peekable();
+    while let Some(k) = it.next() {
+        if k.is_whitespace() {
+            continue;
+        }
+        let count = match it.peek() {
+            Some('*') => {
+                it.next();
+                None
+            }
+            Some(d) if d.is_ascii_digit() => {
+                let mut n = 0usize;
+                while let Some(d) = it.peek().copied() {
+                    if let Some(v) = d.to_digit(10) {
+                        n = n * 10 + v as usize;
+                        it.next();
+                    } else {
+                        break;
+                    }
+                }
+                Some(n)
+            }
+            _ => Some(1),
+        };
+        dirs.push(PackDir { kind: k, count });
+    }
+    dirs
+}
+
+/// `Array#pack` core: consume `items` per the template, producing raw bytes.
+fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut idx = 0usize; // next array element to consume
+    for d in parse_pack_template(fmt) {
+        match d.kind {
+            // Integer bytes: C (unsigned) / c (signed) are identical at the byte
+            // level. `*` consumes every remaining element.
+            'C' | 'c' => {
+                let n = d.count.unwrap_or(items.len().saturating_sub(idx));
+                for _ in 0..n {
+                    let v = items.get(idx).map(as_i).unwrap_or(0);
+                    out.push((v & 0xff) as u8);
+                    idx += 1;
+                }
+            }
+            // A string: `a` NUL-pads (and NUL is the truncation fill), `A` space-
+            // pads. `*` uses the full string; a count truncates/pads to width.
+            'a' | 'A' => {
+                let sbytes = items
+                    .get(idx)
+                    .map(|v| binstr_to_bytes(&arg_str(v)))
+                    .unwrap_or_default();
+                idx += 1;
+                let pad = if d.kind == 'A' { b' ' } else { 0u8 };
+                match d.count {
+                    None => out.extend_from_slice(&sbytes),
+                    Some(n) => {
+                        for i in 0..n {
+                            out.push(sbytes.get(i).copied().unwrap_or(pad));
+                        }
+                    }
+                }
+            }
+            // Fixed-width integers, big-endian (N/n) and little-endian (V/v).
+            'N' | 'n' | 'V' | 'v' => {
+                let width = if matches!(d.kind, 'N' | 'V') { 4 } else { 2 };
+                let little = matches!(d.kind, 'V' | 'v');
+                let n = d.count.unwrap_or(items.len().saturating_sub(idx));
+                for _ in 0..n {
+                    let v = items.get(idx).map(as_i).unwrap_or(0) as u64;
+                    idx += 1;
+                    let full = v.to_be_bytes();
+                    let mut w: Vec<u8> = full[8 - width..].to_vec();
+                    if little {
+                        w.reverse();
+                    }
+                    out.extend_from_slice(&w);
+                }
+            }
+            // Hex strings: `H` high-nibble-first, `h` low-nibble-first. Consumes
+            // one element; a count limits the nibbles taken (`*` = all).
+            'H' | 'h' => {
+                let hex = items.get(idx).map(arg_str).unwrap_or_default();
+                idx += 1;
+                let nibbles: Vec<u8> = hex
+                    .chars()
+                    .map(|c| c.to_digit(16).unwrap_or(0) as u8)
+                    .collect();
+                let take = d.count.unwrap_or(nibbles.len()).min(nibbles.len());
+                let mut i = 0;
+                while i < take {
+                    let hi = nibbles[i];
+                    let lo = if i + 1 < take { nibbles[i + 1] } else { 0 };
+                    let byte = if d.kind == 'H' {
+                        (hi << 4) | lo
+                    } else {
+                        (lo << 4) | hi
+                    };
+                    out.push(byte);
+                    i += 2;
+                }
+            }
+            other => {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!("unsupported pack directive '{other}'"),
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `String#unpack` core: read `bytes` per the template into Ruby values.
+fn unpack_bytes(bytes: &[u8], fmt: &str) -> Result<Vec<Value>, String> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    for d in parse_pack_template(fmt) {
+        match d.kind {
+            'C' | 'c' => {
+                let n = d.count.unwrap_or(bytes.len().saturating_sub(pos));
+                for _ in 0..n {
+                    match bytes.get(pos) {
+                        Some(&b) => {
+                            let v = if d.kind == 'c' {
+                                b as i8 as i64
+                            } else {
+                                b as i64
+                            };
+                            out.push(Value::Int(v));
+                            pos += 1;
+                        }
+                        None => out.push(Value::Undef),
+                    }
+                }
+            }
+            // `a` keeps everything (including trailing NULs); `A` strips trailing
+            // NULs and spaces. Yields one string element.
+            'a' | 'A' => {
+                let n = d.count.unwrap_or(bytes.len().saturating_sub(pos));
+                let end = (pos + n).min(bytes.len());
+                let slice = &bytes[pos..end];
+                pos = end;
+                let s = if d.kind == 'A' {
+                    let t: &[u8] = {
+                        let mut e = slice.len();
+                        while e > 0 && (slice[e - 1] == 0 || slice[e - 1] == b' ') {
+                            e -= 1;
+                        }
+                        &slice[..e]
+                    };
+                    bytes_to_binstr(t)
+                } else {
+                    bytes_to_binstr(slice)
+                };
+                out.push(new_str(s));
+            }
+            'N' | 'n' | 'V' | 'v' => {
+                let width = if matches!(d.kind, 'N' | 'V') { 4 } else { 2 };
+                let little = matches!(d.kind, 'V' | 'v');
+                let n = d.count.unwrap_or(usize::MAX);
+                let mut produced = 0;
+                while produced < n && pos + width <= bytes.len() {
+                    let mut buf = [0u8; 8];
+                    let chunk = &bytes[pos..pos + width];
+                    if little {
+                        for (i, &b) in chunk.iter().enumerate() {
+                            buf[i] = b;
+                        }
+                        out.push(Value::Int(u64::from_le_bytes(buf) as i64));
+                    } else {
+                        for (i, &b) in chunk.iter().enumerate() {
+                            buf[8 - width + i] = b;
+                        }
+                        out.push(Value::Int(u64::from_be_bytes(buf) as i64));
+                    }
+                    pos += width;
+                    produced += 1;
+                }
+                // A fixed count past the end yields nils (MRI behavior).
+                if d.count.is_some() {
+                    for _ in produced..n {
+                        out.push(Value::Undef);
+                    }
+                }
+            }
+            'H' | 'h' => {
+                let rest = &bytes[pos.min(bytes.len())..];
+                let avail = rest.len() * 2;
+                let take = d.count.unwrap_or(avail).min(avail);
+                let mut s = String::with_capacity(take);
+                for i in 0..take {
+                    let byte = rest[i / 2];
+                    let nib = if d.kind == 'H' {
+                        if i % 2 == 0 {
+                            byte >> 4
+                        } else {
+                            byte & 0x0f
+                        }
+                    } else if i % 2 == 0 {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    };
+                    s.push(std::char::from_digit(nib as u32, 16).unwrap());
+                }
+                pos += take.div_ceil(2);
+                out.push(new_str(s));
+            }
+            other => {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!("unsupported unpack directive '{other}'"),
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+// ---- StringIO ------------------------------------------------------------
+//
+// `require "stringio"` is a no-op (the class is builtin). A StringIO is a plain
+// object of class `StringIO` whose `buf` ivar holds the accumulated String and
+// whose `pos` ivar is the read cursor (a byte offset). Writes append to `buf`
+// (the common output/log-sink and input-buffer patterns only ever append or
+// read); `read`/`gets` advance `pos`.
+
+/// The current buffer string and read cursor of a StringIO receiver.
+fn stringio_state(recv: &Value) -> (String, usize) {
+    with_host(|h| {
+        let buf = match h.ivar_of(recv, "buf") {
+            Value::Undef => String::new(),
+            v => h.as_str(&v).unwrap_or_default(),
+        };
+        let pos = match h.ivar_of(recv, "pos") {
+            Value::Int(n) => n.max(0) as usize,
+            _ => 0,
+        };
+        (buf, pos)
+    })
+}
+
+fn stringio_set_buf(recv: &Value, buf: String) {
+    with_host(|h| {
+        let sv = h.new_string(buf);
+        h.set_ivar_of(recv, "buf", sv);
+    });
+}
+
+fn stringio_set_pos(recv: &Value, pos: usize) {
+    with_host(|h| h.set_ivar_of(recv, "pos", Value::Int(pos as i64)));
+}
+
+fn stringio_method(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    match name {
+        // The internal buffer String (the accumulated content).
+        "string" => Ok(with_host(|h| h.ivar_of(recv, "buf"))),
+        // Append: `write` returns the byte count written, `<<` returns self.
+        "write" | "<<" | "print" => {
+            let (mut buf, _) = stringio_state(recv);
+            let mut written = 0usize;
+            for a in args {
+                let s = with_host(|h| h.to_s(a));
+                written += s.len();
+                buf.push_str(&s);
+            }
+            let end = buf.len();
+            stringio_set_buf(recv, buf);
+            stringio_set_pos(recv, end);
+            match name {
+                "<<" => Ok(recv.clone()),
+                "print" => Ok(Value::Undef),
+                _ => Ok(Value::Int(written as i64)),
+            }
+        }
+        // `puts` appends each argument followed by a newline (unless it already
+        // ends in one); no arguments appends a bare newline.
+        "puts" => {
+            let (mut buf, _) = stringio_state(recv);
+            if args.is_empty() {
+                buf.push('\n');
+            } else {
+                for a in args {
+                    let s = with_host(|h| h.to_s(a));
+                    buf.push_str(&s);
+                    if !s.ends_with('\n') {
+                        buf.push('\n');
+                    }
+                }
+            }
+            let end = buf.len();
+            stringio_set_buf(recv, buf);
+            stringio_set_pos(recv, end);
+            Ok(Value::Undef)
+        }
+        // `read([len])` — from the cursor. No arg reads the rest (as `""` at EOF);
+        // a length reads that many bytes and returns nil once past the end.
+        "read" => {
+            let (buf, pos) = stringio_state(recv);
+            let bytes = buf.as_bytes();
+            match args.first() {
+                None => {
+                    let out = String::from_utf8_lossy(&bytes[pos.min(bytes.len())..]).into_owned();
+                    stringio_set_pos(recv, bytes.len());
+                    Ok(new_str(out))
+                }
+                Some(a) => {
+                    let len = as_i(a).max(0) as usize;
+                    if pos >= bytes.len() && len > 0 {
+                        return Ok(Value::Undef);
+                    }
+                    let end = (pos + len).min(bytes.len());
+                    let out = String::from_utf8_lossy(&bytes[pos..end]).into_owned();
+                    stringio_set_pos(recv, end);
+                    Ok(new_str(out))
+                }
+            }
+        }
+        // `gets` — the next line (through and including the `\n`), nil at EOF.
+        "gets" => {
+            let (buf, pos) = stringio_state(recv);
+            let bytes = buf.as_bytes();
+            if pos >= bytes.len() {
+                return Ok(Value::Undef);
+            }
+            let nl = bytes[pos..].iter().position(|&b| b == b'\n');
+            let end = match nl {
+                Some(i) => pos + i + 1,
+                None => bytes.len(),
+            };
+            let out = String::from_utf8_lossy(&bytes[pos..end]).into_owned();
+            stringio_set_pos(recv, end);
+            Ok(new_str(out))
+        }
+        // `each_line` / `each` — yield each line; returns self.
+        "each_line" | "each" => {
+            if let Some(b) = &block {
+                loop {
+                    let line = stringio_method(recv, "gets", &[], None)?;
+                    if matches!(line, Value::Undef) {
+                        break;
+                    }
+                    call_proc(b, &[line])?;
+                }
+            }
+            Ok(recv.clone())
+        }
+        "rewind" => {
+            stringio_set_pos(recv, 0);
+            Ok(Value::Int(0))
+        }
+        "pos" | "tell" => Ok(Value::Int(stringio_state(recv).1 as i64)),
+        "pos=" | "seek" => {
+            let p = as_i(&args[0]).max(0) as usize;
+            stringio_set_pos(recv, p);
+            Ok(Value::Int(p as i64))
+        }
+        "eof?" | "eof" => {
+            let (buf, pos) = stringio_state(recv);
+            Ok(Value::Bool(pos >= buf.len()))
+        }
+        "size" | "length" => Ok(Value::Int(stringio_state(recv).0.len() as i64)),
+        "rewind!" | "close" | "flush" | "fsync" => Ok(Value::Undef),
+        "to_s" => Ok(with_host(|h| h.ivar_of(recv, "buf"))),
+        _ => Err(no_method_error(recv, name)),
+    }
 }
 
 pub(crate) fn raise_exc(class: &str, msg: &str) -> String {

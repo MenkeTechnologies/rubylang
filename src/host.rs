@@ -691,6 +691,7 @@ pub fn reset_host() {
     with_host(|h| *h = RubyHost::new());
     crate::intercepts::clear();
     FILE_DIR_STACK.with(|s| s.borrow_mut().clear());
+    FILE_PATH_STACK.with(|s| s.borrow_mut().clear());
     DEF_TARGET.with(|t| t.borrow_mut().clear());
 }
 
@@ -700,6 +701,9 @@ thread_local! {
     /// top-level script's dir at the bottom. `require_relative` resolves against
     /// the top entry (the requiring file's dir).
     static FILE_DIR_STACK: RefCell<Vec<std::path::PathBuf>> = const { RefCell::new(Vec::new()) };
+    /// The path of the file currently being run, pushed/popped in lockstep with
+    /// `FILE_DIR_STACK`; the top entry is what `__FILE__` reports.
+    static FILE_PATH_STACK: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Push the directory of the file about to run (see `FILE_DIR_STACK`).
@@ -707,9 +711,18 @@ pub fn push_file_dir(dir: std::path::PathBuf) {
     FILE_DIR_STACK.with(|s| s.borrow_mut().push(dir));
 }
 
+/// Push the path of the file about to run (see `FILE_PATH_STACK`), the value
+/// `__FILE__` reports while it runs. Pushed in lockstep with `push_file_dir`.
+pub fn push_file_path(path: String) {
+    FILE_PATH_STACK.with(|s| s.borrow_mut().push(path));
+}
+
 /// Pop after a required/loaded file finishes running.
 pub fn pop_file_dir() {
     FILE_DIR_STACK.with(|s| {
+        s.borrow_mut().pop();
+    });
+    FILE_PATH_STACK.with(|s| {
         s.borrow_mut().pop();
     });
 }
@@ -718,6 +731,11 @@ pub fn pop_file_dir() {
 /// `require_relative` resolution.
 pub fn current_file_dir() -> Option<std::path::PathBuf> {
     FILE_DIR_STACK.with(|s| s.borrow().last().cloned())
+}
+
+/// The path of the file currently running (top of the stack), for `__FILE__`.
+pub fn current_file_path() -> Option<String> {
+    FILE_PATH_STACK.with(|s| s.borrow().last().cloned())
 }
 
 /// Where a bare `def` should register while a `class_eval`/`instance_eval`
@@ -2503,6 +2521,7 @@ impl RubyHost {
                 | "OpenStruct"
                 | "SQLite3"
                 | "SQLite3::Database"
+                | "StringIO"
                 // `ENV` is modeled as a class-ref so its `[]`/`fetch`/… dispatch
                 // through `dispatch_classref` (it is the process environment).
                 | "ENV"
@@ -2816,6 +2835,22 @@ impl RubyHost {
             class: class.to_string(),
             ivars,
         })
+    }
+    /// Whether `class` is (or descends from) a builtin exception class. The
+    /// builtin roots are name-based (`*Error`, `Exception`, `StopIteration`);
+    /// user classes are resolved through the superclass chain.
+    pub fn is_exception_class(&self, class: &str) -> bool {
+        fn builtin(n: &str) -> bool {
+            n.ends_with("Error") || n == "Exception" || n == "StopIteration"
+        }
+        let mut cur = Some(class.to_string());
+        while let Some(name) = cur {
+            if builtin(&name) {
+                return true;
+            }
+            cur = self.superclass_of(&name);
+        }
+        false
     }
     /// Whether an exception of class `exc_class` is caught by a `rescue` naming
     /// `rescued` (walks the exception's superclass chain; unknown classes match
@@ -4091,6 +4126,20 @@ pub fn call_super(explicit_args: Option<Vec<Value>>) -> Result<Value, String> {
     let recv_class =
         with_host(|h| h.object_class(&self_obj)).unwrap_or_else(|| def_class.clone());
     let Some((def, owner)) = with_host(|h| h.find_super(&recv_class, &def_class, &method)) else {
+        // No user-defined super method in the ancestor chain. A `super` from a
+        // user `initialize` up to a native superclass initializer is the common
+        // case: `Exception#initialize(msg)` records the message; every other
+        // `Object#initialize` is a no-op. Anything else is a genuine error.
+        if method == "initialize" {
+            let args = explicit_args.unwrap_or(cur_args);
+            let is_exc = with_host(|h| h.is_exception_class(&recv_class));
+            if is_exc {
+                if let Some(msg) = args.first() {
+                    with_host(|h| h.set_ivar_of(&self_obj, "message", msg.clone()));
+                }
+            }
+            return Ok(Value::Undef);
+        }
         return Err(format!("super: no superclass method '{method}'"));
     };
     let args = explicit_args.unwrap_or(cur_args);

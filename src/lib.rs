@@ -45,6 +45,8 @@ pub fn eval_str(src: &str) -> Result<Value, String> {
     let cwd = std::env::current_dir().unwrap_or_default();
     host::with_host(|h| h.init_load_path(&cwd.to_string_lossy()));
     host::push_file_dir(cwd);
+    // A `-e` one-liner has no script file; MRI reports `__FILE__` as "-e".
+    host::push_file_path("-e".to_string());
     run_compiled(compile(src)?)
 }
 
@@ -86,6 +88,9 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     host::with_host(|h| h.init_load_path(&dir.to_string_lossy()));
     host::push_file_dir(dir);
+    // `__FILE__` for the top-level script is the path exactly as given on the
+    // command line (MRI does not canonicalize it).
+    host::push_file_path(path.to_string());
     // If `ruby --build FILE` warmed the cache, the stored program is the whole
     // bundled app (every statically-required file inlined). Run it directly —
     // it skips lex/parse/lower AND needs none of the required source files on
