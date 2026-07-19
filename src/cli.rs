@@ -30,6 +30,11 @@ pub struct Cli {
     #[arg(long = "build")]
     pub build: bool,
 
+    /// With --build: emit a standalone native executable (no interpreter, no
+    /// sources) next to the script instead of warming the cache.
+    #[arg(long = "native", requires = "build")]
+    pub native: bool,
+
     /// Print the compiled fusevm bytecode for the script and exit.
     #[arg(long = "dump-bytecode")]
     pub dump_bytecode: bool,

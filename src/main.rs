@@ -36,6 +36,16 @@ fn main() -> ExitCode {
             };
         }
         if cli.build {
+            if cli.native {
+                return match rubylang::aot::build_native(&file) {
+                    Ok(msg) => {
+                        // A build report is explicit user-requested output.
+                        println!("{msg}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => fail(&e),
+                };
+            }
             return match rubylang::aot::build(&file) {
                 Ok(msg) => {
                     // A build report is explicit user-requested output.

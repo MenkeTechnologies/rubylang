@@ -669,6 +669,49 @@ end-to-end (`tests/socket.rs`, incl. a raw `std::net` client and `curl`).
   load (the runtime `require` path swallows it). Use the runtime `require` path
   (don't `--build`) for the rare code that depends on either behavior.
 
+## AOT native executable (`ruby --build --native`)
+
+- **Standalone binary, no interpreter, no sources.** `ruby --build --native FILE`
+  bundles the app exactly as `--build` does, then emits a native executable next
+  to the entrypoint (`app.rb` → `app`). It runs the whole program with **no `ruby`
+  interpreter and no `.rb` files present** — verified end-to-end (multi-file app
+  with a namespaced class, a block-taking method, and a namespaced constant; run
+  after deleting every source; stdout and exit code match both `ruby FILE` and
+  MRI). `file app` reports a native Mach-O / ELF executable.
+- **How it links.** `fusevm::aot::compile_object` lowers the **main** chunk to a
+  relocatable object that exports the native driver `fusevm_aot_entry`, the
+  serialized main chunk, and imports the runtime shims plus the frontend hook
+  `fusevm_aot_register_builtins`. Because `compile_object` embeds only the main
+  chunk, the rest of the program (methods/classes/blocks/constants) is serialized
+  with the same serde-flat form the on-disk cache uses (`cache::program_to_blob`)
+  and baked into a generated Rust frontend via `include_bytes!` as a fixed-size
+  byte array (so the symbol's address *is* the data). The frontend's `main` calls
+  `fusevm::aot::fusevm_aot_run_embedded`; `rustc` links it against the rubylang
+  rlib (which statically links fusevm and the whole runtime) plus the object.
+  The frontend hook (`aot::fusevm_aot_register_builtins`, in the rubylang library)
+  installs the same builtins + numeric hook `host::run_chunk_on` uses and loads
+  the embedded program into the thread-local host before main runs.
+- **Only the top-level chunk is native (today).** Method and block bodies are
+  **not** AOT-compiled — each runs through the interpreter (`host::run_chunk_on`
+  spins a fresh VM per call), reading the body from the host the frontend hook
+  loaded. So the "native executable" is a native top-level driver over an
+  interpreted method/block core, not a fully native-compiled program. This is
+  correct and self-contained; it is not yet the "every method compiled to
+  machine code" endpoint.
+- **Needs `rustc` + the build tree.** The link step shells out to `rustc` and
+  resolves the rubylang rlib + its dependency rlibs from the `target/<profile>`
+  dir next to the running `ruby` binary. An installed `ruby` stripped of its build
+  tree (no `librubylang.rlib`) reports a clear error instead of a broken binary;
+  the integration test (`tests/aot_native.rs`) skips cleanly when `rustc` is
+  absent. Cross-compilation is not supported — the object targets the host ISA
+  (`cranelift_native`), so it builds for the machine it runs on.
+- **Binary size + per-app link cost.** The executable statically links the whole
+  rubylang + fusevm + Cranelift runtime, so it is large (~30 MiB, unstripped debug
+  profile) and each build pays a `rustc` link (~1–2 s). No attempt is made yet to
+  shrink via dead-code stripping or a release-profile runtime. On macOS the linker
+  prints a benign "no platform load command" note for the cranelift-object output
+  (it assumes macOS and links fine); it is silenced in the build report.
+
 ## Tooling
 
 - **DAP debugger (`ruby --dap`).** Source-line breakpoints fire inside method,

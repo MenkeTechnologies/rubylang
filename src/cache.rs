@@ -80,6 +80,25 @@ struct CProg {
     deps: Vec<(String, u64)>,
 }
 
+/// Serialize a whole compiled `Program` (main chunk + methods/classes/begins/
+/// procs) to a self-contained bincode blob, reusing the same serde-flat `CProg`
+/// form the on-disk cache uses. `ruby --build --native` bakes this blob into the
+/// generated AOT frontend (`include_bytes!`) so the standalone binary carries its
+/// full program with no source files and no cache lookup. No dependency manifest
+/// is written: the binary IS the program, so staleness never applies.
+pub fn program_to_blob(prog: &Program) -> Result<Vec<u8>, String> {
+    let cp = to_cprog(prog);
+    bincode::serialize(&cp).map_err(|e| format!("aot program encode: {e}"))
+}
+
+/// Inverse of [`program_to_blob`]: rebuild a `Program` from an AOT-embedded blob.
+/// Called by the AOT runtime hook (`fusevm_aot_register_builtins`) to load the
+/// methods/classes/begins/procs into the host before the embedded main chunk runs.
+pub fn program_from_blob(bytes: &[u8]) -> Result<Program, String> {
+    let cp: CProg = bincode::deserialize(bytes).map_err(|e| format!("aot program decode: {e}"))?;
+    Ok(from_cprog(cp))
+}
+
 /// A stable content key for a source string.
 pub fn key_for(src: &str) -> u64 {
     let mut h = rustc_hash::FxHasher::default();

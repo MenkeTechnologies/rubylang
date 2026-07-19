@@ -159,6 +159,7 @@ Implemented and checked against the reference `ruby`:
 | `--lsp` | Language Server Protocol over stdio. |
 | `--dap` | Debug Adapter Protocol over stdio: source-line breakpoints inside methods, stepping, stack + variables. |
 | `--build FILE` | AOT-bundle the whole app — the entrypoint plus every file it statically `require`s / `require_relative`s — into one program in the on-disk cache. A later `ruby FILE` runs it directly, needing none of the required sources on disk. |
+| `--build --native FILE` | Emit a **standalone native executable** next to the script (`app.rb` → `app`). It runs the whole app with no `ruby` interpreter and no `.rb` sources present. `fusevm`'s Cranelift AOT emitter compiles the main chunk to a native object; the full program (methods/classes/blocks/constants) is baked in and linked against the rubylang runtime (`rustc` + the crate rlib). Needs `rustc` and the build tree present. |
 | `--dump-bytecode FILE` | Print the lowered fusevm chunk. |
 
 ---
@@ -207,6 +208,18 @@ and the AOP method-intercept engine are all in the tree. `before`/`after`/
 `around` advice registered via `intercept(pattern, kind, handler)` fires from the
 method-dispatch choke point, gated on an O(1) check so unadvised calls are
 unaffected.
+
+`ruby --build --native FILE` compiles an app to a **standalone native
+executable** — no interpreter, no `.rb` sources at run time. `fusevm`'s Cranelift
+AOT emitter lowers the main chunk to a relocatable object exporting a native
+driver; the full program (methods/classes/blocks/constants) is serialized and
+baked into a generated frontend, which `rustc` links against the rubylang runtime
+(the crate rlib, itself statically linking fusevm) plus that object. At startup
+the frontend hook installs the same builtins + numeric hook a normal run uses and
+loads the embedded program into the host, so method dispatch, block yields, and
+namespaced-constant reads resolve exactly as under `ruby FILE`. Method/block
+bodies run through the interpreter from that host; only the top-level chunk is
+native today.
 
 The DAP debugger (`ruby --dap`) sets source-line breakpoints inside method bodies, steps (next/stepIn/stepOut), and inspects the call stack and locals; markers are emitted only in --dap mode, so normal runs are unaffected.
 Regex literals (`/pat/flags`), `=~`/`!~`, `String#{match,scan,match?,sub,gsub}`
