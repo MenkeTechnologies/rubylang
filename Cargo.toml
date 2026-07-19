@@ -57,6 +57,15 @@ path = "src/bin/gen_docs.rs"
 name = "parity"
 path = "src/bin/parity.rs"
 
+# Differential parity FUZZER: generates thousands of seed-deterministic Ruby
+# snippets and diffs stdout+exit of the reference `ruby` against rubylang.
+# Development tool (runs subprocesses only, never links the lib); needs a
+# reference `ruby`, so CI never runs it. Ported from the zshrs parity-fuzz
+# harness.
+[[bin]]
+name = "parity-fuzz"
+path = "src/bin/parity_fuzz.rs"
+
 [dependencies]
 # Ruby executes on fusevm. rubyrs is a pure frontend: it lowers Ruby to fusevm
 # bytecode (src/compiler.rs) and hosts the Ruby object heap (src/host.rs,

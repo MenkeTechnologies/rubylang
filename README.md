@@ -221,6 +221,16 @@ harness** — `cargo run --bin parity` diffs the snippet corpus
 `tests/parity.rs` replays the frozen outputs in CI with no `ruby` installed.
 Nothing is faked as working: an unimplemented method raises `undefined method`.
 
+Alongside the fixed corpus, a **differential parity fuzzer** — `cargo run --bin
+parity-fuzz` — generates thousands of seed-deterministic Ruby snippets across
+grammar-driven modes (arithmetic, float shortest-repr, slicing, enumerables,
+format specs, `case`/`when`, …) and diffs stdout + exit code of the reference
+`ruby` against rubylang. Every divergence is delta-debugged to a minimal
+reproducer and replays exactly with `parity-fuzz --seed N --once`. It runs
+subprocesses only (never links the library) and needs a reference `ruby`, so CI
+does not run it. `--baseline FILE` allowlists known gaps so only a new
+divergence fails the run; `RUBYLANG_FUZZ_RUBY=PATH` selects the oracle.
+
 The `examples/` directory holds runnable programs that double as tests: the
 `test_*.rb` scripts embed `check` assertions that abort on any divergence from
 Ruby, and `tests/examples.rs` runs every example through the binary in CI,
