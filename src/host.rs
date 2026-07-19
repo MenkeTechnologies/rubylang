@@ -143,6 +143,9 @@ pub enum LazyOp {
     DropWhile(Value),
     Take(i64),
     Drop(i64),
+    /// `zip(a, b, …)` — pairs each element with the same-index element of every
+    /// argument array (nil past the end), producing an array per element.
+    Zip(Vec<Vec<Value>>),
 }
 
 /// A heap object — the Ruby reference types.

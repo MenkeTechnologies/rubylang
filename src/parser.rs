@@ -1192,9 +1192,12 @@ impl Parser {
 
     fn opt_value(&mut self) -> Result<Option<Box<Expr>>, String> {
         if matches!(self.peek(), Tok::Newline | Tok::Semicolon | Tok::Eof)
+            || matches!(self.peek(), Tok::Op(o) if matches!(o.as_str(), "}" | ")" | "]"))
             || self.is_kw("end")
             || self.is_kw("if")
             || self.is_kw("unless")
+            || self.is_kw("while")
+            || self.is_kw("until")
         {
             Ok(None)
         } else {

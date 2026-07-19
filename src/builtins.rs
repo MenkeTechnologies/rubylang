@@ -796,6 +796,22 @@ pub(crate) fn dispatch(
             };
             return Ok(Value::Bool(same));
         }
+        // `object_id` / `__id__` — a stable per-object identity integer. Ruby
+        // guarantees `Integer#object_id == 2n+1`; nil/false/true use their fixed
+        // immediate ids; every heap object gets a distinct even id from its
+        // handle (never colliding with the odd integer ids or the immediates).
+        "object_id" | "__id__" => {
+            let id = match recv {
+                Value::Int(n) => n.wrapping_mul(2).wrapping_add(1),
+                Value::Undef => 4,
+                Value::Bool(false) => 0,
+                Value::Bool(true) => 20,
+                Value::Obj(h) => (*h as i64 + 1).wrapping_mul(8),
+                Value::Float(f) => (f.to_bits() as i64) | 1,
+                _ => 8,
+            };
+            return Ok(Value::Int(id));
+        }
         // `dup` makes a fresh shallow copy so mutating the copy does not leak back
         // to the original; the copy is never frozen. `clone` also shallow-copies
         // but preserves the frozen state of the original.
@@ -4237,6 +4253,13 @@ fn dispatch_array(
             if let Some(b) = &block {
                 for x in &arr {
                     let r = call_proc(b, std::slice::from_ref(x))?;
+                    if has_pending_signal() {
+                        // `break value` short-circuits and becomes the result.
+                        if let Some(bv) = take_break() {
+                            return Ok(bv);
+                        }
+                        break;
+                    }
                     if name == "flat_map" {
                         if let Some(xs) = with_host(|h| h.as_array(&r)) {
                             out.extend(xs);
@@ -4259,6 +4282,12 @@ fn dispatch_array(
             if let Some(b) = &block {
                 for x in &arr {
                     let r = call_proc(b, std::slice::from_ref(x))?;
+                    if has_pending_signal() {
+                        if let Some(bv) = take_break() {
+                            return Ok(bv);
+                        }
+                        break;
+                    }
                     let t = with_host(|h| h.truthy(&r));
                     if t == keep_when {
                         out.push(x.clone());
@@ -4273,6 +4302,12 @@ fn dispatch_array(
             if let Some(b) = &block {
                 for x in &arr {
                     let r = call_proc(b, std::slice::from_ref(x))?;
+                    if has_pending_signal() {
+                        if let Some(bv) = take_break() {
+                            return Ok(bv);
+                        }
+                        break;
+                    }
                     if with_host(|h| h.truthy(&r)) {
                         out.push(r);
                     }
@@ -4397,6 +4432,13 @@ fn dispatch_array(
             if let Some(b) = &block {
                 for x in items {
                     acc = call_proc(b, &[acc.clone(), x.clone()])?;
+                    if has_pending_signal() {
+                        // `break value` short-circuits and becomes the result.
+                        if let Some(bv) = take_break() {
+                            return Ok(bv);
+                        }
+                        break;
+                    }
                 }
             }
             Ok(acc)
@@ -4815,7 +4857,12 @@ fn dispatch_array(
         "to_h" => {
             let mut m = IndexMap::new();
             for x in &arr {
-                if let Some(pair) = with_host(|h| h.as_array(x)) {
+                // With a block each element is mapped to the `[key, value]` pair.
+                let elem = match &block {
+                    Some(b) => call_proc(b, std::slice::from_ref(x))?,
+                    None => x.clone(),
+                };
+                if let Some(pair) = with_host(|h| h.as_array(&elem)) {
                     if pair.len() == 2 {
                         let k = with_host(|h| h.value_to_key(&pair[0]));
                         m.insert(k, pair[1].clone());
@@ -5162,6 +5209,13 @@ fn dispatch_lazy(
         "drop_while" => Ok(extend(LazyOp::DropWhile(blk()?))),
         "take" => Ok(extend(LazyOp::Take(as_i(&args[0]).max(0)))),
         "drop" => Ok(extend(LazyOp::Drop(as_i(&args[0]).max(0)))),
+        "zip" => {
+            let others: Vec<Vec<Value>> = args
+                .iter()
+                .map(|a| with_host(|h| h.as_array(a)).unwrap_or_default())
+                .collect();
+            Ok(extend(LazyOp::Zip(others)))
+        }
         "lazy" => Ok(recv.clone()),
         "first" => {
             let out = lazy_pull(
@@ -5191,6 +5245,8 @@ enum LazyState {
     Take(i64),
     Drop(i64),
     Dropping(bool),
+    /// `zip` cursor: the index of the next element to pair.
+    Zip(usize),
     None,
 }
 
@@ -5289,6 +5345,20 @@ fn lazy_feed(
                 lazy_feed(ops, state, i + 1, elem, out, limit)
             }
         }
+        LazyOp::Zip(others) => {
+            let LazyState::Zip(idx) = &mut state[i] else {
+                return Ok(false);
+            };
+            let n = *idx;
+            *idx += 1;
+            let mut row = Vec::with_capacity(others.len() + 1);
+            row.push(elem);
+            for other in others {
+                row.push(other.get(n).cloned().unwrap_or(Value::Undef));
+            }
+            let paired = new_arr(row);
+            lazy_feed(ops, state, i + 1, paired, out, limit)
+        }
     }
 }
 
@@ -5307,6 +5377,7 @@ fn lazy_pull(
             LazyOp::Take(n) => LazyState::Take(*n),
             LazyOp::Drop(n) => LazyState::Drop(*n),
             LazyOp::DropWhile(_) => LazyState::Dropping(true),
+            LazyOp::Zip(_) => LazyState::Zip(0),
             _ => LazyState::None,
         })
         .collect();
@@ -5347,6 +5418,7 @@ fn lazy_pull(
                     LazyOp::Take(n) => LazyState::Take(*n),
                     LazyOp::Drop(n) => LazyState::Drop(*n),
                     LazyOp::DropWhile(_) => LazyState::Dropping(true),
+                    LazyOp::Zip(_) => LazyState::Zip(0),
                     _ => LazyState::None,
                 };
             }
@@ -6248,11 +6320,24 @@ fn dispatch_hash(
         }
         "merge" => {
             // `merge` with no argument returns a copy; each hash argument is
-            // merged in left-to-right.
+            // merged in left-to-right. With a block, key collisions are resolved
+            // by `block.call(key, old_value, new_value)`.
             let mut m = map;
             for a in args {
                 if let Some(other) = with_host(|h| h.as_hash(a)) {
-                    m.extend(other);
+                    if let Some(b) = &block {
+                        for (k, v) in other {
+                            if let Some(old) = m.get(&k) {
+                                let kv = with_host(|h| h.key_value(&k));
+                                let merged = call_proc(b, &[kv, old.clone(), v.clone()])?;
+                                m.insert(k, merged);
+                            } else {
+                                m.insert(k, v);
+                            }
+                        }
+                    } else {
+                        m.extend(other);
+                    }
                 }
             }
             Ok(with_host(|h| h.new_hash(m)))
@@ -6318,14 +6403,22 @@ fn dispatch_hash(
             Ok(with_host(|h| h.new_hash(out)))
         }
         "transform_keys" => {
+            // `transform_keys(hash = {}) { |key| ... }` — a key present in the
+            // mapping hash is rewritten to its mapped value; otherwise the block
+            // (if any) computes the new key; otherwise the key is unchanged.
+            let mapping = args.first().and_then(|a| with_host(|h| h.as_hash(a)));
             let mut out = IndexMap::new();
-            if let Some(b) = &block {
-                for (k, v) in &map {
-                    let kv = with_host(|h| h.key_value(k));
+            for (k, v) in &map {
+                let kv = with_host(|h| h.key_value(k));
+                let nkey = if let Some(mapped) = mapping.as_ref().and_then(|m| m.get(k)) {
+                    with_host(|h| h.value_to_key(mapped))
+                } else if let Some(b) = &block {
                     let nk = call_proc(b, std::slice::from_ref(&kv))?;
-                    let nkey = with_host(|h| h.value_to_key(&nk));
-                    out.insert(nkey, v.clone());
-                }
+                    with_host(|h| h.value_to_key(&nk))
+                } else {
+                    k.clone()
+                };
+                out.insert(nkey, v.clone());
             }
             Ok(with_host(|h| h.new_hash(out)))
         }
@@ -7425,10 +7518,22 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
         "loop" => {
             if let Some(b) = &block {
                 loop {
-                    call_proc(b, &[])?;
+                    // `Kernel#loop` silently rescues `StopIteration` and stops,
+                    // returning the iterator's result (nil for the common case).
+                    if let Err(e) = call_proc(b, &[]) {
+                        let exc = with_host(|h| h.take_pending_exc());
+                        let cls = exc.as_ref().and_then(|v| with_host(|h| h.object_class(v)));
+                        if cls.as_deref() == Some("StopIteration") {
+                            return Ok(Value::Undef);
+                        }
+                        if let Some(v) = exc {
+                            with_host(|h| h.set_pending_exc(v));
+                        }
+                        return Err(e);
+                    }
                     if has_pending_signal() {
-                        take_break();
-                        break;
+                        // `break value` inside the loop is the loop's value.
+                        return Ok(take_break().unwrap_or(Value::Undef));
                     }
                 }
             }

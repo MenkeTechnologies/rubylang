@@ -1348,3 +1348,14 @@ begin
 rescue FiberError
   puts "dead"
 end
+#==#
+p [1, 2, 3, 4].map { |x| break x * 100 if x == 3; x }
+p [10, 20, 30, 40].inject { |a, b| break :halted if b == 30; a + b }
+p(loop { break "done" })
+p [1, 2, 3].to_h { |x| [x, x.to_s] }
+p({a: 1, b: 2}.merge({b: 10, c: 3}) { |key, old, new| old + new })
+p({x: 1, y: 2}.transform_keys({x: :a, y: :b}))
+p [1, 2, 3, 4].lazy.zip([:a, :b, :c, :d]).map { |n, s| "#{n}#{s}" }.first(3)
+p((1..Float::INFINITY).lazy.zip(["x", "y"]).first(3))
+p 42.object_id
+p [true.object_id, false.object_id, nil.object_id]

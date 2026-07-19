@@ -3784,3 +3784,53 @@ fn fiber_error_conditions() {
         ":raised",
     );
 }
+
+// --- Fanout round 5: surface-completeness fixes ----------------------------
+
+#[test]
+fn break_value_short_circuits_iterators() {
+    // `break value` inside a block becomes the iterator's result.
+    eq("[1, 2, 3, 4].map { |x| break x if x == 3; x }", "3");
+    eq("[1, 2, 3, 4].select { |x| break :stop if x == 3; x.odd? }", ":stop");
+    eq("[1, 2, 3, 4].filter_map { |x| break 99 if x == 3; x if x.even? }", "99");
+    eq("[1, 2, 3, 4].inject { |a, b| break b if b == 3; a + b }", "3");
+    eq("loop { break 42 }", "42");
+    // Bare `break` before a closing delimiter now parses.
+    eq("[1, 2].each { break }", "nil");
+    eq("loop { break }", "nil");
+    // `Kernel#loop` silently rescues StopIteration (external iterator exhausted).
+    eq("e = [1, 2].each; s = 0; loop { s += e.next }; s", "3");
+}
+
+#[test]
+fn object_id_identity() {
+    eq("5.object_id", "11");
+    eq("nil.object_id", "4");
+    eq("true.object_id", "20");
+    eq("s = \"x\"; s.object_id == s.object_id", "true");
+    eq("\"a\".object_id == \"a\".object_id", "false");
+    eq("\"x\".object_id.class", "Integer");
+}
+
+#[test]
+fn hash_merge_and_transform_keys_variants() {
+    // merge with a conflict-resolution block.
+    eq("{a: 1, b: 2}.merge({b: 3, c: 4}) { |k, o, n| o + n }", "{a: 1, b: 5, c: 4}");
+    // transform_keys with a mapping hash, and hash + block.
+    eq("{a: 1, b: 2}.transform_keys({a: :x})", "{x: 1, b: 2}");
+    eq(
+        "{a: 1, b: 2, c: 3}.transform_keys({a: :x}) { |k| k.upcase }",
+        "{x: 1, B: 2, C: 3}",
+    );
+}
+
+#[test]
+fn array_to_h_block_and_lazy_zip() {
+    eq("[1, 2, 3].to_h { |x| [x, x * x] }", "{1 => 1, 2 => 4, 3 => 9}");
+    eq("[1, 2, 3].lazy.zip([4, 5, 6]).to_a", "[[1, 4], [2, 5], [3, 6]]");
+    eq(
+        "[1, 2, 3].lazy.zip([4, 5], [7, 8, 9]).to_a",
+        "[[1, 4, 7], [2, 5, 8], [3, nil, 9]]",
+    );
+    eq("(1..Float::INFINITY).lazy.zip([9, 8, 7]).first(2)", "[[1, 9], [2, 8]]");
+}
