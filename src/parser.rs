@@ -21,6 +21,10 @@ pub struct Parser {
     pos: usize,
     /// Counter for unique temporaries (safe-navigation desugaring).
     tmp: usize,
+    /// When set, a trailing `do … end` is NOT grabbed as a call's block — it
+    /// belongs to an enclosing `while`/`until`/`for`/`case` whose condition is
+    /// being parsed (`while cond do … end`: the `do` binds to `while`).
+    no_do_block: bool,
 }
 
 /// Parse a full program.
@@ -30,6 +34,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
         toks,
         pos: 0,
         tmp: 0,
+        no_do_block: false,
     };
     p.program()
 }
@@ -816,7 +821,9 @@ impl Parser {
     }
 
     fn maybe_block(&mut self) -> Result<Option<Block>, String> {
-        if self.eat_kw("do") {
+        // Inside a loop/case condition a `do` binds to the enclosing keyword, not
+        // to a call in the condition — leave it for the loop parser to consume.
+        if !self.no_do_block && self.eat_kw("do") {
             let (params, splat, preludes) = self.block_params()?;
             let rest = self.body_until(&["end"])?;
             self.expect_kw("end")?;
@@ -1311,9 +1318,19 @@ impl Parser {
         })
     }
 
+    /// Parse an expression that is a loop/case condition: a trailing `do` binds
+    /// to the enclosing keyword, so suppress do-block grabbing for this expr only.
+    fn cond_expr(&mut self) -> Result<Expr, String> {
+        let saved = self.no_do_block;
+        self.no_do_block = true;
+        let e = self.expr();
+        self.no_do_block = saved;
+        e
+    }
+
     fn while_expr(&mut self, negate: bool) -> Result<Expr, String> {
         self.advance();
-        let mut cond = self.expr()?;
+        let mut cond = self.cond_expr()?;
         if negate {
             cond = Expr::Unary(UnOp::Not, Box::new(cond));
         }
@@ -1330,7 +1347,7 @@ impl Parser {
         self.advance();
         let var = self.ident_name()?;
         self.expect_kw("in")?;
-        let iter = self.expr()?;
+        let iter = self.cond_expr()?;
         self.eat_kw("do");
         let body = self.body_until(&["end"])?;
         self.expect_kw("end")?;

@@ -4902,3 +4902,15 @@ fn super_with_a_block() {
         "11",
     );
 }
+
+/// Multi-line `while/until/for … do` — the optional `do` keyword binds to the
+/// loop, not to a call in the condition. Found in real gem code (tzinfo). vs MRI.
+#[test]
+fn loop_with_optional_do_keyword() {
+    eq("i = 0; while i < 3 do\n  i += 1\nend\ni", "3");
+    eq("i = 5; until i <= 0 do\n  i -= 2\nend\ni", "-1");
+    eq("s = 0; for x in [1, 2, 3] do\n  s += x\nend\ns", "6");
+    // A brace/do block in the condition still attaches to its call.
+    eq("r = []; [1, 2].each do |x| r << x end; r", "[1, 2]");
+    eq("while [1].any? { |x| x > 5 } do\n  break\nend\n:ok", ":ok");
+}
