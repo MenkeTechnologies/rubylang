@@ -4843,3 +4843,18 @@ fn string_unary_freeze_operators() {
     // -@ on an already-frozen string returns a frozen string.
     eq("s = \"x\".freeze; (-s).frozen?", "true");
 }
+
+/// Enumerable#grep/grep_v and Module visibility directives with arguments —
+/// found missing while loading real gems onto the load path. vs ruby 4.0.6.
+#[test]
+fn grep_and_visibility_directives() {
+    eq("[1, 2, \"a\", \"b\", 3].grep(Integer)", "[1, 2, 3]");
+    eq("[\"x1\", \"y\", \"x2\"].grep(/x/)", "[\"x1\", \"x2\"]");
+    eq("(1..10).to_a.grep(3..6)", "[3, 4, 5, 6]");
+    eq("[1, 2, 3, 4].grep(Integer) { |x| x * 10 }", "[10, 20, 30, 40]");
+    eq("[1, \"a\", 2].grep_v(Integer)", "[\"a\"]");
+    // Visibility directives with args are accepted (rubylang doesn't enforce
+    // visibility); private_constant/private return the name, module_function nil.
+    eq("module M1; X = 5; private_constant :X; def self.g; X; end; end; M1.g", "5");
+    eq("class C1; def a; 1; end; private :a; end; C1.new.send(:a)", "1");
+}

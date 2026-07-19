@@ -736,6 +736,26 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
             with_host(|h| h.add_alias(&cls, &new_name, &old_name));
             return Ok(with_host(|h| h.new_symbol(&new_name)));
         }
+        // Visibility directives in a class/module body — rubylang does not enforce
+        // visibility, so accept them as no-ops (gems use them constantly:
+        // `private_constant :X`, `private :m`, `module_function :m`). Ruby returns
+        // the single name argument, or nil.
+        if matches!(
+            name,
+            "private"
+                | "public"
+                | "protected"
+                | "module_function"
+                | "private_constant"
+                | "public_constant"
+                | "private_class_method"
+                | "public_class_method"
+        ) {
+            return Ok(match args {
+                [one] if name != "module_function" => one.clone(),
+                _ => Value::Undef,
+            });
+        }
         if name == "new" || with_host(|h| h.find_class_method(&cls, name)).is_some() {
             return dispatch_classref(&cls, name, args, block);
         }
@@ -972,6 +992,18 @@ pub(crate) fn dispatch(
         }
         // Immediates (Integer/Float/true/false/nil) and Symbols are always frozen
         // in Ruby; a mutable reference type reports frozen only after `freeze`.
+        // Method/constant visibility directives. rubylang does not enforce
+        // visibility, so these are accepted as no-ops (used pervasively by gems:
+        // `private_constant :X`, `private :m`, `module_function`). Ruby returns
+        // the single name argument (or nil), which callers occasionally chain.
+        "private" | "public" | "protected" | "module_function" | "private_constant"
+        | "public_constant" | "private_class_method" | "public_class_method"
+        | "private_constant?" => {
+            return Ok(match args {
+                [one] if name != "module_function" => one.clone(),
+                _ => Value::Undef,
+            });
+        }
         "frozen?" => return Ok(Value::Bool(with_host(|h| h.is_frozen(recv)))),
         "instance_variable_get" => {
             let raw = name_of(&args[0]);
@@ -5035,6 +5067,24 @@ fn dispatch_array(
                         }
                     }
                     out.push(r);
+                }
+            }
+            Ok(new_arr(out))
+        }
+        // `grep(pat)` keeps elements matching `pat === e` (`grep_v` the rest); a
+        // block maps each kept element. pat is a Class/Regexp/Range/value.
+        "grep" | "grep_v" if !args.is_empty() => {
+            let invert = name == "grep_v";
+            let mut out = Vec::new();
+            for x in &arr {
+                let m = dispatch(&args[0], "===", std::slice::from_ref(x), None)
+                    .map(|v| with_host(|h| h.truthy(&v)))
+                    .unwrap_or(false);
+                if m != invert {
+                    match &block {
+                        Some(b) => out.push(call_proc(b, std::slice::from_ref(x))?),
+                        None => out.push(x.clone()),
+                    }
                 }
             }
             Ok(new_arr(out))

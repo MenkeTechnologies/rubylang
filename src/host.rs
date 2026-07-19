@@ -1064,8 +1064,14 @@ impl RubyHost {
     /// a push through either name is visible through the other, matching Ruby's
     /// `$LOAD_PATH.equal?($:)`.
     pub fn init_load_path(&mut self, dir: &str) {
-        let d = self.new_string(dir.to_string());
-        let load_path = self.new_array(vec![d]);
+        // The script dir first, then every installed gem's `lib/` dir — modern
+        // Ruby auto-activates RubyGems, putting gem libs on $LOAD_PATH, so
+        // `require "some_gem"` resolves. rubylang mirrors that (drop-in intent).
+        let mut entries = vec![self.new_string(dir.to_string())];
+        for gd in gem_lib_dirs() {
+            entries.push(self.new_string(gd));
+        }
+        let load_path = self.new_array(entries);
         self.set_global("LOAD_PATH", load_path.clone());
         self.set_global(":", load_path);
         let features = self.new_array(Vec::new());
@@ -3753,6 +3759,52 @@ fn dedup_keep_first(items: Vec<String>) -> Vec<String> {
         .into_iter()
         .filter(|x| seen.insert(x.clone()))
         .collect()
+}
+
+/// Every installed gem's `lib/` directory, so `require "gem"` resolves like
+/// RubyGems (modern Ruby auto-activates gem libs onto $LOAD_PATH). Gem roots come
+/// from `GEM_HOME`/`GEM_PATH` (colon-separated) when set, else common system
+/// locations. Each root holds `gems/<name>-<ver>/`, whose `lib/` (when present)
+/// goes on the load path. Best-effort — unreadable dirs are skipped silently.
+fn gem_lib_dirs() -> Vec<String> {
+    use std::path::PathBuf;
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for var in ["GEM_HOME", "GEM_PATH"] {
+        if let Ok(v) = std::env::var(var) {
+            for p in v.split(':').filter(|s| !s.is_empty()) {
+                roots.push(PathBuf::from(p));
+            }
+        }
+    }
+    if roots.is_empty() {
+        // Default gem roots: `<base>/<ruby-version>/` each holds a `gems/` dir.
+        for base in [
+            "/opt/homebrew/lib/ruby/gems",
+            "/usr/local/lib/ruby/gems",
+            "/usr/lib/ruby/gems",
+        ] {
+            if let Ok(rd) = std::fs::read_dir(base) {
+                roots.extend(rd.flatten().map(|e| e.path()));
+            }
+        }
+        if let Some(home) = dirs::home_dir() {
+            if let Ok(rd) = std::fs::read_dir(home.join(".local/share/gem/ruby")) {
+                roots.extend(rd.flatten().map(|e| e.path()));
+            }
+        }
+    }
+    let mut libs = Vec::new();
+    for root in roots {
+        if let Ok(rd) = std::fs::read_dir(root.join("gems")) {
+            for e in rd.flatten() {
+                let lib = e.path().join("lib");
+                if lib.is_dir() {
+                    libs.push(lib.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    libs
 }
 
 /// Whether `name` is a builtin exception class name (for ancestry).
