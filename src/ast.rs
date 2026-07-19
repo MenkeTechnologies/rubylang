@@ -190,8 +190,13 @@ pub enum Expr {
     /// `defined?(expr)` — a description string of the operand (or nil), without
     /// evaluating it.
     Defined(Box<Expr>),
-    /// `super` (args `None` = forward the current method's args) / `super(args)`.
-    Super(Option<Vec<Expr>>),
+    /// `super` (args `None` = forward the current method's args) / `super(args)`,
+    /// with an optional block literal (`super { ... }` passes a new block instead
+    /// of forwarding the current method's block).
+    Super {
+        args: Option<Vec<Expr>>,
+        block: Option<Block>,
+    },
     /// A splat argument/element: `*expr` in a call or array literal.
     Splat(Box<Expr>),
     /// A lambda literal `->(params) { body }` (a Proc value).

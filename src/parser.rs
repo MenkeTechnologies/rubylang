@@ -1230,19 +1230,22 @@ impl Parser {
             "super" => {
                 self.advance();
                 // `super` (no parens) forwards the current args; `super(...)` /
-                // `super a, b` passes explicit args.
-                if self.is_op("(") {
-                    let (args, _) = self.call_tail()?;
-                    Ok(Expr::Super(Some(args)))
-                } else if self.cur_space() && self.starts_command_arg() {
+                // `super a, b` passes explicit args. A trailing `{ }` / `do…end`
+                // block passes a new block (`super { … }` — not forwarded).
+                let is_block_next = self.is_op("{") || self.is_kw("do");
+                let (args, block) = if self.is_op("(") {
+                    let (args, blk) = self.call_tail()?;
+                    (Some(args), blk)
+                } else if self.cur_space() && !is_block_next && self.starts_command_arg() {
                     let mut args = vec![self.arg()?];
                     while self.eat_op(",") {
                         args.push(self.arg()?);
                     }
-                    Ok(Expr::Super(Some(args)))
+                    (Some(args), self.maybe_block()?)
                 } else {
-                    Ok(Expr::Super(None))
-                }
+                    (None, self.maybe_block()?)
+                };
+                Ok(Expr::Super { args, block })
             }
             "begin" => {
                 self.advance();

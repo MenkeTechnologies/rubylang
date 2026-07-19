@@ -126,6 +126,8 @@ pub mod ops {
     pub const DEFINE_SINGLETON: u16 = 44; // [recv, name, synth] -> :name; def obj.m / def Klass.m
     pub const DEFINE_METHOD_DYN: u16 = 45; // [name, synth] -> :name; def under active eval target
     pub const FIRE_HOOK: u16 = 46; // [module, hook, target] -> nil; inherited/included/extended/prepended
+    pub const SUPER_BLK: u16 = 47; // [args..., proc] argc=n+1 -> super with explicit args + a new block
+    pub const SUPER_FWD_BLK: u16 = 48; // [proc] -> super forwarding args, with a new block
 }
 
 /// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried
@@ -4283,6 +4285,16 @@ pub fn call_class_method(
 /// Invoke `super`: resume the method lookup above the current frame's defining
 /// class. `args` is `None` to forward the current method's arguments.
 pub fn call_super(explicit_args: Option<Vec<Value>>) -> Result<Value, String> {
+    call_super_blk(explicit_args, None)
+}
+
+/// `super` with an optional block override. `block_override` is `Some` for
+/// `super { … }` / `super(args) { … }` (a fresh block); `None` forwards the
+/// current method's block.
+pub fn call_super_blk(
+    explicit_args: Option<Vec<Value>>,
+    block_override: Option<Value>,
+) -> Result<Value, String> {
     let (self_obj, method, def_class, cur_args) = with_host(|h| h.super_context());
     let (Some(method), Some(def_class)) = (method, def_class) else {
         return Err("super called outside of a method".to_string());
@@ -4310,7 +4322,11 @@ pub fn call_super(explicit_args: Option<Vec<Value>>) -> Result<Value, String> {
         return Err(format!("super: no superclass method '{method}'"));
     };
     let args = explicit_args.unwrap_or(cur_args);
-    let block = with_host(|h| h.cur_scope().block.clone());
+    // A `super { … }` block overrides; otherwise forward the current block.
+    let block = match block_override {
+        Some(b) => Some(b),
+        None => with_host(|h| h.cur_scope().block.clone()),
+    };
     run_method(&def, self_obj, &args, block, Some(method), Some(owner))
 }
 

@@ -4872,3 +4872,33 @@ fn operator_symbols_and_operator_method_defs() {
     // `def =~` (and other operator method names) parse.
     eq("class C9; def =~(o); 42; end; end; (C9.new =~ 5)", "42");
 }
+
+/// `super { block }` — passing a new block to super (not forwarding the current
+/// one). Found in real gem code (tzinfo). vs ruby 4.0.6.
+#[test]
+fn super_with_a_block() {
+    // super { blk } passes a fresh block to the superclass method.
+    eq(
+        "class A; def each; yield 1; yield 2; end; end; \
+         class B < A; def each; r = []; super { |x| r << x * 10 }; r; end; end; \
+         B.new.each",
+        "[10, 20]",
+    );
+    // super(args) { blk } — explicit args + new block.
+    eq(
+        "class A; def go(n); n.times { |i| yield i }; end; end; \
+         class B < A; def go(n); r = []; super(n) { |i| r << i + 100 }; r; end; end; \
+         B.new.go(3)",
+        "[100, 101, 102]",
+    );
+    // Plain super still forwards args and block.
+    eq(
+        "class A; def m; yield 5; end; end; class B < A; def m; super; end; end; \
+         v = nil; B.new.m { |x| v = x }; v",
+        "5",
+    );
+    eq(
+        "class A; def f(x); x + 1; end; end; class B < A; def f(x); super; end; end; B.new.f(10)",
+        "11",
+    );
+}

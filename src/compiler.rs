@@ -492,17 +492,41 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::YIELD, argc(args.len())?), 0);
             }
             Expr::Defined(operand) => self.compile_defined(b, operand)?,
-            Expr::Super(args) => match args {
-                Some(args) => {
-                    for a in args {
-                        self.compile_expr(b, a)?;
+            Expr::Super { args, block } => {
+                let proc_id = match block {
+                    Some(bl) => Some(self.compile_proc(bl)?),
+                    None => None,
+                };
+                match (args, proc_id) {
+                    // `super(args)` — explicit args, forward the current block.
+                    (Some(args), None) => {
+                        for a in args {
+                            self.compile_expr(b, a)?;
+                        }
+                        b.emit(Op::CallBuiltin(ops::SUPER, argc(args.len())?), 0);
                     }
-                    b.emit(Op::CallBuiltin(ops::SUPER, argc(args.len())?), 0);
+                    // `super` — forward args and block.
+                    (None, None) => {
+                        b.emit(Op::CallBuiltin(ops::SUPER_FWD, 0), 0);
+                    }
+                    // `super(args) { blk }` — explicit args + a new block (the
+                    // proc rides on top of the args on the stack).
+                    (Some(args), Some(id)) => {
+                        for a in args {
+                            self.compile_expr(b, a)?;
+                        }
+                        b.emit(Op::LoadInt(id as i64), 0);
+                        b.emit(Op::CallBuiltin(ops::MKPROC, 1), 0);
+                        b.emit(Op::CallBuiltin(ops::SUPER_BLK, argc(args.len() + 1)?), 0);
+                    }
+                    // `super { blk }` — forward args, pass a new block.
+                    (None, Some(id)) => {
+                        b.emit(Op::LoadInt(id as i64), 0);
+                        b.emit(Op::CallBuiltin(ops::MKPROC, 1), 0);
+                        b.emit(Op::CallBuiltin(ops::SUPER_FWD_BLK, 1), 0);
+                    }
                 }
-                None => {
-                    b.emit(Op::CallBuiltin(ops::SUPER_FWD, 0), 0);
-                }
-            },
+            }
         }
         Ok(())
     }

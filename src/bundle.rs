@@ -224,7 +224,7 @@ impl Bundler {
             }
             Expr::Return(x) | Expr::Break(x) | Expr::Next(x) => self.walk_opt(x, base)?,
             Expr::Yield(xs) => self.walk_exprs(xs, base)?,
-            Expr::Super(Some(xs)) => self.walk_exprs(xs, base)?,
+            Expr::Super { args: Some(xs), .. } => self.walk_exprs(xs, base)?,
             Expr::Splat(x) => self.walk_expr(x, base)?,
             Expr::Defined(x) => self.walk_expr(x, base)?,
             // `def` / lambda bodies run when invoked, not at load time — their

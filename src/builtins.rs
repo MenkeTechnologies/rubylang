@@ -55,6 +55,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::BEGIN, b_begin);
     vm.register_builtin(ops::SUPER, b_super);
     vm.register_builtin(ops::SUPER_FWD, b_super_fwd);
+    vm.register_builtin(ops::SUPER_BLK, b_super_blk);
+    vm.register_builtin(ops::SUPER_FWD_BLK, b_super_fwd_blk);
     vm.register_builtin(ops::MKARGS, b_mkargs);
     vm.register_builtin(ops::CALL_ARR, b_call_arr);
     vm.register_builtin(ops::CALL_METHOD_ARR, b_call_method_arr);
@@ -225,6 +227,25 @@ fn b_super(vm: &mut VM, argc: u8) -> Value {
 
 fn b_super_fwd(vm: &mut VM, _: u8) -> Value {
     match crate::host::call_super(None) {
+        Ok(v) => propagate(vm, v),
+        Err(e) => abort(vm, e),
+    }
+}
+
+/// `super(args) { blk }` — the proc rides on top of the args; argc = n_args + 1.
+fn b_super_blk(vm: &mut VM, argc: u8) -> Value {
+    let block = vm.pop();
+    let args = pop_n(vm, argc.saturating_sub(1) as usize);
+    match crate::host::call_super_blk(Some(args), Some(block)) {
+        Ok(v) => propagate(vm, v),
+        Err(e) => abort(vm, e),
+    }
+}
+
+/// `super { blk }` — forward args, pass a new block (the proc on top of stack).
+fn b_super_fwd_blk(vm: &mut VM, _: u8) -> Value {
+    let block = vm.pop();
+    match crate::host::call_super_blk(None, Some(block)) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
