@@ -703,12 +703,12 @@ fn gen_exceptions(seed: u64) -> Vec<String> {
         0 => format!("p (begin; raise \"{w}\"; rescue => e; e.message; end)"),
         1 => format!("p (begin; Integer(\"{w}\"); rescue ArgumentError; :caught; end)"),
         2 => format!("p (begin; {n} / 0; rescue ZeroDivisionError => e; e.message; end)"),
-        3 => format!("p (begin; [].fetch(9); rescue IndexError; :idx; end)"),
+        3 => "p (begin; [].fetch(9); rescue IndexError; :idx; end)".to_string(),
         4 => format!("p (begin; raise ArgumentError, \"{w}\"; rescue => e; [e.class.to_s, e.message]; end)"),
-        5 => format!("r = []; begin; r << 1; raise \"x\"; rescue; r << 2; ensure; r << 3; end; p r"),
+        5 => "r = []; begin; r << 1; raise \"x\"; rescue; r << 2; ensure; r << 3; end; p r".to_string(),
         6 => format!("p (begin; {{}}.fetch(:{w}); rescue KeyError; :key; end)"),
-        7 => format!("class E1 < StandardError; end; p (begin; raise E1; rescue E1; :custom; end)"),
-        _ => format!("p (begin; nil.foo; rescue NoMethodError; :nome; end)"),
+        7 => "class E1 < StandardError; end; p (begin; raise E1; rescue E1; :custom; end)".to_string(),
+        _ => "p (begin; nil.foo; rescue NoMethodError; :nome; end)".to_string(),
     })
 }
 
@@ -769,10 +769,10 @@ fn gen_kernelconv(seed: u64) -> Vec<String> {
     let w = ww(r);
     one(match r.below(11) {
         0 => format!("p Integer(\"{}\")", r.range(0, 999)),
-        1 => format!("p Integer(\"ff\", 16)"),
+        1 => "p Integer(\"ff\", 16)".to_string(),
         2 => format!("p Integer(\"{}\", 2)", if r.below(2) == 0 { "1010" } else { "1101" }),
         3 => format!("p Float(\"{}.5\")", r.range(0, 99)),
-        4 => format!("p Array(nil)"),
+        4 => "p Array(nil)".to_string(),
         5 => format!("p Array([{n}])"),
         6 => format!("p Array({n})"),
         7 => format!("p (begin; Integer(\"{w}\"); rescue ArgumentError; :bad; end)"),
@@ -896,8 +896,7 @@ fn signature(program: &str) -> String {
     let body = program
         .lines()
         .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .next_back()
+        .rfind(|l| !l.is_empty())
         .unwrap_or("")
         .to_string();
     let mut s = body;
