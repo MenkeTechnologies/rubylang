@@ -280,6 +280,73 @@ fn module_include_mixes_in_methods() {
     );
 }
 
+// Namespaced constants / nested modules. Each expected value was confirmed
+// against the reference `ruby` (4.x). See BUGS.md "Namespaces" for the scheme.
+#[test]
+fn namespaced_constants_and_nested_modules() {
+    // A constant defined inside a nested module is reachable by its qualified
+    // path; the constant is stored under `A::B::X`.
+    eq("module A; module B; X = 1; end; end; A::B::X", "1");
+    // Three levels deep.
+    eq(
+        "module A; module B; module C; X = 9; end; end; end; A::B::C::X",
+        "9",
+    );
+    // The compact form `class A::B::C` registers the class under its qualified
+    // name; `Module#name` returns that path.
+    eq(
+        "module A; module B; end; end; class A::B::C; end; A::B::C.name",
+        "\"A::B::C\"",
+    );
+    // `module A::B` compact-form name is likewise qualified.
+    eq("module A; module B; end; end; A::B.name", "\"A::B\"");
+    // `include Namespaced::Module` finds the module and mixes its methods in.
+    eq(
+        "module F; module M; def hi; 1; end; end; end; \
+         class C; include F::M; end; C.new.hi",
+        "1",
+    );
+    // A class inheriting a namespaced superclass (`< Foo::Base`).
+    eq(
+        "module F; class Base; def b; 9; end; end; end; \
+         class D < F::Base; end; D.new.b",
+        "9",
+    );
+    // A bare constant read inside a namespace resolves against the lexical
+    // nesting (here `M::V`), not just the top level.
+    eq(
+        "module M; V = 42; def self.read; V; end; end; M.read",
+        "42",
+    );
+    // A nested class opened inside a class body (`class Outer; class Inner`).
+    eq(
+        "class Outer; class Inner; def v; 7; end; end; end; Outer::Inner.new.v",
+        "7",
+    );
+    // A namespaced class used as a value / hash key.
+    eq(
+        "module A; class C; end; end; h = { A::C => \"x\" }; h[A::C]",
+        "\"x\"",
+    );
+    // `const_get` with a qualified string resolves the nested path.
+    eq(
+        "module A; module B; end; end; Object.const_get(\"A::B\").name",
+        "\"A::B\"",
+    );
+    // `A.const_get(\"B\")` resolves a name relative to the receiver's namespace.
+    eq("module A; X = 5; end; A.const_get(\"X\")", "5");
+    // A namespaced exception class raised and rescued by its qualified name.
+    eq(
+        "module E; class Boom < StandardError; end; end; \
+         (begin; raise E::Boom, \"x\"; rescue E::Boom => e; e.message; end)",
+        "\"x\"",
+    );
+    // `Class < Module`: a class reference is both a Class and a Module.
+    eq("String.is_a?(Module)", "true");
+    // `Module.nesting` is best-effort; empty at the top level (matches MRI).
+    eq("Module.nesting", "[]");
+}
+
 #[test]
 fn class_methods_via_def_self() {
     eq(

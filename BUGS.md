@@ -51,8 +51,8 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   variable store yet, so `@n ||= 0; @n += 1` restarts each call.
 - **Class-body statements** run at definition time with `self` bound to the
   class, so `def`, `attr_*`, `include`, class variables (`@@x = 0`), constants,
-  and other executable statements all take effect. (Constants are stored
-  globally rather than namespaced under the class.)
+  and other executable statements all take effect. Constants are namespaced
+  under their enclosing module/class (see "Namespaces" below), not global.
 - **Modifier `rescue` inside call-args / array literals.** Numeric-literal
   binding (`-7.abs` → `(-7).abs`, with `-2**2` → `-(2**2)`) and modifier
   `rescue` precedence (`x = a rescue b` → `x = (a rescue b)`, plus grouping
@@ -79,7 +79,28 @@ Implemented and verified against the reference `ruby`:
   hook as a class method.
 - **Constant reflection.** `const_get` / `const_set` / `const_defined?` /
   `constants` on any class or module ref, including builtin class names
-  (`Object.const_get(:String)`).
+  (`Object.const_get(:String)`). `const_get`/`const_set`/`const_defined?`
+  resolve a name relative to the receiver's namespace (`A.const_get("B")` →
+  `A::B`) and accept a qualified string (`Object.const_get("A::B")`).
+- **Namespaces (nested modules / classes).** `module A; module B; … end; end`,
+  the compact forms `class A::B::C` / `module A::B`, nested `class`es inside a
+  class body, a namespaced superclass (`class D < Foo::Base`), and
+  `include`/`prepend`/`extend Namespaced::Mod` all resolve and mix in. A
+  constant is stored under its fully-qualified name (`A::B::X`), and a class's
+  `name`/`inspect` reports that path. Constant lookup follows Ruby's rule: a
+  qualified path (`A::B::X`) resolves through each namespace, and a bare `Const`
+  inside a namespace body walks the lexical nesting (innermost first) then the
+  top level. The nesting is captured at compile time (each class/module body
+  pushes its qualified name), so methods and constants resolve against their
+  definition-site nesting. Approximations, all lenient supersets of MRI: the
+  compact form does not require the intermediate parent to pre-exist (MRI raises
+  `uninitialized constant` when it is missing); the lexical chain for a bare
+  read is derived by stripping segments of the innermost qualified name rather
+  than tracking a separate `[A::B, A]` nesting list (identical for the common
+  `module A; module B` shape); and `Module.nesting` is best-effort — it returns
+  `[]` (correct at the top level) because the runtime does not carry the
+  lexical nesting of the call site. Reopening a class/module still replaces the
+  prior definition (a pre-existing limitation, independent of namespacing).
 - **Top-level `self`.** Fixed to `main`, an ordinary `Object`, so
   `self.class.name == "Object"` (was `"NilClass"`). Top-level instance variables
   now live on that object.
@@ -110,10 +131,6 @@ Honest limitations of this surface:
   registration is what dispatch uses). A `def` inside an *ordinary* method body
   called from within an eval is correctly isolated (hoists, does not hit the eval
   target).
-- **Constants remain a flat, global store.** `const_get`/`const_set`/`constants`
-  operate on that flat store rather than per-module namespaces, so a nested path
-  (`Mod.const_get("A::B")`) resolves by its last segment and `constants` lists all
-  user-defined constant names rather than only a given module's.
 - **Hook firing order approximates MRI.** Hooks fire from the class-definition
   site in source order (`inherited` before the body, `included`/`extended`/
   `prepended` after), which is correct for observing *which* class triggered the

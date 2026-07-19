@@ -1573,27 +1573,13 @@ impl Parser {
             self.expect_kw("end")?;
             return Ok(Expr::SingletonClass { recv, body });
         }
-        let name = match self.advance() {
-            Tok::Const(s) => s,
-            other => {
-                return Err(format!(
-                    "line {}: expected class name, found '{}'",
-                    self.line(),
-                    other
-                ))
-            }
-        };
+        // The class name may be a `::`-qualified constant path (the compact
+        // form `class A::B::C`). `const_path` joins the segments into
+        // `"A::B::C"`; the compiler stores the class under that qualified key.
+        let name = self.const_path("class name")?;
         let superclass = if self.eat_op("<") {
-            match self.advance() {
-                Tok::Const(s) => Some(s),
-                other => {
-                    return Err(format!(
-                        "line {}: expected superclass, found '{}'",
-                        self.line(),
-                        other
-                    ))
-                }
-            }
+            // A superclass may itself be namespaced (`class D < Foo::Base`).
+            Some(self.const_path("superclass")?)
         } else {
             None
         };
@@ -1608,19 +1594,45 @@ impl Parser {
 
     fn module_expr(&mut self) -> Result<Expr, String> {
         self.advance(); // module
-        let name = match self.advance() {
+        // Like a class name, a module name may be a `::`-qualified path
+        // (`module A::B`); the compiler stores it under the qualified key.
+        let name = self.const_path("module name")?;
+        let body = self.body_until(&["end"])?;
+        self.expect_kw("end")?;
+        Ok(Expr::Module { name, body })
+    }
+
+    /// Parse a `::`-qualified constant path (`A`, `A::B`, `A::B::C`) and return
+    /// it joined with `::`. Used for class/module names and superclasses, where
+    /// the whole path names one entity rather than a runtime const lookup.
+    fn const_path(&mut self, what: &str) -> Result<String, String> {
+        let mut path = match self.advance() {
             Tok::Const(s) => s,
             other => {
                 return Err(format!(
-                    "line {}: expected module name, found '{}'",
+                    "line {}: expected {what}, found '{}'",
                     self.line(),
                     other
                 ))
             }
         };
-        let body = self.body_until(&["end"])?;
-        self.expect_kw("end")?;
-        Ok(Expr::Module { name, body })
+        while self.is_op("::") {
+            self.advance(); // ::
+            match self.advance() {
+                Tok::Const(s) => {
+                    path.push_str("::");
+                    path.push_str(&s);
+                }
+                other => {
+                    return Err(format!(
+                        "line {}: expected {what} segment after '::', found '{}'",
+                        self.line(),
+                        other
+                    ))
+                }
+            }
+        }
+        Ok(path)
     }
 
     /// Parse the `rescue …` clauses and optional `ensure …` after a body.
@@ -1628,10 +1640,28 @@ impl Parser {
         let mut rescues = Vec::new();
         while self.eat_kw("rescue") {
             let mut classes = Vec::new();
-            // optional list of exception class names
+            // optional list of exception class names, each possibly namespaced
+            // (`rescue Foo::Bar => e`) — stored under its qualified name.
             while let Tok::Const(c) = self.peek().clone() {
                 self.advance();
-                classes.push(c);
+                let mut path = c;
+                while self.is_op("::") {
+                    self.advance(); // ::
+                    match self.advance() {
+                        Tok::Const(seg) => {
+                            path.push_str("::");
+                            path.push_str(&seg);
+                        }
+                        other => {
+                            return Err(format!(
+                                "line {}: expected constant after '::' in rescue, found '{}'",
+                                self.line(),
+                                other
+                            ))
+                        }
+                    }
+                }
+                classes.push(path);
                 if !self.eat_op(",") {
                     break;
                 }

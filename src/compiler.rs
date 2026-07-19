@@ -47,6 +47,13 @@ pub struct Compiler {
     /// carrying the source line so the debugger can pause at statement
     /// boundaries. Off for normal runs — zero extra ops in the chunk.
     debug: bool,
+    /// The lexical namespace stack (outermost first) as fully-qualified names:
+    /// inside `module A; module B` it is `["A", "A::B"]`. Constants defined in a
+    /// namespace are stored under `<innermost>::<name>`; a bare constant read is
+    /// compiled to a candidate chain that walks this nesting then the top level
+    /// (Ruby's lexical constant lookup). Superclass/include names are resolved
+    /// against it too.
+    nesting: Vec<String>,
 }
 
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
@@ -500,7 +507,59 @@ impl Compiler {
         Ok(())
     }
 
+    /// Qualify a name with the innermost enclosing namespace: `X` inside
+    /// `module A::B` becomes `A::B::X`. At the top level (`nesting` empty) the
+    /// name is returned unchanged. This is the storage key for a constant or a
+    /// nested class/module.
+    fn qualify(&self, name: &str) -> String {
+        match self.nesting.last() {
+            Some(ns) => format!("{ns}::{name}"),
+            None => name.to_string(),
+        }
+    }
+
+    /// Resolve a written class/module reference (`Base`, `Foo::Base`) used as a
+    /// superclass or mixin argument to an already-registered qualified name.
+    /// Tries, innermost namespace first, `<ns>::<written>`, then `<written>`
+    /// itself, returning the first that a class/module was registered under. If
+    /// none match (a forward or builtin reference) the written name is kept.
+    fn resolve_class_name(&self, written: &str) -> String {
+        for ns in self.nesting.iter().rev() {
+            let cand = format!("{ns}::{written}");
+            if self.classes.iter().any(|(n, _)| *n == cand) {
+                return cand;
+            }
+        }
+        written.to_string()
+    }
+
+    /// The lexical-lookup candidate chain for a bare constant read, encoded as a
+    /// `\x1f`-separated string the `GETCONST` builtin splits and tries in order.
+    /// For `X` inside `module A; module B` this is `A::B::X`, `A::X`, `X`
+    /// (innermost nesting first, then the top level) — Ruby's constant search.
+    fn const_candidates(&self, name: &str) -> String {
+        if self.nesting.is_empty() {
+            return name.to_string();
+        }
+        let mut cands: Vec<String> = self
+            .nesting
+            .iter()
+            .rev()
+            .map(|ns| format!("{ns}::{name}"))
+            .collect();
+        cands.push(name.to_string());
+        cands.join("\u{1f}")
+    }
+
     fn compile_var_read(&mut self, b: &mut ChunkBuilder, kind: VarKind, name: &str) {
+        // A constant read inside a namespace lowers to a candidate chain so the
+        // runtime can walk the lexical nesting; every other var reads by name.
+        if let VarKind::Const = kind {
+            let encoded = self.const_candidates(name);
+            self.kstr(b, &encoded);
+            b.emit(Op::CallBuiltin(ops::GETCONST, 1), 0);
+            return;
+        }
         let op = match kind {
             VarKind::Local => ops::GETLOCAL,
             VarKind::Instance => ops::GETIVAR,
@@ -527,7 +586,14 @@ impl Compiler {
                     VarKind::Global => ops::SETGVAR,
                     VarKind::Const => ops::SETCONST,
                 };
-                self.kstr(b, name);
+                // A constant assignment inside a namespace defines it under the
+                // qualified name (`X = 1` in `module A::B` sets `A::B::X`).
+                let stored = if let VarKind::Const = kind {
+                    self.qualify(name)
+                } else {
+                    name.to_string()
+                };
+                self.kstr(b, &stored);
                 self.compile_expr(b, value)?;
                 b.emit(Op::CallBuiltin(op, 2), 0);
             }
@@ -1127,6 +1193,14 @@ impl Compiler {
         superclass: &Option<String>,
         body: &[Stmt],
     ) -> Result<(), String> {
+        // The class/module is stored under its fully-qualified name (prefixed by
+        // the enclosing namespace). The superclass is resolved against the
+        // *enclosing* nesting, before this class's own name is pushed.
+        let qname = self.qualify(name);
+        let resolved_super = superclass.as_ref().map(|s| self.resolve_class_name(s));
+        // Push this namespace so nested class/module defs, constant assignments,
+        // and bare constant reads inside the body resolve lexically against it.
+        self.nesting.push(qname.clone());
         let mut methods: indexmap::IndexMap<String, MethodDef> = indexmap::IndexMap::new();
         let mut class_methods: indexmap::IndexMap<String, MethodDef> = indexmap::IndexMap::new();
         let mut includes: Vec<String> = Vec::new();
@@ -1175,7 +1249,8 @@ impl Compiler {
                         }
                     }
                 }
-                // `include ModuleName` — record the mixin.
+                // `include ModuleName` / `include A::B` — record the mixin,
+                // resolved to the module's qualified registration name.
                 Expr::Call {
                     recv: None,
                     name: m,
@@ -1183,8 +1258,8 @@ impl Compiler {
                     ..
                 } if m == "include" => {
                     for a in args {
-                        if let Expr::Var(VarKind::Const, module) = a {
-                            includes.push(module.clone());
+                        if let Some(module) = const_path_name(a) {
+                            includes.push(self.resolve_class_name(&module));
                         }
                     }
                 }
@@ -1196,8 +1271,8 @@ impl Compiler {
                     ..
                 } if m == "prepend" => {
                     for a in args {
-                        if let Expr::Var(VarKind::Const, module) = a {
-                            prepends.push(module.clone());
+                        if let Some(module) = const_path_name(a) {
+                            prepends.push(self.resolve_class_name(&module));
                         }
                     }
                 }
@@ -1210,8 +1285,8 @@ impl Compiler {
                     ..
                 } if m == "extend" => {
                     for a in args {
-                        if let Expr::Var(VarKind::Const, module) = a {
-                            extends.push(module.clone());
+                        if let Some(module) = const_path_name(a) {
+                            extends.push(self.resolve_class_name(&module));
                         }
                     }
                 }
@@ -1245,10 +1320,14 @@ impl Compiler {
         let hook_includes = includes.clone();
         let hook_prepends = prepends.clone();
         let hook_extends = extends.clone();
+        // Done with this namespace: everything referenced below (the class ref
+        // to run the body on, hook targets) uses the qualified name, so pop
+        // before emitting those so they resolve at the enclosing level.
+        self.nesting.pop();
         self.classes.push((
-            name.to_string(),
+            qname.clone(),
             ClassDef {
-                superclass: superclass.clone(),
+                superclass: resolved_super.clone(),
                 methods,
                 includes,
                 prepends,
@@ -1257,25 +1336,27 @@ impl Compiler {
             },
         ));
         // `inherited(subclass)` fires when the subclass is opened — before its body.
-        if let Some(sc) = superclass {
-            self.emit_hook(b, sc, "inherited", name);
+        if let Some(sc) = &resolved_super {
+            self.emit_hook(b, sc, "inherited", &qname);
         }
-        // Run the class body (`self` = class) once, at definition time.
+        // Run the class body (`self` = class) once, at definition time. The class
+        // ref is loaded by its qualified name directly (a single-candidate const).
         if !init_body.is_empty() {
-            self.compile_var_read(b, VarKind::Const, name);
+            self.kstr(b, &qname);
+            b.emit(Op::CallBuiltin(ops::GETCONST, 1), 0);
             self.kstr(b, "__class_body__");
             b.emit(Op::CallBuiltin(ops::CALL_METHOD, 2), 0);
             b.emit(Op::Pop, 0);
         }
         // Module hooks fire once the include/prepend/extend relationship is set.
         for m in &hook_includes {
-            self.emit_hook(b, m, "included", name);
+            self.emit_hook(b, m, "included", &qname);
         }
         for m in &hook_prepends {
-            self.emit_hook(b, m, "prepended", name);
+            self.emit_hook(b, m, "prepended", &qname);
         }
         for m in &hook_extends {
-            self.emit_hook(b, m, "extended", name);
+            self.emit_hook(b, m, "extended", &qname);
         }
         // A class/module definition evaluates to nil here.
         b.emit(Op::LoadUndef, 0);
@@ -1459,6 +1540,28 @@ fn sym_name(e: &Expr) -> Option<String> {
             [StrPart::Lit(s)] => Some(s.clone()),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+/// Flatten a constant reference used as a mixin argument into its written path:
+/// a bare `Expr::Var(Const, "M")` → `"M"`, and a `::`-chain (which parses as a
+/// no-arg capitalized method call, `A::B` → `Call{recv: A, name: "B"}`) →
+/// `"A::B"`. Returns `None` for anything that is not a constant path.
+fn const_path_name(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Var(VarKind::Const, n) => Some(n.clone()),
+        Expr::Call {
+            recv: Some(r),
+            name,
+            args,
+            block,
+        } if args.is_empty()
+            && block.is_none()
+            && name.chars().next().is_some_and(|c| c.is_uppercase()) =>
+        {
+            Some(format!("{}::{}", const_path_name(r)?, name))
+        }
         _ => None,
     }
 }

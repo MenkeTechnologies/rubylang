@@ -2108,6 +2108,10 @@ impl RubyHost {
         if class == "Numeric" && (actual == "Integer" || actual == "Float") {
             return true;
         }
+        // `Class < Module` in MRI: a class reference is both a Class and a Module.
+        if class == "Module" && actual == "Class" {
+            return true;
+        }
         if class == "Comparable" && matches!(actual.as_str(), "Integer" | "Float" | "String") {
             return true;
         }
@@ -2247,6 +2251,8 @@ impl RubyHost {
                 | "Method"
                 | "Object"
                 | "BasicObject"
+                | "Module"
+                | "Class"
                 | "Comparable"
                 | "Enumerable"
                 | "NilClass"

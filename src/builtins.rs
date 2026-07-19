@@ -377,19 +377,29 @@ fn b_setgvar(vm: &mut VM, _: u8) -> Value {
     val
 }
 fn b_getconst(vm: &mut VM, _: u8) -> Value {
-    let name = name_of(&vm.pop());
-    let v = with_host(|h| h.get_const(&name));
-    if !matches!(v, Value::Undef) {
-        return v;
+    let encoded = name_of(&vm.pop());
+    // A bare constant read inside a namespace is compiled to a `\x1f`-separated
+    // candidate chain (innermost-qualified first, then the top-level name) — the
+    // lexical constant search. Try each in order; the last (or a name with no
+    // separator, at the top level) is the plain name.
+    for name in encoded.split('\u{1f}') {
+        let v = with_host(|h| h.get_const(name));
+        if !matches!(v, Value::Undef) {
+            return v;
+        }
+        // An unassigned constant that names a class (user-defined, or a builtin
+        // exception like `RuntimeError`) resolves to a class reference. The
+        // builtin-exception fallback is a name heuristic (`*Error`), so it must
+        // only fire for an unqualified candidate — otherwise a namespaced miss
+        // like `Foo::NegativeError` would spuriously resolve and shadow the real
+        // top-level `NegativeError` later in the candidate chain.
+        if with_host(|h| h.class_exists(name) || h.is_builtin_class(name))
+            || (!name.contains("::") && is_builtin_exception(name))
+        {
+            return with_host(|h| h.class_ref(name));
+        }
     }
-    // An unassigned constant that names a class (user-defined, or a builtin
-    // exception like `RuntimeError`) resolves to a class reference.
-    if with_host(|h| h.class_exists(&name) || h.is_builtin_class(&name))
-        || is_builtin_exception(&name)
-    {
-        return with_host(|h| h.class_ref(&name));
-    }
-    v
+    Value::Undef
 }
 
 /// Builtin exception class names that resolve to a class reference even without
@@ -1484,6 +1494,11 @@ fn dispatch_classref(
             Some(sc) => h.class_ref(&sc),
             None => Value::Undef,
         })),
+        // `Module.nesting` — best-effort. The runtime does not track the lexical
+        // nesting of the call site (class bodies are flattened at compile time),
+        // so this returns the empty array (correct at the top level; a namespaced
+        // call site would report its enclosing modules in MRI).
+        "nesting" if cls == "Module" => Ok(new_arr(vec![])),
         // `Module#ancestors` — the class/module ancestor chain as class refs.
         "ancestors" => Ok(with_host(|h| {
             let refs: Vec<Value> = h
@@ -1548,12 +1563,12 @@ fn dispatch_classref(
             Ok(with_host(|h| h.new_hash(map)))
         }
         "[]" if cls == "Array" => Ok(new_arr(args.to_vec())),
-        // `Mod.const_get(sym)` — resolve a constant by name (supports a nested
-        // `"A::B"` path in the flat constant store by resolving the last segment).
+        // `Mod.const_get(sym)` — resolve a constant by name. A qualified string
+        // (`"A::B"`) or a name relative to the receiver (`A.const_get("B")`) is
+        // resolved under the fully-qualified path in the namespaced store.
         "const_get" => {
             let cname = name_of(&args[0]);
-            let leaf = cname.rsplit("::").next().unwrap_or(&cname);
-            match const_lookup(leaf) {
+            match const_lookup_under(cls, &cname) {
                 Some(v) => Ok(v),
                 None => Err(raise_exc(
                     "NameError",
@@ -1561,18 +1576,20 @@ fn dispatch_classref(
                 )),
             }
         }
-        // `Mod.const_set(sym, val)` — define a constant (flat store).
+        // `Mod.const_set(sym, val)` — define a constant under the receiver's
+        // namespace (`A.const_set(:B, v)` sets `A::B`; a top-level receiver sets
+        // the bare name).
         "const_set" => {
             let cname = name_of(&args[0]);
             let val = args.get(1).cloned().unwrap_or(Value::Undef);
-            with_host(|h| h.set_const(&cname, val.clone()));
+            let key = const_key_under(cls, &cname);
+            with_host(|h| h.set_const(&key, val.clone()));
             Ok(val)
         }
         // `Mod.const_defined?(sym)`.
         "const_defined?" => {
             let cname = name_of(&args[0]);
-            let leaf = cname.rsplit("::").next().unwrap_or(&cname);
-            Ok(Value::Bool(const_lookup(leaf).is_some()))
+            Ok(Value::Bool(const_lookup_under(cls, &cname).is_some()))
         }
         // `Mod.constants` — the user-defined constant names (flat store), as
         // symbols. Class names are not enumerated (matching neither MRI exactly
@@ -1586,6 +1603,19 @@ fn dispatch_classref(
             if let Some(def) = with_host(|h| h.find_class_method(cls, name)) {
                 let recv = with_host(|h| h.class_ref(cls));
                 return crate::host::call_class_method(recv, &def, name, cls, args, block);
+            }
+            // `Mod::Const` — a namespaced constant or nested class/module. Both
+            // `::` and `.` lower to a method call here, so a no-arg capitalized
+            // name is a constant lookup under the fully-qualified path.
+            if args.is_empty() && name.chars().next().is_some_and(|c| c.is_uppercase()) {
+                let qualified = format!("{cls}::{name}");
+                let v = with_host(|h| h.get_const(&qualified));
+                if !matches!(v, Value::Undef) {
+                    return Ok(v);
+                }
+                if with_host(|h| h.class_exists(&qualified)) {
+                    return Ok(with_host(|h| h.class_ref(&qualified)));
+                }
             }
             // `Mod::Const` for an unresolved constant calls `Mod.const_missing`
             // (Rails autoloading depends on this). The `::` form reaches here as a
@@ -1605,6 +1635,12 @@ fn dispatch_classref(
                         None,
                     );
                 }
+                // An unresolved namespaced constant is a NameError, matching MRI
+                // (`A::Nope` → `uninitialized constant A::Nope`), not a NoMethodError.
+                return Err(raise_exc(
+                    "NameError",
+                    &format!("uninitialized constant {cls}::{name}"),
+                ));
             }
             Err(raise_exc(
                 "NoMethodError",
@@ -1612,6 +1648,31 @@ fn dispatch_classref(
             ))
         }
     }
+}
+
+/// The storage key for `receiver.const_set(name, …)`: qualified under the
+/// receiver's namespace, except a top-level receiver (`Object`/`Kernel`), which
+/// stores the bare (or already-qualified) name.
+fn const_key_under(cls: &str, name: &str) -> String {
+    if matches!(cls, "Object" | "Kernel" | "BasicObject") {
+        name.to_string()
+    } else {
+        format!("{cls}::{name}")
+    }
+}
+
+/// Resolve `receiver.const_get(name)`. Tries, in order: the receiver-qualified
+/// path (`A.const_get("B")` → `A::B`), the name taken as an absolute top-level
+/// path (`Object.const_get("A::B")`), and finally the bare leaf segment (legacy
+/// flat lookup). Each is resolved through `const_lookup`.
+fn const_lookup_under(cls: &str, name: &str) -> Option<Value> {
+    let qualified = const_key_under(cls, name);
+    const_lookup(&qualified)
+        .or_else(|| const_lookup(name))
+        .or_else(|| {
+            let leaf = name.rsplit("::").next().unwrap_or(name);
+            const_lookup(leaf)
+        })
 }
 
 /// Resolve a constant name against the flat constant store, falling back to a
