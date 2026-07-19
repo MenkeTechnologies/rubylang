@@ -111,9 +111,20 @@ nu-ansi-term = "0.50"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 toml = "0.8"
 
+# fancy-regex is the Ruby-level regex engine (src/host.rs Regexp, all the
+# String/Regexp/Symbol regex methods in src/builtins.rs). Unlike the linear-time
+# `regex` crate it is a backtracking engine, so Ruby/Onigmo features `regex`
+# rejects — backreferences (`/([a-z])\1/`), look-around (`(?=…)`, `(?<=…)`) —
+# compile and match, matching MRI. Pure Rust, no C Oniguruma binding, so it
+# cross-compiles to macOS/Linux aarch64 + Linux x86_64 like the rest of the crate.
+fancy-regex = "0.18.0"
+# The linear-time `regex` crate stays only for the parity-fuzz harness'
+# (src/bin/parity_fuzz.rs) literal-normalization pass — simple anchored patterns,
+# no backrefs, where guaranteed-linear matching over untrusted fuzz input is the
+# point. Ruby-level regex uses fancy-regex above, never this.
+regex = "1"
 # Glob matcher for the AOP method-call intercept engine (src/intercepts.rs) —
 # `*`/`?`/char-class matching of intercept patterns against method names.
-regex = "1"
 glob = "0.3"
 
 # Stackful same-thread coroutines backing Ruby Fiber (Fiber.new/resume/yield).

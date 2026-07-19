@@ -896,7 +896,7 @@ pub(crate) fn dispatch(
                 return Ok(Value::Bool(with_host(|h| h.is_a(&args[0], &cls))));
             }
             if let Some((re, _)) = with_host(|h| h.as_regex(recv)) {
-                return Ok(Value::Bool(re.is_match(&arg_str(&args[0]))));
+                return Ok(Value::Bool(re.is_match(&arg_str(&args[0])).unwrap_or(false)));
             }
             if let Some((lo, hi, excl)) = with_host(|h| h.as_range(recv)) {
                 let n = as_i(&args[0]);
@@ -3460,13 +3460,13 @@ fn dispatch_string(
         "include?" => Ok(Value::Bool(s.contains(&arg_str(&args[0])))),
         "start_with?" => Ok(Value::Bool(args.iter().any(|a| match str_regex(a) {
             // A Regexp prefix matches when it matches at the very start.
-            Some(re) => re.find(&s).map(|m| m.start() == 0).unwrap_or(false),
+            Some(re) => re.find(&s).ok().flatten().map(|m| m.start() == 0).unwrap_or(false),
             None => s.starts_with(&arg_str(a)),
         }))),
         "end_with?" => Ok(Value::Bool(args.iter().any(|a| s.ends_with(&arg_str(a))))),
         "match?" => {
             let m = str_regex(&args[0])
-                .map(|re| re.is_match(&s))
+                .map(|re| re.is_match(&s).unwrap_or(false))
                 .unwrap_or(false);
             Ok(Value::Bool(m))
         }
@@ -3476,6 +3476,8 @@ fn dispatch_string(
                 match_data(&re, &s);
                 Ok(re
                     .find(&s)
+                    .ok()
+                    .flatten()
                     .map(|m| Value::Int(s[..m.start()].chars().count() as i64))
                     .unwrap_or(Value::Undef))
             }
@@ -3861,14 +3863,16 @@ fn str_index_set(recv: &Value, s: &str, args: &[Value]) -> Result<Value, String>
 }
 
 /// The compiled regex for a value that is a Regexp, else `None`.
-fn str_regex(v: &Value) -> Option<regex::Regex> {
+fn str_regex(v: &Value) -> Option<fancy_regex::Regex> {
     with_host(|h| h.as_regex(v)).map(|(re, _)| re)
 }
 
 /// Build a `MatchData` value for the first match of `re` in `s`, or `nil`, and
 /// update the match globals (`$~`, `$&`, `` $` ``, `$'`, `$+`, `$1`..`$9`).
-fn match_data(re: &regex::Regex, s: &str) -> Value {
-    let caps = re.captures(s);
+fn match_data(re: &fancy_regex::Regex, s: &str) -> Value {
+    // fancy-regex's backtracking `captures` returns a Result; a match error is
+    // treated as no match (MRI raises nothing here — it just fails to match).
+    let caps = re.captures(s).ok().flatten();
     set_match_globals(caps.as_ref().map(|c| (c, s)))
 }
 
@@ -3876,7 +3880,7 @@ fn match_data(re: &regex::Regex, s: &str) -> Value {
 /// failed match), and return the corresponding `MatchData` value (or `nil`).
 /// Ruby names these `$~` (the MatchData), `$&` (whole match), `` $` ``/`$'`
 /// (pre/post text), `$+` (last matched group), and `$1`..`$9` (numbered groups).
-fn set_match_globals(m: Option<(&regex::Captures, &str)>) -> Value {
+fn set_match_globals(m: Option<(&fancy_regex::Captures, &str)>) -> Value {
     with_host(|h| {
         // Clear the numbered globals first so a failed match leaves no stale
         // captures behind.
@@ -3948,17 +3952,21 @@ fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value,
 
 /// `String#scan(re)`: every match. With capture groups, each element is an array
 /// of the captured groups; otherwise each element is the whole matched string.
-fn scan_regex(re: &regex::Regex, s: &str) -> Value {
+fn scan_regex(re: &fancy_regex::Regex, s: &str) -> Value {
     let ngroups = re.captures_len(); // includes the whole-match group 0
     if ngroups <= 1 {
+        // fancy-regex iterators yield `Result` (backtracking can error); a match
+        // error ends the scan, so drop errored items with `filter_map(Result::ok)`.
         let out: Vec<Value> = re
             .find_iter(s)
+            .filter_map(Result::ok)
             .map(|m| new_str(m.as_str().to_string()))
             .collect();
         new_arr(out)
     } else {
         let out: Vec<Value> = re
             .captures_iter(s)
+            .filter_map(Result::ok)
             .map(|c| {
                 let groups: Vec<Value> = (1..ngroups)
                     .map(|i| {
@@ -4016,14 +4024,14 @@ fn string_split(s: &str, sep: &str, limit: i64) -> Vec<String> {
 
 /// Split `s` on a regex. Capture groups in the pattern are interleaved into the
 /// result (Ruby behavior). `limit` follows the same rules as `string_split`.
-fn regex_split(re: &regex::Regex, s: &str, limit: i64) -> Vec<String> {
+fn regex_split(re: &fancy_regex::Regex, s: &str, limit: i64) -> Vec<String> {
     if s.is_empty() {
         return Vec::new();
     }
     let mut out = Vec::new();
     let mut last = 0;
     let ngroups = re.captures_len();
-    for caps in re.captures_iter(s) {
+    for caps in re.captures_iter(s).filter_map(Result::ok) {
         if limit > 0 && out.len() as i64 >= limit - 1 {
             break;
         }
@@ -4051,9 +4059,9 @@ fn regex_split(re: &regex::Regex, s: &str, limit: i64) -> Vec<String> {
 
 /// `String#scan(re) { ... }`: yield each match (setting `$~`), passing the whole
 /// match for an ungrouped pattern or the capture-group array for a grouped one.
-fn scan_each(re: &regex::Regex, s: &str, bl: &Value) -> Result<(), String> {
+fn scan_each(re: &fancy_regex::Regex, s: &str, bl: &Value) -> Result<(), String> {
     let ngroups = re.captures_len();
-    for caps in re.captures_iter(s) {
+    for caps in re.captures_iter(s).filter_map(Result::ok) {
         set_match_globals(Some((&caps, s)));
         let arg = if ngroups <= 1 {
             new_str(caps.get(0).unwrap().as_str().to_string())
@@ -4075,7 +4083,7 @@ fn scan_each(re: &regex::Regex, s: &str, bl: &Value) -> Result<(), String> {
 /// `String#sub`/`gsub` with a Regexp: a replacement string (with `\1` group
 /// refs) or a block that receives each match.
 fn regex_replace(
-    re: &regex::Regex,
+    re: &fancy_regex::Regex,
     s: &str,
     rest: &[Value],
     block: &Option<Value>,
@@ -4083,7 +4091,7 @@ fn regex_replace(
 ) -> Result<Value, String> {
     let mut out = String::new();
     let mut last = 0;
-    for (count, caps) in re.captures_iter(s).enumerate() {
+    for (count, caps) in re.captures_iter(s).filter_map(Result::ok).enumerate() {
         if !all && count >= 1 {
             break;
         }
@@ -4113,7 +4121,7 @@ fn regex_replace(
 }
 
 /// Expand `\1`..`\9` (and `\0`) group back-references in a replacement string.
-fn expand_backrefs(repl: &str, caps: &regex::Captures) -> String {
+fn expand_backrefs(repl: &str, caps: &fancy_regex::Captures) -> String {
     let mut out = String::new();
     let mut chars = repl.chars().peekable();
     while let Some(c) = chars.next() {
@@ -4324,7 +4332,7 @@ fn str_slice_remove(s: &str, args: &[Value]) -> Option<(String, String)> {
         // A string or regex argument removes its first occurrence.
         [pat] => {
             if let Some(re) = str_regex(pat) {
-                let m = re.find(s)?;
+                let m = re.find(s).ok().flatten()?;
                 let start = s[..m.start()].chars().count();
                 let end = start + m.as_str().chars().count();
                 Some(cut(start, end))
@@ -4370,6 +4378,8 @@ fn str_index(s: &str, args: &[Value]) -> Value {
             } else if let Some((re, _)) = with_host(|h| h.as_regex(rng)) {
                 // `s[/re/]` — the whole match, or nil.
                 re.find(s)
+                    .ok()
+                    .flatten()
                     .map(|m| new_str(m.as_str().to_string()))
                     .unwrap_or(Value::Undef)
             } else if let Some(sub) = with_host(|h| h.as_str(rng)) {
@@ -4386,7 +4396,7 @@ fn str_index(s: &str, args: &[Value]) -> Value {
         // `s[/re/, n]` — the nth capture group of the match (0 = whole match).
         [re, Value::Int(n)] if with_host(|h| h.as_regex(re)).is_some() => {
             let (re, _) = with_host(|h| h.as_regex(re)).unwrap();
-            match re.captures(s) {
+            match re.captures(s).ok().flatten() {
                 Some(caps) => caps
                     .get((*n).max(0) as usize)
                     .map(|m| new_str(m.as_str().to_string()))
@@ -8854,7 +8864,7 @@ fn dispatch_symbol(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         // `match?` tests the name against a Regexp (or string pattern) without $~.
         "match?" => {
             let m = str_regex(&args[0])
-                .map(|re| re.is_match(&s))
+                .map(|re| re.is_match(&s).unwrap_or(false))
                 .unwrap_or(false);
             Ok(Value::Bool(m))
         }
@@ -8942,13 +8952,15 @@ fn dispatch_regexp(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         "source" => Ok(new_str(source)),
         "match?" => {
             let s = arg_str(&args[0]);
-            Ok(Value::Bool(re.is_match(&s)))
+            Ok(Value::Bool(re.is_match(&s).unwrap_or(false)))
         }
         "=~" => {
             let s = arg_str(&args[0]);
             match_data(&re, &s); // sets `$~`/`$1`..
             Ok(re
                 .find(&s)
+                .ok()
+                .flatten()
                 .map(|m| Value::Int(s[..m.start()].chars().count() as i64))
                 .unwrap_or(Value::Undef))
         }

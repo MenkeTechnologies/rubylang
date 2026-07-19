@@ -238,7 +238,7 @@ pub enum RObj {
     /// A compiled regular expression: its Ruby source plus the compiled matcher.
     Regexp {
         source: String,
-        re: regex::Regex,
+        re: fancy_regex::Regex,
     },
     /// The result of a successful `String#match` / `Regexp#match`: the group
     /// captures (index 0 is the whole match; `None` = an unmatched optional
@@ -1519,9 +1519,15 @@ impl RubyHost {
             _ => None,
         }
     }
-    /// Compile a regex literal (Ruby `flags` → Rust inline flags: `i`
+    /// Compile a regex literal (Ruby `flags` → inline flags: `i`
     /// case-insensitive, `m` dot-matches-newline, `x` extended). Returns an error
-    /// string if the pattern is not valid for the Rust regex engine.
+    /// string if the pattern is not valid for the fancy-regex engine.
+    ///
+    /// fancy-regex is a backtracking engine, so Ruby/Onigmo features the `regex`
+    /// crate rejects — backreferences (`\1`, `\k<name>`) and look-around
+    /// (`(?=…)`, `(?<=…)`) — compile and match here. Ruby anchors (`\A`/`\z`/
+    /// `\Z`/`\G`), `\h`/`\H`, named groups, and POSIX classes are all supported
+    /// by its parser, so patterns pass through unrewritten.
     pub fn new_regex(&mut self, source: &str, flags: &str) -> Result<Value, String> {
         let mut inline = String::new();
         if flags.contains('i') {
@@ -1538,7 +1544,7 @@ impl RubyHost {
         } else {
             format!("(?{inline}){source}")
         };
-        match regex::Regex::new(&full) {
+        match fancy_regex::Regex::new(&full) {
             Ok(re) => Ok(self.alloc(RObj::Regexp {
                 source: source.to_string(),
                 re,
@@ -1557,7 +1563,7 @@ impl RubyHost {
         }
     }
     /// The compiled matcher + source of a regex value, if `v` is one.
-    pub fn as_regex(&self, v: &Value) -> Option<(regex::Regex, String)> {
+    pub fn as_regex(&self, v: &Value) -> Option<(fancy_regex::Regex, String)> {
         match self.obj(v) {
             Some(RObj::Regexp { re, source }) => Some((re.clone(), source.clone())),
             _ => None,
