@@ -1632,3 +1632,82 @@ p (1.0 / 0.0).round(0)
 p (10.0 / 0.0).round(0)
 #==#
 p 1e15
+#==#
+# ── intmeth / enumerable / exceptions / struct / rational / pattern-match / kernel-conv ──
+p 48.gcd(36)
+#==#
+p 4.lcm(6)
+#==#
+p 100.divmod(7)
+#==#
+p 255.to_s(16)
+#==#
+p (-42).abs.digits
+#==#
+p 5.pow(3, 13)
+#==#
+p 12.bit_length
+#==#
+p [10.even?, 7.odd?, 0.zero?]
+#==#
+p [1, 2, 3, 4, 5].each_slice(2).to_a
+#==#
+p [1, 2, 3, 4].each_cons(2).to_a
+#==#
+p [1, -2, 3, -4].partition { |x| x > 0 }
+#==#
+p [1, 2, 3, 4, 5, 6].group_by { |x| x % 3 }
+#==#
+p [1, 2, 3].flat_map { |x| [x, -x] }
+#==#
+p [3, 1, 3, 2, 1].tally
+#==#
+p [1, 2, 2, 3, 3, 3].chunk_while { |a, b| a == b }.to_a
+#==#
+p (begin; raise "boom"; rescue => e; e.message; end)
+#==#
+p (begin; 1 / 0; rescue ZeroDivisionError => e; e.message; end)
+#==#
+p (begin; Integer("nope"); rescue ArgumentError; :caught; end)
+#==#
+r = []; begin; r << 1; raise "x"; rescue; r << 2; ensure; r << 3; end; p r
+#==#
+class E1 < StandardError; end; p (begin; raise E1; rescue E1; :custom; end)
+#==#
+S = Struct.new(:a, :b); p S.new(1, 2).to_a
+#==#
+S2 = Struct.new(:a, :b); p S2.new(1, 2).to_h
+#==#
+S3 = Struct.new(:x, :y); p(S3.new(1, 2) == S3.new(1, 2))
+#==#
+S4 = Struct.new(:a, keyword_init: true); p S4.new(a: 9).a
+#==#
+p(Rational(1, 3) + Rational(1, 6))
+#==#
+p(Rational(3, 4) * Rational(2, 9))
+#==#
+p(Rational(7, 2) % Rational(1, 3))
+#==#
+p(Rational(2, 3) ** -2)
+#==#
+p(5 / Rational(2, 3))
+#==#
+p [Rational(6, 4).numerator, Rational(6, 4).denominator]
+#==#
+case [1, 2]; in [a, b]; p a + b; end
+#==#
+case {name: "Ann", age: 30}; in {name: String => s}; p s; end
+#==#
+case [1, 2, 3, 4]; in [_, _, *rest]; p rest; end
+#==#
+p Integer("ff", 16)
+#==#
+p Integer("1010", 2)
+#==#
+p Float("3.14")
+#==#
+p Array(nil)
+#==#
+p Array([1, 2])
+#==#
+p format("%05.2f", 3.14159)
