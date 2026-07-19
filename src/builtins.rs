@@ -1216,6 +1216,9 @@ pub(crate) fn dispatch(
         "TCPServer" => dispatch_tcp_server(recv, name, args, block),
         "TCPSocket" => dispatch_tcp_socket(recv, name, args, block),
         "SQLite3::Database" => dispatch_sqlite_db(recv, name, args, block),
+        "Fiddle::Handle" => dispatch_fiddle_handle(recv, name, args),
+        "Fiddle::Function" => dispatch_fiddle_function(recv, name, args),
+        "Fiddle::Pointer" => dispatch_fiddle_pointer(recv, name, args),
         "Enumerator::Lazy" => dispatch_lazy(recv, name, args, block),
         "Enumerator::Yielder" => dispatch_yielder(recv, name, args),
         "Rational" => dispatch_rational(recv, name, args),
@@ -1618,6 +1621,12 @@ fn dispatch_classref(
     }
     if cls == "SQLite3::Database" && (name == "new" || name == "open") {
         return sqlite_db_new(args, block);
+    }
+    // Fiddle — Ruby's built-in FFI. The `Fiddle` module namespace resolves its
+    // type-code constants and sub-classes; `Fiddle.dlopen` opens a library;
+    // `Fiddle::Function.new` / `Fiddle::Pointer.*` build the callable / pointer.
+    if let Some(r) = dispatch_fiddle_classref(cls, name, args)? {
+        return Ok(r);
     }
     match name {
         "new" => {
@@ -7049,6 +7058,386 @@ fn dispatch_sqlite_db(
     }
 }
 
+// ---- Fiddle (FFI) -----------------------------------------------------------
+//
+// Ruby's built-in FFI stdlib. `Fiddle.dlopen`/`Fiddle::Handle` wrap a `dlopen`ed
+// shared library (host side table); `Fiddle::Function` binds a C function
+// address to a runtime signature and calls it through libffi; `Fiddle::Pointer`
+// wraps a raw address so a returned `char*` reads back as a Ruby String.
+
+use libffi::middle::{arg as ffi_arg, Arg, Cif, CodePtr, Type};
+use std::ffi::c_void;
+
+/// Raise `Fiddle::DLError` — MRI's error class for dlopen/dlsym/type failures.
+/// (`*Error` names are rescuable class refs; see `is_builtin_exception`.)
+fn fiddle_err(msg: &str) -> String {
+    raise_exc("Fiddle::DLError", msg)
+}
+
+/// The MRI integer value of a `Fiddle::TYPE_*`/`ALIGN_*` constant, reached as a
+/// method send on the `Fiddle` module ref (exactly like `Math::PI`). A negative
+/// type code is the unsigned variant of its magnitude (`TYPE_SIZE_T` = -5 =
+/// unsigned `TYPE_LONG`), matching MRI's own values.
+fn fiddle_type_const(name: &str) -> Option<i64> {
+    Some(match name {
+        "TYPE_VOID" => 0,
+        "TYPE_VOIDP" => 1,
+        "TYPE_CHAR" => 2,
+        "TYPE_SHORT" => 3,
+        "TYPE_INT" => 4,
+        "TYPE_LONG" => 5,
+        "TYPE_LONG_LONG" => 6,
+        "TYPE_FLOAT" => 7,
+        "TYPE_DOUBLE" => 8,
+        "TYPE_SIZE_T" => -5,
+        "TYPE_SSIZE_T" => 5,
+        "TYPE_PTRDIFF_T" => 5,
+        "TYPE_INTPTR_T" => 5,
+        "TYPE_UINTPTR_T" => -5,
+        "TYPE_UCHAR" => -2,
+        "TYPE_USHORT" => -3,
+        "TYPE_UINT" => -4,
+        "TYPE_ULONG" => -5,
+        "TYPE_ULONG_LONG" => -6,
+        "ALIGN_VOIDP" | "SIZEOF_VOIDP" | "SIZEOF_LONG" | "SIZEOF_LONG_LONG" => 8,
+        "SIZEOF_INT" => 4,
+        "SIZEOF_SHORT" => 2,
+        "SIZEOF_CHAR" => 1,
+        "SIZEOF_DOUBLE" => 8,
+        "SIZEOF_FLOAT" => 4,
+        _ => return None,
+    })
+}
+
+/// MRI Fiddle type code → libffi `Type`. `None` for an unknown code. `TYPE_VOID`
+/// (0) is valid only as a return type.
+fn fiddle_ffi_type(code: i32) -> Option<Type> {
+    let unsigned = code < 0;
+    let t = match (code.abs(), unsigned) {
+        (0, _) => Type::void(),
+        (1, _) => Type::pointer(), // TYPE_VOIDP
+        (2, false) => Type::i8(),  // TYPE_CHAR
+        (2, true) => Type::u8(),
+        (3, false) => Type::c_short(), // TYPE_SHORT
+        (3, true) => Type::u16(),
+        (4, false) => Type::c_int(), // TYPE_INT
+        (4, true) => Type::c_uint(),
+        (5, false) => Type::c_long(), // TYPE_LONG
+        (5, true) => Type::usize(),   // TYPE_SIZE_T (unsigned long == usize on LP64)
+        (6, false) => Type::c_longlong(), // TYPE_LONG_LONG
+        (6, true) => Type::u64(),
+        (7, _) => Type::f32(), // TYPE_FLOAT
+        (8, _) => Type::f64(), // TYPE_DOUBLE
+        _ => return None,
+    };
+    Some(t)
+}
+
+/// A single marshalled C argument, stored in correctly-sized native storage so
+/// libffi reads the right number of bytes. `Ptr` carries a raw pointer (a
+/// String's char*, another Pointer's address, or a raw integer address).
+enum FiddleArg {
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    Ptr(*const c_void),
+}
+
+/// `Fiddle::Function#call(*args)` — marshal Ruby args to C via libffi, invoke the
+/// bound function, and marshal the C result back to Ruby.
+fn fiddle_call(recv: &Value, args: &[Value]) -> Result<Value, String> {
+    let (addr, argtypes, ret) =
+        crate::host::fiddle_func_parts(recv).ok_or_else(|| fiddle_err("not a Fiddle::Function"))?;
+    if args.len() != argtypes.len() {
+        return Err(raise_exc(
+            "ArgumentError",
+            &format!(
+                "wrong number of arguments (given {}, expected {})",
+                args.len(),
+                argtypes.len()
+            ),
+        ));
+    }
+    // Keep-alive buffers for `TYPE_VOIDP` String args: the char* handed to C must
+    // stay valid for the whole call, so its NUL-terminated bytes live here.
+    let mut keep: Vec<Vec<u8>> = Vec::new();
+    let mut store: Vec<FiddleArg> = Vec::with_capacity(args.len());
+    let mut ffi_types: Vec<Type> = Vec::with_capacity(args.len());
+    for (v, &code) in args.iter().zip(argtypes.iter()) {
+        ffi_types.push(
+            fiddle_ffi_type(code).ok_or_else(|| fiddle_err(&format!("unknown type code {code}")))?,
+        );
+        let s = match code.abs() {
+            1 => {
+                // TYPE_VOIDP: String → char*; Fiddle::Pointer → its address;
+                // nil → NULL; Integer → a raw address.
+                let p: *const c_void = if matches!(v, Value::Undef) {
+                    std::ptr::null()
+                } else if let Some(s) = with_host(|h| h.as_str(v)) {
+                    let mut b = s.into_bytes();
+                    b.push(0);
+                    let ptr = b.as_ptr() as *const c_void;
+                    keep.push(b);
+                    ptr
+                } else if let Some((paddr, _)) = crate::host::fiddle_ptr_parts(v) {
+                    paddr as *const c_void
+                } else {
+                    (as_i(v) as u64) as *const c_void
+                };
+                FiddleArg::Ptr(p)
+            }
+            2 => FiddleArg::I8(as_i(v) as i8),
+            3 => FiddleArg::I16(as_i(v) as i16),
+            4 => FiddleArg::I32(as_i(v) as i32),
+            5 | 6 => FiddleArg::I64(int_arg(v).unwrap_or_else(|| as_i(v))),
+            7 => FiddleArg::F32(as_f(v) as f32),
+            8 => FiddleArg::F64(as_f(v)),
+            _ => return Err(fiddle_err(&format!("unsupported argument type code {code}"))),
+        };
+        store.push(s);
+    }
+    let ret_type =
+        fiddle_ffi_type(ret).ok_or_else(|| fiddle_err(&format!("unknown return type code {ret}")))?;
+    let cif = Cif::new(ffi_types, ret_type);
+    let code_ptr = CodePtr(addr as *mut c_void);
+    // Build the untyped Arg list, each borrowing its stable `store` slot.
+    let ffi_args: Vec<Arg> = store
+        .iter()
+        .map(|s| match s {
+            FiddleArg::I8(v) => ffi_arg(v),
+            FiddleArg::I16(v) => ffi_arg(v),
+            FiddleArg::I32(v) => ffi_arg(v),
+            FiddleArg::I64(v) => ffi_arg(v),
+            FiddleArg::F32(v) => ffi_arg(v),
+            FiddleArg::F64(v) => ffi_arg(v),
+            FiddleArg::Ptr(v) => ffi_arg(v),
+        })
+        .collect();
+
+    let ret_unsigned = ret < 0;
+    // SAFETY: a raw C call whose signature is only checked at runtime. If the
+    // declared argument/return types do not match the real C function the
+    // process can crash — that is Fiddle's documented low-level contract, and it
+    // matches MRI. libffi widens integer returns to at least register width, so
+    // reading a signed return through an 8-byte `i64` buffer is safe; float
+    // returns come back at their own width. Every `Arg`'s backing storage
+    // (`store`, and the `keep` char* buffers) is still live for the whole call.
+    let result = unsafe {
+        match ret.abs() {
+            0 => {
+                let _: i64 = cif.call(code_ptr, &ffi_args);
+                Value::Undef
+            }
+            // TYPE_VOIDP result → a Fiddle::Pointer (matching MRI), readable via
+            // #to_s / #to_str.
+            1 => {
+                let a: i64 = cif.call(code_ptr, &ffi_args);
+                crate::host::fiddle_ptr_raw(a as u64, 0)
+            }
+            2..=6 => {
+                let raw: i64 = cif.call(code_ptr, &ffi_args);
+                if ret_unsigned {
+                    let u = raw as u64;
+                    if u <= i64::MAX as u64 {
+                        Value::Int(u as i64)
+                    } else {
+                        with_host(|h| h.new_bigint(num_bigint::BigInt::from(u)))
+                    }
+                } else {
+                    Value::Int(raw)
+                }
+            }
+            7 => {
+                let f: f32 = cif.call(code_ptr, &ffi_args);
+                Value::Float(f as f64)
+            }
+            8 => {
+                let f: f64 = cif.call(code_ptr, &ffi_args);
+                Value::Float(f)
+            }
+            _ => return Err(fiddle_err(&format!("unsupported return type code {ret}"))),
+        }
+    };
+    drop(keep);
+    Ok(result)
+}
+
+/// Open a library ref for `Fiddle.dlopen` / `Fiddle::Handle.new`.
+fn fiddle_dlopen_ref(path: Option<String>) -> Result<Value, String> {
+    crate::host::fiddle_dlopen(path.as_deref()).map_err(|e| fiddle_err(&e))
+}
+
+/// `Fiddle::Function.new(addr, [arg_type_codes], ret_type_code)`. `addr` is an
+/// Integer (typically `handle[sym]`) or a Fiddle::Pointer.
+fn fiddle_function_new(args: &[Value]) -> Result<Value, String> {
+    let addr = args
+        .first()
+        .map(|v| match crate::host::fiddle_ptr_parts(v) {
+            Some((a, _)) => a,
+            None => int_arg(v).unwrap_or_else(|| as_i(v)) as u64,
+        })
+        .unwrap_or(0);
+    let argtypes: Vec<i32> = args
+        .get(1)
+        .and_then(|a| with_host(|h| h.as_array(a)))
+        .unwrap_or_default()
+        .iter()
+        .map(|v| as_i(v) as i32)
+        .collect();
+    let ret = args.get(2).map(|v| as_i(v) as i32).unwrap_or(0);
+    Ok(crate::host::fiddle_func_new(addr, argtypes, ret))
+}
+
+/// `Fiddle::Pointer[str]` / `Fiddle::Pointer.to_ptr(str)` — wrap a String's bytes
+/// (NUL-terminated so `#to_s` reads a valid C string) in owned memory.
+fn fiddle_ptr_from(args: &[Value]) -> Value {
+    let s = args.first().map(arg_str).unwrap_or_default();
+    let size = s.len() as i64;
+    let mut buf = s.into_bytes();
+    buf.push(0);
+    crate::host::fiddle_alloc(buf, size)
+}
+
+/// Fiddle class-ref surface (`Fiddle.*`, `Fiddle::Handle.new`,
+/// `Fiddle::Function.new`, `Fiddle::Pointer.*`). Returns `Ok(None)` for a class
+/// or name it does not own, so `dispatch_classref` continues.
+fn dispatch_fiddle_classref(
+    cls: &str,
+    name: &str,
+    args: &[Value],
+) -> Result<Option<Value>, String> {
+    match cls {
+        "Fiddle" => {
+            if let Some(code) = fiddle_type_const(name) {
+                return Ok(Some(Value::Int(code)));
+            }
+            match name {
+                "dlopen" => {
+                    let path = args.first().and_then(fiddle_path_arg);
+                    return fiddle_dlopen_ref(path).map(Some);
+                }
+                "Handle" | "Function" | "Pointer" | "DLError" | "Error" => {
+                    return Ok(Some(with_host(|h| h.class_ref(&format!("Fiddle::{name}")))));
+                }
+                _ => {}
+            }
+        }
+        "Fiddle::Handle" if name == "new" => {
+            let path = args.first().and_then(fiddle_path_arg);
+            return fiddle_dlopen_ref(path).map(Some);
+        }
+        "Fiddle::Function" if name == "new" => {
+            return fiddle_function_new(args).map(Some);
+        }
+        "Fiddle::Pointer" => match name {
+            "[]" | "to_ptr" => return Ok(Some(fiddle_ptr_from(args))),
+            "malloc" => {
+                let n = args.first().map(as_i).unwrap_or(0).max(0) as usize;
+                let mut buf = vec![0u8; n];
+                buf.push(0); // NUL guard so #to_s on a zeroed buffer is ""
+                return Ok(Some(crate::host::fiddle_alloc(buf, n as i64)));
+            }
+            "new" => {
+                let addr = args.first().map(|v| as_i(v) as u64).unwrap_or(0);
+                let size = args.get(1).map(as_i).unwrap_or(0);
+                return Ok(Some(crate::host::fiddle_ptr_raw(addr, size)));
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    Ok(None)
+}
+
+/// A dlopen path argument: `nil` → `None` (the current process), else the string.
+fn fiddle_path_arg(v: &Value) -> Option<String> {
+    match v {
+        Value::Undef => None,
+        _ => Some(arg_str(v)),
+    }
+}
+
+/// `Fiddle::Handle` instance methods: symbol resolution and `close`.
+fn dispatch_fiddle_handle(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "[]" | "sym" => {
+            let sym = args.first().map(arg_str).unwrap_or_default();
+            let addr = crate::host::fiddle_sym(recv, &sym).map_err(|e| fiddle_err(&e))?;
+            Ok(Value::Int(addr as i64))
+        }
+        "close" => {
+            crate::host::fiddle_handle_close(recv);
+            Ok(Value::Int(0))
+        }
+        "inspect" | "to_s" => Ok(new_str(with_host(|h| h.to_s(recv)))),
+        _ => Err(no_method_error(recv, name)),
+    }
+}
+
+/// `Fiddle::Function` instance methods: `call` and the address readers.
+fn dispatch_fiddle_function(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "call" => fiddle_call(recv, args),
+        "to_i" | "to_int" => {
+            let addr = crate::host::fiddle_func_parts(recv).map(|(a, _, _)| a).unwrap_or(0);
+            Ok(Value::Int(addr as i64))
+        }
+        "inspect" | "to_s" => Ok(new_str(with_host(|h| h.to_s(recv)))),
+        _ => Err(no_method_error(recv, name)),
+    }
+}
+
+/// `Fiddle::Pointer` instance methods: read the pointed-to memory back to Ruby,
+/// plus `size`/`null?`/`to_i`/`[]`/`free`.
+fn dispatch_fiddle_pointer(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let (addr, size) = crate::host::fiddle_ptr_parts(recv)
+        .ok_or_else(|| no_method_error(recv, name))?;
+    match name {
+        // `to_s` with a length reads exactly that many bytes; without one it
+        // reads the sized buffer (up to NUL) or a NUL-terminated C string.
+        "to_s" => match args.first() {
+            Some(a) => Ok(new_str(crate::host::fiddle_read_bytes(
+                addr,
+                as_i(a).max(0) as usize,
+            ))),
+            None => Ok(new_str(crate::host::fiddle_read_cstr_or_len(addr, size))),
+        },
+        "to_str" => {
+            let len = args
+                .first()
+                .map(|a| as_i(a).max(0) as usize)
+                .unwrap_or(size.max(0) as usize);
+            Ok(new_str(crate::host::fiddle_read_bytes(addr, len)))
+        }
+        "to_i" | "to_int" => Ok(Value::Int(addr as i64)),
+        "null?" => Ok(Value::Bool(addr == 0)),
+        "size" => Ok(Value::Int(size)),
+        "free" => {
+            crate::host::fiddle_free(recv);
+            Ok(Value::Undef)
+        }
+        // `ptr[i]` → the unsigned byte at offset i; `ptr[i, len]` → a String.
+        "[]" => {
+            let i = args.first().map(as_i).unwrap_or(0).max(0) as u64;
+            match args.get(1) {
+                Some(l) => Ok(new_str(crate::host::fiddle_read_bytes(
+                    addr.wrapping_add(i),
+                    as_i(l).max(0) as usize,
+                ))),
+                None => {
+                    let b = crate::host::fiddle_read_bytes(addr.wrapping_add(i), 1);
+                    Ok(Value::Int(b.bytes().next().unwrap_or(0) as i64))
+                }
+            }
+        }
+        "inspect" => Ok(new_str(with_host(|h| h.inspect(recv)))),
+        _ => Err(no_method_error(recv, name)),
+    }
+}
+
 /// `IO#puts` for one argument: arrays flatten (each element on its own line),
 /// scalars get a trailing `\n` only if their string form lacks one.
 fn io_puts_arg(recv: &Value, v: &Value) -> Result<(), String> {
@@ -11269,6 +11658,7 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "abbrev"
             | "delegate"
             | "sqlite3"
+            | "fiddle"
     )
 }
 

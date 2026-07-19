@@ -325,6 +325,32 @@ pub enum RObj {
     Db {
         id: u32,
     },
+    /// A `Fiddle::Handle` — a `dlopen`ed shared library. Holds only an index
+    /// into `RubyHost.fiddle_libs`; the underlying `libloading::os::unix::Library`
+    /// is not `Clone` (it owns the OS `dlopen` handle), so it lives in the side
+    /// table exactly like `Db`/`File`.
+    FiddleHandle {
+        id: u32,
+    },
+    /// A `Fiddle::Function` — a callable bound to a C function address plus its
+    /// runtime signature. All fields are `Clone`, so it rides inline (no side
+    /// table): `addr` is the resolved code pointer, `args` the argument
+    /// Fiddle type codes, `ret` the return type code (MRI's small integer codes).
+    FiddleFunc {
+        addr: u64,
+        args: Vec<i32>,
+        ret: i32,
+    },
+    /// A `Fiddle::Pointer` — a raw memory address with an optional known byte
+    /// `size`. When `owned` is `Some(id)` the pointer owns a heap buffer stored
+    /// in `RubyHost.fiddle_mem` (from `Pointer.malloc`/`Pointer[str]`); `#free`
+    /// releases it. A pointer returned from a C call (`TYPE_VOIDP` result) has
+    /// `owned == None` and borrows memory the callee owns.
+    FiddlePtr {
+        addr: u64,
+        size: i64,
+        owned: Option<u32>,
+    },
 }
 
 /// Julian Day Number of the Unix epoch (1970-01-01), so `jd = days + this`.
@@ -585,6 +611,17 @@ pub struct RubyHost {
     /// sqlite3 pointer), so — like `io_handles` — it lives here, never inline in
     /// the `RObj` value enum.
     db_handles: Vec<Option<DbCell>>,
+    /// Live `Fiddle::Handle` libraries, indexed by `RObj::FiddleHandle.id`.
+    /// `None` once closed. The `libloading` library owns the OS `dlopen` handle
+    /// and is not `Clone`, so — like `db_handles` — it lives here.
+    fiddle_libs: Vec<Option<FiddleLib>>,
+    /// Owned heap buffers behind `Fiddle::Pointer`s created by
+    /// `Pointer.malloc`/`Pointer[str]`/`Pointer.to_ptr`, indexed by
+    /// `RObj::FiddlePtr.owned`. `None` once `#free`d. The buffer's heap address
+    /// is stable across pushes into this outer `Vec` (only the `Box` header
+    /// moves, never the bytes it points at), so a `FiddlePtr.addr` computed from
+    /// `.as_ptr()` stays valid until `#free`.
+    fiddle_mem: Vec<Option<Box<[u8]>>>,
 }
 
 /// One live `SQLite3::Database`, indexed by `RObj::Db.id`. Wraps the owned
@@ -595,6 +632,14 @@ pub struct DbCell {
     conn: rusqlite::Connection,
     pub results_as_hash: bool,
 }
+
+/// One live `Fiddle::Handle`, indexed by `RObj::FiddleHandle.id`. Wraps the
+/// owned `libloading` library (the OS `dlopen` handle). Kept in a side table
+/// because the library is not `Clone` and must stay loaded for as long as any
+/// resolved symbol address is in use. Unix-only (`os::unix`), matching the
+/// crate's target set — `os::unix::Library::this()` backs `Fiddle.dlopen(nil)`,
+/// which the cross-platform `libloading::Library` does not expose.
+pub struct FiddleLib(libloading::os::unix::Library);
 
 /// A column value carried between the `rusqlite` layer and the Ruby object heap.
 /// Re-exports `rusqlite::types::Value` (Null/Integer/Real/Text/Blob) so the SQL
@@ -987,6 +1032,8 @@ impl RubyHost {
             fibers: Vec::new(),
             io_handles: vec![IoCell::Stdout, IoCell::Stderr, IoCell::Stdin],
             db_handles: Vec::new(),
+            fiddle_libs: Vec::new(),
+            fiddle_mem: Vec::new(),
             struct_defs: IndexMap::new(),
             struct_counter: 0,
             class_vars: IndexMap::new(),
@@ -2533,6 +2580,10 @@ impl RubyHost {
                 | "OpenStruct"
                 | "SQLite3"
                 | "SQLite3::Database"
+                | "Fiddle"
+                | "Fiddle::Handle"
+                | "Fiddle::Function"
+                | "Fiddle::Pointer"
                 | "StringIO"
                 // `ENV` is modeled as a class-ref so its `[]`/`fetch`/… dispatch
                 // through `dispatch_classref` (it is the process environment).
@@ -2918,6 +2969,14 @@ impl RubyHost {
                 Some(RObj::Date { days }) => self.date_to_s(days),
                 Some(RObj::DateTime { secs }) => self.datetime_to_s(secs),
                 Some(RObj::Db { .. }) => "#<SQLite3::Database>".to_string(),
+                // `Fiddle::Pointer#to_s` reads the pointed-to memory as a C
+                // string (matching MRI); the library/function handles render a
+                // short description.
+                Some(RObj::FiddleHandle { id }) => format!("#<Fiddle::Handle id={id}>"),
+                Some(RObj::FiddleFunc { addr, .. }) => {
+                    format!("#<Fiddle::Function ptr=0x{addr:x}>")
+                }
+                Some(RObj::FiddlePtr { addr, size, .. }) => fiddle_read_cstr_or_len(addr, size),
                 Some(RObj::Lazy { .. }) => "#<Enumerator::Lazy>".to_string(),
                 Some(RObj::Enumerator { buf, .. }) => {
                     format!("#<Enumerator: {}>", self.inspect_array(&buf))
@@ -3012,6 +3071,15 @@ impl RubyHost {
                 Some(RObj::Date { days }) => self.date_inspect(days),
                 Some(RObj::DateTime { secs }) => self.datetime_inspect(secs),
                 Some(RObj::Db { .. }) => "#<SQLite3::Database>".to_string(),
+                Some(RObj::FiddleHandle { id }) => format!("#<Fiddle::Handle id={id}>"),
+                Some(RObj::FiddleFunc { addr, .. }) => {
+                    format!("#<Fiddle::Function ptr=0x{addr:x}>")
+                }
+                // `Fiddle::Pointer#inspect` shows the address and known byte size
+                // (MRI: `#<Fiddle::Pointer ptr=0x… size=N>`).
+                Some(RObj::FiddlePtr { addr, size, .. }) => {
+                    format!("#<Fiddle::Pointer ptr=0x{addr:x} size={size}>")
+                }
                 // A String range inspects its endpoints with quotes: `"a".."e"`.
                 Some(RObj::StrRange { lo, hi, exclusive }) => {
                     format!("{lo:?}{}{hi:?}", if exclusive { "..." } else { ".." })
@@ -3119,6 +3187,9 @@ impl RubyHost {
                 Some(RObj::Date { .. }) => "Date",
                 Some(RObj::DateTime { .. }) => "DateTime",
                 Some(RObj::Db { .. }) => "SQLite3::Database",
+                Some(RObj::FiddleHandle { .. }) => "Fiddle::Handle",
+                Some(RObj::FiddleFunc { .. }) => "Fiddle::Function",
+                Some(RObj::FiddlePtr { .. }) => "Fiddle::Pointer",
                 Some(RObj::Set(_)) => "Set",
                 Some(RObj::Array(_)) => "Array",
                 Some(RObj::Hash { .. }) => "Hash",
@@ -4635,6 +4706,190 @@ pub fn db_results_as_hash(v: &Value) -> bool {
     match db_id(v) {
         Some(id) => with_host(|h| matches!(h.db_handles.get(id as usize), Some(Some(c)) if c.results_as_hash)),
         None => false,
+    }
+}
+
+// ---- Fiddle (FFI) side table ----------------------------------------------
+
+/// `Fiddle.dlopen(path)` / `Fiddle::Handle.new(path)`. A `nil`/empty path opens
+/// the current process' global symbol scope (`dlopen(NULL)`), so libc symbols
+/// already loaded into the process — `strlen`, `abs`, `sqrt`, `getenv` — are
+/// resolvable without naming a library file. A path opens that shared object
+/// with `RTLD_LAZY | RTLD_GLOBAL` (the sqlite3-gem/MRI default). Returns a fresh
+/// `RObj::FiddleHandle` value.
+pub fn fiddle_dlopen(path: Option<&str>) -> Result<Value, String> {
+    let lib = match path {
+        None => libloading::os::unix::Library::this(),
+        Some(p) => {
+            // SAFETY: `dlopen` of a user-named library. This runs arbitrary
+            // constructor code in the loaded object, exactly as MRI's
+            // `Fiddle.dlopen` does — the operation is inherently unsafe and its
+            // safety is the caller's responsibility (a bad path only errors).
+            unsafe {
+                libloading::os::unix::Library::open(
+                    Some(p),
+                    libc::RTLD_LAZY | libc::RTLD_GLOBAL,
+                )
+                .map_err(|e| e.to_string())?
+            }
+        }
+    };
+    Ok(with_host(|h| {
+        let id = h.fiddle_libs.len() as u32;
+        h.fiddle_libs.push(Some(FiddleLib(lib)));
+        h.alloc(RObj::FiddleHandle { id })
+    }))
+}
+
+/// Resolve `name` in a `Fiddle::Handle` to its raw code address (`handle[name]`
+/// / `handle.sym(name)`). Errors if the handle is closed or the symbol is
+/// missing (MRI raises `Fiddle::DLError`).
+pub fn fiddle_sym(v: &Value, name: &str) -> Result<u64, String> {
+    let id = match with_host(|h| h.obj(v).cloned()) {
+        Some(RObj::FiddleHandle { id }) => id,
+        _ => return Err("not a Fiddle::Handle".to_string()),
+    };
+    with_host(|h| {
+        let lib = h
+            .fiddle_libs
+            .get(id as usize)
+            .and_then(|l| l.as_ref())
+            .ok_or_else(|| "closed handle".to_string())?;
+        // libloading appends a trailing NUL if absent; pass it explicitly.
+        let mut sym_bytes = name.as_bytes().to_vec();
+        sym_bytes.push(0);
+        // SAFETY: `dlsym`. The returned `Symbol` borrows the library; `into_raw`
+        // detaches it into a bare address that stays valid while the library is
+        // loaded (it lives in `fiddle_libs` until `#close`). We only read the
+        // address, never call through this typing.
+        let sym: libloading::os::unix::Symbol<*mut std::ffi::c_void> = unsafe {
+            lib.0.get(&sym_bytes).map_err(|e| e.to_string())?
+        };
+        Ok(sym.into_raw() as u64)
+    })
+}
+
+/// The `(addr, arg type codes, ret type code)` behind a `Fiddle::Function`.
+pub fn fiddle_func_parts(v: &Value) -> Option<(u64, Vec<i32>, i32)> {
+    match with_host(|h| h.obj(v).cloned()) {
+        Some(RObj::FiddleFunc { addr, args, ret }) => Some((addr, args, ret)),
+        _ => None,
+    }
+}
+
+/// The `(addr, size)` behind a `Fiddle::Pointer`.
+pub fn fiddle_ptr_parts(v: &Value) -> Option<(u64, i64)> {
+    match with_host(|h| h.obj(v).cloned()) {
+        Some(RObj::FiddlePtr { addr, size, .. }) => Some((addr, size)),
+        _ => None,
+    }
+}
+
+/// Build a `Fiddle::Function` value from a resolved address and its runtime
+/// signature (argument type codes + return type code).
+pub fn fiddle_func_new(addr: u64, args: Vec<i32>, ret: i32) -> Value {
+    with_host(|h| h.alloc(RObj::FiddleFunc { addr, args, ret }))
+}
+
+/// `handle.close` — drop the library (unloads it), leaving the handle closed.
+pub fn fiddle_handle_close(v: &Value) {
+    if let Some(RObj::FiddleHandle { id }) = with_host(|h| h.obj(v).cloned()) {
+        with_host(|h| {
+            if let Some(slot) = h.fiddle_libs.get_mut(id as usize) {
+                *slot = None;
+            }
+        });
+    }
+}
+
+/// Allocate an owned, heap-backed `Fiddle::Pointer` from `buf` and record its
+/// stable data address. `size` is the logical byte size exposed to Ruby
+/// (`Pointer#size`); `buf` may carry a trailing NUL beyond `size` so `#to_s`
+/// reads a valid C string.
+pub fn fiddle_alloc(buf: Vec<u8>, size: i64) -> Value {
+    with_host(|h| {
+        let id = h.fiddle_mem.len() as u32;
+        h.fiddle_mem.push(Some(buf.into_boxed_slice()));
+        let addr = h.fiddle_mem[id as usize].as_ref().unwrap().as_ptr() as u64;
+        h.alloc(RObj::FiddlePtr {
+            addr,
+            size,
+            owned: Some(id),
+        })
+    })
+}
+
+/// A `Fiddle::Pointer` that borrows memory it does not own (a `TYPE_VOIDP`
+/// result, or `Pointer.new(addr)`). `size` 0 means "unknown length".
+pub fn fiddle_ptr_raw(addr: u64, size: i64) -> Value {
+    with_host(|h| {
+        h.alloc(RObj::FiddlePtr {
+            addr,
+            size,
+            owned: None,
+        })
+    })
+}
+
+/// `ptr.free` — release an owned buffer. A no-op on a borrowed pointer.
+pub fn fiddle_free(v: &Value) {
+    if let Some(RObj::FiddlePtr {
+        owned: Some(id), ..
+    }) = with_host(|h| h.obj(v).cloned())
+    {
+        with_host(|h| {
+            if let Some(slot) = h.fiddle_mem.get_mut(id as usize) {
+                *slot = None;
+            }
+        });
+    }
+}
+
+/// Read a NUL-terminated C string at `addr`. Empty for a null pointer.
+///
+/// SAFETY: dereferences a raw address the caller asserts is a valid, live,
+/// NUL-terminated C string. A wrong address crashes the process — this is the
+/// documented low-level contract of `Fiddle::Pointer#to_s`, matching MRI.
+pub fn fiddle_read_cstr(addr: u64) -> String {
+    if addr == 0 {
+        return String::new();
+    }
+    unsafe {
+        std::ffi::CStr::from_ptr(addr as *const std::os::raw::c_char)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// Read exactly `len` bytes at `addr` as a (lossily-decoded) String. Empty for a
+/// null pointer or zero length.
+///
+/// SAFETY: reads `len` bytes from a raw address the caller asserts is valid and
+/// at least `len` bytes long (Fiddle's low-level contract).
+pub fn fiddle_read_bytes(addr: u64, len: usize) -> String {
+    if addr == 0 || len == 0 {
+        return String::new();
+    }
+    unsafe {
+        let sl = std::slice::from_raw_parts(addr as *const u8, len);
+        String::from_utf8_lossy(sl).into_owned()
+    }
+}
+
+/// The default `#to_s` reading used by host `to_s`: a known-size pointer reads
+/// that many bytes, else it reads up to the first NUL. Used so `puts ptr` /
+/// interpolation match `Fiddle::Pointer#to_s`.
+pub fn fiddle_read_cstr_or_len(addr: u64, size: i64) -> String {
+    if size > 0 {
+        // A sized buffer that ends in (or contains) a NUL still stops at it,
+        // matching MRI, so `Pointer["abc"].to_s` is "abc" not "abc\0…".
+        let raw = fiddle_read_bytes(addr, size as usize);
+        match raw.find('\0') {
+            Some(i) => raw[..i].to_string(),
+            None => raw,
+        }
+    } else {
+        fiddle_read_cstr(addr)
     }
 }
 

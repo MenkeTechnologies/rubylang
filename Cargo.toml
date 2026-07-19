@@ -149,5 +149,16 @@ num-rational = "0.4"
 # system package required.
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# `Fiddle` — Ruby's built-in FFI stdlib. `libloading` is the dlopen/dlsym
+# wrapper (opening a shared library and resolving a symbol to its raw address);
+# `libffi` builds a call interface (`Cif`) from types decided at runtime and
+# invokes an arbitrary C function through it. Both build on macOS aarch64 +
+# Linux x86_64/aarch64 (libffi vendors and compiles its own C via libffi-sys;
+# libloading is a thin wrapper over the platform `dlopen`). Unix-only surface
+# (`os::unix::Library::this()` gives `Fiddle.dlopen(nil)`), which matches the
+# crate's existing unix target set.
+libloading = "0.8"
+libffi = "5"
+
 [dev-dependencies]
 tempfile = "3"

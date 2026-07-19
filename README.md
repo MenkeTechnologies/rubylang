@@ -148,7 +148,7 @@ Implemented and checked against the reference `ruby`:
 - **String interpolation** — double-quoted `#{}` interpolation.
 - **Standard library** — `require`-able builtin libs including `json`, `set`,
   `date`/`time`, `securerandom`, `digest`, `base64`, `ostruct`, `socket`
-  (`TCPServer`/`TCPSocket`), and `sqlite3`.
+  (`TCPServer`/`TCPSocket`), `sqlite3`, and `fiddle`.
 - **Database persistence** — `require "sqlite3"` gives a real, on-disk
   `SQLite3::Database` backed by a bundled SQLite (compiled in-tree, no external
   gem or FFI). The core sqlite3-gem shape: `SQLite3::Database.new(path)` /
@@ -174,6 +174,38 @@ Implemented and checked against the reference `ruby`:
   [`examples/orm_app.rb`](examples/orm_app.rb) (CRUD) and
   [`examples/orm_blog.rb`](examples/orm_blog.rb) (associations, validations,
   callbacks, query chaining).
+- **FFI via Fiddle** — `require "fiddle"` gives real foreign-function calls:
+  `Fiddle.dlopen` a shared library (or `dlopen(nil)` for the current process),
+  resolve a symbol's address with `handle[sym]`, then build a
+  `Fiddle::Function.new(addr, [arg_types], ret_type)` and `#call` it. Arguments
+  (Integer/Float/String) marshal to C and the result marshals back through
+  libffi, with a runtime-determined signature — this is genuine C execution, not
+  a shim. `Fiddle::Pointer` wraps bytes and reads a returned `char*` back into a
+  Ruby String. The MRI type codes are provided (`TYPE_VOID`/`TYPE_INT`/
+  `TYPE_LONG`/`TYPE_SIZE_T`/`TYPE_VOIDP`/`TYPE_DOUBLE`/`TYPE_CHAR`/`TYPE_SHORT`/
+  `TYPE_LONG_LONG` and their unsigned negatives), and `Fiddle::DLError` is
+  rescuable. FFI is inherently unsafe — a wrong signature can crash the process,
+  exactly as MRI Fiddle documents.
+
+  ```ruby
+  require "fiddle"
+  libc = Fiddle.dlopen(nil)                                   # current process
+  strlen = Fiddle::Function.new(libc["strlen"],
+                                [Fiddle::TYPE_VOIDP], Fiddle::TYPE_SIZE_T)
+  strlen.call("hello")                                        # => 5
+  sqrt = Fiddle::Function.new(libc["sqrt"],
+                              [Fiddle::TYPE_DOUBLE], Fiddle::TYPE_DOUBLE)
+  sqrt.call(16.0)                                             # => 4.0
+  dup = Fiddle::Function.new(libc["strdup"],
+                             [Fiddle::TYPE_VOIDP], Fiddle::TYPE_VOIDP)
+  dup.call("world").to_s                                      # => "world"
+  ```
+
+  **Boundary:** Fiddle calls *arbitrary C functions in a shared library* — it is
+  not a libruby C ABI. MRI-C-API extension gems (nokogiri, the C `mysql2`, etc.)
+  link against `libruby` and its `VALUE`/`rb_*` internals; that ABI is a
+  separate, much larger surface Fiddle does not provide, so those native gems do
+  not load. Pure-Ruby gems and anything expressible as direct C calls do.
 
 ---
 

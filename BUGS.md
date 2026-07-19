@@ -649,6 +649,52 @@ Implemented (the core sqlite3-gem shape):
   or `db.type_translation`. Raw `BEGIN`/`COMMIT` via `execute` work.
 - `SQLite3::Database` is not user-subclassable.
 
+## FFI (`Fiddle`)
+
+`require "fiddle"` is a no-op returning true (the classes are always present).
+Fiddle is real foreign-function calling: `libloading` provides `dlopen`/`dlsym`
+and `libffi` builds a call interface from types decided at runtime, so Ruby code
+invokes actual C functions. Both crates are vendored/compiled in-tree (libffi
+builds its own C via `libffi-sys`), so this needs no system package and builds on
+macOS aarch64 + Linux x86_64/aarch64. The `Fiddle::Handle` library, and the
+owned buffers behind `Fiddle::Pointer`, live in host side tables (the
+`fiddle_libs` / `fiddle_mem` pattern, like `db_handles`/`io_handles`).
+
+Implemented (enough to call C):
+- `Fiddle.dlopen(path)` / `Fiddle::Handle.new(path)` → a `Fiddle::Handle`.
+  `Fiddle.dlopen(nil)` opens the current process' global scope (`dlopen(NULL)`),
+  so already-loaded libc symbols resolve with no library path. `handle[sym]` /
+  `handle.sym(name)` → the symbol's address (Integer); `handle.close`.
+- Type codes `Fiddle::TYPE_VOID`/`TYPE_VOIDP`/`TYPE_CHAR`/`TYPE_SHORT`/`TYPE_INT`/
+  `TYPE_LONG`/`TYPE_LONG_LONG`/`TYPE_FLOAT`/`TYPE_DOUBLE`/`TYPE_SIZE_T` (and the
+  unsigned negatives), with MRI's exact integer values.
+- `Fiddle::Function.new(addr, [arg_types], ret_type)` and `#call(*args)`:
+  Integer/Float/String arguments marshal to C through libffi and the result
+  marshals back (integer/size_t → Integer, float/double → Float, `TYPE_VOIDP`
+  result → a `Fiddle::Pointer`). A String argument passes as a NUL-terminated C
+  `char*` for `TYPE_VOIDP`.
+- `Fiddle::Pointer[str]` / `.to_ptr(str)` (wrap bytes), `.malloc(n)`, `#to_s`,
+  `#to_str(len)`, `#[]` (byte / slice read), `#size`, `#null?`, `#to_i`, `#free`.
+  A returned `char*` reads back as a Ruby String via `#to_s`.
+- `Fiddle::DLError` (rescuable) for dlopen/dlsym/type failures.
+
+Not modeled / boundaries:
+- **Not a libruby C ABI.** Fiddle calls arbitrary C functions in a shared
+  library; it does not expose `libruby`'s `VALUE`/`rb_*` C-API. MRI-C-API
+  extension gems (nokogiri, the C `mysql2`, etc.) link against that ABI, so they
+  do not load. Pure-Ruby gems and anything expressible as direct C calls work.
+- **FFI is unsafe by construction.** A signature that does not match the real C
+  function can crash the process — this matches MRI Fiddle's low-level contract
+  and is not guarded.
+- **Unix only.** Backed by `os::unix` `dlopen` (macOS + Linux, the crate's
+  target set). No Windows `LoadLibrary` path.
+- **No closures/callbacks.** `Fiddle::Closure` (passing a Ruby block as a C
+  function pointer) is not implemented, nor `Fiddle::Pointer#ptr`/`#ref`
+  dereferencing, struct/`CStruct` layouts, or `Fiddle::Function::STDCALL` (only
+  the default C calling convention).
+- **Unsigned results above `i64::MAX`** promote to a bignum, but such values do
+  not arise from the common libc surface.
+
 ## Loading files (`require` / `require_relative` / `load`)
 
 - **`require`, `require_relative`, and `load` actually read, parse, compile, and
