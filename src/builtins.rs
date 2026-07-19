@@ -11680,6 +11680,18 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "delegate"
             | "sqlite3"
             | "fiddle"
+            // Core libs that are no-ops in modern Ruby (their classes are built
+            // in) or that gems require defensively.
+            | "thread"
+            | "monitor"
+            | "mutex_m"
+            | "weakref"
+            | "English"
+            | "did_you_mean"
+            | "rbconfig"
+            | "ripper"
+            | "objspace"
+            | "date/format"
     )
 }
 

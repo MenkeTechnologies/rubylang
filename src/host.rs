@@ -3868,16 +3868,46 @@ fn gem_lib_dirs() -> Vec<String> {
     }
     let mut libs = Vec::new();
     for root in roots {
+        let spec_dir = root.join("specifications");
         if let Ok(rd) = std::fs::read_dir(root.join("gems")) {
             for e in rd.flatten() {
-                let lib = e.path().join("lib");
-                if lib.is_dir() {
-                    libs.push(lib.to_string_lossy().into_owned());
+                let gem_dir = e.path();
+                // A gem's real require dirs come from its gemspec's `require_paths`
+                // (usually `["lib"]`, but some — concurrent-ruby — use a custom
+                // path like `lib/concurrent-ruby`). Fall back to `lib`.
+                let spec = spec_dir.join(format!("{}.gemspec", e.file_name().to_string_lossy()));
+                let paths = gemspec_require_paths(&spec).unwrap_or_else(|| vec!["lib".into()]);
+                for p in paths {
+                    let lib = gem_dir.join(&p);
+                    if lib.is_dir() {
+                        libs.push(lib.to_string_lossy().into_owned());
+                    }
                 }
             }
         }
     }
     libs
+}
+
+/// Extract the quoted `require_paths` from a gemspec (`s.require_paths = ["lib",
+/// "ext"]`), stripping `.freeze`. `None` if the file is unreadable or has no
+/// `require_paths` line. A lightweight scan — gemspecs are Ruby, but this line is
+/// a plain array literal in practice.
+fn gemspec_require_paths(spec: &std::path::Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(spec).ok()?;
+    let line = text.lines().find(|l| l.contains("require_paths"))?;
+    let open = line.find('[')?;
+    let close = line[open..].find(']')? + open;
+    let inner = &line[open + 1..close];
+    let paths: Vec<String> = inner
+        .split(',')
+        .filter_map(|part| {
+            let p = part.trim().trim_end_matches(".freeze").trim();
+            let p = p.trim_matches(|c| c == '"' || c == '\'');
+            (!p.is_empty()).then(|| p.to_string())
+        })
+        .collect();
+    (!paths.is_empty()).then_some(paths)
 }
 
 /// Whether `name` is a builtin exception class name (for ancestry).
