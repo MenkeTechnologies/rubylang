@@ -532,7 +532,7 @@ impl Parser {
                 } else {
                     self.method_name()?
                 };
-                let (args, block) = self.call_tail()?;
+                let (args, block) = self.dot_call_tail()?;
                 if safe {
                     // `a&.b(args)` desugars to `(t = a).nil? ? nil : t.b(args)`,
                     // evaluating the receiver once and skipping the call on nil.
@@ -636,6 +636,40 @@ impl Parser {
         Self::push_trailing_kwargs(&mut args, kwargs, kwsplats);
         let block = self.maybe_block()?.or(amp_block);
         Ok((args, block))
+    }
+
+    /// Like `call_tail`, but also accepts paren-less command arguments on a
+    /// dot/`&.` receiver: `obj.meth a, b`, `STDOUT.puts "x"`, `arr.push *xs`,
+    /// `render :index, status: 200`. Mirrors the bare command-call path in
+    /// `ident_primary`: a `(` with no leading space is a parenthesized call;
+    /// otherwise a leading space followed by a token that starts a command
+    /// argument collects comma-separated args (kwargs/splats/`&blk` included)
+    /// without parens. A `[` with no leading space stays indexing, `= x` stays a
+    /// setter, `{ }`/`do` stays a block — all excluded because `starts_command_arg`
+    /// rejects `=`/`{`/`do` and the `cur_space` guard rejects a tight `[`/`(`.
+    fn dot_call_tail(&mut self) -> Result<(Vec<Expr>, Option<Block>), String> {
+        // `obj.meth(args)` — no space before `(` — parenthesized call.
+        if self.is_op("(") && !self.cur_space() {
+            return self.call_tail();
+        }
+        // `obj.meth arg1, arg2` — a space, then a token that starts an argument
+        // (a spaced `obj.meth (x)` also lands here, as `obj.meth((x))`, matching
+        // the bare command path and MRI).
+        if self.cur_space() && self.starts_command_arg() {
+            let mut args = Vec::new();
+            let mut amp_block = None;
+            let mut kwargs: Vec<(Expr, Expr)> = Vec::new();
+            let mut kwsplats: Vec<Expr> = Vec::new();
+            self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
+            while self.eat_op(",") {
+                self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
+            }
+            Self::push_trailing_kwargs(&mut args, kwargs, kwsplats);
+            let block = self.maybe_block()?.or(amp_block);
+            return Ok((args, block));
+        }
+        // No args (`obj.meth`) or a trailing block (`obj.meth { }` / `do end`).
+        self.call_tail()
     }
 
     /// Append the trailing keyword hash to `args`: the literal `key: value` pairs,

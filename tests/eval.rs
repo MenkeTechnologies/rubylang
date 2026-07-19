@@ -3497,8 +3497,8 @@ fn case_in_deconstruct_protocol() {
 fn enumerator_new_block_generators() {
     // Finite generator: to_a collects every yielded value.
     eq("Enumerator.new { |y| y << 1; y << 2; y << 3 }.to_a", "[1, 2, 3]");
-    // `Yielder#yield` is an alias of `<<` (parenthesized: rubylang has no
-    // paren-less command calls on dot-receivers).
+    // `Yielder#yield` is an alias of `<<` (paren-less and parenthesized forms
+    // both parse — see `parenless_command_call_on_dot_and_const_receiver`).
     eq("Enumerator.new { |y| y.yield(1); y.yield(2) }.to_a", "[1, 2]");
     // first(n) with an explicit count returns an array.
     eq("Enumerator.new { |y| y << 10; y << 20; y << 30 }.first(2)", "[10, 20]");
@@ -3833,4 +3833,59 @@ fn array_to_h_block_and_lazy_zip() {
         "[[1, 4, 7], [2, 5, 8], [3, nil, 9]]",
     );
     eq("(1..Float::INFINITY).lazy.zip([9, 8, 7]).first(2)", "[[1, 9], [2, 8]]");
+}
+
+#[test]
+fn parenless_command_call_on_dot_and_const_receiver() {
+    // Paren-less args on a dot receiver: single, multiple, kwargs, splat.
+    eq("3.between? 1, 5", "true");
+    eq("[1, 2, 3].include? 2", "true");
+    eq(r#""hi".sub "i", "o""#, r#""ho""#);
+    eq(r#""abc".slice 1, 2"#, r#""bc""#);
+    eq("[1, 2].push 3", "[1, 2, 3]");
+    eq("10.gcd 4", "2");
+    // Operator method name with a paren-less arg.
+    eq("2.+ 3", "5");
+    // Trailing keyword args collect into an implicit hash.
+    eq("{}.merge a: 1", "{a: 1}");
+    // `*splat` as a paren-less command arg.
+    eq("[0].concat *[[1, 2]]", "[0, 1, 2]");
+    // Chained: the arg is itself a dot chain (`a.b c.d`).
+    eq(r#""a".concat "b".upcase"#, r#""aB""#);
+    eq("[1, 2].push [3].first", "[1, 2, 3]");
+    // A method defined on a class, invoked paren-less on an instance.
+    eq("class C; def go(x); x * 2; end; end; C.new.go 21", "42");
+    // Const receiver + paren-less command (`Const.meth arg`).
+    eq("Math.sqrt 16", "4.0");
+    // Safe navigation carries paren-less args too.
+    eq(r#""hi"&.sub "h", "b""#, r#""bi""#);
+    // Enumerator::Yielder#yield and Fiber.yield, paren-less (previously
+    // required parentheses — see BUGS.md).
+    eq("Enumerator.new { |y| y.yield 1; y.yield 2 }.to_a", "[1, 2]");
+    eq("Fiber.new { |x| Fiber.yield x + 1 }.resume 5", "6");
+}
+
+#[test]
+fn parenless_dot_call_guards_no_regression() {
+    // No args, then a terminator — a plain method call, no slurped argument.
+    eq("[9, 8].first", "9");
+    // `[` with no leading space is indexing, not `first([0])`.
+    eq("[[1], [2]].first[0]", "1");
+    // A tight/spaced binary `-` after a dot call stays binary.
+    eq("1 - 2.abs", "-1");
+    eq("5.abs - 3", "2");
+    // Parenthesized calls still parse (no space before `(`).
+    eq("{}.merge(a: 1)", "{a: 1}");
+    eq("5.between?(1, 9)", "true");
+    eq("[1].push(2)", "[1, 2]");
+    // `= x` after a dot call is a setter, not a command arg.
+    eq("class C; attr_accessor :x; end; c = C.new; c.x = 5; c.x", "5");
+    // Blocks bind to the dot call, not consumed as args.
+    eq("3.tap { |n| }", "3");
+    eq("[1, 2].map { |x| x * 2 }.first", "2");
+    eq("[3, 1, 2].sort { |a, b| a <=> b }.last", "3");
+    // Method chains with no args.
+    eq(r#""abc".upcase.reverse"#, r#""CBA""#);
+    // A dot call followed by a low-precedence operator, not an argument.
+    eq("5.between?(1, 9) && true", "true");
 }
