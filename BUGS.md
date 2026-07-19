@@ -83,7 +83,15 @@ Implemented and verified against the reference `ruby`:
   receiver stores a per-object singleton method; a class receiver registers a
   class method (identical to `def self.m`). `class << obj … end` on an instance
   works the same way. Singleton methods take priority over the class's own
-  instance methods in dispatch (matching `Module#ancestors` order).
+  instance methods in dispatch (matching `Module#ancestors` order). A bare
+  self-call inside a singleton method (or inside a block whose `self` is a
+  receiver carrying singletons) resolves those singletons.
+- **`define_method`.** `define_method(:m) { … }` in a class body and the explicit
+  receiver form `Klass.define_method(:m) { … }` both register an instance method
+  whose body is the block. When invoked, the block rebinds `self` to the calling
+  instance: `@ivar` reads/writes hit that instance and bare-name calls dispatch on
+  it, while the block's closed-over locals stay visible. `obj.define_singleton_method`
+  is the per-object analogue.
 - **`const_missing`.** `Mod::Const` for an unresolved constant calls
   `Mod.const_missing(:Const)` when the class/module defines it (the hook Rails
   autoloading relies on).
@@ -133,9 +141,12 @@ Implemented and verified against the reference `ruby`:
   defines persist), returning the last value. `Module#class_eval`/`module_eval`
   (block or string) runs with `self` = the class, so a bare `def` defines an
   instance method. `Object#instance_eval`/`instance_exec` (block or string) runs
-  with `self` = the receiver: `@ivar` hits the receiver, and a bare `def` defines
-  a singleton on it (a class method when the receiver is a class). `instance_exec`
-  forwards its arguments to the block.
+  with `self` = the receiver — a full rebind, not just for ivar writes: a
+  bare-name call inside the block dispatches on the receiver (reaching its
+  instance and singleton methods), `@ivar` reads and writes hit the receiver,
+  `self` is the receiver, and a bare `def` defines a singleton on it (a class
+  method when the receiver is a class). `instance_exec` forwards its arguments to
+  the block; the closed-over locals of the block stay visible.
 
 Honest limitations of this surface:
 

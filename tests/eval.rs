@@ -4085,6 +4085,77 @@ fn instance_exec_passes_arguments() {
     );
 }
 
+#[test]
+fn instance_exec_rebinds_self_for_dispatch_ivars_and_args() {
+    // A block run under `instance_exec` rebinds `self` to the receiver: bare-name
+    // calls dispatch on it, `@ivar` reads its state, `self` is it, and explicit
+    // args still bind. Verified against MRI (ruby 4.0.6): 99 / 7 / Foo / 12.
+    let cls = "class Foo; def initialize; @n = 7; end; def bar; 99; end; end; f = Foo.new; ";
+    eq(&format!("{cls}f.instance_exec {{ bar }}"), "99");
+    eq(&format!("{cls}f.instance_exec {{ @n }}"), "7");
+    eq(&format!("{cls}f.instance_exec {{ self }}.class"), "Foo");
+    eq(&format!("{cls}f.instance_exec(5) {{ |x| x + @n }}"), "12");
+}
+
+#[test]
+fn instance_eval_block_dispatches_to_receiver_singleton() {
+    // Under `instance_eval`, a bare-name call resolves the receiver's singleton
+    // method (not the lexical self), and `self` is the receiver. MRI: 42 / D.
+    eq(
+        "class D; end; o = D.new; def o.m; 42; end; o.instance_eval { m }",
+        "42",
+    );
+    eq(
+        "class D2; end; o = D2.new; o.instance_eval { self }.class",
+        "D2",
+    );
+    // An ivar write under instance_eval still lands on the receiver (regression
+    // guard for the previously-working write path).
+    eq(
+        "o = Object.new; o.instance_eval { @v = 3 }; o.instance_variable_get(:@v)",
+        "3",
+    );
+}
+
+#[test]
+fn define_method_on_class_receiver_rebinds_self() {
+    // `Klass.define_method(:m) { ... }` (explicit class receiver) registers an
+    // instance method whose block rebinds `self` to the invoking instance: it
+    // reads that instance's `@ivar` and dispatches its other methods. MRI:
+    // "hi" / 1.
+    eq(
+        "class C; def helper; 1; end; end; C.define_method(:r) { @name }; \
+         c = C.new; c.instance_variable_set(:@name, \"hi\"); c.r",
+        "\"hi\"",
+    );
+    eq(
+        "class C2; def helper; 1; end; end; C2.define_method(:g) { helper }; C2.new.g",
+        "1",
+    );
+}
+
+#[test]
+fn ordinary_iteration_block_keeps_lexical_self_unchanged() {
+    // Regression: a plain `each` block is NOT under instance_exec/eval/
+    // define_method, so its `self` stays the lexically enclosing method's self —
+    // `@ivar` and bare calls resolve against that, and the accumulation works.
+    // MRI: 6 / [11, 12] / 30.
+    eq(
+        "class E; def initialize; @base = 0; end; def go; s = @base; \
+         [1,2,3].each { |x| s += x }; s; end; end; E.new.go",
+        "6",
+    );
+    eq(
+        "class F; def bump(x); x + 10; end; def run; a = []; \
+         [1,2].each { |x| a << bump(x) }; a; end; end; F.new.run",
+        "[11, 12]",
+    );
+    eq(
+        "t = 0; [10, 20].each { |x| t += x }; t",
+        "30",
+    );
+}
+
 // ---- stdlib modules: Digest / Base64 / SecureRandom / OpenStruct ----------
 
 #[test]

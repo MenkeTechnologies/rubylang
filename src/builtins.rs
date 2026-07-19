@@ -732,6 +732,18 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
         }
         return kernel(name, args, block);
     }
+    // A per-object singleton method (`def obj.m`, `class << obj`) or a
+    // `define_singleton_method` block on `self` — a bare self-call must reach it
+    // through object dispatch (singletons are keyed by object id, not class).
+    // This matters when `self` is rebound (`instance_eval`/`instance_exec`) to a
+    // receiver carrying singleton methods, and for ordinary singleton-to-singleton
+    // self-calls.
+    if with_host(|h| {
+        h.find_singleton_method(&this, name).is_some()
+            || h.find_singleton_define_method(&this, name).is_some()
+    }) {
+        return dispatch(&this, name, args, block);
+    }
     // A bare call inside an instance method is `self.name(...)`. Route to object
     // dispatch when `self` handles it via a `define_method` or a universal object
     // method (instance_variable_get/set, send, respond_to?, …); a plain user
@@ -1731,6 +1743,23 @@ fn dispatch_classref(
             let syms: Vec<Value> = h.const_names().iter().map(|n| h.new_symbol(n)).collect();
             h.new_array(syms)
         })),
+        // `Klass.define_method(:name) { body }` (or a Proc/Method 2nd arg) —
+        // register an instance method whose body is the block, running with `self`
+        // bound to the receiver when invoked (mirrors the class-body form).
+        "define_method" => {
+            let mname = name_of(&args[0]);
+            let proc = block.or_else(|| args.get(1).cloned()).ok_or_else(|| {
+                raise_exc("ArgumentError", "tried to create method without a block")
+            })?;
+            with_host(|h| h.add_define_method(cls, &mname, proc));
+            Ok(with_host(|h| h.new_symbol(&mname)))
+        }
+        // `Klass.alias_method(:new, :old)` — register an alias on the class.
+        "alias_method" if args.len() >= 2 => {
+            let (new_name, old_name) = (name_of(&args[0]), name_of(&args[1]));
+            with_host(|h| h.add_alias(cls, &new_name, &old_name));
+            Ok(with_host(|h| h.new_symbol(&new_name)))
+        }
         _ => {
             // A class method: `def self.m` runs with self bound to the class ref.
             if let Some(def) = with_host(|h| h.find_class_method(cls, name)) {
