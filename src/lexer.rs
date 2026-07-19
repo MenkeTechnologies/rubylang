@@ -1028,9 +1028,11 @@ fn regex_start(out: &[Token], sp: bool, next: Option<u8>) -> bool {
 
 /// Operator method-name symbols, longest-first so `starts_with` picks the
 /// longest (`[]=` before `[]`, `<=>` before `<=` before `<`).
+// Longest / most-specific first: `op_symbol_at` takes the first `starts_with`
+// match, so `-@`/`+@`/`!~` must precede `-`/`+`/`!` (`:-@` vs `:-`).
 const OP_SYMBOLS: &[&str] = &[
-    "<=>", "===", "[]=", "**", "==", "!=", "<=", ">=", "<<", ">>", "=~", "[]", "+", "-", "*", "/",
-    "%", "<", ">", "&", "|", "^", "~", "!",
+    "<=>", "===", "[]=", "**", "==", "!=", "!~", "<=", ">=", "<<", ">>", "=~", "[]", "-@", "+@",
+    "+", "-", "*", "/", "%", "<", ">", "&", "|", "^", "~", "!",
 ];
 
 /// The operator symbol beginning `s` (text right after `:`), or `None`.

@@ -4858,3 +4858,17 @@ fn grep_and_visibility_directives() {
     eq("module M1; X = 5; private_constant :X; def self.g; X; end; end; M1.g", "5");
     eq("class C1; def a; 1; end; private :a; end; C1.new.send(:a)", "1");
 }
+
+/// Operator symbols (`:-@`, `:+@`, `:!~`) and operator method-name defs (`def =~`)
+/// — found parsing real gem source (tzinfo). vs ruby 4.0.6.
+#[test]
+fn operator_symbols_and_operator_method_defs() {
+    eq(":-@", ":-@");
+    eq(":+@", ":+@");
+    eq("\"x\".respond_to?(:-@)", "true");
+    // Existing operator symbols still lex correctly after the reorder.
+    eq("[1, 2, 3].reduce(:-)", "-4");
+    eq("[:+, :-, :*, :<=>].length", "4");
+    // `def =~` (and other operator method names) parse.
+    eq("class C9; def =~(o); 42; end; end; (C9.new =~ 5)", "42");
+}
