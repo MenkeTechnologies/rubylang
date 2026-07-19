@@ -1086,6 +1086,8 @@ pub(crate) fn dispatch(
         "Enumerator" => dispatch_enumerator(recv, name, args, block),
         "Fiber" => dispatch_fiber(recv, name, args),
         "IO" | "File" => dispatch_io(recv, name, args, block),
+        "TCPServer" => dispatch_tcp_server(recv, name, args, block),
+        "TCPSocket" => dispatch_tcp_socket(recv, name, args, block),
         "Enumerator::Lazy" => dispatch_lazy(recv, name, args, block),
         "Enumerator::Yielder" => dispatch_yielder(recv, name, args),
         "Rational" => dispatch_rational(recv, name, args),
@@ -1392,6 +1394,10 @@ fn dispatch_classref(
         if let Some(r) = dispatch_dir_class(name, args, block.clone()) {
             return r;
         }
+    }
+    // `TCPServer.new([host,] port)` / `TCPSocket.new(host, port)` over std::net.
+    if (cls == "TCPServer" || cls == "TCPSocket") && (name == "new" || name == "open") {
+        return tcp_class_new(cls, args, block);
     }
     match name {
         "new" => {
@@ -6033,6 +6039,207 @@ fn dispatch_io(
         "inspect" | "to_s" => Ok(new_str(with_host(|h| h.to_s(recv)))),
         _ => Err(no_method_error(recv, name)),
     }
+}
+
+// ---- TCP sockets ----------------------------------------------------------
+
+/// Raise a `SocketError` carrying the host-side OS error text.
+fn socket_err(e: &str) -> String {
+    raise_exc("SocketError", e)
+}
+
+/// Parse a TCP port from an Integer or a numeric String argument.
+fn tcp_port_arg(v: &Value) -> Result<u16, String> {
+    match v {
+        Value::Int(n) => u16::try_from(*n).map_err(|_| raise_exc("SocketError", "invalid port number")),
+        _ => {
+            let s = with_host(|h| h.as_str(v)).unwrap_or_default();
+            s.trim().parse::<u16>().map_err(|_| {
+                raise_exc(
+                    "SocketError",
+                    &format!("getaddrinfo: Servname not supported for ai_socktype: {s}"),
+                )
+            })
+        }
+    }
+}
+
+/// `TCPServer.new`/`.open` and `TCPSocket.new`/`.open`. For `TCPServer` a block
+/// (`.open`) yields the server and closes it on return; for `TCPSocket` a block
+/// yields the connected socket and closes it on return.
+fn tcp_class_new(cls: &str, args: &[Value], block: Option<Value>) -> Result<Value, String> {
+    let sock = if cls == "TCPServer" {
+        let (host, port) = match args {
+            [p] => ("0.0.0.0".to_string(), tcp_port_arg(p)?),
+            [h, p] => {
+                let host = if matches!(h, Value::Undef) {
+                    "0.0.0.0".to_string()
+                } else {
+                    with_host(|hh| hh.as_str(h)).unwrap_or_else(|| "0.0.0.0".to_string())
+                };
+                (host, tcp_port_arg(p)?)
+            }
+            _ => return Err(raise_exc("ArgumentError", "wrong number of arguments")),
+        };
+        crate::host::tcp_listen(&host, port).map_err(|e| socket_err(&e))?
+    } else {
+        // TCPSocket.new(host, port)
+        let (h, p) = match args {
+            [h, p] => (h, p),
+            _ => return Err(raise_exc("ArgumentError", "wrong number of arguments")),
+        };
+        let host = with_host(|hh| hh.as_str(h)).unwrap_or_default();
+        crate::host::tcp_connect(&host, tcp_port_arg(p)?).map_err(|e| socket_err(&e))?
+    };
+    match block {
+        Some(bl) => {
+            let r = call_proc(&bl, std::slice::from_ref(&sock));
+            let _ = crate::host::tcp_close(&sock);
+            r
+        }
+        None => Ok(sock),
+    }
+}
+
+/// Instance methods on a `TCPServer` handle: `accept`, `addr`, `close`, `closed?`.
+fn dispatch_tcp_server(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    match name {
+        "accept" => crate::host::tcp_accept(recv).map_err(|e| socket_err(&e)),
+        // `accept_nonblock` is best-effort: with buffered sockets we have no
+        // pending queue to peek, so it behaves like a blocking `accept`.
+        "accept_nonblock" => crate::host::tcp_accept(recv).map_err(|e| socket_err(&e)),
+        "addr" | "local_address" => crate::host::tcp_addr(recv, false).map_err(|e| io_err(&e)),
+        "listen" => Ok(Value::Int(0)),
+        "close" => {
+            crate::host::tcp_close(recv).map_err(|e| io_err(&e))?;
+            Ok(Value::Undef)
+        }
+        "closed?" => Ok(Value::Bool(crate::host::tcp_closed(recv))),
+        "inspect" | "to_s" => Ok(new_str(with_host(|h| h.to_s(recv)))),
+        _ => {
+            let _ = (args, block);
+            Err(no_method_error(recv, name))
+        }
+    }
+}
+
+/// Instance methods on a `TCPSocket` handle: the read/write surface needed to
+/// serve or issue an HTTP request.
+fn dispatch_tcp_socket(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    match name {
+        "write" => {
+            let mut total = 0usize;
+            for a in args {
+                let s = display(a);
+                total += crate::host::tcp_write(recv, &s).map_err(|e| io_err(&e))?;
+            }
+            Ok(Value::Int(total as i64))
+        }
+        "<<" => {
+            crate::host::tcp_write(recv, &display(&args[0])).map_err(|e| io_err(&e))?;
+            Ok(recv.clone())
+        }
+        "print" => {
+            let mut out = String::new();
+            for a in args {
+                out.push_str(&display(a));
+            }
+            crate::host::tcp_write(recv, &out).map_err(|e| io_err(&e))?;
+            Ok(Value::Undef)
+        }
+        "puts" => {
+            if args.is_empty() {
+                crate::host::tcp_write(recv, "\n").map_err(|e| io_err(&e))?;
+            }
+            for a in args {
+                tcp_puts_arg(recv, a)?;
+            }
+            Ok(Value::Undef)
+        }
+        "gets" => crate::host::tcp_gets(recv).map_err(|e| io_err(&e)),
+        "read" => {
+            let n = args.first().and_then(int_arg).map(|n| n.max(0) as usize);
+            crate::host::tcp_read(recv, n).map_err(|e| io_err(&e))
+        }
+        "readpartial" => {
+            let n = args.first().and_then(int_arg).unwrap_or(0).max(0) as usize;
+            match crate::host::tcp_readpartial(recv, n).map_err(|e| io_err(&e))? {
+                Some(v) => Ok(v),
+                None => Err(raise_exc("EOFError", "end of file reached")),
+            }
+        }
+        "read_nonblock" => {
+            let n = args.first().and_then(int_arg).unwrap_or(0).max(0) as usize;
+            match crate::host::tcp_read_nonblock(recv, n) {
+                Ok(Some(v)) => Ok(v),
+                Ok(None) => Err(raise_exc("EOFError", "end of file reached")),
+                Err(e) if e == "__EAGAIN__" => Err(raise_exc(
+                    "IO::EAGAINWaitReadable",
+                    "Resource temporarily unavailable - read would block",
+                )),
+                Err(e) => Err(io_err(&e)),
+            }
+        }
+        "each_line" | "each" => {
+            let mut results = Vec::new();
+            loop {
+                match crate::host::tcp_gets(recv).map_err(|e| io_err(&e))? {
+                    Value::Undef => break,
+                    line => match &block {
+                        Some(bl) => {
+                            call_proc(bl, std::slice::from_ref(&line))?;
+                        }
+                        None => results.push(line),
+                    },
+                }
+            }
+            match block {
+                Some(_) => Ok(recv.clone()),
+                None => Ok(with_host(|h| h.new_enumerator(results, "each"))),
+            }
+        }
+        "addr" | "local_address" => crate::host::tcp_addr(recv, false).map_err(|e| io_err(&e)),
+        "peeraddr" | "remote_address" => crate::host::tcp_addr(recv, true).map_err(|e| io_err(&e)),
+        "flush" | "sync" | "fsync" => Ok(recv.clone()),
+        "sync=" => Ok(args.first().cloned().unwrap_or(Value::Undef)),
+        "close" | "close_write" | "close_read" => {
+            crate::host::tcp_close(recv).map_err(|e| io_err(&e))?;
+            Ok(Value::Undef)
+        }
+        "closed?" => Ok(Value::Bool(crate::host::tcp_closed(recv))),
+        "inspect" | "to_s" => Ok(new_str(with_host(|h| h.to_s(recv)))),
+        _ => Err(no_method_error(recv, name)),
+    }
+}
+
+/// `TCPSocket#puts` for one argument: arrays flatten; scalars get a trailing
+/// `\n` only if their string form lacks one (mirrors `io_puts_arg`).
+fn tcp_puts_arg(recv: &Value, v: &Value) -> Result<(), String> {
+    if let Some(arr) = with_host(|h| h.as_array(v)) {
+        if arr.is_empty() {
+            crate::host::tcp_write(recv, "\n").map_err(|e| io_err(&e))?;
+        }
+        for e in &arr {
+            tcp_puts_arg(recv, e)?;
+        }
+    } else {
+        let mut s = display(v);
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
+        crate::host::tcp_write(recv, &s).map_err(|e| io_err(&e))?;
+    }
+    Ok(())
 }
 
 /// `IO#puts` for one argument: arrays flatten (each element on its own line),

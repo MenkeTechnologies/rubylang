@@ -581,14 +581,34 @@ pub enum IoCell {
         file: Option<std::fs::File>,
         path: String,
     },
+    /// A listening `TCPServer` (`std::net::TcpListener`). `None` once closed.
+    /// `local` is the bound address string (`127.0.0.1:8080`) for `#inspect`.
+    /// Neither `Clone`, so — like `File` — it lives in this side table, never
+    /// inline in the `RObj` value enum.
+    TcpListener {
+        listener: Option<std::net::TcpListener>,
+        local: String,
+    },
+    /// A connected `TCPSocket` (`std::net::TcpStream`), from `TCPServer#accept`
+    /// or `TCPSocket.new`. `None` once closed. `peer` is the remote address for
+    /// `#inspect`/`#peeraddr`. `rbuf` is a read-ahead buffer so `#gets`/`#read`
+    /// don't issue one syscall per byte (refilled 4 KiB at a time).
+    TcpStream {
+        stream: Option<std::net::TcpStream>,
+        peer: String,
+        rbuf: std::collections::VecDeque<u8>,
+    },
 }
 
 impl IoCell {
     /// The Ruby class name for this handle: `File` for a file handle, `IO` for a
-    /// standard stream (matching MRI, where `File < IO` but the streams are `IO`).
+    /// standard stream (matching MRI, where `File < IO` but the streams are `IO`),
+    /// `TCPServer`/`TCPSocket` for the socket handles.
     fn class_name(&self) -> &'static str {
         match self {
             IoCell::File { .. } => "File",
+            IoCell::TcpListener { .. } => "TCPServer",
+            IoCell::TcpStream { .. } => "TCPSocket",
             _ => "IO",
         }
     }
@@ -2244,6 +2264,8 @@ impl RubyHost {
                 | "File"
                 | "Dir"
                 | "IO"
+                | "TCPServer"
+                | "TCPSocket"
         )
     }
     pub fn classref_name(&self, v: &Value) -> Option<String> {
@@ -2265,6 +2287,20 @@ impl RubyHost {
                     format!("#<File:{path}>")
                 } else {
                     format!("#<File:{path} (closed)>")
+                }
+            }
+            Some(IoCell::TcpListener { listener, local }) => {
+                if listener.is_some() {
+                    format!("#<TCPServer:{local}>")
+                } else {
+                    "#<TCPServer: (closed)>".to_string()
+                }
+            }
+            Some(IoCell::TcpStream { stream, peer, .. }) => {
+                if stream.is_some() {
+                    format!("#<TCPSocket:{peer}>")
+                } else {
+                    "#<TCPSocket: (closed)>".to_string()
                 }
             }
             None => "#<IO:(invalid)>".to_string(),
@@ -4086,6 +4122,9 @@ pub fn io_write_str(v: &Value, s: &str) -> Result<usize, String> {
             .map(|_| s.len())
             .map_err(|e| e.to_string()),
         Some(IoCell::File { file: None, .. }) => Err("closed stream".to_string()),
+        Some(IoCell::TcpListener { .. }) | Some(IoCell::TcpStream { .. }) => {
+            Err("not an IO".to_string())
+        }
         None => Err("not an IO".to_string()),
     })
 }
@@ -4109,6 +4148,9 @@ pub fn io_read_all(v: &Value) -> Result<String, String> {
                 Ok(s)
             }
             Some(IoCell::Stdout) | Some(IoCell::Stderr) => Err("not opened for reading".to_string()),
+            Some(IoCell::TcpListener { .. }) | Some(IoCell::TcpStream { .. }) => {
+                Err("not an IO".to_string())
+            }
             None => Err("not an IO".to_string()),
         }
     })
@@ -4129,6 +4171,9 @@ pub fn io_gets(v: &Value) -> Result<Value, String> {
                 Some(IoCell::Stdin) => std::io::stdin().read(&mut one),
                 Some(IoCell::Stdout) | Some(IoCell::Stderr) => {
                     return Err("not opened for reading".to_string())
+                }
+                Some(IoCell::TcpListener { .. }) | Some(IoCell::TcpStream { .. }) => {
+                    return Err("not an IO".to_string())
                 }
                 None => return Err("not an IO".to_string()),
             };
@@ -4184,6 +4229,279 @@ pub fn io_flush(v: &Value) -> Result<(), String> {
         Some(IoCell::File { file: Some(f), .. }) => f.flush().map_err(|e| e.to_string()),
         _ => Ok(()),
     })
+}
+
+// ---- TCP sockets (std::net) ----------------------------------------------
+//
+// `TCPServer`/`TCPSocket` reuse the `IoHandle`/`io_handles` side table: a socket
+// value is an `RObj::IoHandle` pointing at an `IoCell::TcpListener`/`TcpStream`.
+// Every blocking syscall (`accept`, `read`, `write`) is issued on a `try_clone`d
+// handle *after* the host `RefCell` borrow is released, so a blocked socket op
+// never holds the host lock (a client on another thread has its own thread-local
+// host, but never blocking under the borrow keeps the single-thread invariant).
+
+/// Register an owned `IoCell` in the host side table, returning a fresh
+/// `IoHandle` value pointing at it.
+fn io_alloc_cell(cell: IoCell) -> Value {
+    with_host(|h| {
+        let id = h.io_handles.len() as u32;
+        h.io_handles.push(cell);
+        h.alloc(RObj::IoHandle { id })
+    })
+}
+
+/// A `try_clone`d `TcpStream` for the handle `id` (so the caller can block on a
+/// read/write without holding the host borrow). Errors if closed or not a stream.
+fn tcp_stream_clone(id: u32) -> Result<std::net::TcpStream, String> {
+    with_host(|h| match h.io_handles.get(id as usize) {
+        Some(IoCell::TcpStream { stream: Some(s), .. }) => s.try_clone().map_err(|e| e.to_string()),
+        Some(IoCell::TcpStream { stream: None, .. }) => Err("closed stream".to_string()),
+        _ => Err("not a TCPSocket".to_string()),
+    })
+}
+
+/// Bytes currently buffered in the read-ahead buffer of a `TcpStream` handle.
+fn tcp_rbuf_len(id: u32) -> Result<usize, String> {
+    with_host(|h| match h.io_handles.get(id as usize) {
+        Some(IoCell::TcpStream { rbuf, .. }) => Ok(rbuf.len()),
+        _ => Err("not a TCPSocket".to_string()),
+    })
+}
+
+/// Pop up to `max` bytes off the front of the read-ahead buffer.
+fn tcp_rbuf_take(id: u32, max: usize) -> Vec<u8> {
+    with_host(|h| match h.io_handles.get_mut(id as usize) {
+        Some(IoCell::TcpStream { rbuf, .. }) => {
+            let n = max.min(rbuf.len());
+            rbuf.drain(..n).collect()
+        }
+        _ => Vec::new(),
+    })
+}
+
+/// Read one 4 KiB chunk from the socket into its read-ahead buffer (blocking).
+/// Returns the number of bytes read (0 = EOF). The blocking `read` runs on a
+/// cloned handle with the host borrow released.
+fn tcp_fill(id: u32) -> Result<usize, String> {
+    use std::io::Read;
+    let stream = tcp_stream_clone(id)?;
+    let mut buf = [0u8; 4096];
+    let n = (&stream).read(&mut buf).map_err(|e| e.to_string())?;
+    with_host(|h| {
+        if let Some(IoCell::TcpStream { rbuf, .. }) = h.io_handles.get_mut(id as usize) {
+            rbuf.extend(&buf[..n]);
+        }
+    });
+    Ok(n)
+}
+
+fn tcp_new_string(bytes: &[u8]) -> Value {
+    with_host(|h| h.new_string(String::from_utf8_lossy(bytes).into_owned()))
+}
+
+/// `TCPServer.new([host,] port)`: bind + listen. `host` defaults to all
+/// interfaces; `port` 0 lets the OS assign an ephemeral port (read back with
+/// `#addr`).
+pub fn tcp_listen(host: &str, port: u16) -> Result<Value, String> {
+    let listener = std::net::TcpListener::bind((host, port)).map_err(|e| e.to_string())?;
+    let local = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    Ok(io_alloc_cell(IoCell::TcpListener {
+        listener: Some(listener),
+        local,
+    }))
+}
+
+/// `TCPServer#accept`: block for the next connection, returning a connected
+/// `TCPSocket`. The blocking `accept` runs on a cloned listener with the host
+/// borrow released.
+pub fn tcp_accept(v: &Value) -> Result<Value, String> {
+    let id = io_id(v).ok_or("not a socket")?;
+    let listener = with_host(|h| match h.io_handles.get(id as usize) {
+        Some(IoCell::TcpListener {
+            listener: Some(l), ..
+        }) => l.try_clone().map_err(|e| e.to_string()),
+        Some(IoCell::TcpListener { listener: None, .. }) => Err("closed stream".to_string()),
+        _ => Err("not a TCPServer".to_string()),
+    })?;
+    let (stream, peer) = listener.accept().map_err(|e| e.to_string())?;
+    Ok(io_alloc_cell(IoCell::TcpStream {
+        stream: Some(stream),
+        peer: peer.to_string(),
+        rbuf: std::collections::VecDeque::new(),
+    }))
+}
+
+/// `TCPSocket.new(host, port)`: connect to a remote endpoint (blocking).
+pub fn tcp_connect(host: &str, port: u16) -> Result<Value, String> {
+    let stream = std::net::TcpStream::connect((host, port)).map_err(|e| e.to_string())?;
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    Ok(io_alloc_cell(IoCell::TcpStream {
+        stream: Some(stream),
+        peer,
+        rbuf: std::collections::VecDeque::new(),
+    }))
+}
+
+/// `TCPSocket#write`/`#<<`/`#print`: write all of `s`, returning the byte count.
+pub fn tcp_write(v: &Value, s: &str) -> Result<usize, String> {
+    use std::io::Write;
+    let id = io_id(v).ok_or("not a socket")?;
+    let stream = tcp_stream_clone(id)?;
+    (&stream)
+        .write_all(s.as_bytes())
+        .map_err(|e| e.to_string())?;
+    Ok(s.len())
+}
+
+/// `TCPSocket#gets`: read one line up to and including `\n` (or EOF). Returns nil
+/// at EOF with an empty buffer. Buffered via the handle's read-ahead buffer.
+pub fn tcp_gets(v: &Value) -> Result<Value, String> {
+    let id = io_id(v).ok_or("not a socket")?;
+    loop {
+        let line = with_host(|h| match h.io_handles.get_mut(id as usize) {
+            Some(IoCell::TcpStream { rbuf, .. }) => Ok(rbuf
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|pos| rbuf.drain(..=pos).collect::<Vec<u8>>())),
+            _ => Err("not a TCPSocket".to_string()),
+        })?;
+        if let Some(bytes) = line {
+            return Ok(tcp_new_string(&bytes));
+        }
+        if tcp_fill(id)? == 0 {
+            // EOF: return whatever remains (no trailing newline), else nil.
+            let rest = tcp_rbuf_take(id, usize::MAX);
+            return Ok(if rest.is_empty() {
+                Value::Undef
+            } else {
+                tcp_new_string(&rest)
+            });
+        }
+    }
+}
+
+/// `TCPSocket#read(n)`: read exactly `n` bytes, blocking until `n` are available
+/// or EOF. `n == None` reads everything until EOF. Returns nil when `n > 0` and
+/// the stream is already at EOF (matching MRI).
+pub fn tcp_read(v: &Value, n: Option<usize>) -> Result<Value, String> {
+    let id = io_id(v).ok_or("not a socket")?;
+    match n {
+        Some(n) => {
+            while tcp_rbuf_len(id)? < n {
+                if tcp_fill(id)? == 0 {
+                    break;
+                }
+            }
+            let bytes = tcp_rbuf_take(id, n);
+            if bytes.is_empty() && n > 0 {
+                return Ok(Value::Undef);
+            }
+            Ok(tcp_new_string(&bytes))
+        }
+        None => {
+            while tcp_fill(id)? != 0 {}
+            let bytes = tcp_rbuf_take(id, usize::MAX);
+            Ok(tcp_new_string(&bytes))
+        }
+    }
+}
+
+/// `TCPSocket#readpartial(n)`: return between 1 and `n` bytes, blocking only if
+/// the buffer is empty. `Ok(None)` signals EOF (the caller raises `EOFError`).
+pub fn tcp_readpartial(v: &Value, n: usize) -> Result<Option<Value>, String> {
+    let id = io_id(v).ok_or("not a socket")?;
+    if tcp_rbuf_len(id)? == 0 && tcp_fill(id)? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(tcp_new_string(&tcp_rbuf_take(id, n))))
+}
+
+/// `TCPSocket#read_nonblock(n)` (best-effort): return immediately with up to `n`
+/// buffered/available bytes. `Ok(None)` = EOF; `Err("__EAGAIN__")` = no data
+/// ready (the caller raises `IO::EAGAINWaitReadable`). The `O_NONBLOCK` flag is
+/// set on the shared open file description for the duration of the one read and
+/// then cleared — best-effort, not a full non-blocking IO model.
+pub fn tcp_read_nonblock(v: &Value, n: usize) -> Result<Option<Value>, String> {
+    use std::io::Read;
+    let id = io_id(v).ok_or("not a socket")?;
+    if tcp_rbuf_len(id)? > 0 {
+        return Ok(Some(tcp_new_string(&tcp_rbuf_take(id, n))));
+    }
+    let stream = tcp_stream_clone(id)?;
+    stream.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; n.max(1)];
+    let res = (&stream).read(&mut buf);
+    let _ = stream.set_nonblocking(false);
+    match res {
+        Ok(0) => Ok(None),
+        Ok(k) => Ok(Some(tcp_new_string(&buf[..k]))),
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Err("__EAGAIN__".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The `[family, port, host, ip]` address array for a socket, matching MRI's
+/// `TCPServer#addr` / `TCPSocket#addr` / `#peeraddr` shape (no reverse DNS: the
+/// host field carries the numeric IP).
+pub fn tcp_addr(v: &Value, peer: bool) -> Result<Value, String> {
+    let id = io_id(v).ok_or("not a socket")?;
+    let addr: std::net::SocketAddr = with_host(|h| match h.io_handles.get(id as usize) {
+        Some(IoCell::TcpListener {
+            listener: Some(l), ..
+        }) if !peer => l.local_addr().map_err(|e| e.to_string()),
+        Some(IoCell::TcpStream { stream: Some(s), .. }) => {
+            if peer {
+                s.peer_addr().map_err(|e| e.to_string())
+            } else {
+                s.local_addr().map_err(|e| e.to_string())
+            }
+        }
+        Some(IoCell::TcpListener { listener: None, .. })
+        | Some(IoCell::TcpStream { stream: None, .. }) => Err("closed stream".to_string()),
+        _ => Err("not a socket".to_string()),
+    })?;
+    let fam = if addr.is_ipv6() { "AF_INET6" } else { "AF_INET" };
+    let ip = addr.ip().to_string();
+    Ok(with_host(|h| {
+        let items = vec![
+            h.new_string(fam.to_string()),
+            Value::Int(addr.port() as i64),
+            h.new_string(ip.clone()),
+            h.new_string(ip),
+        ];
+        h.new_array(items)
+    }))
+}
+
+/// `TCPServer#close` / `TCPSocket#close`: drop the underlying handle (idempotent).
+pub fn tcp_close(v: &Value) -> Result<(), String> {
+    let id = io_id(v).ok_or("not a socket")?;
+    with_host(|h| match h.io_handles.get_mut(id as usize) {
+        Some(IoCell::TcpListener { listener, .. }) => *listener = None,
+        Some(IoCell::TcpStream { stream, .. }) => *stream = None,
+        _ => {}
+    });
+    Ok(())
+}
+
+/// `#closed?` for either socket kind.
+pub fn tcp_closed(v: &Value) -> bool {
+    match io_id(v) {
+        Some(id) => with_host(|h| {
+            matches!(
+                h.io_handles.get(id as usize),
+                Some(IoCell::TcpListener { listener: None, .. })
+                    | Some(IoCell::TcpStream { stream: None, .. })
+            )
+        }),
+        None => false,
+    }
 }
 
 /// Like `call_proc`, but `self_override` (when given) rebinds `self` inside the

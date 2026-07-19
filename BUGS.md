@@ -380,6 +380,56 @@ an explicit base or the cwd). IO instance: `read`/`write`/`gets`/`puts`/
 - **`.localtime`/timezones** are unmodeled elsewhere (see Runtime); file mtimes
   are not surfaced as `Time` objects.
 
+## Sockets (`TCPServer` / `TCPSocket`)
+
+Backed by `std::net` (`TcpListener`/`TcpStream`) — no C extension, no external
+crate. A socket value is an `RObj::IoHandle` into the same `io_handles` side
+table as `File`/`IO`, with two new `IoCell` cases (`TcpListener`/`TcpStream`);
+the non-`Clone` OS handles live in the table exactly like `File`'s
+`std::fs::File` and `Fiber`'s coroutine. Every blocking syscall (`accept`,
+`read`, `write`) is issued on a `try_clone`d handle *after* the host borrow is
+released, so a blocked socket never holds the interpreter lock. `TCPSocket`
+reads are buffered (a 4 KiB read-ahead `VecDeque`) so `gets`/`read` don't issue
+one syscall per byte. This is enough to serve HTTP: a pure-Ruby `TCPServer`
+accept loop reading a request and writing an `HTTP/1.1 200` response is verified
+end-to-end (`tests/socket.rs`, incl. a raw `std::net` client and `curl`).
+
+**Working, output-matched to MRI:**
+- `TCPServer.new(port)` / `TCPServer.new(host, port)` — bind + listen; `host`
+  defaults to `0.0.0.0`; `port` `0` gets an OS-assigned ephemeral port. `.open`
+  with a block yields the server and closes it on return.
+- `TCPServer#accept` (blocking) → a connected `TCPSocket`; `#addr`
+  (`["AF_INET", port, ip, ip]`, the ephemeral-port readback path), `#close`,
+  `#closed?`.
+- `TCPSocket.new(host, port)` client; `.open` with a block.
+- `TCPSocket#gets` (line, buffered), `#read(n)` (exactly `n`, or all with
+  `read`/`read(nil)`), `#readpartial(n)`, `#write`/`#<<`/`#print`/`#puts`,
+  `#each_line`/`#each`, `#peeraddr`/`#remote_address`, `#addr`/`#local_address`,
+  `#close`, `#closed?`. `#inspect`/`#to_s` → `#<TCPServer:127.0.0.1:PORT>` /
+  `#<TCPSocket:PEER>`.
+- `require 'socket'` is a no-op returning true (the classes are always present).
+
+**Known gaps / divergences:**
+- **TCP only.** No `UDPSocket`, no `UNIXSocket`/`UNIXServer`, no `Socket`
+  (the low-level BSD-socket class), no `Addrinfo`. `#local_address`/
+  `#remote_address` return the `#addr` array, not a real `Addrinfo` object.
+- **Blocking only.** No `IO.select`, no `IO#wait_readable`/`wait_writable`, no
+  event loop. `#read_nonblock` is best-effort: it toggles `O_NONBLOCK` for one
+  read and raises `IO::EAGAINWaitReadable` on `WouldBlock` / `EOFError` at EOF,
+  but `TCPServer#accept_nonblock` falls back to a blocking `accept` (the
+  buffered model has no pending-queue to peek). No `IO.select`-based
+  multiplexing means one connection at a time unless the caller threads.
+- **No TLS/SSL.** No `OpenSSL::SSL::SSLSocket` — plaintext HTTP only, not HTTPS.
+- **No `Errno` hierarchy.** Connect/bind failures raise a single `SocketError`
+  carrying the OS message, not the specific `Errno::ECONNREFUSED` /
+  `Errno::EADDRINUSE` MRI raises. Still a rescuable `StandardError` descendant;
+  only the class name differs.
+- **No socket options / timeouts.** No `setsockopt`/`getsockopt`,
+  `SO_REUSEADDR`, `TCP_NODELAY`, `#recv`/`#send` with flags, connect/read
+  timeouts, or `#shutdown`. `#close_read`/`#close_write` close the whole socket.
+- **No separator/limit args** to `gets`/`readlines`; `gets` is `\n`-terminated.
+- `TCPServer`/`TCPSocket` are not user-subclassable.
+
 ## Loading files (`require` / `require_relative` / `load`)
 
 - **`require`, `require_relative`, and `load` actually read, parse, compile, and
