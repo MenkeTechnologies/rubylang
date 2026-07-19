@@ -10332,7 +10332,7 @@ enum ReqMode {
 /// Standard-library names the runtime provides natively (or intentionally
 /// ignores), so `require '<name>'` is a no-op returning true rather than a file
 /// search. These never map to a `.rb` on disk.
-fn is_builtin_lib(name: &str) -> bool {
+pub(crate) fn is_builtin_lib(name: &str) -> bool {
     let n = name.strip_suffix(".rb").unwrap_or(name);
     matches!(
         n,
@@ -10396,8 +10396,11 @@ fn load_path_dirs() -> Vec<String> {
     })
 }
 
-/// Try `base/raw` and, unless it already ends in `.rb`, `base/raw.rb`.
-fn resolve_in(base: &std::path::Path, raw: &str) -> Option<std::path::PathBuf> {
+/// Try `base/raw` and, unless it already ends in `.rb`, `base/raw.rb`. Shared by
+/// the runtime resolvers and the build-time bundler (`bundle.rs`), so a required
+/// path resolves identically whether it is loaded at run time or bundled ahead of
+/// time.
+pub(crate) fn resolve_in(base: &std::path::Path, raw: &str) -> Option<std::path::PathBuf> {
     if let Some(f) = try_file(&base.join(raw)) {
         return Some(f);
     }
@@ -10409,9 +10412,14 @@ fn resolve_in(base: &std::path::Path, raw: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// `require` resolution: an absolute path (with/without `.rb`), else every
-/// `$LOAD_PATH` entry, else the current directory.
-fn resolve_require(raw: &str) -> Option<std::path::PathBuf> {
+/// Core of `require` resolution over an explicit, ordered search-dir list
+/// (host-independent, so the build-time bundler can reuse it with the entrypoint
+/// dir + cwd in place of a live `$LOAD_PATH`): an absolute path (with/without
+/// `.rb`), else each dir in order, else the current directory.
+pub(crate) fn resolve_require_in(
+    dirs: &[std::path::PathBuf],
+    raw: &str,
+) -> Option<std::path::PathBuf> {
     let p = std::path::Path::new(raw);
     if p.is_absolute() {
         if let Some(f) = try_file(p) {
@@ -10422,12 +10430,21 @@ fn resolve_require(raw: &str) -> Option<std::path::PathBuf> {
         }
         return None;
     }
-    for dir in load_path_dirs() {
-        if let Some(f) = resolve_in(std::path::Path::new(&dir), raw) {
+    for dir in dirs {
+        if let Some(f) = resolve_in(dir, raw) {
             return Some(f);
         }
     }
     resolve_in(std::path::Path::new("."), raw)
+}
+
+/// `require` resolution against the live `$LOAD_PATH`, else the current directory.
+fn resolve_require(raw: &str) -> Option<std::path::PathBuf> {
+    let dirs: Vec<std::path::PathBuf> = load_path_dirs()
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    resolve_require_in(&dirs, raw)
 }
 
 /// `require_relative` resolution: relative to the requiring file's directory

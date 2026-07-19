@@ -153,12 +153,12 @@ Implemented and checked against the reference `ruby`:
 
 | Flag | Effect |
 | --- | --- |
-| `FILE` | Run a `.rb` script. |
+| `FILE` | Run a `.rb` script. Runs a matching `--build` bundle from the cache if one is current, else compiles fresh. |
 | `-e SRC` | Run a one-liner. |
 | `--repl` | Interactive REPL on a persistent host. |
 | `--lsp` | Language Server Protocol over stdio. |
 | `--dap` | Debug Adapter Protocol over stdio: source-line breakpoints inside methods, stepping, stack + variables. |
-| `--build FILE` | AOT-compile the script's bytecode into the on-disk cache. |
+| `--build FILE` | AOT-bundle the whole app — the entrypoint plus every file it statically `require`s / `require_relative`s — into one program in the on-disk cache. A later `ruby FILE` runs it directly, needing none of the required sources on disk. |
 | `--dump-bytecode FILE` | Print the lowered fusevm chunk. |
 
 ---

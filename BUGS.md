@@ -570,6 +570,64 @@ end-to-end (`tests/socket.rs`, incl. a raw `std::net` client and `curl`).
   noted for `` $` ``/`$'`); reference them outside interpolation.
 
 
+## AOT bundling (`ruby --build`)
+
+- **Whole-app build-time merge.** `ruby --build FILE` compiles the entrypoint
+  *and everything it statically requires* into one program and warms it into the
+  cache (`~/.rubylang/scripts.rkyv`). A build-time pass (`bundle.rs`) walks the
+  entrypoint AST; for every `require "..."` / `require_relative "..."` whose
+  argument is a **literal** string it resolves the path with the *same* resolver
+  the runtime uses (`builtins::resolve_in` / `resolve_require_in`, shared code —
+  not a reimplementation), reads + parses the target, recursively bundles *its*
+  requires (deduped by absolute path, cycle-safe), and inlines each file **at the
+  require site** wrapped in `begin … end`, so a required file's top level runs
+  exactly where the `require` sat and after the requires preceding it. A second
+  `require` of an already-bundled path becomes `false` (MRI's already-loaded
+  return). The combined statement list lowers through the normal `compiler`
+  path — proc/begin ids are assigned natively in one pass, so no id rebasing is
+  needed for the static bundle (rebasing still governs the runtime
+  `require`/`load`/REPL merge). A subsequent `ruby FILE` runs the cached bundle
+  directly: it skips lex/parse/lower **and needs none of the required source
+  files on disk**.
+- **Stale-bundle detection.** The stored bundle carries a dependency manifest
+  (`(abs_path, content-key)` for every inlined file). On run, a still-present
+  dependency whose content changed since `--build` marks the whole bundle stale,
+  so the run silently recompiles from source instead of executing an outdated
+  artifact; an *absent* dependency is trusted (that is the "ship the bundle, drop
+  the sources" case). The cache key is the canonical entrypoint path plus its
+  source, so two apps that share identical entrypoint source but require
+  different files never collide.
+- **Dynamic requires stay runtime (honest).** A `require` whose argument is not a
+  literal string (computed / interpolated) cannot be resolved at build time and
+  is left as a runtime call — it still works when the source is present, and the
+  build report counts it under "runtime require(s) left dynamic." A builtin-lib
+  name (`json`, `socket`, …) is likewise never bundled (it stays a runtime
+  no-op), and a literal path that does not resolve is left in place to raise
+  `LoadError` at run time exactly as MRI would. Requires inside a `def` / block /
+  lambda body are **not** bundled either: those run when the method is *called*,
+  not at load time, so inlining them would change semantics. Class/module/`begin`
+  bodies and top-level `if` branches *are* load-time, so their literal requires
+  are bundled (a conditional require is inlined in-branch — it runs only if the
+  branch runs; the required file's `def`/`class`/constant definitions are hoisted
+  globally by the compiler regardless, matching Ruby's "defined but maybe unused"
+  load semantics).
+- **Divergence — top-level local shadowing.** A bundled file's top level runs
+  inside the `begin … end` wrapper, which is a block closure over the requiring
+  file's scope, not the fresh top-level binding MRI (and the rubylang *runtime*
+  `require`) gives it. New top-level locals in a bundled file stay block-local
+  (they neither leak downward into the requirer nor upward out of the block), but
+  if the requirer *already has* a live local of the same name, an assignment to
+  that name in the bundled file reassigns the requirer's local instead of
+  shadowing it. Example: entry has `secret = 1`, then requires a file whose top
+  level does `secret = 42`; run directly this prints `1` (isolated), but built
+  with `--build` it prints `42`. This only bites when a required file assigns a
+  bare top-level local whose name collides with a live local in the requirer —
+  essentially never in real libraries, which define constants/classes/methods,
+  not shared top-level locals. Related: a top-level `return` in a bundled file
+  propagates out of the `begin` wrapper rather than merely ending that file's
+  load (the runtime `require` path swallows it). Use the runtime `require` path
+  (don't `--build`) for the rare code that depends on either behavior.
+
 ## Tooling
 
 - **DAP debugger (`ruby --dap`).** Source-line breakpoints fire inside method,

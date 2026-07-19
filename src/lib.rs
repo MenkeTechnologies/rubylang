@@ -10,6 +10,7 @@ pub mod aot;
 pub mod ast;
 pub mod banner;
 pub mod builtins;
+pub mod bundle;
 pub mod cache;
 pub mod cli;
 pub mod compiler;
@@ -85,6 +86,14 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     host::with_host(|h| h.init_load_path(&dir.to_string_lossy()));
     host::push_file_dir(dir);
+    // If `ruby --build FILE` warmed the cache, the stored program is the whole
+    // bundled app (every statically-required file inlined). Run it directly —
+    // it skips lex/parse/lower AND needs none of the required source files on
+    // disk. `cache::load` returns `None` (falls back to a fresh compile + runtime
+    // `require`) on a miss or when any still-present bundled file has changed.
+    if let Some(prog) = cache::load_file(&abs.to_string_lossy(), &src) {
+        return run_compiled(prog);
+    }
     run_compiled(compile(&src)?)
 }
 
