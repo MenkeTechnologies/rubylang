@@ -216,7 +216,9 @@ module AppKit
       locals = symbolize(opts["locals"] || opts[:locals] || {})
 
       source = template.is_a?(String) ? template : read_template(template)
-      inner = ERB.new(source).result_with_hash(locals)
+      # trim mode "-" (Sinatra's default): a `-%>` chomps the trailing newline so
+      # `<% ... -%>` control lines don't emit blank lines.
+      inner = ERB.new(source, trim_mode: "-").result_with_hash(locals)
 
       layout_name = if opts.key?(:layout)
         opts[:layout]
@@ -232,7 +234,7 @@ module AppKit
 
       layout_src = File.read(layout_path).gsub(/<%=\s*yield\s*%>/, "<%= _appkit_yield %>")
       wrap_locals = locals.merge({ :_appkit_yield => inner })
-      ERB.new(layout_src).result_with_hash(wrap_locals)
+      ERB.new(layout_src, trim_mode: "-").result_with_hash(wrap_locals)
     end
 
     # ---- Rack app contract -------------------------------------------------

@@ -3205,6 +3205,18 @@ impl RubyHost {
             if let Some(x) = self.as_bigint(a) {
                 return Ok(self.new_bigint(-x));
             }
+            // `String#-@` returns a frozen copy of the string (Ruby's frozen-
+            // string operator); a mutable string is duped and frozen, an already
+            // frozen one returns itself.
+            if self.as_str(a).is_some() && matches!(a, Value::Obj(_)) {
+                let c = if self.is_frozen(a) {
+                    a.clone()
+                } else {
+                    self.dup_value(a)
+                };
+                self.freeze_value(&c);
+                return Ok(c);
+            }
             return match a {
                 Value::Int(n) => Ok(Value::Int(n.wrapping_neg())),
                 Value::Float(f) => Ok(Value::Float(-*f)),

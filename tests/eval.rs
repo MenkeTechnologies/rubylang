@@ -4831,3 +4831,15 @@ fn float_round_domain_and_promotion() {
     // Ordinary rounds unaffected.
     eq("3.14159.round(2)", "3.14");
 }
+
+/// String#-@ (frozen copy) and String#+@ (mutable copy) — Ruby's frozen-string
+/// operators, found missing by running a real MVC app. vs ruby 4.0.6.
+#[test]
+fn string_unary_freeze_operators() {
+    eq("(-\"foo\").frozen?", "true");
+    eq("-\"foo\"", "\"foo\"");
+    eq("(+\"bar\").frozen?", "false");
+    eq("+\"bar\"", "\"bar\"");
+    // -@ on an already-frozen string returns a frozen string.
+    eq("s = \"x\".freeze; (-s).frozen?", "true");
+}
