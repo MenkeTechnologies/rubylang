@@ -2723,7 +2723,23 @@ fn dispatch_number(
                 h.new_string(s)
             }))
         }
-        "to_i" | "to_int" | "floor" if name != "floor" => Ok(Value::Int(as_i(recv))),
+        "to_i" | "to_int" | "floor" if name != "floor" => {
+            // A non-finite Float can't convert to an Integer (Ruby FloatDomainError).
+            if let Value::Float(f) = recv {
+                if !f.is_finite() {
+                    let name = if f.is_nan() {
+                        "NaN"
+                    } else if *f > 0.0 {
+                        "Infinity"
+                    } else {
+                        "-Infinity"
+                    };
+                    return Err(raise_exc("FloatDomainError", name));
+                }
+                return Ok(float_to_int_value(f.trunc()));
+            }
+            Ok(Value::Int(as_i(recv)))
+        }
         "to_f" => Ok(Value::Float(as_f(recv))),
         // `Integer#to_r` is `n/1`; `Float#to_r` is the *exact* rational the f64
         // represents (`0.5` → `1/2`, `0.1` → `3602879701896397/36028797018963968`).
@@ -2797,10 +2813,10 @@ fn dispatch_number(
         "integer?" => Ok(Value::Bool(matches!(recv, Value::Int(_)))),
         "succ" | "next" => Ok(Value::Int(as_i(recv) + 1)),
         "pred" => Ok(Value::Int(as_i(recv) - 1)),
-        "floor" => Ok(round_like(recv, args.first().map(as_i), f64::floor)),
-        "ceil" => Ok(round_like(recv, args.first().map(as_i), f64::ceil)),
-        "round" => Ok(round_like(recv, args.first().map(as_i), f64::round)),
-        "truncate" => Ok(round_like(recv, args.first().map(as_i), f64::trunc)),
+        "floor" => round_like(recv, args.first().map(as_i), f64::floor),
+        "ceil" => round_like(recv, args.first().map(as_i), f64::ceil),
+        "round" => round_like(recv, args.first().map(as_i), f64::round),
+        "truncate" => round_like(recv, args.first().map(as_i), f64::trunc),
         "nan?" if matches!(recv, Value::Float(_)) => {
             Ok(Value::Bool(matches!(recv, Value::Float(f) if f.is_nan())))
         }
@@ -2994,27 +3010,65 @@ fn dispatch_number(
 /// Ruby returns a `Float` only when `ndigits > 0`; with no argument or a
 /// non-positive count the result is an `Integer`. Integers are returned
 /// unchanged unless `ndigits < 0` (round to a power of ten).
-fn round_like(recv: &Value, ndigits: Option<i64>, op: fn(f64) -> f64) -> Value {
-    match recv {
-        Value::Float(f) => match ndigits {
-            Some(d) if d > 0 => {
-                let m = 10f64.powi(d as i32);
-                Value::Float(op(f * m) / m)
-            }
-            Some(d) if d < 0 => {
-                let m = 10f64.powi((-d) as i32);
-                Value::Int((op(f / m) * m) as i64)
-            }
-            _ => Value::Int(op(*f) as i64),
+/// Convert a whole-valued f64 to a Ruby Integer, promoting past the i64 range to
+/// a BigInt (`(2.0**70).round`, `1e20.to_i`) instead of saturating.
+fn float_to_int_value(f: f64) -> Value {
+    use num_traits::{FromPrimitive as _, ToPrimitive as _};
+    match num_bigint::BigInt::from_f64(f.trunc()) {
+        Some(b) => match b.to_i64() {
+            Some(n) => Value::Int(n),
+            None => with_host(|h| h.new_bigint(b)),
         },
-        Value::Int(n) => match ndigits {
+        None => Value::Int(0),
+    }
+}
+
+fn round_like(recv: &Value, ndigits: Option<i64>, op: fn(f64) -> f64) -> Result<Value, String> {
+    match recv {
+        Value::Float(f) => {
+            // A non-finite Float raises FloatDomainError when the result would be
+            // an Integer (round with no / negative ndigits, floor/ceil/truncate);
+            // round(positive ndigits) returns a Float, so Infinity/NaN pass through.
+            if !f.is_finite() {
+                if matches!(ndigits, Some(d) if d > 0) {
+                    return Ok(Value::Float(*f));
+                }
+                let name = if f.is_nan() {
+                    "NaN"
+                } else if *f > 0.0 {
+                    "Infinity"
+                } else {
+                    "-Infinity"
+                };
+                return Err(raise_exc("FloatDomainError", name));
+            }
+            Ok(match ndigits {
+                Some(d) if d > 0 => {
+                    let m = 10f64.powi(d as i32);
+                    let r = op(f * m) / m;
+                    // A nonzero value that rounds to zero is +0.0 in Ruby; an
+                    // input that is already ±0.0 keeps its sign.
+                    if r == 0.0 && *f != 0.0 {
+                        Value::Float(0.0)
+                    } else {
+                        Value::Float(r)
+                    }
+                }
+                Some(d) if d < 0 => {
+                    let m = 10f64.powi((-d) as i32);
+                    float_to_int_value(op(f / m) * m)
+                }
+                _ => float_to_int_value(op(*f)),
+            })
+        }
+        Value::Int(n) => Ok(match ndigits {
             Some(d) if d < 0 => {
                 let m = 10f64.powi((-d) as i32);
                 Value::Int((op(*n as f64 / m) * m) as i64)
             }
             _ => Value::Int(*n),
-        },
-        _ => recv.clone(),
+        }),
+        _ => Ok(recv.clone()),
     }
 }
 

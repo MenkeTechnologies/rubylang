@@ -4801,3 +4801,32 @@ fn capitalized_symbol_hash_keys() {
     eq("h = { Ruby: 5 }; h[:Ruby]", "5");
     eq("{ Lang: 10, Ruby: 2 }", "{Lang: 10, Ruby: 2}");
 }
+
+/// Float formatting / rounding parity fixes from the differential fuzzer.
+/// Confirmed against ruby 4.0.6.
+#[test]
+fn float_scientific_notation_threshold() {
+    // Ruby switches to scientific notation at magnitude >= 1e15 (and < 1e-4).
+    eq("1e15", "1.0e+15");
+    eq("9.9e14", "990000000000000.0");
+    eq("1.5e15", "1.5e+15");
+    eq("1e14", "100000000000000.0");
+    eq("1e-4", "0.0001");
+    eq("9e-5", "9.0e-05");
+}
+
+#[test]
+fn float_round_domain_and_promotion() {
+    // Non-finite floats raise FloatDomainError on Integer-producing conversions;
+    // round(positive) passes them through.
+    eq("(1.0 / 0.0).round(2)", "Infinity");
+    // A round/to_i past the i64 range promotes to BigInt (not i64 saturation).
+    eq("(1e10 * 1e10).round", "100000000000000000000");
+    eq("(2.0 ** 70).round", "1180591620717411303424");
+    eq("1e20.to_i", "100000000000000000000");
+    // A nonzero value that rounds to zero is +0.0; -0.0 input keeps its sign.
+    eq("(-1.5 / 1e10).round(4)", "0.0");
+    eq("(-0.0).round(2)", "-0.0");
+    // Ordinary rounds unaffected.
+    eq("3.14159.round(2)", "3.14");
+}

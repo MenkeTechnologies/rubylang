@@ -3690,8 +3690,9 @@ fn fmt_float(f: f64) -> String {
         };
     }
     let a = f.abs();
-    // Ruby prints very large / very small magnitudes in scientific notation.
-    if a != 0.0 && !(1e-4..1e16).contains(&a) {
+    // Ruby prints in scientific notation outside [1e-4, 1e15): a magnitude >= 1e15
+    // has a decimal exponent past Float::DIG (15), and < 1e-4 is below -4.
+    if a != 0.0 && !(1e-4..1e15).contains(&a) {
         return sci_notation(f);
     }
     if f == f.trunc() {
