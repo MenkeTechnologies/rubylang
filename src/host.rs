@@ -20,6 +20,8 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use crate::intercepts::{self, Advice};
+
 /// A local-variable environment, shared (by `Rc`) between a frame and any block
 /// or lambda that captures it — so a closure keeps its variables alive after the
 /// defining method returns, and closure/enclosing mutations are mutually visible.
@@ -259,6 +261,13 @@ pub enum RObj {
     Date {
         days: i64,
     },
+    /// A `DateTime`, stored as seconds since the Unix epoch (UTC, like `Time`),
+    /// but with `Date`-style arithmetic (by day) and an ISO8601 `inspect`. Uses
+    /// the same proleptic-Gregorian calendar; there is no tz database, so it is
+    /// UTC-only (`%z` → `+0000`, `%Z` → `UTC`, `to_s` offset always `+00:00`).
+    DateTime {
+        secs: f64,
+    },
 }
 
 /// Julian Day Number of the Unix epoch (1970-01-01), so `jd = days + this`.
@@ -484,6 +493,7 @@ pub fn with_host<R>(f: impl FnOnce(&mut RubyHost) -> R) -> R {
 /// Reset the host to a clean slate (fresh top-level frame).
 pub fn reset_host() {
     with_host(|h| *h = RubyHost::new());
+    crate::intercepts::clear();
 }
 
 impl Default for RubyHost {
@@ -831,6 +841,37 @@ impl RubyHost {
             "#<Date: {} (({}j,0s,0n),+0s,2299161j)>",
             self.date_to_s(days),
             days + UNIX_EPOCH_JDN
+        )
+    }
+    /// Build a `DateTime` from seconds since the Unix epoch (UTC).
+    pub fn new_datetime(&mut self, secs: f64) -> Value {
+        self.alloc(RObj::DateTime { secs })
+    }
+    /// The epoch seconds of a `DateTime`, if `v` is one.
+    pub fn datetime_secs(&self, v: &Value) -> Option<f64> {
+        match self.obj(v) {
+            Some(RObj::DateTime { secs }) => Some(*secs),
+            _ => None,
+        }
+    }
+    /// `DateTime#to_s` / `#iso8601`: `YYYY-MM-DDTHH:MM:SS+00:00` (UTC-only).
+    pub fn datetime_to_s(&self, secs: f64) -> String {
+        let (y, mo, d, hh, mi, ss, _, _, _) = self.time_fields(secs);
+        format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mi:02}:{ss:02}+00:00")
+    }
+    /// `DateTime#inspect`: the ISO8601 form plus the Julian Day Number, the
+    /// seconds-since-midnight, and the nanosecond fraction, matching MRI.
+    pub fn datetime_inspect(&self, secs: f64) -> String {
+        let (_, _, _, hh, mi, ss, _, _, frac) = self.time_fields(secs);
+        let day = (secs / 86_400.0).floor() as i64;
+        let sod = hh * 3600 + mi * 60 + ss;
+        let nsec = (frac * 1e9).round() as i64;
+        format!(
+            "#<DateTime: {} (({}j,{}s,{}n),+0s,2299161j)>",
+            self.datetime_to_s(secs),
+            day + UNIX_EPOCH_JDN,
+            sod,
+            nsec
         )
     }
     /// The canonical `Time#to_s` / `#inspect` text: `YYYY-MM-DD HH:MM:SS UTC`.
@@ -1492,6 +1533,9 @@ impl RubyHost {
         if class == "Enumerable" && matches!(actual.as_str(), "Array" | "Hash" | "Range") {
             return true;
         }
+        if actual == "DateTime" && matches!(class, "Date" | "Comparable") {
+            return true;
+        }
         if let Some(oc) = self.object_class(v) {
             return self.class_is_ancestor(&oc, class);
         }
@@ -1517,6 +1561,7 @@ impl RubyHost {
             "Integer" | "Float" | "Rational" => own(&["Numeric", "Comparable"]),
             "Complex" => own(&["Numeric"]),
             "String" | "Symbol" | "Time" | "Date" => own(&["Comparable"]),
+            "DateTime" => own(&["Date", "Comparable"]),
             "Array" | "Hash" | "Range" | "Set" | "Struct" => own(&["Enumerable"]),
             _ => {
                 if self.classes.contains_key(name) {
@@ -1630,6 +1675,7 @@ impl RubyHost {
                 | "Struct"
                 | "Time"
                 | "Date"
+                | "DateTime"
                 | "Math"
         )
     }
@@ -1919,6 +1965,7 @@ impl RubyHost {
                 }
                 Some(RObj::Time { secs }) => self.time_to_s(secs, false),
                 Some(RObj::Date { days }) => self.date_to_s(days),
+                Some(RObj::DateTime { secs }) => self.datetime_to_s(secs),
                 Some(RObj::Lazy { .. }) => "#<Enumerator::Lazy>".to_string(),
                 Some(RObj::Enumerator { buf, .. }) => {
                     format!("#<Enumerator: {}>", self.inspect_array(&buf))
@@ -1993,6 +2040,7 @@ impl RubyHost {
                 // `Time#inspect` shows a fractional second (unlike `#to_s`).
                 Some(RObj::Time { secs }) => self.time_to_s(secs, true),
                 Some(RObj::Date { days }) => self.date_inspect(days),
+                Some(RObj::DateTime { secs }) => self.datetime_inspect(secs),
                 // A String range inspects its endpoints with quotes: `"a".."e"`.
                 Some(RObj::StrRange { lo, hi, exclusive }) => {
                     format!("{lo:?}{}{hi:?}", if exclusive { "..." } else { ".." })
@@ -2078,6 +2126,7 @@ impl RubyHost {
                 Some(RObj::Enumerator { .. }) => "Enumerator",
                 Some(RObj::Time { .. }) => "Time",
                 Some(RObj::Date { .. }) => "Date",
+                Some(RObj::DateTime { .. }) => "DateTime",
                 Some(RObj::Set(_)) => "Set",
                 Some(RObj::Array(_)) => "Array",
                 Some(RObj::Hash { .. }) => "Hash",
@@ -2364,6 +2413,43 @@ impl RubyHost {
                 _ => {}
             }
         }
+        // `DateTime` arithmetic (by day, like `Date`, but keeping the time of
+        // day). `DateTime - DateTime` is the Rational number of days between
+        // them; `DateTime ± Numeric` shifts by that many days and stays a
+        // `DateTime`. Comparisons order by epoch seconds.
+        if let Some(sa) = self.datetime_secs(a) {
+            let num_f = |v: &Value| match v {
+                Value::Int(n) => Some(*n as f64),
+                Value::Float(f) => Some(*f),
+                _ => None,
+            };
+            match op {
+                Sub => {
+                    if let Some(sb) = self.datetime_secs(b) {
+                        let numer = num_bigint::BigInt::from((sa - sb).round() as i64);
+                        let r = num_rational::BigRational::new(
+                            numer,
+                            num_bigint::BigInt::from(86_400),
+                        );
+                        return Ok(self.new_rational(r));
+                    }
+                    if let Some(n) = num_f(b) {
+                        return Ok(self.new_datetime(sa - n * 86_400.0));
+                    }
+                }
+                Add => {
+                    if let Some(n) = num_f(b) {
+                        return Ok(self.new_datetime(sa + n * 86_400.0));
+                    }
+                }
+                Lt | Gt | Le | Ge => {
+                    if let Some(sb) = self.datetime_secs(b) {
+                        return Ok(Value::Bool(cmp_ord(op, sa.total_cmp(&sb))));
+                    }
+                }
+                _ => {}
+            }
+        }
         // Class comparison operators (`Integer < Numeric`): true when the left
         // class is a proper subclass, false when equal or an ancestor, nil when
         // the two classes are unrelated.
@@ -2507,6 +2593,8 @@ impl RubyHost {
                     (Some(RObj::Time { secs: x }), Some(RObj::Time { secs: y })) => x == y,
                     // Two Dates are equal when they name the same day.
                     (Some(RObj::Date { days: x }), Some(RObj::Date { days: y })) => x == y,
+                    // Two DateTimes are equal when they name the same instant.
+                    (Some(RObj::DateTime { secs: x }), Some(RObj::DateTime { secs: y })) => x == y,
                     // Two struct instances are equal when they share a class and
                     // all their members compare equal.
                     (
@@ -2697,6 +2785,26 @@ pub fn run_main(chunk: Chunk) -> Result<Value, String> {
     r
 }
 
+thread_local! {
+    /// Nonzero while an advice handler is executing. Weaving is suppressed for
+    /// the duration so a handler's own dispatch is never re-advised (prevents
+    /// self-advising and infinite recursion).
+    static IN_ADVICE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn in_advice() -> bool {
+    IN_ADVICE.with(|f| f.get() > 0)
+}
+
+/// Fire one advice handler by name, propagating any raise. `args` is what the
+/// handler receives (the call args for `before`, the result for `after`/`around`).
+fn fire_advice(handler: &str, args: &[Value]) -> Result<Value, String> {
+    IN_ADVICE.with(|f| f.set(f.get() + 1));
+    let r = call_method(handler, args, None);
+    IN_ADVICE.with(|f| f.set(f.get() - 1));
+    r
+}
+
 /// Run a resolved method: push a fresh frame bound to `self_obj`, bind args, and
 /// run the body with locals targeting that new top frame.
 #[allow(clippy::too_many_arguments)]
@@ -2708,6 +2816,24 @@ fn run_method(
     method_name: Option<String>,
     def_class: Option<String>,
 ) -> Result<Value, String> {
+    // AOP weave. Fast path: `intercepts::any()` is an O(1) empty-check, so a call
+    // with no registered advice pays only one bool test and takes `None`. The
+    // `in_advice` guard keeps a handler's own calls from being advised.
+    let advice: Option<Vec<(Advice, String)>> = if intercepts::any() && !in_advice() {
+        method_name
+            .as_deref()
+            .map(intercepts::matches)
+            .filter(|m| !m.is_empty())
+    } else {
+        None
+    };
+    if let Some(adv) = &advice {
+        for (kind, handler) in adv {
+            if *kind == Advice::Before {
+                fire_advice(handler, args)?;
+            }
+        }
+    }
     let saved_active = with_host(|h| {
         let mut binding = h.bind_params(
             &def.params,
@@ -2740,7 +2866,7 @@ fn run_method(
         h.active_scope = saved_active;
         h.signal.take()
     });
-    match sig {
+    let result = match sig {
         Some(Signal::Return(v)) => Ok(v),
         // A `throw` must keep unwinding past this method boundary to reach its
         // `catch`; re-arm the signal so the caller's chunk halts too.
@@ -2749,6 +2875,29 @@ fn run_method(
             r
         }
         _ => r,
+    };
+    // AOP `after`/`around` weave: only on a normal (Ok) return, after the frame is
+    // gone so handlers run at the call site's scope. `after` observes the result;
+    // `around` replaces it (post-transform).
+    let Some(adv) = advice else {
+        return result;
+    };
+    match result {
+        Ok(mut val) => {
+            for (kind, handler) in &adv {
+                match kind {
+                    Advice::After => {
+                        fire_advice(handler, std::slice::from_ref(&val))?;
+                    }
+                    Advice::Around => {
+                        val = fire_advice(handler, std::slice::from_ref(&val))?;
+                    }
+                    Advice::Before => {}
+                }
+            }
+            Ok(val)
+        }
+        err => err,
     }
 }
 

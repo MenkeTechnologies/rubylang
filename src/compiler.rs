@@ -1363,15 +1363,25 @@ fn lower_array_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
     {
         return lower_find_pattern(elems, subj);
     }
-    let is_arr = pcall(
+    // Array patterns match any object responding to `deconstruct` (Arrays return
+    // self). The `respond_to?` gate short-circuits, so `deconstruct` runs only on
+    // a matching receiver; its result is bound once to `d`, and every length /
+    // index below reads `d`, never the raw subject.
+    let uid = FIND_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = Expr::Var(VarKind::Local, format!("__decon{uid}__"));
+    let gate = pcall(
         subj.clone(),
-        "is_a?",
-        vec![Expr::Var(VarKind::Const, "Array".into())],
+        "respond_to?",
+        vec![Expr::Symbol("deconstruct".into())],
+    );
+    let assign_d = Expr::Assign(
+        Box::new(d.clone()),
+        Box::new(pcall(subj.clone(), "deconstruct", vec![])),
     );
     let splat_at = elems.iter().position(|p| matches!(p, Pattern::Splat(_)));
-    let len = pcall(subj.clone(), "length", vec![]);
+    let len = || pcall(d.clone(), "length", vec![]);
 
-    let mut test = is_arr;
+    let mut test = pand(gate, assign_d);
     let mut binds = Vec::new();
     match splat_at {
         None => {
@@ -1380,12 +1390,12 @@ fn lower_array_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
                 test,
                 Expr::Binary(
                     BinOp::Eq,
-                    Box::new(len),
+                    Box::new(len()),
                     Box::new(Expr::Int(elems.len() as i64)),
                 ),
             );
             for (i, p) in elems.iter().enumerate() {
-                let (t, bs) = lower_pattern(p, &pindex(subj, i as i64));
+                let (t, bs) = lower_pattern(p, &pindex(&d, i as i64));
                 test = pand(test, t);
                 binds.extend(bs);
             }
@@ -1396,26 +1406,26 @@ fn lower_array_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
             let min = (pre.len() + post.len()) as i64;
             test = pand(
                 test,
-                Expr::Binary(BinOp::Ge, Box::new(len.clone()), Box::new(Expr::Int(min))),
+                Expr::Binary(BinOp::Ge, Box::new(len()), Box::new(Expr::Int(min))),
             );
             for (i, p) in pre.iter().enumerate() {
-                let (t, bs) = lower_pattern(p, &pindex(subj, i as i64));
+                let (t, bs) = lower_pattern(p, &pindex(&d, i as i64));
                 test = pand(test, t);
                 binds.extend(bs);
             }
-            // The `*rest` slice: `subj[pre_len, length - pre_len - post_len]`.
+            // The `*rest` slice: `d[pre_len, length - pre_len - post_len]`.
             if let Pattern::Splat(Some(name)) = &elems[s] {
                 let count = Expr::Binary(
                     BinOp::Sub,
                     Box::new(Expr::Binary(
                         BinOp::Sub,
-                        Box::new(len),
+                        Box::new(len()),
                         Box::new(Expr::Int(pre.len() as i64)),
                     )),
                     Box::new(Expr::Int(post.len() as i64)),
                 );
                 let slice = Expr::Index(
-                    Box::new(subj.clone()),
+                    Box::new(d.clone()),
                     vec![Expr::Int(pre.len() as i64), count],
                 );
                 binds.push(Expr::Assign(
@@ -1426,7 +1436,7 @@ fn lower_array_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
             // Post-splat elements count back from the end.
             for (j, p) in post.iter().enumerate() {
                 let idx = -(post.len() as i64) + j as i64;
-                let (t, bs) = lower_pattern(p, &pindex(subj, idx));
+                let (t, bs) = lower_pattern(p, &pindex(&d, idx));
                 test = pand(test, t);
                 binds.extend(bs);
             }
@@ -1445,16 +1455,18 @@ fn lower_find_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
     let k = mids.len() as i64;
 
     let uid = FIND_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The subject is deconstructed once into `d`; the scan and slices read `d`.
+    let d = Expr::Var(VarKind::Local, format!("__findd{uid}__"));
     let idx = Expr::Var(VarKind::Local, format!("__find_i{uid}__"));
     let s_name = format!("__find_s{uid}__");
     let s = Expr::Var(VarKind::Local, s_name.clone());
-    let len = || pcall(subj.clone(), "length", vec![]);
+    let len = || pcall(d.clone(), "length", vec![]);
 
-    // Predicate over a candidate start `s`: every middle matches at `subj[s+j]`.
+    // Predicate over a candidate start `s`: every middle matches at `d[s+j]`.
     let pred = mids
         .iter()
         .enumerate()
-        .map(|(j, m)| lower_pattern(m, &pindex_expr(subj, padd(s.clone(), j as i64))).0)
+        .map(|(j, m)| lower_pattern(m, &pindex_expr(&d, padd(s.clone(), j as i64))).0)
         .reduce(pand)
         .unwrap_or(Expr::True);
 
@@ -1491,12 +1503,19 @@ fn lower_find_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
         rescues: vec![],
         ensure: None,
     };
-    let is_arr = pcall(
+    // Find patterns match any object responding to `deconstruct`; the gate
+    // short-circuits and the deconstructed array is bound once to `d` before the
+    // scan runs.
+    let gate = pcall(
         subj.clone(),
-        "is_a?",
-        vec![Expr::Var(VarKind::Const, "Array".into())],
+        "respond_to?",
+        vec![Expr::Symbol("deconstruct".into())],
     );
-    let test = pand(is_arr, found);
+    let assign_d = Expr::Assign(
+        Box::new(d.clone()),
+        Box::new(pcall(subj.clone(), "deconstruct", vec![])),
+    );
+    let test = pand(gate, pand(assign_d, found));
 
     // Bindings run once `idx` holds the first matching start position.
     let mut binds = Vec::new();
@@ -1504,20 +1523,20 @@ fn lower_find_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
         binds.push(Expr::Assign(
             Box::new(Expr::Var(VarKind::Local, name.clone())),
             Box::new(Expr::Index(
-                Box::new(subj.clone()),
+                Box::new(d.clone()),
                 vec![Expr::Int(0), idx.clone()],
             )),
         ));
     }
     for (j, m) in mids.iter().enumerate() {
-        binds.extend(lower_pattern(m, &pindex_expr(subj, padd(idx.clone(), j as i64))).1);
+        binds.extend(lower_pattern(m, &pindex_expr(&d, padd(idx.clone(), j as i64))).1);
     }
     if let Pattern::Splat(Some(name)) = post {
         let start = padd(idx.clone(), k);
         let count = Expr::Binary(BinOp::Sub, Box::new(len()), Box::new(start.clone()));
         binds.push(Expr::Assign(
             Box::new(Expr::Var(VarKind::Local, name.clone())),
-            Box::new(Expr::Index(Box::new(subj.clone()), vec![start, count])),
+            Box::new(Expr::Index(Box::new(d.clone()), vec![start, count])),
         ));
     }
     (test, binds)
@@ -1528,17 +1547,34 @@ fn lower_hash_pattern(
     rest: &HashRest,
     subj: &Expr,
 ) -> (Expr, Vec<Expr>) {
-    let mut test = pcall(
+    // Hash patterns match any object responding to `deconstruct_keys` (Hashes
+    // return self). MRI passes the array of requested symbol keys, or `nil` when
+    // the pattern is open (`**rest`), `**nil`, or empty (`{}`). The gate
+    // short-circuits so `deconstruct_keys` runs only on a matching receiver; its
+    // result is bound once to `dh` and every lookup below reads `dh`.
+    let uid = FIND_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dh = Expr::Var(VarKind::Local, format!("__deconk{uid}__"));
+    let keys_arg = if matches!(rest, HashRest::None) && !pairs.is_empty() {
+        Expr::Array(pairs.iter().map(|(k, _)| Expr::Symbol(k.clone())).collect())
+    } else {
+        Expr::Nil
+    };
+    let gate = pcall(
         subj.clone(),
-        "is_a?",
-        vec![Expr::Var(VarKind::Const, "Hash".into())],
+        "respond_to?",
+        vec![Expr::Symbol("deconstruct_keys".into())],
     );
+    let assign_dh = Expr::Assign(
+        Box::new(dh.clone()),
+        Box::new(pcall(subj.clone(), "deconstruct_keys", vec![keys_arg])),
+    );
+    let mut test = pand(gate, assign_dh);
     let mut binds = Vec::new();
     for (key, sub) in pairs {
-        let at = Expr::Index(Box::new(subj.clone()), vec![Expr::Symbol(key.clone())]);
+        let at = Expr::Index(Box::new(dh.clone()), vec![Expr::Symbol(key.clone())]);
         test = pand(
             test,
-            pcall(subj.clone(), "key?", vec![Expr::Symbol(key.clone())]),
+            pcall(dh.clone(), "key?", vec![Expr::Symbol(key.clone())]),
         );
         match sub {
             None => binds.push(Expr::Assign(
@@ -1552,6 +1588,17 @@ fn lower_hash_pattern(
             }
         }
     }
+    // `**name` binds the remaining keys (those not named in the pattern).
+    if let HashRest::Splat(Some(name)) = rest {
+        let except_args = pairs
+            .iter()
+            .map(|(k, _)| Expr::Symbol(k.clone()))
+            .collect::<Vec<_>>();
+        binds.push(Expr::Assign(
+            Box::new(Expr::Var(VarKind::Local, name.clone())),
+            Box::new(pcall(dh.clone(), "except", except_args)),
+        ));
+    }
     // `**nil` (or a bare `{}`) forbids any other keys: the subject must contain
     // exactly the listed keys.
     let exact = matches!(rest, HashRest::Nil)
@@ -1561,7 +1608,7 @@ fn lower_hash_pattern(
             test,
             Expr::Binary(
                 BinOp::Eq,
-                Box::new(pcall(subj.clone(), "length", vec![])),
+                Box::new(pcall(dh.clone(), "length", vec![])),
                 Box::new(Expr::Int(pairs.len() as i64)),
             ),
         );

@@ -53,10 +53,6 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   class, so `def`, `attr_*`, `include`, class variables (`@@x = 0`), constants,
   and other executable statements all take effect. (Constants are stored
   globally rather than namespaced under the class.)
-- **Keyword param named after a reserved word** (`def f(class: "x")`) is not
-  parsed — the parser rejects `class`/`def`/`end`/etc. as a parameter name. A
-  paren-less call *carrying* keyword args (`greet name: "x"`, `opts 9, **h`,
-  `total *a`) does parse.
 - **Modifier `rescue` inside call-args / array literals.** Numeric-literal
   binding (`-7.abs` → `(-7).abs`, with `-2**2` → `-(2**2)`) and modifier
   `rescue` precedence (`x = a rescue b` → `x = (a rescue b)`, plus grouping
@@ -150,9 +146,9 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   `Time ± Numeric → Time`) and comparison/sort all work, with a dependency-free
   proleptic-Gregorian calendar (valid for negative epochs too). The
   local-timezone offset is **not** modeled — there is no tz database, so
-  `.utc`/`.getutc` are exact and `.localtime`/`Time.local` behave as UTC. `Date`/
-  `DateTime` and timezone-aware `strftime` (`%Z` always prints `UTC`, `%z` always
-  `+0000`) are not implemented.
+  `.utc`/`.getutc` are exact and `.localtime`/`Time.local` behave as UTC.
+  Timezone-aware `strftime` is not modeled (`%Z` always prints `UTC`, `%z` always
+  `+0000`).
 - **`Date`** (available without `require "date"`, which is accepted as a no-op).
   `Date.new`/`civil`, `Date.today`, `Date.jd`, and `Date.parse` (ISO
   `YYYY-MM-DD` / `YYYY/MM/DD` only — MRI's lenient free-form parsing is not
@@ -161,8 +157,19 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   `strftime`, day/month/year arithmetic (`+`/`-`/`next_day`/`prev_day`/
   `next_month`/`prev_month`/`>>`/`<<` with last-day clamping), `Date - Date →
   Rational`, and comparison/sort all work over the same proleptic-Gregorian
-  calendar as `Time`. `DateTime`, `Date#>>`-with-fractional, and locale-aware
-  formatting are not implemented.
+  calendar as `Time`. `Date#>>`-with-fractional and locale-aware formatting are
+  not implemented.
+- **`DateTime`** (also available without `require "date"`; it is a `Date`
+  subclass carrying a time of day). `DateTime.new`/`civil` (year through second),
+  `DateTime.now` (UTC here), `DateTime.jd`, and `DateTime.parse` (ISO8601
+  `YYYY-MM-DDTHH:MM:SS` only) construct values. Field readers add `hour`/`min`/
+  `sec` to the `Date` set; `to_s`/`iso8601`/`inspect` use the ISO8601 form
+  (`2020-01-01T12:30:45+00:00`); `strftime`, day/month/year arithmetic (keeping
+  the time of day), `DateTime - DateTime → Rational` (in days), `to_date`,
+  `to_time`, and comparison/sort all work over the same proleptic-Gregorian,
+  UTC-only calendar. Because the model is UTC-only, `DateTime#to_time.to_s`
+  renders the zone as `UTC` rather than MRI's `+0000`, and fractional-second /
+  `DateTime.now` sub-second values are not bit-for-bit faithful (f64 storage).
 - **`Array#pack` / `String#unpack`** are not implemented: strings are UTF-8
   (`String`, not a byte buffer), so the binary directives (`N`/`n`/`V`/`v`/`H`,
   high `C` bytes) cannot round-trip. This is a durable encoding limitation, not a
@@ -206,15 +213,24 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   value pattern is alternation, not bitwise-or), `*rest` splats, the two-sided
   find pattern (`[*, x, *]`), `**nil` exact-key enforcement, and `if`/`unless`
   guards work. As in MRI, a variable binding inside an `|` branch is rejected
-  ("variable capture in alternative pattern"). Not yet: the `deconstruct` /
-  `deconstruct_keys` protocol on user objects (array and hash patterns test
-  `is_a?(Array)` / `is_a?(Hash)` directly), and binding a hash `**rest` name.
+  ("variable capture in alternative pattern"). Array and hash patterns honour the
+  `deconstruct` / `deconstruct_keys` protocol: an array pattern matches any object
+  responding to `deconstruct` (called once, must return an Array), a hash pattern
+  any object responding to `deconstruct_keys` (passed the requested symbol keys,
+  or `nil` for `**rest`/`**nil`/`{}`); binding a hash `**rest` name is supported.
 
 ## Tooling
 
 - **DAP stepping.** The adapter completes the initialize/launch handshake and
   runs the program to completion with stdout capture, but breakpoints and
   stepping are not wired yet.
-- **AOP weave.** The method-intercept registry (`src/intercepts.rs`) matches and
-  stores advice, but the dispatch loop does not yet fire it — the fast path stays
-  fast until the feature is turned on explicitly.
+- **AOP weave.** `before`/`after`/`around` advice registered via the Ruby-facing
+  `intercept(pattern, kind, handler)` builtin now fires from the `run_method`
+  dispatch choke point: `before` runs pre-call with the call args, `after` runs
+  post-call with the result (observe-only), `around` runs post-call and replaces
+  the result. Weaving is gated on an O(1) `intercepts::any()` check, so calls with
+  no registered advice are unaffected, and a reentrancy guard prevents handlers
+  from advising themselves. Not yet supported: true "call the original from inside
+  the handler" wrapping — the registry stores only a handler name and there is no
+  native proc that re-invokes the original body, so `around` is a post-transform
+  rather than a sandwich. Adding that needs an original-as-block substrate.

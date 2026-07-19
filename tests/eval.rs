@@ -3191,3 +3191,213 @@ fn alternation_binding_and_capture_rejection() {
     // Variable capture inside an alternation branch is rejected (MRI SyntaxError).
     assert!(ev("case 5; in a | Integer; :x; end").is_err());
 }
+
+// --- Fanout round 2: reserved-word keyword labels --------------------------
+
+#[test]
+fn reserved_word_keyword_labels() {
+    // reserved-word keyword parameter with a default
+    eq("def f(in: 5); :ok; end; f", ":ok");
+    // reserved-word required keyword parameter, called with reserved-word kwarg
+    eq("def opts(in:); :ok; end; opts(in: 9)", ":ok");
+    // reserved-word kwarg value flows through **opts (value observable)
+    eq("def g(**o); o; end; g(class: 1, if: 2)", "{class: 1, if: 2}");
+    // reserved-word symbol hash keys
+    eq("{if: 1, class: 2, end: 3}", "{if: 1, class: 2, end: 3}");
+    // multiple reserved kwparams
+    eq("def f(if: 1, unless: 2); :ok; end; f", ":ok");
+    // no space before colon
+    eq(r#"def f(class:"x"); :ok; end; f"#, ":ok");
+    // GUARD: ternary is untouched (the `:` is not adjacent to a bare keyword).
+    eq("x = 5; x > 3 ? :big : :small", ":big");
+}
+
+// --- Fanout round 2: AOP method-intercept weave ----------------------------
+
+#[test]
+fn aop_intercept_weave() {
+    // before appends, after appends, around transforms the result; all fire.
+    eq(
+        r#"
+        $log = []
+        def audit(*a); $log << :before; end
+        def note(r);   $log << :after;  end
+        def double(r); r * 2; end
+        def compute(x); x + 1; end
+        intercept("compute", :before, :audit)
+        intercept("compute", :after,  :note)
+        intercept("compute", :around, :double)
+        r = compute(10)
+        [r, $log]
+        "#,
+        "[22, [:before, :after]]",
+    );
+
+    // No advice registered on an unmatched name: body runs untouched.
+    eq(
+        r#"
+        def audit(*a); end
+        def plain(x); x + 1; end
+        intercept("compute", :before, :audit)
+        plain(41)
+        "#,
+        "42",
+    );
+}
+
+// --- Fanout round 2: DateTime ----------------------------------------------
+
+#[test]
+fn datetime_calendar() {
+    // Construction and field readers.
+    eq(
+        "d = DateTime.new(2020, 1, 1, 12, 30, 45); \
+         [d.year, d.month, d.day, d.hour, d.min, d.sec, d.wday, d.yday, d.cwday, d.jd, d.leap?]",
+        "[2020, 1, 1, 12, 30, 45, 3, 1, 3, 2458850, true]",
+    );
+    eq("DateTime.new(2020, 1, 1).class.to_s", "\"DateTime\"");
+    eq("DateTime.new(2020, 1, 1).is_a?(Date)", "true");
+    eq("DateTime.new(2020, 1, 1).is_a?(Comparable)", "true");
+    // to_s / iso8601 / inspect (ISO8601, UTC offset +00:00).
+    eq(
+        "DateTime.new(2020, 1, 1, 12, 30, 45).to_s",
+        "\"2020-01-01T12:30:45+00:00\"",
+    );
+    eq(
+        "DateTime.new(2020, 1, 1, 12, 30, 45).iso8601",
+        "\"2020-01-01T12:30:45+00:00\"",
+    );
+    eq(
+        "DateTime.new(2020, 1, 1, 12, 30, 45).inspect",
+        "\"#<DateTime: 2020-01-01T12:30:45+00:00 ((2458850j,45045s,0n),+0s,2299161j)>\"",
+    );
+    // strftime reuses the Date/Time directive engine.
+    eq(
+        "DateTime.new(2020, 1, 1, 12, 30, 45).strftime(\"%Y-%m-%dT%H:%M:%S\")",
+        "\"2020-01-01T12:30:45\"",
+    );
+    // Constructors: default year, jd, ISO8601 parse.
+    eq("DateTime.new.to_s", "\"-4712-01-01T00:00:00+00:00\"");
+    eq("DateTime.jd(2458850).to_s", "\"2020-01-01T00:00:00+00:00\"");
+    eq(
+        "DateTime.parse(\"2020-01-01T12:30:00\").to_s",
+        "\"2020-01-01T12:30:00+00:00\"",
+    );
+    // Arithmetic: ± day, month shift keep the time of day.
+    eq(
+        "(DateTime.new(2020, 1, 1, 12, 30, 45) + 1).to_s",
+        "\"2020-01-02T12:30:45+00:00\"",
+    );
+    eq(
+        "(DateTime.new(2020, 1, 1, 12, 30, 45) - 1).to_s",
+        "\"2019-12-31T12:30:45+00:00\"",
+    );
+    eq(
+        "(DateTime.new(2020, 1, 1, 12, 30, 45) >> 1).to_s",
+        "\"2020-02-01T12:30:45+00:00\"",
+    );
+    eq(
+        "(DateTime.new(2020, 1, 1, 12, 30, 45) << 2).to_s",
+        "\"2019-11-01T12:30:45+00:00\"",
+    );
+    eq(
+        "DateTime.new(2020, 1, 1, 12, 30, 45).next_day.to_s",
+        "\"2020-01-02T12:30:45+00:00\"",
+    );
+    // DateTime - DateTime is a Rational day count (with sub-day precision).
+    eq(
+        "DateTime.new(2020, 1, 5, 0, 0, 0) - DateTime.new(2020, 1, 1, 12, 30, 45)",
+        "(6679/1920)",
+    );
+    // Conversions.
+    eq(
+        "DateTime.new(2020, 1, 1, 12, 30, 45).to_date.to_s",
+        "\"2020-01-01\"",
+    );
+    eq(
+        "DateTime.new(2020, 1, 1, 12, 30, 45).to_date.class.to_s",
+        "\"Date\"",
+    );
+    eq(
+        "DateTime.new(2020, 1, 1, 12, 30, 45).to_time.to_i",
+        "1577881845",
+    );
+    eq(
+        "DateTime.new(2020, 1, 1, 12, 30, 45).to_time.class.to_s",
+        "\"Time\"",
+    );
+    // Comparison, equality, and sort.
+    eq(
+        "DateTime.new(2020, 1, 1, 12, 30, 45) < DateTime.new(2020, 1, 5)",
+        "true",
+    );
+    eq(
+        "DateTime.new(2020, 1, 1, 12, 30, 45) <=> DateTime.new(2020, 1, 5)",
+        "-1",
+    );
+    eq(
+        "DateTime.new(2020, 1, 1) == DateTime.new(2020, 1, 1)",
+        "true",
+    );
+    eq(
+        "d = DateTime.new(2020, 1, 1, 12, 30, 45); \
+         e = DateTime.new(2020, 1, 5, 0, 0, 0); \
+         [d, e, DateTime.new(2019, 1, 1)].sort.map(&:to_s)",
+        "[\"2019-01-01T00:00:00+00:00\", \"2020-01-01T12:30:45+00:00\", \"2020-01-05T00:00:00+00:00\"]",
+    );
+}
+
+// --- Fanout round 2: case/in deconstruct protocol --------------------------
+
+#[test]
+fn case_in_deconstruct_protocol() {
+    // Array pattern fires user `deconstruct` (exact arity).
+    eq(
+        "class P; def deconstruct; [1,2]; end; end; case P.new; in [a,b]; [a,b]; end",
+        "[1, 2]",
+    );
+    // Arity mismatch (too few / too many, no splat) falls through to else.
+    eq(
+        "class P; def deconstruct; [1]; end; end; case P.new; in [a,b]; 1; else; :no; end",
+        ":no",
+    );
+    eq(
+        "class P; def deconstruct; [1,2,3]; end; end; case P.new; in [a,b]; 1; else; :no; end",
+        ":no",
+    );
+    // Splat binds the tail slice.
+    eq(
+        "class P; def deconstruct; [1,2,3,4]; end; end; case P.new; in [a,*b]; b; end",
+        "[2, 3, 4]",
+    );
+    // Nested: inner user object deconstructs inside an outer array.
+    eq(
+        "class Pt; def deconstruct; [1,2]; end; end; case [Pt.new, 9]; in [[a,b], c]; [a,b,c]; end",
+        "[1, 2, 9]",
+    );
+    // Find pattern over a user object.
+    eq(
+        "class P; def deconstruct; [1,2,3,4,5]; end; end; case P.new; in [*pre, 3, *post]; [pre,post]; end",
+        "[[1, 2], [4, 5]]",
+    );
+    // Hash pattern fires user `deconstruct_keys`.
+    eq(
+        "class P; def deconstruct_keys(k); {x:1,y:2}; end; end; case P.new; in {x:}; x; end",
+        "1",
+    );
+    // Hash value subpattern against a deconstructed key.
+    eq(
+        "class P; def deconstruct_keys(k); {x:5}; end; end; case P.new; in {x: Integer => n}; n; else; :no; end",
+        "5",
+    );
+    // `**rest` binds remaining keys from the deconstructed hash.
+    eq(
+        "class P; def deconstruct_keys(k); {x:1,y:2,z:3}; end; end; case P.new; in {x:, **rest}; [x, rest]; end",
+        "[1, {y: 2, z: 3}]",
+    );
+    // GUARD: plain arrays/hashes still match; non-array/hash receivers fall through.
+    eq("case [1,2]; in [a,b]; [a,b]; end", "[1, 2]");
+    eq("case({a:1}); in {a:}; a; end", "1");
+    eq("case 5; in [a,b]; 1; else; :no; end", ":no");
+    eq("case 5; in {a:}; 1; else; :no; end", ":no");
+}

@@ -77,6 +77,7 @@ fn is_kernel_function(name: &str) -> bool {
             | "require"
             | "require_relative"
             | "load"
+            | "intercept"
             | "raise"
             | "fail"
             | "abort"
@@ -875,6 +876,18 @@ pub(crate) fn dispatch(
                 }
                 return Ok(Value::Bool(false));
             }
+            // Built-in receivers are otherwise permissive, but the pattern-match
+            // deconstruction protocol must be accurate: only Arrays respond to
+            // `deconstruct`, only Hashes to `deconstruct_keys`. Reporting `true`
+            // for e.g. an Integer would make `case 5; in [a, b]` call a missing
+            // method instead of falling through to the next clause.
+            match name_of(&args[0]).as_str() {
+                "deconstruct" => return Ok(Value::Bool(with_host(|h| h.is_a(recv, "Array")))),
+                "deconstruct_keys" => {
+                    return Ok(Value::Bool(with_host(|h| h.is_a(recv, "Hash"))))
+                }
+                _ => {}
+            }
             return Ok(Value::Bool(true));
         }
         _ => {}
@@ -903,6 +916,7 @@ pub(crate) fn dispatch(
         "Set" => dispatch_set(recv, name, args, block),
         "Time" => dispatch_time(recv, name, args),
         "Date" => dispatch_date(recv, name, args),
+        "DateTime" => dispatch_datetime(recv, name, args),
         "Enumerator" => dispatch_enumerator(recv, name, args, block),
         "Enumerator::Lazy" => dispatch_lazy(recv, name, args, block),
         "Rational" => dispatch_rational(recv, name, args),
@@ -1056,6 +1070,40 @@ fn dispatch_classref(
                 let s = with_host(|h| h.as_str(&args[0]).unwrap_or_default());
                 return match parse_iso_date(&s) {
                     Some(days) => Ok(with_host(|h| h.new_date(days))),
+                    None => Err(raise_exc("ArgumentError", "invalid date")),
+                };
+            }
+            _ => {}
+        }
+    }
+    // `DateTime` constructors (proleptic Gregorian, UTC-only). Same calendar as
+    // `Date`/`Time`, but carrying a time of day. `DateTime.parse` accepts an
+    // ISO8601 `YYYY-MM-DDTHH:MM:SS` (optional time/zone), like `Date.parse`.
+    if cls == "DateTime" {
+        match name {
+            "new" | "civil" => {
+                let g = |i: usize, dflt: i64| args.get(i).map(as_i).unwrap_or(dflt);
+                let (y, mo, d) = (g(0, -4712), g(1, 1), g(2, 1));
+                let (hh, mi) = (g(3, 0), g(4, 0));
+                let ss = args.get(5).map(as_f).unwrap_or(0.0);
+                let days = crate::host::days_from_civil(y, mo, d);
+                let secs = days as f64 * 86_400.0 + (hh * 3600 + mi * 60) as f64 + ss;
+                return Ok(with_host(|h| h.new_datetime(secs)));
+            }
+            "now" => return Ok(with_host(|h| h.new_datetime(now_epoch_secs()))),
+            "jd" => {
+                let g = |i: usize, dflt: i64| args.get(i).map(as_i).unwrap_or(dflt);
+                let jd = args.first().map(as_i).unwrap_or(crate::host::UNIX_EPOCH_JDN);
+                let days = jd - crate::host::UNIX_EPOCH_JDN;
+                let (hh, mi) = (g(1, 0), g(2, 0));
+                let ss = args.get(3).map(as_f).unwrap_or(0.0);
+                let secs = days as f64 * 86_400.0 + (hh * 3600 + mi * 60) as f64 + ss;
+                return Ok(with_host(|h| h.new_datetime(secs)));
+            }
+            "parse" => {
+                let s = with_host(|h| h.as_str(&args[0]).unwrap_or_default());
+                return match parse_iso_datetime(&s) {
+                    Some(secs) => Ok(with_host(|h| h.new_datetime(secs))),
                     None => Err(raise_exc("ArgumentError", "invalid date")),
                 };
             }
@@ -3702,7 +3750,7 @@ fn dispatch_array(
         "dig" => Ok(dig(recv, args)),
         "empty?" => Ok(Value::Bool(arr.is_empty())),
         "reverse" => Ok(new_arr(arr.into_iter().rev().collect())),
-        "to_a" | "to_ary" | "dup" | "clone" => Ok(new_arr(arr)),
+        "to_a" | "to_ary" | "dup" | "clone" | "deconstruct" => Ok(new_arr(arr)),
         "include?" => Ok(Value::Bool(
             arr.iter().any(|x| with_host(|h| h.eq_values(x, &args[0]))),
         )),
@@ -5535,6 +5583,125 @@ fn dispatch_date(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
     }
 }
 
+/// Parse an ISO8601 `YYYY-MM-DDTHH:MM:SS` (date, optional `T`/space + time,
+/// optional trailing `Z`/`+hh:mm` zone which is ignored — UTC-only) into epoch
+/// seconds. Reuses `parse_iso_date` for the date half.
+fn parse_iso_datetime(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let (dpart, tpart) = match s.split_once(['T', ' ']) {
+        Some((a, b)) => (a, Some(b)),
+        None => (s, None),
+    };
+    let days = parse_iso_date(dpart)?;
+    let mut secs = days as f64 * 86_400.0;
+    if let Some(t) = tpart {
+        // Drop a trailing zone designator; UTC-only, so the offset is ignored.
+        let t = t.split(['Z', '+']).next().unwrap_or(t);
+        let comps: Vec<&str> = t.splitn(3, ':').collect();
+        let hh: i64 = comps.first()?.trim().parse().ok()?;
+        let mi: i64 = comps.get(1).and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+        let ss: f64 = comps.get(2).and_then(|x| x.trim().parse().ok()).unwrap_or(0.0);
+        secs += (hh * 3600 + mi * 60) as f64 + ss;
+    }
+    Some(secs)
+}
+
+/// `DateTime` instance methods (UTC-only, proleptic Gregorian). Field readers
+/// and `strftime` reuse `time_fields`/`time_strftime`; arithmetic is by day
+/// (like `Date`), keeping the time of day.
+fn dispatch_datetime(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let secs = with_host(|h| h.datetime_secs(recv).unwrap_or(0.0));
+    let f = with_host(|h| h.time_fields(secs));
+    let (y, mo, d, hh, mi, ss, wday, yday, _frac) = f;
+    let day = (secs / 86_400.0).floor() as i64;
+    let tod = secs - day as f64 * 86_400.0;
+    let arg_i = |i: usize, dflt: i64| args.get(i).map(as_i).unwrap_or(dflt);
+    match name {
+        "year" => Ok(Value::Int(y)),
+        "month" | "mon" => Ok(Value::Int(mo)),
+        "day" | "mday" => Ok(Value::Int(d)),
+        "hour" => Ok(Value::Int(hh)),
+        "min" => Ok(Value::Int(mi)),
+        "sec" => Ok(Value::Int(ss)),
+        "wday" => Ok(Value::Int(wday)),
+        "yday" => Ok(Value::Int(yday)),
+        "cwday" => Ok(Value::Int(if wday == 0 { 7 } else { wday })),
+        "jd" => Ok(Value::Int(day + crate::host::UNIX_EPOCH_JDN)),
+        "leap?" => Ok(Value::Bool(crate::host::is_leap_year(y))),
+        "sunday?" => Ok(Value::Bool(wday == 0)),
+        "monday?" => Ok(Value::Bool(wday == 1)),
+        "tuesday?" => Ok(Value::Bool(wday == 2)),
+        "wednesday?" => Ok(Value::Bool(wday == 3)),
+        "thursday?" => Ok(Value::Bool(wday == 4)),
+        "friday?" => Ok(Value::Bool(wday == 5)),
+        "saturday?" => Ok(Value::Bool(wday == 6)),
+        "to_s" | "iso8601" => Ok(with_host(|h| {
+            let s = h.datetime_to_s(secs);
+            h.new_string(s)
+        })),
+        "inspect" => Ok(with_host(|h| {
+            let s = h.datetime_inspect(secs);
+            h.new_string(s)
+        })),
+        "strftime" => {
+            let fmt = with_host(|h| h.as_str(&args[0]).unwrap_or_default());
+            Ok(with_host(|h| {
+                let s = time_strftime(&fmt, f, secs);
+                h.new_string(s)
+            }))
+        }
+        "to_date" => Ok(with_host(|h| h.new_date(day))),
+        "to_time" => Ok(with_host(|h| h.new_time(secs))),
+        "next_day" | "succ" => {
+            Ok(with_host(|h| h.new_datetime(secs + arg_i(0, 1) as f64 * 86_400.0)))
+        }
+        "prev_day" => Ok(with_host(|h| h.new_datetime(secs - arg_i(0, 1) as f64 * 86_400.0))),
+        "next_month" | ">>" => Ok(with_host(|h| {
+            h.new_datetime(date_add_months(day, arg_i(0, 1)) as f64 * 86_400.0 + tod)
+        })),
+        "prev_month" | "<<" => Ok(with_host(|h| {
+            h.new_datetime(date_add_months(day, -arg_i(0, 1)) as f64 * 86_400.0 + tod)
+        })),
+        "next_year" => Ok(with_host(|h| {
+            h.new_datetime(date_add_months(day, 12 * arg_i(0, 1)) as f64 * 86_400.0 + tod)
+        })),
+        "prev_year" => Ok(with_host(|h| {
+            h.new_datetime(date_add_months(day, -12 * arg_i(0, 1)) as f64 * 86_400.0 + tod)
+        })),
+        "+" => Ok(with_host(|h| h.new_datetime(secs + as_f(&args[0]) * 86_400.0))),
+        "-" => {
+            if let Some(other) = with_host(|h| h.datetime_secs(&args[0])) {
+                Ok(with_host(|h| {
+                    let numer = num_bigint::BigInt::from((secs - other).round() as i64);
+                    let r = num_rational::BigRational::new(numer, num_bigint::BigInt::from(86_400));
+                    h.new_rational(r)
+                }))
+            } else {
+                Ok(with_host(|h| h.new_datetime(secs - as_f(&args[0]) * 86_400.0)))
+            }
+        }
+        "<=>" => {
+            if let Some(other) = with_host(|h| h.datetime_secs(&args[0])) {
+                Ok(Value::Int(match secs.total_cmp(&other) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }))
+            } else {
+                Ok(Value::Undef)
+            }
+        }
+        "==" => Ok(Value::Bool(
+            with_host(|h| h.datetime_secs(&args[0])) == Some(secs),
+        )),
+        "hash" => Ok(Value::Int(secs.to_bits() as i64)),
+        _ => Err(raise_exc(
+            "NoMethodError",
+            &format!("undefined method '{name}' for an instance of DateTime"),
+        )),
+    }
+}
+
 fn dispatch_set(
     recv: &Value,
     name: &str,
@@ -5711,6 +5878,9 @@ fn dispatch_hash(
             }
         }
         "empty?" => Ok(Value::Bool(map.is_empty())),
+        // Pattern-match protocol: return self (the requested-keys arg is only a
+        // hint; the pattern re-checks each key). Matches MRI's `Hash#deconstruct_keys`.
+        "deconstruct_keys" => Ok(recv.clone()),
         "keys" => Ok(with_host(|h| {
             let ks: Vec<Value> = map.keys().map(|k| h.key_value(k)).collect();
             h.new_array(ks)
@@ -6753,6 +6923,28 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
         }
         "pp" => kernel("p", args, block),
         "require" | "require_relative" | "load" => Ok(Value::Bool(true)),
+        // AOP: `intercept(pattern, kind, handler)` registers `handler` (a method
+        // name) to run as :before/:after/:around advice on any called method whose
+        // name matches the glob `pattern`.
+        "intercept" => {
+            let pattern = name_of(&args[0]);
+            let kind = name_of(args.get(1).unwrap_or(&Value::Undef));
+            let handler = name_of(args.get(2).unwrap_or(&Value::Undef));
+            let advice = match kind.as_str() {
+                "before" => crate::intercepts::Advice::Before,
+                "after" => crate::intercepts::Advice::After,
+                "around" => crate::intercepts::Advice::Around,
+                other => {
+                    return Err(raise_exc(
+                        "ArgumentError",
+                        &format!("unknown advice kind '{other}'"),
+                    ))
+                }
+            };
+            crate::intercepts::register(&pattern, advice, &handler)
+                .map_err(|e| raise_exc("ArgumentError", &e))?;
+            Ok(with_host(|h| h.new_symbol(&handler)))
+        }
         "raise" | "fail" => {
             // Forms: `raise` / `raise "msg"` / `raise SomeError` /
             // `raise SomeError, "msg"` / `raise instance`.
@@ -7940,6 +8132,10 @@ fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     // Two Dates order by their day count.
     if let (Some(x), Some(y)) = with_host(|h| (h.date_days(a), h.date_days(b))) {
         return x.cmp(&y);
+    }
+    // Two DateTimes order by their epoch seconds.
+    if let (Some(x), Some(y)) = with_host(|h| (h.datetime_secs(a), h.datetime_secs(b))) {
+        return x.total_cmp(&y);
     }
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),

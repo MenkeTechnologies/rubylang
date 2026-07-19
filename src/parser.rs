@@ -667,15 +667,14 @@ impl Parser {
             kwsplats.push(self.arg()?);
             return Ok(());
         }
-        // `key: value` keyword argument (symbol key).
-        if let Tok::Ident(key) = self.peek().clone() {
-            if matches!(&self.toks[self.pos + 1].kind, Tok::Op(o) if o == ":") {
-                self.advance(); // key
-                self.advance(); // :
-                let v = self.arg()?;
-                kwargs.push((Expr::Symbol(key), v));
-                return Ok(());
-            }
+        // `key: value` keyword argument (symbol key). The label may be any
+        // reserved word (`f(class: 1, if: 2)`).
+        if let Some(key) = self.peek_label() {
+            self.advance(); // key
+            self.advance(); // :
+            let v = self.arg()?;
+            kwargs.push((Expr::Symbol(key), v));
+            return Ok(());
         }
         // `*expr` — splat the array's elements into the argument list.
         if self.is_op("*") {
@@ -875,6 +874,27 @@ impl Parser {
         }];
         out.extend(nested);
         Ok((temp, out))
+    }
+
+    /// True when the token *after* the current one is a bare label colon `:`
+    /// (as in `key: value`), not `::` or an operator symbol.
+    fn label_colon_ahead(&self) -> bool {
+        matches!(self.toks.get(self.pos + 1).map(|t| &t.kind),
+                 Some(Tok::Op(o)) if o == ":")
+    }
+
+    /// A `name:` label — an identifier or any reserved word (`class:`, `if:`)
+    /// immediately followed by `:`. Ruby allows every keyword as a keyword-arg /
+    /// hash-key label, disambiguated from the keyword itself by the trailing `:`.
+    /// Returns the label name without consuming tokens; `None` if not at a label.
+    fn peek_label(&self) -> Option<String> {
+        if !self.label_colon_ahead() {
+            return None;
+        }
+        match self.peek() {
+            Tok::Ident(s) | Tok::Keyword(s) => Some(s.clone()),
+            _ => None,
+        }
     }
 
     fn ident_name(&mut self) -> Result<String, String> {
@@ -1676,7 +1696,17 @@ impl Parser {
             });
         }
         let splat = self.eat_op("*");
-        let name = self.ident_name()?;
+        // A keyword parameter's label may be any reserved word (`def f(class: 1)`,
+        // `def f(in:)`), recognized when a keyword is immediately followed by `:`.
+        // The `:` is left in place for the keyword-parameter check below.
+        let name = if !splat && matches!(self.peek(), Tok::Keyword(_)) && self.label_colon_ahead() {
+            match self.advance() {
+                Tok::Keyword(k) => k,
+                _ => unreachable!(),
+            }
+        } else {
+            self.ident_name()?
+        };
         // Keyword parameter: `name:` (required) or `name: default`.
         if !splat && self.is_op(":") {
             self.advance();
@@ -1796,14 +1826,12 @@ impl Parser {
 
     fn hash_pair(&mut self) -> Result<(Expr, Expr), String> {
         // `label: value` → symbol key; `key => value` → arbitrary key.
-        if let Tok::Ident(name) = self.peek().clone() {
-            // lookahead for `name:`
-            if matches!(&self.toks[self.pos + 1].kind, Tok::Op(o) if o == ":") {
-                self.advance();
-                self.advance();
-                let v = self.expr()?;
-                return Ok((Expr::Symbol(name), v));
-            }
+        // The label may be any reserved word (`{if: 1, class: 2}`).
+        if let Some(name) = self.peek_label() {
+            self.advance();
+            self.advance();
+            let v = self.expr()?;
+            return Ok((Expr::Symbol(name), v));
         }
         let k = self.expr()?;
         self.expect_op("=>")?;

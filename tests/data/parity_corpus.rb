@@ -1214,3 +1214,54 @@ begin
 rescue RangeError
   puts "range error"
 end
+#==#
+def f(in: 5); :ok; end
+p f
+def g(**o); o; end
+p g(class: 1, if: 2)
+p({if: 1, class: 2, end: 3})
+#==#
+class P
+  def deconstruct
+    [1, 2, 3, 4, 5]
+  end
+  def deconstruct_keys(keys)
+    {x: 1, y: 2, z: 3}
+  end
+end
+case P.new
+in [a, b, *rest]
+  p [a, b, rest]
+end
+case P.new
+in [*pre, 3, *post]
+  p [pre, post]
+end
+case P.new
+in {x:, **others}
+  p [x, others]
+end
+case 5
+in [a, b]
+  p :arr
+in {a:}
+  p :hash
+else
+  p :fell_through
+end
+#==#
+require "date"
+d = DateTime.new(2020, 1, 1, 12, 30, 45)
+puts d.to_s
+puts d.iso8601
+puts d.inspect
+puts d.strftime("%Y-%m-%dT%H:%M:%S")
+puts [d.year, d.month, d.day, d.hour, d.min, d.sec, d.wday, d.yday, d.jd, d.leap?].inspect
+puts (d + 1).to_s
+puts (d >> 1).to_s
+puts (d << 2).to_s
+puts (DateTime.new(2020, 1, 5) - d).to_s
+puts d.to_date.to_s
+puts DateTime.parse("2019-06-15T08:00:00").to_s
+puts [d, DateTime.new(2019, 1, 1), DateTime.new(2020, 1, 5)].sort.map(&:to_s).inspect
+puts d.is_a?(Date)
