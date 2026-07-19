@@ -1557,15 +1557,21 @@ impl Parser {
 
     fn class_expr(&mut self) -> Result<Expr, String> {
         self.advance(); // class
-        // `class << self … end` — a singleton-class body (`<<` lexes as the
-        // left-shift op here: the char after it is a space, not a heredoc
-        // marker). Only the `self` receiver is supported.
+        // `class << self … end` / `class << obj … end` — a singleton-class body
+        // (`<<` lexes as the left-shift op here: the char after it is a space,
+        // not a heredoc marker). `self` yields `recv == None`; any other receiver
+        // (an identifier or constant) is captured for runtime singleton defs.
         if self.is_op("<<") {
             self.advance(); // <<
-            self.expect_kw("self")?;
+            let recv = if self.is_kw("self") {
+                self.advance();
+                None
+            } else {
+                Some(Box::new(self.postfix()?))
+            };
             let body = self.body_until(&["end"])?;
             self.expect_kw("end")?;
-            return Ok(Expr::SingletonClass(body));
+            return Ok(Expr::SingletonClass { recv, body });
         }
         let name = match self.advance() {
             Tok::Const(s) => s,
@@ -1653,12 +1659,36 @@ impl Parser {
 
     fn def_expr(&mut self) -> Result<Expr, String> {
         self.advance();
-        // `def self.name` is a class (singleton) method.
-        let singleton =
-            self.is_kw("self") && matches!(&self.toks[self.pos + 1].kind, Tok::Op(o) if o == ".");
-        if singleton {
-            self.advance(); // self
-            self.advance(); // .
+        // A receiver-qualified def: `def self.name` (class method), or
+        // `def obj.name` / `def Klass.name` (a singleton method on that object /
+        // class). Recognized when the token after the receiver is a `.`.
+        let dot_next = matches!(&self.toks[self.pos + 1].kind, Tok::Op(o) if o == ".");
+        let mut singleton = false;
+        let mut singleton_recv: Option<Box<Expr>> = None;
+        if dot_next {
+            match self.peek().clone() {
+                Tok::Keyword(k) if k == "self" => {
+                    self.advance(); // self
+                    self.advance(); // .
+                    singleton = true;
+                }
+                Tok::Ident(s) => {
+                    self.advance(); // receiver identifier
+                    self.advance(); // .
+                    singleton_recv = Some(Box::new(Expr::Var(VarKind::Local, s)));
+                }
+                Tok::Const(s) => {
+                    self.advance(); // receiver constant
+                    self.advance(); // .
+                    singleton_recv = Some(Box::new(Expr::Var(VarKind::Const, s)));
+                }
+                Tok::GVar(s) => {
+                    self.advance();
+                    self.advance();
+                    singleton_recv = Some(Box::new(Expr::Var(VarKind::Global, s)));
+                }
+                _ => {}
+            }
         }
         let name = self.method_name()?;
         let mut params = Vec::new();
@@ -1687,6 +1717,7 @@ impl Parser {
                 params,
                 body: vec![Stmt { expr, line }],
                 singleton,
+                singleton_recv,
             });
         }
         let body = self.body_with_rescue()?;
@@ -1696,6 +1727,7 @@ impl Parser {
             params,
             body,
             singleton,
+            singleton_recv,
         })
     }
 

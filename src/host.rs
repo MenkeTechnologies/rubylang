@@ -123,6 +123,9 @@ pub mod ops {
     pub const GETCVAR: u16 = 41; // [name] -> class variable of self's class
     pub const SETCVAR: u16 = 42; // [name, value] -> set class variable
     pub const DEFINED_DESC: u16 = 43; // [kind, name] -> `defined?` description or nil
+    pub const DEFINE_SINGLETON: u16 = 44; // [recv, name, synth] -> :name; def obj.m / def Klass.m
+    pub const DEFINE_METHOD_DYN: u16 = 45; // [name, synth] -> :name; def under active eval target
+    pub const FIRE_HOOK: u16 = 46; // [module, hook, target] -> nil; inherited/included/extended/prepended
 }
 
 /// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried
@@ -550,6 +553,9 @@ pub struct RubyHost {
     class_vars: IndexMap<String, IndexMap<String, Value>>,
     /// `define_method`-created instance methods: class → name → block Proc.
     define_methods: IndexMap<String, IndexMap<String, Value>>,
+    /// Per-object singleton methods (`def obj.m`, `class << obj`, and bare `def`
+    /// inside `obj.instance_eval`), keyed by the object's heap id → name → method.
+    singleton_methods: IndexMap<u32, IndexMap<String, MethodDef>>,
     /// `alias_method`/`alias` mappings: class → alias name → target method name.
     method_aliases: IndexMap<String, IndexMap<String, String>>,
     /// Live fibers, indexed by `RObj::Fiber.id`. The coroutine is `.take()`n out
@@ -630,6 +636,7 @@ pub fn reset_host() {
     with_host(|h| *h = RubyHost::new());
     crate::intercepts::clear();
     FILE_DIR_STACK.with(|s| s.borrow_mut().clear());
+    DEF_TARGET.with(|t| t.borrow_mut().clear());
 }
 
 thread_local! {
@@ -658,6 +665,133 @@ pub fn current_file_dir() -> Option<std::path::PathBuf> {
     FILE_DIR_STACK.with(|s| s.borrow().last().cloned())
 }
 
+/// Where a bare `def` should register while a `class_eval`/`instance_eval`
+/// target is active. `Instance` = an instance method on the class (class_eval),
+/// `ClassMethod` = a class/singleton method (`Klass.instance_eval`), `Singleton`
+/// = a per-object singleton (`obj.instance_eval`), `None` = an ordinary method
+/// body inside an eval (defs there hoist as usual, not onto the eval target).
+#[derive(Clone)]
+pub enum DefTarget {
+    Instance(String),
+    ClassMethod(String),
+    Singleton(u32),
+    None,
+}
+
+thread_local! {
+    /// A dynamically-scoped stack of the active `def` target(s). Empty during
+    /// normal execution; a `class_eval`/`instance_eval` pushes its target for the
+    /// duration of the body, and every method call nested underneath pushes a
+    /// `None` so defs inside called methods hoist normally.
+    static DEF_TARGET: RefCell<Vec<DefTarget>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Register a runtime `def` (identified by its real name and the synthetic name
+/// its body was stashed under) onto the active eval target, if any.
+pub fn apply_def_target(real: &str, synth: &str) {
+    let target = DEF_TARGET.with(|t| t.borrow().last().cloned());
+    let Some(target) = target else {
+        return;
+    };
+    let Some(def) = with_host(|h| h.method_def(synth)) else {
+        return;
+    };
+    with_host(|h| match target {
+        DefTarget::Instance(c) => h.add_instance_method(&c, real, def),
+        DefTarget::ClassMethod(c) => h.add_class_method(&c, real, def),
+        DefTarget::Singleton(id) => h.add_singleton_method(id, real, def),
+        DefTarget::None => {}
+    });
+}
+
+/// Run a block with `self` rebound to `self_val` and `target` as the active
+/// `def` target for its duration (`class_eval`/`instance_eval`/`instance_exec`
+/// block forms). `args` are the block's arguments.
+pub fn eval_block_scoped(
+    block: &Value,
+    self_val: &Value,
+    target: DefTarget,
+    args: &[Value],
+) -> Result<Value, String> {
+    DEF_TARGET.with(|t| t.borrow_mut().push(target));
+    let r = call_proc_self(block, args, Some(self_val));
+    DEF_TARGET.with(|t| t.borrow_mut().pop());
+    r
+}
+
+/// Compile and run `src` with `self` rebound to `self_val` and `target` as the
+/// active `def` target (string `class_eval`/`instance_eval`). Methods, classes,
+/// and constants it defines persist on the host.
+pub fn eval_string_scoped(
+    src: &str,
+    self_val: &Value,
+    target: DefTarget,
+) -> Result<Value, String> {
+    DEF_TARGET.with(|t| t.borrow_mut().push(target));
+    with_host(|h| {
+        h.frames.push(Frame {
+            scope: Scope {
+                locals: new_env(),
+                block: None,
+                self_obj: self_val.clone(),
+                method_name: None,
+                def_class: None,
+            },
+            args: Vec::new(),
+            line: 0,
+        });
+    });
+    let saved_active = with_host(|h| h.active_scope.take());
+    let r = eval_in_place(src);
+    with_host(|h| {
+        h.frames.pop();
+        h.active_scope = saved_active;
+    });
+    DEF_TARGET.with(|t| t.borrow_mut().pop());
+    r
+}
+
+/// `eval("code")` at top level / current self: compile `src` into the running
+/// host (its proc/begin templates appended at the right offset) and run its main
+/// chunk in the current frame. Definitions persist; returns the last value.
+pub fn eval_in_place(src: &str) -> Result<Value, String> {
+    let stmts = crate::parser::parse(src)?;
+    let (proc_base, begin_base) = with_host(|h| (h.procs.len(), h.begins.len()));
+    let prog = crate::compiler::compile_at(&stmts, proc_base, begin_base)?;
+    let main = prog.main;
+    with_host(|h| {
+        for (name, def) in prog.methods {
+            h.methods.insert(name, def);
+        }
+        for (name, def) in prog.classes {
+            h.classes.insert(name, def);
+        }
+        h.begins.extend(prog.begins);
+        h.procs.extend(prog.procs);
+    });
+    run_chunk_on(main)
+}
+
+/// Invoke a per-object singleton method (`def obj.m`): push a frame bound to the
+/// object and run the body, resolving `super` against the object's own class.
+pub fn call_singleton(
+    recv: Value,
+    def: &MethodDef,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    let def_class = with_host(|h| h.class_of(&recv));
+    run_method(
+        def,
+        recv,
+        args,
+        block,
+        Some(name.into()),
+        Some(def_class),
+    )
+}
+
 impl Default for RubyHost {
     fn default() -> Self {
         Self::new()
@@ -666,13 +800,19 @@ impl Default for RubyHost {
 
 impl RubyHost {
     pub fn new() -> Self {
+        // MRI's top-level `self` is `main`, an ordinary Object — so
+        // `self.class.name == "Object"`. It occupies heap slot 0.
+        let main = RObj::Object {
+            class: "Object".to_string(),
+            ivars: IndexMap::new(),
+        };
         let mut h = RubyHost {
-            heap: Vec::new(),
+            heap: vec![main],
             frames: vec![Frame {
                 scope: Scope {
                     locals: new_env(),
                     block: None,
-                    self_obj: Value::Undef,
+                    self_obj: Value::Obj(0),
                     method_name: None,
                     def_class: None,
                 },
@@ -699,6 +839,7 @@ impl RubyHost {
             struct_counter: 0,
             class_vars: IndexMap::new(),
             define_methods: IndexMap::new(),
+            singleton_methods: IndexMap::new(),
             method_aliases: IndexMap::new(),
         };
         // Seed the standard streams as `STDOUT`/`STDERR`/`STDIN` constants and
@@ -1717,6 +1858,10 @@ impl RubyHost {
     pub fn set_const(&mut self, name: &str, v: Value) {
         self.consts.insert(name.to_string(), v);
     }
+    /// The names of user-defined constants in the flat store (`Module#constants`).
+    pub fn const_names(&self) -> Vec<String> {
+        self.consts.keys().cloned().collect()
+    }
     // Instance vars live on the current `self` object; at the top level (self is
     // the main object) they fall back to a global-keyed table.
     pub fn get_ivar(&self, name: &str) -> Value {
@@ -1778,6 +1923,49 @@ impl RubyHost {
     /// an instance's class, or a class-reference's own name.
     pub fn cvar_owner(&self, this: &Value) -> Option<String> {
         self.object_class(this).or_else(|| self.classref_name(this))
+    }
+    /// Fetch a compiled method body previously registered under `name` (used to
+    /// retrieve the body of a runtime `def` by its synthetic retrieval name).
+    pub fn method_def(&self, name: &str) -> Option<MethodDef> {
+        self.methods.get(name).cloned()
+    }
+    /// Register a per-object singleton method (`def obj.m`, `class << obj`).
+    pub fn add_singleton_method(&mut self, id: u32, name: &str, def: MethodDef) {
+        self.singleton_methods
+            .entry(id)
+            .or_default()
+            .insert(name.to_string(), def);
+    }
+    /// A per-object singleton method for `name`, if `v` is an object that has one.
+    pub fn find_singleton_method(&self, v: &Value, name: &str) -> Option<MethodDef> {
+        if self.singleton_methods.is_empty() {
+            return None;
+        }
+        match v {
+            Value::Obj(id) => self
+                .singleton_methods
+                .get(id)
+                .and_then(|m| m.get(name))
+                .cloned(),
+            _ => None,
+        }
+    }
+    /// Register a class method (`def self.m` equivalent) on a class at runtime
+    /// (`def Klass.m`, `Klass.instance_eval { def m }`).
+    pub fn add_class_method(&mut self, class: &str, name: &str, def: MethodDef) {
+        self.classes
+            .entry(class.to_string())
+            .or_default()
+            .class_methods
+            .insert(name.to_string(), def);
+    }
+    /// Register an instance method on a class at runtime (`class_eval { def m }`).
+    pub fn add_instance_method(&mut self, class: &str, name: &str, def: MethodDef) {
+        self.classes
+            .entry(class.to_string())
+            .or_default()
+            .methods
+            .insert(name.to_string(), def);
     }
     /// Register a `define_method`-created instance method (a block Proc) on a class.
     pub fn add_define_method(&mut self, class: &str, name: &str, proc: Value) {
@@ -3468,7 +3656,24 @@ fn run_method(
         // scope in effect at the call site.
         h.active_scope.take()
     });
+    // Isolate the `def` target: a bare `def` inside an ordinary method body must
+    // hoist normally even when called from within a `class_eval`/`instance_eval`.
+    // Only touched when an eval is actually in flight (empty stack = no-op).
+    let def_target_pushed = DEF_TARGET.with(|t| {
+        let mut b = t.borrow_mut();
+        if b.is_empty() {
+            false
+        } else {
+            b.push(DefTarget::None);
+            true
+        }
+    });
     let r = run_chunk_on(def.chunk.clone());
+    if def_target_pushed {
+        DEF_TARGET.with(|t| {
+            t.borrow_mut().pop();
+        });
+    }
     let sig = with_host(|h| {
         h.frames.pop();
         h.active_scope = saved_active;

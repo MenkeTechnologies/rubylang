@@ -3889,3 +3889,131 @@ fn parenless_dot_call_guards_no_regression() {
     // A dot call followed by a low-precedence operator, not an argument.
     eq("5.between?(1, 9) && true", "true");
 }
+
+// ---- metaprogramming: singleton methods, hooks, reflection, eval ----------
+
+#[test]
+fn singleton_method_on_object() {
+    // `def obj.foo` defines a per-object singleton method.
+    eq("o = Object.new; def o.foo; 7; end; o.foo", "7");
+    // The singleton is bound to that object only; a sibling does not get it.
+    eq(
+        "o = Object.new; def o.foo; 7; end; p2 = Object.new; p2.respond_to?(:foo)",
+        "false",
+    );
+    // `@ivar` inside a singleton method reads the receiver's own state.
+    eq(
+        "o = Object.new; o.instance_variable_set(:@v, 5); def o.d; @v * 2; end; o.d",
+        "10",
+    );
+}
+
+#[test]
+fn singleton_method_on_class_is_a_class_method() {
+    // `def Klass.bar` registers a class method.
+    eq("class Klass; end; def Klass.bar; 8; end; Klass.bar", "8");
+}
+
+#[test]
+fn singleton_class_body_on_object() {
+    // `class << obj; def m; end; end` defines singleton methods on the object.
+    eq(
+        "o = Object.new; class << o; def baz; 9; end; end; o.baz",
+        "9",
+    );
+}
+
+#[test]
+fn const_missing_is_called_for_unresolved_scoped_const() {
+    eq(
+        r#"class C; def self.const_missing(name); "missing:#{name}"; end; end; C::Nope"#,
+        r#""missing:Nope""#,
+    );
+}
+
+#[test]
+fn inherited_hook_fires_with_the_subclass() {
+    eq(
+        "$log = nil; class Base; def self.inherited(sub); $log = sub.name; end; end; class Sub < Base; end; $log",
+        r#""Sub""#,
+    );
+}
+
+#[test]
+fn included_hook_fires_with_the_including_class() {
+    eq(
+        "$log = nil; module M; def self.included(base); $log = base.name; end; end; class Host; include M; end; $log",
+        r#""Host""#,
+    );
+}
+
+#[test]
+fn extended_and_prepended_hooks_fire() {
+    eq(
+        "$log = nil; module E; def self.extended(base); $log = base.name; end; end; class HE; extend E; end; $log",
+        r#""HE""#,
+    );
+    eq(
+        "$log = nil; module P; def self.prepended(base); $log = base.name; end; end; class HP; prepend P; end; $log",
+        r#""HP""#,
+    );
+}
+
+#[test]
+fn constant_reflection() {
+    eq("Object.const_get(:String)", "String");
+    eq("X = 5; Object.const_get(:X)", "5");
+    eq("Object.const_set(:Y, 42); Y", "42");
+    eq("Object.const_defined?(:String)", "true");
+    eq("Object.const_defined?(:NoSuchConst)", "false");
+    // A nested path resolves against the flat constant store by its last segment.
+    eq("module A; B = 99; end; A.const_get(\"A::B\")", "99");
+    eq("Object.const_set(:Zeta, 1); Object.constants.include?(:Zeta)", "true");
+}
+
+#[test]
+fn top_level_self_is_an_object_named_main() {
+    // MRI's top-level `self` is `main`, an Object — not nil.
+    eq("self.class.name", r#""Object""#);
+    eq("self.is_a?(Object)", "true");
+    eq("self.nil?", "false");
+}
+
+#[test]
+fn eval_runs_a_string_on_the_current_host() {
+    eq("eval(\"1 + 2\")", "3");
+    // A method defined inside eval persists and is callable afterward.
+    eq("eval(\"def em; 111; end\"); em", "111");
+    // A constant defined inside eval persists.
+    eq("eval(\"K = 21\"); K * 2", "42");
+}
+
+#[test]
+fn class_eval_block_defines_instance_methods() {
+    eq(
+        "class CE; end; CE.class_eval { def hi; 42; end }; CE.new.hi",
+        "42",
+    );
+}
+
+#[test]
+fn instance_eval_block_sees_receiver_state_and_defines_singletons() {
+    // `@ivar` in an instance_eval block hits the receiver.
+    eq(
+        "o = Object.new; o.instance_variable_set(:@x, 3); o.instance_eval { @x }",
+        "3",
+    );
+    // A bare `def` in an instance_eval block defines a singleton on the receiver.
+    eq(
+        "o = Object.new; o.instance_eval { def s; 9; end }; o.s",
+        "9",
+    );
+}
+
+#[test]
+fn instance_exec_passes_arguments() {
+    eq(
+        "o = Object.new; o.instance_variable_set(:@x, 4); o.instance_exec(3) { |n| n * @x }",
+        "12",
+    );
+}

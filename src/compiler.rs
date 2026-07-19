@@ -40,6 +40,9 @@ pub struct Compiler {
     loops: Vec<LoopCtx>,
     /// Monotonic counter for unique temporaries (`case/in` subject slots).
     tmp: usize,
+    /// Monotonic counter for the synthetic retrieval names under which method
+    /// bodies for runtime `def`s (singleton / eval-target) are registered.
+    def_ctr: usize,
     /// When true (`--dap`), emit a per-statement `Op::Extended(DBG_LINE)` marker
     /// carrying the source line so the debugger can pause at statement
     /// boundaries. Off for normal runs — zero extra ops in the chunk.
@@ -142,6 +145,43 @@ fn rebase_chunk(chunk: &mut Chunk, proc_off: usize, begin_off: usize) {
     }
 }
 
+/// Compile a program whose `proc`/`begin` template ids start at the given bases,
+/// returning only the newly-emitted procs/begins. Used by `eval` so a string
+/// compiled into an already-running host references the host's proc/begin tables
+/// at the correct absolute offsets when its new templates are appended.
+pub fn compile_at(stmts: &[Stmt], proc_base: usize, begin_base: usize) -> Result<Program, String> {
+    // Seed placeholder templates so freshly-assigned ids start past the bases;
+    // they are dropped from the returned program (only the new tail is kept).
+    let mut c = Compiler {
+        procs: (0..proc_base).map(|_| dummy_proc()).collect(),
+        begins: (0..begin_base)
+            .map(|_| BeginDef {
+                body: 0,
+                rescues: vec![],
+                ensure: None,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let mut b = ChunkBuilder::new();
+    c.compile_seq(&mut b, stmts)?;
+    Ok(Program {
+        main: b.build(),
+        methods: c.methods,
+        classes: c.classes,
+        begins: c.begins.split_off(begin_base),
+        procs: c.procs.split_off(proc_base),
+    })
+}
+
+fn dummy_proc() -> ProcDef {
+    ProcDef {
+        params: vec![],
+        splat: None,
+        chunk: ChunkBuilder::new().build(),
+    }
+}
+
 impl Compiler {
     /// Compile a sequence of statements as a body: each value but the last is
     /// popped; the last is left on the stack (Ruby's "value is the last expr").
@@ -161,6 +201,17 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// Compile a `def` body and register it under a fresh synthetic name, so a
+    /// runtime `DEFINE_SINGLETON`/`DEFINE_METHOD_DYN` op can fetch the compiled
+    /// `MethodDef` from the host by that name. Returns the synthetic name.
+    fn stash_method(&mut self, params: &[Param], body: &[Stmt]) -> Result<String, String> {
+        let def = self.compile_method(params, body)?;
+        let synth = format!("__def{}__", self.def_ctr);
+        self.def_ctr += 1;
+        self.methods.push((synth.clone(), def));
+        Ok(synth)
     }
 
     /// Compile a method: a prologue that fills in any defaulted parameter the
@@ -347,15 +398,38 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::INDEX_GET, argc(1 + idx.len())?), 0);
             }
             Expr::Def {
-                name, params, body, ..
+                name,
+                params,
+                body,
+                singleton_recv,
+                ..
             } => {
-                // A top-level `def` (singleton or not) registers a top-level
-                // method; class-body `def`s are handled in `compile_class`.
-                let def = self.compile_method(params, body)?;
-                self.methods.push((name.clone(), def));
-                // `def` evaluates to the method name as a symbol.
-                self.kstr(b, name);
-                b.emit(Op::CallBuiltin(ops::MKSYM, 1), 0);
+                match singleton_recv {
+                    // `def obj.m` / `def Klass.m` — evaluate the receiver and
+                    // register the body as a per-object singleton method (or, for
+                    // a class receiver, a class method) at runtime.
+                    Some(recv) => {
+                        let synth = self.stash_method(params, body)?;
+                        self.compile_expr(b, recv)?;
+                        self.kstr(b, name);
+                        self.kstr(b, &synth);
+                        b.emit(Op::CallBuiltin(ops::DEFINE_SINGLETON, 3), 0);
+                    }
+                    // A plain `def`: hoisted as a top-level method (available
+                    // before the line runs), plus a runtime `DEFINE_METHOD_DYN`
+                    // that registers it on the active `class_eval`/`instance_eval`
+                    // target when one is in effect. `def` evaluates to `:name`.
+                    None => {
+                        let def = self.compile_method(params, body)?;
+                        let synth = format!("__def{}__", self.def_ctr);
+                        self.def_ctr += 1;
+                        self.methods.push((name.clone(), def.clone()));
+                        self.methods.push((synth.clone(), def));
+                        self.kstr(b, name);
+                        self.kstr(b, &synth);
+                        b.emit(Op::CallBuiltin(ops::DEFINE_METHOD_DYN, 2), 0);
+                    }
+                }
             }
             Expr::Class {
                 name,
@@ -363,9 +437,28 @@ impl Compiler {
                 body,
             } => self.compile_class(b, name, superclass, body)?,
             Expr::Module { name, body } => self.compile_class(b, name, &None, body)?,
-            // A top-level `class << self` (singleton of `main`) is unsupported;
-            // it evaluates to nil rather than aborting compilation.
-            Expr::SingletonClass(_) => {
+            // `class << recv … end` outside a class body. Each inner `def`
+            // becomes a singleton method of `recv` (or the current `self` for
+            // `class << self`), registered at runtime. Evaluates to nil.
+            Expr::SingletonClass { recv, body } => {
+                for s in body {
+                    if let Expr::Def {
+                        name, params, body, ..
+                    } = &s.expr
+                    {
+                        let synth = self.stash_method(params, body)?;
+                        match recv {
+                            Some(r) => self.compile_expr(b, r)?,
+                            None => {
+                                b.emit(Op::CallBuiltin(ops::GETSELF, 0), 0);
+                            }
+                        }
+                        self.kstr(b, name);
+                        self.kstr(b, &synth);
+                        b.emit(Op::CallBuiltin(ops::DEFINE_SINGLETON, 3), 0);
+                        b.emit(Op::Pop, 0);
+                    }
+                }
                 b.emit(Op::LoadUndef, 0);
             }
             Expr::SelfExpr => {
@@ -1045,11 +1138,18 @@ impl Compiler {
         let mut init_body: Vec<Stmt> = Vec::new();
         for stmt in body {
             match &stmt.expr {
+                // `def Klass.m` / `def obj.m` inside a class body carries an
+                // explicit receiver — defer to runtime (via `__class_body__`).
+                Expr::Def {
+                    singleton_recv: Some(_),
+                    ..
+                } => init_body.push(stmt.clone()),
                 Expr::Def {
                     name,
                     params,
                     body,
                     singleton,
+                    singleton_recv: None,
                 } => {
                     let def = self.compile_method(params, body)?;
                     if *singleton {
@@ -1117,8 +1217,8 @@ impl Compiler {
                 }
                 // `class << self … end` — its `def`s are class (singleton)
                 // methods, the same as `def self.x`.
-                Expr::SingletonClass(inner) => {
-                    for s in inner {
+                Expr::SingletonClass { recv: None, body } => {
+                    for s in body {
                         if let Expr::Def {
                             name, params, body, ..
                         } = &s.expr
@@ -1127,6 +1227,9 @@ impl Compiler {
                         }
                     }
                 }
+                // `class << obj … end` inside a class body — an explicit receiver;
+                // defer to runtime (via `__class_body__`).
+                Expr::SingletonClass { recv: Some(_), .. } => init_body.push(stmt.clone()),
                 _ => init_body.push(stmt.clone()),
             }
         }
@@ -1138,6 +1241,10 @@ impl Compiler {
                 self.compile_method(&[], &init_body)?,
             );
         }
+        // Capture the mixin lists for hook firing before they move into ClassDef.
+        let hook_includes = includes.clone();
+        let hook_prepends = prepends.clone();
+        let hook_extends = extends.clone();
         self.classes.push((
             name.to_string(),
             ClassDef {
@@ -1149,6 +1256,10 @@ impl Compiler {
                 class_methods,
             },
         ));
+        // `inherited(subclass)` fires when the subclass is opened — before its body.
+        if let Some(sc) = superclass {
+            self.emit_hook(b, sc, "inherited", name);
+        }
         // Run the class body (`self` = class) once, at definition time.
         if !init_body.is_empty() {
             self.compile_var_read(b, VarKind::Const, name);
@@ -1156,9 +1267,30 @@ impl Compiler {
             b.emit(Op::CallBuiltin(ops::CALL_METHOD, 2), 0);
             b.emit(Op::Pop, 0);
         }
+        // Module hooks fire once the include/prepend/extend relationship is set.
+        for m in &hook_includes {
+            self.emit_hook(b, m, "included", name);
+        }
+        for m in &hook_prepends {
+            self.emit_hook(b, m, "prepended", name);
+        }
+        for m in &hook_extends {
+            self.emit_hook(b, m, "extended", name);
+        }
         // A class/module definition evaluates to nil here.
         b.emit(Op::LoadUndef, 0);
         Ok(())
+    }
+
+    /// Emit a runtime `FIRE_HOOK`: if `module` defines the class method `hook`
+    /// (`inherited`/`included`/`extended`/`prepended`), call it with a reference
+    /// to `target` (the subclass or including class). A no-op if undefined.
+    fn emit_hook(&mut self, b: &mut ChunkBuilder, module: &str, hook: &str, target: &str) {
+        self.kstr(b, module);
+        self.kstr(b, hook);
+        self.kstr(b, target);
+        b.emit(Op::CallBuiltin(ops::FIRE_HOOK, 3), 0);
+        b.emit(Op::Pop, 0);
     }
 
     /// A generated `attr_reader` method body: `@field`.

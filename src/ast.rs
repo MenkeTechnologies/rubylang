@@ -149,12 +149,15 @@ pub enum Expr {
     Index(Box<Expr>, Vec<Expr>),
 
     /// `def name(params) … end`. `singleton` is true for `def self.name` (a
-    /// class method).
+    /// class method). `singleton_recv` carries the explicit receiver of
+    /// `def obj.name` / `def Klass.name` — a per-object singleton method (or, when
+    /// the receiver is a class, a class method), resolved at runtime.
     Def {
         name: String,
         params: Vec<Param>,
         body: Vec<Stmt>,
         singleton: bool,
+        singleton_recv: Option<Box<Expr>>,
     },
     /// `class Name [< Super] … end`.
     Class {
@@ -195,9 +198,15 @@ pub enum Expr {
     Lambda(Block),
     /// A regex literal `/pattern/flags`.
     Regex(String, String),
-    /// `class << self … end` — a singleton-class body. Its `def`s become class
-    /// (singleton) methods of the enclosing class, equivalent to `def self.x`.
-    SingletonClass(Vec<Stmt>),
+    /// `class << recv … end` — a singleton-class body. With `recv == None`
+    /// (`class << self`) inside a class body its `def`s become class (singleton)
+    /// methods, equivalent to `def self.x`. With an explicit `recv`
+    /// (`class << obj`) its `def`s become singleton methods of that object,
+    /// resolved at runtime.
+    SingletonClass {
+        recv: Option<Box<Expr>>,
+        body: Vec<Stmt>,
+    },
 }
 
 /// One `in pattern [if/unless guard]` clause of a `case/in`.

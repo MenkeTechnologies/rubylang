@@ -61,6 +61,9 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::CALL_ARR_BLK, b_call_arr_blk);
     vm.register_builtin(ops::CALL_METHOD_ARR_BLK, b_call_method_arr_blk);
     vm.register_builtin(ops::DEFINED_DESC, b_defined_desc);
+    vm.register_builtin(ops::DEFINE_SINGLETON, b_define_singleton);
+    vm.register_builtin(ops::DEFINE_METHOD_DYN, b_define_method_dyn);
+    vm.register_builtin(ops::FIRE_HOOK, b_fire_hook);
 }
 
 /// Whether `name` is a built-in Kernel function (so `defined?(puts)` and the
@@ -94,6 +97,7 @@ fn is_kernel_function(name: &str) -> bool {
             | "srand"
             | "catch"
             | "throw"
+            | "eval"
             | "block_given?"
             | "Integer"
             | "Float"
@@ -429,6 +433,56 @@ fn b_defined(vm: &mut VM, _: u8) -> Value {
     Value::Bool(with_host(|h| h.local_defined(&name)))
 }
 
+/// `def obj.m` / `def Klass.m` / `class << obj; def m`: stack is
+/// `[recv, name, synth]`. Register the stashed body (under `synth`) as a
+/// singleton method on `recv` (a per-object singleton, or a class method when
+/// `recv` is a class). Evaluates to `:name`.
+fn b_define_singleton(vm: &mut VM, _: u8) -> Value {
+    let synth = name_of(&vm.pop());
+    let name = name_of(&vm.pop());
+    let recv = vm.pop();
+    let Some(def) = with_host(|h| h.method_def(&synth)) else {
+        return abort(vm, format!("internal: missing method body '{synth}'"));
+    };
+    with_host(|h| {
+        if let Some(cls) = h.classref_name(&recv) {
+            h.add_class_method(&cls, &name, def);
+        } else if let Value::Obj(id) = recv {
+            h.add_singleton_method(id, &name, def);
+        }
+    });
+    with_host(|h| h.new_symbol(&name))
+}
+
+/// A plain `def`: stack is `[name, synth]`. When a `class_eval`/`instance_eval`
+/// target is active the body registers onto it; otherwise a no-op (the method is
+/// already hoisted). Evaluates to `:name`.
+fn b_define_method_dyn(vm: &mut VM, _: u8) -> Value {
+    let synth = name_of(&vm.pop());
+    let name = name_of(&vm.pop());
+    crate::host::apply_def_target(&name, &synth);
+    with_host(|h| h.new_symbol(&name))
+}
+
+/// `inherited`/`included`/`extended`/`prepended` hook: stack is
+/// `[module, hook, target]`. If `module` defines the class method `hook`, call
+/// it with a reference to `target` (the subclass or including class).
+fn b_fire_hook(vm: &mut VM, _: u8) -> Value {
+    let target = name_of(&vm.pop());
+    let hook = name_of(&vm.pop());
+    let module = name_of(&vm.pop());
+    if let Some(def) = with_host(|h| h.find_class_method(&module, &hook)) {
+        let recv = with_host(|h| h.class_ref(&module));
+        let arg = with_host(|h| h.class_ref(&target));
+        if let Err(e) =
+            crate::host::call_class_method(recv, &def, &hook, &module, &[arg], None)
+        {
+            return abort(vm, e);
+        }
+    }
+    Value::Undef
+}
+
 // ---- calls ----------------------------------------------------------------
 
 fn b_call(vm: &mut VM, argc: u8) -> Value {
@@ -704,6 +758,25 @@ fn is_universal_object_method(name: &str) -> bool {
     )
 }
 
+/// The `def` target for an `instance_eval`/`class_eval` on `recv`. For
+/// `instance_eval` (`instance == true`) a class receiver takes class methods and
+/// an object takes singletons; for `class_eval` a class receiver takes instance
+/// methods.
+fn eval_target(recv: &Value, instance: bool) -> crate::host::DefTarget {
+    use crate::host::DefTarget;
+    if let Some(cls) = with_host(|h| h.classref_name(recv)) {
+        if instance {
+            DefTarget::ClassMethod(cls)
+        } else {
+            DefTarget::Instance(cls)
+        }
+    } else if let Value::Obj(id) = recv {
+        DefTarget::Singleton(*id)
+    } else {
+        DefTarget::None
+    }
+}
+
 /// A receiver method call. Universal methods first, then per-class.
 pub(crate) fn dispatch(
     recv: &Value,
@@ -711,6 +784,12 @@ pub(crate) fn dispatch(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    // A per-object singleton method (`def obj.m`, `class << obj`) has the highest
+    // priority — ahead of the class's own instance methods and the universal
+    // fallbacks.
+    if let Some(def) = with_host(|h| h.find_singleton_method(recv, name)) {
+        return crate::host::call_singleton(recv.clone(), &def, name, args, block);
+    }
     // A user-defined method wins over the universal fallbacks (so a class can
     // override `to_s`, `==`, `inspect`, etc.).
     if let Some(cls) = with_host(|h| h.object_class(recv)) {
@@ -948,6 +1027,34 @@ pub(crate) fn dispatch(
                 _ => {}
             }
             return Ok(Value::Bool(true));
+        }
+        // `instance_eval`/`instance_exec` run with `self` = receiver: a bare `def`
+        // defines a singleton on the receiver (or a class method when the receiver
+        // is a class), and `@ivar` accesses the receiver's instance variables.
+        "instance_eval" | "instance_exec" => {
+            let target = eval_target(recv, true);
+            if let Some(b) = block {
+                // instance_eval yields the receiver; instance_exec passes `args`.
+                let block_args: Vec<Value> = if name == "instance_exec" {
+                    args.to_vec()
+                } else {
+                    vec![recv.clone()]
+                };
+                return crate::host::eval_block_scoped(&b, recv, target, &block_args);
+            }
+            // String form: `instance_eval("code")`.
+            let src = arg_str(&args[0]);
+            return crate::host::eval_string_scoped(&src, recv, target);
+        }
+        // `class_eval`/`module_eval` run with `self` = the class: a bare `def`
+        // defines an instance method on it.
+        "class_eval" | "module_eval" if with_host(|h| h.classref_name(recv)).is_some() => {
+            let target = eval_target(recv, false);
+            if let Some(b) = block {
+                return crate::host::eval_block_scoped(&b, recv, target, std::slice::from_ref(recv));
+            }
+            let src = arg_str(&args[0]);
+            return crate::host::eval_string_scoped(&src, recv, target);
         }
         _ => {}
     }
@@ -1400,11 +1507,63 @@ fn dispatch_classref(
             Ok(with_host(|h| h.new_hash(map)))
         }
         "[]" if cls == "Array" => Ok(new_arr(args.to_vec())),
+        // `Mod.const_get(sym)` — resolve a constant by name (supports a nested
+        // `"A::B"` path in the flat constant store by resolving the last segment).
+        "const_get" => {
+            let cname = name_of(&args[0]);
+            let leaf = cname.rsplit("::").next().unwrap_or(&cname);
+            match const_lookup(leaf) {
+                Some(v) => Ok(v),
+                None => Err(raise_exc(
+                    "NameError",
+                    &format!("uninitialized constant {cname}"),
+                )),
+            }
+        }
+        // `Mod.const_set(sym, val)` — define a constant (flat store).
+        "const_set" => {
+            let cname = name_of(&args[0]);
+            let val = args.get(1).cloned().unwrap_or(Value::Undef);
+            with_host(|h| h.set_const(&cname, val.clone()));
+            Ok(val)
+        }
+        // `Mod.const_defined?(sym)`.
+        "const_defined?" => {
+            let cname = name_of(&args[0]);
+            let leaf = cname.rsplit("::").next().unwrap_or(&cname);
+            Ok(Value::Bool(const_lookup(leaf).is_some()))
+        }
+        // `Mod.constants` — the user-defined constant names (flat store), as
+        // symbols. Class names are not enumerated (matching neither MRI exactly
+        // nor hiding user constants set via assignment / const_set).
+        "constants" => Ok(with_host(|h| {
+            let syms: Vec<Value> = h.const_names().iter().map(|n| h.new_symbol(n)).collect();
+            h.new_array(syms)
+        })),
         _ => {
             // A class method: `def self.m` runs with self bound to the class ref.
             if let Some(def) = with_host(|h| h.find_class_method(cls, name)) {
                 let recv = with_host(|h| h.class_ref(cls));
                 return crate::host::call_class_method(recv, &def, name, cls, args, block);
+            }
+            // `Mod::Const` for an unresolved constant calls `Mod.const_missing`
+            // (Rails autoloading depends on this). The `::` form reaches here as a
+            // no-arg call named like a constant (leading uppercase).
+            if args.is_empty()
+                && name.chars().next().is_some_and(|c| c.is_uppercase())
+            {
+                if let Some(def) = with_host(|h| h.find_class_method(cls, "const_missing")) {
+                    let recv = with_host(|h| h.class_ref(cls));
+                    let sym = with_host(|h| h.new_symbol(name));
+                    return crate::host::call_class_method(
+                        recv,
+                        &def,
+                        "const_missing",
+                        cls,
+                        &[sym],
+                        None,
+                    );
+                }
             }
             Err(raise_exc(
                 "NoMethodError",
@@ -1412,6 +1571,28 @@ fn dispatch_classref(
             ))
         }
     }
+}
+
+/// Resolve a constant name against the flat constant store, falling back to a
+/// class reference for a name that denotes a (user or builtin) class.
+fn const_lookup(name: &str) -> Option<Value> {
+    with_host(|h| {
+        let v = h.get_const(name);
+        if !matches!(v, Value::Undef) {
+            return Some(v);
+        }
+        if h.class_exists(name) || h.is_builtin_class(name) {
+            return Some(h.class_ref(name));
+        }
+        None
+    })
+    .or_else(|| {
+        if is_builtin_exception(name) {
+            Some(with_host(|h| h.class_ref(name)))
+        } else {
+            None
+        }
+    })
 }
 
 /// Instance methods generated for a `Struct` class. Returns `Ok(None)` for a
@@ -7844,6 +8025,14 @@ fn parse_hex_float(s: &str) -> Option<f64> {
 
 fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, String> {
     match name {
+        // `eval("code")` — compile and run the string on the current host in the
+        // current self/scope; definitions it makes persist. (Only the top-level /
+        // current-binding form is supported; an explicit `Binding` argument is
+        // not modeled.)
+        "eval" => {
+            let src = arg_str(&args[0]);
+            crate::host::eval_in_place(&src)
+        }
         "puts" => {
             if args.is_empty() {
                 println!();

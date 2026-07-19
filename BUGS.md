@@ -61,6 +61,65 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   (`p(1/0 rescue 5)`) and array elements (`[1/0 rescue 5]`); this parser accepts
   them (a permissive superset — no valid MRI program breaks).
 
+## Metaprogramming / reflection / eval
+
+Implemented and verified against the reference `ruby`:
+
+- **Singleton methods.** `def obj.m` and `def Klass.m` parse and run: an object
+  receiver stores a per-object singleton method; a class receiver registers a
+  class method (identical to `def self.m`). `class << obj … end` on an instance
+  works the same way. Singleton methods take priority over the class's own
+  instance methods in dispatch (matching `Module#ancestors` order).
+- **`const_missing`.** `Mod::Const` for an unresolved constant calls
+  `Mod.const_missing(:Const)` when the class/module defines it (the hook Rails
+  autoloading relies on).
+- **Definition hooks.** `inherited(subclass)` fires when a subclass is opened;
+  `included`/`extended`/`prepended(base)` fire when the corresponding mixin
+  relationship is established. Each fires only if the module/class defines the
+  hook as a class method.
+- **Constant reflection.** `const_get` / `const_set` / `const_defined?` /
+  `constants` on any class or module ref, including builtin class names
+  (`Object.const_get(:String)`).
+- **Top-level `self`.** Fixed to `main`, an ordinary `Object`, so
+  `self.class.name == "Object"` (was `"NilClass"`). Top-level instance variables
+  now live on that object.
+- **`eval` / `class_eval` / `instance_eval` / `instance_exec`.** `eval("code")`
+  compiles and runs the string on the current host (methods/classes/constants it
+  defines persist), returning the last value. `Module#class_eval`/`module_eval`
+  (block or string) runs with `self` = the class, so a bare `def` defines an
+  instance method. `Object#instance_eval`/`instance_exec` (block or string) runs
+  with `self` = the receiver: `@ivar` hits the receiver, and a bare `def` defines
+  a singleton on it (a class method when the receiver is a class). `instance_exec`
+  forwards its arguments to the block.
+
+Honest limitations of this surface:
+
+- **Singleton storage is keyed by heap id.** Per-object singleton methods live in
+  a `heap-id → name → MethodDef` map. This is stable for the object's lifetime,
+  but object identity is the heap slot, so it does not survive `dup`/`clone`
+  (a shallow copy gets a new id and none of the original's singletons) — matching
+  MRI, which also does not copy the singleton class on `dup`.
+- **`eval` binds to the current scope only.** The top-level / current-`self`
+  binding is supported; an explicit `Binding` argument (`eval(str, some_binding)`)
+  is not modeled. String `class_eval`/`instance_eval` rebind `self` but share the
+  caller's local scope.
+- **A bare `def` is still hoisted globally in addition to registering on an eval
+  target.** Because top-level/`in-block` `def`s are hoisted into the method table
+  at compile time, a `def` inside `class_eval`/`instance_eval` also leaves a
+  same-named top-level method behind (harmless pollution; the eval-target
+  registration is what dispatch uses). A `def` inside an *ordinary* method body
+  called from within an eval is correctly isolated (hoists, does not hit the eval
+  target).
+- **Constants remain a flat, global store.** `const_get`/`const_set`/`constants`
+  operate on that flat store rather than per-module namespaces, so a nested path
+  (`Mod.const_get("A::B")`) resolves by its last segment and `constants` lists all
+  user-defined constant names rather than only a given module's.
+- **Hook firing order approximates MRI.** Hooks fire from the class-definition
+  site in source order (`inherited` before the body, `included`/`extended`/
+  `prepended` after), which is correct for observing *which* class triggered the
+  hook; exact interleaving with surrounding output can differ because class
+  bodies are otherwise hoisted.
+
 ## Lexer
 
 - **Not lexed:** (nothing outstanding here). Heredocs (`<<END`, `<<~SQL`, `<<-EOT`, `<<'RAW'`),
