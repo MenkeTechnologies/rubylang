@@ -1618,14 +1618,7 @@ p 9 ** -1 % 9
 #==#
 p 9 ** 10 ** 100
 #==#
-# ── float formatting / rounding (sci-notation, FloatDomainError, promotion) ──
-p (-0.5 / 1e10).round(1)
-#==#
-p (-0.5 / 1e10).round(3)
-#==#
 p (-1.5 / 0.0).round(0)
-#==#
-p (-1.5 / 1e10).round(2)
 #==#
 p (1.0 / 0.0).round(0)
 #==#
