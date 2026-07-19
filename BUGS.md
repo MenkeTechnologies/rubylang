@@ -146,10 +146,26 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   (block-less) returns a finite Enumerator over the elements repeated `n` times.
   Limits: external iteration (`next`/`peek`) materializes the block to completion
   on first use, so it works only for *finite* generators — an infinite
-  generator's `.next` runs forever (no fibers/coroutines to pause a block);
+  generator's `.next` still runs forever (routing it through a `Fiber` is a
+  planned follow-on, now that the Fiber engine exists — see below);
   `y.yield` must be called with parentheses (`y.yield(v)`), as paren-less command
   calls on a dot-receiver are not parsed; and block-less endless `cycle` (no
   count) stays `nil` (it would need an infinite external-iteration enumerator).
+- **Fiber (stackful coroutines).** `Fiber.new { |first| ... }`, `#resume(*args)`,
+  `Fiber.yield(v)`, and `#alive?` are implemented on `corosensei` same-thread
+  stackful coroutines: a fiber freezes its entire native stack — including the
+  in-flight fusevm `VM::run()` driving its block — onto an alternate stack, so
+  `Fiber.yield` suspends *below* the VM (fusevm needs no suspend/resume API) and
+  the coroutine shares the thread-local object heap with its resumer. `resume`
+  threads a value in as `Fiber.yield`'s return (and as the block's first
+  parameter on the initial resume); the block's final value is the last
+  `resume`'s result, and side effects fire lazily at the real yield boundaries.
+  Resuming a fiber whose block has returned raises `FiberError` (dead fiber);
+  `Fiber.yield` at the root raises `FiberError`. Each fiber runs its own `VM`
+  instance and its own volatile execution context (scope/signal/frames), swapped
+  at every resume/suspend boundary, so fibers are isolated and nest correctly.
+  `Fiber.yield` must be called with parentheses (`Fiber.yield(v)`) — the
+  paren-less dot-receiver command form is not parsed.
 - **Bignum.** Integers auto-promote to arbitrary precision on overflow, like
   MRI: values that fit stay `i64` immediates, and only the overflow path
   allocates a `BigInt` heap object (backed by `num-bigint`). Arithmetic, bit

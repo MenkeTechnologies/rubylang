@@ -951,6 +951,7 @@ pub(crate) fn dispatch(
         "Date" => dispatch_date(recv, name, args),
         "DateTime" => dispatch_datetime(recv, name, args),
         "Enumerator" => dispatch_enumerator(recv, name, args, block),
+        "Fiber" => dispatch_fiber(recv, name, args),
         "Enumerator::Lazy" => dispatch_lazy(recv, name, args, block),
         "Enumerator::Yielder" => dispatch_yielder(recv, name, args),
         "Rational" => dispatch_rational(recv, name, args),
@@ -1040,6 +1041,27 @@ fn dispatch_classref(
             raise_exc("ArgumentError", "tried to create Enumerator without a block")
         })?;
         return Ok(with_host(|h| h.new_generator(b)));
+    }
+    // `Fiber.new { |first| ... }` — a stackful coroutine. `Fiber.yield(v)`
+    // suspends the currently running fiber.
+    if cls == "Fiber" {
+        match name {
+            "new" => {
+                let b = block.ok_or_else(|| {
+                    raise_exc("ArgumentError", "tried to create a Fiber without a block")
+                })?;
+                return Ok(crate::host::new_fiber(b));
+            }
+            "yield" => {
+                let v = match args {
+                    [] => Value::Undef,
+                    [one] => one.clone(),
+                    many => new_arr(many.to_vec()),
+                };
+                return crate::host::fiber_yield(v);
+            }
+            _ => {}
+        }
     }
     // `Set.new(enum)` / `Set[a, b, c]` — a deduplicated collection.
     if cls == "Set" {
@@ -5483,6 +5505,30 @@ fn drive_generator(gblock: &Value, limit: usize) -> Result<Vec<Value>, String> {
     Ok(buf)
 }
 
+/// Instance methods on a `Fiber`: `resume(*args)`, `alive?`.
+fn dispatch_fiber(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "resume" => {
+            let v = match args {
+                [] => Value::Undef,
+                [one] => one.clone(),
+                many => new_arr(many.to_vec()),
+            };
+            crate::host::fiber_resume(recv, v)
+        }
+        "alive?" => Ok(Value::Bool(crate::host::fiber_alive(recv))),
+        "inspect" | "to_s" => Ok(new_str(format!(
+            "#<Fiber (created){}>",
+            if crate::host::fiber_alive(recv) {
+                ""
+            } else {
+                " (dead)"
+            }
+        ))),
+        _ => Err(no_method_error(recv, name)),
+    }
+}
+
 /// A block-based generator (`Enumerator.new { |y| ... }`). Terminal operations
 /// re-drive the block; `next`/`peek` materialize it to completion once.
 fn dispatch_generator(
@@ -8380,7 +8426,7 @@ fn num_op_method(op: fusevm::NumOp) -> &'static str {
 
 /// Raise a typed exception: register the exception object (so `rescue Class` can
 /// match it) and return the message as the `Err` payload.
-fn raise_exc(class: &str, msg: &str) -> String {
+pub(crate) fn raise_exc(class: &str, msg: &str) -> String {
     let exc = with_host(|h| h.new_exception(class, msg));
     with_host(|h| h.set_pending_exc(exc));
     msg.to_string()

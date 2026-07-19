@@ -1321,3 +1321,30 @@ begin
 rescue => e
   puts e.class.name
 end
+#==#
+f = Fiber.new { Fiber.yield(1); Fiber.yield(2); 3 }
+p [f.resume, f.resume, f.resume]
+gen = Fiber.new do
+  n = 1
+  loop { Fiber.yield(n * n); n += 1 }
+end
+p (1..5).map { gen.resume }
+producer = Fiber.new do |start|
+  acc = start
+  3.times { acc = Fiber.yield(acc * 2) }
+  acc
+end
+p producer.resume(5)
+p producer.resume(10)
+p producer.resume(100)
+p producer.resume(7)
+fib = Fiber.new { Fiber.yield(:only) }
+p fib.alive?
+fib.resume
+fib.resume
+p fib.alive?
+begin
+  fib.resume
+rescue FiberError
+  puts "dead"
+end

@@ -3726,3 +3726,61 @@ fn json_module() {
         "\"JSON::ParserError\"",
     );
 }
+
+// --- Fanout round 5: Fiber (stackful coroutines) ---------------------------
+
+#[test]
+fn fiber_resume_and_yield() {
+    // Finite resume sequence: two yields then a return.
+    eq(
+        "f = Fiber.new { Fiber.yield(1); Fiber.yield(2); 3 }; [f.resume, f.resume, f.resume]",
+        "[1, 2, 3]",
+    );
+    // resume(v) supplies Fiber.yield's return; the first resume is the block param.
+    eq(
+        "f = Fiber.new { |a| b = Fiber.yield(a + 1); Fiber.yield(b + 1); :done }; \
+         [f.resume(10), f.resume(20), f.resume(30)]",
+        "[11, 21, :done]",
+    );
+    // alive? transitions to false once the block returns.
+    eq(
+        "f = Fiber.new { Fiber.yield(nil) }\n\
+         before = f.alive?\n\
+         f.resume\n\
+         f.resume\n\
+         [before, f.alive?]",
+        "[true, false]",
+    );
+    // A Fibonacci generator over an infinite loop, driven by resume.
+    eq(
+        "fib = Fiber.new { a, b = 0, 1; loop { Fiber.yield(a); a, b = b, a + b } }; \
+         8.times.map { fib.resume }",
+        "[0, 1, 1, 2, 3, 5, 8, 13]",
+    );
+    // A fiber captures its defining scope.
+    eq(
+        "x = 100; f = Fiber.new { Fiber.yield(x + 1); x + 2 }; [f.resume, f.resume]",
+        "[101, 102]",
+    );
+    // Nested fibers resume each other; each keeps its own execution state.
+    eq(
+        "inner = Fiber.new { Fiber.yield(:i1); :i_done }; \
+         outer = Fiber.new { Fiber.yield(inner.resume); Fiber.yield(inner.resume); :o_done }; \
+         [outer.resume, outer.resume, outer.resume]",
+        "[:i1, :i_done, :o_done]",
+    );
+}
+
+#[test]
+fn fiber_error_conditions() {
+    // Resuming a dead fiber raises FiberError.
+    eq(
+        "f = Fiber.new { 42 }; f.resume; begin; f.resume; rescue FiberError; :raised; end",
+        ":raised",
+    );
+    // Fiber.yield at the root (no running fiber) raises FiberError.
+    eq(
+        "begin; Fiber.yield(1); rescue FiberError; :raised; end",
+        ":raised",
+    );
+}

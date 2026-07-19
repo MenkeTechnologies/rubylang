@@ -107,6 +107,13 @@ toml = "0.8"
 regex = "1"
 glob = "0.3"
 
+# Stackful same-thread coroutines backing Ruby Fiber (Fiber.new/resume/yield).
+# Switches the native stack on the SAME OS thread, so the thread_local! RubyHost
+# object heap is shared across a fiber suspend/resume — a thread-per-fiber would
+# get a fresh empty host. Covers macOS/Linux aarch64 + Linux x86_64. Vendorable,
+# no build script.
+corosensei = "0.3"
+
 # Arbitrary-precision integers: Ruby Integer auto-promotes past the i64 range
 # (2**64, factorials, …) instead of overflowing. Values that fit stay `i64`;
 # only the overflow path allocates a `BigInt` heap object.

@@ -267,6 +267,13 @@ pub enum RObj {
         sink: usize,
         limit: usize,
     },
+    /// A `Fiber` (`Fiber.new { ... }`). Holds only an index into
+    /// `RubyHost.fibers`; the corosensei `Coroutine` (neither Clone nor Debug)
+    /// cannot live inline in this `#[derive(Clone)]` enum, so it sits in the
+    /// side table exactly like `procs`/`enum_sinks`/`around_stack`.
+    Fiber {
+        id: u32,
+    },
     /// A `Time`, stored as seconds since the Unix epoch (a float, so
     /// sub-second precision and `Time - Time` Float differences are faithful).
     /// Always interpreted as UTC — the local-timezone offset is not modeled
@@ -521,6 +528,38 @@ pub struct RubyHost {
     define_methods: IndexMap<String, IndexMap<String, Value>>,
     /// `alias_method`/`alias` mappings: class → alias name → target method name.
     method_aliases: IndexMap<String, IndexMap<String, String>>,
+    /// Live fibers, indexed by `RObj::Fiber.id`. The coroutine is `.take()`n out
+    /// for the duration of `resume` so the fiber body can re-enter `with_host`
+    /// without a double mutable borrow.
+    fibers: Vec<FiberCell>,
+}
+
+/// One suspended fiber. `coro` is `None` only while this fiber is actively
+/// running (taken out across `Coroutine::resume`). `ctx` holds the fiber's
+/// volatile execution context while it is suspended.
+struct FiberCell {
+    coro: Option<corosensei::Coroutine<Value, Value, Result<Value, String>>>,
+    /// Raw pointer to the fiber body's `Yielder`, published by the coroutine
+    /// closure on entry (same thread → valid for the body's lifetime). Read by
+    /// `Fiber.yield` to suspend the currently running fiber.
+    yielder: *const (),
+    ctx: FiberContext,
+    done: bool,
+}
+
+/// The mutable "execution registers" of `RubyHost` that represent *where
+/// control currently is*, as opposed to the shared object heap. Swapped at
+/// every fiber resume/suspend boundary so a suspended fiber's half-finished
+/// scope/signal state never leaks into the resuming caller (and vice-versa).
+#[derive(Default)]
+struct FiberContext {
+    active_scope: Option<Scope>,
+    signal: Option<Signal>,
+    pending_exc: Option<Value>,
+    error: Option<String>,
+    frames: Vec<Frame>,
+    enum_sinks: Vec<Vec<Value>>,
+    around_stack: Vec<AroundCall>,
 }
 
 thread_local! {
@@ -572,6 +611,7 @@ impl RubyHost {
             frozen: HashSet::new(),
             enum_sinks: Vec::new(),
             around_stack: Vec::new(),
+            fibers: Vec::new(),
             struct_defs: IndexMap::new(),
             struct_counter: 0,
             class_vars: IndexMap::new(),
@@ -1846,6 +1886,7 @@ impl RubyHost {
                 | "DateTime"
                 | "Math"
                 | "JSON"
+                | "Fiber"
         )
     }
     pub fn classref_name(&self, v: &Value) -> Option<String> {
@@ -2186,6 +2227,7 @@ impl RubyHost {
                     "#<Enumerator: #<Enumerator::Generator>:each>".to_string()
                 }
                 Some(RObj::Yielder { .. }) => "#<Enumerator::Yielder>".to_string(),
+                Some(RObj::Fiber { .. }) => "#<Fiber (created)>".to_string(),
                 Some(RObj::Range { lo, hi, exclusive }) => {
                     format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
                 }
@@ -2342,6 +2384,7 @@ impl RubyHost {
                 Some(RObj::Enumerator { .. }) => "Enumerator",
                 Some(RObj::Generator { .. }) => "Enumerator",
                 Some(RObj::Yielder { .. }) => "Enumerator::Yielder",
+                Some(RObj::Fiber { .. }) => "Fiber",
                 Some(RObj::Time { .. }) => "Time",
                 Some(RObj::Date { .. }) => "Date",
                 Some(RObj::DateTime { .. }) => "DateTime",
@@ -3392,6 +3435,141 @@ pub fn run_begin(begin_id: usize) -> Result<Value, String> {
 /// argument to a multi-parameter block is destructured, matching Ruby.
 pub fn call_proc(proc_val: &Value, args: &[Value]) -> Result<Value, String> {
     call_proc_self(proc_val, args, None)
+}
+
+// ---- Fiber (stackful coroutines, same-thread via corosensei) ----------------
+
+thread_local! {
+    /// Id of the fiber whose body is currently executing on this thread, or
+    /// `None` at the root. `Fiber.yield` suspends this fiber; yielding at the
+    /// root is a FiberError.
+    static CUR_FIBER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+impl RubyHost {
+    /// Swap the volatile execution context in one shot, returning the previous
+    /// one. Used to install a fiber's context on resume and pull it back out on
+    /// suspend/return, keeping caller and fiber execution states isolated.
+    fn install_fiber_ctx(&mut self, mut c: FiberContext) -> FiberContext {
+        std::mem::swap(&mut self.active_scope, &mut c.active_scope);
+        std::mem::swap(&mut self.signal, &mut c.signal);
+        std::mem::swap(&mut self.pending_exc, &mut c.pending_exc);
+        std::mem::swap(&mut self.error, &mut c.error);
+        std::mem::swap(&mut self.frames, &mut c.frames);
+        std::mem::swap(&mut self.enum_sinks, &mut c.enum_sinks);
+        std::mem::swap(&mut self.around_stack, &mut c.around_stack);
+        c
+    }
+}
+
+/// The root frame a fiber's execution context starts with, so `cur_scope` never
+/// hits an empty `frames` before the fiber body's proc pushes its own frame.
+fn fiber_root_frame() -> Frame {
+    Frame {
+        scope: Scope {
+            locals: new_env(),
+            block: None,
+            self_obj: Value::Undef,
+            method_name: None,
+            def_class: None,
+        },
+        args: Vec::new(),
+    }
+}
+
+/// `Fiber.new { |first| ... }`: build a suspended stackful coroutine whose body
+/// runs the block. Nothing executes until the first `resume`.
+pub fn new_fiber(block: Value) -> Value {
+    let id = with_host(|h| {
+        let id = h.fibers.len() as u32;
+        h.fibers.push(FiberCell {
+            coro: None,
+            yielder: std::ptr::null(),
+            ctx: FiberContext {
+                frames: vec![fiber_root_frame()],
+                ..FiberContext::default()
+            },
+            done: false,
+        });
+        id
+    });
+    let coro = corosensei::Coroutine::new(
+        move |yielder: &corosensei::Yielder<Value, Value>, first: Value| {
+            // Same thread → publish the yielder pointer so `Fiber.yield` (running
+            // deep inside this body's VM) can reach it. Valid for the body's life.
+            with_host(|h| h.fibers[id as usize].yielder = yielder as *const _ as *const ());
+            // The first resume value becomes the block's single parameter (MRI).
+            call_proc(&block, std::slice::from_ref(&first))
+        },
+    );
+    with_host(|h| h.fibers[id as usize].coro = Some(coro));
+    with_host(|h| h.alloc(RObj::Fiber { id }))
+}
+
+/// `Fiber.yield(v)` — suspend the running fiber, handing `v` to `resume`'s
+/// caller; returns the value the next `resume(x)` supplies. FiberError at root.
+pub fn fiber_yield(v: Value) -> Result<Value, String> {
+    let id = match CUR_FIBER.with(|c| c.get()) {
+        Some(id) => id,
+        None => {
+            return Err(crate::builtins::raise_exc(
+                "FiberError",
+                "can't yield from root fiber",
+            ))
+        }
+    };
+    let yp = with_host(|h| h.fibers[id as usize].yielder);
+    // SAFETY: same-thread coroutine; the yielder lives for the whole fiber body,
+    // and we only reach here from inside that body (its stack is live).
+    let yielder = unsafe { &*(yp as *const corosensei::Yielder<Value, Value>) };
+    Ok(yielder.suspend(v))
+}
+
+/// `fiber.resume(v)` — run the fiber until its next `Fiber.yield` or its block
+/// returns. FiberError on a dead (returned) fiber. Preserves the shared host:
+/// the coroutine is taken out so the body re-enters `with_host` freely, and the
+/// volatile context is swapped so the caller's scope/signal survive the switch.
+pub fn fiber_resume(fiber: &Value, v: Value) -> Result<Value, String> {
+    let id = match with_host(|h| h.obj(fiber).cloned()) {
+        Some(RObj::Fiber { id }) => id,
+        _ => return Err("not a fiber".into()),
+    };
+    if with_host(|h| h.fibers[id as usize].done) {
+        return Err(crate::builtins::raise_exc("FiberError", "dead fiber called"));
+    }
+    let mut coro = with_host(|h| h.fibers[id as usize].coro.take())
+        .ok_or_else(|| crate::builtins::raise_exc("FiberError", "double resume of a fiber"))?;
+
+    // Install the fiber's context; keep the caller's in a local across resume.
+    let fiber_ctx = with_host(|h| std::mem::take(&mut h.fibers[id as usize].ctx));
+    let caller_ctx = with_host(|h| h.install_fiber_ctx(fiber_ctx));
+    let prev = CUR_FIBER.with(|c| c.replace(Some(id)));
+
+    let out = coro.resume(v); // no host borrow held; body drives its own VM
+
+    CUR_FIBER.with(|c| c.set(prev));
+    // Pull the fiber's context back out, restore the caller's.
+    let fiber_ctx = with_host(|h| h.install_fiber_ctx(caller_ctx));
+    with_host(|h| {
+        h.fibers[id as usize].ctx = fiber_ctx;
+        h.fibers[id as usize].coro = Some(coro);
+    });
+
+    match out {
+        corosensei::CoroutineResult::Yield(y) => Ok(y),
+        corosensei::CoroutineResult::Return(r) => {
+            with_host(|h| h.fibers[id as usize].done = true);
+            r // block's value, or a propagated raise
+        }
+    }
+}
+
+/// `fiber.alive?` — false once the block has returned.
+pub fn fiber_alive(fiber: &Value) -> bool {
+    match with_host(|h| h.obj(fiber).cloned()) {
+        Some(RObj::Fiber { id }) => with_host(|h| !h.fibers[id as usize].done),
+        _ => false,
+    }
 }
 
 /// Like `call_proc`, but `self_override` (when given) rebinds `self` inside the
