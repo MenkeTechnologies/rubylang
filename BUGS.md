@@ -278,6 +278,49 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   `deconstruct_keys` honours a requested-key filter (returning only the named
   members, in the requested order) or all members when passed `nil`.
 
+## File / IO / Dir
+
+Backed by `std::fs`/`std::io`, verified method-by-method against the reference
+`ruby`. The `std::fs::File` is stored in a host side table (`io_handles`),
+indexed by an `RObj::IoHandle` — the same non-`Clone`-in-a-`Clone`-enum pattern
+`Fiber` uses for its coroutine. `STDOUT`/`STDERR`/`STDIN` (and the matching
+`$stdout`/`$stderr`/`$stdin` globals) are pre-seeded stream handles.
+
+**Working, output-matched to MRI:** `File.read`/`write` (write returns the byte
+count), `exist?`/`exists?`/`file?`/`directory?`/`size`/`delete`/`unlink`,
+`readlines`/`foreach`, `open(path, mode)` (block form yields the IO and closes
+it on exit, returning the block value; block-less returns the open IO); the
+pure path helpers `basename` (incl. `suffix` and `.*` extension strip),
+`dirname`, `extname` (MRI edge cases: leading-dot names, trailing dot →`"."`,
+all-dots →`""`), `join`, `expand_path` (lexical `~`/`.`/`..` resolution against
+an explicit base or the cwd). IO instance: `read`/`write`/`gets`/`puts`/
+`print`/`<<`/`each_line`/`each`/`readlines`/`close`/`closed?`/`flush`/`inspect`
+(`#<File:/path>`, `#<File:/path (closed)>`, `#<IO:<STDOUT>>`). `Dir.pwd`,
+`glob`/`[]` (sorted per MRI ≥3.0; leading-dot files excluded from `*`;
+`{a,b}` brace alternation expanded and concatenated in brace order),
+`entries` (incl. `.`/`..`), `exist?`/`exists?`, `mkdir`/`rmdir`, `chdir`
+(block form restores the cwd), `home`. `Kernel#open(path, mode)` delegates to
+`File.open`.
+
+**Known gaps / divergences:**
+- **No `Errno` hierarchy.** Filesystem failures raise a single
+  `SystemCallError` carrying the OS message, not the specific `Errno::ENOENT` /
+  `Errno::EEXIST` MRI raises. The error is still a rescuable `StandardError`
+  descendant; only the class name differs.
+- **`IO#to_s` returns the `inspect` form** (`#<IO:<STDOUT>>`, `#<File:/path>`)
+  rather than MRI's non-deterministic address form (`#<IO:0x0000…>`). Chosen for
+  a deterministic, testable string; `#inspect` itself is exact.
+- **`Dir.glob` drops a literal `./` prefix.** The `glob` crate normalizes
+  `./a.txt` to `a.txt`, so a pattern like `{sub,.}/*.txt` loses the `./` MRI
+  keeps. `*`, `*.ext`, `**`, `[..]`, and brace patterns all match exactly.
+- **`gets` reads byte-at-a-time** (one syscall per byte) — correct, not tuned
+  for large-file line iteration.
+- **No pipe/command IO** (`open("|cmd")`), no `File.chmod`/`symlink`/`stat`
+  struct, no `IO.select`/`seek`/`pos`/`rewind`/`tell`, no separator/limit args
+  to `gets`/`readlines`. `File`/`IO`/`Dir` are not user-subclassable.
+- **`.localtime`/timezones** are unmodeled elsewhere (see Runtime); file mtimes
+  are not surfaced as `Time` objects.
+
 ## Tooling
 
 - **DAP debugger (`ruby --dap`).** Source-line breakpoints fire inside method,

@@ -74,6 +74,7 @@ fn is_kernel_function(name: &str) -> bool {
             | "p"
             | "pp"
             | "gets"
+            | "open"
             | "require"
             | "require_relative"
             | "load"
@@ -968,6 +969,7 @@ pub(crate) fn dispatch(
         "DateTime" => dispatch_datetime(recv, name, args),
         "Enumerator" => dispatch_enumerator(recv, name, args, block),
         "Fiber" => dispatch_fiber(recv, name, args),
+        "IO" | "File" => dispatch_io(recv, name, args, block),
         "Enumerator::Lazy" => dispatch_lazy(recv, name, args, block),
         "Enumerator::Yielder" => dispatch_yielder(recv, name, args),
         "Rational" => dispatch_rational(recv, name, args),
@@ -1260,6 +1262,19 @@ fn dispatch_classref(
                 };
             }
             _ => {}
+        }
+    }
+    // `File` and `IO` share their class-level surface (`File < IO`): read/write,
+    // the path predicates, `open`, `basename`/`dirname`/`extname`/`join`/
+    // `expand_path`. `Dir` gets its own class-method dispatcher.
+    if cls == "File" || cls == "IO" {
+        if let Some(r) = dispatch_file_class(name, args, block.clone()) {
+            return r;
+        }
+    }
+    if cls == "Dir" {
+        if let Some(r) = dispatch_dir_class(name, args, block.clone()) {
+            return r;
         }
     }
     match name {
@@ -5601,6 +5616,546 @@ fn dispatch_fiber(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Str
     }
 }
 
+// ---- File / IO / Dir ------------------------------------------------------
+
+/// Read a required string argument at index `i` (path/data). Coerces via
+/// `String`-conversion; empty string if absent (callers validate arity above).
+fn str_arg(args: &[Value], i: usize) -> String {
+    args.get(i)
+        .and_then(|a| with_host(|h| h.as_str(a)))
+        .unwrap_or_default()
+}
+
+/// `IOError` carrying `msg` — the raise form used by closed-stream operations.
+fn io_err(msg: &str) -> String {
+    raise_exc("IOError", msg)
+}
+
+/// Map an `errno`-style host error string into a Ruby `Errno::ENOENT`-shaped
+/// `SystemCallError` message. We don't model the full `Errno` hierarchy, so a
+/// generic `SystemCallError` carries the OS text (faithful message, simpler
+/// class).
+fn sys_err(op: &str, path: &str, e: &std::io::Error) -> String {
+    raise_exc("SystemCallError", &format!("{op} - {path}: {e}"))
+}
+
+/// Class methods shared by `File` and `IO`. Returns `None` for a name this
+/// dispatcher doesn't own (so the caller falls through to the generic path).
+fn dispatch_file_class(
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Option<Result<Value, String>> {
+    Some(match name {
+        "read" => {
+            let path = str_arg(args, 0);
+            match std::fs::read_to_string(&path) {
+                Ok(s) => Ok(new_str(s)),
+                Err(e) => Err(sys_err("No such file or directory @ rb_sysopen", &path, &e)),
+            }
+        }
+        "write" => {
+            let path = str_arg(args, 0);
+            let data = str_arg(args, 1);
+            match std::fs::write(&path, data.as_bytes()) {
+                Ok(()) => Ok(Value::Int(data.len() as i64)),
+                Err(e) => Err(sys_err("open", &path, &e)),
+            }
+        }
+        "readlines" => {
+            let path = str_arg(args, 0);
+            match std::fs::read_to_string(&path) {
+                Ok(s) => Ok(new_arr(
+                    s.split_inclusive('\n')
+                        .map(|l| new_str(l.to_string()))
+                        .collect::<Vec<_>>(),
+                )),
+                Err(e) => Err(sys_err("No such file or directory @ rb_sysopen", &path, &e)),
+            }
+        }
+        "foreach" => {
+            let path = str_arg(args, 0);
+            let s = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(sys_err("No such file or directory @ rb_sysopen", &path, &e))),
+            };
+            match &block {
+                Some(bl) => {
+                    for line in s.split_inclusive('\n') {
+                        let lv = new_str(line.to_string());
+                        if let Err(e) = call_proc(bl, std::slice::from_ref(&lv)) {
+                            return Some(Err(e));
+                        }
+                    }
+                    Ok(Value::Undef)
+                }
+                // Block-less `foreach` yields an Enumerator over the lines.
+                None => Ok(with_host(|h| {
+                    let lines: Vec<Value> =
+                        s.split_inclusive('\n').map(|l| h.new_string(l.to_string())).collect();
+                    h.new_enumerator(lines, "each")
+                })),
+            }
+        }
+        "open" => return Some(file_open(args, block)),
+        "exist?" | "exists?" => Ok(Value::Bool(std::path::Path::new(&str_arg(args, 0)).exists())),
+        "file?" => Ok(Value::Bool(std::path::Path::new(&str_arg(args, 0)).is_file())),
+        "directory?" => Ok(Value::Bool(std::path::Path::new(&str_arg(args, 0)).is_dir())),
+        "size" => {
+            let path = str_arg(args, 0);
+            match std::fs::metadata(&path) {
+                Ok(m) => Ok(Value::Int(m.len() as i64)),
+                Err(e) => Err(sys_err("No such file or directory @ rb_file_s_stat", &path, &e)),
+            }
+        }
+        "delete" | "unlink" => {
+            let mut count = 0i64;
+            for a in args {
+                let path = with_host(|h| h.as_str(a)).unwrap_or_default();
+                if let Err(e) = std::fs::remove_file(&path) {
+                    return Some(Err(sys_err("unlink", &path, &e)));
+                }
+                count += 1;
+            }
+            Ok(Value::Int(count))
+        }
+        "basename" => {
+            let ext = args.get(1).and_then(|a| with_host(|h| h.as_str(a)));
+            Ok(new_str(path_basename(&str_arg(args, 0), ext.as_deref())))
+        }
+        "dirname" => Ok(new_str(path_dirname(&str_arg(args, 0)))),
+        "extname" => Ok(new_str(path_extname(&str_arg(args, 0)))),
+        "join" => Ok(new_str(path_join(args))),
+        "expand_path" => {
+            let base = args.get(1).and_then(|a| with_host(|h| h.as_str(a)));
+            Ok(new_str(path_expand(&str_arg(args, 0), base.as_deref())))
+        }
+        _ => return None,
+    })
+}
+
+/// `File.open(path, mode="r")`. With a block: yields the IO, closes it on exit,
+/// returns the block's value. Without: returns the open IO.
+fn file_open(args: &[Value], block: Option<Value>) -> Result<Value, String> {
+    let path = str_arg(args, 0);
+    let mode = args
+        .get(1)
+        .and_then(|a| with_host(|h| h.as_str(a)))
+        .unwrap_or_else(|| "r".to_string());
+    let mut opts = std::fs::OpenOptions::new();
+    match mode.trim_end_matches('b') {
+        "r" | "r+" => {
+            opts.read(true).write(mode.contains('+'));
+        }
+        "w" | "w+" => {
+            opts.write(true).create(true).truncate(true).read(mode.contains('+'));
+        }
+        "a" | "a+" => {
+            opts.append(true).create(true).read(mode.contains('+'));
+        }
+        _ => {
+            opts.read(true);
+        }
+    }
+    let file = opts
+        .open(&path)
+        .map_err(|e| sys_err("No such file or directory @ rb_sysopen", &path, &e))?;
+    let io = crate::host::io_alloc_file(file, path);
+    match block {
+        Some(bl) => {
+            let r = call_proc(&bl, std::slice::from_ref(&io));
+            let _ = crate::host::io_close(&io);
+            r
+        }
+        None => Ok(io),
+    }
+}
+
+/// Instance methods on an `IO`/`File` handle (from `File.open`, or `$stdout`
+/// et al.).
+fn dispatch_io(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    match name {
+        "write" => {
+            let mut total = 0usize;
+            for a in args {
+                let s = display(a);
+                total += crate::host::io_write_str(recv, &s).map_err(|e| io_err(&e))?;
+            }
+            Ok(Value::Int(total as i64))
+        }
+        "<<" => {
+            let s = display(&args[0]);
+            crate::host::io_write_str(recv, &s).map_err(|e| io_err(&e))?;
+            Ok(recv.clone())
+        }
+        "print" => {
+            let mut out = String::new();
+            for a in args {
+                out.push_str(&display(a));
+            }
+            crate::host::io_write_str(recv, &out).map_err(|e| io_err(&e))?;
+            Ok(Value::Undef)
+        }
+        "puts" => {
+            if args.is_empty() {
+                crate::host::io_write_str(recv, "\n").map_err(|e| io_err(&e))?;
+            }
+            for a in args {
+                io_puts_arg(recv, a)?;
+            }
+            Ok(Value::Undef)
+        }
+        "read" => {
+            let s = crate::host::io_read_all(recv).map_err(|e| io_err(&e))?;
+            Ok(new_str(s))
+        }
+        "gets" => crate::host::io_gets(recv).map_err(|e| io_err(&e)),
+        "readlines" => Ok(new_arr(
+            crate::host::io_readlines(recv).map_err(|e| io_err(&e))?,
+        )),
+        "each_line" | "each" => {
+            let lines = crate::host::io_readlines(recv).map_err(|e| io_err(&e))?;
+            match block {
+                Some(bl) => {
+                    for l in &lines {
+                        call_proc(&bl, std::slice::from_ref(l))?;
+                    }
+                    Ok(recv.clone())
+                }
+                None => Ok(with_host(|h| h.new_enumerator(lines, "each"))),
+            }
+        }
+        "close" => {
+            crate::host::io_close(recv).map_err(|e| io_err(&e))?;
+            Ok(Value::Undef)
+        }
+        "closed?" => Ok(Value::Bool(crate::host::io_closed(recv))),
+        "flush" | "sync" | "fsync" => {
+            crate::host::io_flush(recv).map_err(|e| io_err(&e))?;
+            Ok(recv.clone())
+        }
+        "sync=" => Ok(args.first().cloned().unwrap_or(Value::Undef)),
+        "inspect" | "to_s" => Ok(new_str(with_host(|h| h.to_s(recv)))),
+        _ => Err(no_method_error(recv, name)),
+    }
+}
+
+/// `IO#puts` for one argument: arrays flatten (each element on its own line),
+/// scalars get a trailing `\n` only if their string form lacks one.
+fn io_puts_arg(recv: &Value, v: &Value) -> Result<(), String> {
+    if let Some(arr) = with_host(|h| h.as_array(v)) {
+        if arr.is_empty() {
+            crate::host::io_write_str(recv, "\n").map_err(|e| io_err(&e))?;
+        }
+        for e in &arr {
+            io_puts_arg(recv, e)?;
+        }
+    } else {
+        let mut s = display(v);
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
+        crate::host::io_write_str(recv, &s).map_err(|e| io_err(&e))?;
+    }
+    Ok(())
+}
+
+/// Class methods on `Dir`. Returns `None` for names it doesn't own.
+fn dispatch_dir_class(
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Option<Result<Value, String>> {
+    Some(match name {
+        "pwd" | "getwd" => match std::env::current_dir() {
+            Ok(p) => Ok(new_str(p.to_string_lossy().into_owned())),
+            Err(e) => Err(raise_exc("SystemCallError", &e.to_string())),
+        },
+        "glob" | "[]" => {
+            let pat = str_arg(args, 0);
+            Ok(new_arr(dir_glob(&pat).into_iter().map(new_str).collect()))
+        }
+        "entries" => {
+            let path = str_arg(args, 0);
+            match std::fs::read_dir(&path) {
+                Ok(rd) => {
+                    let mut names: Vec<String> = vec![".".to_string(), "..".to_string()];
+                    for e in rd.flatten() {
+                        names.push(e.file_name().to_string_lossy().into_owned());
+                    }
+                    Ok(new_arr(names.into_iter().map(new_str).collect()))
+                }
+                Err(e) => Err(sys_err("No such file or directory @ dir_initialize", &path, &e)),
+            }
+        }
+        "exist?" | "exists?" => {
+            Ok(Value::Bool(std::path::Path::new(&str_arg(args, 0)).is_dir()))
+        }
+        "mkdir" => {
+            let path = str_arg(args, 0);
+            match std::fs::create_dir(&path) {
+                Ok(()) => Ok(Value::Int(0)),
+                Err(e) => Err(sys_err("mkdir", &path, &e)),
+            }
+        }
+        "rmdir" | "delete" | "unlink" => {
+            let path = str_arg(args, 0);
+            match std::fs::remove_dir(&path) {
+                Ok(()) => Ok(Value::Int(0)),
+                Err(e) => Err(sys_err("rmdir", &path, &e)),
+            }
+        }
+        "chdir" => {
+            let path = if args.is_empty() {
+                std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
+            } else {
+                str_arg(args, 0)
+            };
+            if let Err(e) = std::env::set_current_dir(&path) {
+                return Some(Err(sys_err("chdir", &path, &e)));
+            }
+            match &block {
+                // Block form: run the block in the new cwd, restore afterwards,
+                // return the block's value.
+                Some(bl) => {
+                    let prev = std::env::current_dir().ok();
+                    let r = call_proc(bl, &[]);
+                    if let Some(p) = prev {
+                        let _ = std::env::set_current_dir(p);
+                    }
+                    r
+                }
+                None => Ok(Value::Int(0)),
+            }
+        }
+        "home" => Ok(new_str(
+            std::env::var("HOME").unwrap_or_else(|_| "/".to_string()),
+        )),
+        _ => return None,
+    })
+}
+
+/// `Dir.glob` matching. Each `{a,b}` brace alternative is globbed separately,
+/// its matches sorted lexicographically (MRI's default since 3.0), and the
+/// alternatives concatenated in brace order (MRI does not re-sort across the
+/// whole set) with duplicates dropped, keeping first occurrence. Leading-dot
+/// files are excluded from `*`/`?`/`[..]` (MRI default). The `glob` crate has no
+/// brace support, so `brace_expand` handles it. Paths stay relative when the
+/// pattern is relative.
+fn dir_glob(pattern: &str) -> Vec<String> {
+    use glob::{glob_with, MatchOptions};
+    let opts = MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: true,
+    };
+    let mut out: Vec<String> = Vec::new();
+    for pat in brace_expand(pattern) {
+        let mut group: Vec<String> = Vec::new();
+        if let Ok(paths) = glob_with(&pat, opts) {
+            for entry in paths.flatten() {
+                group.push(entry.to_string_lossy().into_owned());
+            }
+        }
+        group.sort();
+        for g in group {
+            if !out.contains(&g) {
+                out.push(g);
+            }
+        }
+    }
+    out
+}
+
+/// Expand one level of `{a,b,c}` brace alternation into concrete patterns
+/// (`x.{rb,txt}` → `["x.rb", "x.txt"]`). No braces → the pattern unchanged.
+fn brace_expand(pattern: &str) -> Vec<String> {
+    let (Some(open), Some(close)) = (pattern.find('{'), pattern.find('}')) else {
+        return vec![pattern.to_string()];
+    };
+    if close < open {
+        return vec![pattern.to_string()];
+    }
+    let prefix = &pattern[..open];
+    let suffix = &pattern[close + 1..];
+    let mut out = Vec::new();
+    for alt in pattern[open + 1..close].split(',') {
+        // Recurse so multiple brace groups all expand.
+        for tail in brace_expand(&format!("{prefix}{alt}{suffix}")) {
+            out.push(tail);
+        }
+    }
+    out
+}
+
+// ---- pure path helpers (File.basename/dirname/extname/join/expand_path) ----
+
+/// The last path component of `path`, trailing slashes stripped (`"/"` stays
+/// `"/"`). Empty string for an empty path.
+fn path_last_component(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        // All slashes (or empty): the root's basename is "/", empty stays empty.
+        return if path.is_empty() { "" } else { "/" };
+    }
+    match trimmed.rfind('/') {
+        Some(i) => &trimmed[i + 1..],
+        None => trimmed,
+    }
+}
+
+/// `File.extname` — the extension including the leading dot, MRI semantics: a
+/// leading-dot name (`.bashrc`) has no extension; a trailing dot yields `"."`;
+/// an all-dots component yields `""`.
+fn path_extname(path: &str) -> String {
+    let base = path_last_component(path);
+    // Index of the first non-dot byte; if none, the component is all dots.
+    let start = match base.bytes().position(|b| b != b'.') {
+        Some(i) => i,
+        None => return String::new(),
+    };
+    // The last dot at or after `start` is the extension boundary.
+    match base[start..].rfind('.') {
+        Some(rel) => base[start + rel..].to_string(),
+        None => String::new(),
+    }
+}
+
+/// `File.basename(path[, suffix])`. `suffix == ".*"` strips whatever extension
+/// `extname` finds; any other suffix is stripped only when it is a trailing
+/// match that leaves a non-empty stem.
+fn path_basename(path: &str, suffix: Option<&str>) -> String {
+    let base = path_last_component(path);
+    match suffix {
+        None => base.to_string(),
+        Some(".*") => {
+            let ext = path_extname(base);
+            if ext.is_empty() {
+                base.to_string()
+            } else {
+                base[..base.len() - ext.len()].to_string()
+            }
+        }
+        Some(sfx) => {
+            if base != sfx && base.ends_with(sfx) {
+                base[..base.len() - sfx.len()].to_string()
+            } else {
+                base.to_string()
+            }
+        }
+    }
+}
+
+/// `File.dirname` — everything before the last component. No slash → `"."`;
+/// the root → `"/"`.
+fn path_dirname(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return if path.is_empty() { ".".to_string() } else { "/".to_string() };
+    }
+    match trimmed.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(i) => trimmed[..i].to_string(),
+        None => ".".to_string(),
+    }
+}
+
+/// `File.join(*parts)` — join with `/`, collapsing so exactly one slash sits
+/// between adjacent parts. No parts → `""`.
+fn path_join(parts: &[Value]) -> String {
+    let strs: Vec<String> = parts
+        .iter()
+        .map(|p| with_host(|h| h.as_str(p)).unwrap_or_default())
+        .collect();
+    let mut it = strs.into_iter();
+    let mut s = match it.next() {
+        Some(first) => first,
+        None => return String::new(),
+    };
+    for p in it {
+        let left = s.ends_with('/');
+        let right = p.starts_with('/');
+        match (left, right) {
+            (true, true) => s.push_str(&p[1..]),
+            (false, false) => {
+                s.push('/');
+                s.push_str(&p);
+            }
+            _ => s.push_str(&p),
+        }
+    }
+    s
+}
+
+/// `File.expand_path(path[, base])` — purely lexical (no filesystem access):
+/// expands a leading `~`, resolves against `base` (default cwd), and collapses
+/// `.`/`..`. Absolute result, no trailing slash except the root.
+fn path_expand(path: &str, base: Option<&str>) -> String {
+    let expanded = expand_tilde(path);
+    let combined = if expanded.starts_with('/') {
+        expanded
+    } else {
+        // Resolve `base` (itself possibly relative or `~`) against the cwd first.
+        let base_raw = base
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "/".to_string())
+            });
+        let base_abs = if base_raw.is_empty() {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "/".to_string())
+        } else {
+            path_expand(&base_raw, None)
+        };
+        if expanded.is_empty() {
+            base_abs
+        } else {
+            format!("{base_abs}/{expanded}")
+        }
+    };
+    normalize_abs(&combined)
+}
+
+/// Expand a leading `~` (`~` → `$HOME`, `~/x` → `$HOME/x`). Other forms (`~user`)
+/// are left untouched.
+fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        std::env::var("HOME").unwrap_or_else(|_| "~".to_string())
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+        format!("{home}/{rest}")
+    } else {
+        path.to_string()
+    }
+}
+
+/// Collapse `.`/`..`/empty segments of an absolute path into a canonical form.
+fn normalize_abs(path: &str) -> String {
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    if stack.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", stack.join("/"))
+    }
+}
+
 /// A block-based generator (`Enumerator.new { |y| ... }`). Terminal operations
 /// re-drive the block; `next`/`peek` materialize it to completion once.
 fn dispatch_generator(
@@ -7326,6 +7881,9 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             })
         }
         "pp" => kernel("p", args, block),
+        // `Kernel#open(path, mode="r")` delegates to `File.open` for a plain
+        // path (no pipe/`|command` support).
+        "open" => file_open(args, block),
         "require" | "require_relative" | "load" => Ok(Value::Bool(true)),
         // AOP: `intercept(pattern, kind, handler)` registers `handler` (a method
         // name) to run as :before/:after/:around advice on any called method whose

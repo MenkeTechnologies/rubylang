@@ -287,6 +287,14 @@ pub enum RObj {
     Fiber {
         id: u32,
     },
+    /// An `IO`/`File` object. Holds only an index into `RubyHost.io_handles`;
+    /// the underlying `std::fs::File` is neither `Clone` nor storable inline in
+    /// this `#[derive(Clone)]` enum, so it lives in the side table exactly like
+    /// `fibers`. The cell's discriminant decides whether `class` is `IO` (the
+    /// standard streams) or `File` (a `File.open` handle).
+    IoHandle {
+        id: u32,
+    },
     /// A `Time`, stored as seconds since the Unix epoch (a float, so
     /// sub-second precision and `Time - Time` Float differences are faithful).
     /// Always interpreted as UTC — the local-timezone offset is not modeled
@@ -548,6 +556,36 @@ pub struct RubyHost {
     /// for the duration of `resume` so the fiber body can re-enter `with_host`
     /// without a double mutable borrow.
     fibers: Vec<FiberCell>,
+    /// Live `IO`/`File` objects, indexed by `RObj::IoHandle.id`. Slots 0/1/2 are
+    /// pre-seeded with the standard streams (`STDOUT`/`STDERR`/`STDIN`).
+    io_handles: Vec<IoCell>,
+}
+
+/// One live `IO`/`File` object, indexed by `RObj::IoHandle.id`. The three
+/// standard streams are represented structurally (they route to the process
+/// stdio); `File` holds the owned `std::fs::File` (`None` once closed) and the
+/// path used for `#inspect`. `std::fs::File` is not `Clone`, so — like the
+/// coroutines in `fibers` — it cannot live inside the `RObj` value enum and
+/// sits here instead.
+pub enum IoCell {
+    Stdout,
+    Stderr,
+    Stdin,
+    File {
+        file: Option<std::fs::File>,
+        path: String,
+    },
+}
+
+impl IoCell {
+    /// The Ruby class name for this handle: `File` for a file handle, `IO` for a
+    /// standard stream (matching MRI, where `File < IO` but the streams are `IO`).
+    fn class_name(&self) -> &'static str {
+        match self {
+            IoCell::File { .. } => "File",
+            _ => "IO",
+        }
+    }
 }
 
 /// One suspended fiber. `coro` is `None` only while this fiber is actively
@@ -601,7 +639,7 @@ impl Default for RubyHost {
 
 impl RubyHost {
     pub fn new() -> Self {
-        RubyHost {
+        let mut h = RubyHost {
             heap: Vec::new(),
             frames: vec![Frame {
                 scope: Scope {
@@ -629,12 +667,26 @@ impl RubyHost {
             enum_sinks: Vec::new(),
             around_stack: Vec::new(),
             fibers: Vec::new(),
+            io_handles: vec![IoCell::Stdout, IoCell::Stderr, IoCell::Stdin],
             struct_defs: IndexMap::new(),
             struct_counter: 0,
             class_vars: IndexMap::new(),
             define_methods: IndexMap::new(),
             method_aliases: IndexMap::new(),
-        }
+        };
+        // Seed the standard streams as `STDOUT`/`STDERR`/`STDIN` constants and
+        // the `$stdout`/`$stderr`/`$stdin` globals. Slots 0/1/2 in `io_handles`
+        // hold the corresponding `IoCell`s (see the field initializer above).
+        let stdout = h.alloc(RObj::IoHandle { id: 0 });
+        let stderr = h.alloc(RObj::IoHandle { id: 1 });
+        let stdin = h.alloc(RObj::IoHandle { id: 2 });
+        h.set_const("STDOUT", stdout.clone());
+        h.set_const("STDERR", stderr.clone());
+        h.set_const("STDIN", stdin.clone());
+        h.set_global("stdout", stdout);
+        h.set_global("stderr", stderr);
+        h.set_global("stdin", stdin);
+        h
     }
 
     /// Record `v` as frozen (`Object#freeze`). Immediates and symbols are
@@ -1949,12 +2001,33 @@ impl RubyHost {
                 | "Math"
                 | "JSON"
                 | "Fiber"
+                | "File"
+                | "Dir"
+                | "IO"
         )
     }
     pub fn classref_name(&self, v: &Value) -> Option<String> {
         match self.obj(v) {
             Some(RObj::ClassRef(n)) => Some(n.clone()),
             _ => None,
+        }
+    }
+    /// The `#inspect` string for an IO/File handle (id into `io_handles`):
+    /// `#<IO:<STDOUT>>` for the standard streams, `#<File:/path>` for an open
+    /// file, `#<File:/path (closed)>` once closed. Matches MRI's `IO#inspect`.
+    fn io_inspect_str(&self, id: u32) -> String {
+        match self.io_handles.get(id as usize) {
+            Some(IoCell::Stdout) => "#<IO:<STDOUT>>".to_string(),
+            Some(IoCell::Stderr) => "#<IO:<STDERR>>".to_string(),
+            Some(IoCell::Stdin) => "#<IO:<STDIN>>".to_string(),
+            Some(IoCell::File { file, path }) => {
+                if file.is_some() {
+                    format!("#<File:{path}>")
+                } else {
+                    format!("#<File:{path} (closed)>")
+                }
+            }
+            None => "#<IO:(invalid)>".to_string(),
         }
     }
     /// Look up `method` on `class`, walking the ancestor chain (own methods,
@@ -2290,6 +2363,7 @@ impl RubyHost {
                 }
                 Some(RObj::Yielder { .. }) => "#<Enumerator::Yielder>".to_string(),
                 Some(RObj::Fiber { .. }) => "#<Fiber (created)>".to_string(),
+                Some(RObj::IoHandle { id }) => self.io_inspect_str(id),
                 Some(RObj::Range { lo, hi, exclusive }) => {
                     format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
                 }
@@ -2447,6 +2521,11 @@ impl RubyHost {
                 Some(RObj::Generator { .. }) => "Enumerator",
                 Some(RObj::Yielder { .. }) => "Enumerator::Yielder",
                 Some(RObj::Fiber { .. }) => "Fiber",
+                Some(RObj::IoHandle { id }) => self
+                    .io_handles
+                    .get(*id as usize)
+                    .map(|c| c.class_name())
+                    .unwrap_or("IO"),
                 Some(RObj::Time { .. }) => "Time",
                 Some(RObj::Date { .. }) => "Date",
                 Some(RObj::DateTime { .. }) => "DateTime",
@@ -3656,6 +3735,167 @@ pub fn fiber_alive(fiber: &Value) -> bool {
         Some(RObj::Fiber { id }) => with_host(|h| !h.fibers[id as usize].done),
         _ => false,
     }
+}
+
+// ---- IO / File side table -------------------------------------------------
+
+/// Register an owned `std::fs::File` (opened by `File.open`/`File.read`/…) in the
+/// host side table and return a fresh `IoHandle` value pointing at it.
+pub fn io_alloc_file(file: std::fs::File, path: String) -> Value {
+    with_host(|h| {
+        let id = h.io_handles.len() as u32;
+        h.io_handles.push(IoCell::File {
+            file: Some(file),
+            path,
+        });
+        h.alloc(RObj::IoHandle { id })
+    })
+}
+
+/// The `io_handles` index behind an `IoHandle` value, if `v` is one.
+fn io_id(v: &Value) -> Option<u32> {
+    match with_host(|h| h.obj(v).cloned()) {
+        Some(RObj::IoHandle { id }) => Some(id),
+        _ => None,
+    }
+}
+
+/// Whether this handle is closed (`File#closed?`). Standard streams never close.
+pub fn io_closed(v: &Value) -> bool {
+    match io_id(v) {
+        Some(id) => with_host(|h| {
+            matches!(
+                h.io_handles.get(id as usize),
+                Some(IoCell::File { file: None, .. })
+            )
+        }),
+        None => false,
+    }
+}
+
+/// `IO#write` for one already-stringified chunk; returns the byte count written.
+pub fn io_write_str(v: &Value, s: &str) -> Result<usize, String> {
+    use std::io::Write;
+    let id = io_id(v).ok_or("not an IO")?;
+    with_host(|h| match h.io_handles.get_mut(id as usize) {
+        Some(IoCell::Stdout) => {
+            let mut o = std::io::stdout();
+            o.write_all(s.as_bytes())
+                .and_then(|_| o.flush())
+                .map(|_| s.len())
+                .map_err(|e| e.to_string())
+        }
+        Some(IoCell::Stderr) => {
+            let mut o = std::io::stderr();
+            o.write_all(s.as_bytes())
+                .and_then(|_| o.flush())
+                .map(|_| s.len())
+                .map_err(|e| e.to_string())
+        }
+        Some(IoCell::Stdin) => Err("not opened for writing".to_string()),
+        Some(IoCell::File { file: Some(f), .. }) => f
+            .write_all(s.as_bytes())
+            .map(|_| s.len())
+            .map_err(|e| e.to_string()),
+        Some(IoCell::File { file: None, .. }) => Err("closed stream".to_string()),
+        None => Err("not an IO".to_string()),
+    })
+}
+
+/// `IO#read` (no length): read everything remaining from the current position.
+pub fn io_read_all(v: &Value) -> Result<String, String> {
+    use std::io::Read;
+    let id = io_id(v).ok_or("not an IO")?;
+    with_host(|h| {
+        let mut s = String::new();
+        match h.io_handles.get_mut(id as usize) {
+            Some(IoCell::File { file: Some(f), .. }) => {
+                f.read_to_string(&mut s).map_err(|e| e.to_string())?;
+                Ok(s)
+            }
+            Some(IoCell::File { file: None, .. }) => Err("closed stream".to_string()),
+            Some(IoCell::Stdin) => {
+                std::io::stdin()
+                    .read_to_string(&mut s)
+                    .map_err(|e| e.to_string())?;
+                Ok(s)
+            }
+            Some(IoCell::Stdout) | Some(IoCell::Stderr) => Err("not opened for reading".to_string()),
+            None => Err("not an IO".to_string()),
+        }
+    })
+}
+
+/// `IO#gets`: read one line up to and including the next `\n` (or EOF). Returns
+/// nil at EOF. Byte-oriented so the file cursor advances line by line.
+pub fn io_gets(v: &Value) -> Result<Value, String> {
+    use std::io::Read;
+    let id = io_id(v).ok_or("not an IO")?;
+    with_host(|h| {
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            let mut one = [0u8; 1];
+            let n = match h.io_handles.get_mut(id as usize) {
+                Some(IoCell::File { file: Some(f), .. }) => f.read(&mut one),
+                Some(IoCell::File { file: None, .. }) => return Err("closed stream".to_string()),
+                Some(IoCell::Stdin) => std::io::stdin().read(&mut one),
+                Some(IoCell::Stdout) | Some(IoCell::Stderr) => {
+                    return Err("not opened for reading".to_string())
+                }
+                None => return Err("not an IO".to_string()),
+            };
+            match n {
+                Ok(0) => break,
+                Ok(_) => {
+                    buf.push(one[0]);
+                    if one[0] == b'\n' {
+                        break;
+                    }
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        if buf.is_empty() {
+            Ok(Value::Undef)
+        } else {
+            Ok(h.new_string(String::from_utf8_lossy(&buf).into_owned()))
+        }
+    })
+}
+
+/// `IO#readlines`/`#each_line`: the remaining lines, each keeping its `\n`.
+pub fn io_readlines(v: &Value) -> Result<Vec<Value>, String> {
+    let all = io_read_all(v)?;
+    Ok(with_host(|h| {
+        all.split_inclusive('\n')
+            .map(|l| h.new_string(l.to_string()))
+            .collect()
+    }))
+}
+
+/// `IO#close`: drop the underlying file (idempotent). A no-op for the standard
+/// streams (MRI lets you close them, but we keep the process stdio intact).
+pub fn io_close(v: &Value) -> Result<(), String> {
+    let id = io_id(v).ok_or("not an IO")?;
+    with_host(|h| {
+        if let Some(IoCell::File { file, .. }) = h.io_handles.get_mut(id as usize) {
+            *file = None;
+        }
+    });
+    Ok(())
+}
+
+/// `IO#flush`: flush the underlying stream. Returns unit; the caller returns the
+/// IO object (MRI's `flush` returns `self`).
+pub fn io_flush(v: &Value) -> Result<(), String> {
+    use std::io::Write;
+    let id = io_id(v).ok_or("not an IO")?;
+    with_host(|h| match h.io_handles.get_mut(id as usize) {
+        Some(IoCell::Stdout) => std::io::stdout().flush().map_err(|e| e.to_string()),
+        Some(IoCell::Stderr) => std::io::stderr().flush().map_err(|e| e.to_string()),
+        Some(IoCell::File { file: Some(f), .. }) => f.flush().map_err(|e| e.to_string()),
+        _ => Ok(()),
+    })
 }
 
 /// Like `call_proc`, but `self_override` (when given) rebinds `self` inside the
