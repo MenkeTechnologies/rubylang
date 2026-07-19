@@ -2544,6 +2544,13 @@ fn dispatch_number(
                         if r.is_negative() {
                             return Err(raise_exc("ZeroDivisionError", "divided by 0"));
                         }
+                        // 0 ** positive-Rational is the exact Rational zero (0/1),
+                        // not a Float — the exponent is a Rational.
+                        let zero = num_rational::BigRational::new(
+                            num_bigint::BigInt::from(0),
+                            one(),
+                        );
+                        return Ok(with_host(|h| h.new_rational(zero)));
                     }
                 }
                 if base == one() {
@@ -2562,14 +2569,22 @@ fn dispatch_number(
                 }
                 if (base > one() || base < num_bigint::BigInt::from(-1))
                     && int_arg(&args[0]).is_none()
-                    && with_host(|h| h.as_bigint(&args[0]).map(|e| e > one()).unwrap_or(false))
+                    && with_host(|h| h.as_bigint(&args[0]).map(|e| e.abs() > one()).unwrap_or(false))
                 {
+                    // An integer exponent of EITHER sign that overflows i64 makes
+                    // base**exp (or its Rational reciprocal) too large to build.
                     return Err(raise_exc("ArgumentError", "exponent is too large"));
                 }
             }
             // Integer ** non-negative Integer stays an exact Integer (promoting
             // to BigInt on overflow), like Ruby.
             if let (Some(base), Some(exp)) = (with_host(|h| h.as_bigint(recv)), int_arg(&args[0])) {
+                // |base| >= 2 here (0 / ±1 short-circuited above). An exponent
+                // magnitude that overflows u32 can't be materialized — Ruby raises,
+                // and it would otherwise truncate in the `as u32` cast below.
+                if exp.unsigned_abs() > u32::MAX as u64 {
+                    return Err(raise_exc("ArgumentError", "exponent is too large"));
+                }
                 if exp >= 0 {
                     let r = base.pow(exp as u32);
                     return Ok(with_host(|h| h.new_bigint(r)));
