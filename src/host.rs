@@ -68,6 +68,16 @@ impl std::fmt::Debug for Scope {
     }
 }
 
+/// `Op::Extended` ids that are NOT builtin dispatches — the DAP debug
+/// line-marker. Its id namespace is `Op::Extended(id, _)`, independent of the
+/// `ops` builtin ids below (which are dispatched via the extension handler
+/// registered by `install`); the marker is a no-op unless the DAP debug hook is
+/// installed, so normal runs ignore it.
+pub mod ext {
+    /// Per-statement source-line marker emitted only in `--dap` compile mode.
+    pub const DBG_LINE: u16 = 1;
+}
+
 /// Builtin ids emitted by the compiler and registered on every VM.
 pub mod ops {
     pub const GETLOCAL: u16 = 1; // [name] -> value

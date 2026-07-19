@@ -135,7 +135,9 @@ impl Parser {
     }
 
     /// A body: statements until one of the given block-terminating keywords.
-    fn body_until(&mut self, terms: &[&str]) -> Result<Vec<Expr>, String> {
+    /// Each statement carries its 1-based source line, so `--dap` can set a
+    /// breakpoint on any line inside a method/block/loop body.
+    fn body_until(&mut self, terms: &[&str]) -> Result<Vec<Stmt>, String> {
         let mut out = Vec::new();
         self.skip_terms();
         while !matches!(self.peek(), Tok::Eof) {
@@ -144,7 +146,9 @@ impl Parser {
                     break;
                 }
             }
-            out.push(self.statement()?);
+            let line = self.line();
+            let expr = self.statement()?;
+            out.push(Stmt { expr, line });
             self.skip_terms();
         }
         Ok(out)
@@ -178,7 +182,7 @@ impl Parser {
                 let cond = self.expr()?;
                 e = Expr::If {
                     cond: Box::new(cond),
-                    then: vec![e],
+                    then: vec![e.into()],
                     elifs: vec![],
                     els: None,
                 };
@@ -186,7 +190,7 @@ impl Parser {
                 let cond = self.expr()?;
                 e = Expr::If {
                     cond: Box::new(Expr::Unary(UnOp::Not, Box::new(cond))),
-                    then: vec![e],
+                    then: vec![e.into()],
                     elifs: vec![],
                     els: None,
                 };
@@ -201,7 +205,7 @@ impl Parser {
                     },
                     Err(e) => Expr::While {
                         cond: Box::new(cond),
-                        body: vec![e],
+                        body: vec![e.into()],
                     },
                 };
             } else if self.eat_kw("until") {
@@ -213,18 +217,18 @@ impl Parser {
                     },
                     Err(e) => Expr::While {
                         cond: Box::new(Expr::Unary(UnOp::Not, Box::new(cond))),
-                        body: vec![e],
+                        body: vec![e.into()],
                     },
                 };
             } else if self.eat_kw("rescue") {
                 // `expr rescue fallback` — a bare rescue catching StandardError.
                 let handler = self.expr()?;
                 e = Expr::Begin {
-                    body: vec![e],
+                    body: vec![e.into()],
                     rescues: vec![Rescue {
                         classes: vec![],
                         binding: None,
-                        body: vec![handler],
+                        body: vec![handler.into()],
                     }],
                     ensure: None,
                 };
@@ -321,11 +325,11 @@ impl Parser {
         while self.eat_kw("rescue") {
             let handler = self.ternary()?;
             e = Expr::Begin {
-                body: vec![e],
+                body: vec![e.into()],
                 rescues: vec![Rescue {
                     classes: vec![],
                     binding: None,
-                    body: vec![handler],
+                    body: vec![handler.into()],
                 }],
                 ensure: None,
             };
@@ -341,9 +345,9 @@ impl Parser {
             let els = self.ternary()?;
             return Ok(Expr::If {
                 cond: Box::new(cond),
-                then: vec![then],
+                then: vec![then.into()],
                 elifs: vec![],
-                els: Some(vec![els]),
+                els: Some(vec![els.into()]),
             });
         }
         Ok(cond)
@@ -545,14 +549,15 @@ impl Parser {
                             args: vec![],
                             block: None,
                         }),
-                        then: vec![Expr::Nil],
+                        then: vec![Expr::Nil.into()],
                         elifs: vec![],
                         els: Some(vec![Expr::Call {
                             recv: Some(Box::new(Expr::Var(VarKind::Local, tmp))),
                             name,
                             args,
                             block,
-                        }]),
+                        }
+                        .into()]),
                     };
                 } else {
                     e = Expr::Call {
@@ -711,7 +716,7 @@ impl Parser {
                 *amp_block = Some(Block {
                     params: vec!["__symargs__".into()],
                     splat: Some(0),
-                    body: vec![call],
+                    body: vec![call.into()],
                 });
                 return Ok(());
             }
@@ -727,7 +732,7 @@ impl Parser {
             *amp_block = Some(Block {
                 params: vec!["__blkx__".into()],
                 splat: None,
-                body: vec![call],
+                body: vec![call.into()],
             });
             return Ok(());
         }
@@ -768,7 +773,9 @@ impl Parser {
             let mut body = Vec::new();
             self.skip_terms();
             while !self.is_op("}") && !matches!(self.peek(), Tok::Eof) {
-                body.push(self.statement()?);
+                let line = self.line();
+                let expr = self.statement()?;
+                body.push(Stmt { expr, line });
                 self.skip_terms();
             }
             self.expect_op("}")?;
@@ -784,12 +791,13 @@ impl Parser {
 
     /// Prepend the destructuring `preludes` (parallel-assignment unpackings) to
     /// the block `body`, so `(a, b)` parameters are unpacked before the body runs.
-    fn prepend_preludes(&self, mut preludes: Vec<Expr>, body: Vec<Expr>) -> Vec<Expr> {
+    fn prepend_preludes(&self, preludes: Vec<Expr>, body: Vec<Stmt>) -> Vec<Stmt> {
         if preludes.is_empty() {
             return body;
         }
-        preludes.extend(body);
-        preludes
+        let mut out: Vec<Stmt> = preludes.into_iter().map(Stmt::from).collect();
+        out.extend(body);
+        out
     }
 
     /// Parse a block/lambda parameter list, returning the flat parameter names,
@@ -1573,7 +1581,7 @@ impl Parser {
     }
 
     /// Parse the `rescue …` clauses and optional `ensure …` after a body.
-    fn rescue_tail(&mut self) -> Result<(Vec<Rescue>, Option<Vec<Expr>>), String> {
+    fn rescue_tail(&mut self) -> Result<(Vec<Rescue>, Option<Vec<Stmt>>), String> {
         let mut rescues = Vec::new();
         while self.eat_kw("rescue") {
             let mut classes = Vec::new();
@@ -1635,11 +1643,12 @@ impl Parser {
         // Endless method definition (Ruby 3+): `def name(params) = expression`.
         // The body is a single expression and there is no `end`.
         if self.eat_op("=") {
+            let line = self.line();
             let expr = self.statement()?;
             return Ok(Expr::Def {
                 name,
                 params,
-                body: vec![expr],
+                body: vec![Stmt { expr, line }],
                 singleton,
             });
         }
@@ -1656,7 +1665,7 @@ impl Parser {
     /// A method body that may carry a bare `rescue`/`ensure` (implicit `begin`),
     /// stopping at `end`. If any rescue/ensure clause is present, the body is
     /// wrapped in a `Begin` node.
-    fn body_with_rescue(&mut self) -> Result<Vec<Expr>, String> {
+    fn body_with_rescue(&mut self) -> Result<Vec<Stmt>, String> {
         let body = self.body_until(&["rescue", "ensure", "end"])?;
         let (rescues, ensure) = self.rescue_tail()?;
         if rescues.is_empty() && ensure.is_none() {
@@ -1666,7 +1675,8 @@ impl Parser {
                 body,
                 rescues,
                 ensure,
-            }])
+            }
+            .into()])
         }
     }
 
@@ -1848,14 +1858,14 @@ impl Parser {
 /// A plain `begin … end` (no `rescue`/`ensure`) unwraps to its statement list.
 /// A `begin … rescue/ensure … end` is kept whole as a single body statement so
 /// its exception handling still fires each iteration.
-fn do_while_body(e: Expr) -> Result<Vec<Expr>, Expr> {
+fn do_while_body(e: Expr) -> Result<Vec<Stmt>, Expr> {
     match e {
         Expr::Begin {
             body,
             rescues,
             ensure,
         } if rescues.is_empty() && ensure.is_none() => Ok(body),
-        e @ Expr::Begin { .. } => Ok(vec![e]),
+        e @ Expr::Begin { .. } => Ok(vec![e.into()]),
         other => Err(other),
     }
 }

@@ -60,7 +60,7 @@ pub struct Block {
     /// Index into `params` of a `*rest` splat parameter, if any (collects the
     /// surplus positional args into an array).
     pub splat: Option<usize>,
-    pub body: Vec<Expr>,
+    pub body: Vec<Stmt>,
 }
 
 /// A Ruby expression.
@@ -102,40 +102,40 @@ pub enum Expr {
     /// `cond ? then : else`, and `if`/`unless`/modifier forms.
     If {
         cond: Box<Expr>,
-        then: Vec<Expr>,
-        elifs: Vec<(Expr, Vec<Expr>)>,
-        els: Option<Vec<Expr>>,
+        then: Vec<Stmt>,
+        elifs: Vec<(Expr, Vec<Stmt>)>,
+        els: Option<Vec<Stmt>>,
     },
     /// `while`/`until` (until is parsed as `while !cond`).
     While {
         cond: Box<Expr>,
-        body: Vec<Expr>,
+        body: Vec<Stmt>,
     },
     /// `begin … end while cond` / `begin … end until cond` — a post-test loop:
     /// the body runs at least once, then the condition is checked (until is
     /// parsed as `while !cond`).
     DoWhile {
         cond: Box<Expr>,
-        body: Vec<Expr>,
+        body: Vec<Stmt>,
     },
     /// `for v in iter … end`.
     For {
         var: String,
         iter: Box<Expr>,
-        body: Vec<Expr>,
+        body: Vec<Stmt>,
     },
     /// `case subj; when …; else …; end`.
     Case {
         subject: Box<Expr>,
-        whens: Vec<(Vec<Expr>, Vec<Expr>)>,
-        els: Option<Vec<Expr>>,
+        whens: Vec<(Vec<Expr>, Vec<Stmt>)>,
+        els: Option<Vec<Stmt>>,
     },
     /// `case subj; in pattern [if guard]; body; … end` — structural pattern
     /// matching (Ruby 3). An absent `else` raises `NoMatchingPatternError`.
     CaseIn {
         subject: Box<Expr>,
         clauses: Vec<InClause>,
-        els: Option<Vec<Expr>>,
+        els: Option<Vec<Stmt>>,
     },
 
     /// A call. `recv` is `None` for a bare/self call (`puts x`, `foo`).
@@ -153,28 +153,28 @@ pub enum Expr {
     Def {
         name: String,
         params: Vec<Param>,
-        body: Vec<Expr>,
+        body: Vec<Stmt>,
         singleton: bool,
     },
     /// `class Name [< Super] … end`.
     Class {
         name: String,
         superclass: Option<String>,
-        body: Vec<Expr>,
+        body: Vec<Stmt>,
     },
     /// `module Name … end` (treated as a namespace of methods for now).
     Module {
         name: String,
-        body: Vec<Expr>,
+        body: Vec<Stmt>,
     },
     /// `self`.
     SelfExpr,
 
     /// `begin … rescue [Class] [=> e] … ensure … end`.
     Begin {
-        body: Vec<Expr>,
+        body: Vec<Stmt>,
         rescues: Vec<Rescue>,
-        ensure: Option<Vec<Expr>>,
+        ensure: Option<Vec<Stmt>>,
     },
 
     Return(Option<Box<Expr>>),
@@ -197,7 +197,7 @@ pub enum Expr {
     Regex(String, String),
     /// `class << self … end` — a singleton-class body. Its `def`s become class
     /// (singleton) methods of the enclosing class, equivalent to `def self.x`.
-    SingletonClass(Vec<Expr>),
+    SingletonClass(Vec<Stmt>),
 }
 
 /// One `in pattern [if/unless guard]` clause of a `case/in`.
@@ -206,7 +206,7 @@ pub struct InClause {
     pub pattern: Pattern,
     /// A trailing `if cond` (or `unless cond`, stored pre-negated) guard.
     pub guard: Option<Expr>,
-    pub body: Vec<Expr>,
+    pub body: Vec<Stmt>,
 }
 
 /// A structural pattern for `case/in`.
@@ -276,7 +276,7 @@ pub struct Rescue {
     pub classes: Vec<String>,
     /// Optional `=> name` binding for the caught exception.
     pub binding: Option<String>,
-    pub body: Vec<Expr>,
+    pub body: Vec<Stmt>,
 }
 
 /// A top-level statement. Ruby is expression-oriented; this is a thin wrapper so
@@ -285,4 +285,13 @@ pub struct Rescue {
 pub struct Stmt {
     pub expr: Expr,
     pub line: u32,
+}
+
+impl From<Expr> for Stmt {
+    /// Wrap an `Expr` as a synthetic statement (line 0). Used for desugared /
+    /// pattern-lowered bodies that have no source line; the debug marker skips
+    /// line-0 statements so they never become spurious breakpoint targets.
+    fn from(expr: Expr) -> Stmt {
+        Stmt { expr, line: 0 }
+    }
 }

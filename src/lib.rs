@@ -26,7 +26,13 @@ pub use fusevm::Value;
 /// Compile a source string to a runnable program.
 pub fn compile(src: &str) -> Result<compiler::Program, String> {
     let stmts = parser::parse(src)?;
-    compiler::compile(&stmts)
+    compiler::compile(&stmts, false)
+}
+
+/// Compile with per-statement DAP line markers enabled (`ruby --dap`).
+pub fn compile_debug(src: &str) -> Result<compiler::Program, String> {
+    let stmts = parser::parse(src)?;
+    compiler::compile(&stmts, true)
 }
 
 /// Parse, compile, load, and run a Ruby source string on a fresh host; return

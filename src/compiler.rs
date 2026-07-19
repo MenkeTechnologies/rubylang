@@ -40,16 +40,20 @@ pub struct Compiler {
     loops: Vec<LoopCtx>,
     /// Monotonic counter for unique temporaries (`case/in` subject slots).
     tmp: usize,
+    /// When true (`--dap`), emit a per-statement `Op::Extended(DBG_LINE)` marker
+    /// carrying the source line so the debugger can pause at statement
+    /// boundaries. Off for normal runs — zero extra ops in the chunk.
+    debug: bool,
 }
 
-/// Compile a parsed program.
-pub fn compile(stmts: &[Stmt]) -> Result<Program, String> {
-    let mut c = Compiler::default();
+/// Compile a parsed program. `debug` enables per-statement DAP line markers.
+pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
+    let mut c = Compiler {
+        debug,
+        ..Default::default()
+    };
     let mut b = ChunkBuilder::new();
-    c.compile_seq(
-        &mut b,
-        &stmts.iter().map(|s| s.expr.clone()).collect::<Vec<_>>(),
-    )?;
+    c.compile_seq(&mut b, stmts)?;
     Ok(Program {
         main: b.build(),
         methods: c.methods,
@@ -60,15 +64,19 @@ pub fn compile(stmts: &[Stmt]) -> Result<Program, String> {
 }
 
 impl Compiler {
-    /// Compile a sequence of expressions as a body: each value but the last is
+    /// Compile a sequence of statements as a body: each value but the last is
     /// popped; the last is left on the stack (Ruby's "value is the last expr").
-    fn compile_seq(&mut self, b: &mut ChunkBuilder, body: &[Expr]) -> Result<(), String> {
+    /// In debug mode each statement is preceded by a line marker.
+    fn compile_seq(&mut self, b: &mut ChunkBuilder, body: &[Stmt]) -> Result<(), String> {
         if body.is_empty() {
             b.emit(Op::LoadUndef, 0);
             return Ok(());
         }
-        for (i, e) in body.iter().enumerate() {
-            self.compile_expr(b, e)?;
+        for (i, s) in body.iter().enumerate() {
+            if self.debug && s.line != 0 {
+                b.emit(Op::Extended(crate::host::ext::DBG_LINE, 0), s.line);
+            }
+            self.compile_expr(b, &s.expr)?;
             if i + 1 < body.len() {
                 b.emit(Op::Pop, 0);
             }
@@ -78,7 +86,7 @@ impl Compiler {
 
     /// Compile a method: a prologue that fills in any defaulted parameter the
     /// caller omitted (`defined?(p) ? p : <default>`), then the body.
-    fn compile_method(&mut self, params: &[Param], body: &[Expr]) -> Result<MethodDef, String> {
+    fn compile_method(&mut self, params: &[Param], body: &[Stmt]) -> Result<MethodDef, String> {
         let saved = std::mem::take(&mut self.loops);
         let mut b = ChunkBuilder::new();
         for p in params {
@@ -123,7 +131,7 @@ impl Compiler {
         })
     }
 
-    fn compile_body_chunk(&mut self, body: &[Expr]) -> Result<Chunk, String> {
+    fn compile_body_chunk(&mut self, body: &[Stmt]) -> Result<Chunk, String> {
         // A method/proc body is its own chunk; a native-loop context from the
         // enclosing chunk does not cross into it (break/next become signals).
         let saved = std::mem::take(&mut self.loops);
@@ -582,9 +590,9 @@ impl Compiler {
         &mut self,
         b: &mut ChunkBuilder,
         cond: &Expr,
-        then: &[Expr],
-        elifs: &[(Expr, Vec<Expr>)],
-        els: &Option<Vec<Expr>>,
+        then: &[Stmt],
+        elifs: &[(Expr, Vec<Stmt>)],
+        els: &Option<Vec<Stmt>>,
     ) -> Result<(), String> {
         let mut end_jumps = Vec::new();
         // primary
@@ -621,7 +629,7 @@ impl Compiler {
         &mut self,
         b: &mut ChunkBuilder,
         cond: &Expr,
-        body: &[Expr],
+        body: &[Stmt],
     ) -> Result<(), String> {
         let start = b.current_pos();
         self.loops.push(LoopCtx {
@@ -656,7 +664,7 @@ impl Compiler {
         &mut self,
         b: &mut ChunkBuilder,
         cond: &Expr,
-        body: &[Expr],
+        body: &[Stmt],
     ) -> Result<(), String> {
         let body_start = b.current_pos();
         self.loops.push(LoopCtx {
@@ -687,7 +695,7 @@ impl Compiler {
         b: &mut ChunkBuilder,
         var: &str,
         iter: &Expr,
-        body: &[Expr],
+        body: &[Stmt],
     ) -> Result<(), String> {
         // `for v in iter … end` ≡ `iter.each { |v| … }` (block shares the frame,
         // so `v` and any assignments leak, matching Ruby's `for`).
@@ -713,7 +721,7 @@ impl Compiler {
         b: &mut ChunkBuilder,
         subject: &Expr,
         clauses: &[InClause],
-        els: &Option<Vec<Expr>>,
+        els: &Option<Vec<Stmt>>,
     ) -> Result<(), String> {
         self.tmp += 1;
         let tmp = format!("__casein{}__", self.tmp);
@@ -769,8 +777,8 @@ impl Compiler {
         &mut self,
         b: &mut ChunkBuilder,
         subject: &Expr,
-        whens: &[(Vec<Expr>, Vec<Expr>)],
-        els: &Option<Vec<Expr>>,
+        whens: &[(Vec<Expr>, Vec<Stmt>)],
+        els: &Option<Vec<Stmt>>,
     ) -> Result<(), String> {
         // Bind the subject to a synthetic local so it is evaluated once.
         let tmp = "__case__";
@@ -922,7 +930,7 @@ impl Compiler {
     /// Compile a body into a proc template with the given params; return its id.
     fn compile_proc_body(
         &mut self,
-        body: &[Expr],
+        body: &[Stmt],
         params: &[String],
         splat: Option<usize>,
     ) -> Result<usize, String> {
@@ -945,7 +953,7 @@ impl Compiler {
         b: &mut ChunkBuilder,
         name: &str,
         superclass: &Option<String>,
-        body: &[Expr],
+        body: &[Stmt],
     ) -> Result<(), String> {
         let mut methods: indexmap::IndexMap<String, MethodDef> = indexmap::IndexMap::new();
         let mut class_methods: indexmap::IndexMap<String, MethodDef> = indexmap::IndexMap::new();
@@ -955,9 +963,9 @@ impl Compiler {
         // Class-body statements that aren't defs/attrs/includes (e.g. `@@x = 0`,
         // constant assignments) run at class-definition time with `self` bound to
         // the class.
-        let mut init_body: Vec<Expr> = Vec::new();
+        let mut init_body: Vec<Stmt> = Vec::new();
         for stmt in body {
-            match stmt {
+            match &stmt.expr {
                 Expr::Def {
                     name,
                     params,
@@ -1034,13 +1042,13 @@ impl Compiler {
                     for s in inner {
                         if let Expr::Def {
                             name, params, body, ..
-                        } = s
+                        } = &s.expr
                         {
                             class_methods.insert(name.clone(), self.compile_method(params, body)?);
                         }
                     }
                 }
-                other => init_body.push(other.clone()),
+                _ => init_body.push(stmt.clone()),
             }
         }
         // Compile the leftover body as a synthetic class method so it can run with
@@ -1112,9 +1120,9 @@ impl Compiler {
     fn compile_begin(
         &mut self,
         b: &mut ChunkBuilder,
-        body: &[Expr],
+        body: &[Stmt],
         rescues: &[Rescue],
-        ensure: &Option<Vec<Expr>>,
+        ensure: &Option<Vec<Stmt>>,
     ) -> Result<(), String> {
         let body_id = self.compile_proc_body(body, &[], None)?;
         let mut rdefs = Vec::new();
@@ -1475,7 +1483,7 @@ fn lower_find_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
     // idx != nil
     let scan = Expr::If {
         cond: Box::new(pand(pcall(idx.clone(), "nil?", vec![]), pred)),
-        then: vec![Expr::Assign(Box::new(idx.clone()), Box::new(s.clone()))],
+        then: vec![Expr::Assign(Box::new(idx.clone()), Box::new(s.clone())).into()],
         elifs: vec![],
         els: None,
     };
@@ -1491,14 +1499,14 @@ fn lower_find_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
         block: Some(Block {
             params: vec![s_name],
             splat: None,
-            body: vec![scan],
+            body: vec![scan.into()],
         }),
     };
     let found = Expr::Begin {
         body: vec![
-            Expr::Assign(Box::new(idx.clone()), Box::new(Expr::Nil)),
-            each,
-            Expr::Binary(BinOp::Ne, Box::new(idx.clone()), Box::new(Expr::Nil)),
+            Expr::Assign(Box::new(idx.clone()), Box::new(Expr::Nil)).into(),
+            each.into(),
+            Expr::Binary(BinOp::Ne, Box::new(idx.clone()), Box::new(Expr::Nil)).into(),
         ],
         rescues: vec![],
         ensure: None,
