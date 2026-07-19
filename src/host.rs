@@ -2266,6 +2266,13 @@ impl RubyHost {
                 | "IO"
                 | "TCPServer"
                 | "TCPSocket"
+                | "SecureRandom"
+                | "Base64"
+                | "Digest"
+                | "Digest::MD5"
+                | "Digest::SHA1"
+                | "Digest::SHA256"
+                | "OpenStruct"
         )
     }
     pub fn classref_name(&self, v: &Value) -> Option<String> {
@@ -2667,6 +2674,18 @@ impl RubyHost {
                 Some(RObj::Object { class, ivars }) => {
                     // A struct prints `#<struct Name a=1, b=2>`; an exception
                     // object prints its message; other objects show their class.
+                    // OpenStruct#to_s aliases inspect (`#<OpenStruct a=1, b=2>`).
+                    if class == "OpenStruct" {
+                        let body: Vec<String> = ivars
+                            .iter()
+                            .map(|(k, val)| format!("{k}={}", self.inspect(&val.clone())))
+                            .collect();
+                        return if body.is_empty() {
+                            "#<OpenStruct>".to_string()
+                        } else {
+                            format!("#<OpenStruct {}>", body.join(", "))
+                        };
+                    }
                     if let Some((members, _)) = self.struct_def(&class) {
                         let parts: Vec<String> = members
                             .iter()
@@ -2727,6 +2746,18 @@ impl RubyHost {
                     }
                     out.push('>');
                     out
+                }
+                // `OpenStruct#inspect`: `#<OpenStruct a=1, b=2>` (ivars in order).
+                Some(RObj::Object { class, ivars }) if class == "OpenStruct" => {
+                    let body: Vec<String> = ivars
+                        .iter()
+                        .map(|(k, val)| format!("{k}={}", self.inspect(&val.clone())))
+                        .collect();
+                    if body.is_empty() {
+                        "#<OpenStruct>".to_string()
+                    } else {
+                        format!("#<OpenStruct {}>", body.join(", "))
+                    }
                 }
                 _ => self.to_s(v),
             },
@@ -3288,6 +3319,23 @@ impl RubyHost {
                             let bv = self.ivar_of(b, m);
                             self.eq_values(ix.get(m).unwrap_or(&Value::Undef), &bv)
                         })
+                    }
+                    // Two OpenStructs are equal when they carry the same
+                    // attributes (name→value), order-independent like MRI.
+                    (
+                        Some(RObj::Object {
+                            class: cx,
+                            ivars: ix,
+                        }),
+                        Some(RObj::Object {
+                            class: cy,
+                            ivars: iy,
+                        }),
+                    ) if cx == "OpenStruct" && cy == "OpenStruct" => {
+                        ix.len() == iy.len()
+                            && ix
+                                .iter()
+                                .all(|(k, v)| iy.get(k).is_some_and(|w| self.eq_values(v, w)))
                     }
                     _ => matches!((a, b), (Value::Obj(i), Value::Obj(j)) if i == j),
                 }

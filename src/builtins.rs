@@ -1012,6 +1012,22 @@ pub(crate) fn dispatch(
                 {
                     return Ok(Value::Bool(true));
                 }
+                // OpenStruct responds to a current attribute's reader and writer,
+                // plus the container methods. A writer for a not-yet-set field is
+                // not reported (MRI only adds it once assigned).
+                if cls == "OpenStruct" {
+                    let field = m.trim_end_matches('=');
+                    let has = with_host(|h| {
+                        h.ivar_names(recv)
+                            .iter()
+                            .any(|n| n.trim_start_matches('@') == field)
+                    });
+                    let always = matches!(
+                        m.as_str(),
+                        "to_h" | "each_pair" | "each" | "[]" | "[]=" | "dig" | "members"
+                    );
+                    return Ok(Value::Bool(has || always));
+                }
                 return Ok(Value::Bool(false));
             }
             // Built-in receivers are otherwise permissive, but the pattern-match
@@ -1215,6 +1231,19 @@ fn dispatch_classref(
             _ => {}
         }
     }
+    // `OpenStruct.new(field: val, ...)` — a struct whose attributes are set from
+    // the (optional) initial hash and grow dynamically. State lives in ivars.
+    if cls == "OpenStruct" && name == "new" {
+        let obj = with_host(|h| h.new_object("OpenStruct"));
+        if let Some(map) = args.first().and_then(|a| with_host(|h| h.as_hash(a))) {
+            for (k, v) in map {
+                let kv = with_host(|h| h.key_value(&k));
+                let field = name_of(&kv);
+                with_host(|h| h.set_ivar_of(&obj, &field, v.clone()));
+            }
+        }
+        return Ok(obj);
+    }
     // `Time` constructors. All produce a UTC time (the local-timezone offset is
     // not modeled). `Time.at(n)` wraps epoch seconds; `Time.utc`/`Time.gm`
     // build from broken-down UTC fields; `Time.now` reads the system clock.
@@ -1381,6 +1410,12 @@ fn dispatch_classref(
             }
             _ => {}
         }
+    }
+    // Dependency-free stdlib modules: SecureRandom, Base64, Digest::{MD5,SHA1,
+    // SHA256}, OpenStruct. Each is reached as a class-method send on the module
+    // reference (`SecureRandom.hex(8)`, `Base64.encode64(s)`, `Digest::MD5`).
+    if let Some(r) = dispatch_stdlib_module(cls, name, args) {
+        return r;
     }
     // `File` and `IO` share their class-level surface (`File < IO`): read/write,
     // the path predicates, `open`, `basename`/`dirname`/`extname`/`join`/
@@ -1755,6 +1790,13 @@ fn dispatch_object(
     // Enumerable module: `map`, `select`, `reduce`, … derived from the class's `each`.
     if with_host(|h| h.is_a(recv, "Enumerable")) {
         if let Some(r) = enumerable_method(recv, name, args, block.clone())? {
+            return Ok(r);
+        }
+    }
+    // OpenStruct: dynamic attribute get/set plus `to_h`/`[]`/`[]=`/`each_pair`/…,
+    // stored as the object's ivars. An unknown reader returns nil (never raises).
+    if cls == "OpenStruct" {
+        if let Some(r) = openstruct_method(recv, name, args, block.clone())? {
             return Ok(r);
         }
     }
@@ -8602,6 +8644,530 @@ fn kernel_rand(args: &[Value]) -> Value {
         Some(Value::Int(n)) if *n > 0 => Value::Int((z % (*n as u64)) as i64),
         // Top 53 bits give a uniform double in [0, 1), like Ruby's `rand`.
         _ => Value::Float((z >> 11) as f64 / (1u64 << 53) as f64),
+    }
+}
+
+// ---- Stdlib modules: SecureRandom / Base64 / Digest / OpenStruct -----------
+//
+// All dependency-free and MRI-faithful. Digest and Base64 are deterministic and
+// verified byte-for-byte against the reference `ruby`; SecureRandom draws from
+// the same thread-local SplitMix64 that backs `rand`, so its outputs are the
+// right shape/length/format but not cryptographically strong (documented).
+
+/// `n` pseudo-random bytes from the SplitMix64 PRNG (shared with `rand`).
+fn secure_random_bytes(n: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        for b in rng_next().to_le_bytes() {
+            if out.len() < n {
+                out.push(b);
+            }
+        }
+    }
+    out
+}
+
+const B64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Base64-encode `data` with the chosen alphabet. `pad` appends `=` padding.
+fn base64_encode_bytes(data: &[u8], alphabet: &[u8; 64], pad: bool) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(alphabet[((n >> 18) & 63) as usize] as char);
+        out.push(alphabet[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(alphabet[((n >> 6) & 63) as usize] as char);
+        } else if pad {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(alphabet[(n & 63) as usize] as char);
+        } else if pad {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Base64-decode, accepting both the standard and URL-safe alphabets and
+/// skipping whitespace (lenient, covering `decode64`/`strict_decode64`/urlsafe).
+fn base64_decode_bytes(s: &str) -> Vec<u8> {
+    let val = |c: u8| -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    };
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    let mut out = Vec::new();
+    for &c in s.as_bytes() {
+        if c == b'=' {
+            break;
+        }
+        let Some(v) = val(c) else { continue };
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// MRI `Base64.encode64`: standard alphabet, padded, wrapped every 60 output
+/// chars with `\n`, and a trailing `\n` (empty input yields `""`).
+fn base64_encode64(data: &[u8]) -> String {
+    let raw = base64_encode_bytes(data, B64_STD, true);
+    if raw.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(raw.len() + raw.len() / 60 + 1);
+    for (i, c) in raw.chars().enumerate() {
+        if i > 0 && i % 60 == 0 {
+            out.push('\n');
+        }
+        out.push(c);
+    }
+    out.push('\n');
+    out
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 15) as u32, 16).unwrap());
+    }
+    s
+}
+
+/// MD5 (RFC 1321), pure Rust, returns the 16-byte digest.
+fn md5_digest(msg: &[u8]) -> [u8; 16] {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const K: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+        0xeb86d391,
+    ];
+    let (mut a0, mut b0, mut c0, mut d0): (u32, u32, u32, u32) =
+        (0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476);
+    let mut data = msg.to_vec();
+    let bit_len = (msg.len() as u64).wrapping_mul(8);
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&bit_len.to_le_bytes());
+    for block in data.chunks(64) {
+        let mut m = [0u32; 16];
+        for (i, w) in m.iter_mut().enumerate() {
+            *w = u32::from_le_bytes([
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
+            ]);
+        }
+        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+        for i in 0..64 {
+            let (f, g) = match i {
+                0..=15 => ((b & c) | (!b & d), i),
+                16..=31 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            let f = f
+                .wrapping_add(a)
+                .wrapping_add(K[i])
+                .wrapping_add(m[g]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(f.rotate_left(S[i]));
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&a0.to_le_bytes());
+    out[4..8].copy_from_slice(&b0.to_le_bytes());
+    out[8..12].copy_from_slice(&c0.to_le_bytes());
+    out[12..16].copy_from_slice(&d0.to_le_bytes());
+    out
+}
+
+/// SHA-1 (FIPS 180-4), pure Rust, returns the 20-byte digest.
+fn sha1_digest(msg: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let mut data = msg.to_vec();
+    let bit_len = (msg.len() as u64).wrapping_mul(8);
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&bit_len.to_be_bytes());
+    for block in data.chunks(64) {
+        let mut w = [0u32; 80];
+        for (i, word) in w.iter_mut().take(16).enumerate() {
+            *word = u32::from_be_bytes([
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
+            ]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    let mut out = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// SHA-256 (FIPS 180-4), pure Rust, returns the 32-byte digest.
+fn sha256_digest(msg: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut data = msg.to_vec();
+    let bit_len = (msg.len() as u64).wrapping_mul(8);
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&bit_len.to_be_bytes());
+    for block in data.chunks(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in w.iter_mut().take(16).enumerate() {
+            *word = u32::from_be_bytes([
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let mut v = h;
+        for i in 0..64 {
+            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+            let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
+            let t1 = v[7]
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+            let t2 = s0.wrapping_add(maj);
+            v[7] = v[6];
+            v[6] = v[5];
+            v[5] = v[4];
+            v[4] = v[3].wrapping_add(t1);
+            v[3] = v[2];
+            v[2] = v[1];
+            v[1] = v[0];
+            v[0] = t1.wrapping_add(t2);
+        }
+        for (hi, vi) in h.iter_mut().zip(v.iter()) {
+            *hi = hi.wrapping_add(*vi);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// The raw digest for a `Digest::<ALGO>` module reference.
+fn digest_of(algo: &str, data: &[u8]) -> Vec<u8> {
+    match algo {
+        "Digest::MD5" => md5_digest(data).to_vec(),
+        "Digest::SHA1" => sha1_digest(data).to_vec(),
+        _ => sha256_digest(data).to_vec(),
+    }
+}
+
+/// Class-method dispatch for the dependency-free stdlib modules. Returns `None`
+/// when `cls` is not one of them (so normal class-ref dispatch continues).
+fn dispatch_stdlib_module(
+    cls: &str,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let str_arg = |i: usize| -> Vec<u8> {
+        args.get(i)
+            .and_then(|a| with_host(|h| h.as_str(a)))
+            .unwrap_or_default()
+            .into_bytes()
+    };
+    match cls {
+        // `Digest` namespace: `Digest::MD5` etc. resolve to the sub-module ref.
+        "Digest" => match name {
+            "MD5" | "SHA1" | "SHA256" => {
+                Some(Ok(with_host(|h| h.class_ref(&format!("Digest::{name}")))))
+            }
+            "hexencode" => Some(Ok(new_str(hex_encode(&str_arg(0))))),
+            _ => None,
+        },
+        "Digest::MD5" | "Digest::SHA1" | "Digest::SHA256" => match name {
+            "hexdigest" => Some(Ok(new_str(hex_encode(&digest_of(cls, &str_arg(0)))))),
+            "digest" => Some(Ok(new_str(
+                String::from_utf8_lossy(&digest_of(cls, &str_arg(0))).into_owned(),
+            ))),
+            "base64digest" => Some(Ok(new_str(base64_encode_bytes(
+                &digest_of(cls, &str_arg(0)),
+                B64_STD,
+                true,
+            )))),
+            _ => None,
+        },
+        "SecureRandom" => Some(dispatch_secure_random(name, args)),
+        "Base64" => match name {
+            "encode64" => Some(Ok(new_str(base64_encode64(&str_arg(0))))),
+            "strict_encode64" => {
+                Some(Ok(new_str(base64_encode_bytes(&str_arg(0), B64_STD, true))))
+            }
+            "urlsafe_encode64" => {
+                // MRI defaults padding to true; `padding: false` drops the `=`.
+                let pad = args
+                    .get(1)
+                    .and_then(|a| with_host(|h| h.as_hash(a)))
+                    .and_then(|m| m.get(&RKey::Sym("padding".to_string())).cloned())
+                    .map(|v| with_host(|h| h.truthy(&v)))
+                    .unwrap_or(true);
+                Some(Ok(new_str(base64_encode_bytes(&str_arg(0), B64_URL, pad))))
+            }
+            "decode64" | "strict_decode64" | "urlsafe_decode64" => {
+                let s = args
+                    .first()
+                    .and_then(|a| with_host(|h| h.as_str(a)))
+                    .unwrap_or_default();
+                Some(Ok(new_str(
+                    String::from_utf8_lossy(&base64_decode_bytes(&s)).into_owned(),
+                )))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `SecureRandom.*` — shape-faithful, drawn from the shared SplitMix64 PRNG.
+fn dispatch_secure_random(name: &str, args: &[Value]) -> Result<Value, String> {
+    let n = |dflt: usize| args.first().map(|a| as_i(a).max(0) as usize).unwrap_or(dflt);
+    match name {
+        "hex" => Ok(new_str(hex_encode(&secure_random_bytes(n(16))))),
+        "bytes" => Ok(new_str(
+            String::from_utf8_lossy(&secure_random_bytes(n(16))).into_owned(),
+        )),
+        "base64" => Ok(new_str(base64_encode_bytes(
+            &secure_random_bytes(n(16)),
+            B64_STD,
+            true,
+        ))),
+        "urlsafe_base64" => Ok(new_str(base64_encode_bytes(
+            &secure_random_bytes(n(16)),
+            B64_URL,
+            false,
+        ))),
+        "uuid" => {
+            let mut b = secure_random_bytes(16);
+            b[6] = (b[6] & 0x0f) | 0x40; // version 4
+            b[8] = (b[8] & 0x3f) | 0x80; // variant 10
+            let h = hex_encode(&b);
+            Ok(new_str(format!(
+                "{}-{}-{}-{}-{}",
+                &h[0..8],
+                &h[8..12],
+                &h[12..16],
+                &h[16..20],
+                &h[20..32],
+            )))
+        }
+        "alphanumeric" => {
+            const CH: &[u8; 62] =
+                b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+            let len = n(16);
+            let s: String = (0..len)
+                .map(|_| CH[(rng_next() % 62) as usize] as char)
+                .collect();
+            Ok(new_str(s))
+        }
+        "random_number" => {
+            let z = rng_next();
+            let unit = (z >> 11) as f64 / (1u64 << 53) as f64;
+            match args.first() {
+                Some(Value::Int(m)) if *m > 0 => Ok(Value::Int((z % (*m as u64)) as i64)),
+                Some(Value::Float(f)) if *f > 0.0 => Ok(Value::Float(unit * f)),
+                _ => Ok(Value::Float(unit)),
+            }
+        }
+        _ => Err(raise_exc(
+            "NoMethodError",
+            &format!("undefined method '{name}' for SecureRandom"),
+        )),
+    }
+}
+
+/// OpenStruct instance methods: dynamic reader/writer plus the container API.
+/// State lives in the object's ivars (bare attribute names). Returns `Ok(None)`
+/// when `name` is not one OpenStruct handles here.
+fn openstruct_method(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Option<Value>, String> {
+    // Ordered (name, value) pairs, restoring insertion order from the ivars.
+    let pairs = || -> Vec<(String, Value)> {
+        with_host(|h| {
+            h.ivar_names(recv)
+                .iter()
+                .map(|n| {
+                    let bare = n.trim_start_matches('@').to_string();
+                    let v = h.ivar_of(recv, &bare);
+                    (bare, v)
+                })
+                .collect()
+        })
+    };
+    match name {
+        // `os.foo = v` — a writer (the parser routes `foo=` here). Restricted to
+        // identifier-like setters so operator names (`[]=`, `==`, `>=`) fall
+        // through to their own arms below.
+        _ if name.ends_with('=')
+            && !args.is_empty()
+            && name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_') =>
+        {
+            let field = &name[..name.len() - 1];
+            with_host(|h| h.set_ivar_of(recv, field, args[0].clone()));
+            Ok(Some(args[0].clone()))
+        }
+        "[]" => {
+            let field = name_of(&args[0]);
+            Ok(Some(with_host(|h| h.ivar_of(recv, &field))))
+        }
+        "[]=" => {
+            let field = name_of(&args[0]);
+            with_host(|h| h.set_ivar_of(recv, &field, args[1].clone()));
+            Ok(Some(args[1].clone()))
+        }
+        "to_h" => {
+            let mut map = IndexMap::new();
+            for (k, v) in pairs() {
+                map.insert(RKey::Sym(k), v);
+            }
+            Ok(Some(with_host(|h| h.new_hash(map))))
+        }
+        "each_pair" | "each" => {
+            if let Some(bl) = block {
+                for (k, v) in pairs() {
+                    let key = with_host(|h| h.new_symbol(&k));
+                    call_proc(&bl, &[key, v])?;
+                }
+            }
+            Ok(Some(recv.clone()))
+        }
+        "members" => Ok(Some(new_arr(
+            pairs()
+                .iter()
+                .map(|(k, _)| with_host(|h| h.new_symbol(k)))
+                .collect(),
+        ))),
+        "dig" => {
+            let field = name_of(&args[0]);
+            let v = with_host(|h| h.ivar_of(recv, &field));
+            if args.len() > 1 && !matches!(v, Value::Undef) {
+                Ok(Some(dispatch(&v, "dig", &args[1..], None)?))
+            } else {
+                Ok(Some(v))
+            }
+        }
+        // Any other bare name is a dynamic reader: return the field or nil.
+        _ if !name.ends_with('?')
+            && !name.ends_with('!')
+            && args.is_empty()
+            && block.is_none() =>
+        {
+            Ok(Some(with_host(|h| h.ivar_of(recv, name))))
+        }
+        _ => Ok(None),
     }
 }
 

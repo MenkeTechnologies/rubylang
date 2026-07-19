@@ -337,6 +337,46 @@ Honest limitations of this surface:
   `deconstruct_keys` honours a requested-key filter (returning only the named
   members, in the requested order) or all members when passed `nil`.
 
+## Stdlib modules (SecureRandom / Digest / Base64 / OpenStruct)
+
+Dependency-free, verified against the reference `ruby`.
+
+- **`Digest::MD5`/`Digest::SHA1`/`Digest::SHA256`** — hand-written MD5 (RFC 1321),
+  SHA-1 and SHA-256 (FIPS 180-4), no crate. `hexdigest`, `digest` (raw bytes),
+  and `base64digest` are supported and match MRI byte-for-byte on ASCII/UTF-8
+  input (`Digest::SHA256.hexdigest("abc")` → the reference vector). `Digest`
+  resolves the `::MD5`/`::SHA1`/`::SHA256` sub-module refs; `Digest.hexencode`
+  hex-encodes a string.
+- **`Base64`** — `encode64` (60-char line wrap + trailing `\n`, matching
+  `[str].pack("m")`), `strict_encode64`, `urlsafe_encode64` (padding defaults to
+  true; `padding: false` drops the `=`), `decode64`/`strict_decode64`/
+  `urlsafe_decode64` (lenient: both alphabets accepted, whitespace skipped, `=`
+  terminates). Byte-exact vs MRI on ASCII/UTF-8.
+- **`SecureRandom`** — `hex`, `base64`, `urlsafe_base64`, `uuid` (v4, correct
+  version/variant nibbles), `alphanumeric`, `bytes`, and `random_number`
+  (`Integer` → `[0, n)` Integer, `Float` → `[0, n)` Float, no-arg → `[0, 1)`
+  Float). **Not cryptographically secure**: it draws from the same thread-local
+  SplitMix64 that backs `Kernel#rand`, so outputs are the right shape, length,
+  and format but not CSPRNG-grade (there is no OS entropy source wired in). This
+  is a deliberate dependency-free tradeoff, not a silent one.
+- **`OpenStruct`** — dynamic attributes stored as the object's ivars.
+  `OpenStruct.new(a: 1)`, reader `os.a`, writer `os.a = 2` (creates the field),
+  unknown reader → `nil`, `os[:a]`/`os[:a] = v`, `to_h`, `each_pair`/`each`,
+  `members`, `dig`, `respond_to?` (true for a set attribute's reader and writer
+  plus the container methods; a writer for an unset field is not reported, as in
+  MRI), `inspect`/`to_s` (`#<OpenStruct a=1, b=2>`), and
+  attribute-wise `==` (order-independent, also inside Arrays/Hashes).
+
+**Limitations.** (1) `Digest`/`Base64`/`SecureRandom` operate on a String's UTF-8
+bytes. rubylang stores a `"\xNN"` source escape as the Unicode code point U+00NN
+(UTF-8-encoded), not a single raw byte like MRI's ASCII-8BIT, so hashing/encoding
+a string built from non-ASCII byte escapes differs from MRI. Pure ASCII/UTF-8
+text is byte-exact. (2) The streaming `Digest` instance API
+(`Digest::MD5.new.update(...).hexdigest`) is not implemented — only the
+class-level one-shot `hexdigest`/`digest`/`base64digest`. (3) A setter-symbol
+literal (`:x=`) does not parse (pre-existing lexer gap); use a String
+(`os.respond_to?("a=")`) or a non-setter symbol.
+
 ## File / IO / Dir
 
 Backed by `std::fs`/`std::io`, verified method-by-method against the reference

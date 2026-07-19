@@ -4017,3 +4017,122 @@ fn instance_exec_passes_arguments() {
         "12",
     );
 }
+
+// ---- stdlib modules: Digest / Base64 / SecureRandom / OpenStruct ----------
+
+#[test]
+fn digest_hexdigest_matches_reference() {
+    // Deterministic vectors verified byte-for-byte against MRI `ruby`.
+    eq(
+        "Digest::MD5.hexdigest(\"abc\")",
+        "\"900150983cd24fb0d6963f7d28e17f72\"",
+    );
+    eq(
+        "Digest::MD5.hexdigest(\"\")",
+        "\"d41d8cd98f00b204e9800998ecf8427e\"",
+    );
+    eq(
+        "Digest::SHA1.hexdigest(\"abc\")",
+        "\"a9993e364706816aba3e25717850c26c9cd0d89d\"",
+    );
+    eq(
+        "Digest::SHA1.hexdigest(\"\")",
+        "\"da39a3ee5e6b4b0d3255bfef95601890afd80709\"",
+    );
+    eq(
+        "Digest::SHA256.hexdigest(\"abc\")",
+        "\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\"",
+    );
+    eq(
+        "Digest::SHA256.hexdigest(\"The quick brown fox jumps over the lazy dog\")",
+        "\"d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592\"",
+    );
+    eq(
+        "Digest::SHA256.base64digest(\"abc\")",
+        "\"ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=\"",
+    );
+}
+
+#[test]
+fn base64_encode_decode_matches_reference() {
+    eq("Base64.encode64(\"hello\")", "\"aGVsbG8=\\n\"");
+    eq("Base64.encode64(\"\")", "\"\"");
+    eq(
+        "Base64.strict_encode64(\"hello world\")",
+        "\"aGVsbG8gd29ybGQ=\"",
+    );
+    // Line-wrap at 60 output chars with a trailing newline.
+    eq(
+        "Base64.encode64(\"a\" * 50)",
+        "\"YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh\\nYWFhYWE=\\n\"",
+    );
+    eq(
+        "Base64.urlsafe_encode64(\"subjects?_d\")",
+        "\"c3ViamVjdHM_X2Q=\"",
+    );
+    eq(
+        "Base64.urlsafe_encode64(\"subjects?_d\", padding: false)",
+        "\"c3ViamVjdHM_X2Q\"",
+    );
+    eq("Base64.decode64(\"aGVsbG8=\\n\")", "\"hello\"");
+    eq("Base64.strict_decode64(\"aGVsbG8=\")", "\"hello\"");
+    eq("Base64.urlsafe_decode64(\"c3ViamVjdHM_X2Q=\")", "\"subjects?_d\"");
+    // Round-trip.
+    eq(
+        "Base64.strict_decode64(Base64.strict_encode64(\"round trip!\"))",
+        "\"round trip!\"",
+    );
+}
+
+#[test]
+fn securerandom_shapes() {
+    // Random output can't match MRI byte-for-byte; assert length/format instead.
+    eq("SecureRandom.hex(8).length == 16", "true");
+    eq("SecureRandom.hex.length == 32", "true");
+    eq("SecureRandom.hex(8) =~ /\\A[0-9a-f]{16}\\z/ ? true : false", "true");
+    eq(
+        "SecureRandom.uuid =~ /\\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\z/ ? true : false",
+        "true",
+    );
+    eq("SecureRandom.alphanumeric(20).length == 20", "true");
+    eq(
+        "SecureRandom.alphanumeric(20) =~ /\\A[0-9A-Za-z]{20}\\z/ ? true : false",
+        "true",
+    );
+    eq("SecureRandom.base64(6).length == 8", "true");
+    eq("SecureRandom.random_number(100).between?(0, 99)", "true");
+    eq("SecureRandom.random_number.class == Float", "true");
+    eq(
+        "n = SecureRandom.random_number(5.0); n >= 0.0 && n < 5.0",
+        "true",
+    );
+}
+
+#[test]
+fn openstruct_dynamic_attributes() {
+    eq("OpenStruct.new(a: 1, b: 2).a", "1");
+    eq("os = OpenStruct.new(a: 1); os.a = 9; os.a", "9");
+    // A new attribute is created on assignment; unknown readers return nil.
+    eq("os = OpenStruct.new; os.x = 5; os.x", "5");
+    eq("OpenStruct.new(a: 1).z", "nil");
+    eq("OpenStruct.new(a: 1, b: 2).to_h", "{a: 1, b: 2}");
+    eq("os = OpenStruct.new(a: 1, b: 2); os[:b]", "2");
+    eq("os = OpenStruct.new; os[:k] = 7; os.k", "7");
+    eq("OpenStruct.new(a: 1, b: 2).members", "[:a, :b]");
+    eq("OpenStruct.new(a: 1).respond_to?(:a)", "true");
+    eq("OpenStruct.new(a: 1).respond_to?(:z)", "false");
+    // A writer responds only for an already-set attribute (MRI semantics).
+    eq("OpenStruct.new(a: 1).respond_to?(\"a=\")", "true");
+    eq("OpenStruct.new(a: 1).respond_to?(\"x=\")", "false");
+    eq("OpenStruct.new(a: 1, b: 2).inspect", "\"#<OpenStruct a=1, b=2>\"");
+    eq("OpenStruct.new.inspect", "\"#<OpenStruct>\"");
+    // Attribute-wise equality, order-independent, including inside collections.
+    eq("OpenStruct.new(a: 1, b: 2) == OpenStruct.new(a: 1, b: 2)", "true");
+    eq("OpenStruct.new(a: 1) == OpenStruct.new(a: 2)", "false");
+    eq("[OpenStruct.new(a: 1)] == [OpenStruct.new(a: 1)]", "true");
+    // Nested dig.
+    eq(
+        "OpenStruct.new(a: OpenStruct.new(b: 5)).dig(:a, :b)",
+        "5",
+    );
+}
