@@ -329,7 +329,9 @@ Honest limitations of this surface:
 - **`Array#pack` / `String#unpack`** are not implemented: strings are UTF-8
   (`String`, not a byte buffer), so the binary directives (`N`/`n`/`V`/`v`/`H`,
   high `C` bytes) cannot round-trip. This is a durable encoding limitation, not a
-  temporary gap.
+  temporary gap. Same root cause: `Integer#chr` for a value in `128..255` returns
+  the UTF-8 code point `U+00NN` (a two-byte `String`) rather than MRI's single
+  ASCII-8BIT byte whose `inspect` is `"\xNN"` — there is no binary-string type.
 - **`defined?`.** The `defined?(expr)` / `defined? expr` operator returns the
   Ruby description string (`"local-variable"`, `"instance-variable"`,
   `"global-variable"`, `"constant"`, `"method"`, `"assignment"`, `"expression"`,

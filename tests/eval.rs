@@ -4454,3 +4454,82 @@ fn dir_and_env_builtins() {
     eq("require \"tmpdir\"; Dir.tmpdir.is_a?(String)", "true");
     eq("require \"tmpdir\"; Dir.respond_to?(:mktmpdir)", "true");
 }
+
+#[test]
+fn string_new_is_a_real_mutable_string() {
+    // `String.new` / `String.new("x")` must produce a real mutable String
+    // (backed by the same representation as a literal), not an opaque object.
+    eq("String.new", "\"\"");
+    eq("String.new(\"x\")", "\"x\"");
+    eq("String.new.length", "0");
+    eq("String.new(\"x\").length", "1");
+    eq("a = String.new; a << \"hi\"; a << \"!\"; a", "\"hi!\"");
+    eq("String.new(\"ab\") + \"cd\"", "\"abcd\"");
+    eq("String.new(\"hi\").upcase", "\"HI\"");
+}
+
+#[test]
+fn array_reverse_each() {
+    // Block form yields elements in reverse, returns the receiver.
+    eq("r = []; [1,2,3].reverse_each { |x| r << x }; r", "[3, 2, 1]");
+    // Block-less form is a reverse Enumerator (chainable).
+    eq("[1,2,3].reverse_each.to_a", "[3, 2, 1]");
+    eq("[1,2,3].reverse_each.map { |x| x * 2 }", "[6, 4, 2]");
+    // Enumerable derives it for a user class with its own `each`.
+    eq(
+        "class C1; include Enumerable; def initialize(*a); @a=a; end; \
+         def each(&b); @a.each(&b); end; end; C1.new(1,2,3).reverse_each.to_a",
+        "[3, 2, 1]",
+    );
+}
+
+#[test]
+fn kernel_warn_returns_nil() {
+    // `warn` writes to $stderr and returns nil; no error, multiple args allowed.
+    eq("warn(\"a\", \"b\")", "nil");
+    eq("warn", "nil");
+    eq("x = warn(\"msg\"); x.nil?", "true");
+}
+
+#[test]
+fn array_reverse_bang_and_uniq_bang() {
+    // In-place reverse returns the receiver, mutated.
+    eq("[3,1,2].reverse!", "[2, 1, 3]");
+    eq("x = [3,1,2]; x.reverse!; x", "[2, 1, 3]");
+    // In-place uniq: receiver when a dup was removed, nil when unchanged.
+    eq("[1,1,2,3,3,3].uniq!", "[1, 2, 3]");
+    eq("[1,2,3].uniq!", "nil");
+    eq("x = [1,1,2]; x.uniq!; x", "[1, 2]");
+}
+
+#[test]
+fn array_of_arrays_sorts_element_wise() {
+    // `Array#<=>` compares element-wise, so sorting `[key, value]` pairs
+    // (the `hash.to_a.sort` idiom) orders by the first element.
+    eq("[[:b, 2], [:a, 1]].sort", "[[:a, 1], [:b, 2]]");
+    eq("{ b: 2, a: 1 }.to_a.sort", "[[:a, 1], [:b, 2]]");
+    eq("[[1, 2], [1, 1], [0, 9]].sort", "[[0, 9], [1, 1], [1, 2]]");
+    eq("[[1], [1, 0], [1, 0, 0]].sort", "[[1], [1, 0], [1, 0, 0]]");
+}
+
+#[test]
+fn kernel_printf_writes_and_returns_nil() {
+    // `printf` returns nil (the formatting itself is covered by `format`).
+    eq("printf(\"%d\", 1)", "nil");
+    eq("format(\"%08.3f\", 3.14159)", "\"0003.142\"");
+    eq("format(\"%-5d|\", 42)", "\"42   |\"");
+}
+
+#[test]
+fn enumerable_chunk_and_slice_when_via_user_each() {
+    let prelude = "class C2; include Enumerable; def initialize(*a); @a=a; end; \
+                   def each(&b); @a.each(&b); end; end; ";
+    eq(
+        &format!("{prelude}C2.new(1,1,2,3,3,3).chunk {{ |x| x }}.to_a"),
+        "[[1, [1, 1]], [2, [2]], [3, [3, 3, 3]]]",
+    );
+    eq(
+        &format!("{prelude}C2.new(1,2,4,5).slice_when {{ |a, b| b > a + 1 }}.to_a"),
+        "[[1, 2], [4, 5]]",
+    );
+}

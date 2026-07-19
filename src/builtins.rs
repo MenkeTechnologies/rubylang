@@ -85,6 +85,7 @@ fn is_kernel_function(name: &str) -> bool {
             | "raise"
             | "fail"
             | "abort"
+            | "warn"
             | "exit"
             | "exit!"
             | "loop"
@@ -92,6 +93,7 @@ fn is_kernel_function(name: &str) -> bool {
             | "proc"
             | "format"
             | "sprintf"
+            | "printf"
             | "sleep"
             | "rand"
             | "srand"
@@ -1580,6 +1582,16 @@ fn dispatch_classref(
                 };
                 return Ok(new_arr(items));
             }
+            // `String.new` / `String.new("x")` — a real mutable string (backed by
+            // `RObj::Str`), not an opaque object. Encoding keywords are accepted
+            // and ignored (only UTF-8/binary bytes are modeled).
+            if cls == "String" {
+                let s = args
+                    .first()
+                    .and_then(|a| with_host(|h| h.as_str(a)))
+                    .unwrap_or_default();
+                return Ok(with_host(|h| h.new_string(s)));
+            }
             // `Hash.new(default)` builds a real Hash whose `[]` returns `default`
             // for a missing key (the counter idiom `Hash.new(0)`); the block form
             // `Hash.new { |h,k| ... }` calls the block on each miss instead.
@@ -2144,6 +2156,9 @@ fn enumerable_method(
         "each_slice",
         "each_cons",
         "chunk_while",
+        "chunk",
+        "slice_when",
+        "reverse_each",
         "to_h",
     ];
     if !ENUM_METHODS.contains(&name) {
@@ -4350,6 +4365,12 @@ fn dispatch_array(
         "dig" => Ok(dig(recv, args)),
         "empty?" => Ok(Value::Bool(arr.is_empty())),
         "reverse" => Ok(new_arr(arr.into_iter().rev().collect())),
+        "reverse!" => {
+            // In-place reverse; returns the receiver.
+            let rev: Vec<Value> = arr.into_iter().rev().collect();
+            with_host(|h| h.set_array(recv, rev));
+            Ok(recv.clone())
+        }
         "to_a" | "to_ary" | "dup" | "clone" | "deconstruct" => Ok(new_arr(arr)),
         "include?" => Ok(Value::Bool(
             arr.iter().any(|x| with_host(|h| h.eq_values(x, &args[0]))),
@@ -4629,6 +4650,27 @@ fn dispatch_array(
             }
             Ok(new_arr(out))
         }
+        "uniq!" => {
+            // In-place `uniq`. Returns the receiver if any duplicate was removed,
+            // else nil (MRI semantics), mirroring `compact!`/`flatten!`.
+            let mut out: Vec<Value> = Vec::new();
+            let mut keys: Vec<Value> = Vec::new();
+            for x in &arr {
+                let key = match &block {
+                    Some(b) => call_proc(b, std::slice::from_ref(x))?,
+                    None => x.clone(),
+                };
+                if !keys.iter().any(|k| with_host(|h| h.eq_values(&key, k))) {
+                    keys.push(key);
+                    out.push(x.clone());
+                }
+            }
+            if out.len() == arr.len() {
+                return Ok(Value::Undef);
+            }
+            with_host(|h| h.set_array(recv, out));
+            Ok(recv.clone())
+        }
         "compact" => Ok(new_arr(
             arr.into_iter()
                 .filter(|x| !matches!(x, Value::Undef))
@@ -4671,6 +4713,24 @@ fn dispatch_array(
                 // Block-less: an Enumerator yielding each element, so external
                 // iteration (`next`/`peek`) and chained Enumerable calls work.
                 Ok(with_host(|h| h.new_enumerator(arr, "each")))
+            }
+        }
+        "reverse_each" => {
+            if let Some(b) = &block {
+                for x in arr.iter().rev() {
+                    call_proc(b, std::slice::from_ref(x))?;
+                    if has_pending_signal() {
+                        if let Some(bv) = take_break() {
+                            return Ok(bv);
+                        }
+                        break;
+                    }
+                }
+                Ok(recv.clone())
+            } else {
+                // Block-less: an Enumerator yielding the elements in reverse.
+                let rev: Vec<Value> = arr.iter().rev().cloned().collect();
+                Ok(with_host(|h| h.new_enumerator(rev, "reverse_each")))
             }
         }
         "each_with_index" => {
@@ -9046,6 +9106,21 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             }
             Ok(new_str(sprintf(&fmt, &args[1..], None)))
         }
+        "printf" => {
+            // `printf(fmt, *args)` writes the formatted string to stdout and
+            // returns nil. A lone trailing Hash supplies `%<name>s` references.
+            let fmt = arg_str(&args[0]);
+            let out = if args.len() == 2 {
+                match with_host(|h| h.as_hash(&args[1])) {
+                    Some(map) => sprintf(&fmt, &[], Some(&map)),
+                    None => sprintf(&fmt, &args[1..], None),
+                }
+            } else {
+                sprintf(&fmt, &args[1..], None)
+            };
+            print!("{out}");
+            Ok(Value::Undef)
+        }
         "gets" => Ok(read_line()),
         "proc" => block.ok_or_else(|| "tried to create Proc without a block".into()),
         "lambda" => {
@@ -9112,6 +9187,31 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
                 Some(v) => as_i(v) as i32,
             };
             std::process::exit(code);
+        }
+        "warn" => {
+            // `warn(*msgs)` writes each message (with a trailing newline) to
+            // $stderr and returns nil. A message that already ends in a newline
+            // is not doubled. Array args are flattened like `puts`.
+            for v in args {
+                if let Some(arr) = with_host(|h| h.as_array(v)) {
+                    for e in &arr {
+                        let s = with_host(|h| h.to_s(e));
+                        if s.ends_with('\n') {
+                            eprint!("{s}");
+                        } else {
+                            eprintln!("{s}");
+                        }
+                    }
+                } else {
+                    let s = with_host(|h| h.to_s(v));
+                    if s.ends_with('\n') {
+                        eprint!("{s}");
+                    } else {
+                        eprintln!("{s}");
+                    }
+                }
+            }
+            Ok(Value::Undef)
         }
         "abort" => {
             // `abort(msg)` writes `msg` to stderr; either form exits with 1.
@@ -11321,6 +11421,17 @@ fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     // Two Symbols order lexicographically by name (`[:b, :a].sort == [:a, :b]`).
     if let (Some(x), Some(y)) = with_host(|h| (h.as_symbol(a), h.as_symbol(b))) {
         return x.cmp(&y);
+    }
+    // Two Arrays compare element-wise, shorter-is-less on a common prefix
+    // (`Array#<=>`), so `[[:b,2],[:a,1]].sort` orders by the first element.
+    if let (Some(xs), Some(ys)) = with_host(|h| (h.as_array(a), h.as_array(b))) {
+        for (x, y) in xs.iter().zip(ys.iter()) {
+            let o = cmp_values(x, y);
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        return xs.len().cmp(&ys.len());
     }
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
