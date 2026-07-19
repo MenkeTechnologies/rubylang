@@ -4717,3 +4717,37 @@ fn script_file_constant_reports_running_file() {
     eq("__FILE__", "\"-e\"");
     eq("File.dirname(__FILE__)", "\".\"");
 }
+
+/// Three rubylang↔MRI parity fixes: Integer ** negative → Rational, negative-range
+/// slice underflow → empty, and Array#<=>. All confirmed against ruby 4.0.6.
+#[test]
+fn integer_pow_negative_is_rational() {
+    eq("5 ** -7", "(1/78125)");
+    eq("2 ** -1", "(1/2)");
+    eq("(-5) ** -3", "(-1/125)");
+    // Non-negative integer power stays an exact Integer.
+    eq("10 ** 3", "1000");
+    eq("2 ** 70", "1180591620717411303424");
+    // Float base keeps Float semantics.
+    eq("2.0 ** -1", "0.5");
+}
+
+#[test]
+fn negative_range_slice_underflow_is_empty() {
+    // A negative endpoint that underflows past index 0 yields an empty slice.
+    eq("\"foo\"[1...-4]", "\"\"");
+    eq("[1, 2, 3][1...-4]", "[]");
+    // In-range negative endpoints still work.
+    eq("\"foo\"[1..-1]", "\"oo\"");
+    eq("\"hello\"[1...-1]", "\"ell\"");
+}
+
+#[test]
+fn array_spaceship_operator() {
+    eq("[1, 2] <=> [1, 2]", "0");
+    eq("[1, 2] <=> [1, 3]", "-1");
+    eq("[1] <=> [1, 2]", "-1");
+    eq("[1, 2, 3] <=> [1, 2]", "1");
+    // Non-array operand → nil.
+    eq("([1, 2] <=> 5).inspect", "\"nil\"");
+}

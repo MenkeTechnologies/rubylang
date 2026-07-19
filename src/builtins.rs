@@ -2521,6 +2521,14 @@ fn dispatch_number(
                     let r = base.pow(exp as u32);
                     return Ok(with_host(|h| h.new_bigint(r)));
                 }
+                // Integer ** -n is the exact Rational 1 / base**n (Ruby returns a
+                // Rational, not a Float). 0 ** -n raises like division by zero.
+                if base == num_bigint::BigInt::from(0) {
+                    return Err(raise_exc("ZeroDivisionError", "divided by 0"));
+                }
+                let denom = base.pow((-exp) as u32);
+                let r = num_rational::BigRational::new(num_bigint::BigInt::from(1), denom);
+                return Ok(with_host(|h| h.new_rational(r)));
             }
             Ok(Value::Float(as_f(recv).powf(as_f(&args[0]))))
         }
@@ -4357,6 +4365,28 @@ fn dispatch_array(
 ) -> Result<Value, String> {
     let arr = with_host(|h| h.as_array(recv).unwrap_or_default());
     match name {
+        // `arr <=> other` — element-wise comparison: the first non-equal pair
+        // decides; if one is a prefix of the other, the shorter is less. Returns
+        // nil when the operand is not an Array.
+        "<=>" if !args.is_empty() => match with_host(|h| h.as_array(&args[0])) {
+            Some(other) => {
+                use std::cmp::Ordering;
+                let n = arr.len().min(other.len());
+                for i in 0..n {
+                    match cmp_values(&arr[i], &other[i]) {
+                        Ordering::Equal => {}
+                        Ordering::Less => return Ok(Value::Int(-1)),
+                        Ordering::Greater => return Ok(Value::Int(1)),
+                    }
+                }
+                Ok(Value::Int(match arr.len().cmp(&other.len()) {
+                    Ordering::Less => -1,
+                    Ordering::Equal => 0,
+                    Ordering::Greater => 1,
+                }))
+            }
+            None => Ok(Value::Undef),
+        },
         // Set-like operators: `&` intersection (deduped), `|` union (deduped),
         // `-` difference. `-` also arrives via the native path (num_op).
         "&" | "intersection" | "|" | "union" | "-" | "difference" if !args.is_empty() => {
@@ -11904,11 +11934,18 @@ fn range_bounds(lo: i64, hi: i64, excl: bool, len: usize) -> Option<(usize, usiz
     let end = if hi == RANGE_ENDLESS {
         len
     } else {
-        let mut e = norm_idx(hi, len).unwrap_or(len);
-        if !excl {
-            e += 1;
+        // A negative endpoint that underflows past index 0 (`|hi| > len`) points
+        // before the string/array start, so the slice is empty — end collapses to
+        // `start` below. (`"foo"[1...-4]` is `""`, not `"oo"`.)
+        match norm_idx(hi, len) {
+            Some(mut e) => {
+                if !excl {
+                    e += 1;
+                }
+                e.min(len)
+            }
+            None => 0,
         }
-        e.min(len)
     };
     Some((start, end.max(start)))
 }
