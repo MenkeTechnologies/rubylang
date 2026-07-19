@@ -595,6 +595,14 @@ enum Mode {
     Printf,
     StringOps,
     Caseexpr,
+    Intmeth,
+    Regex,
+    Enumerable,
+    Exceptions,
+    Struct,
+    Rational,
+    Patternmatch,
+    Kernelconv,
 }
 
 const ALL_MODES: &[Mode] = &[
@@ -615,7 +623,164 @@ const ALL_MODES: &[Mode] = &[
     Mode::Printf,
     Mode::StringOps,
     Mode::Caseexpr,
+    Mode::Intmeth,
+    Mode::Regex,
+    Mode::Enumerable,
+    Mode::Exceptions,
+    Mode::Struct,
+    Mode::Rational,
+    Mode::Patternmatch,
+    Mode::Kernelconv,
 ];
+
+fn gen_intmeth(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let a = ii(r);
+    let b = ii(r);
+    one(match r.below(14) {
+        0 => format!("p {a}.gcd({b})"),
+        1 => format!("p {a}.lcm({b})"),
+        2 => format!("p {a}.abs"),
+        3 => format!("p {a}.divmod({b})"),
+        4 => format!("p {a}.abs.bit_length"),
+        5 => format!("p {a}.abs.digits"),
+        6 => format!("p {a}.to_s(2)"),
+        7 => format!("p {}.pow({}, {})", r.range(2, 9), r.range(1, 6), r.range(2, 9)),
+        8 => format!("p({a} & {b})"),
+        9 => format!("p({a} | {b})"),
+        10 => format!("p({a} ^ {b})"),
+        11 => format!("p({a} << {})", r.range(0, 5)),
+        12 => format!("p [{a}.even?, {a}.odd?, {a}.zero?]"),
+        _ => format!("p {a}.abs.to_s({}).to_i({})", r.range(2, 17), r.range(2, 17)),
+    })
+}
+
+fn gen_regex(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let s = format!("{}{}", ww(r), ww(r));
+    let pats = ["[a-c]+", "o+", "[aeiou]", "\\w+", "l+", "[a-z]{2}", "^.", ".$"];
+    let p = r.pick(&pats);
+    one(match r.below(10) {
+        0 => format!("p(\"{s}\" =~ /{p}/)"),
+        1 => format!("p \"{s}\".match?(/{p}/)"),
+        2 => format!("p \"{s}\".scan(/{p}/)"),
+        3 => format!("p \"{s}\".gsub(/{p}/, \"X\")"),
+        4 => format!("p \"{s}\".sub(/{p}/, \"X\")"),
+        5 => format!("p \"{s}\"[/{p}/]"),
+        6 => format!("p \"{s}\".match(/{p}/) ? \"m\" : \"no\""),
+        7 => format!("p \"{s}\".gsub(/([a-z])\\1/, \"D\")"),
+        8 => format!("p \"{s}\".split(/{p}/)"),
+        _ => format!("p \"{s}\".scan(/{p}/).length"),
+    })
+}
+
+fn gen_enumerable(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let a = arr_lit(r);
+    one(match r.below(14) {
+        0 => format!("p {a}.each_slice(2).to_a"),
+        1 => format!("p {a}.each_cons(2).to_a"),
+        2 => format!("p {a}.partition {{ |x| x > 0 }}"),
+        3 => format!("p {a}.group_by {{ |x| x % 2 }}"),
+        4 => format!("p {a}.flat_map {{ |x| [x, -x] }}"),
+        5 => format!("p {a}.chunk_while {{ |a, b| b > a }}.to_a"),
+        6 => format!("p {a}.take_while {{ |x| x > 0 }}"),
+        7 => format!("p {a}.drop_while {{ |x| x > 0 }}"),
+        8 => format!("p {a}.each_with_object([]) {{ |x, m| m << x * 2 }}"),
+        9 => format!("p {a}.tally"),
+        10 => format!("p {a}.min_by {{ |x| x.abs }}"),
+        11 => format!("p {a}.max_by {{ |x| x.abs }}"),
+        12 => format!("p {a}.sum"),
+        _ => format!("p {a}.sort_by {{ |x| -x }}"),
+    })
+}
+
+fn gen_exceptions(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let w = ww(r);
+    let n = ii(r);
+    one(match r.below(9) {
+        0 => format!("p (begin; raise \"{w}\"; rescue => e; e.message; end)"),
+        1 => format!("p (begin; Integer(\"{w}\"); rescue ArgumentError; :caught; end)"),
+        2 => format!("p (begin; {n} / 0; rescue ZeroDivisionError => e; e.message; end)"),
+        3 => format!("p (begin; [].fetch(9); rescue IndexError; :idx; end)"),
+        4 => format!("p (begin; raise ArgumentError, \"{w}\"; rescue => e; [e.class.to_s, e.message]; end)"),
+        5 => format!("r = []; begin; r << 1; raise \"x\"; rescue; r << 2; ensure; r << 3; end; p r"),
+        6 => format!("p (begin; {{}}.fetch(:{w}); rescue KeyError; :key; end)"),
+        7 => format!("class E1 < StandardError; end; p (begin; raise E1; rescue E1; :custom; end)"),
+        _ => format!("p (begin; nil.foo; rescue NoMethodError; :nome; end)"),
+    })
+}
+
+fn gen_struct(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (x, y) = (ii(r), ii(r));
+    one(match r.below(8) {
+        0 => format!("S = Struct.new(:a, :b); p S.new({x}, {y}).to_a"),
+        1 => format!("S = Struct.new(:a, :b); p S.new({x}, {y}).to_h"),
+        2 => format!("S = Struct.new(:a, :b); p S.new({x}, {y}).members"),
+        3 => format!("S = Struct.new(:a, :b); p(S.new({x}, {y}) == S.new({x}, {y}))"),
+        4 => format!("S = Struct.new(:a, :b); s = S.new({x}, {y}); p [s.a, s.b]"),
+        5 => format!("S = Struct.new(:a, :b); s = S.new({x}, {y}); s.a = {y}; p s.a"),
+        6 => format!("S = Struct.new(:a, :b, keyword_init: true); p S.new(a: {x}, b: {y}).to_h"),
+        _ => format!("S = Struct.new(:a, :b); p S.new({x}, {y})[0]"),
+    })
+}
+
+fn gen_rational(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (a, b) = (r.range(1, 12), r.range(1, 12));
+    let (c, d) = (r.range(1, 12), r.range(1, 12));
+    let n = ii(r);
+    one(match r.below(11) {
+        0 => format!("p(Rational({a}, {b}) + Rational({c}, {d}))"),
+        1 => format!("p(Rational({a}, {b}) - Rational({c}, {d}))"),
+        2 => format!("p(Rational({a}, {b}) * Rational({c}, {d}))"),
+        3 => format!("p(Rational({a}, {b}) / Rational({c}, {d}))"),
+        4 => format!("p(Rational({a}, {b}) % Rational({c}, {d}))"),
+        5 => format!("p(Rational({a}, {b}) ** {})", r.range(-3, 4)),
+        6 => format!("p(Rational({a}, {b}) <=> Rational({c}, {d}))"),
+        7 => format!("p(Rational({a}, {b}) + {n})"),
+        8 => format!("p(Rational({a}, {b}).to_f.round(6))"),
+        9 => format!("p [Rational({a}, {b}).numerator, Rational({a}, {b}).denominator]"),
+        _ => format!("p({n} / Rational({c}, {d}))"),
+    })
+}
+
+fn gen_patternmatch(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let n = r.range(0, 12);
+    let (x, y) = (ii(r), ii(r));
+    one(match r.below(8) {
+        0 => format!("case [{x}, {y}]; in [a, b]; p a + b; end"),
+        1 => format!("case {{a: {x}, b: {y}}}; in {{a:, b:}}; p [a, b]; end"),
+        2 => format!("case [1, {x}, 3]; in [1, m, 3]; p m; in _; p :no; end"),
+        3 => format!("case {n}; in 0..5; p :lo; in Integer; p :hi; end"),
+        4 => format!("case [{x}, {y}]; in [Integer => a, Integer => b]; p a * b; end"),
+        5 => format!("case [1, 2, {x}, {y}]; in [_, _, *rest]; p rest; end"),
+        6 => format!("case {{name: \"{}\", age: {n}}}; in {{name: String => s}}; p s; end", ww(r)),
+        _ => format!("r = (case {n}; in 0 then :z; in n if n > 5 then :big; else :small; end); p r"),
+    })
+}
+
+fn gen_kernelconv(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let n = ii(r);
+    let w = ww(r);
+    one(match r.below(11) {
+        0 => format!("p Integer(\"{}\")", r.range(0, 999)),
+        1 => format!("p Integer(\"ff\", 16)"),
+        2 => format!("p Integer(\"{}\", 2)", if r.below(2) == 0 { "1010" } else { "1101" }),
+        3 => format!("p Float(\"{}.5\")", r.range(0, 99)),
+        4 => format!("p Array(nil)"),
+        5 => format!("p Array([{n}])"),
+        6 => format!("p Array({n})"),
+        7 => format!("p (begin; Integer(\"{w}\"); rescue ArgumentError; :bad; end)"),
+        8 => format!("p String({n})"),
+        9 => format!("p format(\"%05.2f\", {})", r.range(0, 99)),
+        _ => format!("p Integer({n}.to_f)"),
+    })
+}
 
 fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
     match mode {
@@ -636,6 +801,14 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Printf => gen_printf(seed),
         Mode::StringOps => gen_string_ops(seed),
         Mode::Caseexpr => gen_caseexpr(seed),
+        Mode::Intmeth => gen_intmeth(seed),
+        Mode::Regex => gen_regex(seed),
+        Mode::Enumerable => gen_enumerable(seed),
+        Mode::Exceptions => gen_exceptions(seed),
+        Mode::Struct => gen_struct(seed),
+        Mode::Rational => gen_rational(seed),
+        Mode::Patternmatch => gen_patternmatch(seed),
+        Mode::Kernelconv => gen_kernelconv(seed),
     }
 }
 
@@ -658,6 +831,14 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Printf => "printf",
         Mode::StringOps => "string_ops",
         Mode::Caseexpr => "caseexpr",
+        Mode::Intmeth => "intmeth",
+        Mode::Regex => "regex",
+        Mode::Enumerable => "enumerable",
+        Mode::Exceptions => "exceptions",
+        Mode::Struct => "struct",
+        Mode::Rational => "rational",
+        Mode::Patternmatch => "patternmatch",
+        Mode::Kernelconv => "kernelconv",
     }
 }
 
