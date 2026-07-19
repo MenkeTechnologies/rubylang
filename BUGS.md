@@ -217,6 +217,22 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
   do NOT match MRI's libm output in the trailing digits, so they are excluded
   from the parity corpus and tested only with a tolerance. `Math.class` reports
   `Class` rather than `Module` (modules aren't distinguished from classes yet).
+- **`JSON` (dependency-free).** `require "json"` is a no-op; the module is always
+  available. `JSON.generate`/`JSON.dump` and `#to_json` (on any value — Array,
+  Hash, String, Symbol, Integer, Float, `true`/`false`/`nil`, Bignum, and a
+  generic quoted-`to_s` fallback for other objects) hand-encode over the host
+  value model, matching MRI byte-for-byte: symbol hash keys become string keys,
+  non-string keys stringify via `to_s`, `nil`→`null`, floats use `Float#to_s`,
+  and string escaping names only `" \ \b \t \n \f \r` with other C0 controls as
+  lowercase `\uXXXX` (DEL and non-ASCII pass through raw, `/` is not escaped).
+  `JSON.pretty_generate` uses 2-space indent. `JSON.parse`/`JSON.load` is a
+  hand-written recursive-descent decoder producing Hashes with string keys (or
+  symbol keys under `symbolize_names: true`), Integer/Bignum/Float numbers, and
+  arrays/scalars; malformed input raises `JSON::ParserError` (catchable via bare
+  `rescue` / `rescue => e`; the `JSON::ParserError` constant is not registered for
+  explicit-constant rescue). `Rational`/`Complex`/`Time` encode as their quoted
+  `to_s` (MRI's default `Object#to_json`), so those are excluded from the exact
+  parity corpus.
 - **`rand`.** Backed by a thread-local SplitMix64. `srand(seed)` reseeds it so
   `rand`/`rand(n)` are reproducible within a run and returns the previous seed
   (MRI semantics); the MRI-exact sequence and MRI's random startup seed are not

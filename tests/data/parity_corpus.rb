@@ -1304,3 +1304,20 @@ p Dog.instance_methods(false).sort
 p Dog.method_defined?(:speak)
 p Dog.method_defined?(:bark)
 p Dog.method_defined?(:meow)
+#==#
+require "json"
+puts JSON.generate({"name" => "rubylang", "nums" => [1, 2, 3], "nested" => {"ok" => true, "x" => nil}})
+puts({lang: "ruby", version: 4, tags: ["fast", "compiled"]}.to_json)
+puts [1, "two", 3.5, true, false, nil].to_json
+data = JSON.parse('{"a":1,"b":[2,3],"c":{"d":"e"}}')
+p data
+p data["b"]
+sym = JSON.parse('{"k":[1,2]}', symbolize_names: true)
+p sym
+puts JSON.parse(JSON.generate({"round" => ["trip", 42]})).inspect
+puts JSON.pretty_generate({"a" => 1, "b" => [1, 2]})
+begin
+  JSON.parse("{bad}")
+rescue => e
+  puts e.class.name
+end

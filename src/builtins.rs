@@ -734,6 +734,14 @@ pub(crate) fn dispatch(
             }));
         }
         "nil?" => return Ok(Value::Bool(matches!(recv, Value::Undef))),
+        // `to_json` on any value (a user class that defines its own wins via the
+        // find_method_owner check above). Ignores the optional generator-state arg.
+        "to_json" => {
+            return match with_host(|h| json_encode(h, recv)) {
+                Ok(s) => Ok(new_str(s)),
+                Err(e) => Err(raise_exc("JSON::GeneratorError", &e)),
+            };
+        }
         "==" => return Ok(Value::Bool(with_host(|h| h.eq_values(recv, &args[0])))),
         "!=" => return Ok(Value::Bool(!with_host(|h| h.eq_values(recv, &args[0])))),
         "===" => {
@@ -1182,6 +1190,38 @@ fn dispatch_classref(
         };
         if let Some(v) = f {
             return Ok(Value::Float(v));
+        }
+    }
+    // The `JSON` module (dependency-free, hand-written over the host value model).
+    // `generate`/`dump` encode; `parse`/`load` decode; `pretty_generate` indents.
+    if cls == "JSON" {
+        match name {
+            "generate" | "dump" => {
+                return match with_host(|h| json_encode(h, &args[0])) {
+                    Ok(s) => Ok(new_str(s)),
+                    Err(e) => Err(raise_exc("JSON::GeneratorError", &e)),
+                };
+            }
+            "pretty_generate" => {
+                return match with_host(|h| json_pretty(h, &args[0], 0)) {
+                    Ok(s) => Ok(new_str(s)),
+                    Err(e) => Err(raise_exc("JSON::GeneratorError", &e)),
+                };
+            }
+            "parse" | "load" => {
+                let src = with_host(|h| h.as_str(&args[0])).unwrap_or_default();
+                let symbolize = args
+                    .get(1)
+                    .and_then(|a| with_host(|h| h.as_hash(a)))
+                    .and_then(|m| m.get(&RKey::Sym("symbolize_names".to_string())).cloned())
+                    .map(|v| with_host(|h| h.truthy(&v)))
+                    .unwrap_or(false);
+                return match with_host(|h| json_parse(h, &src, symbolize)) {
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(raise_exc("JSON::ParserError", &e)),
+                };
+            }
+            _ => {}
         }
     }
     match name {
@@ -7977,6 +8017,313 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
 
 fn new_str(s: String) -> Value {
     with_host(|h| h.new_string(s))
+}
+
+// ---- JSON (dependency-free, hand-written over the host value model) ---------
+
+/// Encode a value as compact JSON, matching MRI `JSON.generate` byte-for-byte on
+/// the common cases. Takes `&mut RubyHost` directly (never re-enters `with_host`).
+fn json_encode(h: &mut RubyHost, v: &Value) -> Result<String, String> {
+    match v {
+        Value::Undef => Ok("null".to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Int(n) => Ok(n.to_string()),
+        // `to_s` on a Float is Ruby's `Float#to_s` (`1.5`, `2.0`, sci-notation),
+        // which is what MRI's JSON emits for finite floats.
+        Value::Float(_) => Ok(h.to_s(v)),
+        _ => {
+            if let Some(s) = h.as_str(v) {
+                return Ok(json_escape(&s));
+            }
+            if let Some(s) = h.as_symbol(v) {
+                return Ok(json_escape(&s));
+            }
+            if let Some(items) = h.as_array(v) {
+                let mut parts = Vec::with_capacity(items.len());
+                for e in &items {
+                    parts.push(json_encode(h, e)?);
+                }
+                return Ok(format!("[{}]", parts.join(",")));
+            }
+            if let Some(map) = h.as_hash(v) {
+                let mut parts = Vec::with_capacity(map.len());
+                for (k, val) in &map {
+                    let ks = json_key_string(h, k);
+                    parts.push(format!("{}:{}", json_escape(&ks), json_encode(h, val)?));
+                }
+                return Ok(format!("{{{}}}", parts.join(",")));
+            }
+            // A promoted Integer (Bignum) encodes unquoted, like MRI.
+            if let Some(b) = h.as_bigint(v) {
+                return Ok(b.to_string());
+            }
+            // Everything else (Rational, Time, user objects, …) uses the default
+            // `Object#to_json`: its `to_s` as a quoted JSON string.
+            let s = h.to_s(v);
+            Ok(json_escape(&s))
+        }
+    }
+}
+
+/// Pretty-printed JSON (`JSON.pretty_generate`): 2-space indent, `": "` after
+/// keys, one element per line; empty containers stay `{}` / `[]`.
+fn json_pretty(h: &mut RubyHost, v: &Value, depth: usize) -> Result<String, String> {
+    if let Some(items) = h.as_array(v) {
+        if items.is_empty() {
+            return Ok("[]".to_string());
+        }
+        let ind = "  ".repeat(depth + 1);
+        let close = "  ".repeat(depth);
+        let mut parts = Vec::with_capacity(items.len());
+        for e in &items {
+            parts.push(format!("{ind}{}", json_pretty(h, e, depth + 1)?));
+        }
+        return Ok(format!("[\n{}\n{close}]", parts.join(",\n")));
+    }
+    if let Some(map) = h.as_hash(v) {
+        if map.is_empty() {
+            return Ok("{}".to_string());
+        }
+        let ind = "  ".repeat(depth + 1);
+        let close = "  ".repeat(depth);
+        let mut parts = Vec::with_capacity(map.len());
+        for (k, val) in &map {
+            let ks = json_key_string(h, k);
+            parts.push(format!(
+                "{ind}{}: {}",
+                json_escape(&ks),
+                json_pretty(h, val, depth + 1)?
+            ));
+        }
+        return Ok(format!("{{\n{}\n{close}}}", parts.join(",\n")));
+    }
+    json_encode(h, v)
+}
+
+/// A hash key's JSON string form: symbol/string keys keep their text; every
+/// other key type stringifies via `to_s` (`{1=>2}` → `"1"`, `{nil=>3}` → `""`).
+fn json_key_string(h: &mut RubyHost, k: &RKey) -> String {
+    match k {
+        RKey::Str(s) | RKey::Sym(s) => s.clone(),
+        RKey::Int(n) => n.to_string(),
+        _ => {
+            let kv = h.key_value(k);
+            h.to_s(&kv)
+        }
+    }
+}
+
+/// A JSON string literal (quoted, MRI-exact escaping): only `" \ \b \t \n \f \r`
+/// are named; other C0 controls become lowercase `\u00xx`; DEL and all non-ASCII
+/// (UTF-8) pass through raw; `/` is not escaped.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Recursive-descent JSON decoder. Builds host Values: objects → Hash with
+/// `RKey::Str` keys (or `RKey::Sym` when `symbolize`), integers → `Int` (Bignum
+/// on overflow), reals → `Float`. Errors return a plain message (the caller
+/// wraps it in `JSON::ParserError`).
+fn json_parse(h: &mut RubyHost, s: &str, symbolize: bool) -> Result<Value, String> {
+    let mut p = JsonParser {
+        chars: s.chars().collect(),
+        pos: 0,
+    };
+    p.skip_ws();
+    let v = p.parse_value(h, symbolize)?;
+    p.skip_ws();
+    if p.pos != p.chars.len() {
+        return Err("unexpected token after JSON value".to_string());
+    }
+    Ok(v)
+}
+
+struct JsonParser {
+    chars: Vec<char>,
+    pos: usize,
+}
+
+impl JsonParser {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+    fn next(&mut self) -> Option<char> {
+        let c = self.chars.get(self.pos).copied();
+        if c.is_some() {
+            self.pos += 1;
+        }
+        c
+    }
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(' ') | Some('\t') | Some('\n') | Some('\r')) {
+            self.pos += 1;
+        }
+    }
+
+    fn parse_value(&mut self, h: &mut RubyHost, symbolize: bool) -> Result<Value, String> {
+        self.skip_ws();
+        match self.peek() {
+            Some('{') => self.parse_object(h, symbolize),
+            Some('[') => self.parse_array(h, symbolize),
+            Some('"') => {
+                let s = self.parse_string()?;
+                Ok(h.new_string(s))
+            }
+            Some('t') => self.parse_lit("true", Value::Bool(true)),
+            Some('f') => self.parse_lit("false", Value::Bool(false)),
+            Some('n') => self.parse_lit("null", Value::Undef),
+            Some(c) if c == '-' || c.is_ascii_digit() => self.parse_number(h),
+            _ => Err("unexpected token in JSON".to_string()),
+        }
+    }
+
+    fn parse_lit(&mut self, lit: &str, v: Value) -> Result<Value, String> {
+        for want in lit.chars() {
+            if self.next() != Some(want) {
+                return Err(format!("expected `{lit}`"));
+            }
+        }
+        Ok(v)
+    }
+
+    fn parse_object(&mut self, h: &mut RubyHost, symbolize: bool) -> Result<Value, String> {
+        self.pos += 1; // consume '{'
+        let mut map: IndexMap<RKey, Value> = IndexMap::new();
+        self.skip_ws();
+        if self.peek() == Some('}') {
+            self.pos += 1;
+            return Ok(h.new_hash(map));
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() != Some('"') {
+                return Err("expected string key in JSON object".to_string());
+            }
+            let key = self.parse_string()?;
+            self.skip_ws();
+            if self.next() != Some(':') {
+                return Err("expected `:` in JSON object".to_string());
+            }
+            let val = self.parse_value(h, symbolize)?;
+            let k = if symbolize {
+                RKey::Sym(key)
+            } else {
+                RKey::Str(key)
+            };
+            map.insert(k, val);
+            self.skip_ws();
+            match self.next() {
+                Some(',') => continue,
+                Some('}') => break,
+                _ => return Err("expected `,` or `}` in JSON object".to_string()),
+            }
+        }
+        Ok(h.new_hash(map))
+    }
+
+    fn parse_array(&mut self, h: &mut RubyHost, symbolize: bool) -> Result<Value, String> {
+        self.pos += 1; // consume '['
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(']') {
+            self.pos += 1;
+            return Ok(h.new_array(items));
+        }
+        loop {
+            let val = self.parse_value(h, symbolize)?;
+            items.push(val);
+            self.skip_ws();
+            match self.next() {
+                Some(',') => continue,
+                Some(']') => break,
+                _ => return Err("expected `,` or `]` in JSON array".to_string()),
+            }
+        }
+        Ok(h.new_array(items))
+    }
+
+    fn parse_string(&mut self) -> Result<String, String> {
+        self.pos += 1; // consume opening '"'
+        let mut out = String::new();
+        loop {
+            match self.next() {
+                None => return Err("unterminated JSON string".to_string()),
+                Some('"') => break,
+                Some('\\') => match self.next() {
+                    Some('"') => out.push('"'),
+                    Some('\\') => out.push('\\'),
+                    Some('/') => out.push('/'),
+                    Some('b') => out.push('\u{08}'),
+                    Some('f') => out.push('\u{0c}'),
+                    Some('n') => out.push('\n'),
+                    Some('r') => out.push('\r'),
+                    Some('t') => out.push('\t'),
+                    Some('u') => {
+                        let mut code: u32 = 0;
+                        for _ in 0..4 {
+                            let d = self
+                                .next()
+                                .and_then(|c| c.to_digit(16))
+                                .ok_or_else(|| "invalid \\u escape in JSON".to_string())?;
+                            code = code * 16 + d;
+                        }
+                        out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                    }
+                    _ => return Err("invalid escape in JSON string".to_string()),
+                },
+                Some(c) => out.push(c),
+            }
+        }
+        Ok(out)
+    }
+
+    fn parse_number(&mut self, h: &mut RubyHost) -> Result<Value, String> {
+        let start = self.pos;
+        let mut is_float = false;
+        if self.peek() == Some('-') {
+            self.pos += 1;
+        }
+        while let Some(c) = self.peek() {
+            match c {
+                '0'..='9' => self.pos += 1,
+                '.' | 'e' | 'E' | '+' | '-' => {
+                    is_float = true;
+                    self.pos += 1;
+                }
+                _ => break,
+            }
+        }
+        let text: String = self.chars[start..self.pos].iter().collect();
+        if is_float {
+            text.parse::<f64>()
+                .map(Value::Float)
+                .map_err(|_| "invalid number in JSON".to_string())
+        } else {
+            match text.parse::<i64>() {
+                Ok(n) => Ok(Value::Int(n)),
+                Err(_) => text
+                    .parse::<num_bigint::BigInt>()
+                    .map(|b| h.new_bigint(b))
+                    .map_err(|_| "invalid number in JSON".to_string()),
+            }
+        }
+    }
 }
 
 /// The strict numeric hook: fusevm calls this when a native arithmetic or

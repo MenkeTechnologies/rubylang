@@ -3644,3 +3644,85 @@ fn symbols_sort_by_name() {
     eq("[:c, :a, :b].min", ":a");
     eq("[:c, :a, :b].max", ":c");
 }
+
+// --- Fanout round 4: JSON module -------------------------------------------
+
+#[test]
+fn json_module() {
+    // --- generate (compact) ---
+    eq(
+        "require \"json\"; JSON.generate({\"a\" => 1, \"b\" => [1,2]})",
+        "\"{\\\"a\\\":1,\\\"b\\\":[1,2]}\"",
+    );
+    eq(
+        "require \"json\"; JSON.generate([1,\"x\",true,nil])",
+        "\"[1,\\\"x\\\",true,null]\"",
+    );
+    eq("require \"json\"; JSON.generate(1.5)", "\"1.5\"");
+    eq("require \"json\"; JSON.generate(2)", "\"2\"");
+    eq(
+        "require \"json\"; JSON.generate({a: 1, b: {c: [1,2]}})",
+        "\"{\\\"a\\\":1,\\\"b\\\":{\\\"c\\\":[1,2]}}\"",
+    );
+    // string escaping: " \ \n \t
+    eq(
+        "require \"json\"; JSON.generate(\"he\\\"llo\\n\\tx\\\\y\")",
+        "\"\\\"he\\\\\\\"llo\\\\n\\\\tx\\\\\\\\y\\\"\"",
+    );
+    eq("require \"json\"; JSON.generate(nil)", "\"null\"");
+    eq("require \"json\"; JSON.generate(true)", "\"true\"");
+    eq("require \"json\"; JSON.generate({})", "\"{}\"");
+    eq("require \"json\"; JSON.generate([])", "\"[]\"");
+
+    // --- to_json (generic receiver + symbol-key hash) ---
+    eq(
+        "require \"json\"; {a: 1, b: 2}.to_json",
+        "\"{\\\"a\\\":1,\\\"b\\\":2}\"",
+    );
+    eq(
+        "require \"json\"; [1,\"x\",true,nil].to_json",
+        "\"[1,\\\"x\\\",true,null]\"",
+    );
+    eq("require \"json\"; 1.5.to_json", "\"1.5\"");
+    eq("require \"json\"; 2.to_json", "\"2\"");
+    eq("require \"json\"; :sym.to_json", "\"\\\"sym\\\"\"");
+    eq("require \"json\"; nil.to_json", "\"null\"");
+    eq("require \"json\"; true.to_json", "\"true\"");
+    eq("require \"json\"; false.to_json", "\"false\"");
+
+    // --- parse (string keys, scalars, nested) ---
+    eq(
+        "require \"json\"; JSON.parse('{\"a\":1,\"b\":[2,3]}')",
+        "{\"a\" => 1, \"b\" => [2, 3]}",
+    );
+    eq(
+        "require \"json\"; JSON.parse('{\"a\":1}', symbolize_names: true)",
+        "{a: 1}",
+    );
+    eq("require \"json\"; JSON.parse('[1,2,3]')", "[1, 2, 3]");
+    eq("require \"json\"; JSON.parse('42')", "42");
+    eq("require \"json\"; JSON.parse('-3.14e2')", "-314.0");
+    eq("require \"json\"; JSON.parse('\"hi\\n\"')", "\"hi\\n\"");
+    eq("require \"json\"; JSON.parse('true')", "true");
+    eq("require \"json\"; JSON.parse('null')", "nil");
+    eq(
+        "require \"json\"; JSON.parse('{\"a\":{\"b\":[1,{\"c\":2}]}}')",
+        "{\"a\" => {\"b\" => [1, {\"c\" => 2}]}}",
+    );
+    eq(
+        "require \"json\"; JSON.parse('{\"a\":{\"b\":2}}', symbolize_names: true)",
+        "{a: {b: 2}}",
+    );
+
+    // --- round-trip ---
+    eq(
+        "require \"json\"; JSON.parse(JSON.generate({\"x\" => [1, {\"y\" => 2}]}))",
+        "{\"x\" => [1, {\"y\" => 2}]}",
+    );
+
+    // --- malformed input raises JSON::ParserError ---
+    eq(
+        "require \"json\"; begin; JSON.parse('[1,2'); rescue => e; e.class.name; end",
+        "\"JSON::ParserError\"",
+    );
+}

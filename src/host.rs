@@ -1845,6 +1845,7 @@ impl RubyHost {
                 | "Date"
                 | "DateTime"
                 | "Math"
+                | "JSON"
         )
     }
     pub fn classref_name(&self, v: &Value) -> Option<String> {

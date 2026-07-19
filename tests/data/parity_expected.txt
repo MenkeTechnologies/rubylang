@@ -713,3 +713,19 @@ true
 true
 true
 false
+#==#
+{"name":"rubylang","nums":[1,2,3],"nested":{"ok":true,"x":null}}
+{"lang":"ruby","version":4,"tags":["fast","compiled"]}
+[1,"two",3.5,true,false,null]
+{"a" => 1, "b" => [2, 3], "c" => {"d" => "e"}}
+[2, 3]
+{k: [1, 2]}
+{"round" => ["trip", 42]}
+{
+  "a": 1,
+  "b": [
+    1,
+    2
+  ]
+}
+JSON::ParserError
