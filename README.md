@@ -65,8 +65,9 @@ JIT. rubylang carries no VM or JIT of its own. Highlights:
   true); conditions normalize through a `TRUTHY` op before a native branch.
 - **AOP intercepts** — a glob-matched before/after/around method-intercept
   registry, the same design as zshrs's function intercepts.
-- **Editor-ready** — an LSP server, a partial DAP adapter, and an `irb`-style
-  REPL on a persistent host, all over stdio.
+- **Editor-ready** — an LSP server, a DAP debugger (source-line breakpoints
+  inside methods, stepping, stack + locals), and an `irb`-style REPL on a
+  persistent host, all over stdio.
 - **Differential parity** — a 35-snippet corpus diffed live against the
   reference `ruby`, frozen and replayed in CI with no `ruby` installed.
 
@@ -156,7 +157,7 @@ Implemented and checked against the reference `ruby`:
 | `-e SRC` | Run a one-liner. |
 | `--repl` | Interactive REPL on a persistent host. |
 | `--lsp` | Language Server Protocol over stdio. |
-| `--dap` | Debug Adapter Protocol over stdio (handshake + run-to-completion). |
+| `--dap` | Debug Adapter Protocol over stdio: source-line breakpoints inside methods, stepping, stack + variables. |
 | `--build FILE` | AOT-compile the script's bytecode into the on-disk cache. |
 | `--dump-bytecode FILE` | Print the lowered fusevm chunk. |
 
@@ -207,7 +208,7 @@ and the AOP method-intercept engine are all in the tree. `before`/`after`/
 method-dispatch choke point, gated on an O(1) check so unadvised calls are
 unaffected.
 
-The DAP adapter is partial (handshake + run-to-completion; stepping pending).
+The DAP debugger (`ruby --dap`) sets source-line breakpoints inside method bodies, steps (next/stepIn/stepOut), and inspects the call stack and locals; markers are emitted only in --dap mode, so normal runs are unaffected.
 Regex literals (`/pat/flags`), `=~`/`!~`, `String#{match,scan,match?,sub,gsub}`
 with `Regexp`, `MatchData`, and arbitrary-precision `Integer` (auto-promotion on
 overflow) are supported. `extend` / `prepend` / `class << self`, the full

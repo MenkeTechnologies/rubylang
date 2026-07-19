@@ -61,6 +61,18 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
     eval_str(&src)
 }
 
+/// Read and run a `.rb` file under the DAP debugger: compile with per-statement
+/// line markers and run with the debug hook installed (`ruby --dap`).
+pub fn eval_file_debug(path: &str) -> Result<Value, String> {
+    let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let prog = compile_debug(&src)?;
+    host::reset_host();
+    host::set_debug_mode(true);
+    let r = run_compiled(prog);
+    host::set_debug_mode(false);
+    r
+}
+
 /// Evaluate `src` and return the `inspect` form of the last expression's value.
 /// The convenience entry point for tests and `--eval`-style checks.
 pub fn eval_to_string(src: &str) -> Result<String, String> {

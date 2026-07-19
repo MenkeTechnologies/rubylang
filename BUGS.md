@@ -283,9 +283,19 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
 
 ## Tooling
 
-- **DAP stepping.** The adapter completes the initialize/launch handshake and
-  runs the program to completion with stdout capture, but breakpoints and
-  stepping are not wired yet.
+- **DAP debugger (`ruby --dap`).** Source-line breakpoints fire inside method,
+  block, and loop bodies (per-statement line markers, emitted only in `--dap`
+  mode — normal runs carry zero extra ops and keep the tracing JIT; the debug
+  path runs the pure interpreter so every marker fires). Supports
+  `setBreakpoints` with real marker-based verification (a breakpoint on a
+  blank/`end`/comment line reports unverified and never fires),
+  `stackTrace`/`scopes`/`variables` (locals of the stopped frame), and
+  `continue`/`next`/`stepIn`/`stepOut` with `stopped`/`output`/`terminated`
+  events. It is single-threaded: it services requests only while stopped at a
+  marker, so an async `pause` of a free-running program is not supported. Also
+  not yet: `evaluate`/watch expressions, conditional/hit-count breakpoints,
+  `setVariable`, exception breakpoints, and non-innermost-frame variable
+  inspection.
 - **AOP weave.** `before`/`after`/`around` advice registered via the Ruby-facing
   `intercept(pattern, kind, handler)` builtin fires from the `run_method` dispatch
   choke point: `before` runs pre-call with the call args, `after` runs post-call

@@ -1,108 +1,422 @@
 //! Debug Adapter Protocol over stdio (`ruby --dap`).
 //!
-//! A minimal, spec-compliant adapter: it completes the initialize/launch
-//! handshake, runs the launched `.rb` program to completion while streaming its
-//! stdout as `output` events, and terminates. Stepping / breakpoints are a later
-//! wave (the fusevm line table is emitted but not yet surfaced as stops); the
-//! handshake and run-to-completion path are real so an editor can attach today.
+//! A single-threaded source-line debugger. The program is compiled with
+//! per-statement line markers (`Op::Extended(DBG_LINE)`, emitted only in this
+//! mode — normal runs carry zero extra ops) and run on the pure interpreter
+//! (the tracing JIT would compile hot loops and skip the markers). The fusevm
+//! extension handler fires synchronously at each marker; when it lands on a
+//! breakpoint or a step target it pauses IN PLACE and services DAP requests
+//! (`stackTrace`/`scopes`/`variables`/`continue`/`next`/`stepIn`/`stepOut`)
+//! from stdin until a resume command, then returns control to the VM.
 //!
-//! Program stdout is captured through a `pipe` + `dup2` on fd 1 so `puts`/`print`
-//! land in `output` events instead of corrupting the JSON channel on fd 1.
+//! Because it is single-threaded, an async `pause` of a free-running program is
+//! not supported (the adapter only reads requests while stopped at a marker);
+//! breakpoints and stepping — the load-bearing features — work inside method,
+//! block, and loop bodies. Program stdout is redirected to a pipe during the
+//! run and forwarded as `output` events, so `puts`/`print` never corrupt the
+//! JSON protocol channel on the saved stdout fd.
 
 use serde_json::{json, Value as J};
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::io::{Read, Write};
+use std::os::unix::io::{FromRawFd, RawFd};
+
+use fusevm::Op;
+
+/// How the debuggee should proceed from a stop.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Continue,
+    StepIn,
+    StepOver(usize),
+    StepOut(usize),
+}
+
+struct DebugState {
+    breakpoints: HashSet<u32>,
+    /// Lines that actually carry a marker (so a breakpoint on them can fire).
+    verified: HashSet<u32>,
+    mode: Mode,
+    /// Real stdout, saved before the program's stdout is redirected to a pipe;
+    /// all DAP protocol is written here.
+    proto_fd: RawFd,
+    /// Read end of the program-stdout pipe (non-blocking), drained into `output`
+    /// events. `-1` until `launch` sets it up.
+    pipe_r: RawFd,
+    /// Source path reported in stack frames.
+    program: String,
+    seq: i64,
+    /// True once `launch` has redirected stdout and the debuggee is running.
+    active: bool,
+}
+
+thread_local! {
+    static DBG: RefCell<DebugState> = RefCell::new(DebugState {
+        breakpoints: HashSet::new(),
+        verified: HashSet::new(),
+        mode: Mode::Continue,
+        proto_fd: 1,
+        pipe_r: -1,
+        program: String::new(),
+        seq: 1,
+        active: false,
+    });
+}
 
 /// Entry point for `ruby --dap`.
 pub fn run() -> Result<(), String> {
-    let mut input = std::io::stdin();
-    let mut seq = 1i64;
+    // Save the real stdout up front; all DAP protocol goes here even after the
+    // program's stdout is redirected to a pipe during `launch`.
+    let proto = unsafe { libc::dup(1) };
+    DBG.with(|d| d.borrow_mut().proto_fd = proto);
 
+    let mut input = std::io::stdin();
     while let Some(msg) = read_message(&mut input)? {
         let command = msg.get("command").and_then(|c| c.as_str()).unwrap_or("");
         let req_seq = msg.get("seq").and_then(|s| s.as_i64()).unwrap_or(0);
-
         match command {
             "initialize" => {
                 respond(
-                    &mut seq,
                     req_seq,
                     command,
                     json!({ "supportsConfigurationDoneRequest": true }),
                 );
-                event(&mut seq, "initialized", json!({}));
+                event("initialized", json!({}));
             }
+            "setBreakpoints" => set_breakpoints(&msg, req_seq),
+            "configurationDone" => respond(req_seq, command, json!({})),
+            "threads" => respond(
+                req_seq,
+                command,
+                json!({ "threads": [{ "id": 1, "name": "main" }] }),
+            ),
             "launch" => {
-                respond(&mut seq, req_seq, command, json!({}));
                 let program = msg
                     .get("arguments")
                     .and_then(|a| a.get("program"))
                     .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                run_program(&mut seq, program);
-                event(&mut seq, "terminated", json!({}));
-            }
-            "configurationDone" | "threads" | "setBreakpoints" => {
-                let body = if command == "threads" {
-                    json!({ "threads": [{ "id": 1, "name": "main" }] })
-                } else {
-                    json!({})
-                };
-                respond(&mut seq, req_seq, command, body);
+                    .unwrap_or("")
+                    .to_string();
+                respond(req_seq, command, json!({}));
+                launch(&program);
             }
             "disconnect" => {
-                respond(&mut seq, req_seq, command, json!({}));
+                respond(req_seq, command, json!({}));
                 break;
             }
-            _ => respond(&mut seq, req_seq, command, json!({})),
+            _ => respond(req_seq, command, json!({})),
         }
+    }
+    unsafe {
+        libc::close(proto);
     }
     Ok(())
 }
 
-/// Run the program, capturing its stdout and forwarding it as `output` events.
-fn run_program(seq: &mut i64, program: &str) {
-    let captured = capture_stdout(|| {
-        if let Err(e) = crate::eval_file(program) {
-            eprintln!("ruby: {e}");
+/// `setBreakpoints`: store the requested lines and report each verified only if
+/// the program actually emits a marker on that line (a blank/`end`/comment line
+/// is reported unverified — a breakpoint there would never fire).
+fn set_breakpoints(msg: &J, req_seq: i64) {
+    let path = msg
+        .get("arguments")
+        .and_then(|a| a.get("source"))
+        .and_then(|s| s.get("path"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .to_string();
+    let lines: Vec<u32> = msg
+        .get("arguments")
+        .and_then(|a| a.get("breakpoints"))
+        .and_then(|b| b.as_array())
+        .map(|bps| {
+            bps.iter()
+                .filter_map(|b| b.get("line").and_then(|l| l.as_u64()).map(|l| l as u32))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let markers = marker_lines(&path);
+    DBG.with(|d| {
+        let mut s = d.borrow_mut();
+        if !path.is_empty() {
+            s.program = path;
+        }
+        s.breakpoints = lines.iter().copied().collect();
+        s.verified = markers;
+    });
+    let bps: Vec<J> = DBG.with(|d| {
+        let s = d.borrow();
+        lines
+            .iter()
+            .map(|l| json!({ "verified": s.verified.contains(l), "line": l }))
+            .collect()
+    });
+    respond(req_seq, "setBreakpoints", json!({ "breakpoints": bps }));
+}
+
+/// The set of source lines that carry a `DBG_LINE` marker in the compiled
+/// program (main + every method/proc/class-method chunk) — the lines on which a
+/// breakpoint can actually stop.
+fn marker_lines(path: &str) -> HashSet<u32> {
+    let mut set = HashSet::new();
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return set;
+    };
+    let Ok(prog) = crate::compile_debug(&src) else {
+        return set;
+    };
+    let mut scan = |chunk: &fusevm::Chunk| {
+        for (i, op) in chunk.ops.iter().enumerate() {
+            if let Op::Extended(id, _) = op {
+                if *id == crate::host::ext::DBG_LINE {
+                    if let Some(l) = chunk.lines.get(i) {
+                        set.insert(*l);
+                    }
+                }
+            }
+        }
+    };
+    scan(&prog.main);
+    for (_, m) in &prog.methods {
+        scan(&m.chunk);
+    }
+    for p in &prog.procs {
+        scan(&p.chunk);
+    }
+    for (_, c) in &prog.classes {
+        for m in c.methods.values() {
+            scan(&m.chunk);
+        }
+        for m in c.class_methods.values() {
+            scan(&m.chunk);
+        }
+    }
+    set
+}
+
+/// Run the program under the debugger: redirect its stdout to a pipe, run with
+/// the debug hook (which pauses at breakpoints/steps), then restore stdout,
+/// flush remaining output, and emit `terminated`.
+fn launch(program: &str) {
+    if program.is_empty() {
+        return;
+    }
+    DBG.with(|d| {
+        let mut s = d.borrow_mut();
+        if s.program.is_empty() {
+            s.program = program.to_string();
         }
     });
-    if !captured.is_empty() {
-        event(
-            seq,
-            "output",
-            json!({ "category": "stdout", "output": captured }),
-        );
-    }
-}
-
-/// Redirect fd 1 into a pipe for the duration of `f`, returning what was written.
-fn capture_stdout(f: impl FnOnce()) -> String {
-    // SAFETY: standard pipe + dup2 dance on the process's own stdout fd.
-    unsafe {
+    // SAFETY: standard pipe + dup2 on the process's own stdout fd; the read end
+    // is set non-blocking so `drain_output` never stalls the debugger.
+    let pipe_r = unsafe {
         let mut fds = [0i32; 2];
         if libc::pipe(fds.as_mut_ptr()) != 0 {
-            f();
-            return String::new();
+            -1
+        } else {
+            libc::dup2(fds[1], 1);
+            libc::close(fds[1]);
+            let flags = libc::fcntl(fds[0], libc::F_GETFL);
+            libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
+            fds[0]
         }
-        let saved = libc::dup(1);
-        libc::dup2(fds[1], 1);
-        libc::close(fds[1]);
+    };
+    DBG.with(|d| {
+        let mut s = d.borrow_mut();
+        s.pipe_r = pipe_r;
+        s.mode = Mode::Continue;
+        s.active = true;
+    });
 
-        f();
-        // Flush Rust's stdout buffer before restoring the fd.
-        let _ = std::io::stdout().flush();
+    if let Err(e) = crate::eval_file_debug(program) {
+        eprintln!("ruby: {e}");
+    }
 
-        libc::dup2(saved, 1);
-        libc::close(saved);
+    // Restore stdout, drain any trailing program output, then close the pipe.
+    let _ = std::io::stdout().flush();
+    DBG.with(|d| d.borrow_mut().active = false);
+    drain_output();
+    let saved = DBG.with(|d| d.borrow().proto_fd);
+    unsafe {
+        if saved >= 0 {
+            libc::dup2(saved, 1);
+        }
+        if pipe_r >= 0 {
+            libc::close(pipe_r);
+        }
+    }
+    DBG.with(|d| d.borrow_mut().pipe_r = -1);
+    event("terminated", json!({}));
+}
 
-        let mut out = String::new();
-        let mut file = std::fs::File::from_raw_fd(fds[0]);
-        let _ = file.read_to_string(&mut out);
-        out
+/// Called by the VM (via the extension handler) at each statement marker. Reads
+/// the marker's source line; if it is a breakpoint or the active step target,
+/// pauses and services DAP requests until a resume command.
+pub fn on_debug_line(vm: &mut fusevm::VM) {
+    let line = *vm.chunk.lines.get(vm.ip.saturating_sub(1)).unwrap_or(&0);
+    if line == 0 {
+        return;
+    }
+    let depth = crate::host::with_host(|h| {
+        h.set_cur_line(line);
+        h.frame_depth()
+    });
+    let (stop, is_bp) = DBG.with(|d| {
+        let s = d.borrow();
+        if !s.active {
+            return (false, false);
+        }
+        let bp = s.breakpoints.contains(&line) && s.verified.contains(&line);
+        let step = match s.mode {
+            Mode::Continue => false,
+            Mode::StepIn => true,
+            Mode::StepOver(d0) => depth <= d0,
+            Mode::StepOut(d0) => depth < d0,
+        };
+        (bp || step, bp)
+    });
+    if !stop {
+        return;
+    }
+    drain_output();
+    event(
+        "stopped",
+        json!({
+            "reason": if is_bp { "breakpoint" } else { "step" },
+            "threadId": 1,
+            "allThreadsStopped": true,
+        }),
+    );
+
+    // Service requests until a resume command returns control to the VM.
+    let mut stdin = std::io::stdin();
+    loop {
+        match read_message(&mut stdin) {
+            Ok(Some(msg)) => {
+                if handle_stopped(&msg, depth) {
+                    break;
+                }
+            }
+            _ => {
+                // EOF / read error: let the program run to completion.
+                DBG.with(|d| d.borrow_mut().mode = Mode::Continue);
+                break;
+            }
+        }
     }
 }
 
-use std::os::unix::io::FromRawFd;
+/// Handle one request while stopped. Returns true when a resume command
+/// (`continue`/`next`/`stepIn`/`stepOut`) was processed and the VM should run on.
+fn handle_stopped(msg: &J, depth: usize) -> bool {
+    let command = msg.get("command").and_then(|c| c.as_str()).unwrap_or("");
+    let req_seq = msg.get("seq").and_then(|s| s.as_i64()).unwrap_or(0);
+    match command {
+        "threads" => {
+            respond(
+                req_seq,
+                command,
+                json!({ "threads": [{ "id": 1, "name": "main" }] }),
+            );
+            false
+        }
+        "stackTrace" => {
+            let program = DBG.with(|d| d.borrow().program.clone());
+            let frames: Vec<J> = crate::host::with_host(|h| h.dbg_stack())
+                .into_iter()
+                .enumerate()
+                .map(|(i, (name, line))| {
+                    json!({
+                        "id": i,
+                        "name": name,
+                        "line": line,
+                        "column": 1,
+                        "source": { "path": program },
+                    })
+                })
+                .collect();
+            respond(
+                req_seq,
+                command,
+                json!({ "stackFrames": frames, "totalFrames": frames.len() }),
+            );
+            false
+        }
+        "scopes" => {
+            respond(
+                req_seq,
+                command,
+                json!({ "scopes": [{ "name": "Locals", "variablesReference": 1, "expensive": false }] }),
+            );
+            false
+        }
+        "variables" => {
+            let vars: Vec<J> = crate::host::with_host(|h| h.dbg_locals())
+                .into_iter()
+                .map(|(n, v)| json!({ "name": n, "value": v, "variablesReference": 0 }))
+                .collect();
+            respond(req_seq, command, json!({ "variables": vars }));
+            false
+        }
+        "setBreakpoints" => {
+            set_breakpoints(msg, req_seq);
+            false
+        }
+        "continue" => {
+            DBG.with(|d| d.borrow_mut().mode = Mode::Continue);
+            respond(req_seq, command, json!({ "allThreadsContinued": true }));
+            true
+        }
+        "next" => {
+            DBG.with(|d| d.borrow_mut().mode = Mode::StepOver(depth));
+            respond(req_seq, command, json!({}));
+            true
+        }
+        "stepIn" => {
+            DBG.with(|d| d.borrow_mut().mode = Mode::StepIn);
+            respond(req_seq, command, json!({}));
+            true
+        }
+        "stepOut" => {
+            DBG.with(|d| d.borrow_mut().mode = Mode::StepOut(depth));
+            respond(req_seq, command, json!({}));
+            true
+        }
+        "disconnect" => {
+            DBG.with(|d| d.borrow_mut().mode = Mode::Continue);
+            respond(req_seq, command, json!({}));
+            true
+        }
+        _ => {
+            respond(req_seq, command, json!({}));
+            false
+        }
+    }
+}
+
+/// Read whatever the program has written to its stdout pipe so far (non-blocking)
+/// and forward it as an `output` event.
+fn drain_output() {
+    let fd = DBG.with(|d| d.borrow().pipe_r);
+    if fd < 0 {
+        return;
+    }
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n > 0 {
+            out.extend_from_slice(&buf[..n as usize]);
+        } else {
+            break;
+        }
+    }
+    if !out.is_empty() {
+        let text = String::from_utf8_lossy(&out).to_string();
+        event("output", json!({ "category": "stdout", "output": text }));
+    }
+}
 
 // ---- wire protocol --------------------------------------------------------
 
@@ -110,7 +424,6 @@ use std::os::unix::io::FromRawFd;
 fn read_message(input: &mut std::io::Stdin) -> Result<Option<J>, String> {
     let mut header = Vec::new();
     let mut byte = [0u8; 1];
-    // Read until the blank line terminating the headers.
     loop {
         match input.read(&mut byte) {
             Ok(0) => return Ok(None),
@@ -138,29 +451,41 @@ fn read_message(input: &mut std::io::Stdin) -> Result<Option<J>, String> {
         .map_err(|e| format!("dap json: {e}"))
 }
 
+/// Write a framed JSON message to the saved protocol fd (never to fd 1, which is
+/// the program's redirected stdout during a run).
 fn send(msg: &J) {
     let body = msg.to_string();
-    let out = std::io::stdout();
-    let mut lock = out.lock();
-    let _ = write!(lock, "Content-Length: {}\r\n\r\n{}", body.len(), body);
-    let _ = lock.flush();
+    let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+    let fd = DBG.with(|d| d.borrow().proto_fd);
+    // SAFETY: `fd` is a valid duplicated stdout fd owned by this process; wrapped
+    // in ManuallyDrop so the File does not close it on drop.
+    unsafe {
+        let mut f = std::mem::ManuallyDrop::new(std::fs::File::from_raw_fd(fd));
+        let _ = f.write_all(frame.as_bytes());
+        let _ = f.flush();
+    }
 }
 
-fn respond(seq: &mut i64, req_seq: i64, command: &str, body: J) {
-    let msg = json!({
-        "seq": *seq,
+fn next_seq() -> i64 {
+    DBG.with(|d| {
+        let mut s = d.borrow_mut();
+        let n = s.seq;
+        s.seq += 1;
+        n
+    })
+}
+
+fn respond(req_seq: i64, command: &str, body: J) {
+    send(&json!({
+        "seq": next_seq(),
         "type": "response",
         "request_seq": req_seq,
         "success": true,
         "command": command,
         "body": body,
-    });
-    *seq += 1;
-    send(&msg);
+    }));
 }
 
-fn event(seq: &mut i64, event: &str, body: J) {
-    let msg = json!({ "seq": *seq, "type": "event", "event": event, "body": body });
-    *seq += 1;
-    send(&msg);
+fn event(ev: &str, body: J) {
+    send(&json!({ "seq": next_seq(), "type": "event", "event": ev, "body": body }));
 }

@@ -466,6 +466,9 @@ pub struct ProcDef {
 struct Frame {
     scope: Scope,
     args: Vec<Value>,
+    /// The source line currently executing in this frame (updated by the DAP
+    /// debug hook at each statement marker; 0 outside `--dap`).
+    line: u32,
 }
 
 /// A non-local control signal raised by `break`/`next`/`return`/`retry`.
@@ -609,6 +612,7 @@ impl RubyHost {
                     def_class: None,
                 },
                 args: Vec::new(),
+                line: 0,
             }],
             globals: IndexMap::new(),
             consts: IndexMap::new(),
@@ -1507,6 +1511,51 @@ impl RubyHost {
     /// The active local-variable environment (shared, interior-mutable).
     fn cur_env(&self) -> Env {
         self.cur_scope().locals.clone()
+    }
+    /// DAP: number of active frames (call depth), for step-over/out granularity.
+    pub fn frame_depth(&self) -> usize {
+        self.frames.len()
+    }
+    /// DAP: record the source line currently executing in the top frame.
+    pub fn set_cur_line(&mut self, line: u32) {
+        if let Some(f) = self.frames.last_mut() {
+            f.line = line;
+        }
+    }
+    /// DAP: the call stack as (method-or-`"main"`, current line), innermost first.
+    pub fn dbg_stack(&self) -> Vec<(String, u32)> {
+        self.frames
+            .iter()
+            .rev()
+            .map(|f| {
+                (
+                    f.scope
+                        .method_name
+                        .clone()
+                        .unwrap_or_else(|| "main".into()),
+                    f.line,
+                )
+            })
+            .collect()
+    }
+    /// DAP: the innermost frame's locals as (name, inspect), skipping synthetic
+    /// temporaries (`__…`).
+    pub fn dbg_locals(&mut self) -> Vec<(String, String)> {
+        let env = self.cur_env();
+        let names: Vec<String> = env
+            .borrow()
+            .vars
+            .keys()
+            .filter(|k| !k.starts_with("__"))
+            .cloned()
+            .collect();
+        names
+            .into_iter()
+            .map(|n| {
+                let v = self.get_local(&n);
+                (n, self.inspect(&v))
+            })
+            .collect()
     }
     /// Read a local, walking the scope chain to enclosing environments.
     pub fn get_local(&self, name: &str) -> Value {
@@ -3024,6 +3073,18 @@ fn num_op_name(op: NumOp) -> &'static str {
 // Running chunks: method calls, block invocation, top-level program.
 // ===========================================================================
 
+thread_local! {
+    /// Set while `ruby --dap` is debugging: `run_chunk_on` then installs the DAP
+    /// line-marker extension handler and runs the pure interpreter (no tracing
+    /// JIT) so every `Op::Extended(DBG_LINE)` marker fires. Off for normal runs.
+    static DEBUG_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable/disable DAP debug execution (installs the line-marker hook path).
+pub fn set_debug_mode(on: bool) {
+    DEBUG_MODE.with(|d| d.set(on));
+}
+
 /// Register every rubylang builtin + the numeric hook on a VM, then run it.
 fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
     let mut vm = VM::new(chunk);
@@ -3031,7 +3092,17 @@ fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
     vm.set_numeric_hook(std::sync::Arc::new(|op, a, b| {
         crate::builtins::numeric_hook(op, a, b)
     }));
-    vm.enable_tracing_jit();
+    if DEBUG_MODE.with(|d| d.get()) {
+        // The DAP line marker pauses the interpreter; the tracing JIT would
+        // compile hot loops and skip the markers, so it stays off in debug mode.
+        vm.set_extension_handler(Box::new(|vm, id, _| {
+            if id == ext::DBG_LINE {
+                crate::dap::on_debug_line(vm);
+            }
+        }));
+    } else {
+        vm.enable_tracing_jit();
+    }
     let outcome = vm.run();
     if let Some(e) = with_host(|h| h.take_error()) {
         return Err(e);
@@ -3229,6 +3300,7 @@ fn run_method(
                 def_class,
             },
             args: args.to_vec(),
+            line: 0,
         });
         // A method body runs against its own top frame, not any captured block
         // scope in effect at the call site.
@@ -3487,6 +3559,7 @@ fn fiber_root_frame() -> Frame {
             def_class: None,
         },
         args: Vec::new(),
+        line: 0,
     }
 }
 
