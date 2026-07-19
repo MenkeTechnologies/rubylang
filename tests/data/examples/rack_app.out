@@ -1,23 +1,48 @@
-=== Rack app driven in-process (4 requests) ===
+=== Router: literal / param / wildcard dispatch ===
 
-GET /
-  status:  200
-  headers: {"Content-Type" => "text/html"}
-  body:    "<html><body><h1>Welcome to Rack on rubylang</h1><p>Visitors: 42</p></body></html>"
+GET /posts/42
+  status: 200
+  body:   {"post_id":"42","via_request_params":"42"}
 
-GET /api/status
-  status:  200
-  headers: {"Content-Type" => "application/json"}
-  body:    "{\"status\":\"ok\",\"engine\":\"rubylang\",\"rack\":1}"
+GET /posts/new  (literal beats :id)
+  status: 200
+  body:   <form>new post</form>
 
-GET /hello?name=Ada
-  status:  200
-  headers: {"Content-Type" => "text/html"}
-  body:    "<p>Hello, Ada!</p>"
+GET /files/css/site.css  (wildcard splat)
+  status: 200
+  body:   serving: css/site.css
+
+GET /api/echo?user=ada&tags[]=x&tags[]=y  (nested params)
+  status: 200
+  body:   {"user":"ada","tags":["x","y"]}
 
 GET /nowhere
-  status:  404
-  headers: {"Content-Type" => "text/plain"}
-  body:    "Not Found"
+  status: 404
+  body:   Not Found
 
-=== done ===
+=== Session cookie round-trip ===
+
+1st GET /  -> <html><body><h1>Rack on rubylang</h1><p>Visits: 1</p></body></html>
+   Set-Cookie present: true
+2nd GET /  (replaying cookie) -> <html><body><h1>Rack on rubylang</h1><p>Visits: 2</p></body></html>
+3rd GET /  (forged cookie, signature rejected) -> <html><body><h1>Rack on rubylang</h1><p>Visits: 1</p></body></html>
+
+=== Rack::Static serving a file ===
+
+GET /hello.txt
+  status:       200
+  content-type: text/plain
+  body:         "a static asset\n"
+
+GET /does-not-exist.png
+  status: 404
+
+=== CommonLogger captured 8 lines (router requests) ===
+
+=== MockRequest assertions ===
+  [PASS] param route id
+  [PASS] wildcard depth
+  [PASS] literal specificity
+  [PASS] unknown is 404
+
+=== all assertions passed ===
