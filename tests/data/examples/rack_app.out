@@ -1,0 +1,23 @@
+=== Rack app driven in-process (4 requests) ===
+
+GET /
+  status:  200
+  headers: {"Content-Type" => "text/html"}
+  body:    "<html><body><h1>Welcome to Rack on rubylang</h1><p>Visitors: 42</p></body></html>"
+
+GET /api/status
+  status:  200
+  headers: {"Content-Type" => "application/json"}
+  body:    "{\"status\":\"ok\",\"engine\":\"rubylang\",\"rack\":1}"
+
+GET /hello?name=Ada
+  status:  200
+  headers: {"Content-Type" => "text/html"}
+  body:    "<p>Hello, Ada!</p>"
+
+GET /nowhere
+  status:  404
+  headers: {"Content-Type" => "text/plain"}
+  body:    "Not Found"
+
+=== done ===

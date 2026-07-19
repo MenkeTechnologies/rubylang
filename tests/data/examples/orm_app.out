@@ -1,0 +1,35 @@
+== schema ==
+table_name inferred: users
+columns: ["id", "name", "age"]
+
+== create (INSERT) ==
+created Ann id=1 persisted=true
+created Bob id=2 persisted=true
+
+== read (all / find / where / count / first) ==
+count: 2
+  all -> #1 Ann (30)
+  all -> #2 Bob (25)
+find(1) -> Ann (30)
+  where(age:30) -> Ann
+first -> Ann
+attributes: {"id" => 1, "name" => "Ann", "age" => 30}
+index access: found['name'] = Ann
+
+== update (save on persisted) ==
+Bob after save: 26
+
+== destroy (DELETE) ==
+count with Carol: 3
+count after destroy: 2
+carol persisted after destroy: false
+
+== RecordNotFound ==
+raised: Couldn't find User with id=9999
+
+== persistence: reopen a fresh connection to the SAME file ==
+count after reopen: 2
+  reread -> #1 Ann (30)
+  reread -> #2 Bob (26)
+
+OK
