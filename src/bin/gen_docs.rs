@@ -19,12 +19,12 @@ use std::fmt::Write as _;
 
 fn main() {
     let corpus = rubylang::lsp::corpus();
-    let chapters: BTreeSet<&str> = corpus.iter().map(|(_, c, _)| *c).collect();
+    let chapters: BTreeSet<&str> = corpus.iter().map(|(_, c, _, _)| *c).collect();
 
     let page = format!(
         "{head}{body}{foot}",
         head = HEAD,
-        body = build_body(corpus, chapters.len()),
+        body = build_body(corpus),
         foot = FOOT,
     )
     // Stamp the current crate version so the page never falls behind Cargo.toml
@@ -39,16 +39,20 @@ fn main() {
     println!("wrote {out} ({} methods, {} chapters)", corpus.len(), chapters.len());
 }
 
-/// Render the stat grid plus one section/table per chapter, in corpus order.
-fn build_body(corpus: &[(&str, &str, &str)], _chapter_count: usize) -> String {
+/// Render one `<section>` per chapter, each holding one `<article class="doc-entry">`
+/// per method: name heading, one-line description, and a runnable usage example.
+fn build_body(corpus: &[(&str, &str, &str, &str)]) -> String {
     let mut out = String::new();
 
     // Walk the corpus once, opening a new section each time the chapter changes.
+    // A per-chapter counter keeps the `doc-…` anchor ids unique even when a
+    // method name (e.g. `to_s`) or an operator repeats across chapters.
     let mut current: Option<&str> = None;
-    for (name, chapter, doc) in corpus {
+    let mut idx = 0usize;
+    for (name, chapter, doc, example) in corpus {
         if current != Some(*chapter) {
             if current.is_some() {
-                out.push_str("          </tbody>\n        </table>\n      </section>\n");
+                out.push_str("      </section>\n");
             }
             // The `id="ch-…"` marks this as a real reference chapter. The
             // reference-PDF pipeline keeps id-carrying sections and drops the
@@ -56,24 +60,30 @@ fn build_body(corpus: &[(&str, &str, &str)], _chapter_count: usize) -> String {
             let _ = write!(
                 out,
                 "\n      <section class=\"tutorial-section\" id=\"ch-{slug}\">\n\
-                 \x20       <h2>{title}</h2>\n\
-                 \x20       <table class=\"file-table\">\n\
-                 \x20         <thead><tr><th>Method</th><th>Description</th></tr></thead>\n\
-                 \x20         <tbody>\n",
+                 \x20       <h2>{title}</h2>\n",
                 slug = slugify(chapter),
                 title = html_escape(chapter),
             );
             current = Some(*chapter);
+            idx = 0;
         }
-        let _ = writeln!(
+        idx += 1;
+        let anchor = format!("doc-{}-{}", slugify(chapter), idx);
+        let _ = write!(
             out,
-            "<tr><td><code>{}</code></td><td>{}</td></tr>",
-            html_escape(name),
-            html_escape(doc),
+            "        <article class=\"doc-entry\" id=\"{anchor}\">\n\
+             \x20         <h3><a class=\"doc-anchor\" href=\"#{anchor}\">#</a> <code>{name}</code></h3>\n\
+             \x20         <p>{doc}</p>\n\
+             \x20         <pre><code class=\"lang-ruby\">{example}</code></pre>\n\
+             \x20       </article>\n",
+            anchor = anchor,
+            name = html_escape(name),
+            doc = html_escape(doc),
+            example = html_escape(example),
         );
     }
     if current.is_some() {
-        out.push_str("          </tbody>\n        </table>\n      </section>\n");
+        out.push_str("      </section>\n");
     }
     out
 }
