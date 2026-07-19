@@ -1,0 +1,64 @@
+== schema ==
+authors columns: ["id", "name", "email"]
+posts columns:   ["id", "created_at", "updated_at", "title", "author_id", "views", "published"]
+
+== create authors ==
+alice id=1 bob id=2
+
+== validation: presence failure ==
+save returned: false
+errors: ["Name can't be blank"]
+
+== validation: uniqueness failure ==
+save returned: false
+errors: ["Email has already been taken"]
+
+== create! raises RecordInvalid ==
+raised: Validation failed: Name can't be blank
+
+== create posts (callbacks fire in order) ==
+  [after_create] post #1 "Hello World" published=1
+  [after_create] post #2 "Rails on Ruby" published=1
+  [after_create] post #3 "SQLite Deep Dive" published=0
+
+== belongs_to / has_many ==
+p1.author.name = Alice
+alice.posts.count = 2
+  alice post: Hello World
+  alice post: Rails on Ruby
+alice post titles = ["Hello World", "Rails on Ruby"]
+
+== where.order.limit chaining (lazy) ==
+sql = SELECT * FROM posts WHERE published = ? ORDER BY views DESC LIMIT 2
+  top post: Rails on Ruby (55 views)
+  top post: Hello World (10 views)
+top titles = ["Rails on Ruby", "Hello World"]
+
+== pluck / find_by / first / last / exists? ==
+all titles = ["Hello World", "Rails on Ruby", "SQLite Deep Dive"]
+find_by title -> #2 by author Alice
+first title = Hello World
+last title  = SQLite Deep Dive
+default last title = SQLite Deep Dive
+exists published=0 ? true
+
+== where.not ==
+  published: Hello World
+  published: Rails on Ruby
+
+== update + dirty tracking ==
+before: changed?=false views=10
+after assign: changed?=true changed=["views"]
+after update: changed?=false views=42
+
+== reload ==
+p2 title after reload = Rails on Ruby
+
+== update_all ==
+update_all affected = 2
+
+== destroy_all ==
+posts before = 3
+posts after destroying bob's = 2
+
+OK

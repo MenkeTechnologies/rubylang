@@ -158,6 +158,22 @@ Implemented and checked against the reference `ruby`:
   `last_insert_row_id` / `changes`, and rescuable `SQLite3::SQLException`. The
   sqlite→Ruby type map is INTEGER→Integer, REAL→Float, TEXT→String, NULL→nil,
   BLOB→String. See [`examples/sqlite_persistence.rb`](examples/sqlite_persistence.rb).
+- **ActiveRecord-style ORM** — [`stdlib/active_record.rb`](stdlib/active_record.rb)
+  is a real, pure-Ruby subset of Rails' ActiveRecord built on the bundled
+  `SQLite3::Database` (no stubs, runs identically on rubylang and MRI). Covers
+  connection management + table-name inference + PRAGMA schema introspection with
+  dynamically-defined column accessors; a lazy chainable query `Relation`
+  (`where` / `order` / `limit` / `offset` / `pluck` / `first` / `last` / `count`
+  / `exists?` / `find_each` / `where.not`, every value `?`-bound); finders
+  (`find` / `find_by` / `find_by!`); persistence (`create!` / `save!` / `update` /
+  `destroy_all` / `update_all` / `reload`, dirty tracking, `new_record?`);
+  presence + query-backed uniqueness validations with an `errors` object
+  (`save` returns `false` when invalid, `save!`/`create!` raise
+  `AR::RecordInvalid`); `before_save`/`after_save`/`before_create`/`after_create`/
+  `before_destroy` callbacks; and `belongs_to` / `has_many` associations. See
+  [`examples/orm_app.rb`](examples/orm_app.rb) (CRUD) and
+  [`examples/orm_blog.rb`](examples/orm_blog.rb) (associations, validations,
+  callbacks, query chaining).
 
 ---
 
