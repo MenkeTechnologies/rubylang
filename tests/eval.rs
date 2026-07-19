@@ -4373,3 +4373,84 @@ fn array_uniq_with_block_uses_key() {
     eq("%w[a bb cc ddd].uniq(&:length)", "[\"a\", \"bb\", \"ddd\"]");
     eq("[1, 1, 2, 3, 3].uniq", "[1, 2, 3]");
 }
+
+/// Framework-shaped runtime gaps a real web library (Rack / ActiveRecord-style)
+/// trips on. Every expected value confirmed against ruby 4.0.6.
+#[test]
+fn setter_method_definitions() {
+    // Instance setter def `def x=(v)` — dispatched by `obj.x = v`.
+    eq(
+        "class C; def x=(v); @x = v; end; def x; @x; end; end; c = C.new; c.x = 7; c.x",
+        "7",
+    );
+    // Singleton/class-method setter `def self.x=(v)`.
+    eq(
+        "class C; def self.x=(v); @x = v; end; def self.x; @x; end; end; C.x = 5; C.x",
+        "5",
+    );
+    // `class << self; attr_accessor` — class-level attributes.
+    eq(
+        "class C; class << self; attr_accessor :cfg; end; end; C.cfg = 1; C.cfg",
+        "1",
+    );
+    // A setter reached through `send`.
+    eq(
+        "class C; def x=(v); @x = v; end; def x; @x; end; end; c = C.new; c.send(:x=, 9); c.x",
+        "9",
+    );
+}
+
+#[test]
+fn multiline_parenthesized_call_arguments() {
+    // A newline after `(` and before `)` inside a CALL arg list must parse (the
+    // #1 blocker both framework libraries hit).
+    eq("def f(a, b); a + b; end; f(\n  1,\n  2\n)", "3");
+    // Trailing comma + closing paren on its own line.
+    eq("[1, 2, 3].map { |x|\n  x * 2\n}", "[2, 4, 6]");
+    // Nested multi-line call.
+    eq(
+        "def g(x); x; end; def f(a, b); a + b; end; g(\n  f(\n    10,\n    20\n  )\n)",
+        "30",
+    );
+}
+
+#[test]
+fn framework_metaprogramming_idioms() {
+    // alias_method.
+    eq(
+        "class C; def a; 1; end; alias_method :b, :a; end; C.new.b",
+        "1",
+    );
+    // prepend + super.
+    eq(
+        "module M; def g; \"M\" + super; end; end; class C; def g; \"C\"; end; prepend M; end; C.new.g",
+        "\"MC\"",
+    );
+    // define_singleton_method.
+    eq(
+        "o = Object.new; o.define_singleton_method(:h) { 42 }; o.h",
+        "42",
+    );
+    // Anonymous class instantiation (Class.new { ... }.new).
+    eq("Class.new { def z; 9; end }.new.z", "9");
+    // superclass.
+    eq("class B; end; class D < B; end; D.superclass", "B");
+    // instance_eval — literal block rebinds self.
+    eq(
+        "o = Object.new; o.instance_eval { @v = 3 }; o.instance_variable_get(:@v)",
+        "3",
+    );
+    // instance_eval — a forwarded &block also rebinds self.
+    eq("def d(&b); Object.new.instance_eval(&b); end; d { 5 }", "5");
+}
+
+#[test]
+fn dir_and_env_builtins() {
+    // ENV pseudo-hash over the process environment.
+    eq("ENV[\"PATH\"].nil?", "false");
+    eq("ENV.fetch(\"RUBYLANG_NOPE_XYZ\", \"d\")", "\"d\"");
+    eq("ENV.key?(\"RUBYLANG_NOPE_XYZ\")", "false");
+    // Dir.tmpdir (needs `require \"tmpdir\"`, a no-op) returns a String path.
+    eq("require \"tmpdir\"; Dir.tmpdir.is_a?(String)", "true");
+    eq("require \"tmpdir\"; Dir.respond_to?(:mktmpdir)", "true");
+}

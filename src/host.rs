@@ -558,11 +558,19 @@ pub struct RubyHost {
     /// Class variables (`@@x`): class name → variable name → value. Shared across
     /// the class hierarchy (looked up by walking the superclass chain).
     class_vars: IndexMap<String, IndexMap<String, Value>>,
+    /// Class-level instance variables (`@x` where `self` is a class/module, e.g.
+    /// inside `def self.m` or `class << self`): class name → variable name →
+    /// value. Unlike `@@` class variables these are NOT inherited.
+    class_ivars: IndexMap<String, IndexMap<String, Value>>,
     /// `define_method`-created instance methods: class → name → block Proc.
     define_methods: IndexMap<String, IndexMap<String, Value>>,
     /// Per-object singleton methods (`def obj.m`, `class << obj`, and bare `def`
     /// inside `obj.instance_eval`), keyed by the object's heap id → name → method.
     singleton_methods: IndexMap<u32, IndexMap<String, MethodDef>>,
+    /// `define_singleton_method`-created singletons: object heap id → name → block
+    /// Proc. Proc-based (closes over its defining scope), parallel to
+    /// `define_methods` but per-object rather than per-class.
+    singleton_define_methods: IndexMap<u32, IndexMap<String, Value>>,
     /// `alias_method`/`alias` mappings: class → alias name → target method name.
     method_aliases: IndexMap<String, IndexMap<String, String>>,
     /// Live fibers, indexed by `RObj::Fiber.id`. The coroutine is `.take()`n out
@@ -964,8 +972,10 @@ impl RubyHost {
             struct_defs: IndexMap::new(),
             struct_counter: 0,
             class_vars: IndexMap::new(),
+            class_ivars: IndexMap::new(),
             define_methods: IndexMap::new(),
             singleton_methods: IndexMap::new(),
+            singleton_define_methods: IndexMap::new(),
             method_aliases: IndexMap::new(),
         };
         // Seed the standard streams as `STDOUT`/`STDERR`/`STDIN` constants and
@@ -1847,9 +1857,26 @@ impl RubyHost {
             return name == "new" || self.find_class_method(&cls, name).is_some();
         }
         if let Some(cls) = self.object_class(&this) {
-            if self.find_method(&cls, name).is_some() {
+            if self.find_method(&cls, name).is_some()
+                || self.find_define_method(&cls, name).is_some()
+            {
                 return true;
             }
+            // A Struct member accessor (`x` / `x=`) is handled at dispatch, not as
+            // a stored method, so a bare self-call to it must still resolve.
+            if let Some((members, _)) = self.struct_def(&cls) {
+                let member = name.strip_suffix('=').unwrap_or(name);
+                if members.iter().any(|m| m == member) {
+                    return true;
+                }
+            }
+        }
+        // A per-object singleton (`def obj.m`, `class << obj`) or a
+        // `define_singleton_method` block on the current self.
+        if self.find_singleton_method(&this, name).is_some()
+            || self.find_singleton_define_method(&this, name).is_some()
+        {
+            return true;
         }
         self.methods.contains_key(name)
     }
@@ -2003,10 +2030,19 @@ impl RubyHost {
     pub fn get_ivar(&self, name: &str) -> Value {
         match self.current_self() {
             Value::Obj(_) => {
-                if let Some(RObj::Object { ivars, .. }) = self.obj(&self.current_self()) {
-                    return ivars.get(name).cloned().unwrap_or(Value::Undef);
+                match self.obj(&self.current_self()) {
+                    Some(RObj::Object { ivars, .. }) => {
+                        ivars.get(name).cloned().unwrap_or(Value::Undef)
+                    }
+                    // `@x` where `self` is a class/module (class-level ivar).
+                    Some(RObj::ClassRef(cls)) => self
+                        .class_ivars
+                        .get(cls)
+                        .and_then(|m| m.get(name))
+                        .cloned()
+                        .unwrap_or(Value::Undef),
+                    _ => Value::Undef,
                 }
-                Value::Undef
             }
             _ => self
                 .globals
@@ -2018,11 +2054,20 @@ impl RubyHost {
     pub fn set_ivar(&mut self, name: &str, v: Value) {
         let this = self.current_self();
         match this {
-            Value::Obj(i) => {
-                if let Some(RObj::Object { ivars, .. }) = self.heap.get_mut(i as usize) {
+            Value::Obj(i) => match self.heap.get_mut(i as usize) {
+                Some(RObj::Object { ivars, .. }) => {
                     ivars.insert(name.to_string(), v);
                 }
-            }
+                // `@x = v` where `self` is a class/module (class-level ivar).
+                Some(RObj::ClassRef(cls)) => {
+                    let cls = cls.clone();
+                    self.class_ivars
+                        .entry(cls)
+                        .or_default()
+                        .insert(name.to_string(), v);
+                }
+                _ => {}
+            },
             _ => {
                 self.globals.insert(format!("@{name}"), v);
             }
@@ -2041,6 +2086,21 @@ impl RubyHost {
     }
     pub fn class_exists(&self, name: &str) -> bool {
         self.classes.contains_key(name)
+    }
+    /// Register an anonymous class/module (`Class.new`/`Module.new`) under a fresh
+    /// name and return it. The optional superclass seeds the `ClassDef`; the block
+    /// body (if any) is run afterwards as a `class_eval` by the caller.
+    pub fn define_anon_class(&mut self, superclass: Option<String>) -> String {
+        self.struct_counter += 1;
+        let name = format!("#<Class:{}>", self.struct_counter);
+        self.classes.insert(
+            name.clone(),
+            ClassDef {
+                superclass,
+                ..ClassDef::default()
+            },
+        );
+        name
     }
     /// Register a `Struct.new(...)` definition under a fresh anonymous name and
     /// return that name (used as the class of its instances until renamed).
@@ -2080,6 +2140,27 @@ impl RubyHost {
         match v {
             Value::Obj(id) => self
                 .singleton_methods
+                .get(id)
+                .and_then(|m| m.get(name))
+                .cloned(),
+            _ => None,
+        }
+    }
+    /// Register a `define_singleton_method` (a block Proc) on a specific object.
+    pub fn add_singleton_define_method(&mut self, id: u32, name: &str, proc: Value) {
+        self.singleton_define_methods
+            .entry(id)
+            .or_default()
+            .insert(name.to_string(), proc);
+    }
+    /// A per-object `define_singleton_method` block for `name`, if `v` has one.
+    pub fn find_singleton_define_method(&self, v: &Value, name: &str) -> Option<Value> {
+        if self.singleton_define_methods.is_empty() {
+            return None;
+        }
+        match v {
+            Value::Obj(id) => self
+                .singleton_define_methods
                 .get(id)
                 .and_then(|m| m.get(name))
                 .cloned(),
@@ -2173,6 +2254,30 @@ impl RubyHost {
     pub fn rename_struct(&mut self, old: &str, new: &str) {
         if let Some(def) = self.struct_defs.shift_remove(old) {
             self.struct_defs.insert(new.to_string(), def);
+        }
+    }
+    /// Re-register an anonymous class/module (`Class.new`/`Module.new`) under the
+    /// constant it is first assigned to, so `Foo = Class.new` names it `Foo`
+    /// (matching MRI) and `include Foo` (resolved by name) finds it. Also moves any
+    /// class variables / class-level ivars keyed by the old anonymous name.
+    pub fn is_anon_class(&self, name: &str) -> bool {
+        name.starts_with("#<Class:") && self.classes.contains_key(name)
+    }
+    pub fn rename_class(&mut self, old: &str, new: &str) {
+        if let Some(def) = self.classes.shift_remove(old) {
+            self.classes.insert(new.to_string(), def);
+        }
+        if let Some(v) = self.class_vars.shift_remove(old) {
+            self.class_vars.insert(new.to_string(), v);
+        }
+        if let Some(v) = self.class_ivars.shift_remove(old) {
+            self.class_ivars.insert(new.to_string(), v);
+        }
+        if let Some(v) = self.define_methods.shift_remove(old) {
+            self.define_methods.insert(new.to_string(), v);
+        }
+        if let Some(v) = self.method_aliases.shift_remove(old) {
+            self.method_aliases.insert(new.to_string(), v);
         }
     }
     /// Allocate an instance of `class`.
@@ -2398,6 +2503,9 @@ impl RubyHost {
                 | "OpenStruct"
                 | "SQLite3"
                 | "SQLite3::Database"
+                // `ENV` is modeled as a class-ref so its `[]`/`fetch`/… dispatch
+                // through `dispatch_classref` (it is the process environment).
+                | "ENV"
         )
     }
     pub fn classref_name(&self, v: &Value) -> Option<String> {

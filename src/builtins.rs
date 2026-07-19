@@ -431,6 +431,14 @@ fn b_setconst(vm: &mut VM, _: u8) -> Value {
     let val = with_host(|h| match h.classref_name(&val) {
         Some(cref) if cref.starts_with("Struct:") && h.struct_def(&cref).is_some() => {
             h.rename_struct(&cref, &name);
+            // Also move any methods defined by a `Struct.new(...) do ... end` body.
+            h.rename_class(&cref, &name);
+            h.class_ref(&name)
+        }
+        // `Foo = Class.new` / `Foo = Module.new` names the anonymous class/module
+        // after the constant (MRI behavior), so `include Foo` resolves by name.
+        Some(cref) if h.is_anon_class(&cref) => {
+            h.rename_class(&cref, &name);
             h.class_ref(&name)
         }
         _ => val.clone(),
@@ -732,6 +740,14 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
         {
             return dispatch(&this, name, args, block);
         }
+        // A bare call to a Struct member accessor (`x` / `x=`) inside a struct
+        // method must route through object dispatch to reach `struct_method`.
+        if let Some((members, _)) = with_host(|h| h.struct_def(&cls)) {
+            let member = name.strip_suffix('=').unwrap_or(name);
+            if members.iter().any(|m| m == member) {
+                return dispatch(&this, name, args, block);
+            }
+        }
     }
     if with_host(|h| h.responds_to(name)) {
         return call_method(name, args, block);
@@ -765,6 +781,9 @@ fn is_universal_object_method(name: &str) -> bool {
             | "dup"
             | "clone"
             | "methods"
+            | "instance_eval"
+            | "instance_exec"
+            | "define_singleton_method"
     )
 }
 
@@ -799,6 +818,10 @@ pub(crate) fn dispatch(
     // fallbacks.
     if let Some(def) = with_host(|h| h.find_singleton_method(recv, name)) {
         return crate::host::call_singleton(recv.clone(), &def, name, args, block);
+    }
+    // A `define_singleton_method` block runs with `self` = the receiver.
+    if let Some(proc) = with_host(|h| h.find_singleton_define_method(recv, name)) {
+        return crate::host::call_proc_self(&proc, args, Some(recv));
     }
     // A user-defined method wins over the universal fallbacks (so a class can
     // override `to_s`, `==`, `inspect`, etc.).
@@ -1054,6 +1077,19 @@ pub(crate) fn dispatch(
             }
             return Ok(Value::Bool(true));
         }
+        // `obj.define_singleton_method(:name) { body }` — a per-object method from
+        // the block (or a Method/Proc arg), keyed by the receiver's heap id.
+        "define_singleton_method" if matches!(recv, Value::Obj(_)) => {
+            let mname = name_of(&args[0]);
+            let proc = block
+                .clone()
+                .or_else(|| args.get(1).cloned())
+                .ok_or_else(|| raise_exc("ArgumentError", "tried to create Proc without a block"))?;
+            if let Value::Obj(id) = recv {
+                with_host(|h| h.add_singleton_define_method(*id, &mname, proc));
+            }
+            return Ok(with_host(|h| h.new_symbol(&mname)));
+        }
         // `instance_eval`/`instance_exec` run with `self` = receiver: a bare `def`
         // defines a singleton on the receiver (or a class method when the receiver
         // is a class), and `@ivar` accesses the receiver's instance variables.
@@ -1149,6 +1185,10 @@ fn dispatch_classref(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    // `ENV` — the process environment as a hash-like object (backed by std::env).
+    if cls == "ENV" {
+        return dispatch_env(name, args, block);
+    }
     // `Struct.new(:a, :b [, keyword_init: true])` defines a new struct class and
     // returns a reference to it (usually assigned to a constant).
     if cls == "Struct" && name == "new" {
@@ -1165,7 +1205,18 @@ fn dispatch_classref(
             }
         }
         let struct_name = with_host(|h| h.define_struct(members, keyword_init));
-        return Ok(with_host(|h| h.class_ref(&struct_name)));
+        let cref = with_host(|h| h.class_ref(&struct_name));
+        // `Struct.new(:a) do ... end` — the block body defines instance methods on
+        // the new struct class (run as a `class_eval`).
+        if let Some(bl) = block {
+            crate::host::eval_block_scoped(
+                &bl,
+                &cref,
+                crate::host::DefTarget::Instance(struct_name),
+                std::slice::from_ref(&cref),
+            )?;
+        }
+        return Ok(cref);
     }
     // Instantiating a struct class: bind positional args (or keyword args) to the
     // member instance variables.
@@ -1493,6 +1544,29 @@ fn dispatch_classref(
     }
     match name {
         "new" => {
+            // `Class.new([Super]) { body }` / `Module.new { body }` — an anonymous
+            // class/module. The optional first arg is the superclass; the block is
+            // run as a `class_eval` so its `def`s become instance methods.
+            if cls == "Class" || cls == "Module" {
+                let superclass = if cls == "Class" {
+                    args.first()
+                        .and_then(|a| with_host(|h| h.classref_name(a)))
+                        .or_else(|| Some("Object".to_string()))
+                } else {
+                    None
+                };
+                let name = with_host(|h| h.define_anon_class(superclass));
+                let cref = with_host(|h| h.class_ref(&name));
+                if let Some(bl) = block {
+                    crate::host::eval_block_scoped(
+                        &bl,
+                        &cref,
+                        crate::host::DefTarget::Instance(name),
+                        std::slice::from_ref(&cref),
+                    )?;
+                }
+                return Ok(cref);
+            }
             // `Array.new(n)` / `Array.new(n, val)` / `Array.new(n) { |i| ... }`.
             if cls == "Array" {
                 let n = args.first().map(as_i).unwrap_or(0).max(0) as usize;
@@ -6623,6 +6697,103 @@ fn io_puts_arg(recv: &Value, v: &Value) -> Result<(), String> {
 }
 
 /// Class methods on `Dir`. Returns `None` for names it doesn't own.
+/// `ENV` — the process environment surfaced as a hash-like object over
+/// `std::env`. Keys and values are strings; a `nil` value deletes.
+fn dispatch_env(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, String> {
+    let key = |i: usize| args.get(i).map(|a| with_host(|h| h.to_s(a)));
+    match name {
+        "[]" => {
+            let k = str_arg(args, 0);
+            Ok(std::env::var(&k).map(new_str).unwrap_or(Value::Undef))
+        }
+        "[]=" | "store" => {
+            let k = str_arg(args, 0);
+            match args.get(1) {
+                Some(Value::Undef) | None => std::env::remove_var(&k),
+                Some(v) => std::env::set_var(&k, with_host(|h| h.to_s(v))),
+            }
+            Ok(args.get(1).cloned().unwrap_or(Value::Undef))
+        }
+        "fetch" => {
+            let k = str_arg(args, 0);
+            match std::env::var(&k) {
+                Ok(v) => Ok(new_str(v)),
+                Err(_) => {
+                    if let Some(bl) = &block {
+                        call_proc(bl, &[new_str(k)])
+                    } else if args.len() >= 2 {
+                        Ok(args[1].clone())
+                    } else {
+                        Err(raise_exc("KeyError", &format!("key not found: {k:?}")))
+                    }
+                }
+            }
+        }
+        "key?" | "has_key?" | "include?" | "member?" => {
+            Ok(Value::Bool(std::env::var(str_arg(args, 0)).is_ok()))
+        }
+        "value?" | "has_value?" => {
+            let target = key(0).unwrap_or_default();
+            Ok(Value::Bool(std::env::vars().any(|(_, v)| v == target)))
+        }
+        "key" => {
+            let target = key(0).unwrap_or_default();
+            Ok(std::env::vars()
+                .find(|(_, v)| *v == target)
+                .map(|(k, _)| new_str(k))
+                .unwrap_or(Value::Undef))
+        }
+        "delete" => {
+            let k = str_arg(args, 0);
+            let prev = std::env::var(&k).ok();
+            std::env::remove_var(&k);
+            Ok(prev.map(new_str).unwrap_or(Value::Undef))
+        }
+        "keys" => Ok(new_arr(std::env::vars().map(|(k, _)| new_str(k)).collect())),
+        "values" => Ok(new_arr(std::env::vars().map(|(_, v)| new_str(v)).collect())),
+        "to_h" | "to_hash" => {
+            let map: IndexMap<RKey, Value> = std::env::vars()
+                .map(|(k, v)| (RKey::Str(k), new_str(v)))
+                .collect();
+            Ok(with_host(|h| h.new_hash(map)))
+        }
+        "to_a" => Ok(new_arr(
+            std::env::vars()
+                .map(|(k, v)| new_arr(vec![new_str(k), new_str(v)]))
+                .collect(),
+        )),
+        "size" | "length" => Ok(Value::Int(std::env::vars().count() as i64)),
+        "empty?" => Ok(Value::Bool(std::env::vars().next().is_none())),
+        "each" | "each_pair" => {
+            if let Some(bl) = &block {
+                for (k, v) in std::env::vars().collect::<Vec<_>>() {
+                    call_proc(bl, &[new_str(k), new_str(v)])?;
+                }
+            }
+            Ok(with_host(|h| h.class_ref("ENV")))
+        }
+        "each_key" => {
+            if let Some(bl) = &block {
+                for (k, _) in std::env::vars().collect::<Vec<_>>() {
+                    call_proc(bl, &[new_str(k)])?;
+                }
+            }
+            Ok(with_host(|h| h.class_ref("ENV")))
+        }
+        "inspect" | "to_s" => {
+            let map: IndexMap<RKey, Value> = std::env::vars()
+                .map(|(k, v)| (RKey::Str(k), new_str(v)))
+                .collect();
+            let h = with_host(|h| h.new_hash(map));
+            Ok(new_str(with_host(|host| host.inspect(&h))))
+        }
+        _ => Err(raise_exc(
+            "NoMethodError",
+            &format!("undefined method '{name}' for ENV"),
+        )),
+    }
+}
+
 fn dispatch_dir_class(
     name: &str,
     args: &[Value],
@@ -6693,6 +6864,48 @@ fn dispatch_dir_class(
         "home" => Ok(new_str(
             std::env::var("HOME").unwrap_or_else(|_| "/".to_string()),
         )),
+        // `Dir.tmpdir` (from `require "tmpdir"`) — the system temp directory.
+        "tmpdir" => Ok(new_str(std::env::temp_dir().to_string_lossy().into_owned())),
+        // `Dir.mktmpdir([prefix][, tmpdir])` — create a fresh temp directory. With
+        // a block, yield its path and remove it (recursively) afterwards, returning
+        // the block value; without a block, return the created path.
+        "mktmpdir" => {
+            let prefix = match args.first() {
+                Some(a) if !matches!(a, Value::Undef) => with_host(|h| h.to_s(a)),
+                _ => "d".to_string(),
+            };
+            let base = std::env::temp_dir();
+            let mut path = std::path::PathBuf::new();
+            // Try a handful of randomized names to avoid collisions.
+            let mut created = false;
+            for _ in 0..64 {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0);
+                let n = std::process::id() ^ nanos.rotate_left(13) ^ (path.capacity() as u32);
+                path = base.join(format!("{prefix}{n:08x}{nanos:08x}"));
+                if std::fs::create_dir(&path).is_ok() {
+                    created = true;
+                    break;
+                }
+            }
+            if !created {
+                return Some(Err(raise_exc(
+                    "SystemCallError",
+                    "could not create temp directory",
+                )));
+            }
+            let p = path.to_string_lossy().into_owned();
+            match &block {
+                Some(bl) => {
+                    let r = call_proc(bl, &[new_str(p.clone())]);
+                    let _ = std::fs::remove_dir_all(&path);
+                    r
+                }
+                None => Ok(new_str(p)),
+            }
+        }
         _ => return None,
     })
 }

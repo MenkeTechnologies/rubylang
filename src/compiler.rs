@@ -1294,11 +1294,41 @@ impl Compiler {
                 // methods, the same as `def self.x`.
                 Expr::SingletonClass { recv: None, body } => {
                     for s in body {
-                        if let Expr::Def {
-                            name, params, body, ..
-                        } = &s.expr
-                        {
-                            class_methods.insert(name.clone(), self.compile_method(params, body)?);
+                        match &s.expr {
+                            Expr::Def {
+                                name, params, body, ..
+                            } => {
+                                class_methods
+                                    .insert(name.clone(), self.compile_method(params, body)?);
+                            }
+                            // `attr_accessor`/`attr_reader`/`attr_writer` inside
+                            // `class << self` define class-level accessors.
+                            Expr::Call {
+                                recv: None,
+                                name: m,
+                                args,
+                                ..
+                            } if matches!(
+                                m.as_str(),
+                                "attr_accessor" | "attr_reader" | "attr_writer"
+                            ) =>
+                            {
+                                for a in args {
+                                    if let Some(field) = sym_name(a) {
+                                        if m != "attr_writer" {
+                                            class_methods
+                                                .insert(field.clone(), self.build_getter(&field));
+                                        }
+                                        if m != "attr_reader" {
+                                            class_methods.insert(
+                                                format!("{field}="),
+                                                self.build_setter(&field),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }

@@ -112,6 +112,14 @@ impl Parser {
             self.advance();
         }
     }
+    /// Skip bare newlines only (not `;`). Used inside an open call-arg / param
+    /// paren, where a newline is insignificant line continuation (Ruby allows
+    /// `foo(\n  a,\n  b\n)` and a multi-line `def`/param list).
+    fn skip_nl(&mut self) {
+        while matches!(self.peek(), Tok::Newline) {
+            self.advance();
+        }
+    }
 
     fn program(&mut self) -> Result<Vec<Stmt>, String> {
         let mut stmts = Vec::new();
@@ -633,10 +641,20 @@ impl Parser {
         let mut kwargs: Vec<(Expr, Expr)> = Vec::new();
         let mut kwsplats: Vec<Expr> = Vec::new();
         if self.eat_op("(") {
+            // A newline right after `(`, after each `,`, or before `)` is
+            // insignificant inside a call-arg paren (multi-line arg lists). A
+            // trailing comma before `)` is allowed.
+            self.skip_nl();
             if !self.is_op(")") {
                 self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
+                self.skip_nl();
                 while self.eat_op(",") {
+                    self.skip_nl();
+                    if self.is_op(")") {
+                        break;
+                    }
                     self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
+                    self.skip_nl();
                 }
             }
             self.expect_op(")")?;
@@ -1739,13 +1757,35 @@ impl Parser {
                 _ => {}
             }
         }
-        let name = self.method_name()?;
+        let mut name = self.method_name()?;
+        // Setter method name: `def name=(v)` / `def self.name=(v)`. The `=` must be
+        // adjacent (no space) to distinguish from an endless def `def name = expr`.
+        // Only a plain identifier base takes a setter `=` (operator names like `==`,
+        // `[]` are already fully formed by `method_name`).
+        if self.is_op("=")
+            && !self.cur_space()
+            && name
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            self.advance();
+            name.push('=');
+        }
         let mut params = Vec::new();
         if self.eat_op("(") {
+            // Multi-line param lists: newlines inside the paren are insignificant.
+            self.skip_nl();
             if !self.is_op(")") {
                 params.push(self.param()?);
+                self.skip_nl();
                 while self.eat_op(",") {
+                    self.skip_nl();
+                    if self.is_op(")") {
+                        break;
+                    }
                     params.push(self.param()?);
+                    self.skip_nl();
                 }
             }
             self.expect_op(")")?;

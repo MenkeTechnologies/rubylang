@@ -783,8 +783,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                     i += 1;
                 }
-                // allow trailing ? / ! on symbol/method names
-                if i < b.len() && (b[i] == b'?' || b[i] == b'!') {
+                // allow trailing ? / ! on symbol/method names, or a single `=` for
+                // a setter symbol (`:x=`) — but not `==`/`=~`/`=>` which are ops.
+                if i < b.len()
+                    && (b[i] == b'?'
+                        || b[i] == b'!'
+                        || (b[i] == b'='
+                            && !matches!(b.get(i + 1), Some(b'=') | Some(b'~') | Some(b'>'))))
+                {
                     i += 1;
                 }
                 out.push(Token {
