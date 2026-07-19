@@ -1711,3 +1711,20 @@ p Array(nil)
 p Array([1, 2])
 #==#
 p format("%05.2f", 3.14159)
+#==#
+# ── regex backreferences + look-around (fancy-regex engine) ──
+p "hello".gsub(/([a-z])\1/, "D")
+#==#
+p "aabbcc".scan(/(.)\1/)
+#==#
+p "Mississippi".gsub(/(\w)\1/, "-")
+#==#
+p "committee".scan(/(.)\1/)
+#==#
+p "foobar".gsub(/o(?=b)/, "0")
+#==#
+p "banana".gsub(/a(?=n)/, "A")
+#==#
+p "abcabc".match?(/(abc)\1/)
+#==#
+p "noon".gsub(/(\w)(\w)\2\1/, "P")
