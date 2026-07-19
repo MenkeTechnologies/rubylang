@@ -60,13 +60,17 @@ fn build_body(corpus: &[(&str, &str, &str)], chapter_count: usize) -> String {
             if current.is_some() {
                 out.push_str("          </tbody>\n        </table>\n      </section>\n");
             }
+            // The `id="ch-…"` marks this as a real reference chapter. The
+            // reference-PDF pipeline keeps id-carrying sections and drops the
+            // id-less ones (page chrome / link lists), so every chapter needs it.
             let _ = write!(
                 out,
-                "\n      <section class=\"tutorial-section\">\n\
+                "\n      <section class=\"tutorial-section\" id=\"ch-{slug}\">\n\
                  \x20       <h2>{title}</h2>\n\
                  \x20       <table class=\"file-table\">\n\
                  \x20         <thead><tr><th>Method</th><th>Description</th></tr></thead>\n\
                  \x20         <tbody>\n",
+                slug = slugify(chapter),
                 title = html_escape(chapter),
             );
             current = Some(*chapter);
@@ -88,6 +92,24 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Lowercase, non-alphanumeric runs collapsed to a single `-`, edges trimmed —
+/// e.g. `Enumerator::Lazy` -> `enumerator-lazy`, `TrueClass/FalseClass` ->
+/// `trueclass-falseclass`. Used for the `id="ch-…"` chapter anchors.
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 const HEAD: &str = r#"<!DOCTYPE html>
