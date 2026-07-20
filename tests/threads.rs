@@ -94,3 +94,55 @@ fn thread_local_variables_do_not_leak_to_the_spawner() {
         "nil\n"
     );
 }
+
+#[test]
+fn mutex_synchronize_guards_a_counter() {
+    let out = run(
+        "m = Mutex.new
+         c = [0]
+         ts = (1..10).map { Thread.new { 100.times { m.synchronize { c[0] += 1 } } } }
+         ts.each(&:join)
+         p c[0]",
+    );
+    assert_eq!(out, "1000\n");
+}
+
+#[test]
+fn queue_blocks_consumer_until_producer_pushes() {
+    // The consumer thread pops an empty queue — it must block (releasing the GVL)
+    // until the main thread pushes, then wake and return the item.
+    assert_eq!(
+        run("q = Queue.new; t = Thread.new { q.pop }; q.push(:hello); p t.value"),
+        ":hello\n"
+    );
+}
+
+#[test]
+fn queue_work_sharing_across_threads() {
+    // Four workers drain a closed queue of 1..100; every item is handled once, so
+    // the totals sum to 5050 regardless of how the work is split.
+    let out = run(
+        "q = Queue.new
+         (1..100).each { |i| q.push(i) }
+         q.close
+         ts = (1..4).map { Thread.new { s = 0; while (x = q.pop); s += x; end; s } }
+         p ts.map(&:value).sum",
+    );
+    assert_eq!(out, "5050\n");
+}
+
+#[test]
+fn condition_variable_wait_and_signal() {
+    // The waiter parks on the condvar until the main thread flips the predicate
+    // and signals; the predicate-loop pattern tolerates spurious wakeups.
+    assert_eq!(
+        run("m = Mutex.new
+             cv = ConditionVariable.new
+             ready = [false]
+             t = Thread.new { m.synchronize { cv.wait(m) until ready[0]; :done } }
+             ready[0] = true
+             cv.signal
+             p t.value"),
+        ":done\n"
+    );
+}

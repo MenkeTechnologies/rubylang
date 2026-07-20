@@ -1368,6 +1368,36 @@ fn dispatch_classref(
             o
         }));
     }
+    // `Queue.new` / `SizedQueue.new(cap)` — a thread-safe FIFO. The blocking core
+    // lives in a side table keyed by the object's `__qid` ivar (see `queue_method`).
+    if matches!(cls, "Queue" | "Thread::Queue" | "SizedQueue" | "Thread::SizedQueue")
+        && name == "new"
+    {
+        let cap = if cls.ends_with("SizedQueue") {
+            Some(args.first().map(as_i).unwrap_or(0).max(0) as usize)
+        } else {
+            None
+        };
+        let qid = crate::host::new_queue(cap);
+        return Ok(with_host(|h| {
+            let o = h.new_object(if cls.ends_with("SizedQueue") {
+                "SizedQueue"
+            } else {
+                "Queue"
+            });
+            h.set_ivar_of(&o, "__qid", Value::Int(qid as i64));
+            o
+        }));
+    }
+    // `ConditionVariable.new`.
+    if matches!(cls, "ConditionVariable" | "Thread::ConditionVariable") && name == "new" {
+        let cvid = crate::host::new_condvar();
+        return Ok(with_host(|h| {
+            let o = h.new_object("ConditionVariable");
+            h.set_ivar_of(&o, "__cvid", Value::Int(cvid as i64));
+            o
+        }));
+    }
     // `Thread` class methods. `Thread.new { }` spawns a real OS thread that runs
     // under the GVL (only one Ruby thread executes at a time, like MRI).
     if cls == "Thread" {
@@ -2269,6 +2299,18 @@ fn dispatch_object(
     // Mutex/Monitor: a lock flag; `synchronize` runs the block under the lock.
     if cls == "Mutex" || cls == "Thread::Mutex" || cls == "Monitor" {
         if let Some(r) = mutex_method(recv, name, block.clone())? {
+            return Ok(r);
+        }
+    }
+    // Queue/SizedQueue: thread-safe FIFO with blocking pop/push.
+    if cls == "Queue" || cls == "SizedQueue" {
+        if let Some(r) = queue_method(recv, name, args)? {
+            return Ok(r);
+        }
+    }
+    // ConditionVariable: wait releases the mutex + GVL and parks until signalled.
+    if cls == "ConditionVariable" {
+        if let Some(r) = condvar_method(recv, name, args)? {
             return Ok(r);
         }
     }
@@ -10357,6 +10399,71 @@ fn mutex_method(
         }
         "exit" | "mon_exit" => {
             set(false);
+            Ok(Some(recv.clone()))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `Queue`/`SizedQueue` instance methods, keyed by the `__qid` ivar. `pop`/`push`
+/// block on the queue's own condvar (with the GVL released) — see `queue_pop`.
+fn queue_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+    let qid = match with_host(|h| h.ivar_of(recv, "__qid")) {
+        Value::Int(n) => n as u32,
+        _ => return Ok(None),
+    };
+    // `pop(true)`/`push(v, true)` request non-blocking (raise if would block).
+    let non_block = |a: Option<&Value>| a.is_some_and(|v| with_host(|h| h.truthy(v)));
+    match name {
+        "push" | "enq" | "<<" | "append" => {
+            let v = args.first().cloned().unwrap_or(Value::Undef);
+            crate::host::queue_push(qid, v, non_block(args.get(1)))?;
+            Ok(Some(recv.clone()))
+        }
+        "pop" | "deq" | "shift" => Ok(Some(crate::host::queue_pop(qid, non_block(args.first()))?)),
+        "size" | "length" => Ok(Some(Value::Int(crate::host::queue_len(qid) as i64))),
+        "empty?" => Ok(Some(Value::Bool(crate::host::queue_len(qid) == 0))),
+        "num_waiting" => Ok(Some(Value::Int(0))),
+        "clear" => {
+            crate::host::queue_clear(qid);
+            Ok(Some(recv.clone()))
+        }
+        "close" => {
+            crate::host::queue_close(qid);
+            Ok(Some(recv.clone()))
+        }
+        "closed?" => Ok(Some(Value::Bool(crate::host::queue_closed(qid)))),
+        _ => Ok(None),
+    }
+}
+
+/// `ConditionVariable` instance methods, keyed by the `__cvid` ivar. `wait`
+/// unlocks the given `Mutex`, releases the GVL, parks until `signal`/`broadcast`,
+/// then relocks the mutex (MRI semantics).
+fn condvar_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+    let cvid = match with_host(|h| h.ivar_of(recv, "__cvid")) {
+        Value::Int(n) => n as u32,
+        _ => return Ok(None),
+    };
+    match name {
+        "wait" => {
+            // Unlock the caller's mutex (arg 0) for the duration of the wait.
+            let mutex = args.first().cloned();
+            if let Some(m) = &mutex {
+                with_host(|h| h.set_ivar_of(m, "__locked", Value::Bool(false)));
+            }
+            crate::host::condvar_wait(cvid);
+            if let Some(m) = &mutex {
+                with_host(|h| h.set_ivar_of(m, "__locked", Value::Bool(true)));
+            }
+            Ok(Some(recv.clone()))
+        }
+        "signal" => {
+            crate::host::condvar_notify(cvid, false);
+            Ok(Some(recv.clone()))
+        }
+        "broadcast" => {
+            crate::host::condvar_notify(cvid, true);
             Ok(Some(recv.clone()))
         }
         _ => Ok(None),

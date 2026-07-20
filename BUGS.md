@@ -309,10 +309,17 @@ Honest limitations of this surface:
   `Mutex`/`Thread::Mutex`/`Monitor` (`lock`/`unlock`/`try_lock`/`locked?`/
   `synchronize`) work: under the GVL a critical section with no blocking call runs
   uninterrupted, so `synchronize` holds a lock flag around the block (cleared even
-  on a raise). Not yet: `Queue`/`ConditionVariable` and blocking-op safepoints (a
-  `Queue#pop` on empty cannot yet block-and-wake a producer), and
-  `report_on_exception`'s stderr warning is not emitted. Fibers remain
-  thread-owned (a fiber is resumed only on its creating thread, as in MRI).
+  on a raise). `Queue`/`SizedQueue` (`push`/`<<`/`pop`/`size`/`empty?`/`close`/…)
+  and `ConditionVariable` (`wait`/`signal`/`broadcast`) block for real: each has
+  its own mutex+condvar (independent of the GVL), and a blocking `pop`/`wait`
+  releases the GVL so a producer/signaller can run, then reacquires it — a
+  consumer thread that `pop`s an empty queue correctly parks until a `push`.
+  `ConditionVariable` uses a generation counter so a signal delivered after the
+  waiter starts waiting is never lost (bare non-predicate signals can still race,
+  as in MRI). Not yet: `report_on_exception`'s stderr warning, and MRI's fatal
+  deadlock detector (a program that waits on a queue no thread will ever feed
+  hangs rather than aborting). Fibers remain thread-owned (a fiber is resumed only
+  on its creating thread, as in MRI).
 - **Bignum.** Integers auto-promote to arbitrary precision on overflow, like
   MRI: values that fit stay `i64` immediates, and only the overflow path
   allocates a `BigInt` heap object (backed by `num-bigint`). Arithmetic, bit

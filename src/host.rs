@@ -617,6 +617,12 @@ pub struct RubyHost {
     /// plus the shared result/done cells the thread body publishes into. Shared
     /// (not thread-local) — a `Thread` object is visible from any thread.
     threads: Vec<ThreadCell>,
+    /// `Queue`/`SizedQueue` sync structures, indexed by the object's `__qid` ivar.
+    /// Each has its OWN mutex+condvar (independent of the GVL) so a blocking
+    /// `pop`/`push` can wait for a producer/consumer after releasing the GVL.
+    queues: Vec<Arc<QueueSync>>,
+    /// `ConditionVariable` sync structures, indexed by the object's `__cvid` ivar.
+    condvars: Vec<Arc<CondVarSync>>,
     /// Live `IO`/`File` objects, indexed by `RObj::IoHandle.id`. Slots 0/1/2 are
     /// pre-seeded with the standard streams (`STDOUT`/`STDERR`/`STDIN`).
     io_handles: Vec<IoCell>,
@@ -706,6 +712,30 @@ impl IoCell {
             _ => "IO",
         }
     }
+}
+
+/// A `Queue`'s blocking core: items plus close state behind the queue's own
+/// mutex, with a condvar to wake blocked `pop`/`push`. Independent of the GVL —
+/// a waiter releases the GVL (so producers can run) and parks here instead.
+struct QueueSync {
+    data: Mutex<QueueData>,
+    cv: std::sync::Condvar,
+}
+
+struct QueueData {
+    items: std::collections::VecDeque<Value>,
+    closed: bool,
+    /// `Some(n)` for a `SizedQueue` (a full `push` blocks); `None` for `Queue`.
+    cap: Option<usize>,
+}
+
+/// A `ConditionVariable`'s core: a monotonically increasing generation counter
+/// behind a mutex, plus a condvar. `signal`/`broadcast` bump the generation; a
+/// `wait` parks until the generation moves past the value it captured — so a
+/// signal delivered while the waiter holds the mutex is never lost.
+struct CondVarSync {
+    gen: Mutex<u64>,
+    cv: std::sync::Condvar,
 }
 
 /// One spawned `Thread`: the OS-thread `JoinHandle` (taken by `join`), plus the
@@ -1130,6 +1160,8 @@ impl RubyHost {
             enum_sinks: Vec::new(),
             around_stack: Vec::new(),
             threads: Vec::new(),
+            queues: Vec::new(),
+            condvars: Vec::new(),
             io_handles: vec![IoCell::Stdout, IoCell::Stderr, IoCell::Stdin],
             db_handles: Vec::new(),
             fiddle_libs: Vec::new(),
@@ -2763,6 +2795,12 @@ impl RubyHost {
                 | "Mutex"
                 | "Thread::Mutex"
                 | "Monitor"
+                | "Queue"
+                | "Thread::Queue"
+                | "SizedQueue"
+                | "Thread::SizedQueue"
+                | "ConditionVariable"
+                | "Thread::ConditionVariable"
                 | "File"
                 | "Dir"
                 | "IO"
@@ -4950,6 +4988,170 @@ pub fn thread_alive(thread: &Value) -> bool {
                 .unwrap_or(false)
         }),
         _ => false,
+    }
+}
+
+// ---- Queue / SizedQueue (thread-safe, blocking) ----------------------------
+
+/// Register a new queue (`cap = Some(n)` → `SizedQueue`). Returns its id, stored
+/// in the object's `__qid` ivar.
+pub fn new_queue(cap: Option<usize>) -> u32 {
+    with_host(|h| {
+        let id = h.queues.len() as u32;
+        h.queues.push(Arc::new(QueueSync {
+            data: Mutex::new(QueueData {
+                items: std::collections::VecDeque::new(),
+                closed: false,
+                cap,
+            }),
+            cv: std::sync::Condvar::new(),
+        }));
+        id
+    })
+}
+
+/// Clone the queue's shared sync handle out of the host so blocking waits happen
+/// without holding the GVL.
+fn queue_sync(id: u32) -> Option<Arc<QueueSync>> {
+    with_host(|h| h.queues.get(id as usize).cloned())
+}
+
+/// `Queue#push(v)` — append and wake a waiter. A `SizedQueue` blocks (GVL
+/// released) while full, unless `non_block` (then raises `ThreadError`).
+pub fn queue_push(id: u32, v: Value, non_block: bool) -> Result<Value, String> {
+    let q = match queue_sync(id) {
+        Some(q) => q,
+        None => return Ok(Value::Undef),
+    };
+    let full = {
+        let d = q.data.lock().unwrap();
+        d.cap.is_some_and(|c| d.items.len() >= c)
+    };
+    if full {
+        if non_block {
+            return Err(crate::builtins::raise_exc("ThreadError", "queue full"));
+        }
+        gvl_blocking(|| {
+            let mut d = q.data.lock().unwrap();
+            while d.cap.is_some_and(|c| d.items.len() >= c) && !d.closed {
+                d = q.cv.wait(d).unwrap();
+            }
+        });
+    }
+    {
+        let mut d = q.data.lock().unwrap();
+        if d.closed {
+            return Err(crate::builtins::raise_exc(
+                "ClosedQueueError",
+                "queue closed",
+            ));
+        }
+        d.items.push_back(v);
+    }
+    q.cv.notify_all();
+    Ok(Value::Undef)
+}
+
+/// `Queue#pop` — remove the front; if empty, block (GVL released) until a `push`,
+/// unless `non_block` (raise `ThreadError`) or the queue is closed and drained
+/// (return `nil`).
+pub fn queue_pop(id: u32, non_block: bool) -> Result<Value, String> {
+    let q = match queue_sync(id) {
+        Some(q) => q,
+        None => return Ok(Value::Undef),
+    };
+    loop {
+        {
+            let mut d = q.data.lock().unwrap();
+            if let Some(v) = d.items.pop_front() {
+                drop(d);
+                q.cv.notify_all(); // wake a SizedQueue push blocked on a full queue
+                return Ok(v);
+            }
+            if d.closed {
+                return Ok(Value::Undef);
+            }
+        }
+        if non_block {
+            return Err(crate::builtins::raise_exc("ThreadError", "queue empty"));
+        }
+        // Empty: release the GVL so a producer can run, and park until a push.
+        gvl_blocking(|| {
+            let mut d = q.data.lock().unwrap();
+            while d.items.is_empty() && !d.closed {
+                d = q.cv.wait(d).unwrap();
+            }
+        });
+    }
+}
+
+/// `Queue#length`/`#size`.
+pub fn queue_len(id: u32) -> usize {
+    queue_sync(id).map_or(0, |q| q.data.lock().unwrap().items.len())
+}
+
+/// `Queue#close` — no more pushes; blocked pops drain then return `nil`.
+pub fn queue_close(id: u32) {
+    if let Some(q) = queue_sync(id) {
+        q.data.lock().unwrap().closed = true;
+        q.cv.notify_all();
+    }
+}
+
+/// `Queue#closed?`.
+pub fn queue_closed(id: u32) -> bool {
+    queue_sync(id).is_some_and(|q| q.data.lock().unwrap().closed)
+}
+
+/// `Queue#clear`.
+pub fn queue_clear(id: u32) {
+    if let Some(q) = queue_sync(id) {
+        q.data.lock().unwrap().items.clear();
+    }
+}
+
+// ---- ConditionVariable -----------------------------------------------------
+
+/// Register a new `ConditionVariable`; returns its id (the `__cvid` ivar).
+pub fn new_condvar() -> u32 {
+    with_host(|h| {
+        let id = h.condvars.len() as u32;
+        h.condvars.push(Arc::new(CondVarSync {
+            gen: Mutex::new(0),
+            cv: std::sync::Condvar::new(),
+        }));
+        id
+    })
+}
+
+fn condvar_sync(id: u32) -> Option<Arc<CondVarSync>> {
+    with_host(|h| h.condvars.get(id as usize).cloned())
+}
+
+/// `ConditionVariable#wait(mutex)` — release the GVL and park until `signal`/
+/// `broadcast` bumps the generation past the value captured while holding the
+/// mutex (so a signal delivered after we start waiting is never missed). The
+/// caller unlocks the Ruby `mutex` before and relocks it after.
+pub fn condvar_wait(id: u32) {
+    let Some(c) = condvar_sync(id) else { return };
+    gvl_blocking(|| {
+        let mut g = c.gen.lock().unwrap();
+        let start = *g;
+        while *g == start {
+            g = c.cv.wait(g).unwrap();
+        }
+    });
+}
+
+/// `ConditionVariable#signal` (`all = false`) / `#broadcast` (`all = true`).
+pub fn condvar_notify(id: u32, all: bool) {
+    if let Some(c) = condvar_sync(id) {
+        *c.gen.lock().unwrap() += 1;
+        if all {
+            c.cv.notify_all();
+        } else {
+            c.cv.notify_one();
+        }
     }
 }
 

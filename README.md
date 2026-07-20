@@ -64,7 +64,10 @@ JIT. rubylang carries no VM or JIT of its own. Highlights:
   the one process-global object heap, serialized by a Global VM Lock exactly like
   MRI: only one thread executes Ruby at a time, so shared-heap mutation stays
   atomic. `Thread#join`/`#value` release the GVL while waiting and re-raise a
-  thread's exception; each thread swaps in its own call stack.
+  thread's exception; each thread swaps in its own call stack. `Mutex`, `Queue`/
+  `SizedQueue`, and `ConditionVariable` are provided — a blocking `Queue#pop`/
+  `ConditionVariable#wait` releases the GVL and parks on its own condvar until a
+  producer/signaller wakes it.
 - **Ruby truthiness** — only `nil` and `false` are falsy (`0` and `""` are
   true); conditions normalize through a `TRUTHY` op before a native branch.
 - **AOP intercepts** — a glob-matched before/after/around method-intercept
