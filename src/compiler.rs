@@ -430,11 +430,19 @@ impl Compiler {
                 block,
             } => self.compile_call(b, recv, name, args, block)?,
             Expr::Index(recv, idx) => {
-                self.compile_expr(b, recv)?;
-                for i in idx {
-                    self.compile_expr(b, i)?;
+                if idx.iter().any(|i| matches!(i, Expr::Splat(_))) {
+                    // Spread index args (`Hash[*pairs]`, `a[*idx]`) → `recv.[](*idx)`.
+                    self.compile_expr(b, recv)?;
+                    self.kstr(b, "[]");
+                    self.compile_spread(b, idx)?;
+                    b.emit(Op::CallBuiltin(ops::CALL_METHOD_ARR, 3), 0);
+                } else {
+                    self.compile_expr(b, recv)?;
+                    for i in idx {
+                        self.compile_expr(b, i)?;
+                    }
+                    b.emit(Op::CallBuiltin(ops::INDEX_GET, argc(1 + idx.len())?), 0);
                 }
-                b.emit(Op::CallBuiltin(ops::INDEX_GET, argc(1 + idx.len())?), 0);
             }
             Expr::Def {
                 name,

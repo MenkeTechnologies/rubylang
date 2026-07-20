@@ -620,9 +620,9 @@ impl Parser {
                 self.advance();
                 let mut idx = Vec::new();
                 if !self.is_op("]") {
-                    idx.push(self.expr()?);
+                    idx.push(self.index_arg()?);
                     while self.eat_op(",") {
-                        idx.push(self.expr()?);
+                        idx.push(self.index_arg()?);
                     }
                 }
                 self.expect_op("]")?;
@@ -641,6 +641,15 @@ impl Parser {
             }
         }
         Ok(e)
+    }
+
+    /// One `[]` index argument, allowing a `*splat` (`Hash[*pairs]`, `a[*idx]`).
+    fn index_arg(&mut self) -> Result<Expr, String> {
+        if self.eat_op("*") {
+            Ok(Expr::Splat(Box::new(self.expr()?)))
+        } else {
+            self.expr()
+        }
     }
 
     fn method_name(&mut self) -> Result<String, String> {
@@ -1129,12 +1138,26 @@ impl Parser {
             Tok::Op(ref o) if o == "(" => {
                 self.advance();
                 self.skip_terms();
-                // A parenthesized group takes a full statement, so a trailing
-                // modifier works inside it: `(expr if cond)`, `(x unless y)`.
-                let e = self.statement()?;
+                // A parenthesized group takes a full statement (so a trailing
+                // modifier works: `(expr if cond)`), and may hold a `;`/newline-
+                // separated sequence (`(a = 1; b = 2)`) that evaluates to its last
+                // expression.
+                let mut stmts: Vec<Stmt> = vec![self.statement()?.into()];
                 self.skip_terms();
+                while !self.is_op(")") {
+                    stmts.push(self.statement()?.into());
+                    self.skip_terms();
+                }
                 self.expect_op(")")?;
-                Ok(e)
+                if stmts.len() == 1 {
+                    Ok(stmts.pop().unwrap().expr)
+                } else {
+                    Ok(Expr::Begin {
+                        body: stmts,
+                        rescues: Vec::new(),
+                        ensure: None,
+                    })
+                }
             }
             Tok::Op(ref o) if o == "[" => self.array_lit(),
             Tok::Op(ref o) if o == "->" => self.lambda_lit(),
