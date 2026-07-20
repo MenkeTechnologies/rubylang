@@ -1284,6 +1284,7 @@ pub(crate) fn dispatch(
         "DateTime" => dispatch_datetime(recv, name, args),
         "Enumerator" => dispatch_enumerator(recv, name, args, block),
         "Fiber" => dispatch_fiber(recv, name, args),
+        "Thread" => dispatch_thread(recv, name, args),
         "IO" | "File" => dispatch_io(recv, name, args, block),
         "TCPServer" => dispatch_tcp_server(recv, name, args, block),
         "TCPSocket" => dispatch_tcp_socket(recv, name, args, block),
@@ -1354,6 +1355,26 @@ fn dispatch_classref(
             _ => Err(raise_exc(
                 "NoMethodError",
                 &format!("undefined method '{name}' for ObjectSpace:Module"),
+            )),
+        };
+    }
+    // `Thread` class methods. `Thread.new { }` spawns a real OS thread that runs
+    // under the GVL (only one Ruby thread executes at a time, like MRI).
+    if cls == "Thread" {
+        return match name {
+            "new" | "start" | "fork" => {
+                let b = block.ok_or_else(|| {
+                    raise_exc("ThreadError", "must be called with a block")
+                })?;
+                Ok(crate::host::spawn_thread(b))
+            }
+            "current" | "main" => Ok(crate::host::current_thread()),
+            // Cooperative-scheduler hints; the GVL already serializes execution.
+            "pass" => Ok(Value::Undef),
+            "list" => Ok(new_arr(vec![crate::host::current_thread()])),
+            _ => Err(raise_exc(
+                "NoMethodError",
+                &format!("undefined method '{name}' for Thread"),
             )),
         };
     }
@@ -6569,6 +6590,29 @@ fn drive_generator(gblock: &Value, limit: usize) -> Result<Vec<Value>, String> {
 }
 
 /// Instance methods on a `Fiber`: `resume(*args)`, `alive?`.
+/// `Thread` instance methods. `join`/`value` release the GVL and wait for the OS
+/// thread; `value` returns the block's value (re-raising a thread exception),
+/// `join` returns the thread.
+fn dispatch_thread(recv: &Value, name: &str, _args: &[Value]) -> Result<Value, String> {
+    match name {
+        "join" => {
+            crate::host::thread_join(recv)?;
+            Ok(recv.clone())
+        }
+        "value" => crate::host::thread_join(recv),
+        "alive?" => Ok(Value::Bool(crate::host::thread_alive(recv))),
+        "status" => Ok(if crate::host::thread_alive(recv) {
+            new_str("run".to_string())
+        } else {
+            Value::Bool(false)
+        }),
+        "name" => Ok(Value::Undef),
+        // A Thread compares/inspects by identity like any object.
+        "inspect" | "to_s" => Ok(new_str(with_host(|h| h.inspect(recv)))),
+        _ => Err(no_method_error(recv, name)),
+    }
+}
+
 fn dispatch_fiber(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
         "resume" => {

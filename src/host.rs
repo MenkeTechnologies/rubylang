@@ -299,6 +299,11 @@ pub enum RObj {
     Fiber {
         id: u32,
     },
+    /// A `Thread`. Holds an index into `RubyHost.threads` (the `JoinHandle` +
+    /// shared result/done flags); the real OS thread lives in that side table.
+    Thread {
+        id: u32,
+    },
     /// An `IO`/`File` object. Holds only an index into `RubyHost.io_handles`;
     /// the underlying `std::fs::File` is neither `Clone` nor storable inline in
     /// this `#[derive(Clone)]` enum, so it lives in the side table exactly like
@@ -608,6 +613,10 @@ pub struct RubyHost {
     singleton_define_methods: IndexMap<u32, IndexMap<String, Value>>,
     /// `alias_method`/`alias` mappings: class → alias name → target method name.
     method_aliases: IndexMap<String, IndexMap<String, String>>,
+    /// Live `Thread`s, indexed by `RObj::Thread.id`: the OS-thread `JoinHandle`
+    /// plus the shared result/done cells the thread body publishes into. Shared
+    /// (not thread-local) — a `Thread` object is visible from any thread.
+    threads: Vec<ThreadCell>,
     /// Live `IO`/`File` objects, indexed by `RObj::IoHandle.id`. Slots 0/1/2 are
     /// pre-seeded with the standard streams (`STDOUT`/`STDERR`/`STDIN`).
     io_handles: Vec<IoCell>,
@@ -697,6 +706,19 @@ impl IoCell {
             _ => "IO",
         }
     }
+}
+
+/// One spawned `Thread`: the OS-thread `JoinHandle` (taken by `join`), plus the
+/// shared cells its body publishes into — `result` (the block's value or a raised
+/// error) and `done` (set true when the body finishes).
+struct ThreadCell {
+    handle: Option<std::thread::JoinHandle<()>>,
+    result: Arc<Mutex<Option<Result<Value, String>>>>,
+    /// The raised exception object (if the body raised), captured before the
+    /// thread's context is torn down so `join`/`value` can re-raise the real
+    /// object (with `#message` etc.), not just the message string.
+    exc: Arc<Mutex<Option<Value>>>,
+    done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One suspended fiber. `coro` is `None` only while this fiber is actively
@@ -815,6 +837,7 @@ pub fn reset_host() {
     // Fibers moved off the host into a thread-local, so clear them explicitly.
     FIBERS.with(|f| f.borrow_mut().clear());
     CUR_FIBER.with(|c| c.set(None));
+    CURRENT_THREAD.with(|c| *c.borrow_mut() = None);
 }
 
 thread_local! {
@@ -1106,6 +1129,7 @@ impl RubyHost {
             frozen: HashSet::new(),
             enum_sinks: Vec::new(),
             around_stack: Vec::new(),
+            threads: Vec::new(),
             io_handles: vec![IoCell::Stdout, IoCell::Stderr, IoCell::Stdin],
             db_handles: Vec::new(),
             fiddle_libs: Vec::new(),
@@ -2735,6 +2759,7 @@ impl RubyHost {
                 | "JSON"
                 | "ERB"
                 | "Fiber"
+                | "Thread"
                 | "File"
                 | "Dir"
                 | "IO"
@@ -3161,6 +3186,14 @@ impl RubyHost {
                 }
                 Some(RObj::Yielder { .. }) => "#<Enumerator::Yielder>".to_string(),
                 Some(RObj::Fiber { .. }) => "#<Fiber (created)>".to_string(),
+                Some(RObj::Thread { id }) => {
+                    let alive = self
+                        .threads
+                        .get(id as usize)
+                        .map(|t| !t.done.load(std::sync::atomic::Ordering::SeqCst))
+                        .unwrap_or(false);
+                    format!("#<Thread:{id:#x} {}>", if alive { "run" } else { "dead" })
+                }
                 Some(RObj::IoHandle { id }) => self.io_inspect_str(id),
                 Some(RObj::Range { lo, hi, exclusive }) => {
                     format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
@@ -3353,6 +3386,7 @@ impl RubyHost {
                 Some(RObj::Generator { .. }) => "Enumerator",
                 Some(RObj::Yielder { .. }) => "Enumerator::Yielder",
                 Some(RObj::Fiber { .. }) => "Fiber",
+                Some(RObj::Thread { .. }) => "Thread",
                 Some(RObj::IoHandle { id }) => self
                     .io_handles
                     .get(*id as usize)
@@ -4658,6 +4692,30 @@ thread_local! {
     /// on the shared `Send` `RubyHost`. (MRI likewise forbids resuming a fiber on
     /// a thread other than the one that created it.)
     static FIBERS: RefCell<Vec<FiberCell>> = const { RefCell::new(Vec::new()) };
+
+    /// This OS thread's own `Thread.current` object, created on first request.
+    static CURRENT_THREAD: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+/// `Thread.current` — a stable `Thread` object for the running OS thread, cached
+/// per-thread. It is handle-less (already running, nothing to join); `alive?` is
+/// true and `join`/`value` are no-ops that return it/nil.
+pub fn current_thread() -> Value {
+    if let Some(v) = CURRENT_THREAD.with(|c| c.borrow().clone()) {
+        return v;
+    }
+    let v = with_host(|h| {
+        let id = h.threads.len() as u32;
+        h.threads.push(ThreadCell {
+            handle: None,
+            result: Arc::new(Mutex::new(None)),
+            exc: Arc::new(Mutex::new(None)),
+            done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        h.alloc(RObj::Thread { id })
+    });
+    CURRENT_THREAD.with(|c| *c.borrow_mut() = Some(v.clone()));
+    v
 }
 
 /// Access this thread's fiber table.
@@ -4788,6 +4846,106 @@ pub fn fiber_resume(fiber: &Value, v: Value) -> Result<Value, String> {
 pub fn fiber_alive(fiber: &Value) -> bool {
     match with_host(|h| h.obj(fiber).cloned()) {
         Some(RObj::Fiber { id }) => with_fibers(|fibers| !fibers[id as usize].done),
+        _ => false,
+    }
+}
+
+// ---- Thread (real OS threads serialized by the GVL) ------------------------
+
+/// `Thread.new { ... }` — spawn an OS thread running `block` under the GVL.
+/// The spawner holds the GVL, so the new thread blocks on `gvl_enter` until the
+/// spawner releases it (at `join`/`value`/`sleep`), giving MRI's one-Ruby-thread-
+/// at-a-time semantics. Returns a `Thread` object.
+pub fn spawn_thread(block: Value) -> Value {
+    use std::sync::atomic::AtomicBool;
+    let result: Arc<Mutex<Option<Result<Value, String>>>> = Arc::new(Mutex::new(None));
+    let exc: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+    let done = Arc::new(AtomicBool::new(false));
+    let (r2, e2, d2) = (result.clone(), exc.clone(), done.clone());
+    let handle = std::thread::spawn(move || {
+        let (out, raised) = run_thread_body(&block);
+        *r2.lock().unwrap() = Some(out);
+        *e2.lock().unwrap() = raised;
+        d2.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    with_host(|h| {
+        let id = h.threads.len() as u32;
+        h.threads.push(ThreadCell {
+            handle: Some(handle),
+            result,
+            exc,
+            done,
+        });
+        h.alloc(RObj::Thread { id })
+    })
+}
+
+/// The body an OS thread runs: acquire the GVL, install a fresh execution context
+/// (so this thread's frames/scope/signal don't clobber the spawner's, which live
+/// in the shared host), run the block, then restore the spawner's context. On a
+/// raise, the exception object is captured before the context is torn down.
+fn run_thread_body(block: &Value) -> (Result<Value, String>, Option<Value>) {
+    with_gvl(|| {
+        let fresh = FiberContext {
+            frames: vec![fiber_root_frame()],
+            ..FiberContext::default()
+        };
+        let saved = with_host(|h| h.install_fiber_ctx(fresh));
+        let r = call_proc(block, &[]);
+        let raised = if r.is_err() {
+            with_host(|h| h.take_pending_exc())
+        } else {
+            None
+        };
+        with_host(|h| h.install_fiber_ctx(saved));
+        (r, raised)
+    })
+}
+
+/// `Thread#join`/`#value` — release the GVL, wait for the OS thread to finish,
+/// reacquire, and return its stored outcome (an `Err` is the raised exception,
+/// re-raised by `value` / by `join` when it propagates). Idempotent: only the
+/// first call owns the `JoinHandle`; later calls just read the result.
+pub fn thread_join(thread: &Value) -> Result<Value, String> {
+    let id = match with_host(|h| h.obj(thread).cloned()) {
+        Some(RObj::Thread { id }) => id as usize,
+        _ => return Err("not a thread".into()),
+    };
+    let handle = with_host(|h| h.threads.get_mut(id).and_then(|t| t.handle.take()));
+    if let Some(handle) = handle {
+        // Drop the GVL so the spawned thread can actually run, then wait for it.
+        gvl_blocking(move || {
+            let _ = handle.join();
+        });
+    }
+    let (result, raised) = with_host(|h| {
+        h.threads
+            .get(id)
+            .map(|t| {
+                (
+                    t.result.lock().unwrap().clone(),
+                    t.exc.lock().unwrap().clone(),
+                )
+            })
+            .unwrap_or((None, None))
+    });
+    // Re-raise the real exception object so a `rescue => e` binds it (with
+    // `#message`/`#class`), matching MRI's `Thread#value`.
+    if let Some(exc) = raised {
+        with_host(|h| h.set_pending_exc(exc));
+    }
+    result.unwrap_or(Ok(Value::Undef))
+}
+
+/// `Thread#alive?` — true until the body has finished.
+pub fn thread_alive(thread: &Value) -> bool {
+    match with_host(|h| h.obj(thread).cloned()) {
+        Some(RObj::Thread { id }) => with_host(|h| {
+            h.threads
+                .get(id as usize)
+                .map(|t| !t.done.load(std::sync::atomic::Ordering::SeqCst))
+                .unwrap_or(false)
+        }),
         _ => false,
     }
 }
