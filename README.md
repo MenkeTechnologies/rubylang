@@ -58,9 +58,13 @@ JIT. rubylang carries no VM or JIT of its own. Highlights:
 - **Reference-typed objects** — String, Array, and Hash live on the host heap
   behind `Value::Obj` handles, so `a.push(x)` mutates in place — real Ruby
   reference semantics.
-- **Scope-sharing blocks** — every variable access routes through the
-  thread-local host, so a block run as a nested VM captures and mutates its
-  enclosing locals.
+- **Scope-sharing blocks** — every variable access routes through the shared
+  host, so a block run as a nested VM captures and mutates its enclosing locals.
+- **Real threads under a GVL** — `Thread.new` spawns an OS thread that runs on
+  the one process-global object heap, serialized by a Global VM Lock exactly like
+  MRI: only one thread executes Ruby at a time, so shared-heap mutation stays
+  atomic. `Thread#join`/`#value` release the GVL while waiting and re-raise a
+  thread's exception; each thread swaps in its own call stack.
 - **Ruby truthiness** — only `nil` and `false` are falsy (`0` and `""` are
   true); conditions normalize through a `TRUTHY` op before a native branch.
 - **AOP intercepts** — a glob-matched before/after/around method-intercept
@@ -274,7 +278,8 @@ Ruby source → lexer → parser (AST) → lower to fusevm bytecode → fusevm V
 | **fusevm-hosted** | No local `vm.rs` / `jit.rs`. Ruby lowers to fusevm bytecode and runs on the shared three-tier Cranelift JIT; `jit-disk-cache` persists native code across runs. |
 | **Native arithmetic** | Operators lower to native fusevm ops; a strict numeric hook supplies Ruby semantics (String/Array `+`, floored integer division, cross-type `==`) only for non-numeric operands. |
 | **Reference-typed objects** | String, Array, and Hash live on the host heap behind `Value::Obj` handles, so `a.push(x)` mutates in place — real Ruby reference semantics. |
-| **Scope-sharing blocks** | Every variable access routes through the thread-local host, so a block run as a nested VM captures and mutates its enclosing locals. |
+| **Scope-sharing blocks** | Every variable access routes through the shared host, so a block run as a nested VM captures and mutates its enclosing locals. |
+| **GVL threading** | One process-global `Mutex<RubyHost>` heap (MRI's single-VM model). `Thread`s share it; a Global VM Lock serializes execution (only the lock-holder runs Ruby), released around blocking waits. Local-var envs are `Arc<Mutex>` and fibers are thread-owned so the heap is `Send`. |
 | **Ruby truthiness** | Only `nil` and `false` are falsy — `0` and `""` are true — so conditions normalize through a `TRUTHY` op before a native branch. |
 
 ---

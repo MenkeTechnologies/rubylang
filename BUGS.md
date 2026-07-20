@@ -288,7 +288,7 @@ Honest limitations of this surface:
   stackful coroutines: a fiber freezes its entire native stack — including the
   in-flight fusevm `VM::run()` driving its block — onto an alternate stack, so
   `Fiber.yield` suspends *below* the VM (fusevm needs no suspend/resume API) and
-  the coroutine shares the thread-local object heap with its resumer. `resume`
+  the coroutine shares the process-global object heap with its resumer. `resume`
   threads a value in as `Fiber.yield`'s return (and as the block's first
   parameter on the initial resume); the block's final value is the last
   `resume`'s result, and side effects fire lazily at the real yield boundaries.
@@ -296,6 +296,20 @@ Honest limitations of this surface:
   `Fiber.yield` at the root raises `FiberError`. Each fiber runs its own `VM`
   instance and its own volatile execution context (scope/signal/frames), swapped
   at every resume/suspend boundary, so fibers are isolated and nest correctly.
+- **Thread (real OS threads under a GVL).** `Thread.new`/`start`/`fork` spawn a
+  real OS thread that runs on the one process-global `Mutex<RubyHost>` heap. A
+  Global VM Lock serializes execution — only the lock-holder runs Ruby, exactly
+  like MRI — so shared-heap read-modify-write (`x += 1` across threads) stays
+  atomic. Because the spawner holds the GVL, the child does not start until the
+  spawner releases it (at `join`/`value`), giving one-thread-at-a-time ordering;
+  a thread swaps in its own execution context (frames/scope/signal) so call
+  stacks never collide. `Thread#join`/`#value` release the GVL, wait for the OS
+  thread, reacquire, and `value` re-raises the thread's real exception object.
+  `#alive?`/`#status`, `Thread.current`/`main`/`pass`/`list` are present. Not yet:
+  `Mutex`/`Queue`/`ConditionVariable` and blocking-op safepoints (a `Queue#pop`
+  on empty cannot yet block-and-wake a producer), and `report_on_exception`'s
+  stderr warning is not emitted. Fibers remain thread-owned (a fiber is resumed
+  only on its creating thread, as in MRI).
 - **Bignum.** Integers auto-promote to arbitrary precision on overflow, like
   MRI: values that fit stay `i64` immediates, and only the overflow path
   allocates a `BigInt` heap object (backed by `num-bigint`). Arithmetic, bit
