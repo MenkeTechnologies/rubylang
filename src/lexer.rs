@@ -525,8 +525,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 if i < b.len()
                     && matches!(
                         b[i],
+                        // match/output/input-related punctuation globals …
                         b'~' | b'&' | b'`' | b'\'' | b'+' | b',' | b'\\' | b';' | b'/' | b'!'
                             | b':' | b'"'
+                        // … plus `$?` (last process status), `$$` (pid), `$*`
+                        // (ARGV), `$@` (last backtrace), `$<` (ARGF), `$>` (stdout).
+                            | b'?' | b'$' | b'*' | b'@' | b'<' | b'>'
                     )
                 {
                     i += 1;

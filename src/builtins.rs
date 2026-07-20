@@ -1566,6 +1566,21 @@ fn dispatch_classref(
             _ => {}
         }
     }
+    // `Etc` (from `require "etc"`, a C-ext stdlib) — only the CPU-count surface
+    // gems actually use for pool sizing.
+    if cls == "Etc" {
+        match name {
+            "nprocessors" => {
+                let n = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1);
+                return Ok(Value::Int(n as i64));
+            }
+            "sysconfdir" => return Ok(new_str("/etc".to_string())),
+            "systmpdir" => return Ok(new_str("/tmp".to_string())),
+            _ => {}
+        }
+    }
     // `Ractor` — rubylang has no real Ractors, but gems (concurrent-ruby) probe
     // `Ractor.shareable?`/`make_shareable` unconditionally on Ruby 3+. Model just
     // the shareability surface: immutable/frozen values are shareable.
@@ -12307,6 +12322,7 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "erb"
             | "logger"
             | "open3"
+            | "etc"
             | "socket"
             | "io/console"
             | "abbrev"
