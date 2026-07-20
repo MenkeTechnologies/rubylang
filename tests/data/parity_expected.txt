@@ -1266,3 +1266,8 @@ true
 7
 #==#
 "boom"
+#==#
+included in Speaker
+"LOUD"
+#==#
+"[x]"

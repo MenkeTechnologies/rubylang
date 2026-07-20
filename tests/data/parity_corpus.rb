@@ -2035,3 +2035,22 @@ p Integer.instance_method(:+).bind_call(3, 4)
 #==#
 # ── rescue with a top-level-scoped exception class ──
 p(begin; raise NameError, "boom"; rescue ::NameError => e; e.message; end)
+#==#
+# ── runtime / conditional include & prepend (with hooks) ──
+module Loud
+  def self.included(base); puts "included in #{base}"; end
+  def speak; "LOUD"; end
+end
+class Speaker
+  include Loud if true
+end
+p Speaker.new.speak
+#==#
+module Wrap
+  def val; "[" + super + "]"; end
+end
+class Boxed
+  def val; "x"; end
+end
+Boxed.prepend(Wrap)
+p Boxed.new.val

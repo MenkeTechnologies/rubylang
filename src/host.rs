@@ -2388,6 +2388,21 @@ impl RubyHost {
     pub fn add_class(&mut self, name: String, def: ClassDef) {
         self.classes.insert(name, def);
     }
+    /// Runtime `Class#include`/`prepend`/`extend`: append `module` to the class's
+    /// mixin list (deduped), creating the ClassDef if needed. `kind` is
+    /// `"include"`, `"prepend"`, or `"extend"`.
+    pub fn class_mixin(&mut self, class: &str, module: &str, kind: &str) {
+        let def = self.classes.entry(class.to_string()).or_default();
+        let list = match kind {
+            "prepend" => &mut def.prepends,
+            "extend" => &mut def.extends,
+            _ => &mut def.includes,
+        };
+        let m = module.to_string();
+        if !list.contains(&m) {
+            list.push(m);
+        }
+    }
     pub fn class_exists(&self, name: &str) -> bool {
         self.classes.contains_key(name)
     }

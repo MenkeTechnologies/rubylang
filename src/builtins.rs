@@ -817,6 +817,12 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
             with_host(|h| h.add_alias(&cls, &new_name, &old_name));
             return Ok(with_host(|h| h.new_symbol(&new_name)));
         }
+        // A bare `include`/`prepend`/`extend M` in a class body (e.g. a
+        // conditional `prepend M if cond`, which the compile-time class-body
+        // handler doesn't extract) — dispatch on the class itself.
+        if matches!(name, "include" | "prepend" | "extend") && !args.is_empty() {
+            return dispatch(&this, name, args, block);
+        }
         // Visibility directives in a class/module body — rubylang does not enforce
         // visibility, so accept them as no-ops (gems use them constantly:
         // `private_constant :X`, `private :m`, `module_function :m`). Ruby returns
@@ -2019,8 +2025,27 @@ fn dispatch_classref(
             }
         }
         "name" | "to_s" | "inspect" => Ok(new_str(cls.to_string())),
-        // `Class#superclass` — the direct superclass reference, or nil for
-        // `BasicObject`.
+        // Runtime `Class#include`/`prepend`/`extend(Module, …)` — the same mixin
+        // effect the compile-time class-body forms have, but for a conditional or
+        // dynamic call (`prepend Correctable if Correctable`). Fires the module's
+        // `included`/`prepended`/`extended` hook.
+        "include" | "prepend" | "extend" if !args.is_empty() => {
+            for a in args {
+                if let Some(m) = with_host(|h| h.classref_name(a)) {
+                    with_host(|h| h.class_mixin(cls, &m, name));
+                    let hook = match name {
+                        "include" => "included",
+                        "prepend" => "prepended",
+                        _ => "extended",
+                    };
+                    if with_host(|h| h.find_class_method(&m, hook)).is_some() {
+                        let target = with_host(|h| h.class_ref(cls));
+                        dispatch(a, hook, &[target], None)?;
+                    }
+                }
+            }
+            Ok(with_host(|h| h.class_ref(cls)))
+        }
         "superclass" => Ok(with_host(|h| match h.class_superclass(cls) {
             Some(sc) => h.class_ref(&sc),
             None => Value::Undef,
