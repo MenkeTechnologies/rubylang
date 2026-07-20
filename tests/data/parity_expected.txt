@@ -1150,3 +1150,41 @@ bound-puts
 #<Enumerator: [1, 2, 3]:map>
 #==#
 [1, 4, 9]
+#==#
+[9, 8]
+#==#
+[]
+#==#
+["https", "user", "host.com", 9000, "/a/b", "x=1&y=2", "frag"]
+#==#
+[80, 443]
+#==#
+"https://h.com/a/b?c=1"
+#==#
+"a=1&b=hello+world"
+#==#
+[["a", "1"], ["b", "hello world"]]
+#==#
+"URI::HTTPS"
+#==#
+[["a", "b", "c"], ["1", "2", "3"]]
+#==#
+[["a", "b,c", "d"], ["1", "x\ny", "3"]]
+#==#
+"a,\"b,c\",d\n"
+#==#
+"1,2\nx,\"y,z\"\n"
+#==#
+[{v: true, name: "bob"}, ["file.txt"]]
+#==#
+{c: 5}
+#==#
+"---\na: 1\nb:\n- 1\n- 2\n"
+#==#
+{"a" => 1, "b" => [1, 2]}
+#==#
+"---\n- 1\n- two\n- :three\n- true\n-\n"
+#==#
+true
+#==#
+{"db" => {"host" => "localhost", "port" => 5432, "tags" => ["a", "b"]}}

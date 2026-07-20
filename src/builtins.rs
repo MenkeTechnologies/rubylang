@@ -5263,6 +5263,17 @@ fn dispatch_array(
             with_host(|h| h.set_array(recv, a));
             Ok(recv.clone())
         }
+        // `replace(other)` — swap this array's contents for `other`'s (in place).
+        "replace" => {
+            let other = with_host(|h| h.as_array(&args[0])).unwrap_or_default();
+            with_host(|h| h.set_array(recv, other));
+            Ok(recv.clone())
+        }
+        // `clear` — empty the array in place, returning self.
+        "clear" => {
+            with_host(|h| h.set_array(recv, Vec::new()));
+            Ok(recv.clone())
+        }
         "each" => {
             if let Some(b) = &block {
                 for x in &arr {
@@ -12125,6 +12136,21 @@ enum ReqMode {
 /// Standard-library names the runtime provides natively (or intentionally
 /// ignores), so `require '<name>'` is a no-op returning true rather than a file
 /// search. These never map to a `.rb` on disk.
+/// Pure-Ruby stdlib libraries bundled into the binary, keyed by `require` name.
+/// Each is compiled and run on the host the first time it is required, so the
+/// installed `ruby` needs no external stdlib directory. Kept out of
+/// `is_builtin_lib` so `require` actually loads them instead of no-opping.
+pub(crate) fn embedded_stdlib(name: &str) -> Option<&'static str> {
+    let n = name.strip_suffix(".rb").unwrap_or(name);
+    match n {
+        "uri" => Some(include_str!("../stdlib/uri.rb")),
+        "csv" => Some(include_str!("../stdlib/csv.rb")),
+        "optparse" => Some(include_str!("../stdlib/optparse.rb")),
+        "yaml" | "psych" => Some(include_str!("../stdlib/yaml.rb")),
+        _ => None,
+    }
+}
+
 pub(crate) fn is_builtin_lib(name: &str) -> bool {
     let n = name.strip_suffix(".rb").unwrap_or(name);
     matches!(
@@ -12151,13 +12177,11 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "fileutils"
             | "tmpdir"
             | "tempfile"
-            | "uri"
+            // `uri`, `csv`, `yaml`, `optparse` are real pure-Ruby libs bundled via
+            // `embedded_stdlib`, not no-op names — kept out of this list on purpose.
             | "cgi"
             | "erb"
-            | "yaml"
-            | "csv"
             | "logger"
-            | "optparse"
             | "open3"
             | "socket"
             | "io/console"
@@ -12315,6 +12339,23 @@ fn do_require(args: &[Value], mode: ReqMode) -> Result<Value, String> {
             ))
         }
     };
+
+    // A pure-Ruby stdlib bundled into the binary (uri, csv, optparse, yaml, …):
+    // compile+run its embedded source once, so a bare `require "uri"` works with
+    // no external file — the installed `ruby` stays self-contained.
+    if mode == ReqMode::Require {
+        if let Some(src) = embedded_stdlib(&raw) {
+            let feature = format!("<embedded>/{raw}.rb");
+            if feature_loaded(&feature) {
+                return Ok(Value::Bool(false));
+            }
+            record_feature(&feature);
+            let prog = crate::compile(src).map_err(|e| raise_exc("SyntaxError", &e))?;
+            let main = crate::load_merged(prog);
+            crate::host::run_required_main(main)?;
+            return Ok(Value::Bool(true));
+        }
+    }
 
     // A known builtin library name is a no-op that reports success.
     if mode == ReqMode::Require && is_builtin_lib(&raw) {

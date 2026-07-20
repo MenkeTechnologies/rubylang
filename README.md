@@ -157,7 +157,9 @@ Implemented and checked against the reference `ruby`:
 - **String interpolation** — double-quoted `#{}` interpolation.
 - **Standard library** — `require`-able builtin libs including `json`, `set`,
   `date`/`time`, `securerandom`, `digest`, `base64`, `ostruct`, `socket`
-  (`TCPServer`/`TCPSocket`), `sqlite3`, and `fiddle`.
+  (`TCPServer`/`TCPSocket`), `sqlite3`, and `fiddle`, plus bundled pure-Ruby
+  `uri`, `csv`, `optparse`, and `yaml` (common-surface subsets, loaded from the
+  binary with no external files).
 - **Database persistence** — `require "sqlite3"` gives a real, on-disk
   `SQLite3::Database` backed by a bundled SQLite (compiled in-tree, no external
   gem or FFI). The core sqlite3-gem shape: `SQLite3::Database.new(path)` /

@@ -1793,3 +1793,71 @@ p [1, 2, 3].map(&nil)
 #==#
 sq = ->(x) { x * x }
 p [1, 2, 3].map(&sq)
+#==#
+# ── Array#replace / #clear (in-place) ──
+a = [1, 2, 3]; a.replace([9, 8]); p a
+#==#
+a = [1, 2, 3]; a.clear; p a
+#==#
+# ── bundled stdlib: uri ──
+require "uri"
+u = URI.parse("https://user@host.com:9000/a/b?x=1&y=2#frag")
+p [u.scheme, u.userinfo, u.host, u.port, u.path, u.query, u.fragment]
+#==#
+require "uri"
+p [URI.parse("http://h.com/a").port, URI.parse("https://h.com/a").port]
+#==#
+require "uri"
+p URI.parse("https://h.com/a/b?c=1").to_s
+#==#
+require "uri"
+p URI.encode_www_form({"a" => "1", "b" => "hello world"})
+#==#
+require "uri"
+p URI.decode_www_form("a=1&b=hello+world")
+#==#
+require "uri"
+p URI("https://x.com").class.to_s
+#==#
+# ── bundled stdlib: csv ──
+require "csv"
+p CSV.parse("a,b,c\n1,2,3")
+#==#
+require "csv"
+p CSV.parse(%Q{a,"b,c",d\n1,"x\ny",3})
+#==#
+require "csv"
+p CSV.generate_line(["a", "b,c", "d"])
+#==#
+require "csv"
+s = CSV.generate { |c| c << [1, 2]; c << ["x", "y,z"] }; p s
+#==#
+# ── bundled stdlib: optparse ──
+require "optparse"
+o = {}
+op = OptionParser.new { |x| x.on("-v", "--verbose") { o[:v] = true }; x.on("--name NAME") { |n| o[:name] = n } }
+argv = ["-v", "--name", "bob", "file.txt"]
+op.parse!(argv)
+p [o, argv]
+#==#
+require "optparse"
+o = {}
+OptionParser.new { |x| x.on("--count N", Integer) { |n| o[:c] = n } }.parse!(a = ["--count=5"])
+p o
+#==#
+# ── bundled stdlib: yaml (dump + load round-trip) ──
+require "yaml"
+p YAML.dump({"a" => 1, "b" => [1, 2]})
+#==#
+require "yaml"
+p YAML.load("---\na: 1\nb:\n- 1\n- 2\n")
+#==#
+require "yaml"
+p YAML.dump([1, "two", :three, true, nil])
+#==#
+require "yaml"
+h = {"name" => "x", "nums" => [1, 2, 3], "nested" => {"k" => "v"}}
+p YAML.load(YAML.dump(h)) == h
+#==#
+require "yaml"
+p YAML.load("db:\n  host: localhost\n  port: 5432\n  tags:\n  - a\n  - b")

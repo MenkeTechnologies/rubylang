@@ -769,6 +769,22 @@ Not modeled / boundaries:
   the runtime provides natively or ignores (`set`, `json`, `date`, `time`,
   `securerandom`, and a fixed list of common stdlib names) returns `true`
   without a file search, so those names never map to a `.rb` on disk.
+- **Bundled pure-Ruby stdlib (`uri`, `csv`, `optparse`, `yaml`).** These are real
+  pure-Ruby libraries embedded in the binary (`embedded_stdlib`, via
+  `include_str!`), compiled and run on the host the first time they are required
+  — so `require "uri"` actually defines `URI` (etc.) with no external file, and
+  the installed `ruby` stays self-contained. Coverage is the common surface, not
+  the full API: `URI` parse/join/`encode_www_form` (HTTP/HTTPS/FTP + Generic, no
+  scheme registry); `CSV` parse/generate with RFC-4180 quoting (no converters or
+  `:headers` Row objects); `OptionParser` short/long/`--[no-]`/valued flags with
+  Integer/Float coercion, `parse!`/`parse`/`to_s` (no required-arg enforcement or
+  completion); `YAML` block-style emit/parse for Hash/Array/String/Symbol/
+  Integer/Float/bool/nil plus inline flow collections on load, `dump` output
+  round-trips through `load` (no anchors/tags/multi-doc/block scalars/custom
+  objects). Not yet: `module_function` (these libs use `def self.`), `to_yaml` on
+  builtin receivers (only user objects — reopening `Object` does not reach
+  builtin types), and `FileUtils`/similar native pseudo-modules whose *constant*
+  is unbound (`FileUtils.mkdir_p` works, but `FileUtils.class` is `NilClass`).
 - **`__dir__`** returns the directory of the file currently running (from the
   same file-dir stack), a String; under `-e`/stdin it returns the seeded current
   directory (MRI returns the relative `"."` there).
