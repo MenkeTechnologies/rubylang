@@ -305,11 +305,14 @@ Honest limitations of this surface:
   a thread swaps in its own execution context (frames/scope/signal) so call
   stacks never collide. `Thread#join`/`#value` release the GVL, wait for the OS
   thread, reacquire, and `value` re-raises the thread's real exception object.
-  `#alive?`/`#status`, `Thread.current`/`main`/`pass`/`list` are present. Not yet:
-  `Mutex`/`Queue`/`ConditionVariable` and blocking-op safepoints (a `Queue#pop`
-  on empty cannot yet block-and-wake a producer), and `report_on_exception`'s
-  stderr warning is not emitted. Fibers remain thread-owned (a fiber is resumed
-  only on its creating thread, as in MRI).
+  `#alive?`/`#status`, `Thread.current`/`main`/`pass`/`list` are present.
+  `Mutex`/`Thread::Mutex`/`Monitor` (`lock`/`unlock`/`try_lock`/`locked?`/
+  `synchronize`) work: under the GVL a critical section with no blocking call runs
+  uninterrupted, so `synchronize` holds a lock flag around the block (cleared even
+  on a raise). Not yet: `Queue`/`ConditionVariable` and blocking-op safepoints (a
+  `Queue#pop` on empty cannot yet block-and-wake a producer), and
+  `report_on_exception`'s stderr warning is not emitted. Fibers remain
+  thread-owned (a fiber is resumed only on its creating thread, as in MRI).
 - **Bignum.** Integers auto-promote to arbitrary precision on overflow, like
   MRI: values that fit stay `i64` immediates, and only the overflow path
   allocates a `BigInt` heap object (backed by `num-bigint`). Arithmetic, bit

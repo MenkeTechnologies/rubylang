@@ -1358,6 +1358,16 @@ fn dispatch_classref(
             )),
         };
     }
+    // `Mutex.new` / `Thread::Mutex.new` / `Monitor.new` — a lock object. Under the
+    // GVL a critical section with no blocking call is already exclusive, so the
+    // lock is a `locked` flag on the object (see `mutex_method`).
+    if (cls == "Mutex" || cls == "Thread::Mutex" || cls == "Monitor") && name == "new" {
+        return Ok(with_host(|h| {
+            let o = h.new_object(cls);
+            h.set_ivar_of(&o, "__locked", Value::Bool(false));
+            o
+        }));
+    }
     // `Thread` class methods. `Thread.new { }` spawns a real OS thread that runs
     // under the GVL (only one Ruby thread executes at a time, like MRI).
     if cls == "Thread" {
@@ -2253,6 +2263,12 @@ fn dispatch_object(
     // Random instance: its own reproducible PRNG stream (state in the `state` ivar).
     if cls == "Random" {
         if let Some(r) = random_method(recv, name, args)? {
+            return Ok(r);
+        }
+    }
+    // Mutex/Monitor: a lock flag; `synchronize` runs the block under the lock.
+    if cls == "Mutex" || cls == "Thread::Mutex" || cls == "Monitor" {
+        if let Some(r) = mutex_method(recv, name, block.clone())? {
             return Ok(r);
         }
     }
@@ -10292,6 +10308,59 @@ fn random_advance(recv: &Value) -> u64 {
     let mut m = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     m = (m ^ (m >> 27)).wrapping_mul(0x94D049BB133111EB);
     m ^ (m >> 31)
+}
+
+/// `Mutex`/`Monitor` instance methods. The lock state is a `__locked` flag on the
+/// object. Under the GVL a critical section with no blocking call runs without
+/// interruption, so `synchronize` simply runs the block with the flag set and
+/// clears it afterward (even if the block raises). Returns `Ok(None)` for a name
+/// it does not handle.
+fn mutex_method(
+    recv: &Value,
+    name: &str,
+    block: Option<Value>,
+) -> Result<Option<Value>, String> {
+    let locked = || with_host(|h| matches!(h.ivar_of(recv, "__locked"), Value::Bool(true)));
+    let set = |v: bool| with_host(|h| h.set_ivar_of(recv, "__locked", Value::Bool(v)));
+    match name {
+        "lock" => {
+            set(true);
+            Ok(Some(recv.clone()))
+        }
+        "unlock" => {
+            set(false);
+            Ok(Some(recv.clone()))
+        }
+        "locked?" => Ok(Some(Value::Bool(locked()))),
+        "owned?" => Ok(Some(Value::Bool(locked()))),
+        "try_lock" => {
+            if locked() {
+                Ok(Some(Value::Bool(false)))
+            } else {
+                set(true);
+                Ok(Some(Value::Bool(true)))
+            }
+        }
+        "synchronize" | "mon_synchronize" | "enter" | "mon_enter" => {
+            let b = match block {
+                Some(b) => b,
+                // `lock`-style entry with no block (Monitor#mon_enter).
+                None => {
+                    set(true);
+                    return Ok(Some(recv.clone()));
+                }
+            };
+            set(true);
+            let r = call_proc(&b, &[]);
+            set(false);
+            r.map(Some)
+        }
+        "exit" | "mon_exit" => {
+            set(false);
+            Ok(Some(recv.clone()))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Instance methods of a `Random` object (`rand`, `seed`). Returns `Ok(None)`
