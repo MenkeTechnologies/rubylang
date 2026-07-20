@@ -880,7 +880,9 @@ impl Parser {
         // to a call in the condition — leave it for the loop parser to consume.
         if !self.no_do_block && self.eat_kw("do") {
             let (params, splat, preludes) = self.block_params()?;
-            let rest = self.body_until(&["end"])?;
+            // A `do … rescue … else … ensure … end` block carries an implicit
+            // begin (Ruby 2.6+), so parse the rescue tail like a method body.
+            let rest = self.body_with_rescue()?;
             self.expect_kw("end")?;
             let body = self.prepend_preludes(preludes, rest);
             return Ok(Some(Block {
@@ -1364,9 +1366,13 @@ impl Parser {
             }
             "begin" => {
                 self.advance();
-                let body = self.body_until(&["rescue", "ensure", "end"])?;
-                let (rescues, ensure) = self.rescue_tail()?;
+                let mut body = self.body_until(&["rescue", "else", "ensure", "end"])?;
+                let (rescues, els, ensure) = self.rescue_tail()?;
                 self.expect_kw("end")?;
+                // `else` runs after the body when it raised nothing (appended).
+                if let Some(e) = els {
+                    body.extend(e);
+                }
                 Ok(Expr::Begin {
                     body,
                     rescues,
@@ -1907,7 +1913,10 @@ impl Parser {
     }
 
     /// Parse the `rescue …` clauses and optional `ensure …` after a body.
-    fn rescue_tail(&mut self) -> Result<(Vec<Rescue>, Option<Vec<Stmt>>), String> {
+    #[allow(clippy::type_complexity)]
+    fn rescue_tail(
+        &mut self,
+    ) -> Result<(Vec<Rescue>, Option<Vec<Stmt>>, Option<Vec<Stmt>>), String> {
         let mut rescues = Vec::new();
         while self.eat_kw("rescue") {
             let mut classes = Vec::new();
@@ -1943,19 +1952,26 @@ impl Parser {
                 None
             };
             self.eat_kw("then");
-            let body = self.body_until(&["rescue", "ensure", "end"])?;
+            let body = self.body_until(&["rescue", "else", "ensure", "end"])?;
             rescues.push(Rescue {
                 classes,
                 binding,
                 body,
             });
         }
+        // `else` (after all rescues, before ensure) runs when the body raised no
+        // exception. Returned to the caller, which appends it to the begin body.
+        let els = if self.eat_kw("else") {
+            Some(self.body_until(&["ensure", "end"])?)
+        } else {
+            None
+        };
         let ensure = if self.eat_kw("ensure") {
             Some(self.body_until(&["end"])?)
         } else {
             None
         };
-        Ok((rescues, ensure))
+        Ok((rescues, els, ensure))
     }
 
     fn def_expr(&mut self) -> Result<Expr, String> {
@@ -2058,11 +2074,17 @@ impl Parser {
     /// stopping at `end`. If any rescue/ensure clause is present, the body is
     /// wrapped in a `Begin` node.
     fn body_with_rescue(&mut self) -> Result<Vec<Stmt>, String> {
-        let body = self.body_until(&["rescue", "ensure", "end"])?;
-        let (rescues, ensure) = self.rescue_tail()?;
+        let mut body = self.body_until(&["rescue", "ensure", "end"])?;
+        let (rescues, els, ensure) = self.rescue_tail()?;
         if rescues.is_empty() && ensure.is_none() {
             Ok(body)
         } else {
+            // The `else` body runs after the main body when it raised nothing;
+            // append it (an exception in it is not caught by these rescues in MRI,
+            // a rarely-material difference).
+            if let Some(e) = els {
+                body.extend(e);
+            }
             Ok(vec![Expr::Begin {
                 body,
                 rescues,

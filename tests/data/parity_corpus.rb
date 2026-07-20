@@ -2004,3 +2004,25 @@ big = {}
 (1..200).each { |i| big[i] = i * i }
 lit = eval("{" + (1..200).map { |i| "#{i} => #{i * i}" }.join(", ") + "}")
 p [lit.size, lit[200], lit == big]
+#==#
+# ── begin/rescue/else (else runs when no exception) ──
+p(begin; 1 + 1; rescue; :err; else; :ok; end)
+#==#
+def raises_then_else
+  begin
+    raise "boom"
+  rescue
+    :caught
+  else
+    :no_raise
+  end
+end
+p raises_then_else
+#==#
+# ── do...end block with an inline rescue/else (Ruby 2.6+) ──
+r = [1, 0, 2].map do |n|
+  10 / n
+rescue ZeroDivisionError
+  -1
+end
+p r
