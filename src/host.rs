@@ -18,7 +18,7 @@ use fusevm::{Chunk, NumOp, VMResult, Value, VM};
 use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::intercepts::{self, Advice};
 
@@ -32,19 +32,22 @@ pub struct EnvData {
     vars: IndexMap<String, Value>,
     parent: Option<Env>,
 }
-pub type Env = Rc<RefCell<EnvData>>;
+/// `Arc<Mutex>` (not `Rc<RefCell>`) so the whole object heap is `Send` and can be
+/// shared across `Thread`s. Under the GVL only the running thread touches any
+/// env, so the mutex is always uncontended (a cheap fast-path lock).
+pub type Env = Arc<Mutex<EnvData>>;
 
 fn new_env() -> Env {
-    Rc::new(RefCell::new(EnvData {
+    Arc::new(Mutex::new(EnvData {
         vars: IndexMap::new(),
         parent: None,
     }))
 }
 fn env_with(vars: IndexMap<String, Value>) -> Env {
-    Rc::new(RefCell::new(EnvData { vars, parent: None }))
+    Arc::new(Mutex::new(EnvData { vars, parent: None }))
 }
 fn child_env(parent: Env) -> Env {
-    Rc::new(RefCell::new(EnvData {
+    Arc::new(Mutex::new(EnvData {
         vars: IndexMap::new(),
         parent: Some(parent),
     }))
@@ -605,10 +608,6 @@ pub struct RubyHost {
     singleton_define_methods: IndexMap<u32, IndexMap<String, Value>>,
     /// `alias_method`/`alias` mappings: class → alias name → target method name.
     method_aliases: IndexMap<String, IndexMap<String, String>>,
-    /// Live fibers, indexed by `RObj::Fiber.id`. The coroutine is `.take()`n out
-    /// for the duration of `resume` so the fiber body can re-enter `with_host`
-    /// without a double mutable borrow.
-    fibers: Vec<FiberCell>,
     /// Live `IO`/`File` objects, indexed by `RObj::IoHandle.id`. Slots 0/1/2 are
     /// pre-seeded with the standard streams (`STDOUT`/`STDERR`/`STDIN`).
     io_handles: Vec<IoCell>,
@@ -744,6 +743,9 @@ pub fn reset_host() {
     FILE_DIR_STACK.with(|s| s.borrow_mut().clear());
     FILE_PATH_STACK.with(|s| s.borrow_mut().clear());
     DEF_TARGET.with(|t| t.borrow_mut().clear());
+    // Fibers moved off the host into a thread-local, so clear them explicitly.
+    FIBERS.with(|f| f.borrow_mut().clear());
+    CUR_FIBER.with(|c| c.set(None));
 }
 
 thread_local! {
@@ -887,7 +889,7 @@ pub fn eval_erb_with_locals(
     let self_obj = with_host(|h| h.new_object("Object"));
     let env = new_env();
     {
-        let mut e = env.borrow_mut();
+        let mut e = env.lock().unwrap();
         for (k, v) in locals {
             e.vars.insert(k, v);
         }
@@ -1035,7 +1037,6 @@ impl RubyHost {
             frozen: HashSet::new(),
             enum_sinks: Vec::new(),
             around_stack: Vec::new(),
-            fibers: Vec::new(),
             io_handles: vec![IoCell::Stdout, IoCell::Stderr, IoCell::Stdin],
             db_handles: Vec::new(),
             fiddle_libs: Vec::new(),
@@ -2094,7 +2095,8 @@ impl RubyHost {
     pub fn dbg_locals(&mut self) -> Vec<(String, String)> {
         let env = self.cur_env();
         let names: Vec<String> = env
-            .borrow()
+            .lock()
+            .unwrap()
             .vars
             .keys()
             .filter(|k| !k.starts_with("__"))
@@ -2112,10 +2114,10 @@ impl RubyHost {
     pub fn get_local(&self, name: &str) -> Value {
         let mut env = self.cur_env();
         loop {
-            if let Some(v) = env.borrow().vars.get(name).cloned() {
+            if let Some(v) = env.lock().unwrap().vars.get(name).cloned() {
                 return v;
             }
-            let parent = env.borrow().parent.clone();
+            let parent = env.lock().unwrap().parent.clone();
             match parent {
                 Some(p) => env = p,
                 None => return Value::Undef,
@@ -2127,25 +2129,25 @@ impl RubyHost {
     pub fn set_local(&self, name: &str, v: Value) {
         let mut env = self.cur_env();
         loop {
-            if env.borrow().vars.contains_key(name) {
-                env.borrow_mut().vars.insert(name.to_string(), v);
+            if env.lock().unwrap().vars.contains_key(name) {
+                env.lock().unwrap().vars.insert(name.to_string(), v);
                 return;
             }
-            let parent = env.borrow().parent.clone();
+            let parent = env.lock().unwrap().parent.clone();
             match parent {
                 Some(p) => env = p,
                 None => break,
             }
         }
-        self.cur_env().borrow_mut().vars.insert(name.to_string(), v);
+        self.cur_env().lock().unwrap().vars.insert(name.to_string(), v);
     }
     pub fn local_defined(&self, name: &str) -> bool {
         let mut env = self.cur_env();
         loop {
-            if env.borrow().vars.contains_key(name) {
+            if env.lock().unwrap().vars.contains_key(name) {
                 return true;
             }
-            let parent = env.borrow().parent.clone();
+            let parent = env.lock().unwrap().parent.clone();
             match parent {
                 Some(p) => env = p,
                 None => return false,
@@ -4485,10 +4487,10 @@ fn run_template(id: usize, args: &[Value]) -> Result<Value, String> {
         for (p, prev) in saved {
             match prev {
                 Some(v) => {
-                    env.borrow_mut().vars.insert(p, v);
+                    env.lock().unwrap().vars.insert(p, v);
                 }
                 None => {
-                    env.borrow_mut().vars.shift_remove(&p);
+                    env.lock().unwrap().vars.shift_remove(&p);
                 }
             }
         }
@@ -4580,6 +4582,18 @@ thread_local! {
     /// `None` at the root. `Fiber.yield` suspends this fiber; yielding at the
     /// root is a FiberError.
     static CUR_FIBER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+
+    /// Live fibers for THIS thread, indexed by `RObj::Fiber.id`. Fibers are
+    /// thread-owned — a corosensei `Coroutine` holds a native stack plus a raw
+    /// yielder pointer valid only on its creating thread — so they live here, not
+    /// on the shared `Send` `RubyHost`. (MRI likewise forbids resuming a fiber on
+    /// a thread other than the one that created it.)
+    static FIBERS: RefCell<Vec<FiberCell>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Access this thread's fiber table.
+fn with_fibers<R>(f: impl FnOnce(&mut Vec<FiberCell>) -> R) -> R {
+    FIBERS.with(|c| f(&mut c.borrow_mut()))
 }
 
 impl RubyHost {
@@ -4617,9 +4631,9 @@ fn fiber_root_frame() -> Frame {
 /// `Fiber.new { |first| ... }`: build a suspended stackful coroutine whose body
 /// runs the block. Nothing executes until the first `resume`.
 pub fn new_fiber(block: Value) -> Value {
-    let id = with_host(|h| {
-        let id = h.fibers.len() as u32;
-        h.fibers.push(FiberCell {
+    let id = with_fibers(|fibers| {
+        let id = fibers.len() as u32;
+        fibers.push(FiberCell {
             coro: None,
             yielder: std::ptr::null(),
             ctx: FiberContext {
@@ -4634,12 +4648,12 @@ pub fn new_fiber(block: Value) -> Value {
         move |yielder: &corosensei::Yielder<Value, Value>, first: Value| {
             // Same thread → publish the yielder pointer so `Fiber.yield` (running
             // deep inside this body's VM) can reach it. Valid for the body's life.
-            with_host(|h| h.fibers[id as usize].yielder = yielder as *const _ as *const ());
+            with_fibers(|fibers| fibers[id as usize].yielder = yielder as *const _ as *const ());
             // The first resume value becomes the block's single parameter (MRI).
             call_proc(&block, std::slice::from_ref(&first))
         },
     );
-    with_host(|h| h.fibers[id as usize].coro = Some(coro));
+    with_fibers(|fibers| fibers[id as usize].coro = Some(coro));
     with_host(|h| h.alloc(RObj::Fiber { id }))
 }
 
@@ -4655,7 +4669,7 @@ pub fn fiber_yield(v: Value) -> Result<Value, String> {
             ))
         }
     };
-    let yp = with_host(|h| h.fibers[id as usize].yielder);
+    let yp = with_fibers(|fibers| fibers[id as usize].yielder);
     // SAFETY: same-thread coroutine; the yielder lives for the whole fiber body,
     // and we only reach here from inside that body (its stack is live).
     let yielder = unsafe { &*(yp as *const corosensei::Yielder<Value, Value>) };
@@ -4671,14 +4685,14 @@ pub fn fiber_resume(fiber: &Value, v: Value) -> Result<Value, String> {
         Some(RObj::Fiber { id }) => id,
         _ => return Err("not a fiber".into()),
     };
-    if with_host(|h| h.fibers[id as usize].done) {
+    if with_fibers(|fibers| fibers[id as usize].done) {
         return Err(crate::builtins::raise_exc("FiberError", "dead fiber called"));
     }
-    let mut coro = with_host(|h| h.fibers[id as usize].coro.take())
+    let mut coro = with_fibers(|fibers| fibers[id as usize].coro.take())
         .ok_or_else(|| crate::builtins::raise_exc("FiberError", "double resume of a fiber"))?;
 
     // Install the fiber's context; keep the caller's in a local across resume.
-    let fiber_ctx = with_host(|h| std::mem::take(&mut h.fibers[id as usize].ctx));
+    let fiber_ctx = with_fibers(|fibers| std::mem::take(&mut fibers[id as usize].ctx));
     let caller_ctx = with_host(|h| h.install_fiber_ctx(fiber_ctx));
     let prev = CUR_FIBER.with(|c| c.replace(Some(id)));
 
@@ -4687,15 +4701,15 @@ pub fn fiber_resume(fiber: &Value, v: Value) -> Result<Value, String> {
     CUR_FIBER.with(|c| c.set(prev));
     // Pull the fiber's context back out, restore the caller's.
     let fiber_ctx = with_host(|h| h.install_fiber_ctx(caller_ctx));
-    with_host(|h| {
-        h.fibers[id as usize].ctx = fiber_ctx;
-        h.fibers[id as usize].coro = Some(coro);
+    with_fibers(|fibers| {
+        fibers[id as usize].ctx = fiber_ctx;
+        fibers[id as usize].coro = Some(coro);
     });
 
     match out {
         corosensei::CoroutineResult::Yield(y) => Ok(y),
         corosensei::CoroutineResult::Return(r) => {
-            with_host(|h| h.fibers[id as usize].done = true);
+            with_fibers(|fibers| fibers[id as usize].done = true);
             r // block's value, or a propagated raise
         }
     }
@@ -4704,7 +4718,7 @@ pub fn fiber_resume(fiber: &Value, v: Value) -> Result<Value, String> {
 /// `fiber.alive?` — false once the block has returned.
 pub fn fiber_alive(fiber: &Value) -> bool {
     match with_host(|h| h.obj(fiber).cloned()) {
-        Some(RObj::Fiber { id }) => with_host(|h| !h.fibers[id as usize].done),
+        Some(RObj::Fiber { id }) => with_fibers(|fibers| !fibers[id as usize].done),
         _ => false,
     }
 }
@@ -5612,7 +5626,8 @@ pub fn call_proc_self(
         None => {
             for (i, p) in def.params.iter().enumerate() {
                 child
-                    .borrow_mut()
+                    .lock()
+                    .unwrap()
                     .vars
                     .insert(p.clone(), bound.get(i).cloned().unwrap_or(Value::Undef));
             }
@@ -5623,7 +5638,7 @@ pub fn call_proc_self(
             let after = def.params.len() - si - 1;
             for (i, p) in def.params.iter().take(si).enumerate() {
                 let v = bound.get(i).cloned().unwrap_or(Value::Undef);
-                child.borrow_mut().vars.insert(p.clone(), v);
+                child.lock().unwrap().vars.insert(p.clone(), v);
             }
             let splat_end = bound.len().saturating_sub(after).max(si);
             let rest: Vec<Value> = bound
@@ -5631,10 +5646,10 @@ pub fn call_proc_self(
                 .map(|s| s.to_vec())
                 .unwrap_or_default();
             let arr = with_host(|h| h.new_array(rest));
-            child.borrow_mut().vars.insert(def.params[si].clone(), arr);
+            child.lock().unwrap().vars.insert(def.params[si].clone(), arr);
             for (j, p) in def.params.iter().skip(si + 1).enumerate() {
                 let v = bound.get(splat_end + j).cloned().unwrap_or(Value::Undef);
-                child.borrow_mut().vars.insert(p.clone(), v);
+                child.lock().unwrap().vars.insert(p.clone(), v);
             }
         }
     }
@@ -5730,3 +5745,11 @@ pub fn take_break() -> Option<Value> {
 pub fn has_pending_signal() -> bool {
     with_host(|h| h.signal.is_some())
 }
+
+/// Compile-time guard: `RubyHost` must stay `Send` — the GVL model shares one
+/// host across `Thread`s. If a future field reintroduces `Rc`/a raw pointer/a
+/// non-`Send` handle, this fails to compile (fix the field, don't delete this).
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<RubyHost>();
+};
