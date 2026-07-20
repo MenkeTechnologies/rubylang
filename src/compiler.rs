@@ -15,6 +15,24 @@ use crate::host::{ops, BeginDef, ClassDef, MethodDef, ProcDef, RescueDef};
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::sync::Arc;
 
+thread_local! {
+    /// Set by `crate::compile` from the source's `# frozen_string_literal:` magic
+    /// comment before each file compiles; read when lowering string literals so a
+    /// non-interpolated literal freezes. Per-file: `crate::compile` sets it every
+    /// call, and every `require` funnels through there, so each file gets its own.
+    static FROZEN_STR_LITERALS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the file currently being compiled froze its string literals.
+pub fn frozen_string_literals() -> bool {
+    FROZEN_STR_LITERALS.with(|c| c.get())
+}
+
+/// Set the frozen-string-literal flag for the next compilation (one file).
+pub fn set_frozen_string_literals(on: bool) {
+    FROZEN_STR_LITERALS.with(|c| c.set(on));
+}
+
 /// The full output of compiling a program.
 pub struct Program {
     pub main: Chunk,
@@ -302,7 +320,15 @@ impl Compiler {
                         StrPart::Interp(e) => self.compile_expr(b, e)?,
                     }
                 }
-                b.emit(Op::CallBuiltin(ops::MKSTR, parts.len() as u8), 0);
+                // Under `# frozen_string_literal: true`, a *non-interpolated*
+                // literal is frozen (MRI leaves interpolated strings mutable).
+                let all_literal = parts.iter().all(|p| matches!(p, StrPart::Lit(_)));
+                let op = if frozen_string_literals() && all_literal {
+                    ops::MKSTRF
+                } else {
+                    ops::MKSTR
+                };
+                b.emit(Op::CallBuiltin(op, parts.len() as u8), 0);
             }
             Expr::Symbol(s) => {
                 self.kstr(b, s);

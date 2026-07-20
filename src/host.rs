@@ -128,6 +128,7 @@ pub mod ops {
     pub const FIRE_HOOK: u16 = 46; // [module, hook, target] -> nil; inherited/included/extended/prepended
     pub const SUPER_BLK: u16 = 47; // [args..., proc] argc=n+1 -> super with explicit args + a new block
     pub const SUPER_FWD_BLK: u16 = 48; // [proc] -> super forwarding args, with a new block
+    pub const MKSTRF: u16 = 49; // [parts...] argc=n -> frozen heap String (frozen_string_literal)
 }
 
 /// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried

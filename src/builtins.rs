@@ -33,6 +33,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::CALL_METHOD, b_call_method);
     vm.register_builtin(ops::CALL_METHOD_BLK, b_call_method_blk);
     vm.register_builtin(ops::MKSTR, b_mkstr);
+    vm.register_builtin(ops::MKSTRF, b_mkstrf);
     vm.register_builtin(ops::MKSYM, b_mksym);
     vm.register_builtin(ops::MKARRAY, b_mkarray);
     vm.register_builtin(ops::MKHASH, b_mkhash);
@@ -581,6 +582,15 @@ fn b_mkstr(vm: &mut VM, argc: u8) -> Value {
         s.push_str(&display(p));
     }
     with_host(|h| h.new_string(s))
+}
+
+/// `# frozen_string_literal: true`: build a string literal and freeze it, so
+/// `"x".frozen?` is true and mutating it raises FrozenError. Emitted (in place of
+/// `MKSTR`) only for non-interpolated literals in a file carrying the comment.
+fn b_mkstrf(vm: &mut VM, argc: u8) -> Value {
+    let s = b_mkstr(vm, argc);
+    with_host(|h| h.freeze_value(&s));
+    s
 }
 fn b_mksym(vm: &mut VM, _: u8) -> Value {
     let name = name_of(&vm.pop());
@@ -3405,6 +3415,7 @@ fn dispatch_string(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    frozen_guard(recv, name, STRING_MUTATORS)?;
     let s = with_host(|h| h.as_str(recv).unwrap_or_default());
     match name {
         "length" | "size" => Ok(Value::Int(s.chars().count() as i64)),
@@ -4692,6 +4703,7 @@ fn dispatch_array(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    frozen_guard(recv, name, ARRAY_MUTATORS)?;
     let arr = with_host(|h| h.as_array(recv).unwrap_or_default());
     match name {
         // `arr <=> other` — element-wise comparison: the first non-equal pair
@@ -8675,6 +8687,7 @@ fn dispatch_hash(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    frozen_guard(recv, name, HASH_MUTATORS)?;
     let map = with_host(|h| h.as_hash(recv).unwrap_or_default());
     match name {
         "size" | "length" => Ok(Value::Int(map.len() as i64)),
@@ -12457,6 +12470,59 @@ pub(crate) fn raise_exc(class: &str, msg: &str) -> String {
     with_host(|h| h.set_pending_exc(exc));
     msg.to_string()
 }
+
+/// Raise `FrozenError` when `name` is a mutating method (any `!`-suffixed method,
+/// or one of the explicit `mutators`) and `recv` is frozen — MRI's
+/// `can't modify frozen <Class>: <inspect>`. A no-op for unfrozen receivers, so
+/// non-frozen dispatch is unaffected.
+fn frozen_guard(recv: &Value, name: &str, mutators: &[&str]) -> Result<(), String> {
+    let is_mutator = (name.len() > 1 && name.ends_with('!')) || mutators.contains(&name);
+    if is_mutator && with_host(|h| h.is_frozen(recv)) {
+        let (cls, insp) = with_host(|h| (h.class_of(recv).to_string(), h.inspect(recv)));
+        return Err(raise_exc(
+            "FrozenError",
+            &format!("can't modify frozen {cls}: {insp}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Explicit (non-`!`) String mutators guarded against a frozen receiver.
+const STRING_MUTATORS: &[&str] = &[
+    "<<",
+    "concat",
+    "replace",
+    "clear",
+    "insert",
+    "prepend",
+    "[]=",
+    "force_encoding",
+];
+
+/// Explicit (non-`!`) Array mutators guarded against a frozen receiver.
+const ARRAY_MUTATORS: &[&str] = &[
+    "<<",
+    "push",
+    "append",
+    "pop",
+    "shift",
+    "unshift",
+    "prepend",
+    "concat",
+    "insert",
+    "delete",
+    "delete_at",
+    "clear",
+    "replace",
+    "fill",
+    "[]=",
+    "store",
+];
+
+/// Explicit (non-`!`) Hash mutators guarded against a frozen receiver.
+const HASH_MUTATORS: &[&str] = &[
+    "[]=", "store", "delete", "clear", "replace", "update", "merge!",
+];
 
 /// Raise a `NoMethodError` with the ruby-4.0 message form for `recv`:
 /// `for nil` / `for true` / `for false`, `for class C` when the receiver is a

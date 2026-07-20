@@ -82,8 +82,32 @@ fn seed_verbosity(cfg: &RunConfig) {
 
 /// Compile a source string to a runnable program.
 pub fn compile(src: &str) -> Result<compiler::Program, String> {
+    compiler::set_frozen_string_literals(has_frozen_string_literal(src));
     let stmts = parser::parse(src)?;
     compiler::compile(&stmts, false)
+}
+
+/// Detect a `# frozen_string_literal: true` magic comment. MRI honors it only in
+/// the leading comment block (after an optional shebang) and stops at the first
+/// line of code. The value must be `true`; anything else (incl. `false`) is off.
+fn has_frozen_string_literal(src: &str) -> bool {
+    for (i, line) in src.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if i == 0 && t.starts_with("#!") {
+            continue; // shebang
+        }
+        let Some(rest) = t.strip_prefix('#') else {
+            break; // first non-comment line ends the magic-comment region
+        };
+        // Accept `# frozen_string_literal: true` and `-*- … -*-` emacs form.
+        if let Some(after) = rest.split("frozen_string_literal:").nth(1) {
+            return after.trim_start().trim_end_matches("-*-").trim().starts_with("true");
+        }
+    }
+    false
 }
 
 /// Compile with per-statement DAP line markers enabled (`ruby --dap`).
