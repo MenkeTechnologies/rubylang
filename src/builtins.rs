@@ -823,6 +823,17 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
         if matches!(name, "include" | "prepend" | "extend") && !args.is_empty() {
             return dispatch(&this, name, args, block);
         }
+        // Runtime `attr_accessor`/`attr_reader`/`attr_writer` (e.g. in a
+        // `class_eval` / conditional class body) — register native accessors.
+        if matches!(name, "attr_accessor" | "attr_reader" | "attr_writer") {
+            let reader = name != "attr_writer";
+            let writer = name != "attr_reader";
+            for a in args {
+                let field = name_of(a);
+                with_host(|h| h.add_attr(&cls, &field, reader, writer));
+            }
+            return Ok(Value::Undef);
+        }
         // Visibility directives in a class/module body — rubylang does not enforce
         // visibility, so accept them as no-ops (gems use them constantly:
         // `private_constant :X`, `private :m`, `module_function :m`). Ruby returns
@@ -2029,6 +2040,17 @@ fn dispatch_classref(
         // effect the compile-time class-body forms have, but for a conditional or
         // dynamic call (`prepend Correctable if Correctable`). Fires the module's
         // `included`/`prepended`/`extended` hook.
+        // `C.attr_accessor(:x)` / `C.send(:attr_reader, :y)` — register a native
+        // accessor directly on the class.
+        "attr_accessor" | "attr_reader" | "attr_writer" => {
+            let reader = name != "attr_writer";
+            let writer = name != "attr_reader";
+            for a in args {
+                let field = name_of(a);
+                with_host(|h| h.add_attr(cls, &field, reader, writer));
+            }
+            Ok(Value::Undef)
+        }
         "include" | "prepend" | "extend" if !args.is_empty() => {
             for a in args {
                 if let Some(m) = with_host(|h| h.classref_name(a)) {
@@ -2492,6 +2514,18 @@ fn dispatch_object(
                 Ok(new_str(cls.to_string()))
             } else {
                 Ok(m)
+            }
+        }
+        // A runtime-declared attribute accessor (`class_eval { attr_accessor :x }`)
+        // reads/writes the `@field` ivar natively, ahead of method_missing.
+        _ if with_host(|h| h.attr_access(cls, name)).is_some() => {
+            let (field, is_writer) = with_host(|h| h.attr_access(cls, name)).unwrap();
+            if is_writer {
+                let v = args.first().cloned().unwrap_or(Value::Undef);
+                with_host(|h| h.set_ivar_of(recv, &field, v.clone()));
+                Ok(v)
+            } else {
+                Ok(with_host(|h| h.ivar_of(recv, &field)))
             }
         }
         // A class that defines `method_missing` handles any otherwise-undefined

@@ -607,6 +607,11 @@ pub struct RubyHost {
     /// inside `def self.m` or `class << self`): class name → variable name →
     /// value. Unlike `@@` class variables these are NOT inherited.
     class_ivars: IndexMap<String, IndexMap<String, Value>>,
+    /// Native attribute accessors declared at runtime (`class_eval { attr_accessor
+    /// :x }`, `C.send(:attr_reader, :y)`): class → field → (has_reader, has_writer).
+    /// Checked in dispatch as an `@field` get/set, so no bytecode method is
+    /// synthesized. Compile-time `attr_*` still builds real methods.
+    attr_accessors: IndexMap<String, IndexMap<String, (bool, bool)>>,
     /// `define_method`-created instance methods: class → name → block Proc.
     define_methods: IndexMap<String, IndexMap<String, Value>>,
     /// Per-object singleton methods (`def obj.m`, `class << obj`, and bare `def`
@@ -1175,6 +1180,7 @@ impl RubyHost {
             struct_counter: 0,
             class_vars: IndexMap::new(),
             class_ivars: IndexMap::new(),
+            attr_accessors: IndexMap::new(),
             define_methods: IndexMap::new(),
             singleton_methods: IndexMap::new(),
             singleton_define_methods: IndexMap::new(),
@@ -2387,6 +2393,36 @@ impl RubyHost {
     /// Register a user class.
     pub fn add_class(&mut self, name: String, def: ClassDef) {
         self.classes.insert(name, def);
+    }
+    /// Register a runtime attribute accessor `field` on `class` (a reader and/or
+    /// a writer), checked natively in dispatch as an `@field` get/set.
+    pub fn add_attr(&mut self, class: &str, field: &str, reader: bool, writer: bool) {
+        let e = self
+            .attr_accessors
+            .entry(class.to_string())
+            .or_default()
+            .entry(field.to_string())
+            .or_insert((false, false));
+        e.0 |= reader;
+        e.1 |= writer;
+    }
+    /// If `method` is a runtime attribute accessor on `class` or an ancestor,
+    /// return `(field, is_writer)`; a trailing `=` selects the writer.
+    pub fn attr_access(&self, class: &str, method: &str) -> Option<(String, bool)> {
+        let (field, writer) = match method.strip_suffix('=') {
+            Some(f) => (f, true),
+            None => (method, false),
+        };
+        let mut cur = Some(class.to_string());
+        while let Some(c) = cur {
+            if let Some((r, w)) = self.attr_accessors.get(&c).and_then(|m| m.get(field)) {
+                if (writer && *w) || (!writer && *r) {
+                    return Some((field.to_string(), writer));
+                }
+            }
+            cur = self.classes.get(&c).and_then(|d| d.superclass.clone());
+        }
+        None
     }
     /// Runtime `Class#include`/`prepend`/`extend`: append `module` to the class's
     /// mixin list (deduped), creating the ClassDef if needed. `kind` is

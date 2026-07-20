@@ -2054,3 +2054,17 @@ class Boxed
 end
 Boxed.prepend(Wrap)
 p Boxed.new.val
+#==#
+# ── runtime attr_accessor (class_eval / send / direct) ──
+class Dyn1; end
+Dyn1.class_eval { attr_accessor :name }
+d = Dyn1.new
+d.name = "set at runtime"
+p d.name
+#==#
+class Dyn2; end
+Dyn2.send(:attr_reader, :a)
+Dyn2.send(:attr_writer, :a)
+d2 = Dyn2.new
+d2.a = 7
+p d2.a
