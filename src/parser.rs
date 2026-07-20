@@ -16,6 +16,15 @@ use crate::lexer::{lex, Tok, Token};
 /// the block body (unpacking each `(a, b)` group from its temp parameter).
 type BlockParams = (Vec<String>, Option<usize>, Vec<Expr>);
 
+/// Synthetic local names the `...` forwarding sugar binds on both sides: a
+/// `def m(...)` captures the caller's args into these, and a nested `m(...)`
+/// call spreads them straight back out (`*rest`, `**kw`, `&blk`). The reserved
+/// `__fwd_*__` names follow the parser's existing sentinel convention
+/// (`__blkx__`, `__symargs__`) — chosen not to collide with real user locals.
+const FWD_REST: &str = "__fwd_rest__";
+const FWD_KW: &str = "__fwd_kw__";
+const FWD_BLK: &str = "__fwd_blk__";
+
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
@@ -733,6 +742,26 @@ impl Parser {
         kwargs: &mut Vec<(Expr, Expr)>,
         kwsplats: &mut Vec<Expr>,
     ) -> Result<(), String> {
+        // `m(...)` — forward the args a `def m(...)` captured: spread its
+        // positional rest, its keyword rest, and re-pass its block. Recognized
+        // only when `...` is the final argument (next token `)`); `m(...5)`
+        // stays a beginless range.
+        if self.is_op("...")
+            && matches!(&self.toks[self.pos + 1].kind, Tok::Op(o) if o == ")")
+        {
+            self.advance(); // ...
+            args.push(Expr::Splat(Box::new(Expr::Var(VarKind::Local, FWD_REST.into()))));
+            kwsplats.push(Expr::Var(VarKind::Local, FWD_KW.into()));
+            // Re-pass the captured block by value: forwarding no block (`__fwd_blk__`
+            // is nil) must stay no block, so `block_given?`/`&blk` in the callee are
+            // faithful — a wrapper proc would always read as a block present.
+            *amp_block = Some(Block {
+                params: vec![],
+                splat: None,
+                body: vec![Expr::BlockPass(Box::new(Expr::Var(VarKind::Local, FWD_BLK.into()))).into()],
+            });
+            return Ok(());
+        }
         // `**hash` — spread a hash as keyword arguments.
         if self.is_op("**") {
             self.advance();
@@ -787,19 +816,14 @@ impl Parser {
                 });
                 return Ok(());
             }
-            // `&expr` — block-pass any callable (Proc / Method / to_proc-able):
-            // `{ |__blkx__| (expr).call(__blkx__) }`.
+            // `&expr` — block-pass any callable by value (Proc / Method / SymProc,
+            // or nil for no block). Passed straight through as the block operand so
+            // multi-value yields reach it intact and `&nil` means no block.
             let e = self.arg()?;
-            let call = Expr::Call {
-                recv: Some(Box::new(e)),
-                name: "call".into(),
-                args: vec![Expr::Var(VarKind::Local, "__blkx__".into())],
-                block: None,
-            };
             *amp_block = Some(Block {
-                params: vec!["__blkx__".into()],
+                params: vec![],
                 splat: None,
-                body: vec![call.into()],
+                body: vec![Expr::BlockPass(Box::new(e)).into()],
             });
             return Ok(());
         }
@@ -1801,23 +1825,23 @@ impl Parser {
             // Multi-line param lists: newlines inside the paren are insignificant.
             self.skip_nl();
             if !self.is_op(")") {
-                params.push(self.param()?);
+                self.push_param(&mut params)?;
                 self.skip_nl();
                 while self.eat_op(",") {
                     self.skip_nl();
                     if self.is_op(")") {
                         break;
                     }
-                    params.push(self.param()?);
+                    self.push_param(&mut params)?;
                     self.skip_nl();
                 }
             }
             self.expect_op(")")?;
         } else if !matches!(self.peek(), Tok::Newline | Tok::Semicolon) && !self.is_op("=") {
             // paren-less params (but `def name = expr` is an endless def, not a param)
-            params.push(self.param()?);
+            self.push_param(&mut params)?;
             while self.eat_op(",") {
-                params.push(self.param()?);
+                self.push_param(&mut params)?;
             }
         }
         // Endless method definition (Ruby 3+): `def name(params) = expression`.
@@ -1860,6 +1884,41 @@ impl Parser {
             }
             .into()])
         }
+    }
+
+    /// Parse one parameter into `params`. Ruby 3's `...` forwarding parameter
+    /// (`def m(...)`) expands to the three anonymous collectors a matching
+    /// `m(...)` call forwards: a positional rest, a keyword rest, and a block.
+    fn push_param(&mut self, params: &mut Vec<Param>) -> Result<(), String> {
+        if self.eat_op("...") {
+            params.push(Param {
+                name: FWD_REST.into(),
+                default: None,
+                splat: true,
+                keyword: false,
+                kwsplat: false,
+                block: false,
+            });
+            params.push(Param {
+                name: FWD_KW.into(),
+                default: None,
+                splat: false,
+                keyword: false,
+                kwsplat: true,
+                block: false,
+            });
+            params.push(Param {
+                name: FWD_BLK.into(),
+                default: None,
+                splat: false,
+                keyword: false,
+                kwsplat: false,
+                block: true,
+            });
+            return Ok(());
+        }
+        params.push(self.param()?);
+        Ok(())
     }
 
     fn param(&mut self) -> Result<Param, String> {

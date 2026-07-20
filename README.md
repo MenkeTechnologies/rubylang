@@ -148,10 +148,12 @@ Implemented and checked against the reference `ruby`:
   statement-modifier `rescue`, `raise` with a message or an exception class,
   typed `ZeroDivisionError` / `NoMethodError` / `ArgumentError` and custom
   classes.
-- **Parameters & assignment** — splat parameters (`def f(a, *rest)`), `&:sym`
-  block-pass (`map(&:upcase)`), parallel assignment (`a, b = 1, 2`, array
-  destructuring, swap), block-parameter destructuring (`map { |(a, b), i| … }`,
-  nested and splat groups, `->((a, b)) { }`), default arguments.
+- **Parameters & assignment** — splat parameters (`def f(a, *rest)`), block-pass
+  by value (`&:sym`, `&proc`, `&method(:m)`, `&nil` = no block) and Ruby 3
+  argument forwarding (`def m(...)` / `m(...)`), parallel assignment
+  (`a, b = 1, 2`, array destructuring, swap), block-parameter destructuring
+  (`map { |(a, b), i| … }`, nested and splat groups, `->((a, b)) { }`), default
+  arguments.
 - **String interpolation** — double-quoted `#{}` interpolation.
 - **Standard library** — `require`-able builtin libs including `json`, `set`,
   `date`/`time`, `securerandom`, `digest`, `base64`, `ostruct`, `socket`

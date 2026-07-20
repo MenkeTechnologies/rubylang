@@ -1721,3 +1721,75 @@ p "banana".gsub(/a(?=n)/, "A")
 p "abcabc".match?(/(abc)\1/)
 #==#
 p "noon".gsub(/(\w)(\w)\2\1/, "P")
+#==#
+# ── Ruby 3 argument forwarding `...` (def + call) ──
+def fwd_g(a, b:, &blk); r = a + b; blk ? blk.call(r) : r; end
+def fwd_h(...); fwd_g(...); end
+p fwd_h(1, b: 2)
+#==#
+def fwd_g2(a, b:, &blk); r = a + b; blk ? blk.call(r) : r; end
+def fwd_h2(...); fwd_g2(...); end
+p fwd_h2(1, b: 2) { |x| x * 10 }
+#==#
+def fwd_lead(first, ...); [first, fwd_sum(...)]; end
+def fwd_sum(*a, **k); a.sum + k.values.sum; end
+p fwd_lead(0, 1, 2, x: 3)
+#==#
+# ── String#encoding (UTF-8 only) ──
+p "café".encoding.name
+#==#
+p "abc".encoding.to_s
+#==#
+p "x".encoding.inspect
+#==#
+# ── respond_to_missing? default via super ──
+class RtmD
+  def respond_to_missing?(n, priv = false); n.to_s.start_with?("q_") || super; end
+end
+d = RtmD.new
+p [d.respond_to?(:q_x), d.respond_to?(:nope)]
+#==#
+# ── bound Kernel method (method(:name) over Kernel private methods) ──
+method(:puts).call("bound-puts")
+#==#
+m = method(:format); p m.call("%05.2f", 3.5)
+#==#
+# ── Enumerable#cycle without a block (endless Enumerator) ──
+p [1, 2, 3].cycle.first(7)
+#==#
+p [1, 2].cycle.take(5)
+#==#
+c = %w[a b].cycle; p [c.next, c.next, c.next]
+#==#
+p [1, 2, 3].cycle.lazy.map { |x| x + 10 }.first(4)
+#==#
+p [].cycle.first(3)
+#==#
+# ── StringIO reader methods (readlines / each_line / getc) ──
+require "stringio"
+io = StringIO.new("a\nb\nc\n"); p io.readlines
+#==#
+require "stringio"
+io = StringIO.new("a\nb\nc\n"); p io.each_line.to_a
+#==#
+require "stringio"
+io = StringIO.new("héllo"); p [io.getc, io.getc]
+#==#
+# ── block passed by value: &blk forwarding keeps block_given? faithful ──
+def bpv_outer(&blk); bpv_inner(&blk); end
+def bpv_inner; block_given? ? yield(5) : -1; end
+p [bpv_outer { |x| x + 1 }, bpv_outer]
+#==#
+def bpv_map(&b); [1, 2].map(&b); end
+p bpv_map { |x| x * 2 }
+#==#
+def bpv_map2(&b); [1, 2].map(&b); end
+p bpv_map2
+#==#
+def bpv_pairs(&b); { a: 1, b: 2 }.map(&b); end
+p bpv_pairs { |k, v| "#{k}=#{v}" }
+#==#
+p [1, 2, 3].map(&nil)
+#==#
+sq = ->(x) { x * x }
+p [1, 2, 3].map(&sq)

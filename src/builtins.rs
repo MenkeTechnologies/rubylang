@@ -177,12 +177,24 @@ fn b_call_arr(vm: &mut VM, _: u8) -> Value {
 }
 
 /// Self call with a spread argument array and a block: `[name, args, proc]`.
+/// The block operand of a `*_BLK` call op: a nil value (`&nil`, or a forwarded
+/// block that was never given) means "no block", not a block that happens to be
+/// nil — so `block_given?` stays false and `&blk` capture yields nil. A real
+/// block from `MKPROC` is always a Proc, never `Undef`, so this only ever
+/// normalizes the block-pass-by-value path (`&expr` / `...` forwarding).
+fn block_operand(v: Value) -> Option<Value> {
+    match v {
+        Value::Undef => None,
+        other => Some(other),
+    }
+}
+
 fn b_call_arr_blk(vm: &mut VM, _: u8) -> Value {
-    let block = vm.pop();
+    let block = block_operand(vm.pop());
     let arr = vm.pop();
     let name = name_of(&vm.pop());
     let args = with_host(|h| h.as_array(&arr).unwrap_or_default());
-    match dispatch_call(&name, &args, Some(block)) {
+    match dispatch_call(&name, &args, block) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
@@ -191,12 +203,12 @@ fn b_call_arr_blk(vm: &mut VM, _: u8) -> Value {
 /// Method call with a spread argument array and a block:
 /// `[recv, name, args, proc]`.
 fn b_call_method_arr_blk(vm: &mut VM, _: u8) -> Value {
-    let block = vm.pop();
+    let block = block_operand(vm.pop());
     let arr = vm.pop();
     let name = name_of(&vm.pop());
     let recv = vm.pop();
     let args = with_host(|h| h.as_array(&arr).unwrap_or_default());
-    match dispatch(&recv, &name, &args, Some(block)) {
+    match dispatch(&recv, &name, &args, block) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
@@ -546,7 +558,7 @@ fn b_call(vm: &mut VM, argc: u8) -> Value {
 }
 fn b_call_blk(vm: &mut VM, argc: u8) -> Value {
     let mut vals = pop_n(vm, argc as usize);
-    let block = vals.pop();
+    let block = block_operand(vals.pop().unwrap_or(Value::Undef));
     let name = name_of(&vals.remove(0));
     match dispatch_call(&name, &vals, block) {
         Ok(v) => propagate(vm, v),
@@ -564,7 +576,7 @@ fn b_call_method(vm: &mut VM, argc: u8) -> Value {
 }
 fn b_call_method_blk(vm: &mut VM, argc: u8) -> Value {
     let mut vals = pop_n(vm, argc as usize);
-    let block = vals.pop();
+    let block = block_operand(vals.pop().unwrap_or(Value::Undef));
     let recv = vals.remove(0);
     let name = name_of(&vals.remove(0));
     match dispatch(&recv, &name, &vals, block) {
@@ -2290,6 +2302,16 @@ fn dispatch_object(
     if cls == "StringIO" {
         return stringio_method(recv, name, args, block);
     }
+    // Encoding object (from `String#encoding`): `name` reports "UTF-8" (the only
+    // encoding we carry). `to_s`/`inspect` are handled by the host formatters,
+    // which the universal dispatch reaches before this arm.
+    if cls == "Encoding" && name == "name" {
+        return Ok(with_host(|h| {
+            let v = h.ivar_of(recv, "name");
+            let s = h.to_s(&v);
+            h.new_string(s)
+        }));
+    }
     // Random instance: its own reproducible PRNG stream (state in the `state` ivar).
     if cls == "Random" {
         if let Some(r) = random_method(recv, name, args)? {
@@ -3632,6 +3654,15 @@ fn dispatch_string(
         // shims so `force_encoding`/`encode` chains don't break.
         "force_encoding" => Ok(recv.clone()),
         "encode" => Ok(new_str(s.clone())),
+        // We only carry UTF-8 Strings, so `encoding` always names UTF-8. The
+        // returned Encoding object answers `name`/`to_s`/`inspect` (dispatched in
+        // `dispatch_object` for the `Encoding` class).
+        "encoding" => {
+            let enc = with_host(|h| h.new_object("Encoding"));
+            let name = new_str("UTF-8".to_string());
+            with_host(|h| h.set_ivar_of(&enc, "name", name));
+            Ok(enc)
+        }
         "lines" => Ok(new_arr(split_lines(&s).into_iter().map(new_str).collect())),
         "each_line" => {
             // With a block, iterate the lines and return self; without one,
@@ -5940,8 +5971,8 @@ fn dispatch_array(
                 // Block-less `cycle(n)` is a finite Enumerator over the elements
                 // repeated `n` times (`[1,2].cycle(3).to_a == [1,2,1,2,1,2]`).
                 // Block-less endless `cycle` (no count) is an infinite Enumerator
-                // that cannot be eagerly materialized — no generator source here,
-                // so it stays nil (external iteration over it is unsupported).
+                // backed by a native cycling generator, so `first(n)`/`take(n)`
+                // draw as many repeats as needed.
                 return match args.first() {
                     Some(n) => {
                         let times = as_i(n).max(0) as usize;
@@ -5951,7 +5982,7 @@ fn dispatch_array(
                         }
                         Ok(with_host(|h| h.new_enumerator(out, "each")))
                     }
-                    None => Ok(Value::Undef),
+                    None => Ok(with_host(|h| h.new_cycle_enumerator(arr.clone()))),
                 };
             };
             match args.first() {
@@ -8215,7 +8246,12 @@ fn dispatch_generator(
         "next" | "peek" if args.is_empty() && block.is_none() => {
             let need = with_host(|h| h.generator_unmaterialized(recv));
             if need {
-                let buf = drive_generator(gblock, usize::MAX)?;
+                // A `cycle` generator is infinite: materialize just one cycle
+                // (its element count) and let `generator_next` wrap over it. Any
+                // other generator drives to completion (an infinite one hangs
+                // here, exactly as in MRI without fibers).
+                let limit = with_host(|h| h.cycle_proc_len(gblock)).unwrap_or(usize::MAX);
+                let buf = drive_generator(gblock, limit)?;
                 with_host(|h| h.set_generator_materialized(recv, buf));
             }
             match with_host(|h| h.generator_next(recv, name == "next")) {
@@ -9668,6 +9704,23 @@ fn dispatch_proc(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
 /// Methods on a bound `Method` object (`obj.method(:m)`): `call`/`[]`/`()` route
 /// back through dispatch on the captured receiver; `arity`, `name`, `to_proc`,
 /// `receiver` expose its parts.
+/// Invoke a bound `Method`'s target on its captured receiver, falling back to
+/// the Kernel private methods (`puts`, `print`, `p`, `require`, `raise`, …) when
+/// the receiver's class has no such instance method. MRI reaches those through
+/// Kernel in every object's ancestry, so `method(:puts).call(...)` works on the
+/// top-level `main` object even though `puts` is not a user-defined method.
+pub(crate) fn call_bound(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    match dispatch(recv, name, args, block.clone()) {
+        Err(e) if e.starts_with("undefined method") => kernel(name, args, block).map_err(|_| e),
+        other => other,
+    }
+}
+
 fn dispatch_method(
     recv: &Value,
     name: &str,
@@ -9679,7 +9732,7 @@ fn dispatch_method(
         None => return Err(no_method_error(recv, name)),
     };
     match name {
-        "call" | "()" | "[]" | "yield" | "===" => dispatch(&mrecv, &mname, args, block),
+        "call" | "()" | "[]" | "yield" | "===" => call_bound(&mrecv, &mname, args, block),
         "arity" => Ok(Value::Int(with_host(|h| h.method_arity(&mrecv, &mname)))),
         "name" => Ok(with_host(|h| h.new_symbol(&mname))),
         "receiver" => Ok(mrecv),
@@ -12595,6 +12648,15 @@ fn stringio_set_pos(recv: &Value, pos: usize) {
     with_host(|h| h.set_ivar_of(recv, "pos", Value::Int(pos as i64)));
 }
 
+/// The lines remaining from the read cursor to EOF, each keeping its trailing
+/// `\n` (MRI line semantics). Does not move the cursor — callers that consume
+/// (`readlines`) advance it themselves.
+fn stringio_rest_lines(recv: &Value) -> Vec<Value> {
+    let (buf, pos) = stringio_state(recv);
+    let rest = String::from_utf8_lossy(&buf.as_bytes()[pos.min(buf.len())..]).into_owned();
+    split_lines(&rest).into_iter().map(new_str).collect()
+}
+
 fn stringio_method(
     recv: &Value,
     name: &str,
@@ -12681,18 +12743,40 @@ fn stringio_method(
             stringio_set_pos(recv, end);
             Ok(new_str(out))
         }
-        // `each_line` / `each` — yield each line; returns self.
+        // `each_line` / `each` — with a block, yield each remaining line (through
+        // its `\n`) and return self; without one, an Enumerator over those lines.
         "each_line" | "each" => {
-            if let Some(b) = &block {
-                loop {
-                    let line = stringio_method(recv, "gets", &[], None)?;
-                    if matches!(line, Value::Undef) {
-                        break;
-                    }
-                    call_proc(b, &[line])?;
+            let Some(b) = &block else {
+                return Ok(with_host(|h| h.new_enumerator(stringio_rest_lines(recv), "each")));
+            };
+            loop {
+                let line = stringio_method(recv, "gets", &[], None)?;
+                if matches!(line, Value::Undef) {
+                    break;
                 }
+                call_proc(b, &[line])?;
             }
             Ok(recv.clone())
+        }
+        // `readlines` / `to_a` — all remaining lines as an Array; consumes to EOF.
+        "readlines" | "to_a" => {
+            let lines = stringio_rest_lines(recv);
+            let (buf, _) = stringio_state(recv);
+            stringio_set_pos(recv, buf.len());
+            Ok(new_arr(lines))
+        }
+        // `getc` — the next single character, advancing the cursor; nil at EOF.
+        "getc" => {
+            let (buf, pos) = stringio_state(recv);
+            let bytes = buf.as_bytes();
+            let rest = String::from_utf8_lossy(&bytes[pos.min(bytes.len())..]);
+            match rest.chars().next() {
+                None => Ok(Value::Undef),
+                Some(ch) => {
+                    stringio_set_pos(recv, pos + ch.len_utf8());
+                    Ok(new_str(ch.to_string()))
+                }
+            }
         }
         "rewind" => {
             stringio_set_pos(recv, 0);

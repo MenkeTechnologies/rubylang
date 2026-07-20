@@ -419,6 +419,7 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     ("valid_encoding?", "String", "always true (only valid UTF-8 is carried)", "\"abc\".valid_encoding?   # => true"),
     ("force_encoding", "String", "no-op shim returning self", "\"abc\".force_encoding(\"UTF-8\")   # => \"abc\""),
     ("encode", "String", "no-op shim returning a copy", "\"abc\".encode(\"UTF-8\")   # => \"abc\""),
+    ("encoding", "String", "the Encoding object (always UTF-8)", "\"abc\".encoding.name   # => \"UTF-8\""),
     ("lines", "String", "array of lines (keeping newlines)", "\"a\\nb\\n\".lines   # => [\"a\\n\", \"b\\n\"]"),
     ("each_line", "String", "with block yield each line, return self; else Enumerator of lines", "\"a\\nb\\n\".each_line { |l| }   # => \"a\\nb\\n\""),
     ("center", "String", "center-pad to width using pad string (default space)", "\"hi\".center(6)   # => \"  hi  \""),

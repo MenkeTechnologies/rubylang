@@ -226,6 +226,10 @@ pub enum RObj {
     /// A native proc produced by `Symbol#to_proc` (`&:upcase`): calling it sends
     /// the named method to its first argument (`:upcase.to_proc.call(s)` == `s.upcase`).
     SymProc(String),
+    /// A native generator body for a block-less endless `Enumerable#cycle`: driven
+    /// with a yielder, it repeats the captured elements forever. The yielder's
+    /// limit bounds it for `first(n)`/`take(n)` exactly like a `loop {}` generator.
+    CycleProc(Vec<Value>),
     /// A bound `Method` object (`obj.method(:name)`): the captured receiver plus
     /// the method name. `#call(*args)` routes back through dispatch on the stored
     /// receiver; `#to_proc` yields a callable that closes over both.
@@ -1493,6 +1497,13 @@ impl RubyHost {
             materialized: None,
         })
     }
+    /// A block-less endless `cycle` Enumerator: a `Generator` whose body is a
+    /// native `CycleProc` repeating `buf` forever (bounded by the consumer via
+    /// `first(n)`/`take(n)`).
+    pub fn new_cycle_enumerator(&mut self, buf: Vec<Value>) -> Value {
+        let block = self.alloc(RObj::CycleProc(buf));
+        self.new_generator(block)
+    }
     /// The driving block of a `Generator`, if `v` is one.
     pub fn generator_block(&self, v: &Value) -> Option<Value> {
         match self.obj(v) {
@@ -1533,15 +1544,37 @@ impl RubyHost {
             *materialized = Some((buf, 0));
         }
     }
-    /// External iteration over a materialized generator; `None` past the end.
+    /// The element count of a `CycleProc` generator body, or `None` if `block` is
+    /// not one. Lets the `next`/`peek` path materialize a single cycle instead of
+    /// hanging on the endless drive.
+    pub fn cycle_proc_len(&self, block: &Value) -> Option<usize> {
+        match self.obj(block) {
+            Some(RObj::CycleProc(buf)) => Some(buf.len()),
+            _ => None,
+        }
+    }
+    /// External iteration over a materialized generator; `None` past the end. A
+    /// `cycle` generator (its body is a `CycleProc`) wraps its cursor forever
+    /// rather than ending, so `e.next` round-robins the buffer.
     pub fn generator_next(&mut self, v: &Value, advance: bool) -> Option<Value> {
+        let is_cycle = match self.generator_block(v) {
+            Some(b) => matches!(self.obj(&b), Some(RObj::CycleProc(_))),
+            None => false,
+        };
         if let Some(RObj::Generator {
             materialized: Some((buf, cursor)),
             ..
         }) = self.obj_mut(v)
         {
-            if *cursor >= buf.len() {
+            if buf.is_empty() {
                 return None;
+            }
+            if *cursor >= buf.len() {
+                if is_cycle {
+                    *cursor = 0;
+                } else {
+                    return None;
+                }
             }
             let out = buf[*cursor].clone();
             if advance {
@@ -2097,7 +2130,7 @@ impl RubyHost {
     pub fn is_proc(&self, v: &Value) -> bool {
         matches!(
             self.obj(v),
-            Some(RObj::Proc { .. }) | Some(RObj::SymProc(_))
+            Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) | Some(RObj::CycleProc(_))
         )
     }
     pub fn has_method(&self, name: &str) -> bool {
@@ -3219,8 +3252,11 @@ impl RubyHost {
                 }
                 Some(RObj::FiddlePtr { addr, size, .. }) => fiddle_read_cstr_or_len(addr, size),
                 Some(RObj::Lazy { .. }) => "#<Enumerator::Lazy>".to_string(),
-                Some(RObj::Enumerator { buf, .. }) => {
-                    format!("#<Enumerator: {}>", self.inspect_array(&buf))
+                Some(RObj::Enumerator { buf, method, .. }) => {
+                    // MRI shows `#<Enumerator: <receiver>:<method>>`; we keep the
+                    // materialized values in place of the receiver (they match for
+                    // the common Array case) and append the producing method.
+                    format!("#<Enumerator: {}:{method}>", self.inspect_array(&buf))
                 }
                 Some(RObj::Generator { .. }) => {
                     "#<Enumerator: #<Enumerator::Generator>:each>".to_string()
@@ -3250,7 +3286,9 @@ impl RubyHost {
                 }
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash { map, .. }) => self.inspect_hash(&map),
-                Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) => "#<Proc>".to_string(),
+                Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) | Some(RObj::CycleProc(_)) => {
+                    "#<Proc>".to_string()
+                }
                 Some(RObj::Method { recv, name }) => {
                     format!("#<Method: {}#{name}>", self.class_of(&recv))
                 }
@@ -3264,6 +3302,13 @@ impl RubyHost {
                     // A struct prints `#<struct Name a=1, b=2>`; an exception
                     // object prints its message; other objects show their class.
                     // OpenStruct#to_s aliases inspect (`#<OpenStruct a=1, b=2>`).
+                    // An Encoding object stringifies to its name (`"UTF-8"`).
+                    if class == "Encoding" {
+                        return match ivars.get("name") {
+                            Some(n) => self.to_s(&n.clone()),
+                            None => "#<Encoding>".to_string(),
+                        };
+                    }
                     if class == "OpenStruct" {
                         let body: Vec<String> = ivars
                             .iter()
@@ -3345,6 +3390,14 @@ impl RubyHost {
                     }
                     out.push('>');
                     out
+                }
+                // `Encoding#inspect`: `#<Encoding:UTF-8>` (we only carry UTF-8).
+                Some(RObj::Object { class, ivars }) if class == "Encoding" => {
+                    let name = ivars
+                        .get("name")
+                        .map(|n| self.to_s(&n.clone()))
+                        .unwrap_or_default();
+                    format!("#<Encoding:{name}>")
                 }
                 // `OpenStruct#inspect`: `#<OpenStruct a=1, b=2>` (ivars in order).
                 Some(RObj::Object { class, ivars }) if class == "OpenStruct" => {
@@ -3447,7 +3500,7 @@ impl RubyHost {
                 Some(RObj::Range { .. }) => "Range",
                 Some(RObj::FloatRange { .. }) => "Range",
                 Some(RObj::StrRange { .. }) => "Range",
-                Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) => "Proc",
+                Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) | Some(RObj::CycleProc(_)) => "Proc",
                 Some(RObj::Method { .. }) => "Method",
                 Some(RObj::Regexp { .. }) => "Regexp",
                 Some(RObj::MatchData { .. }) => "MatchData",
@@ -3896,6 +3949,19 @@ impl RubyHost {
                     // Set equality is order-independent membership equality.
                     (Some(RObj::Set(x)), Some(RObj::Set(y))) => {
                         x.len() == y.len() && x.keys().all(|k| y.contains_key(k))
+                    }
+                    // Two Encoding objects are equal when they name the same
+                    // encoding — MRI's encodings are shared singletons, so `==`
+                    // compares by identity; we carry a fresh object per call and
+                    // compare by name to the same effect.
+                    (
+                        Some(RObj::Object { class: ca, ivars: ia }),
+                        Some(RObj::Object { class: cb, ivars: ib }),
+                    ) if ca == "Encoding" && cb == "Encoding" => {
+                        match (ia.get("name"), ib.get("name")) {
+                            (Some(x), Some(y)) => self.eq_values(x, y),
+                            _ => false,
+                        }
                     }
                     // Two Ranges are equal when their endpoints and exclusivity
                     // match (integer, float, and string ranges each compare
@@ -4596,6 +4662,12 @@ pub fn call_super_blk(
                 }
             }
             return Ok(Value::Undef);
+        }
+        // `super` from an override of a base Object hook whose default is native,
+        // not a Ruby method. `Object#respond_to_missing?` defaults to false, so
+        // `name.start_with?("x") || super` in an override resolves cleanly.
+        if method == "respond_to_missing?" {
+            return Ok(Value::Bool(false));
         }
         return Err(format!("super: no superclass method '{method}'"));
     };
@@ -5967,9 +6039,30 @@ pub fn call_proc_self(
             is_lambda,
         }) => (template, scope, kind, is_lambda),
         // A bound `Method` used as a block/proc (`map(&obj.method(:m))`): re-dispatch
-        // the stored method on its captured receiver.
+        // the stored method on its captured receiver, with the Kernel fallback so a
+        // bound Kernel method (`method(:puts)`) works off the `main` object too.
         Some(RObj::Method { recv, name }) => {
-            return crate::builtins::dispatch(&recv, &name, args, None);
+            return crate::builtins::call_bound(&recv, &name, args, None);
+        }
+        // The native `cycle` generator body: driven with a yielder (`args[0]`),
+        // it pushes the captured elements round and round. The yielder returns a
+        // break signal once its limit is hit (`first(n)`/`take(n)`), which unwinds
+        // this loop; an empty buffer yields nothing (finite, empty).
+        Some(RObj::CycleProc(buf)) => {
+            if buf.is_empty() {
+                return Ok(Value::Undef);
+            }
+            let Some(yielder) = args.first().cloned() else {
+                return Err("no yielder is available".to_string());
+            };
+            loop {
+                for v in &buf {
+                    crate::builtins::dispatch(&yielder, "<<", std::slice::from_ref(v), None)?;
+                    if has_pending_signal() {
+                        return Ok(Value::Undef);
+                    }
+                }
+            }
         }
         // A `Symbol#to_proc` proc used as a block value: send the symbol's method
         // to the first argument.

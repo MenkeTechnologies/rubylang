@@ -148,6 +148,14 @@ pub enum Expr {
     /// `recv[idx]` — sugar for `recv.[](idx)` but lowered directly.
     Index(Box<Expr>, Vec<Expr>),
 
+    /// A block passed by value (`&expr`, and the `...` forwarding block). Appears
+    /// ONLY as the sole body statement of a synthetic pass-through `Block`, where
+    /// `compile_call` compiles the inner expression as the call's block operand
+    /// directly — a Proc is used as-is, and nil means no block (unlike a wrapper
+    /// proc, so `block_given?` and `&blk` capture stay faithful). Never evaluated
+    /// as a standalone expression.
+    BlockPass(Box<Expr>),
+
     /// `def name(params) … end`. `singleton` is true for `def self.name` (a
     /// class method). `singleton_recv` carries the explicit receiver of
     /// `def obj.name` / `def Klass.name` — a per-object singleton method (or, when

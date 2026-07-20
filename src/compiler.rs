@@ -348,6 +348,12 @@ impl Compiler {
                 // A bare splat outside a call/array just yields its array.
                 self.compile_expr(b, e)?;
             }
+            Expr::BlockPass(_) => {
+                // A block-pass value (`&expr` / `...`) is only ever the body of a
+                // synthetic pass-through block that `compile_call` unwraps; it is
+                // never a standalone expression.
+                return Err("block-pass used outside call position".into());
+            }
             Expr::Lambda(block) => {
                 // A lambda is a Proc value: compile its body as a proc template.
                 // `MKLAMBDA` (vs `MKPROC`) flags it so `lambda?` returns `true`.
@@ -1120,10 +1126,29 @@ impl Compiler {
         args: &[Expr],
         block: &Option<Block>,
     ) -> Result<(), String> {
-        let proc_id = match block {
-            Some(bl) => Some(self.compile_proc(bl)?),
-            None => None,
+        // A pass-through block (`&expr` / `...` forwarding) carries its value
+        // expression rather than a proc body: emit that value as the block operand
+        // directly. `MkProc` builds a real Proc for an ordinary block literal.
+        let pass_expr = block.as_ref().and_then(block_pass_expr);
+        let proc_id = match (&pass_expr, block) {
+            (Some(_), _) => None,
+            (None, Some(bl)) => Some(self.compile_proc(bl)?),
+            (None, None) => None,
         };
+        // Emit the block operand for a `*_BLK` op: the forwarded value, or a Proc
+        // built from the block literal's id.
+        let emit_block = |s: &mut Self, b: &mut ChunkBuilder| -> Result<(), String> {
+            match (&pass_expr, proc_id) {
+                (Some(e), _) => s.compile_expr(b, e),
+                (None, Some(id)) => {
+                    b.emit(Op::LoadInt(id as i64), 0);
+                    b.emit(Op::CallBuiltin(ops::MKPROC, 1), 0);
+                    Ok(())
+                }
+                (None, None) => Ok(()),
+            }
+        };
+        let has_block = pass_expr.is_some() || proc_id.is_some();
         // A call with a splat argument builds its argument array at runtime and
         // uses the array-spreading call ops (with a block-carrying variant when a
         // block is also passed, e.g. `foo(*args, &blk)`).
@@ -1133,21 +1158,19 @@ impl Compiler {
             }
             self.kstr(b, name);
             self.compile_spread(b, args)?;
-            match (recv.is_some(), proc_id) {
-                (true, Some(id)) => {
-                    b.emit(Op::LoadInt(id as i64), 0);
-                    b.emit(Op::CallBuiltin(ops::MKPROC, 1), 0);
+            match (recv.is_some(), has_block) {
+                (true, true) => {
+                    emit_block(self, b)?;
                     b.emit(Op::CallBuiltin(ops::CALL_METHOD_ARR_BLK, 4), 0);
                 }
-                (true, None) => {
+                (true, false) => {
                     b.emit(Op::CallBuiltin(ops::CALL_METHOD_ARR, 3), 0);
                 }
-                (false, Some(id)) => {
-                    b.emit(Op::LoadInt(id as i64), 0);
-                    b.emit(Op::CallBuiltin(ops::MKPROC, 1), 0);
+                (false, true) => {
+                    emit_block(self, b)?;
                     b.emit(Op::CallBuiltin(ops::CALL_ARR_BLK, 3), 0);
                 }
-                (false, None) => {
+                (false, false) => {
                     b.emit(Op::CallBuiltin(ops::CALL_ARR, 2), 0);
                 }
             }
@@ -1160,18 +1183,14 @@ impl Compiler {
                 for a in args {
                     self.compile_expr(b, a)?;
                 }
-                match proc_id {
-                    Some(id) => {
-                        b.emit(Op::LoadInt(id as i64), 0);
-                        b.emit(Op::CallBuiltin(ops::MKPROC, 1), 0);
-                        b.emit(
-                            Op::CallBuiltin(ops::CALL_METHOD_BLK, argc(3 + args.len())?),
-                            0,
-                        );
-                    }
-                    None => {
-                        b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(2 + args.len())?), 0);
-                    }
+                if has_block {
+                    emit_block(self, b)?;
+                    b.emit(
+                        Op::CallBuiltin(ops::CALL_METHOD_BLK, argc(3 + args.len())?),
+                        0,
+                    );
+                } else {
+                    b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(2 + args.len())?), 0);
                 }
             }
             None => {
@@ -1179,15 +1198,11 @@ impl Compiler {
                 for a in args {
                     self.compile_expr(b, a)?;
                 }
-                match proc_id {
-                    Some(id) => {
-                        b.emit(Op::LoadInt(id as i64), 0);
-                        b.emit(Op::CallBuiltin(ops::MKPROC, 1), 0);
-                        b.emit(Op::CallBuiltin(ops::CALL_BLK, argc(2 + args.len())?), 0);
-                    }
-                    None => {
-                        b.emit(Op::CallBuiltin(ops::CALL, argc(1 + args.len())?), 0);
-                    }
+                if has_block {
+                    emit_block(self, b)?;
+                    b.emit(Op::CallBuiltin(ops::CALL_BLK, argc(2 + args.len())?), 0);
+                } else {
+                    b.emit(Op::CallBuiltin(ops::CALL, argc(1 + args.len())?), 0);
                 }
             }
         }
@@ -1614,6 +1629,19 @@ enum FlowKind {
 }
 
 /// The field name from an `attr_*` argument (`:sym` or `"str"`).
+/// If `block` is a synthetic pass-through (`&expr` / `...` forwarding) — no
+/// params and a single `BlockPass` body statement — return its inner value
+/// expression, which `compile_call` emits as the block operand directly.
+fn block_pass_expr(block: &Block) -> Option<&Expr> {
+    match block.body.as_slice() {
+        [stmt] => match &stmt.expr {
+            Expr::BlockPass(e) => Some(e),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn sym_name(e: &Expr) -> Option<String> {
     match e {
         Expr::Symbol(s) => Some(s.clone()),

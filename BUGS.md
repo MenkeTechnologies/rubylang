@@ -31,8 +31,11 @@ flags; a broad Enumerable/Hash surface (`partition`, `group_by`, `tally`, `zip`,
 capture, `&block` params + `block_given?`/`__method__`, block-parameter
 destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
 `->((a, b)) { }` lambda form), lambdas (`->(x) { }`,
-`.call`/`.()`/`[]`), keyword args + `**opts`, `Integer#step`, `?c` char literals,
-`String#center`/`tr`/`lines`/`delete`/`count`/`to_i(base)`, `Integer#to_s(base)`,
+`.call`/`.()`/`[]`), keyword args + `**opts`; block-pass-by-value (`&proc`,
+`&method(:m)`, and `&nil` = no block, so a forwarded block keeps `block_given?`
+faithful) and Ruby 3 argument forwarding (`def m(...)` / `m(...)`, including a
+leading positional before `...`); `Integer#step`, `?c` char literals,
+`String#center`/`tr`/`lines`/`delete`/`count`/`to_i(base)`/`encoding`, `Integer#to_s(base)`,
 `Array#dig`/`first(n)`/`last(n)`/`min(n)`/`max(n)`/`each_cons`/`sum { }`,
 `Hash#dig`.
 
@@ -177,13 +180,19 @@ Honest limitations of this surface:
   accurately: it consults the receiver's class method table (own methods,
   inherited methods, included/prepended-module methods, `define_method` blocks,
   `alias_method` aliases, and per-object singleton methods), then
-  `respond_to_missing?`, then Struct/OpenStruct attributes. For builtin receivers
+  `respond_to_missing?` (an override can call `super` for the default `false`, the
+  same as `Object#respond_to_missing?`), then Struct/OpenStruct attributes. For builtin receivers
   (`String`, `Integer`, `Array`, `Hash`, `Symbol`, …) `respond_to?` returns
   `true` for any name except the pattern-match deconstruction protocol, because
   there is no enumerable registry of the builtin method surface — so
   `"s".respond_to?(:no_such)` is `true` where MRI is `false`. Accurate builtin
   `respond_to?` needs a per-type method-name registry (deep substrate, not yet
   built).
+- **Refinements (`refine` / `using`) are not implemented.** `refine Klass do … end`
+  raises `undefined method 'refine'`. Scoped, lexically-activated monkey-patching
+  needs a whole activation-scope substrate (per-lexical-scope method-table
+  overlays) that does not exist yet; global reopening (`class String; … end`)
+  covers the common patch case in the meantime.
 
 ## Lexer
 
@@ -276,13 +285,15 @@ Honest limitations of this surface:
   `take(n)`, and lazy pipelines (`gen.lazy.map { ... }.first(n)`): the yielder
   raises a break signal once the requested count is reached, unwinding the loop
   (the same early-stop mechanism as endless-range `.lazy`). `Array#cycle(n)`
-  (block-less) returns a finite Enumerator over the elements repeated `n` times.
-  Limits: external iteration (`next`/`peek`) materializes the block to completion
-  on first use, so it works only for *finite* generators — an infinite
-  generator's `.next` still runs forever (routing it through a `Fiber` is a
-  planned follow-on, now that the Fiber engine exists — see below); and
-  block-less endless `cycle` (no count) stays `nil` (it would need an infinite
-  external-iteration enumerator).
+  (block-less) returns a finite Enumerator over the elements repeated `n` times;
+  block-less endless `cycle` (no count) returns an infinite Enumerator backed by a
+  native cycling generator, so `first(n)`/`take(n)`/`.lazy` draw as many repeats as
+  needed and `next`/`peek` round-robin the elements forever (materializing one
+  cycle, then wrapping). Limits: external iteration (`next`/`peek`) on any *other*
+  infinite generator (`loop { y << ... }`) materializes the block to completion on
+  first use, so it works only for *finite* generators — that block's `.next` still
+  runs forever (routing it through a `Fiber` is a planned follow-on, now that the
+  Fiber engine exists — see below).
 - **Fiber (stackful coroutines).** `Fiber.new { |first| ... }`, `#resume(*args)`,
   `Fiber.yield(v)`, and `#alive?` are implemented on `corosensei` same-thread
   stackful coroutines: a fiber freezes its entire native stack — including the
