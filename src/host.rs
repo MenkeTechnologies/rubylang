@@ -5024,6 +5024,27 @@ pub fn fiddle_read_bytes(addr: u64, len: usize) -> String {
     }
 }
 
+/// Read one raw byte at `addr` (`Fiddle::Pointer#[i]`), unmangled — the `String`
+/// read path lossily re-encodes non-UTF-8 bytes, so a direct byte read is needed.
+pub fn fiddle_read_byte(addr: u64) -> u8 {
+    if addr == 0 {
+        return 0;
+    }
+    unsafe { *(addr as *const u8) }
+}
+
+/// Write `bytes` into the memory at `addr` (`Fiddle::Pointer#[]=`). The caller
+/// clamps the length to the pointer's own buffer size, so this never writes past
+/// an owned `malloc` allocation. A null address or empty slice is a no-op.
+pub fn fiddle_write_bytes(addr: u64, bytes: &[u8]) {
+    if addr == 0 || bytes.is_empty() {
+        return;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len());
+    }
+}
+
 /// The default `#to_s` reading used by host `to_s`: a known-size pointer reads
 /// that many bytes, else it reads up to the first NUL. Used so `puts ptr` /
 /// interpolation match `Fiddle::Pointer#to_s`.

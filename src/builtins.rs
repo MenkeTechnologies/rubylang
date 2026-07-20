@@ -7586,10 +7586,40 @@ fn dispatch_fiddle_pointer(recv: &Value, name: &str, args: &[Value]) -> Result<V
                     as_i(l).max(0) as usize,
                 ))),
                 None => {
-                    let b = crate::host::fiddle_read_bytes(addr.wrapping_add(i), 1);
-                    Ok(Value::Int(b.bytes().next().unwrap_or(0) as i64))
+                    // MRI returns a signed C `char`, and the byte must be read raw
+                    // (the String path lossily re-encodes non-ASCII bytes).
+                    let b = crate::host::fiddle_read_byte(addr.wrapping_add(i));
+                    Ok(Value::Int(b as i8 as i64))
                 }
             }
+        }
+        // `ptr[i] = int` writes one byte; `ptr[i] = str` copies the string's
+        // bytes; `ptr[i, len] = str` copies `len` bytes. Writes are clamped to the
+        // pointer's own buffer size so an owned `malloc` is never overrun.
+        "[]=" => {
+            let i = args.first().map(as_i).unwrap_or(0).max(0) as u64;
+            let base = addr.wrapping_add(i);
+            // Bytes still available in the buffer from offset `i` (unbounded when
+            // the size is unknown, e.g. a pointer returned from C).
+            let avail = if size > 0 {
+                (size as u64).saturating_sub(i) as usize
+            } else {
+                usize::MAX
+            };
+            let value = args.last().unwrap();
+            let bytes: Vec<u8> = match value {
+                Value::Int(n) if args.len() == 2 => vec![*n as u8],
+                _ => with_host(|h| h.as_str(value)).unwrap_or_default().into_bytes(),
+            };
+            // With an explicit length (`ptr[i, len] = …`), write exactly that many.
+            let want = if args.len() >= 3 {
+                as_i(&args[1]).max(0) as usize
+            } else {
+                bytes.len()
+            };
+            let n = want.min(bytes.len()).min(avail);
+            crate::host::fiddle_write_bytes(base, &bytes[..n]);
+            Ok(value.clone())
         }
         "inspect" => Ok(new_str(with_host(|h| h.inspect(recv)))),
         _ => Err(no_method_error(recv, name)),
