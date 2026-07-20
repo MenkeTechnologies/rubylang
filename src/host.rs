@@ -247,6 +247,9 @@ pub enum RObj {
     /// group) plus the text before and after the whole match.
     MatchData {
         groups: Vec<Option<String>>,
+        /// `(name, group_index)` for each named capture `(?<name>…)`, so
+        /// `MatchData#[:name]` / `#["name"]` resolves to the right group.
+        names: Vec<(String, usize)>,
         pre: String,
         post: String,
     },
@@ -1607,13 +1610,19 @@ impl RubyHost {
             Err(e) => Err(format!("invalid regex /{source}/: {e}")),
         }
     }
-    /// The `(groups, pre, post)` of a `MatchData` value, if `v` is one.
+    /// The `(groups, names, pre, post)` of a `MatchData` value, if `v` is one.
     #[allow(clippy::type_complexity)]
-    pub fn as_matchdata(&self, v: &Value) -> Option<(Vec<Option<String>>, String, String)> {
+    pub fn as_matchdata(
+        &self,
+        v: &Value,
+    ) -> Option<(Vec<Option<String>>, Vec<(String, usize)>, String, String)> {
         match self.obj(v) {
-            Some(RObj::MatchData { groups, pre, post }) => {
-                Some((groups.clone(), pre.clone(), post.clone()))
-            }
+            Some(RObj::MatchData {
+                groups,
+                names,
+                pre,
+                post,
+            }) => Some((groups.clone(), names.clone(), pre.clone(), post.clone())),
             _ => None,
         }
     }
@@ -1629,10 +1638,16 @@ impl RubyHost {
     pub fn new_matchdata(
         &mut self,
         groups: Vec<Option<String>>,
+        names: Vec<(String, usize)>,
         pre: String,
         post: String,
     ) -> Value {
-        self.alloc(RObj::MatchData { groups, pre, post })
+        self.alloc(RObj::MatchData {
+            groups,
+            names,
+            pre,
+            post,
+        })
     }
 
     /// Create a proc capturing the currently-active scope (shared by `Rc`).
@@ -5390,13 +5405,13 @@ pub fn call_proc_self(
     args: &[Value],
     self_override: Option<&Value>,
 ) -> Result<Value, String> {
-    let (template, scope, kind) = match with_host(|h| h.obj(proc_val).cloned()) {
+    let (template, scope, kind, is_lambda) = match with_host(|h| h.obj(proc_val).cloned()) {
         Some(RObj::Proc {
             template,
             scope,
             kind,
-            ..
-        }) => (template, scope, kind),
+            is_lambda,
+        }) => (template, scope, kind, is_lambda),
         // A bound `Method` used as a block/proc (`map(&obj.method(:m))`): re-dispatch
         // the stored method on its captured receiver.
         Some(RObj::Method { recv, name }) => {
@@ -5531,6 +5546,10 @@ pub fn call_proc_self(
     let sig = with_host(|h| h.signal.take());
     match sig {
         Some(Signal::Next(v)) => Ok(v),
+        // In a lambda, `return` and `break` are local — they end the lambda and
+        // become its value (MRI lambda semantics). In a plain block/proc both
+        // keep propagating to the defining method / enclosing loop.
+        Some(Signal::Return(v) | Signal::Break(v)) if is_lambda => Ok(v),
         Some(other) => {
             with_host(|h| h.signal = Some(other));
             r

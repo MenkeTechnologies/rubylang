@@ -3977,14 +3977,24 @@ fn match_data(re: &fancy_regex::Regex, s: &str) -> Value {
     // fancy-regex's backtracking `captures` returns a Result; a match error is
     // treated as no match (MRI raises nothing here — it just fails to match).
     let caps = re.captures(s).ok().flatten();
-    set_match_globals(caps.as_ref().map(|c| (c, s)))
+    set_match_globals(caps.as_ref().map(|c| (c, s)), re)
+}
+
+/// `(name, group_index)` for each named capture `(?<name>…)` in `re`, in group
+/// order. fancy-regex reports the whole group-name table via `capture_names()`;
+/// index 0 (the whole match) and unnamed groups yield `None` and are skipped.
+fn capture_name_map(re: &fancy_regex::Regex) -> Vec<(String, usize)> {
+    re.capture_names()
+        .enumerate()
+        .filter_map(|(i, n)| n.map(|n| (n.to_string(), i)))
+        .collect()
 }
 
 /// Set the Ruby match globals from a set of captures (or clear them to `nil` on a
 /// failed match), and return the corresponding `MatchData` value (or `nil`).
 /// Ruby names these `$~` (the MatchData), `$&` (whole match), `` $` ``/`$'`
 /// (pre/post text), `$+` (last matched group), and `$1`..`$9` (numbered groups).
-fn set_match_globals(m: Option<(&fancy_regex::Captures, &str)>) -> Value {
+fn set_match_globals(m: Option<(&fancy_regex::Captures, &str)>, re: &fancy_regex::Regex) -> Value {
     with_host(|h| {
         // Clear the numbered globals first so a failed match leaves no stale
         // captures behind.
@@ -4008,7 +4018,7 @@ fn set_match_globals(m: Option<(&fancy_regex::Captures, &str)>) -> Value {
         };
         let pre = s[..whole.start()].to_string();
         let post = s[whole.end()..].to_string();
-        let md = h.new_matchdata(groups.clone(), pre.clone(), post.clone());
+        let md = h.new_matchdata(groups.clone(), capture_name_map(re), pre.clone(), post.clone());
         h.set_global("~", md.clone());
         let g0 = to_val(h, groups.first().unwrap_or(&None));
         h.set_global("&", g0);
@@ -4034,15 +4044,32 @@ fn set_match_globals(m: Option<(&fancy_regex::Captures, &str)>) -> Value {
 
 /// `MatchData#[n]`, `#pre_match`, `#post_match`, `#to_a`, `#captures`, `#to_s`.
 fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
-    let (groups, pre, post) = match with_host(|h| h.as_matchdata(recv)) {
+    let (groups, names, pre, post) = match with_host(|h| h.as_matchdata(recv)) {
         Some(t) => t,
         None => return Err("not a MatchData".to_string()),
     };
     let strv = |o: &Option<String>| o.clone().map(new_str).unwrap_or(Value::Undef);
     match name {
         "[]" => {
+            // A Symbol or String key selects a named capture (?<name>…); an
+            // integer key selects by group number (negative counts from the end).
+            if let Some(key) =
+                with_host(|h| h.as_symbol(&args[0]).or_else(|| h.as_str(&args[0])))
+            {
+                return match names.iter().find(|(n, _)| *n == key) {
+                    Some((_, idx)) => Ok(groups.get(*idx).map(strv).unwrap_or(Value::Undef)),
+                    None => Err(raise_exc(
+                        "IndexError",
+                        &format!("undefined group name reference: {key}"),
+                    )),
+                };
+            }
             let i = as_i(&args[0]);
-            Ok(groups.get(i as usize).map(strv).unwrap_or(Value::Undef))
+            let idx = if i < 0 { groups.len() as i64 + i } else { i };
+            if idx < 0 {
+                return Ok(Value::Undef);
+            }
+            Ok(groups.get(idx as usize).map(strv).unwrap_or(Value::Undef))
         }
         "pre_match" => Ok(new_str(pre)),
         "post_match" => Ok(new_str(post)),
@@ -4166,7 +4193,7 @@ fn regex_split(re: &fancy_regex::Regex, s: &str, limit: i64) -> Vec<String> {
 fn scan_each(re: &fancy_regex::Regex, s: &str, bl: &Value) -> Result<(), String> {
     let ngroups = re.captures_len();
     for caps in re.captures_iter(s).filter_map(Result::ok) {
-        set_match_globals(Some((&caps, s)));
+        set_match_globals(Some((&caps, s)), re);
         let arg = if ngroups <= 1 {
             new_str(caps.get(0).unwrap().as_str().to_string())
         } else {
@@ -4203,7 +4230,7 @@ fn regex_replace(
         out.push_str(&s[last..m.start()]);
         if let Some(bl) = block {
             // Expose `$~`/`$1`.. to the block for the current match.
-            set_match_globals(Some((&caps, s)));
+            set_match_globals(Some((&caps, s)), re);
             let r = call_proc(bl, &[new_str(m.as_str().to_string())])?;
             out.push_str(&with_host(|h| h.to_s(&r)));
         } else if let Some(map) = rest.first().and_then(|v| with_host(|h| h.as_hash(v))) {
