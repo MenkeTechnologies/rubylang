@@ -193,3 +193,127 @@ fn dap_breakpoint_inside_method_fires_and_steps() {
         Err(_) => panic!("DAP debugger timed out (no result within 15s)"),
     }
 }
+
+#[test]
+fn dap_function_breakpoint_stops_on_entry_and_evaluates() {
+    // A `setFunctionBreakpoints` on `greet` must stop at the method's first
+    // marker (reason `function breakpoint`) with `greet` on top of the stack, and
+    // `evaluate` of the bound parameter must resolve against the paused frame.
+    let dir = std::env::temp_dir();
+    let prog = dir.join(format!("rubylang_dap_fn_{}.rb", std::process::id()));
+    std::fs::write(
+        &prog,
+        "def greet(name)\n  msg = \"hi \" + name\n  puts msg\nend\ngreet(\"world\")\n",
+    )
+    .unwrap();
+    let prog_path = prog.to_str().unwrap().to_string();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ruby"))
+        .arg("--dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ruby --dap");
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+
+    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+    let handle = std::thread::spawn(move || {
+        let mut r = BufReader::new(stdout);
+        let mut seq = 1i64;
+        send(&mut stdin, &mut seq, "initialize", json!({}));
+        send(
+            &mut stdin,
+            &mut seq,
+            "setFunctionBreakpoints",
+            json!({ "breakpoints": [{ "name": "greet" }] }),
+        );
+        send(&mut stdin, &mut seq, "configurationDone", json!({}));
+        send(&mut stdin, &mut seq, "launch", json!({ "program": prog_path }));
+
+        let mut fn_bp_verified = false;
+        let mut stop_reason = String::new();
+        let mut top_name = String::new();
+        let mut eval_result = String::new();
+        let mut terminated = false;
+
+        while let Some(m) = read_msg(&mut r) {
+            let ty = m.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let ev = m.get("event").and_then(|t| t.as_str()).unwrap_or("");
+            let cmd = m.get("command").and_then(|t| t.as_str()).unwrap_or("");
+            if ty == "response" && cmd == "setFunctionBreakpoints" {
+                fn_bp_verified = m
+                    .pointer("/body/breakpoints/0/verified")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+            }
+            if ty == "event" && ev == "stopped" {
+                stop_reason = m
+                    .pointer("/body/reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                send(&mut stdin, &mut seq, "stackTrace", json!({ "threadId": 1 }));
+            }
+            if ty == "response" && cmd == "stackTrace" {
+                top_name = m
+                    .pointer("/body/stackFrames/0/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                send(
+                    &mut stdin,
+                    &mut seq,
+                    "evaluate",
+                    json!({ "expression": "name", "context": "watch" }),
+                );
+            }
+            if ty == "response" && cmd == "evaluate" {
+                eval_result = m
+                    .pointer("/body/result")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                send(&mut stdin, &mut seq, "continue", json!({ "threadId": 1 }));
+            }
+            if ty == "event" && ev == "terminated" {
+                terminated = true;
+                break;
+            }
+        }
+
+        let mut errs = Vec::new();
+        if !fn_bp_verified {
+            errs.push("function breakpoint on `greet` not verified".to_string());
+        }
+        if stop_reason != "function breakpoint" {
+            errs.push(format!("stop reason not function breakpoint: {stop_reason:?}"));
+        }
+        if top_name != "greet" {
+            errs.push(format!("top frame not `greet`: {top_name:?}"));
+        }
+        if eval_result != "\"world\"" {
+            errs.push(format!("evaluate `name` != \"world\": {eval_result:?}"));
+        }
+        if !terminated {
+            errs.push("no terminated event".to_string());
+        }
+        if errs.is_empty() {
+            tx.send(Ok(())).ok();
+        } else {
+            tx.send(Err(errs.join("; "))).ok();
+        }
+    });
+
+    let result = rx.recv_timeout(Duration::from_secs(15));
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = handle.join();
+    let _ = std::fs::remove_file(&prog);
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("DAP function-breakpoint assertion failed: {e}"),
+        Err(_) => panic!("DAP function-breakpoint test timed out (no result within 15s)"),
+    }
+}
