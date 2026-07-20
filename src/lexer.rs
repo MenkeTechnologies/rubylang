@@ -754,6 +754,41 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             // a ternary colon: either at the start of an expression, or as a
             // spaced command argument (`foo :<<`). Ternary's `:` is followed by a
             // space, so `op_symbol_at` never matches there.
+            // `:"name"` / `:'name'` — a quoted symbol literal (`:"\0foo"`, a name
+            // with characters an ordinary symbol can't hold). Interpolation is
+            // not evaluated; double-quoted escapes cover `\0 \n \t \e \\ \"`.
+            b':' if i + 1 < b.len()
+                && (b[i + 1] == b'"' || b[i + 1] == b'\'')
+                && (!prev_is_value(&out) || sp) =>
+            {
+                let quote = b[i + 1];
+                i += 2;
+                let mut bytes: Vec<u8> = Vec::new();
+                while i < b.len() && b[i] != quote {
+                    if quote == b'"' && b[i] == b'\\' && i + 1 < b.len() {
+                        i += 1;
+                        match b[i] {
+                            b'n' => bytes.push(b'\n'),
+                            b't' => bytes.push(b'\t'),
+                            b'0' => bytes.push(0),
+                            b'e' => bytes.push(0x1b),
+                            b'\\' => bytes.push(b'\\'),
+                            b'"' => bytes.push(b'"'),
+                            other => bytes.push(other),
+                        }
+                        i += 1;
+                    } else {
+                        bytes.push(b[i]);
+                        i += 1;
+                    }
+                }
+                i += 1; // closing quote
+                out.push(Token {
+                    kind: Tok::Symbol(String::from_utf8_lossy(&bytes).into_owned()),
+                    line,
+                    space: core::mem::take(&mut sp),
+                });
+            }
             b':' if i + 1 < b.len()
                 && op_symbol_at(&src[i + 1..]).is_some()
                 && (!prev_is_value(&out) || sp) =>

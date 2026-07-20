@@ -2857,6 +2857,7 @@ impl RubyHost {
                 | "Regexp"
                 | "MatchData"
                 | "Encoding"
+                | "Ractor"
                 // `GC`/`ObjectSpace` are modeled as class-refs so their module
                 // methods dispatch through `dispatch_classref` (GC control is a
                 // no-op here; ObjectSpace's heap enumeration is limited).

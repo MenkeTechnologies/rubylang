@@ -525,36 +525,51 @@ impl Compiler {
             }
             Expr::Defined(operand) => self.compile_defined(b, operand)?,
             Expr::Super { args, block } => {
-                let proc_id = match block {
-                    Some(bl) => Some(self.compile_proc(bl)?),
-                    None => None,
+                // A pass-through block (`super(&blk)` / `super(...)`) emits its
+                // value directly as the block operand, like `compile_call`; an
+                // ordinary block literal builds a Proc via `MkProc`.
+                let pass_expr = block.as_ref().and_then(block_pass_expr);
+                let proc_id = match (&pass_expr, block) {
+                    (Some(_), _) => None,
+                    (None, Some(bl)) => Some(self.compile_proc(bl)?),
+                    (None, None) => None,
                 };
-                match (args, proc_id) {
+                let has_block = pass_expr.is_some() || proc_id.is_some();
+                let emit_block = |s: &mut Self, b: &mut ChunkBuilder| -> Result<(), String> {
+                    match (&pass_expr, proc_id) {
+                        (Some(e), _) => s.compile_expr(b, e),
+                        (None, Some(id)) => {
+                            b.emit(Op::LoadInt(id as i64), 0);
+                            b.emit(Op::CallBuiltin(ops::MKPROC, 1), 0);
+                            Ok(())
+                        }
+                        (None, None) => Ok(()),
+                    }
+                };
+                match (args, has_block) {
                     // `super(args)` — explicit args, forward the current block.
-                    (Some(args), None) => {
+                    (Some(args), false) => {
                         for a in args {
                             self.compile_expr(b, a)?;
                         }
                         b.emit(Op::CallBuiltin(ops::SUPER, argc(args.len())?), 0);
                     }
                     // `super` — forward args and block.
-                    (None, None) => {
+                    (None, false) => {
                         b.emit(Op::CallBuiltin(ops::SUPER_FWD, 0), 0);
                     }
-                    // `super(args) { blk }` — explicit args + a new block (the
-                    // proc rides on top of the args on the stack).
-                    (Some(args), Some(id)) => {
+                    // `super(args) { blk }` / `super(args, &blk)` — explicit args +
+                    // a block (the block value rides on top of the args).
+                    (Some(args), true) => {
                         for a in args {
                             self.compile_expr(b, a)?;
                         }
-                        b.emit(Op::LoadInt(id as i64), 0);
-                        b.emit(Op::CallBuiltin(ops::MKPROC, 1), 0);
+                        emit_block(self, b)?;
                         b.emit(Op::CallBuiltin(ops::SUPER_BLK, argc(args.len() + 1)?), 0);
                     }
-                    // `super { blk }` — forward args, pass a new block.
-                    (None, Some(id)) => {
-                        b.emit(Op::LoadInt(id as i64), 0);
-                        b.emit(Op::CallBuiltin(ops::MKPROC, 1), 0);
+                    // `super { blk }` / `super(&blk)` — forward args, pass a block.
+                    (None, true) => {
+                        emit_block(self, b)?;
                         b.emit(Op::CallBuiltin(ops::SUPER_FWD_BLK, 1), 0);
                     }
                 }

@@ -959,7 +959,43 @@ impl Parser {
                 return Ok(());
             }
         }
-        params.push(self.ident_name()?);
+        // `&block` — a block-param capturing the block; bind the name (it stays
+        // nil unless a block flows in, which is rare for a block's own block arg).
+        if self.eat_op("&") {
+            params.push(self.ident_name()?);
+            return Ok(());
+        }
+        // `**rest` — a keyword-splat in a block param; bind the name.
+        if self.eat_op("**") {
+            params.push(self.ident_name().unwrap_or_else(|_| "**".to_string()));
+            return Ok(());
+        }
+        let name = self.ident_name()?;
+        // `name = default` — a block-param default. A block binds a missing
+        // positional to nil, so apply the default when the bound value is nil
+        // (`name = name.nil? ? default : name`); a passed-nil is treated as unset.
+        if self.eat_op("=") {
+            // Parse tighter than bitwise `|` (bp 5) so the closing `|` of the
+            // block-param list is not swallowed as an operator; a complex default
+            // must be parenthesized (`|x = (a || b)|`).
+            let default = self.binary(6)?;
+            let guard = Expr::If {
+                cond: Box::new(Expr::Call {
+                    recv: Some(Box::new(Expr::Var(VarKind::Local, name.clone()))),
+                    name: "nil?".into(),
+                    args: vec![],
+                    block: None,
+                }),
+                then: vec![default.into()],
+                elifs: Vec::new(),
+                els: Some(vec![Expr::Var(VarKind::Local, name.clone()).into()]),
+            };
+            preludes.push(Expr::Assign(
+                Box::new(Expr::Var(VarKind::Local, name.clone())),
+                Box::new(guard),
+            ));
+        }
+        params.push(name);
         Ok(())
     }
 
@@ -1089,7 +1125,9 @@ impl Parser {
             Tok::Op(ref o) if o == "(" => {
                 self.advance();
                 self.skip_terms();
-                let e = self.expr()?;
+                // A parenthesized group takes a full statement, so a trailing
+                // modifier works inside it: `(expr if cond)`, `(x unless y)`.
+                let e = self.statement()?;
                 self.skip_terms();
                 self.expect_op(")")?;
                 Ok(e)

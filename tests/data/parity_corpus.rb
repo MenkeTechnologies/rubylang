@@ -1909,3 +1909,40 @@ class Klass
   extend Mixin
 end
 p Klass.mixed
+#==#
+# ── super(&block) forwards the block (block_given? stays faithful) ──
+class SBase
+  def each; yield 1; yield 2; end
+end
+class SDeriv < SBase
+  def each(&b); super(&b); end
+end
+r = []
+SDeriv.new.each { |x| r << x }
+p r
+#==#
+class GBase
+  def go; block_given? ? yield : :none; end
+end
+class GDeriv < GBase
+  def go(&b); super(&b); end
+end
+p GDeriv.new.go
+#==#
+# ── quoted symbol literals ──
+p :"hello world".length
+#==#
+p :"a\tb".to_s
+#==#
+# ── modifier if/unless inside parentheses ──
+p((5 if true))
+#==#
+p((5 if false) || 9)
+#==#
+p [1, 2, 3].map { |n| (n * 2 if n.odd?) }
+#==#
+# ── block parameters with defaults ──
+f = lambda { |a, b = 10| a + b }
+p [f.call(1), f.call(1, 2)]
+#==#
+p [1, 2].map { |x, i = 99| [x, i] }

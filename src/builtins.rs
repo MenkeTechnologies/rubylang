@@ -247,9 +247,9 @@ fn b_super_fwd(vm: &mut VM, _: u8) -> Value {
 
 /// `super(args) { blk }` — the proc rides on top of the args; argc = n_args + 1.
 fn b_super_blk(vm: &mut VM, argc: u8) -> Value {
-    let block = vm.pop();
+    let block = block_operand(vm.pop());
     let args = pop_n(vm, argc.saturating_sub(1) as usize);
-    match crate::host::call_super_blk(Some(args), Some(block)) {
+    match crate::host::call_super_blk(Some(args), block) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
@@ -257,8 +257,8 @@ fn b_super_blk(vm: &mut VM, argc: u8) -> Value {
 
 /// `super { blk }` — forward args, pass a new block (the proc on top of stack).
 fn b_super_fwd_blk(vm: &mut VM, _: u8) -> Value {
-    let block = vm.pop();
-    match crate::host::call_super_blk(None, Some(block)) {
+    let block = block_operand(vm.pop());
+    match crate::host::call_super_blk(None, block) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
@@ -1563,6 +1563,25 @@ fn dispatch_classref(
                 let store = with_host(fiber_store);
                 return dispatch(&store, "[]=", args, None);
             }
+            _ => {}
+        }
+    }
+    // `Ractor` — rubylang has no real Ractors, but gems (concurrent-ruby) probe
+    // `Ractor.shareable?`/`make_shareable` unconditionally on Ruby 3+. Model just
+    // the shareability surface: immutable/frozen values are shareable.
+    if cls == "Ractor" {
+        match name {
+            "shareable?" => {
+                let v = &args[0];
+                let sharable = matches!(v, Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Undef)
+                    || with_host(|h| h.is_frozen(v));
+                return Ok(Value::Bool(sharable));
+            }
+            "make_shareable" => {
+                with_host(|h| h.freeze_value(&args[0]));
+                return Ok(args[0].clone());
+            }
+            "current" | "main" => return Ok(Value::Undef),
             _ => {}
         }
     }
