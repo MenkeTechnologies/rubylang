@@ -180,8 +180,10 @@ Implemented and checked against the reference `ruby`:
   `Fiddle::Function.new(addr, [arg_types], ret_type)` and `#call` it. Arguments
   (Integer/Float/String) marshal to C and the result marshals back through
   libffi, with a runtime-determined signature — this is genuine C execution, not
-  a shim. `Fiddle::Pointer` wraps bytes and reads a returned `char*` back into a
-  Ruby String. The MRI type codes are provided (`TYPE_VOID`/`TYPE_INT`/
+  a shim. `Fiddle::Pointer` wraps bytes, reads a returned `char*` back into a
+  Ruby String, and supports `ptr[i]`/`ptr[i, len]` reads plus `ptr[i] = byte` /
+  `ptr[i, len] = str` writes (clamped to the allocation). The MRI type codes are
+  provided (`TYPE_VOID`/`TYPE_INT`/
   `TYPE_LONG`/`TYPE_SIZE_T`/`TYPE_VOIDP`/`TYPE_DOUBLE`/`TYPE_CHAR`/`TYPE_SHORT`/
   `TYPE_LONG_LONG` and their unsigned negatives), and `Fiddle::DLError` is
   rescuable. FFI is inherently unsafe — a wrong signature can crash the process,
