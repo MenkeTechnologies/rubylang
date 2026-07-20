@@ -127,22 +127,26 @@ pub fn eval_str(src: &str) -> Result<Value, String> {
 /// `eval_str` with command-line configuration: seeds `-I` includes, `ARGV`/`$0`,
 /// runs `-r` requires, then the one-liner. `$0`/`__FILE__` default to `-e`.
 pub fn eval_str_cfg(src: &str, cfg: &RunConfig) -> Result<Value, String> {
-    host::reset_host();
-    let cwd = std::env::current_dir().unwrap_or_default();
-    host::with_host(|h| h.init_load_path(&cwd.to_string_lossy()));
-    host::with_host(|h| h.prepend_load_path(&cfg.includes));
-    host::push_file_dir(cwd);
-    let name = if cfg.script_name.is_empty() {
-        "-e".to_string()
-    } else {
-        cfg.script_name.clone()
-    };
-    // A `-e` one-liner has no script file; MRI reports `__FILE__` as "-e".
-    host::push_file_path(name.clone());
-    host::with_host(|h| h.set_program_args(&cfg.argv, &name));
-    seed_verbosity(cfg);
-    run_requires(&cfg.requires)?;
-    run_compiled(compile(src)?)
+    // Hold the GVL for the whole run so heap access stays exclusive and any
+    // `Thread` spawned inside contends on the same lock (MRI's model).
+    host::with_gvl(|| {
+        host::reset_host();
+        let cwd = std::env::current_dir().unwrap_or_default();
+        host::with_host(|h| h.init_load_path(&cwd.to_string_lossy()));
+        host::with_host(|h| h.prepend_load_path(&cfg.includes));
+        host::push_file_dir(cwd);
+        let name = if cfg.script_name.is_empty() {
+            "-e".to_string()
+        } else {
+            cfg.script_name.clone()
+        };
+        // A `-e` one-liner has no script file; MRI reports `__FILE__` as "-e".
+        host::push_file_path(name.clone());
+        host::with_host(|h| h.set_program_args(&cfg.argv, &name));
+        seed_verbosity(cfg);
+        run_requires(&cfg.requires)?;
+        run_compiled(compile(src)?)
+    })
 }
 
 /// Run each `-r LIB` on the current host before the program. Requires share the
@@ -194,30 +198,33 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
 /// `eval_file` with command-line configuration (`-I`/`-r`/`ARGV`/`$0`).
 pub fn eval_file_cfg(path: &str, cfg: &RunConfig) -> Result<Value, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    host::reset_host();
-    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
-    let dir = abs
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    host::with_host(|h| h.init_load_path(&dir.to_string_lossy()));
-    host::with_host(|h| h.prepend_load_path(&cfg.includes));
-    host::push_file_dir(dir);
-    // `__FILE__` for the top-level script is the path exactly as given on the
-    // command line (MRI does not canonicalize it). `$0` is the same path.
-    host::push_file_path(path.to_string());
-    host::with_host(|h| h.set_program_args(&cfg.argv, path));
-    seed_verbosity(cfg);
-    run_requires(&cfg.requires)?;
-    // If `ruby --build FILE` warmed the cache, the stored program is the whole
-    // bundled app (every statically-required file inlined). Run it directly —
-    // it skips lex/parse/lower AND needs none of the required source files on
-    // disk. `cache::load` returns `None` (falls back to a fresh compile + runtime
-    // `require`) on a miss or when any still-present bundled file has changed.
-    if let Some(prog) = cache::load_file(&abs.to_string_lossy(), &src) {
-        return run_compiled(prog);
-    }
-    run_compiled(compile(&src)?)
+    // Hold the GVL for the whole run (see `eval_str_cfg`).
+    host::with_gvl(|| {
+        host::reset_host();
+        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+        let dir = abs
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        host::with_host(|h| h.init_load_path(&dir.to_string_lossy()));
+        host::with_host(|h| h.prepend_load_path(&cfg.includes));
+        host::push_file_dir(dir);
+        // `__FILE__` for the top-level script is the path exactly as given on the
+        // command line (MRI does not canonicalize it). `$0` is the same path.
+        host::push_file_path(path.to_string());
+        host::with_host(|h| h.set_program_args(&cfg.argv, path));
+        seed_verbosity(cfg);
+        run_requires(&cfg.requires)?;
+        // If `ruby --build FILE` warmed the cache, the stored program is the whole
+        // bundled app (every statically-required file inlined). Run it directly —
+        // it skips lex/parse/lower AND needs none of the required source files on
+        // disk. `cache::load` returns `None` (falls back to a fresh compile +
+        // runtime `require`) on a miss or a changed bundled file.
+        if let Some(prog) = cache::load_file(&abs.to_string_lossy(), &src) {
+            return run_compiled(prog);
+        }
+        run_compiled(compile(&src)?)
+    })
 }
 
 /// Read and run a `.rb` file under the DAP debugger: compile with per-statement

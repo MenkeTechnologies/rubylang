@@ -727,13 +727,82 @@ struct FiberContext {
     around_stack: Vec<AroundCall>,
 }
 
-thread_local! {
-    static HOST: RefCell<RubyHost> = RefCell::new(RubyHost::new());
+/// The single shared object heap, protected by the GVL mutex — one VM for the
+/// whole process, exactly like MRI. `Thread`s share it; the GVL serializes access
+/// (only the thread holding the lock runs Ruby), so heap mutations stay atomic
+/// w.r.t. other threads the way MRI's GVL guarantees.
+static HOST: std::sync::OnceLock<Mutex<RubyHost>> = std::sync::OnceLock::new();
+
+fn host_lock() -> &'static Mutex<RubyHost> {
+    HOST.get_or_init(|| Mutex::new(RubyHost::new()))
 }
 
-/// Run `f` with mutable access to the thread-local host.
+thread_local! {
+    /// A raw pointer into the GVL-locked host, published while THIS thread holds
+    /// the GVL. Null when the thread is not running Ruby. `with_host` uses it to
+    /// reach the host without re-locking (the GVL already guarantees exclusivity).
+    static HOST_PTR: std::cell::Cell<*mut RubyHost> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// The GVL guard held for this thread's whole execution slice (so a safepoint
+    /// deep in the call stack can drop + reacquire it to let another thread run).
+    static GVL_GUARD: RefCell<Option<std::sync::MutexGuard<'static, RubyHost>>> =
+        const { RefCell::new(None) };
+}
+
+/// Acquire the GVL: lock the shared host, publish the pointer, stash the guard.
+fn gvl_enter() {
+    let mut guard = host_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let ptr: *mut RubyHost = &mut *guard;
+    HOST_PTR.with(|p| p.set(ptr));
+    GVL_GUARD.with(|g| *g.borrow_mut() = Some(guard));
+}
+
+/// Release the GVL: clear the pointer and drop the guard (unlocking the host).
+fn gvl_leave() {
+    HOST_PTR.with(|p| p.set(std::ptr::null_mut()));
+    GVL_GUARD.with(|g| *g.borrow_mut() = None);
+}
+
+/// Run `f` while holding the GVL. Re-entrant: a nested call (the thread already
+/// holds it) just runs `f`. The outermost caller owns the acquire/release, so the
+/// whole Ruby execution slice runs under one continuous lock — preserving the
+/// atomicity MRI's GVL provides.
+pub fn with_gvl<R>(f: impl FnOnce() -> R) -> R {
+    if HOST_PTR.with(|p| !p.get().is_null()) {
+        return f();
+    }
+    gvl_enter();
+    let r = f();
+    gvl_leave();
+    r
+}
+
+/// Temporarily release the GVL around a blocking operation (`Thread#join`,
+/// `Queue#pop` on empty, `sleep`), letting another thread run, then reacquire.
+/// A no-op when the GVL is not held (single-threaded tool/test contexts).
+pub fn gvl_blocking<R>(blocking: impl FnOnce() -> R) -> R {
+    if HOST_PTR.with(|p| p.get().is_null()) {
+        return blocking();
+    }
+    gvl_leave();
+    let r = blocking();
+    gvl_enter();
+    r
+}
+
+/// Run `f` with mutable access to the shared host. When the GVL is held (normal
+/// execution), it reaches the host through the published pointer — no re-lock,
+/// since the GVL already guarantees this thread exclusive access. Outside a GVL
+/// slice (standalone tool/test calls) it locks the host just for this call.
 pub fn with_host<R>(f: impl FnOnce(&mut RubyHost) -> R) -> R {
-    HOST.with(|h| f(&mut h.borrow_mut()))
+    let ptr = HOST_PTR.with(|p| p.get());
+    if !ptr.is_null() {
+        // SAFETY: this thread holds the GVL for the whole slice, so `ptr` points
+        // at the locked host and no other thread can touch it concurrently.
+        return f(unsafe { &mut *ptr });
+    }
+    let mut guard = host_lock().lock().unwrap_or_else(|p| p.into_inner());
+    f(&mut guard)
 }
 
 /// Reset the host to a clean slate (fresh top-level frame).
