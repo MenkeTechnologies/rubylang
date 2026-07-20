@@ -338,25 +338,29 @@ impl Parser {
         }
     }
 
-    /// Low-precedence keyword operators `and` / `or` / `not`.
+    /// Low-precedence keyword operators `and` / `or` / `not`. `not` binds tighter
+    /// than `and`/`or`, so it may lead either operand: `a and not (b)`.
     fn low_kw(&mut self) -> Result<Expr, String> {
-        if self.eat_kw("not") {
-            let e = self.low_kw()?;
-            return Ok(Expr::Unary(UnOp::Not, Box::new(e)));
-        }
-        let mut lhs = self.rescue_mod()?;
+        let mut lhs = self.not_operand()?;
         loop {
             if self.eat_kw("and") {
-                let rhs = self.rescue_mod()?;
-                lhs = Expr::Binary(BinOp::And, Box::new(lhs), Box::new(rhs));
+                lhs = Expr::Binary(BinOp::And, Box::new(lhs), Box::new(self.not_operand()?));
             } else if self.eat_kw("or") {
-                let rhs = self.rescue_mod()?;
-                lhs = Expr::Binary(BinOp::Or, Box::new(lhs), Box::new(rhs));
+                lhs = Expr::Binary(BinOp::Or, Box::new(lhs), Box::new(self.not_operand()?));
             } else {
                 break;
             }
         }
         Ok(lhs)
+    }
+
+    /// An `and`/`or` operand, optionally led by `not` (`not x`, `not not x`).
+    fn not_operand(&mut self) -> Result<Expr, String> {
+        if self.eat_kw("not") {
+            Ok(Expr::Unary(UnOp::Not, Box::new(self.not_operand()?)))
+        } else {
+            self.rescue_mod()
+        }
     }
 
     /// Modifier `rescue`: `expr rescue fallback` binds tighter than assignment
@@ -1561,7 +1565,16 @@ impl Parser {
     /// A method name in an `alias` clause: a bareword, a `:symbol`, or an operator.
     fn alias_name(&mut self) -> Result<String, String> {
         match self.advance() {
-            Tok::Ident(s) | Tok::Const(s) | Tok::Symbol(s) => Ok(s),
+            Tok::Ident(s) | Tok::Const(s) => {
+                // A setter name (`foo=`): a glued `=` is part of the method name.
+                if self.is_op("=") && !self.cur_space() {
+                    self.advance();
+                    Ok(format!("{s}="))
+                } else {
+                    Ok(s)
+                }
+            }
+            Tok::Symbol(s) => Ok(s),
             Tok::Op(o) => Ok(o),
             other => Err(format!("line {}: bad alias name '{other}'", self.line())),
         }
