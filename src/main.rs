@@ -30,10 +30,16 @@ fn main() -> ExitCode {
 
     if let Some(file) = cli.file {
         if cli.dump_bytecode {
-            return match dump(&file) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(&e),
-            };
+            return finish(dump(&file));
+        }
+        if cli.dump_tokens {
+            return finish(dump_tokens(&file));
+        }
+        if cli.dump_ast {
+            return finish(dump_ast(&file));
+        }
+        if cli.disasm {
+            return finish(disasm(&file));
         }
         if cli.build {
             if cli.native {
@@ -97,6 +103,55 @@ fn dump(file: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// `--dump-tokens`: print the lexer token stream (after `rust { }` desugaring),
+/// one `line<TAB>Tok` per line.
+fn dump_tokens(file: &str) -> Result<(), String> {
+    let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let src = rubylang::rust_ffi::desugar(&src);
+    for t in rubylang::lexer::lex(&src)? {
+        println!("{}\t{:?}", t.line, t.kind);
+    }
+    Ok(())
+}
+
+/// `--dump-ast`: print the parsed Ruby AST.
+fn dump_ast(file: &str) -> Result<(), String> {
+    let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let stmts = rubylang::parser::parse(&src)?;
+    println!("{stmts:#?}");
+    Ok(())
+}
+
+/// `--disasm`: print a fusevm bytecode disassembly of the main chunk plus every
+/// compiled method and block, via the shared `fusevm::Chunk::disassemble`.
+fn disasm(file: &str) -> Result<(), String> {
+    let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let prog = rubylang::compile(&src)?;
+    println!("; ruby fusevm — main\n{}", prog.main.disassemble());
+    for (name, m) in &prog.methods {
+        println!(
+            "; ruby fusevm — def {name}({})\n{}",
+            m.params.join(", "),
+            m.chunk.disassemble()
+        );
+    }
+    for (i, p) in prog.procs.iter().enumerate() {
+        println!(
+            "; ruby fusevm — block #{i} (|{}|)\n{}",
+            p.params.join(", "),
+            p.chunk.disassemble()
+        );
+    }
+    Ok(())
+}
+
+fn finish(r: Result<(), String>) -> ExitCode {
+    match r {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&e),
+    }
 }
 
 fn atty_stdin() -> bool {

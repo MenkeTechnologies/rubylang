@@ -27,9 +27,11 @@ pub struct Parser {
     no_do_block: bool,
 }
 
-/// Parse a full program.
+/// Parse a full program. Inline `rust { ... }` FFI blocks are desugared to
+/// `__rust_compile(...)` calls before lexing.
 pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
-    let toks = lex(src)?;
+    let src = crate::rust_ffi::desugar(src);
+    let toks = lex(&src)?;
     let mut p = Parser {
         toks,
         pos: 0,

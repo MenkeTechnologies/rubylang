@@ -737,6 +737,16 @@ fn b_sig_retry(vm: &mut VM, _: u8) -> Value {
 
 /// A self/top-level call: a user method if defined, else a Kernel function.
 fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, String> {
+    // Inline Rust FFI: the `rust { ... }` desugar emits `__rust_compile(b64,
+    // line)`; compile + register the block's exported functions. The base64 body
+    // is a Ruby String object, so read it through the host, not `Value::to_str`.
+    if name == "__rust_compile" {
+        let b64 = args
+            .first()
+            .and_then(|v| with_host(|h| h.as_str(v)))
+            .unwrap_or_default();
+        return fusevm::ffi::compile_and_register(&b64).map(|_| Value::Undef);
+    }
     // Inside a class method `self` is a class ref — `new` and class methods
     // dispatch on the class; anything else (raise, puts, …) is a Kernel call.
     let this = with_host(|h| h.current_self());
@@ -815,6 +825,25 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
     }
     if with_host(|h| h.responds_to(name)) {
         return call_method(name, args, block);
+    }
+    // A `rust { ... }` block's exported functions are callable by bareword.
+    // User-defined Ruby methods still win (resolved above); the registry is only
+    // consulted once nothing else claimed the name, and the membership check
+    // keeps it off the hot path. Ruby String args are host `Value::Obj` handles,
+    // so marshal them into native `fusevm::Value::Str` — fusevm's FFI reads
+    // string args via `Value::to_str`, which on a bare heap handle would yield
+    // `(obj:N)`; ints/floats are already native and pass through unchanged.
+    if fusevm::ffi::is_registered(name) {
+        let marshalled: Vec<Value> = args
+            .iter()
+            .map(|v| match with_host(|h| h.as_str(v)) {
+                Some(s) => Value::str(s),
+                None => v.clone(),
+            })
+            .collect();
+        if let Some(r) = fusevm::ffi::try_call(name, &marshalled) {
+            return r;
+        }
     }
     kernel(name, args, block)
 }
