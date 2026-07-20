@@ -1205,6 +1205,18 @@ pub(crate) fn dispatch(
             }
             return Ok(with_host(|h| h.new_symbol(&mname)));
         }
+        // `obj.extend(M, …)` — mix each module's instance methods into the
+        // receiver's singleton table (MRI returns the receiver).
+        "extend" if matches!(recv, Value::Obj(_)) => {
+            if let Value::Obj(id) = recv {
+                for a in args {
+                    if let Some(mname) = with_host(|h| h.classref_name(a)) {
+                        with_host(|h| h.extend_object(*id, &mname));
+                    }
+                }
+            }
+            return Ok(recv.clone());
+        }
         // `instance_eval`/`instance_exec` run with `self` = receiver: a bare `def`
         // defines a singleton on the receiver (or a class method when the receiver
         // is a class), and `@ivar` accesses the receiver's instance variables.
@@ -1306,6 +1318,57 @@ fn dispatch_classref(
     // `ENV` — the process environment as a hash-like object (backed by std::env).
     if cls == "ENV" {
         return dispatch_env(name, args, block);
+    }
+    // `GC` — rubylang has no user-visible GC to drive, so the control surface is
+    // accepted as no-ops returning MRI-shaped values.
+    if cls == "GC" {
+        return match name {
+            "start" | "garbage_collect" | "compact" | "verify_compaction_references"
+            | "verify_internal_consistency" => Ok(Value::Undef),
+            "enable" | "disable" | "stress" => Ok(Value::Bool(false)),
+            "count" | "total_time" => Ok(Value::Int(0)),
+            "stat" | "latest_gc_info" => Ok(with_host(|h| h.new_hash(IndexMap::new()))),
+            _ => Err(raise_exc(
+                "NoMethodError",
+                &format!("undefined method '{name}' for GC:Module"),
+            )),
+        };
+    }
+    // `ObjectSpace` — the heap is not enumerable by class here, so the
+    // enumeration surface returns 0/empty rather than pretending to walk objects.
+    if cls == "ObjectSpace" {
+        return match name {
+            "garbage_collect" => Ok(Value::Undef),
+            "count_objects" => Ok(with_host(|h| h.new_hash(IndexMap::new()))),
+            "each_object" => Ok(Value::Int(0)),
+            _ => Err(raise_exc(
+                "NoMethodError",
+                &format!("undefined method '{name}' for ObjectSpace:Module"),
+            )),
+        };
+    }
+    // `Random` class methods; `Random.new(seed)` builds an object with its own
+    // reproducible PRNG stream (see `random_advance`).
+    if cls == "Random" {
+        return match name {
+            "new" => Ok(with_host(|h| {
+                let seed = args.first().and_then(int_arg).unwrap_or(0x9E3779B9);
+                let o = h.new_object("Random");
+                h.set_ivar_of(&o, "state", Value::Int(seed));
+                h.set_ivar_of(&o, "seed", Value::Int(seed));
+                o
+            })),
+            "rand" => Ok(kernel_rand(args)),
+            "srand" => {
+                let seed = args.first().and_then(int_arg).unwrap_or(0);
+                Ok(Value::Int(rng_srand(seed)))
+            }
+            "new_seed" => Ok(Value::Int((rng_next() >> 1) as i64)),
+            _ => Err(raise_exc(
+                "NoMethodError",
+                &format!("undefined method '{name}' for Random"),
+            )),
+        };
     }
     // `StringIO.new(initial="")` — a String-backed IO. The buffer and read cursor
     // live in the `buf`/`pos` ivars (see `stringio_method`).
@@ -2155,6 +2218,12 @@ fn dispatch_object(
     // StringIO: a String-backed IO (buffer + read cursor in the `buf`/`pos` ivars).
     if cls == "StringIO" {
         return stringio_method(recv, name, args, block);
+    }
+    // Random instance: its own reproducible PRNG stream (state in the `state` ivar).
+    if cls == "Random" {
+        if let Some(r) = random_method(recv, name, args)? {
+            return Ok(r);
+        }
     }
     match name {
         "message" | "to_s" => {
@@ -10100,12 +10169,51 @@ fn rng_srand(seed: i64) -> i64 {
     RNG_SEED.with(|c| c.replace(seed))
 }
 
-fn kernel_rand(args: &[Value]) -> Value {
-    let z = rng_next();
+/// Build a random value from one 64-bit word and `rand`'s argument: `rand(n)` →
+/// `0..n-1`, `rand(a..b)` → an integer in the (inclusive/exclusive) range, and
+/// no/zero argument → a uniform double in `[0, 1)` (top 53 bits, like MRI).
+fn rand_value(z: u64, args: &[Value]) -> Value {
+    let unit = || (z >> 11) as f64 / (1u64 << 53) as f64;
     match args.first() {
         Some(Value::Int(n)) if *n > 0 => Value::Int((z % (*n as u64)) as i64),
-        // Top 53 bits give a uniform double in [0, 1), like Ruby's `rand`.
-        _ => Value::Float((z >> 11) as f64 / (1u64 << 53) as f64),
+        Some(Value::Float(f)) if *f > 0.0 => Value::Float(unit() * f),
+        Some(v) => {
+            if let Some((lo, hi, excl)) = with_host(|h| h.as_range(v)) {
+                let span = (hi - lo + if excl { 0 } else { 1 }).max(1) as u64;
+                return Value::Int(lo + (z % span) as i64);
+            }
+            Value::Float(unit())
+        }
+        None => Value::Float(unit()),
+    }
+}
+
+fn kernel_rand(args: &[Value]) -> Value {
+    rand_value(rng_next(), args)
+}
+
+/// Advance a `Random` instance's own SplitMix64 state (stored in its `state`
+/// ivar) and return the next 64-bit word — so each `Random.new(seed)` is an
+/// independent, reproducible stream distinct from the global `rand`.
+fn random_advance(recv: &Value) -> u64 {
+    let cur = match with_host(|h| h.ivar_of(recv, "state")) {
+        Value::Int(n) => n as u64,
+        _ => 0x2545F4914F6CDD1D,
+    };
+    let z = cur.wrapping_add(0x9E3779B97F4A7C15);
+    with_host(|h| h.set_ivar_of(recv, "state", Value::Int(z as i64)));
+    let mut m = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    m = (m ^ (m >> 27)).wrapping_mul(0x94D049BB133111EB);
+    m ^ (m >> 31)
+}
+
+/// Instance methods of a `Random` object (`rand`, `seed`). Returns `Ok(None)`
+/// for a name it does not handle.
+fn random_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+    match name {
+        "rand" => Ok(Some(rand_value(random_advance(recv), args))),
+        "seed" => Ok(Some(with_host(|h| h.ivar_of(recv, "seed")))),
+        _ => Ok(None),
     }
 }
 

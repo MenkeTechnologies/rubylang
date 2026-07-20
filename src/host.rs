@@ -2267,6 +2267,38 @@ impl RubyHost {
     pub fn method_def(&self, name: &str) -> Option<MethodDef> {
         self.methods.get(name).cloned()
     }
+    /// `obj.extend(M)` — mix module `M`'s instance methods into `obj`'s singleton
+    /// method table so they answer on just this one object (MRI: extend inserts
+    /// the module into the object's singleton ancestry). Compiled `def`s and
+    /// `define_method` blocks are copied, following `M`'s own `include` chain.
+    pub fn extend_object(&mut self, id: u32, module: &str) {
+        // Collect the module plus the modules it includes (shallow BFS).
+        let mut mods = vec![module.to_string()];
+        let mut i = 0;
+        while i < mods.len() {
+            if let Some(cd) = self.classes.get(&mods[i]) {
+                for inc in cd.includes.clone() {
+                    if !mods.contains(&inc) {
+                        mods.push(inc);
+                    }
+                }
+            }
+            i += 1;
+        }
+        for mname in &mods {
+            if let Some(cd) = self.classes.get(mname).cloned() {
+                for (n, def) in cd.methods {
+                    self.add_singleton_method(id, &n, def);
+                }
+            }
+            if let Some(dm) = self.define_methods.get(mname).cloned() {
+                for (n, proc) in dm {
+                    self.add_singleton_define_method(id, &n, proc);
+                }
+            }
+        }
+    }
+
     /// Register a per-object singleton method (`def obj.m`, `class << obj`).
     pub fn add_singleton_method(&mut self, id: u32, name: &str, def: MethodDef) {
         self.singleton_methods
@@ -2650,6 +2682,12 @@ impl RubyHost {
                 | "Fiddle::Function"
                 | "Fiddle::Pointer"
                 | "StringIO"
+                | "Random"
+                // `GC`/`ObjectSpace` are modeled as class-refs so their module
+                // methods dispatch through `dispatch_classref` (GC control is a
+                // no-op here; ObjectSpace's heap enumeration is limited).
+                | "GC"
+                | "ObjectSpace"
                 // `ENV` is modeled as a class-ref so its `[]`/`fetch`/… dispatch
                 // through `dispatch_classref` (it is the process environment).
                 | "ENV"
