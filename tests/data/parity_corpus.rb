@@ -1946,3 +1946,28 @@ f = lambda { |a, b = 10| a + b }
 p [f.call(1), f.call(1, 2)]
 #==#
 p [1, 2].map { |x, i = 99| [x, i] }
+#==#
+# ── `and`/`or` with a leading `not` operand ──
+def ang; 1 if true and not (false); end
+p ang
+#==#
+# ── setter alias name ──
+class AliasC
+  def val=(v); @val = v; end
+  def val; @val; end
+  alias value= val=
+end
+o = AliasC.new
+o.value = 42
+p o.val
+#==#
+# ── expression superclass: class C < Struct.new(...) ──
+class Point < Struct.new(:x, :y)
+  def dist; Math.sqrt(x * x + y * y); end
+end
+pt = Point.new(3, 4)
+p [pt.x, pt.y, pt.dist]
+#==#
+class OneField < Struct.new(:a)
+end
+p OneField.new(7).a

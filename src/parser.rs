@@ -1772,19 +1772,56 @@ impl Parser {
         // form `class A::B::C`). `const_path` joins the segments into
         // `"A::B::C"`; the compiler stores the class under that qualified key.
         let name = self.const_path("class name")?;
-        let superclass = if self.eat_op("<") {
-            // A superclass may itself be namespaced (`class D < Foo::Base`).
-            Some(self.const_path("superclass")?)
+        // The superclass may be a plain constant path (`class D < Foo::Base`) or a
+        // full expression (`class C < Struct.new(:a, :b)`); parse it as a postfix
+        // expression and discriminate by whether it is a pure constant reference.
+        let superclass_expr = if self.eat_op("<") {
+            Some(self.postfix()?)
         } else {
             None
         };
         let body = self.body_until(&["end"])?;
         self.expect_kw("end")?;
-        Ok(Expr::Class {
-            name,
-            superclass,
-            body,
-        })
+        match superclass_expr {
+            None => Ok(Expr::Class { name, superclass: None, body }),
+            Some(e) => match Self::const_ref_path(&e) {
+                // A constant-path superclass: the ordinary named-superclass form.
+                Some(sup) => Ok(Expr::Class { name, superclass: Some(sup), body }),
+                // An expression superclass (`Struct.new(...)`, `Data.define(...)`,
+                // `Class.new(Base)`): desugar to `NAME = <expr> do BODY end` — the
+                // class body becomes the constructor call's definition block.
+                None => {
+                    let call = match e {
+                        Expr::Call { recv, name: cn, args, .. } => Expr::Call {
+                            recv,
+                            name: cn,
+                            args,
+                            block: Some(Block { params: Vec::new(), splat: None, body }),
+                        },
+                        other => other,
+                    };
+                    Ok(Expr::Assign(
+                        Box::new(Expr::Var(VarKind::Const, name)),
+                        Box::new(call),
+                    ))
+                }
+            },
+        }
+    }
+
+    /// The written constant path of `e` if it is a pure constant reference
+    /// (`Foo`, `A::B::C`), else `None` — used to tell a named superclass apart
+    /// from an expression superclass.
+    fn const_ref_path(e: &Expr) -> Option<String> {
+        match e {
+            Expr::Var(VarKind::Const, name) => Some(name.clone()),
+            Expr::Call { recv: Some(r), name, args, block: None }
+                if args.is_empty() && name.chars().next().is_some_and(|c| c.is_uppercase()) =>
+            {
+                Some(format!("{}::{}", Self::const_ref_path(r)?, name))
+            }
+            _ => None,
+        }
     }
 
     fn module_expr(&mut self) -> Result<Expr, String> {
