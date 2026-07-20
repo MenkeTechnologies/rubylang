@@ -1861,3 +1861,24 @@ p YAML.load(YAML.dump(h)) == h
 #==#
 require "yaml"
 p YAML.load("db:\n  host: localhost\n  port: 5432\n  tags:\n  - a\n  - b")
+#==#
+# ── subject-less case (multi-way if) ──
+x = 5
+p(case; when x < 0 then "neg"; when x.zero? then "zero"; else "pos"; end)
+#==#
+p(case; when false then 1; when 2 == 2, 3 == 4 then "b"; end)
+#==#
+# ── chained assignment binds into ||/&& (a = b || c = d) ──
+c = nil
+a = false || c = 5
+p [a, c]
+#==#
+# ── superclass with leading :: (top-level scope) ──
+class MyHash < ::Hash; end
+p MyHash.new.class.to_s
+#==#
+# ── Array#to_set / Integer#size ──
+require "set"
+p [1, 2, 2, 3, 3, 3].to_set.size
+#==#
+p 255.size

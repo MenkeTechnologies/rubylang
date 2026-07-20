@@ -1550,6 +1550,18 @@ fn dispatch_classref(
                 };
                 return crate::host::fiber_yield(v);
             }
+            // `Fiber[:key]` / `Fiber[:key] = value` — fiber-scoped storage
+            // (Ruby 3.2+). Backed by one process-global hash: correct for the
+            // common single-fiber use (e.g. i18n config); per-fiber isolation is
+            // not modeled.
+            "[]" => {
+                let store = with_host(fiber_store);
+                return dispatch(&store, "[]", args, None);
+            }
+            "[]=" => {
+                let store = with_host(fiber_store);
+                return dispatch(&store, "[]=", args, None);
+            }
             _ => {}
         }
     }
@@ -3204,6 +3216,8 @@ fn dispatch_number(
             let m = if n >= 0 { n as u64 } else { (!n) as u64 };
             Ok(Value::Int((64 - m.leading_zeros()) as i64))
         }
+        // Bytes in the machine word (a fixnum is 8 bytes on a 64-bit build).
+        "size" => Ok(Value::Int(8)),
         "fdiv" => Ok(Value::Float(as_f(recv) / as_f(&args[0]))),
         "clamp" => {
             // Ruby returns the receiver when in range, otherwise the bound
@@ -5274,6 +5288,8 @@ fn dispatch_array(
             with_host(|h| h.set_array(recv, Vec::new()));
             Ok(recv.clone())
         }
+        // `to_set` — a Set of the elements (from `require "set"`).
+        "to_set" => Ok(with_host(|h| h.new_set(arr))),
         "each" => {
             if let Some(b) = &block {
                 for x in &arr {
@@ -6693,8 +6709,18 @@ fn drive_generator(gblock: &Value, limit: usize) -> Result<Vec<Value>, String> {
 /// `Thread` instance methods. `join`/`value` release the GVL and wait for the OS
 /// thread; `value` returns the block's value (re-raising a thread exception),
 /// `join` returns the thread.
-fn dispatch_thread(recv: &Value, name: &str, _args: &[Value]) -> Result<Value, String> {
+fn dispatch_thread(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
+        // `thread[:key]` / `thread[:key] = value` — thread-local storage, backed
+        // by the same process-global store as `Fiber[]` (single-thread-boot scope).
+        "[]" => {
+            let store = with_host(fiber_store);
+            return dispatch(&store, "[]", args, None);
+        }
+        "[]=" => {
+            let store = with_host(fiber_store);
+            return dispatch(&store, "[]=", args, None);
+        }
         "join" => {
             crate::host::thread_join(recv)?;
             Ok(recv.clone())
@@ -6710,6 +6736,19 @@ fn dispatch_thread(recv: &Value, name: &str, _args: &[Value]) -> Result<Value, S
         // A Thread compares/inspects by identity like any object.
         "inspect" | "to_s" => Ok(new_str(with_host(|h| h.inspect(recv)))),
         _ => Err(no_method_error(recv, name)),
+    }
+}
+
+/// The process-global store backing `Fiber[]`/`Thread#[]` (a lazily-created
+/// Hash). Not per-fiber/per-thread — sufficient for a single-fiber boot.
+fn fiber_store(h: &mut crate::host::RubyHost) -> Value {
+    match h.get_global("__fiber_storage__") {
+        Value::Undef => {
+            let hh = h.new_hash(IndexMap::new());
+            h.set_global("__fiber_storage__", hh.clone());
+            hh
+        }
+        v => v,
     }
 }
 
@@ -12378,7 +12417,8 @@ fn do_require(args: &[Value], mode: ReqMode) -> Result<Value, String> {
     let src = std::fs::read_to_string(&abs).map_err(|e| {
         raise_exc("LoadError", &format!("cannot load such file -- {abs_str} ({e})"))
     })?;
-    let prog = crate::compile(&src).map_err(|e| raise_exc("SyntaxError", &e))?;
+    let prog = crate::compile(&src)
+        .map_err(|e| raise_exc("SyntaxError", &format!("{abs_str}: {e}")))?;
 
     // Record the feature before running the body so a circular `require` sees it
     // already loaded and returns false instead of recursing (MRI behavior).

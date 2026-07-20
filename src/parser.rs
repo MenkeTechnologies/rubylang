@@ -298,7 +298,7 @@ impl Parser {
             if o == "=" {
                 self.advance();
                 let rhs = self.assign()?;
-                return Ok(Expr::Assign(Box::new(lhs), Box::new(rhs)));
+                return Ok(Self::rebind_assign(lhs, rhs));
             } else if compound {
                 self.advance();
                 let rhs = self.assign()?;
@@ -323,6 +323,19 @@ impl Parser {
             }
         }
         Ok(lhs)
+    }
+
+    /// Bind an `=` whose parsed left side is a `||`/`&&` chain to the rightmost
+    /// operand, since that chain is not itself an lvalue: `x || y = z` means
+    /// `x || (y = z)` in Ruby (assignment is lower precedence than `||`/`&&` but
+    /// its target is a restricted lvalue). A plain lvalue just becomes `Assign`.
+    fn rebind_assign(lhs: Expr, rhs: Expr) -> Expr {
+        match lhs {
+            Expr::Binary(op @ (BinOp::Or | BinOp::And), a, b) => {
+                Expr::Binary(op, a, Box::new(Self::rebind_assign(*b, rhs)))
+            }
+            other => Expr::Assign(Box::new(other), Box::new(rhs)),
+        }
     }
 
     /// Low-precedence keyword operators `and` / `or` / `not`.
@@ -1386,6 +1399,14 @@ impl Parser {
 
     fn case_expr(&mut self) -> Result<Expr, String> {
         self.advance();
+        // Subject-less `case` (`case; when cond1; …; when cond2; …; end`) is a
+        // multi-way `if`: each `when` condition is tested for truthiness, not
+        // `subject === label`. A terminator or `when` right after `case` means no
+        // subject; desugar the whole thing to an if/elsif chain.
+        if matches!(self.peek(), Tok::Newline | Tok::Semicolon) || self.is_kw("when") {
+            self.skip_terms();
+            return self.case_when_as_if();
+        }
         let subject = self.expr()?;
         self.skip_terms();
         // `case/in` (pattern matching) is chosen by the first clause keyword.
@@ -1411,6 +1432,44 @@ impl Parser {
         Ok(Expr::Case {
             subject: Box::new(subject),
             whens,
+            els,
+        })
+    }
+
+    /// Subject-less `case` → an `if`/`elsif` chain. Each `when a, b` clause tests
+    /// `a || b` for truthiness; the optional `else` is the final branch.
+    fn case_when_as_if(&mut self) -> Result<Expr, String> {
+        let mut clauses: Vec<(Expr, Vec<Stmt>)> = Vec::new();
+        while self.eat_kw("when") {
+            let mut cond = self.expr()?;
+            while self.eat_op(",") {
+                cond = Expr::Binary(BinOp::Or, Box::new(cond), Box::new(self.expr()?));
+            }
+            self.eat_kw("then");
+            let body = self.body_until(&["when", "else", "end"])?;
+            clauses.push((cond, body));
+        }
+        let els = if self.eat_kw("else") {
+            Some(self.body_until(&["end"])?)
+        } else {
+            None
+        };
+        self.expect_kw("end")?;
+        if clauses.is_empty() {
+            // `case; else …; end` with no `when` — just the else body (or nil).
+            let then = els.unwrap_or_else(|| vec![Expr::Nil.into()]);
+            return Ok(Expr::If {
+                cond: Box::new(Expr::True),
+                then,
+                elifs: Vec::new(),
+                els: None,
+            });
+        }
+        let (cond, then) = clauses.remove(0);
+        Ok(Expr::If {
+            cond: Box::new(cond),
+            then,
+            elifs: clauses,
             els,
         })
     }
@@ -1691,6 +1750,9 @@ impl Parser {
     /// it joined with `::`. Used for class/module names and superclasses, where
     /// the whole path names one entity rather than a runtime const lookup.
     fn const_path(&mut self, what: &str) -> Result<String, String> {
+        // A leading `::` is top-level scope resolution (`::Hash`); rubylang's
+        // constants are effectively top-level, so consume it and use the name.
+        self.eat_op("::");
         let mut path = match self.advance() {
             Tok::Const(s) => s,
             other => {
