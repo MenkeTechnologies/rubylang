@@ -9947,7 +9947,12 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             print!("{out}");
             Ok(Value::Undef)
         }
-        "gets" => Ok(read_line()),
+        "gets" => {
+            // MRI's `Kernel#gets` sets `$_` to the line just read (`nil` at EOF).
+            let line = read_line();
+            with_host(|h| h.set_global("_", line.clone()));
+            Ok(line)
+        }
         "proc" => block.ok_or_else(|| "tried to create Proc without a block".into()),
         "lambda" => {
             let b = block.ok_or_else(|| String::from("tried to create Proc without a block"))?;

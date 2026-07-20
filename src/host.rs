@@ -1060,6 +1060,20 @@ impl RubyHost {
         h.set_global("stdout", stdout);
         h.set_global("stderr", stderr);
         h.set_global("stdin", stdin);
+        // Ruby identity constants. `RUBY_ENGINE` names rubylang honestly (engine
+        // split, like JRuby/TruffleRuby); `RUBY_VERSION` is the MRI language level
+        // targeted so gems' `required_ruby_version` checks pass.
+        let ver = h.new_string(crate::RUBY_COMPAT_VERSION.to_string());
+        h.set_const("RUBY_VERSION", ver);
+        let engine = h.new_string(crate::RUBY_ENGINE.to_string());
+        h.set_const("RUBY_ENGINE", engine);
+        let engine_ver = h.new_string(crate::RUBY_ENGINE_VERSION.to_string());
+        h.set_const("RUBY_ENGINE_VERSION", engine_ver);
+        let platform = h.new_string(crate::ruby_platform());
+        h.set_const("RUBY_PLATFORM", platform);
+        let desc = h.new_string(crate::version_banner());
+        h.set_const("RUBY_DESCRIPTION", desc);
+        h.set_const("RUBY_PATCHLEVEL", Value::Int(-1));
         h
     }
 
@@ -1129,6 +1143,40 @@ impl RubyHost {
         let features = self.new_array(Vec::new());
         self.set_global("LOADED_FEATURES", features.clone());
         self.set_global("\"", features);
+    }
+
+    /// Seed the program arguments the way `ruby(1)` does: `ARGV`/`$*` is an Array
+    /// of the post-script command-line arguments, and `$0`/`$PROGRAM_NAME` is the
+    /// script name (the file path, `-e` for a one-liner, or `-` for stdin).
+    pub fn set_program_args(&mut self, argv: &[String], script_name: &str) {
+        let items: Vec<Value> = argv
+            .iter()
+            .map(|a| self.new_string(a.clone()))
+            .collect();
+        let arr = self.new_array(items);
+        self.set_const("ARGV", arr.clone());
+        self.set_global("*", arr);
+        let name = self.new_string(script_name.to_string());
+        self.set_global("0", name.clone());
+        self.set_global("PROGRAM_NAME", name);
+    }
+
+    /// Prepend `-I` directories to the front of `$LOAD_PATH` (MRI resolves `-I`
+    /// dirs before the script dir and gem libs). Must run after `init_load_path`.
+    pub fn prepend_load_path(&mut self, dirs: &[String]) {
+        if dirs.is_empty() {
+            return;
+        }
+        let lp = self.get_global("LOAD_PATH");
+        let news: Vec<Value> = dirs
+            .iter()
+            .map(|d| self.new_string(d.clone()))
+            .collect();
+        if let Some(RObj::Array(items)) = self.obj_mut(&lp) {
+            for (i, v) in news.into_iter().enumerate() {
+                items.insert(i, v);
+            }
+        }
     }
 
     pub fn take_error(&mut self) -> Option<String> {

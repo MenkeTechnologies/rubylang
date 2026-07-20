@@ -25,6 +25,61 @@ pub mod rust_ffi;
 
 pub use fusevm::Value;
 
+/// The MRI language level rubylang targets — the value reported as `RUBY_VERSION`
+/// and in `ruby --version`. Gems test this against `required_ruby_version`.
+pub const RUBY_COMPAT_VERSION: &str = "3.4.0";
+/// `RUBY_ENGINE` — rubylang is its own engine (like `jruby`/`truffleruby`), so
+/// engine-sniffing code can tell it apart from MRI.
+pub const RUBY_ENGINE: &str = "rubylang";
+/// `RUBY_ENGINE_VERSION` — this crate's own version.
+pub const RUBY_ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The `RUBY_PLATFORM` string, built from the host arch/OS.
+pub fn ruby_platform() -> String {
+    format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
+}
+
+/// The `ruby --version` / `-v` banner. Starts with `ruby <X.Y.Z>` so tools that
+/// parse the version line (rbenv/chruby/bundler) read the compat level, then
+/// names the real engine so nothing is misrepresented as MRI.
+pub fn version_banner() -> String {
+    format!(
+        "ruby {} (rubylang {}) [{}]",
+        RUBY_COMPAT_VERSION,
+        RUBY_ENGINE_VERSION,
+        ruby_platform()
+    )
+}
+
+/// Program-invocation configuration threaded in from the command line: `ARGV`,
+/// `-I` load-path prepends, `-r` requires, and the `$0` script name.
+#[derive(Default)]
+pub struct RunConfig {
+    pub argv: Vec<String>,
+    pub includes: Vec<String>,
+    pub requires: Vec<String>,
+    pub script_name: String,
+    /// `-w`/`-W` level: 0 → `$VERBOSE = nil`, 1 → `false`, 2 → `true`.
+    pub warn_level: u8,
+    /// `-d`/`--debug` → `$DEBUG`.
+    pub debug: bool,
+}
+
+/// Seed `$VERBOSE`/`$DEBUG` from the warning level and debug flag (MRI: `-W0`
+/// silences to `nil`, `-w`/`-W2` set `$VERBOSE = true`, default is `false`).
+fn seed_verbosity(cfg: &RunConfig) {
+    // Ruby `nil` is `Value::Undef` in this runtime.
+    let verbose = match cfg.warn_level {
+        0 => Value::Undef,
+        1 => Value::Bool(false),
+        _ => Value::Bool(true),
+    };
+    host::with_host(|h| {
+        h.set_global("VERBOSE", verbose);
+        h.set_global("DEBUG", Value::Bool(cfg.debug));
+    });
+}
+
 /// Compile a source string to a runnable program.
 pub fn compile(src: &str) -> Result<compiler::Program, String> {
     let stmts = parser::parse(src)?;
@@ -42,13 +97,42 @@ pub fn compile_debug(src: &str) -> Result<compiler::Program, String> {
 /// and the `require` file-dir stack are seeded with the current directory so a
 /// `require`/`require_relative` from a `-e` one-liner resolves against it.
 pub fn eval_str(src: &str) -> Result<Value, String> {
+    eval_str_cfg(src, &RunConfig::default())
+}
+
+/// `eval_str` with command-line configuration: seeds `-I` includes, `ARGV`/`$0`,
+/// runs `-r` requires, then the one-liner. `$0`/`__FILE__` default to `-e`.
+pub fn eval_str_cfg(src: &str, cfg: &RunConfig) -> Result<Value, String> {
     host::reset_host();
     let cwd = std::env::current_dir().unwrap_or_default();
     host::with_host(|h| h.init_load_path(&cwd.to_string_lossy()));
+    host::with_host(|h| h.prepend_load_path(&cfg.includes));
     host::push_file_dir(cwd);
+    let name = if cfg.script_name.is_empty() {
+        "-e".to_string()
+    } else {
+        cfg.script_name.clone()
+    };
     // A `-e` one-liner has no script file; MRI reports `__FILE__` as "-e".
-    host::push_file_path("-e".to_string());
+    host::push_file_path(name.clone());
+    host::with_host(|h| h.set_program_args(&cfg.argv, &name));
+    seed_verbosity(cfg);
+    run_requires(&cfg.requires)?;
     run_compiled(compile(src)?)
+}
+
+/// Run each `-r LIB` on the current host before the program. Requires share the
+/// program's host (globals, classes), matching MRI's `-r`.
+fn run_requires(requires: &[String]) -> Result<(), String> {
+    if requires.is_empty() {
+        return Ok(());
+    }
+    // `{lib:?}` quotes+escapes the name into a Ruby string literal for `require`.
+    let src: String = requires
+        .iter()
+        .map(|lib| format!("require {lib:?}\n"))
+        .collect();
+    run_compiled(compile(&src)?).map(|_| ())
 }
 
 /// Merge an already-compiled program onto the current host: rebase its
@@ -80,6 +164,11 @@ pub fn run_compiled(prog: compiler::Program) -> Result<Value, String> {
 /// `require` file-dir stack with the script's own directory (MRI seeds the
 /// running script's dir), so `require`/`require_relative` resolve against it.
 pub fn eval_file(path: &str) -> Result<Value, String> {
+    eval_file_cfg(path, &RunConfig::default())
+}
+
+/// `eval_file` with command-line configuration (`-I`/`-r`/`ARGV`/`$0`).
+pub fn eval_file_cfg(path: &str, cfg: &RunConfig) -> Result<Value, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     host::reset_host();
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
@@ -88,10 +177,14 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     host::with_host(|h| h.init_load_path(&dir.to_string_lossy()));
+    host::with_host(|h| h.prepend_load_path(&cfg.includes));
     host::push_file_dir(dir);
     // `__FILE__` for the top-level script is the path exactly as given on the
-    // command line (MRI does not canonicalize it).
+    // command line (MRI does not canonicalize it). `$0` is the same path.
     host::push_file_path(path.to_string());
+    host::with_host(|h| h.set_program_args(&cfg.argv, path));
+    seed_verbosity(cfg);
+    run_requires(&cfg.requires)?;
     // If `ruby --build FILE` warmed the cache, the stored program is the whole
     // bundled app (every statically-required file inlined). Run it directly —
     // it skips lex/parse/lower AND needs none of the required source files on

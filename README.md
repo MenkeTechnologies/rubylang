@@ -211,16 +211,48 @@ Implemented and checked against the reference `ruby`:
 
 ## [0x04] COMMAND-LINE FLAGS
 
+The `ruby` binary parses the `ruby(1)` option grammar (repeatable `-e`, bundled
+short switches, glued value switches like `-Idir`/`-rlib`, `--` end-of-options,
+and program-file-vs-`ARGV` handling), so shebang scripts and tools that shell out
+to `ruby` work unchanged.
+
+**MRI-compatible switches**
+
 | Flag | Effect |
 | --- | --- |
-| `FILE` | Run a `.rb` script. Runs a matching `--build` bundle from the cache if one is current, else compiles fresh. |
-| `-e SRC` | Run a one-liner. |
+| `FILE [args…]` | Run a `.rb` script; `args` become `ARGV`, `$0`/`$PROGRAM_NAME`/`__FILE__` are set. Runs a matching `--build` bundle from the cache if one is current, else compiles fresh. |
+| `-e SRC [args…]` | Run a one-liner (repeatable; multiple `-e` are joined with newlines). Trailing `args` become `ARGV`; `$0` is `-e`. |
+| `-I DIR` | Prepend `DIR` to `$LOAD_PATH` (repeatable; glued `-Idir` or detached). |
+| `-r LIB` | `require LIB` before the program runs (repeatable). |
+| `-c` | Check syntax only — print `Syntax OK`, do not run. |
+| `-w` / `-W[level]` | Warning level → `$VERBOSE` (`-W0` → `nil`, `-w`/`-W1` → `false`, `-W2` → `true`). |
+| `-d` / `--debug` | Set `$DEBUG`. |
+| `-S` | Search `$PATH` for the program file. |
+| `-v` | Print the version banner, then run any program. |
+| `--version` | Print the version banner and exit. |
+| `-h` / `--help` | Print usage and exit. |
+| `--` | End of options; the next token is the program file, the rest is `ARGV`. |
+
+`RUBY_VERSION` reports `3.4.0` (the targeted MRI language level, so gems'
+`required_ruby_version` checks pass); `RUBY_ENGINE` is `rubylang`,
+`RUBY_ENGINE_VERSION` the crate version, `RUBY_PLATFORM` the host triple. The
+text-processing line-loop switches (`-n`/`-p`/`-a`/`-l`/`-F`) are parsed but not
+yet implemented (they need ARGF plus the Kernel `$_` method family) and error out
+rather than silently mis-running.
+
+**rubylang extensions**
+
+| Flag | Effect |
+| --- | --- |
 | `--repl` | Interactive REPL on a persistent host. |
 | `--lsp` | Language Server Protocol over stdio. |
 | `--dap` | Debug Adapter Protocol over stdio: source-line breakpoints inside methods, stepping, stack + variables. |
 | `--build FILE` | AOT-bundle the whole app — the entrypoint plus every file it statically `require`s / `require_relative`s — into one program in the on-disk cache. A later `ruby FILE` runs it directly, needing none of the required sources on disk. |
 | `--build --native FILE` | Emit a **standalone native executable** next to the script (`app.rb` → `app`). It runs the whole app with no `ruby` interpreter and no `.rb` sources present. `fusevm`'s Cranelift AOT emitter compiles the main chunk to a native object; the full program (methods/classes/blocks/constants) is baked in and linked against the rubylang runtime (`rustc` + the crate rlib). Needs `rustc` and the build tree present. |
-| `--dump-bytecode FILE` | Print the lowered fusevm chunk. |
+| `--dump-tokens FILE` | Print the lexer token stream and exit. |
+| `--dump-ast FILE` | Print the parsed AST and exit. |
+| `--dump-bytecode FILE` | Print the lowered fusevm chunk and exit. |
+| `--disasm FILE` | Print a fusevm bytecode disassembly and exit. |
 
 ---
 

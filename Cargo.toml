@@ -78,7 +78,6 @@ path = "src/bin/parity_fuzz.rs"
 # ahead-of-time object emitter behind `ruby --build`.
 fusevm = { version = "0.14.11", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
 
-clap = { version = "4.5", features = ["derive", "cargo"] }
 thiserror = "2.0"
 rustc-hash = "2.1"
 # Ruby Hash preserves insertion order (observable in `each`/`to_a`/inspect).

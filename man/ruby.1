@@ -14,8 +14,48 @@ JIT. Arithmetic lowers to native VM ops; Ruby object semantics are served by a
 runtime host.
 .SH OPTIONS
 .TP
-.BR \-e ", " \-\-eval " " \fISRC\fR
-Execute a one-liner instead of a file.
+.BR \-e " " \fISRC\fR
+Execute a one-liner instead of a file. Repeatable; multiple
+.B \-e
+snippets are joined with newlines. Trailing arguments become
+.BR ARGV .
+.TP
+.BR \-I " " \fIDIR\fR
+Prepend
+.I DIR
+to
+.BR $LOAD_PATH " (repeatable; glued " \-Idir " or detached)."
+.TP
+.BR \-r " " \fILIB\fR
+.B require
+.I LIB
+before the program runs (repeatable).
+.TP
+.B \-c
+Check syntax only: print
+.BR "Syntax OK" ", do not run."
+.TP
+.BR \-w ", " \-W [\fIlevel\fR]
+Set the warning level in
+.BR $VERBOSE " (" \-W0 " \(-> nil, " \-w / \-W1 " \(-> false, " \-W2 " \(-> true)."
+.TP
+.BR \-d ", " \-\-debug
+Set
+.BR $DEBUG .
+.TP
+.B \-S
+Search
+.B $PATH
+for the program file.
+.TP
+.B \-v
+Print the version banner, then run any program.
+.TP
+.B \-\-version
+Print the version banner and exit.
+.TP
+.BR \-h ", " \-\-help
+Print usage and exit.
 .TP
 .B \-\-repl
 Start the interactive REPL on a persistent host.
