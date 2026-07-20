@@ -627,8 +627,11 @@ impl Parser {
                 }
                 self.expect_op("]")?;
                 e = Expr::Index(Box::new(e), idx);
-            } else if self.eat_op("::") {
-                // Foo::Bar constant access → treat as const ref via Call for now
+            } else if self.is_op("::") && !self.cur_space() {
+                // `Foo::Bar` constant access (via Call). A space before `::` means
+                // it is not scope resolution but a fresh command argument
+                // (`foo ::Bar` → `foo(::Bar)`), so require no preceding space.
+                self.advance();
                 let name = self.method_name()?;
                 e = Expr::Call {
                     recv: Some(Box::new(e)),
@@ -1272,9 +1275,10 @@ impl Parser {
             Tok::Op(o) if o == "*" || o == "**" || o == "&" => {
                 !self.toks.get(self.pos + 1).map(|t| t.space).unwrap_or(true)
             }
-            // A lambda literal (`p ->(x){ x }`), an array/paren group, or a
-            // symbol-array percent literal all begin a command argument.
-            Tok::Op(o) => o == "[" || o == "(" || o == "->",
+            // A lambda literal (`p ->(x){ x }`), an array/paren group, a
+            // top-level constant (`foo ::Bar`), or a symbol-array percent literal
+            // all begin a command argument.
+            Tok::Op(o) => o == "[" || o == "(" || o == "->" || o == "::",
             _ => false,
         }
     }

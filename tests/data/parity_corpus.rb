@@ -1971,3 +1971,15 @@ p [pt.x, pt.y, pt.dist]
 class OneField < Struct.new(:a)
 end
 p OneField.new(7).a
+#==#
+# ── leading-:: constant as an expression and as a command argument ──
+p ::Kernel.respond_to?(:puts)
+#==#
+puts ::Math::PI
+#==#
+def collect(*a, &b); [a, b.call]; end
+def forward(&blk); collect ::Kernel, 1, &blk; end
+p forward { 9 }
+#==#
+# ── parenthesized statement sequence ──
+p((a = 4; b = 5; a * b))

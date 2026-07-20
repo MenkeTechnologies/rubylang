@@ -2809,6 +2809,7 @@ impl RubyHost {
                 | "BasicObject"
                 | "Module"
                 | "Class"
+                | "Kernel"
                 | "Comparable"
                 | "Enumerable"
                 | "NilClass"
