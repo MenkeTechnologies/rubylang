@@ -1983,3 +1983,24 @@ p forward { 9 }
 #==#
 # ── parenthesized statement sequence ──
 p((a = 4; b = 5; a * b))
+#==#
+# ── splat of a Range / Set expands to elements ──
+p [0, *1..3, 4]
+#==#
+p [*"a".."e"]
+#==#
+# ── alias with operator + setter method names ──
+class Store
+  def []=(k, v); (@h ||= {})[k] = v; end
+  def [](k); (@h ||= {})[k]; end
+  alias set []=
+end
+s = Store.new
+s.set(:a, 1)
+p s[:a]
+#==#
+# ── hash literal larger than the MKHASH argc limit (>127 pairs) ──
+big = {}
+(1..200).each { |i| big[i] = i * i }
+lit = eval("{" + (1..200).map { |i| "#{i} => #{i * i}" }.join(", ") + "}")
+p [lit.size, lit[200], lit == big]

@@ -59,6 +59,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::SUPER_BLK, b_super_blk);
     vm.register_builtin(ops::SUPER_FWD_BLK, b_super_fwd_blk);
     vm.register_builtin(ops::MKARGS, b_mkargs);
+    vm.register_builtin(ops::MKHASH_MERGE, b_mkhash_merge);
     vm.register_builtin(ops::CALL_ARR, b_call_arr);
     vm.register_builtin(ops::CALL_METHOD_ARR, b_call_method_arr);
     vm.register_builtin(ops::CALL_ARR_BLK, b_call_arr_blk);
@@ -153,12 +154,39 @@ fn b_defined_desc(vm: &mut VM, _: u8) -> Value {
 }
 
 /// Concatenate `argc` arrays into one (splat argument/element building).
+/// Merge `argc` hashes (left-to-right, later keys win) into one. Used to build a
+/// hash literal too large for a single `MKHASH` (its argc is a `u8`), by chunking
+/// it into sub-hashes.
+fn b_mkhash_merge(vm: &mut VM, argc: u8) -> Value {
+    let pieces = pop_n(vm, argc as usize);
+    let mut map: IndexMap<RKey, Value> = IndexMap::new();
+    for p in &pieces {
+        if let Some(m) = with_host(|h| h.as_hash(p)) {
+            for (k, v) in m {
+                map.insert(k, v);
+            }
+        }
+    }
+    with_host(|h| h.new_hash(map))
+}
+
 fn b_mkargs(vm: &mut VM, argc: u8) -> Value {
     let pieces = pop_n(vm, argc as usize);
     let mut out = Vec::new();
     for p in &pieces {
         match with_host(|h| h.as_array(p)) {
             Some(xs) => out.extend(xs),
+            // A splat of a Range/Set/Enumerator (`*1..5`, `*set`) expands to its
+            // elements via `to_a`; a plain scalar (`*5`) is a one-element run.
+            None if with_host(|h| {
+                h.is_a(p, "Range") || h.is_a(p, "Set") || h.is_a(p, "Enumerator")
+            }) =>
+            {
+                match dispatch(p, "to_a", &[], None).ok().and_then(|a| with_host(|h| h.as_array(&a))) {
+                    Some(xs) => out.extend(xs),
+                    None => out.push(p.clone()),
+                }
+            }
             None => out.push(p.clone()),
         }
     }

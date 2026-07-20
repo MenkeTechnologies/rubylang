@@ -1602,6 +1602,15 @@ impl Parser {
                 }
             }
             Tok::Symbol(s) => Ok(s),
+            // `[]` / `[]=` operator method names (`alias store []=`).
+            Tok::Op(o) if o == "[" => {
+                self.expect_op("]")?;
+                if self.eat_op("=") {
+                    Ok("[]=".to_string())
+                } else {
+                    Ok("[]".to_string())
+                }
+            }
             Tok::Op(o) => Ok(o),
             other => Err(format!("line {}: bad alias name '{other}'", self.line())),
         }

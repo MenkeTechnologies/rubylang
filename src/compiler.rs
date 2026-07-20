@@ -337,11 +337,23 @@ impl Compiler {
             Expr::Array(items) => {
                 if items.iter().any(|it| matches!(it, Expr::Splat(_))) {
                     self.compile_spread(b, items)?;
-                } else {
+                } else if items.len() <= 255 {
                     for it in items {
                         self.compile_expr(b, it)?;
                     }
-                    b.emit(Op::CallBuiltin(ops::MKARRAY, argc(items.len())?), 0);
+                    b.emit(Op::CallBuiltin(ops::MKARRAY, items.len() as u8), 0);
+                } else {
+                    // A literal larger than the MKARRAY argc (u8): build ≤255-item
+                    // chunks and concatenate them with MKARGS.
+                    let mut nchunks = 0usize;
+                    for chunk in items.chunks(255) {
+                        for it in chunk {
+                            self.compile_expr(b, it)?;
+                        }
+                        b.emit(Op::CallBuiltin(ops::MKARRAY, chunk.len() as u8), 0);
+                        nchunks += 1;
+                    }
+                    b.emit(Op::CallBuiltin(ops::MKARGS, argc(nchunks)?), 0);
                 }
             }
             Expr::Splat(e) => {
@@ -367,11 +379,26 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::MKREGEX, 2), 0);
             }
             Expr::Hash(pairs) => {
-                for (k, v) in pairs {
-                    self.compile_expr(b, k)?;
-                    self.compile_expr(b, v)?;
+                if pairs.len() * 2 <= 255 {
+                    for (k, v) in pairs {
+                        self.compile_expr(b, k)?;
+                        self.compile_expr(b, v)?;
+                    }
+                    b.emit(Op::CallBuiltin(ops::MKHASH, (pairs.len() * 2) as u8), 0);
+                } else {
+                    // A literal larger than the MKHASH argc (u8, so >127 pairs):
+                    // build ≤127-pair sub-hashes and merge them (later wins).
+                    let mut nchunks = 0usize;
+                    for chunk in pairs.chunks(127) {
+                        for (k, v) in chunk {
+                            self.compile_expr(b, k)?;
+                            self.compile_expr(b, v)?;
+                        }
+                        b.emit(Op::CallBuiltin(ops::MKHASH, (chunk.len() * 2) as u8), 0);
+                        nchunks += 1;
+                    }
+                    b.emit(Op::CallBuiltin(ops::MKHASH_MERGE, argc(nchunks)?), 0);
                 }
-                b.emit(Op::CallBuiltin(ops::MKHASH, argc(pairs.len() * 2)?), 0);
             }
             Expr::Range { lo, hi, exclusive } => {
                 // An absent bound compiles to a sentinel the runtime recognizes.

@@ -132,6 +132,7 @@ pub mod ops {
     pub const SUPER_BLK: u16 = 47; // [args..., proc] argc=n+1 -> super with explicit args + a new block
     pub const SUPER_FWD_BLK: u16 = 48; // [proc] -> super forwarding args, with a new block
     pub const MKSTRF: u16 = 49; // [parts...] argc=n -> frozen heap String (frozen_string_literal)
+    pub const MKHASH_MERGE: u16 = 50; // [hashes...] argc=n -> one merged Hash (later wins)
 }
 
 /// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried
