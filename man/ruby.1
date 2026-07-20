@@ -31,6 +31,15 @@ Ahead-of-time compile the script's bytecode into the on-disk cache.
 .TP
 .B \-\-dump\-bytecode " " \fIFILE\fR
 Print the lowered fusevm bytecode and exit.
+.TP
+.B \-\-dump\-tokens " " \fIFILE\fR
+Print the lexer token stream and exit.
+.TP
+.B \-\-dump\-ast " " \fIFILE\fR
+Print the parsed AST and exit.
+.TP
+.B \-\-disasm " " \fIFILE\fR
+Print a fusevm bytecode disassembly listing and exit.
 .SH EXIT STATUS
 0 on success, 1 on a parse or runtime error (reported to stderr as
 .IR "ruby: <reason>" ).
