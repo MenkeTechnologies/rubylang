@@ -803,6 +803,7 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
                 | "public_constant"
                 | "private_class_method"
                 | "public_class_method"
+                | "deprecate_constant"
         ) {
             return Ok(match args {
                 [one] if name != "module_function" => one.clone(),
@@ -1561,6 +1562,49 @@ fn dispatch_classref(
             "[]=" => {
                 let store = with_host(fiber_store);
                 return dispatch(&store, "[]=", args, None);
+            }
+            _ => {}
+        }
+    }
+    // `Regexp` class methods: build/escape/union, and the last-match accessor.
+    if cls == "Regexp" {
+        match name {
+            "new" | "compile" => {
+                let src = match with_host(|h| h.as_regex(&args[0])) {
+                    Some((_, s)) => s,
+                    None => arg_str(&args[0]),
+                };
+                // A truthy second arg means case-insensitive (Regexp::IGNORECASE
+                // is 1); the full option bitset is not modeled.
+                let flags = match args.get(1) {
+                    Some(Value::Bool(true)) | Some(Value::Int(_)) => "i",
+                    _ => "",
+                };
+                return with_host(|h| h.new_regex(&src, flags));
+            }
+            "escape" | "quote" => return Ok(new_str(regex_escape(&arg_str(&args[0])))),
+            "union" => {
+                // Flatten a single array arg; each element contributes its source
+                // (a String is escaped, a Regexp uses its pattern), joined by `|`.
+                let items: Vec<Value> = match args {
+                    [one] => with_host(|h| h.as_array(one)).unwrap_or_else(|| vec![one.clone()]),
+                    many => many.to_vec(),
+                };
+                let parts: Vec<String> = items
+                    .iter()
+                    .map(|v| match with_host(|h| h.as_regex(v)) {
+                        Some((_, s)) => format!("(?-mix:{s})"),
+                        None => regex_escape(&arg_str(v)),
+                    })
+                    .collect();
+                return with_host(|h| h.new_regex(&parts.join("|"), ""));
+            }
+            "last_match" => {
+                let m = with_host(|h| h.get_global("~"));
+                return match args.first() {
+                    Some(idx) => dispatch(&m, "[]", std::slice::from_ref(idx), None),
+                    None => Ok(m),
+                };
             }
             _ => {}
         }
@@ -9790,6 +9834,28 @@ fn dispatch_method(
         "to_proc" => Ok(recv.clone()),
         _ => Err(no_method_error(recv, name)),
     }
+}
+
+/// Escape regex metacharacters in `s` (`Regexp.escape`/`quote`), matching MRI's
+/// set: metacharacters get a backslash, control chars become escape sequences.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '.' | '\\' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|'
+            | '#' | '-' | ' ' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x0c' => out.push_str("\\f"),
+            '\x0b' => out.push_str("\\v"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn dispatch_regexp(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {

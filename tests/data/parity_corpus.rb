@@ -1882,3 +1882,30 @@ require "set"
 p [1, 2, 2, 3, 3, 3].to_set.size
 #==#
 p 255.size
+#==#
+# ── Regexp class methods ──
+p Regexp.escape("a.b*c?")
+#==#
+p Regexp.union("a", "b.c").source
+#==#
+p Regexp.new("ab+").class.to_s
+#==#
+"hello" =~ /l+/
+p Regexp.last_match(0)
+#==#
+# ── extend a sibling nested module by bare name (class + module bodies) ──
+module Outer
+  module Helper
+    def helped; "yes"; end
+  end
+  extend Helper
+end
+p Outer.helped
+#==#
+class Klass
+  module Mixin
+    def mixed; 42; end
+  end
+  extend Mixin
+end
+p Klass.mixed

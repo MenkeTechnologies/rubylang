@@ -2854,6 +2854,9 @@ impl RubyHost {
                 | "Fiddle::Pointer"
                 | "StringIO"
                 | "Random"
+                | "Regexp"
+                | "MatchData"
+                | "Encoding"
                 // `GC`/`ObjectSpace` are modeled as class-refs so their module
                 // methods dispatch through `dispatch_classref` (GC control is a
                 // no-op here; ObjectSpace's heap enumeration is limited).
@@ -3016,11 +3019,18 @@ impl RubyHost {
                 return Some(m.clone());
             }
             // `extend M` adds M's *instance* methods as class methods, after
-            // the class's own `def self.m` (last extend wins).
+            // the class's own `def self.m` (last extend wins). A bare `M` written
+            // inside this class's body may name a sibling nested module
+            // (`<name>::M`) — which registers at runtime, so it wasn't resolvable
+            // when the extend was compiled — so try the class's own namespace
+            // first, then the stored/top-level name.
             for module in def.extends.iter().rev() {
-                if let Some(md) = self.classes.get(module) {
-                    if let Some(m) = md.methods.get(method) {
-                        return Some(m.clone());
+                let nested = format!("{name}::{module}");
+                for cand in [&nested, module] {
+                    if let Some(md) = self.classes.get(cand) {
+                        if let Some(m) = md.methods.get(method) {
+                            return Some(m.clone());
+                        }
                     }
                 }
             }
