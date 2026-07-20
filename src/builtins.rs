@@ -2061,6 +2061,12 @@ fn dispatch_classref(
             let m = name_of(&args[0]);
             Ok(Value::Bool(with_host(|h| h.is_method_defined(cls, &m))))
         }
+        // `Module#instance_method(:name)` — an UnboundMethod, modeled as a
+        // receiver-less Method (`recv` = nil) that `bind`/`bind_call` re-target.
+        "instance_method" => {
+            let m = name_of(&args[0]);
+            Ok(with_host(|h| h.new_method(Value::Undef, &m)))
+        }
         // Numeric class constants (`Float::INFINITY`, `Float::NAN`, …), reached
         // via `::` (which lowers to a method call on the class reference).
         "INFINITY" if cls == "Float" => Ok(Value::Float(f64::INFINITY)),
@@ -9889,6 +9895,12 @@ fn dispatch_method(
     };
     match name {
         "call" | "()" | "[]" | "yield" | "===" => call_bound(&mrecv, &mname, args, block),
+        // UnboundMethod (or Method) rebinding: `bind(obj)` yields a Method bound
+        // to `obj`; `bind_call(obj, *args)` binds and invokes in one step.
+        "bind" => Ok(with_host(|h| h.new_method(args[0].clone(), &mname))),
+        "bind_call" => call_bound(&args[0], &mname, &args[1..], block),
+        // `Method#unbind` — drop the receiver, yielding an UnboundMethod.
+        "unbind" => Ok(with_host(|h| h.new_method(Value::Undef, &mname))),
         "arity" => Ok(Value::Int(with_host(|h| h.method_arity(&mrecv, &mname)))),
         "name" => Ok(with_host(|h| h.new_symbol(&mname))),
         "receiver" => Ok(mrecv),

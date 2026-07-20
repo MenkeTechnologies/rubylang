@@ -2026,3 +2026,12 @@ rescue ZeroDivisionError
   -1
 end
 p r
+#==#
+# ── UnboundMethod: instance_method / bind / bind_call ──
+um = String.instance_method(:upcase)
+p um.bind("hi").call
+#==#
+p Integer.instance_method(:+).bind_call(3, 4)
+#==#
+# ── rescue with a top-level-scoped exception class ──
+p(begin; raise NameError, "boom"; rescue ::NameError => e; e.message; end)

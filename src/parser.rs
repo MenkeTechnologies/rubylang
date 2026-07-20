@@ -1921,8 +1921,11 @@ impl Parser {
         while self.eat_kw("rescue") {
             let mut classes = Vec::new();
             // optional list of exception class names, each possibly namespaced
-            // (`rescue Foo::Bar => e`) — stored under its qualified name.
-            while let Tok::Const(c) = self.peek().clone() {
+            // (`rescue Foo::Bar => e`) or top-level-scoped (`rescue ::NameError`)
+            // — stored under its qualified name.
+            loop {
+                self.eat_op("::"); // optional leading top-level `::`
+                let Tok::Const(c) = self.peek().clone() else { break };
                 self.advance();
                 let mut path = c;
                 while self.is_op("::") {
