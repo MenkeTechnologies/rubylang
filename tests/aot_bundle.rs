@@ -63,7 +63,10 @@ fn run_home(home: &Path, args: &[&str], path: &Path) -> (String, String, bool) {
 /// The reference MRI output, if `/opt/homebrew/bin/ruby` is present. Used as a
 /// third witness; the rubylang-vs-rubylang equality is asserted unconditionally.
 fn mri(path: &Path) -> Option<String> {
-    let out = Command::new("/opt/homebrew/bin/ruby").arg(path).output().ok()?;
+    let out = Command::new("/opt/homebrew/bin/ruby")
+        .arg(path)
+        .output()
+        .ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).to_string())
@@ -126,7 +129,10 @@ fn bundles_a_three_file_app_and_runs_from_cache_without_sources() {
     std::fs::remove_file(dir.join("other.rb")).unwrap();
     let (cached, cerr, cok) = run_home(&home, &[], &app);
     assert!(cok, "cached run failed (sources deleted): {cerr}");
-    assert_eq!(cached, expected, "bundled/cached output with sources deleted");
+    assert_eq!(
+        cached, expected,
+        "bundled/cached output with sources deleted"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -146,11 +152,7 @@ fn mri_parity_for_bundled_app() {
         "require_relative \"c\"\n\
          class Chain\n  def run; [from_c].map { |s| s + \"B\" }.first; end\nend\n",
     );
-    let a = write(
-        &dir,
-        "a.rb",
-        "require_relative \"b\"\nputs Chain.new.run\n",
-    );
+    let a = write(&dir, "a.rb", "require_relative \"b\"\nputs Chain.new.run\n");
 
     let (direct, e1, o1) = run_home(&home, &[], &a);
     assert!(o1, "{e1}");

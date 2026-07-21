@@ -127,14 +127,20 @@ fn tcp_server_serves_a_raw_std_net_client() {
     use std::io::Read;
     stream.read_to_string(&mut resp).expect("read response");
 
-    let served = server.join().expect("server thread panicked").expect("server eval error");
+    let served = server
+        .join()
+        .expect("server thread panicked")
+        .expect("server eval error");
     assert_eq!(served, ":served");
 
     assert!(
         resp.starts_with("HTTP/1.1 200 OK\r\n"),
         "response status line, got: {resp:?}"
     );
-    assert!(resp.ends_with("\r\n\r\npong"), "response body, got: {resp:?}");
+    assert!(
+        resp.ends_with("\r\n\r\npong"),
+        "response body, got: {resp:?}"
+    );
 }
 
 /// `TCPServer#addr` reports the bound family/port/host, and a fresh `TCPServer`

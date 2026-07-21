@@ -201,7 +201,11 @@ fn install_menu_bindings(keybindings: &mut Keybindings) {
 
 fn build_static_completions() -> Vec<String> {
     let mut v: Vec<String> = KEYWORDS.iter().map(|s| (*s).to_string()).collect();
-    v.extend(lsp::corpus().iter().map(|(name, _, _, _)| (*name).to_string()));
+    v.extend(
+        lsp::corpus()
+            .iter()
+            .map(|(name, _, _, _)| (*name).to_string()),
+    );
     v.sort();
     v.dedup();
     v

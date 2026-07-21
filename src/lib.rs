@@ -104,7 +104,11 @@ fn has_frozen_string_literal(src: &str) -> bool {
         };
         // Accept `# frozen_string_literal: true` and `-*- … -*-` emacs form.
         if let Some(after) = rest.split("frozen_string_literal:").nth(1) {
-            return after.trim_start().trim_end_matches("-*-").trim().starts_with("true");
+            return after
+                .trim_start()
+                .trim_end_matches("-*-")
+                .trim()
+                .starts_with("true");
         }
     }
     false

@@ -980,11 +980,7 @@ pub fn eval_block_scoped(
 /// Compile and run `src` with `self` rebound to `self_val` and `target` as the
 /// active `def` target (string `class_eval`/`instance_eval`). Methods, classes,
 /// and constants it defines persist on the host.
-pub fn eval_string_scoped(
-    src: &str,
-    self_val: &Value,
-    target: DefTarget,
-) -> Result<Value, String> {
+pub fn eval_string_scoped(src: &str, self_val: &Value, target: DefTarget) -> Result<Value, String> {
     DEF_TARGET.with(|t| t.borrow_mut().push(target));
     with_host(|h| {
         h.frames.push(Frame {
@@ -1014,10 +1010,7 @@ pub fn eval_string_scoped(
 /// template locals in a binding that does not see (or pollute) the caller's
 /// variables. `self` is a blank `Object`, so the template's instance-variable
 /// reads start empty — matching MRI's `result_with_hash` (a new binding).
-pub fn eval_erb_with_locals(
-    src: &str,
-    locals: Vec<(String, Value)>,
-) -> Result<Value, String> {
+pub fn eval_erb_with_locals(src: &str, locals: Vec<(String, Value)>) -> Result<Value, String> {
     let self_obj = with_host(|h| h.new_object("Object"));
     let env = new_env();
     {
@@ -1079,14 +1072,7 @@ pub fn call_singleton(
     block: Option<Value>,
 ) -> Result<Value, String> {
     let def_class = with_host(|h| h.class_of(&recv));
-    run_method(
-        def,
-        recv,
-        args,
-        block,
-        Some(name.into()),
-        Some(def_class),
-    )
+    run_method(def, recv, args, block, Some(name.into()), Some(def_class))
 }
 
 /// Merge a class/module definition into the store, implementing Ruby's
@@ -1287,10 +1273,7 @@ impl RubyHost {
     /// of the post-script command-line arguments, and `$0`/`$PROGRAM_NAME` is the
     /// script name (the file path, `-e` for a one-liner, or `-` for stdin).
     pub fn set_program_args(&mut self, argv: &[String], script_name: &str) {
-        let items: Vec<Value> = argv
-            .iter()
-            .map(|a| self.new_string(a.clone()))
-            .collect();
+        let items: Vec<Value> = argv.iter().map(|a| self.new_string(a.clone())).collect();
         let arr = self.new_array(items);
         self.set_const("ARGV", arr.clone());
         self.set_global("*", arr);
@@ -1306,10 +1289,7 @@ impl RubyHost {
             return;
         }
         let lp = self.get_global("LOAD_PATH");
-        let news: Vec<Value> = dirs
-            .iter()
-            .map(|d| self.new_string(d.clone()))
-            .collect();
+        let news: Vec<Value> = dirs.iter().map(|d| self.new_string(d.clone())).collect();
         if let Some(RObj::Array(items)) = self.obj_mut(&lp) {
             for (i, v) in news.into_iter().enumerate() {
                 items.insert(i, v);
@@ -1520,7 +1500,13 @@ impl RubyHost {
     }
     /// Whether `v` is a generator that has not yet been materialized.
     pub fn generator_unmaterialized(&self, v: &Value) -> bool {
-        matches!(self.obj(v), Some(RObj::Generator { materialized: None, .. }))
+        matches!(
+            self.obj(v),
+            Some(RObj::Generator {
+                materialized: None,
+                ..
+            })
+        )
     }
     /// Open a fresh sink and return a `Yielder` bound to it that stops the
     /// generator after `limit` values (`usize::MAX` = run to completion). Pair
@@ -2246,10 +2232,7 @@ impl RubyHost {
             .rev()
             .map(|f| {
                 (
-                    f.scope
-                        .method_name
-                        .clone()
-                        .unwrap_or_else(|| "main".into()),
+                    f.scope.method_name.clone().unwrap_or_else(|| "main".into()),
                     f.line,
                 )
             })
@@ -2304,7 +2287,11 @@ impl RubyHost {
                 None => break,
             }
         }
-        self.cur_env().lock().unwrap().vars.insert(name.to_string(), v);
+        self.cur_env()
+            .lock()
+            .unwrap()
+            .vars
+            .insert(name.to_string(), v);
     }
     pub fn local_defined(&self, name: &str) -> bool {
         let mut env = self.cur_env();
@@ -3565,7 +3552,9 @@ impl RubyHost {
                 Some(RObj::Range { .. }) => "Range",
                 Some(RObj::FloatRange { .. }) => "Range",
                 Some(RObj::StrRange { .. }) => "Range",
-                Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) | Some(RObj::CycleProc(_)) => "Proc",
+                Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) | Some(RObj::CycleProc(_)) => {
+                    "Proc"
+                }
                 Some(RObj::Method { .. }) => "Method",
                 Some(RObj::Regexp { .. }) => "Regexp",
                 Some(RObj::MatchData { .. }) => "MatchData",
@@ -3895,10 +3884,8 @@ impl RubyHost {
                 Sub => {
                     if let Some(sb) = self.datetime_secs(b) {
                         let numer = num_bigint::BigInt::from((sa - sb).round() as i64);
-                        let r = num_rational::BigRational::new(
-                            numer,
-                            num_bigint::BigInt::from(86_400),
-                        );
+                        let r =
+                            num_rational::BigRational::new(numer, num_bigint::BigInt::from(86_400));
                         return Ok(self.new_rational(r));
                     }
                     if let Some(n) = num_f(b) {
@@ -4020,8 +4007,14 @@ impl RubyHost {
                     // compares by identity; we carry a fresh object per call and
                     // compare by name to the same effect.
                     (
-                        Some(RObj::Object { class: ca, ivars: ia }),
-                        Some(RObj::Object { class: cb, ivars: ib }),
+                        Some(RObj::Object {
+                            class: ca,
+                            ivars: ia,
+                        }),
+                        Some(RObj::Object {
+                            class: cb,
+                            ivars: ib,
+                        }),
                     ) if ca == "Encoding" && cb == "Encoding" => {
                         match (ia.get("name"), ib.get("name")) {
                             (Some(x), Some(y)) => self.eq_values(x, y),
@@ -4711,8 +4704,7 @@ pub fn call_super_blk(
     // Linearize from the receiver's actual class so prepend/include super hits
     // the next method in ancestry order; class-method super (self_obj is a class
     // ref, no object class) falls back to the owner's chain.
-    let recv_class =
-        with_host(|h| h.object_class(&self_obj)).unwrap_or_else(|| def_class.clone());
+    let recv_class = with_host(|h| h.object_class(&self_obj)).unwrap_or_else(|| def_class.clone());
     let Some((def, owner)) = with_host(|h| h.find_super(&recv_class, &def_class, &method)) else {
         // No user-defined super method in the ancestor chain. A `super` from a
         // user `initialize` up to a native superclass initializer is the common
@@ -4991,7 +4983,10 @@ pub fn fiber_resume(fiber: &Value, v: Value) -> Result<Value, String> {
         _ => return Err("not a fiber".into()),
     };
     if with_fibers(|fibers| fibers[id as usize].done) {
-        return Err(crate::builtins::raise_exc("FiberError", "dead fiber called"));
+        return Err(crate::builtins::raise_exc(
+            "FiberError",
+            "dead fiber called",
+        ));
     }
     let mut coro = with_fibers(|fibers| fibers[id as usize].coro.take())
         .ok_or_else(|| crate::builtins::raise_exc("FiberError", "double resume of a fiber"))?;
@@ -5345,11 +5340,7 @@ pub fn db_execute(
             .ok_or_else(|| "cannot use a closed database".to_string())?;
         let mut stmt = cell.conn.prepare(sql).map_err(|e| e.to_string())?;
         let ncol = stmt.column_count();
-        let cols: Vec<String> = stmt
-            .column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         // The sqlite3 gem leaves any placeholder with no supplied bind as NULL
         // (`execute(sql, "one")` against two `?`s binds the second to NULL). Pad
         // to the statement's parameter count so rusqlite's strict count check
@@ -5435,7 +5426,9 @@ pub fn db_set_results_as_hash(v: &Value, on: bool) {
 /// Whether `db.results_as_hash` is set (rows returned as Hashes).
 pub fn db_results_as_hash(v: &Value) -> bool {
     match db_id(v) {
-        Some(id) => with_host(|h| matches!(h.db_handles.get(id as usize), Some(Some(c)) if c.results_as_hash)),
+        Some(id) => with_host(
+            |h| matches!(h.db_handles.get(id as usize), Some(Some(c)) if c.results_as_hash),
+        ),
         None => false,
     }
 }
@@ -5457,11 +5450,8 @@ pub fn fiddle_dlopen(path: Option<&str>) -> Result<Value, String> {
             // `Fiddle.dlopen` does — the operation is inherently unsafe and its
             // safety is the caller's responsibility (a bad path only errors).
             unsafe {
-                libloading::os::unix::Library::open(
-                    Some(p),
-                    libc::RTLD_LAZY | libc::RTLD_GLOBAL,
-                )
-                .map_err(|e| e.to_string())?
+                libloading::os::unix::Library::open(Some(p), libc::RTLD_LAZY | libc::RTLD_GLOBAL)
+                    .map_err(|e| e.to_string())?
             }
         }
     };
@@ -5493,9 +5483,8 @@ pub fn fiddle_sym(v: &Value, name: &str) -> Result<u64, String> {
         // detaches it into a bare address that stays valid while the library is
         // loaded (it lives in `fiddle_libs` until `#close`). We only read the
         // address, never call through this typing.
-        let sym: libloading::os::unix::Symbol<*mut std::ffi::c_void> = unsafe {
-            lib.0.get(&sym_bytes).map_err(|e| e.to_string())?
-        };
+        let sym: libloading::os::unix::Symbol<*mut std::ffi::c_void> =
+            unsafe { lib.0.get(&sym_bytes).map_err(|e| e.to_string())? };
         Ok(sym.into_raw() as u64)
     })
 }
@@ -5731,7 +5720,9 @@ pub fn io_read_all(v: &Value) -> Result<String, String> {
                     .map_err(|e| e.to_string())?;
                 Ok(s)
             }
-            Some(IoCell::Stdout) | Some(IoCell::Stderr) => Err("not opened for reading".to_string()),
+            Some(IoCell::Stdout) | Some(IoCell::Stderr) => {
+                Err("not opened for reading".to_string())
+            }
             Some(IoCell::TcpListener { .. }) | Some(IoCell::TcpStream { .. }) => {
                 Err("not an IO".to_string())
             }
@@ -5838,7 +5829,9 @@ fn io_alloc_cell(cell: IoCell) -> Value {
 /// read/write without holding the host borrow). Errors if closed or not a stream.
 fn tcp_stream_clone(id: u32) -> Result<std::net::TcpStream, String> {
     with_host(|h| match h.io_handles.get(id as usize) {
-        Some(IoCell::TcpStream { stream: Some(s), .. }) => s.try_clone().map_err(|e| e.to_string()),
+        Some(IoCell::TcpStream {
+            stream: Some(s), ..
+        }) => s.try_clone().map_err(|e| e.to_string()),
         Some(IoCell::TcpStream { stream: None, .. }) => Err("closed stream".to_string()),
         _ => Err("not a TCPSocket".to_string()),
     })
@@ -6039,7 +6032,9 @@ pub fn tcp_addr(v: &Value, peer: bool) -> Result<Value, String> {
         Some(IoCell::TcpListener {
             listener: Some(l), ..
         }) if !peer => l.local_addr().map_err(|e| e.to_string()),
-        Some(IoCell::TcpStream { stream: Some(s), .. }) => {
+        Some(IoCell::TcpStream {
+            stream: Some(s), ..
+        }) => {
             if peer {
                 s.peer_addr().map_err(|e| e.to_string())
             } else {
@@ -6050,7 +6045,11 @@ pub fn tcp_addr(v: &Value, peer: bool) -> Result<Value, String> {
         | Some(IoCell::TcpStream { stream: None, .. }) => Err("closed stream".to_string()),
         _ => Err("not a socket".to_string()),
     })?;
-    let fam = if addr.is_ipv6() { "AF_INET6" } else { "AF_INET" };
+    let fam = if addr.is_ipv6() {
+        "AF_INET6"
+    } else {
+        "AF_INET"
+    };
     let ip = addr.ip().to_string();
     Ok(with_host(|h| {
         let items = vec![
@@ -6236,7 +6235,11 @@ pub fn call_proc_self(
                 .map(|s| s.to_vec())
                 .unwrap_or_default();
             let arr = with_host(|h| h.new_array(rest));
-            child.lock().unwrap().vars.insert(def.params[si].clone(), arr);
+            child
+                .lock()
+                .unwrap()
+                .vars
+                .insert(def.params[si].clone(), arr);
             for (j, p) in def.params.iter().skip(si + 1).enumerate() {
                 let v = bound.get(splat_end + j).cloned().unwrap_or(Value::Undef);
                 child.lock().unwrap().vars.insert(p.clone(), v);

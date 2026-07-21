@@ -2107,8 +2107,8 @@ fn lower_hash_pattern(
     }
     // `**nil` (or a bare `{}`) forbids any other keys: the subject must contain
     // exactly the listed keys.
-    let exact = matches!(rest, HashRest::Nil)
-        || (matches!(rest, HashRest::None) && pairs.is_empty());
+    let exact =
+        matches!(rest, HashRest::Nil) || (matches!(rest, HashRest::None) && pairs.is_empty());
     if exact {
         test = pand(
             test,

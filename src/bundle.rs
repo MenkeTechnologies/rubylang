@@ -194,9 +194,7 @@ impl Bundler {
             // A non-require call: recurse the receiver and arguments (a require
             // nested as an argument is still found), but not the block body —
             // a block runs when the method yields, not at load time.
-            Expr::Call {
-                recv, args, ..
-            } => {
+            Expr::Call { recv, args, .. } => {
                 self.walk_opt(recv, base)?;
                 self.walk_exprs(args, base)?;
             }
@@ -205,9 +203,7 @@ impl Bundler {
                 self.walk_exprs(idxs, base)?;
             }
             // Class/module bodies execute at load time — bundle their requires.
-            Expr::Class { body, .. } | Expr::Module { body, .. } => {
-                self.walk_body(body, base)?
-            }
+            Expr::Class { body, .. } | Expr::Module { body, .. } => self.walk_body(body, base)?,
             Expr::SingletonClass { body, .. } => self.walk_body(body, base)?,
             Expr::Begin {
                 body,

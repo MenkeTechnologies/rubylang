@@ -137,11 +137,7 @@ fn required_begin_rescue_body_runs_correctly_begin_id_merge() {
 fn double_require_returns_false_and_does_not_rerun() {
     let dir = fresh_dir("dedup");
     // The required file appends to a global each time its body runs.
-    write(
-        &dir,
-        "lib/once.rb",
-        "$runs ||= 0\n$runs += 1\n",
-    );
+    write(&dir, "lib/once.rb", "$runs ||= 0\n$runs += 1\n");
     let main = write(
         &dir,
         "main.rb",
@@ -162,12 +158,12 @@ fn require_relative_resolves_against_requiring_file() {
     // "b" — resolved against sub/, not dir/. A path bug would fail to find b.
     let dir = fresh_dir("relative");
     write(&dir, "sub/b.rb", "def from_b; \"B\"; end\n");
-    write(&dir, "sub/a.rb", "require_relative \"b\"\ndef from_a; from_b + \"A\"; end\n");
-    let main = write(
+    write(
         &dir,
-        "main.rb",
-        "require_relative \"sub/a\"\nputs from_a\n",
+        "sub/a.rb",
+        "require_relative \"b\"\ndef from_a; from_b + \"A\"; end\n",
     );
+    let main = write(&dir, "main.rb", "require_relative \"sub/a\"\nputs from_a\n");
     let (stdout, stderr, ok) = run(&main);
     assert!(ok, "stderr: {stderr}");
     assert_eq!(stdout, "BA\n");
@@ -209,10 +205,7 @@ fn loaded_features_and_load_path_track_state() {
     let (stdout, stderr, ok) = run(&main);
     assert!(ok, "stderr: {stderr}");
     let canon = std::fs::canonicalize(&helper).unwrap();
-    assert_eq!(
-        stdout,
-        format!("1\n{}\ntrue\n", canon.to_string_lossy())
-    );
+    assert_eq!(stdout, format!("1\n{}\ntrue\n", canon.to_string_lossy()));
 }
 
 #[test]
@@ -243,8 +236,16 @@ fn three_file_require_chain() {
     // a requires b requires c (each require_relative). Assert load order, a
     // cross-file method call chain, and the loaded-feature count.
     let dir = fresh_dir("chain");
-    write(&dir, "c.rb", "$order ||= []\n$order << \"c\"\ndef from_c; \"C\"; end\n");
-    write(&dir, "b.rb", "require_relative \"c\"\n$order << \"b\"\ndef from_b; from_c + \"B\"; end\n");
+    write(
+        &dir,
+        "c.rb",
+        "$order ||= []\n$order << \"c\"\ndef from_c; \"C\"; end\n",
+    );
+    write(
+        &dir,
+        "b.rb",
+        "require_relative \"c\"\n$order << \"b\"\ndef from_b; from_c + \"B\"; end\n",
+    );
     let a = write(
         &dir,
         "a.rb",

@@ -36,22 +36,17 @@ fn thread_join_returns_the_thread() {
 #[test]
 fn threads_share_the_object_heap() {
     // A mutation inside the thread is visible to the joiner — one shared heap.
-    assert_eq!(
-        run("a = []; Thread.new { a << :x }.join; p a"),
-        "[:x]\n"
-    );
+    assert_eq!(run("a = []; Thread.new { a << :x }.join; p a"), "[:x]\n");
 }
 
 #[test]
 fn gvl_serializes_read_modify_write() {
     // 20 threads each do 1000 non-atomic `+= 1`. Without the GVL making each
     // Ruby step exclusive this loses updates; with it the total is exact.
-    let out = run(
-        "c = [0]
+    let out = run("c = [0]
          ts = (1..20).map { Thread.new { 1000.times { c[0] += 1 } } }
          ts.each(&:join)
-         p c[0]",
-    );
+         p c[0]");
     assert_eq!(out, "20000\n");
 }
 
@@ -97,13 +92,11 @@ fn thread_local_variables_do_not_leak_to_the_spawner() {
 
 #[test]
 fn mutex_synchronize_guards_a_counter() {
-    let out = run(
-        "m = Mutex.new
+    let out = run("m = Mutex.new
          c = [0]
          ts = (1..10).map { Thread.new { 100.times { m.synchronize { c[0] += 1 } } } }
          ts.each(&:join)
-         p c[0]",
-    );
+         p c[0]");
     assert_eq!(out, "1000\n");
 }
 
@@ -121,13 +114,11 @@ fn queue_blocks_consumer_until_producer_pushes() {
 fn queue_work_sharing_across_threads() {
     // Four workers drain a closed queue of 1..100; every item is handled once, so
     // the totals sum to 5050 regardless of how the work is split.
-    let out = run(
-        "q = Queue.new
+    let out = run("q = Queue.new
          (1..100).each { |i| q.push(i) }
          q.close
          ts = (1..4).map { Thread.new { s = 0; while (x = q.pop); s += x; end; s } }
-         p ts.map(&:value).sum",
-    );
+         p ts.map(&:value).sum");
     assert_eq!(out, "5050\n");
 }
 

@@ -182,7 +182,10 @@ fn b_mkargs(vm: &mut VM, argc: u8) -> Value {
                 h.is_a(p, "Range") || h.is_a(p, "Set") || h.is_a(p, "Enumerator")
             }) =>
             {
-                match dispatch(p, "to_a", &[], None).ok().and_then(|a| with_host(|h| h.as_array(&a))) {
+                match dispatch(p, "to_a", &[], None)
+                    .ok()
+                    .and_then(|a| with_host(|h| h.as_array(&a)))
+                {
                     Some(xs) => out.extend(xs),
                     None => out.push(p.clone()),
                 }
@@ -565,9 +568,7 @@ fn b_fire_hook(vm: &mut VM, _: u8) -> Value {
     if let Some(def) = with_host(|h| h.find_class_method(&module, &hook)) {
         let recv = with_host(|h| h.class_ref(&module));
         let arg = with_host(|h| h.class_ref(&target));
-        if let Err(e) =
-            crate::host::call_class_method(recv, &def, &hook, &module, &[arg], None)
-        {
+        if let Err(e) = crate::host::call_class_method(recv, &def, &hook, &module, &[arg], None) {
             return abort(vm, e);
         }
     }
@@ -827,7 +828,10 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
         // `class_eval` / conditional class body) — register native accessors.
         // `attr :x` is a reader (the deprecated `attr :x, true` accessor form is
         // not modeled).
-        if matches!(name, "attr" | "attr_accessor" | "attr_reader" | "attr_writer") {
+        if matches!(
+            name,
+            "attr" | "attr_accessor" | "attr_reader" | "attr_writer"
+        ) {
             let reader = name != "attr_writer";
             let writer = matches!(name, "attr_accessor" | "attr_writer");
             for a in args {
@@ -1039,7 +1043,9 @@ pub(crate) fn dispatch(
                 return Ok(Value::Bool(with_host(|h| h.is_a(&args[0], &cls))));
             }
             if let Some((re, _)) = with_host(|h| h.as_regex(recv)) {
-                return Ok(Value::Bool(re.is_match(&arg_str(&args[0])).unwrap_or(false)));
+                return Ok(Value::Bool(
+                    re.is_match(&arg_str(&args[0])).unwrap_or(false),
+                ));
             }
             if let Some((lo, hi, excl)) = with_host(|h| h.as_range(recv)) {
                 let n = as_i(&args[0]);
@@ -1119,8 +1125,14 @@ pub(crate) fn dispatch(
         // visibility, so these are accepted as no-ops (used pervasively by gems:
         // `private_constant :X`, `private :m`, `module_function`). Ruby returns
         // the single name argument (or nil), which callers occasionally chain.
-        "private" | "public" | "protected" | "module_function" | "private_constant"
-        | "public_constant" | "private_class_method" | "public_class_method"
+        "private"
+        | "public"
+        | "protected"
+        | "module_function"
+        | "private_constant"
+        | "public_constant"
+        | "private_class_method"
+        | "public_class_method"
         | "private_constant?" => {
             return Ok(match args {
                 [one] if name != "module_function" => one.clone(),
@@ -1258,9 +1270,7 @@ pub(crate) fn dispatch(
             // method instead of falling through to the next clause.
             match name_of(&args[0]).as_str() {
                 "deconstruct" => return Ok(Value::Bool(with_host(|h| h.is_a(recv, "Array")))),
-                "deconstruct_keys" => {
-                    return Ok(Value::Bool(with_host(|h| h.is_a(recv, "Hash"))))
-                }
+                "deconstruct_keys" => return Ok(Value::Bool(with_host(|h| h.is_a(recv, "Hash")))),
                 _ => {}
             }
             return Ok(Value::Bool(true));
@@ -1272,7 +1282,9 @@ pub(crate) fn dispatch(
             let proc = block
                 .clone()
                 .or_else(|| args.get(1).cloned())
-                .ok_or_else(|| raise_exc("ArgumentError", "tried to create Proc without a block"))?;
+                .ok_or_else(|| {
+                    raise_exc("ArgumentError", "tried to create Proc without a block")
+                })?;
             if let Value::Obj(id) = recv {
                 with_host(|h| h.add_singleton_define_method(*id, &mname, proc));
             }
@@ -1313,7 +1325,12 @@ pub(crate) fn dispatch(
         "class_eval" | "module_eval" if with_host(|h| h.classref_name(recv)).is_some() => {
             let target = eval_target(recv, false);
             if let Some(b) = block {
-                return crate::host::eval_block_scoped(&b, recv, target, std::slice::from_ref(recv));
+                return crate::host::eval_block_scoped(
+                    &b,
+                    recv,
+                    target,
+                    std::slice::from_ref(recv),
+                );
             }
             let src = arg_str(&args[0]);
             return crate::host::eval_string_scoped(&src, recv, target);
@@ -1397,7 +1414,10 @@ fn dispatch_classref(
     // accepted as no-ops returning MRI-shaped values.
     if cls == "GC" {
         return match name {
-            "start" | "garbage_collect" | "compact" | "verify_compaction_references"
+            "start"
+            | "garbage_collect"
+            | "compact"
+            | "verify_compaction_references"
             | "verify_internal_consistency" => Ok(Value::Undef),
             "enable" | "disable" | "stress" => Ok(Value::Bool(false)),
             "count" | "total_time" => Ok(Value::Int(0)),
@@ -1433,8 +1453,10 @@ fn dispatch_classref(
     }
     // `Queue.new` / `SizedQueue.new(cap)` — a thread-safe FIFO. The blocking core
     // lives in a side table keyed by the object's `__qid` ivar (see `queue_method`).
-    if matches!(cls, "Queue" | "Thread::Queue" | "SizedQueue" | "Thread::SizedQueue")
-        && name == "new"
+    if matches!(
+        cls,
+        "Queue" | "Thread::Queue" | "SizedQueue" | "Thread::SizedQueue"
+    ) && name == "new"
     {
         let cap = if cls.ends_with("SizedQueue") {
             Some(args.first().map(as_i).unwrap_or(0).max(0) as usize)
@@ -1466,9 +1488,8 @@ fn dispatch_classref(
     if cls == "Thread" {
         return match name {
             "new" | "start" | "fork" => {
-                let b = block.ok_or_else(|| {
-                    raise_exc("ThreadError", "must be called with a block")
-                })?;
+                let b =
+                    block.ok_or_else(|| raise_exc("ThreadError", "must be called with a block"))?;
                 Ok(crate::host::spawn_thread(b))
             }
             "current" | "main" => Ok(crate::host::current_thread()),
@@ -1579,7 +1600,10 @@ fn dispatch_classref(
     // the enumerator by sending `<<`/`yield` to the yielder it receives.
     if cls == "Enumerator" && name == "new" {
         let b = block.ok_or_else(|| {
-            raise_exc("ArgumentError", "tried to create Enumerator without a block")
+            raise_exc(
+                "ArgumentError",
+                "tried to create Enumerator without a block",
+            )
         })?;
         return Ok(with_host(|h| h.new_generator(b)));
     }
@@ -1658,8 +1682,10 @@ fn dispatch_classref(
         match name {
             "shareable?" => {
                 let v = &args[0];
-                let sharable = matches!(v, Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Undef)
-                    || with_host(|h| h.is_frozen(v));
+                let sharable = matches!(
+                    v,
+                    Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Undef
+                ) || with_host(|h| h.is_frozen(v));
                 return Ok(Value::Bool(sharable));
             }
             "make_shareable" => {
@@ -1820,7 +1846,10 @@ fn dispatch_classref(
             "now" => return Ok(with_host(|h| h.new_datetime(now_epoch_secs()))),
             "jd" => {
                 let g = |i: usize, dflt: i64| args.get(i).map(as_i).unwrap_or(dflt);
-                let jd = args.first().map(as_i).unwrap_or(crate::host::UNIX_EPOCH_JDN);
+                let jd = args
+                    .first()
+                    .map(as_i)
+                    .unwrap_or(crate::host::UNIX_EPOCH_JDN);
                 let days = jd - crate::host::UNIX_EPOCH_JDN;
                 let (hh, mi) = (g(1, 0), g(2, 0));
                 let ss = args.get(3).map(as_f).unwrap_or(0.0);
@@ -1966,7 +1995,10 @@ fn dispatch_classref(
             // The exception namespace: `SQLite3::SQLException` etc. resolve to a
             // class ref so `rescue SQLite3::SQLException` and `SQLite3::SQLException.new`
             // both work. `SQLException` is the base SQL error the runtime raises.
-            "SQLException" | "Exception" | "CantOpenException" | "BusyException"
+            "SQLException"
+            | "Exception"
+            | "CantOpenException"
+            | "BusyException"
             | "ConstraintException" => {
                 return Ok(with_host(|h| h.class_ref(&format!("SQLite3::{name}"))))
             }
@@ -2249,9 +2281,7 @@ fn dispatch_classref(
             // `Mod::Const` for an unresolved constant calls `Mod.const_missing`
             // (Rails autoloading depends on this). The `::` form reaches here as a
             // no-arg call named like a constant (leading uppercase).
-            if args.is_empty()
-                && name.chars().next().is_some_and(|c| c.is_uppercase())
-            {
+            if args.is_empty() && name.chars().next().is_some_and(|c| c.is_uppercase()) {
                 if let Some(def) = with_host(|h| h.find_class_method(cls, "const_missing")) {
                     let recv = with_host(|h| h.class_ref(cls));
                     let sym = with_host(|h| h.new_symbol(name));
@@ -3028,10 +3058,8 @@ fn dispatch_number(
                         }
                         // 0 ** positive-Rational is the exact Rational zero (0/1),
                         // not a Float — the exponent is a Rational.
-                        let zero = num_rational::BigRational::new(
-                            num_bigint::BigInt::from(0),
-                            one(),
-                        );
+                        let zero =
+                            num_rational::BigRational::new(num_bigint::BigInt::from(0), one());
                         return Ok(with_host(|h| h.new_rational(zero)));
                     }
                 }
@@ -3051,7 +3079,11 @@ fn dispatch_number(
                 }
                 if (base > one() || base < num_bigint::BigInt::from(-1))
                     && int_arg(&args[0]).is_none()
-                    && with_host(|h| h.as_bigint(&args[0]).map(|e| e.abs() > one()).unwrap_or(false))
+                    && with_host(|h| {
+                        h.as_bigint(&args[0])
+                            .map(|e| e.abs() > one())
+                            .unwrap_or(false)
+                    })
                 {
                     // An integer exponent of EITHER sign that overflows i64 makes
                     // base**exp (or its Rational reciprocal) too large to build.
@@ -3960,10 +3992,17 @@ fn dispatch_string(
         "to_s" | "to_str" => Ok(recv.clone()),
         "to_sym" => Ok(with_host(|h| h.new_symbol(&s))),
         "include?" => Ok(Value::Bool(s.contains(&arg_str(&args[0])))),
-        "start_with?" => Ok(Value::Bool(args.iter().any(|a| match str_regex(a) {
-            // A Regexp prefix matches when it matches at the very start.
-            Some(re) => re.find(&s).ok().flatten().map(|m| m.start() == 0).unwrap_or(false),
-            None => s.starts_with(&arg_str(a)),
+        "start_with?" => Ok(Value::Bool(args.iter().any(|a| {
+            match str_regex(a) {
+                // A Regexp prefix matches when it matches at the very start.
+                Some(re) => re
+                    .find(&s)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.start() == 0)
+                    .unwrap_or(false),
+                None => s.starts_with(&arg_str(a)),
+            }
         }))),
         "end_with?" => Ok(Value::Bool(args.iter().any(|a| s.ends_with(&arg_str(a))))),
         "match?" => {
@@ -4416,7 +4455,12 @@ fn set_match_globals(m: Option<(&fancy_regex::Captures, &str)>, re: &fancy_regex
         };
         let pre = s[..whole.start()].to_string();
         let post = s[whole.end()..].to_string();
-        let md = h.new_matchdata(groups.clone(), capture_name_map(re), pre.clone(), post.clone());
+        let md = h.new_matchdata(
+            groups.clone(),
+            capture_name_map(re),
+            pre.clone(),
+            post.clone(),
+        );
         h.set_global("~", md.clone());
         let g0 = to_val(h, groups.first().unwrap_or(&None));
         h.set_global("&", g0);
@@ -4451,9 +4495,7 @@ fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value,
         "[]" => {
             // A Symbol or String key selects a named capture (?<name>…); an
             // integer key selects by group number (negative counts from the end).
-            if let Some(key) =
-                with_host(|h| h.as_symbol(&args[0]).or_else(|| h.as_str(&args[0])))
-            {
+            if let Some(key) = with_host(|h| h.as_symbol(&args[0]).or_else(|| h.as_str(&args[0]))) {
                 return match names.iter().find(|(n, _)| *n == key) {
                     Some((_, idx)) => Ok(groups.get(*idx).map(strv).unwrap_or(Value::Undef)),
                     None => Err(raise_exc(
@@ -7030,7 +7072,13 @@ fn dispatch_file_class(
             let path = str_arg(args, 0);
             let s = match std::fs::read_to_string(&path) {
                 Ok(s) => s,
-                Err(e) => return Some(Err(sys_err("No such file or directory @ rb_sysopen", &path, &e))),
+                Err(e) => {
+                    return Some(Err(sys_err(
+                        "No such file or directory @ rb_sysopen",
+                        &path,
+                        &e,
+                    )))
+                }
             };
             match &block {
                 Some(bl) => {
@@ -7044,21 +7092,33 @@ fn dispatch_file_class(
                 }
                 // Block-less `foreach` yields an Enumerator over the lines.
                 None => Ok(with_host(|h| {
-                    let lines: Vec<Value> =
-                        s.split_inclusive('\n').map(|l| h.new_string(l.to_string())).collect();
+                    let lines: Vec<Value> = s
+                        .split_inclusive('\n')
+                        .map(|l| h.new_string(l.to_string()))
+                        .collect();
                     h.new_enumerator(lines, "each")
                 })),
             }
         }
         "open" => return Some(file_open(args, block)),
-        "exist?" | "exists?" => Ok(Value::Bool(std::path::Path::new(&str_arg(args, 0)).exists())),
-        "file?" => Ok(Value::Bool(std::path::Path::new(&str_arg(args, 0)).is_file())),
-        "directory?" => Ok(Value::Bool(std::path::Path::new(&str_arg(args, 0)).is_dir())),
+        "exist?" | "exists?" => Ok(Value::Bool(
+            std::path::Path::new(&str_arg(args, 0)).exists(),
+        )),
+        "file?" => Ok(Value::Bool(
+            std::path::Path::new(&str_arg(args, 0)).is_file(),
+        )),
+        "directory?" => Ok(Value::Bool(
+            std::path::Path::new(&str_arg(args, 0)).is_dir(),
+        )),
         "size" => {
             let path = str_arg(args, 0);
             match std::fs::metadata(&path) {
                 Ok(m) => Ok(Value::Int(m.len() as i64)),
-                Err(e) => Err(sys_err("No such file or directory @ rb_file_s_stat", &path, &e)),
+                Err(e) => Err(sys_err(
+                    "No such file or directory @ rb_file_s_stat",
+                    &path,
+                    &e,
+                )),
             }
         }
         "delete" | "unlink" => {
@@ -7101,7 +7161,10 @@ fn file_open(args: &[Value], block: Option<Value>) -> Result<Value, String> {
             opts.read(true).write(mode.contains('+'));
         }
         "w" | "w+" => {
-            opts.write(true).create(true).truncate(true).read(mode.contains('+'));
+            opts.write(true)
+                .create(true)
+                .truncate(true)
+                .read(mode.contains('+'));
         }
         "a" | "a+" => {
             opts.append(true).create(true).read(mode.contains('+'));
@@ -7208,7 +7271,9 @@ fn socket_err(e: &str) -> String {
 /// Parse a TCP port from an Integer or a numeric String argument.
 fn tcp_port_arg(v: &Value) -> Result<u16, String> {
     match v {
-        Value::Int(n) => u16::try_from(*n).map_err(|_| raise_exc("SocketError", "invalid port number")),
+        Value::Int(n) => {
+            u16::try_from(*n).map_err(|_| raise_exc("SocketError", "invalid port number"))
+        }
         _ => {
             let s = with_host(|h| h.as_str(v)).unwrap_or_default();
             s.trim().parse::<u16>().map_err(|_| {
@@ -7657,8 +7722,8 @@ fn fiddle_ffi_type(code: i32) -> Option<Type> {
         (3, true) => Type::u16(),
         (4, false) => Type::c_int(), // TYPE_INT
         (4, true) => Type::c_uint(),
-        (5, false) => Type::c_long(), // TYPE_LONG
-        (5, true) => Type::usize(),   // TYPE_SIZE_T (unsigned long == usize on LP64)
+        (5, false) => Type::c_long(),     // TYPE_LONG
+        (5, true) => Type::usize(),       // TYPE_SIZE_T (unsigned long == usize on LP64)
         (6, false) => Type::c_longlong(), // TYPE_LONG_LONG
         (6, true) => Type::u64(),
         (7, _) => Type::f32(), // TYPE_FLOAT
@@ -7703,7 +7768,8 @@ fn fiddle_call(recv: &Value, args: &[Value]) -> Result<Value, String> {
     let mut ffi_types: Vec<Type> = Vec::with_capacity(args.len());
     for (v, &code) in args.iter().zip(argtypes.iter()) {
         ffi_types.push(
-            fiddle_ffi_type(code).ok_or_else(|| fiddle_err(&format!("unknown type code {code}")))?,
+            fiddle_ffi_type(code)
+                .ok_or_else(|| fiddle_err(&format!("unknown type code {code}")))?,
         );
         let s = match code.abs() {
             1 => {
@@ -7730,12 +7796,16 @@ fn fiddle_call(recv: &Value, args: &[Value]) -> Result<Value, String> {
             5 | 6 => FiddleArg::I64(int_arg(v).unwrap_or_else(|| as_i(v))),
             7 => FiddleArg::F32(as_f(v) as f32),
             8 => FiddleArg::F64(as_f(v)),
-            _ => return Err(fiddle_err(&format!("unsupported argument type code {code}"))),
+            _ => {
+                return Err(fiddle_err(&format!(
+                    "unsupported argument type code {code}"
+                )))
+            }
         };
         store.push(s);
     }
-    let ret_type =
-        fiddle_ffi_type(ret).ok_or_else(|| fiddle_err(&format!("unknown return type code {ret}")))?;
+    let ret_type = fiddle_ffi_type(ret)
+        .ok_or_else(|| fiddle_err(&format!("unknown return type code {ret}")))?;
     let cif = Cif::new(ffi_types, ret_type);
     let code_ptr = CodePtr(addr as *mut c_void);
     // Build the untyped Arg list, each borrowing its stable `store` slot.
@@ -7917,7 +7987,9 @@ fn dispatch_fiddle_function(recv: &Value, name: &str, args: &[Value]) -> Result<
     match name {
         "call" => fiddle_call(recv, args),
         "to_i" | "to_int" => {
-            let addr = crate::host::fiddle_func_parts(recv).map(|(a, _, _)| a).unwrap_or(0);
+            let addr = crate::host::fiddle_func_parts(recv)
+                .map(|(a, _, _)| a)
+                .unwrap_or(0);
             Ok(Value::Int(addr as i64))
         }
         "inspect" | "to_s" => Ok(new_str(with_host(|h| h.to_s(recv)))),
@@ -7928,8 +8000,8 @@ fn dispatch_fiddle_function(recv: &Value, name: &str, args: &[Value]) -> Result<
 /// `Fiddle::Pointer` instance methods: read the pointed-to memory back to Ruby,
 /// plus `size`/`null?`/`to_i`/`[]`/`free`.
 fn dispatch_fiddle_pointer(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
-    let (addr, size) = crate::host::fiddle_ptr_parts(recv)
-        .ok_or_else(|| no_method_error(recv, name))?;
+    let (addr, size) =
+        crate::host::fiddle_ptr_parts(recv).ok_or_else(|| no_method_error(recv, name))?;
     match name {
         // `to_s` with a length reads exactly that many bytes; without one it
         // reads the sized buffer (up to NUL) or a NUL-terminated C string.
@@ -7986,7 +8058,9 @@ fn dispatch_fiddle_pointer(recv: &Value, name: &str, args: &[Value]) -> Result<V
             let value = args.last().unwrap();
             let bytes: Vec<u8> = match value {
                 Value::Int(n) if args.len() == 2 => vec![*n as u8],
-                _ => with_host(|h| h.as_str(value)).unwrap_or_default().into_bytes(),
+                _ => with_host(|h| h.as_str(value))
+                    .unwrap_or_default()
+                    .into_bytes(),
             };
             // With an explicit length (`ptr[i, len] = …`), write exactly that many.
             let want = if args.len() >= 3 {
@@ -8145,12 +8219,16 @@ fn dispatch_dir_class(
                     }
                     Ok(new_arr(names.into_iter().map(new_str).collect()))
                 }
-                Err(e) => Err(sys_err("No such file or directory @ dir_initialize", &path, &e)),
+                Err(e) => Err(sys_err(
+                    "No such file or directory @ dir_initialize",
+                    &path,
+                    &e,
+                )),
             }
         }
-        "exist?" | "exists?" => {
-            Ok(Value::Bool(std::path::Path::new(&str_arg(args, 0)).is_dir()))
-        }
+        "exist?" | "exists?" => Ok(Value::Bool(
+            std::path::Path::new(&str_arg(args, 0)).is_dir(),
+        )),
         "mkdir" => {
             let path = str_arg(args, 0);
             match std::fs::create_dir(&path) {
@@ -8353,7 +8431,11 @@ fn path_basename(path: &str, suffix: Option<&str>) -> String {
 fn path_dirname(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
-        return if path.is_empty() { ".".to_string() } else { "/".to_string() };
+        return if path.is_empty() {
+            ".".to_string()
+        } else {
+            "/".to_string()
+        };
     }
     match trimmed.rfind('/') {
         Some(0) => "/".to_string(),
@@ -8398,13 +8480,11 @@ fn path_expand(path: &str, base: Option<&str>) -> String {
         expanded
     } else {
         // Resolve `base` (itself possibly relative or `~`) against the cwd first.
-        let base_raw = base
-            .map(|b| b.to_string())
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| "/".to_string())
-            });
+        let base_raw = base.map(|b| b.to_string()).unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "/".to_string())
+        });
         let base_abs = if base_raw.is_empty() {
             std::env::current_dir()
                 .map(|p| p.to_string_lossy().into_owned())
@@ -8839,8 +8919,14 @@ fn parse_iso_datetime(s: &str) -> Option<f64> {
         let t = t.split(['Z', '+']).next().unwrap_or(t);
         let comps: Vec<&str> = t.splitn(3, ':').collect();
         let hh: i64 = comps.first()?.trim().parse().ok()?;
-        let mi: i64 = comps.get(1).and_then(|x| x.trim().parse().ok()).unwrap_or(0);
-        let ss: f64 = comps.get(2).and_then(|x| x.trim().parse().ok()).unwrap_or(0.0);
+        let mi: i64 = comps
+            .get(1)
+            .and_then(|x| x.trim().parse().ok())
+            .unwrap_or(0);
+        let ss: f64 = comps
+            .get(2)
+            .and_then(|x| x.trim().parse().ok())
+            .unwrap_or(0.0);
         secs += (hh * 3600 + mi * 60) as f64 + ss;
     }
     Some(secs)
@@ -8892,10 +8978,12 @@ fn dispatch_datetime(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
         }
         "to_date" => Ok(with_host(|h| h.new_date(day))),
         "to_time" => Ok(with_host(|h| h.new_time(secs))),
-        "next_day" | "succ" => {
-            Ok(with_host(|h| h.new_datetime(secs + arg_i(0, 1) as f64 * 86_400.0)))
-        }
-        "prev_day" => Ok(with_host(|h| h.new_datetime(secs - arg_i(0, 1) as f64 * 86_400.0))),
+        "next_day" | "succ" => Ok(with_host(|h| {
+            h.new_datetime(secs + arg_i(0, 1) as f64 * 86_400.0)
+        })),
+        "prev_day" => Ok(with_host(|h| {
+            h.new_datetime(secs - arg_i(0, 1) as f64 * 86_400.0)
+        })),
         "next_month" | ">>" => Ok(with_host(|h| {
             h.new_datetime(date_add_months(day, arg_i(0, 1)) as f64 * 86_400.0 + tod)
         })),
@@ -8908,7 +8996,9 @@ fn dispatch_datetime(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
         "prev_year" => Ok(with_host(|h| {
             h.new_datetime(date_add_months(day, -12 * arg_i(0, 1)) as f64 * 86_400.0 + tod)
         })),
-        "+" => Ok(with_host(|h| h.new_datetime(secs + as_f(&args[0]) * 86_400.0))),
+        "+" => Ok(with_host(|h| {
+            h.new_datetime(secs + as_f(&args[0]) * 86_400.0)
+        })),
         "-" => {
             if let Some(other) = with_host(|h| h.datetime_secs(&args[0])) {
                 Ok(with_host(|h| {
@@ -8917,7 +9007,9 @@ fn dispatch_datetime(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
                     h.new_rational(r)
                 }))
             } else {
-                Ok(with_host(|h| h.new_datetime(secs - as_f(&args[0]) * 86_400.0)))
+                Ok(with_host(|h| {
+                    h.new_datetime(secs - as_f(&args[0]) * 86_400.0)
+                }))
             }
         }
         "<=>" => {
@@ -10690,11 +10782,7 @@ fn random_advance(recv: &Value) -> u64 {
 /// interruption, so `synchronize` simply runs the block with the flag set and
 /// clears it afterward (even if the block raises). Returns `Ok(None)` for a name
 /// it does not handle.
-fn mutex_method(
-    recv: &Value,
-    name: &str,
-    block: Option<Value>,
-) -> Result<Option<Value>, String> {
+fn mutex_method(recv: &Value, name: &str, block: Option<Value>) -> Result<Option<Value>, String> {
     let locked = || with_host(|h| matches!(h.ivar_of(recv, "__locked"), Value::Bool(true)));
     let set = |v: bool| with_host(|h| h.set_ivar_of(recv, "__locked", Value::Bool(v)));
     match name {
@@ -10964,10 +11052,7 @@ fn md5_digest(msg: &[u8]) -> [u8; 16] {
                 32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
                 _ => (c ^ (b | !d), (7 * i) % 16),
             };
-            let f = f
-                .wrapping_add(a)
-                .wrapping_add(K[i])
-                .wrapping_add(m[g]);
+            let f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(m[g]);
             a = d;
             d = c;
             c = b;
@@ -11128,11 +11213,7 @@ fn digest_of(algo: &str, data: &[u8]) -> Vec<u8> {
 
 /// Class-method dispatch for the dependency-free stdlib modules. Returns `None`
 /// when `cls` is not one of them (so normal class-ref dispatch continues).
-fn dispatch_stdlib_module(
-    cls: &str,
-    name: &str,
-    args: &[Value],
-) -> Option<Result<Value, String>> {
+fn dispatch_stdlib_module(cls: &str, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     let str_arg = |i: usize| -> Vec<u8> {
         args.get(i)
             .and_then(|a| with_host(|h| h.as_str(a)))
@@ -11163,9 +11244,7 @@ fn dispatch_stdlib_module(
         "SecureRandom" => Some(dispatch_secure_random(name, args)),
         "Base64" => match name {
             "encode64" => Some(Ok(new_str(base64_encode64(&str_arg(0))))),
-            "strict_encode64" => {
-                Some(Ok(new_str(base64_encode_bytes(&str_arg(0), B64_STD, true))))
-            }
+            "strict_encode64" => Some(Ok(new_str(base64_encode_bytes(&str_arg(0), B64_STD, true)))),
             "urlsafe_encode64" => {
                 // MRI defaults padding to true; `padding: false` drops the `=`.
                 let pad = args
@@ -11193,7 +11272,11 @@ fn dispatch_stdlib_module(
 
 /// `SecureRandom.*` — shape-faithful, drawn from the shared SplitMix64 PRNG.
 fn dispatch_secure_random(name: &str, args: &[Value]) -> Result<Value, String> {
-    let n = |dflt: usize| args.first().map(|a| as_i(a).max(0) as usize).unwrap_or(dflt);
+    let n = |dflt: usize| {
+        args.first()
+            .map(|a| as_i(a).max(0) as usize)
+            .unwrap_or(dflt)
+    };
     match name {
         "hex" => Ok(new_str(hex_encode(&secure_random_bytes(n(16))))),
         "bytes" => Ok(new_str(
@@ -11224,8 +11307,7 @@ fn dispatch_secure_random(name: &str, args: &[Value]) -> Result<Value, String> {
             )))
         }
         "alphanumeric" => {
-            const CH: &[u8; 62] =
-                b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+            const CH: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
             let len = n(16);
             let s: String = (0..len)
                 .map(|_| CH[(rng_next() % 62) as usize] as char)
@@ -11326,11 +11408,7 @@ fn openstruct_method(
             }
         }
         // Any other bare name is a dynamic reader: return the field or nil.
-        _ if !name.ends_with('?')
-            && !name.ends_with('!')
-            && args.is_empty()
-            && block.is_none() =>
-        {
+        _ if !name.ends_with('?') && !name.ends_with('!') && args.is_empty() && block.is_none() => {
             Ok(Some(with_host(|h| h.ivar_of(recv, name))))
         }
         _ => Ok(None),
@@ -12185,7 +12263,10 @@ impl JsonParser {
         c
     }
     fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(' ') | Some('\t') | Some('\n') | Some('\r')) {
+        while matches!(
+            self.peek(),
+            Some(' ') | Some('\t') | Some('\n') | Some('\r')
+        ) {
             self.pos += 1;
         }
     }
@@ -12646,10 +12727,13 @@ fn do_require(args: &[Value], mode: ReqMode) -> Result<Value, String> {
     }
 
     let src = std::fs::read_to_string(&abs).map_err(|e| {
-        raise_exc("LoadError", &format!("cannot load such file -- {abs_str} ({e})"))
+        raise_exc(
+            "LoadError",
+            &format!("cannot load such file -- {abs_str} ({e})"),
+        )
     })?;
-    let prog = crate::compile(&src)
-        .map_err(|e| raise_exc("SyntaxError", &format!("{abs_str}: {e}")))?;
+    let prog =
+        crate::compile(&src).map_err(|e| raise_exc("SyntaxError", &format!("{abs_str}: {e}")))?;
 
     // Record the feature before running the body so a circular `require` sees it
     // already loaded and returns false instead of recursing (MRI behavior).
@@ -13059,7 +13143,9 @@ fn stringio_method(
         // its `\n`) and return self; without one, an Enumerator over those lines.
         "each_line" | "each" => {
             let Some(b) = &block else {
-                return Ok(with_host(|h| h.new_enumerator(stringio_rest_lines(recv), "each")));
+                return Ok(with_host(|h| {
+                    h.new_enumerator(stringio_rest_lines(recv), "each")
+                }));
             };
             loop {
                 let line = stringio_method(recv, "gets", &[], None)?;
@@ -13539,7 +13625,9 @@ fn reduce_sym(acc: &Value, op: &str, x: &Value) -> Result<Value, String> {
     };
     // Float arithmetic (either operand a Float; a Rational operand demotes to
     // Float, matching Ruby). Native float ops — num_op only covers heap numbers.
-    if numeric(acc) && numeric(x) && (matches!(acc, Value::Float(_)) || matches!(x, Value::Float(_)))
+    if numeric(acc)
+        && numeric(x)
+        && (matches!(acc, Value::Float(_)) || matches!(x, Value::Float(_)))
     {
         let (a, b) = (as_f(acc), as_f(x));
         return Ok(match op {
@@ -13556,9 +13644,7 @@ fn reduce_sym(acc: &Value, op: &str, x: &Value) -> Result<Value, String> {
     // negative infinity (Ruby semantics).
     if let (Value::Int(a), Value::Int(b)) = (acc, x) {
         match op {
-            "/" | "%" if *b == 0 => {
-                return Err(raise_exc("ZeroDivisionError", "divided by 0"))
-            }
+            "/" | "%" if *b == 0 => return Err(raise_exc("ZeroDivisionError", "divided by 0")),
             "/" => return Ok(Value::Int(floor_div(*a, *b))),
             "%" => return Ok(Value::Int(floor_mod(*a, *b))),
             _ => {}

@@ -73,7 +73,10 @@ fn run_ruby(args: &[&str], path: &Path) -> (String, String, i32, bool) {
 
 /// MRI stdout + exit code, if `/opt/homebrew/bin/ruby` is present (third witness).
 fn mri(path: &Path) -> Option<(String, i32)> {
-    let out = Command::new("/opt/homebrew/bin/ruby").arg(path).output().ok()?;
+    let out = Command::new("/opt/homebrew/bin/ruby")
+        .arg(path)
+        .output()
+        .ok()?;
     Some((
         String::from_utf8_lossy(&out.stdout).to_string(),
         out.status.code().unwrap_or(-1),
@@ -125,7 +128,10 @@ fn native_binary_runs_whole_app_without_ruby_or_sources() {
     // 1. Reference: the interpreter.
     let (direct, derr, direct_code, _) = run_ruby(&[], &app);
     assert_eq!(direct_code, 5, "interpreter exit code: {derr}");
-    assert!(direct.contains("slice 0: area=12.56636"), "interp out: {direct}");
+    assert!(
+        direct.contains("slice 0: area=12.56636"),
+        "interp out: {direct}"
+    );
 
     // 2. Build the standalone native binary.
     let (report, berr, _bc, bok) = run_ruby(&["--build", "--native"], &app);
@@ -139,9 +145,14 @@ fn native_binary_runs_whole_app_without_ruby_or_sources() {
     std::fs::remove_file(dir.join("app.rb")).unwrap();
     std::fs::remove_file(dir.join("geometry.rb")).unwrap();
     let exe = dir.join("app");
-    assert!(exe.exists(), "the executable was written next to the source");
+    assert!(
+        exe.exists(),
+        "the executable was written next to the source"
+    );
 
-    let out = Command::new(&exe).output().expect("spawn standalone binary");
+    let out = Command::new(&exe)
+        .output()
+        .expect("spawn standalone binary");
     let bin_out = String::from_utf8_lossy(&out.stdout).to_string();
     let bin_code = out.status.code().unwrap_or(-1);
 
@@ -166,7 +177,11 @@ fn native_binary_matches_mri_when_available() {
     }
 
     let dir = fresh_dir("mriparity");
-    write(&dir, "lib.rb", "module M\n  K = 21\n  def self.double(x); x + x; end\nend\n");
+    write(
+        &dir,
+        "lib.rb",
+        "module M\n  K = 21\n  def self.double(x); x + x; end\nend\n",
+    );
     let app = write(
         &dir,
         "prog.rb",
@@ -184,13 +199,19 @@ fn native_binary_matches_mri_when_available() {
     // Sources deleted; the binary must still run and agree with MRI.
     std::fs::remove_file(dir.join("prog.rb")).unwrap();
     std::fs::remove_file(dir.join("lib.rb")).unwrap();
-    let out = Command::new(dir.join("prog")).output().expect("spawn binary");
+    let out = Command::new(dir.join("prog"))
+        .output()
+        .expect("spawn binary");
     let bin_out = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(out.status.success(), "binary exit ok");
     assert_eq!(bin_out, "total=6 k=21 d=42\n", "standalone output");
     if let Some((ref_out, ref_code)) = mri_out {
         assert_eq!(bin_out, ref_out, "standalone vs MRI stdout");
-        assert_eq!(out.status.code().unwrap_or(-1), ref_code, "vs MRI exit code");
+        assert_eq!(
+            out.status.code().unwrap_or(-1),
+            ref_code,
+            "vs MRI exit code"
+        );
     }
 
     std::fs::remove_dir_all(&dir).ok();

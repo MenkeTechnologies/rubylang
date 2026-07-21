@@ -323,8 +323,7 @@ impl Parser {
                     _ => unreachable!(),
                 };
                 let make = |t: Expr| {
-                    let combined =
-                        Expr::Binary(op, Box::new(t.clone()), Box::new(rhs.clone()));
+                    let combined = Expr::Binary(op, Box::new(t.clone()), Box::new(rhs.clone()));
                     Expr::Assign(Box::new(t), Box::new(combined))
                 };
                 return Ok(Self::rebind_assign(lhs, &make));
@@ -526,10 +525,10 @@ impl Parser {
             // `- 7.abs` keeps the ordinary `-(7.abs)` reading.
             if self.neg_num_adjacent() {
                 self.advance(); // consume '-'
-                // `**` binds tighter than the sign, so `-2**2` is `-(2**2)` and
-                // `-2**2.abs` is `-(2 ** 2.abs)`: the minus wraps the whole power
-                // instead of fusing into the literal. Detected by `**` sitting
-                // immediately after the number (before any `.method`).
+                                // `**` binds tighter than the sign, so `-2**2` is `-(2**2)` and
+                                // `-2**2.abs` is `-(2 ** 2.abs)`: the minus wraps the whole power
+                                // instead of fusing into the literal. Detected by `**` sitting
+                                // immediately after the number (before any `.method`).
                 if matches!(
                     self.toks.get(self.pos + 1).map(|t| &t.kind),
                     Some(Tok::Op(o)) if o == "**"
@@ -792,11 +791,12 @@ impl Parser {
         // positional rest, its keyword rest, and re-pass its block. Recognized
         // only when `...` is the final argument (next token `)`); `m(...5)`
         // stays a beginless range.
-        if self.is_op("...")
-            && matches!(&self.toks[self.pos + 1].kind, Tok::Op(o) if o == ")")
-        {
+        if self.is_op("...") && matches!(&self.toks[self.pos + 1].kind, Tok::Op(o) if o == ")") {
             self.advance(); // ...
-            args.push(Expr::Splat(Box::new(Expr::Var(VarKind::Local, FWD_REST.into()))));
+            args.push(Expr::Splat(Box::new(Expr::Var(
+                VarKind::Local,
+                FWD_REST.into(),
+            ))));
             kwsplats.push(Expr::Var(VarKind::Local, FWD_KW.into()));
             // Re-pass the captured block by value: forwarding no block (`__fwd_blk__`
             // is nil) must stay no block, so `block_given?`/`&blk` in the callee are
@@ -804,7 +804,9 @@ impl Parser {
             *amp_block = Some(Block {
                 params: vec![],
                 splat: None,
-                body: vec![Expr::BlockPass(Box::new(Expr::Var(VarKind::Local, FWD_BLK.into()))).into()],
+                body: vec![
+                    Expr::BlockPass(Box::new(Expr::Var(VarKind::Local, FWD_BLK.into()))).into(),
+                ],
             });
             return Ok(());
         }
@@ -1688,9 +1690,7 @@ impl Parser {
             Pattern::Splat(None) | Pattern::Value(_) | Pattern::Pin(_) => false,
             Pattern::Const(_, None) => false,
             Pattern::Const(_, Some(inner)) => Self::pattern_captures(inner),
-            Pattern::Array(elems) | Pattern::Or(elems) => {
-                elems.iter().any(Self::pattern_captures)
-            }
+            Pattern::Array(elems) | Pattern::Or(elems) => elems.iter().any(Self::pattern_captures),
             Pattern::Hash(pairs, rest) => {
                 matches!(rest, HashRest::Splat(Some(_)))
                     || pairs.iter().any(|(_, sub)| match sub {
@@ -1774,9 +1774,7 @@ impl Parser {
 
     /// `key:`, `key: subpattern`, and a trailing `**rest`/`**nil`, until `}`.
     #[allow(clippy::type_complexity)]
-    fn parse_hash_pattern(
-        &mut self,
-    ) -> Result<(Vec<(String, Option<Pattern>)>, HashRest), String> {
+    fn parse_hash_pattern(&mut self) -> Result<(Vec<(String, Option<Pattern>)>, HashRest), String> {
         let mut pairs = Vec::new();
         let mut rest = HashRest::None;
         self.skip_terms();
@@ -1823,10 +1821,10 @@ impl Parser {
 
     fn class_expr(&mut self) -> Result<Expr, String> {
         self.advance(); // class
-        // `class << self … end` / `class << obj … end` — a singleton-class body
-        // (`<<` lexes as the left-shift op here: the char after it is a space,
-        // not a heredoc marker). `self` yields `recv == None`; any other receiver
-        // (an identifier or constant) is captured for runtime singleton defs.
+                        // `class << self … end` / `class << obj … end` — a singleton-class body
+                        // (`<<` lexes as the left-shift op here: the char after it is a space,
+                        // not a heredoc marker). `self` yields `recv == None`; any other receiver
+                        // (an identifier or constant) is captured for runtime singleton defs.
         if self.is_op("<<") {
             self.advance(); // <<
             let recv = if self.is_kw("self") {
@@ -1854,20 +1852,37 @@ impl Parser {
         let body = self.body_until(&["end"])?;
         self.expect_kw("end")?;
         match superclass_expr {
-            None => Ok(Expr::Class { name, superclass: None, body }),
+            None => Ok(Expr::Class {
+                name,
+                superclass: None,
+                body,
+            }),
             Some(e) => match Self::const_ref_path(&e) {
                 // A constant-path superclass: the ordinary named-superclass form.
-                Some(sup) => Ok(Expr::Class { name, superclass: Some(sup), body }),
+                Some(sup) => Ok(Expr::Class {
+                    name,
+                    superclass: Some(sup),
+                    body,
+                }),
                 // An expression superclass (`Struct.new(...)`, `Data.define(...)`,
                 // `Class.new(Base)`): desugar to `NAME = <expr> do BODY end` — the
                 // class body becomes the constructor call's definition block.
                 None => {
                     let call = match e {
-                        Expr::Call { recv, name: cn, args, .. } => Expr::Call {
+                        Expr::Call {
                             recv,
                             name: cn,
                             args,
-                            block: Some(Block { params: Vec::new(), splat: None, body }),
+                            ..
+                        } => Expr::Call {
+                            recv,
+                            name: cn,
+                            args,
+                            block: Some(Block {
+                                params: Vec::new(),
+                                splat: None,
+                                body,
+                            }),
                         },
                         other => other,
                     };
@@ -1886,9 +1901,12 @@ impl Parser {
     fn const_ref_path(e: &Expr) -> Option<String> {
         match e {
             Expr::Var(VarKind::Const, name) => Some(name.clone()),
-            Expr::Call { recv: Some(r), name, args, block: None }
-                if args.is_empty() && name.chars().next().is_some_and(|c| c.is_uppercase()) =>
-            {
+            Expr::Call {
+                recv: Some(r),
+                name,
+                args,
+                block: None,
+            } if args.is_empty() && name.chars().next().is_some_and(|c| c.is_uppercase()) => {
                 Some(format!("{}::{}", Self::const_ref_path(r)?, name))
             }
             _ => None,
@@ -1897,8 +1915,8 @@ impl Parser {
 
     fn module_expr(&mut self) -> Result<Expr, String> {
         self.advance(); // module
-        // Like a class name, a module name may be a `::`-qualified path
-        // (`module A::B`); the compiler stores it under the qualified key.
+                        // Like a class name, a module name may be a `::`-qualified path
+                        // (`module A::B`); the compiler stores it under the qualified key.
         let name = self.const_path("module name")?;
         let body = self.body_until(&["end"])?;
         self.expect_kw("end")?;
@@ -1954,7 +1972,9 @@ impl Parser {
             // — stored under its qualified name.
             loop {
                 self.eat_op("::"); // optional leading top-level `::`
-                let Tok::Const(c) = self.peek().clone() else { break };
+                let Tok::Const(c) = self.peek().clone() else {
+                    break;
+                };
                 self.advance();
                 let mut path = c;
                 while self.is_op("::") {
@@ -2198,7 +2218,10 @@ impl Parser {
         // Anonymous splat `def f(*)` — collects surplus positional args with no
         // binding. Give it a synthetic name that can never collide with a real
         // identifier so downstream compilation still records the splat position.
-        if splat && (self.is_op(")") || self.is_op(",") || matches!(self.peek(), Tok::Newline | Tok::Semicolon))
+        if splat
+            && (self.is_op(")")
+                || self.is_op(",")
+                || matches!(self.peek(), Tok::Newline | Tok::Semicolon))
         {
             return Ok(Param {
                 name: "*".to_string(),

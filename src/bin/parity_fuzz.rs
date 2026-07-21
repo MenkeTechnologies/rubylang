@@ -115,7 +115,11 @@ fn oracle_path() -> &'static str {
             }
             return p;
         }
-        for p in ["/opt/homebrew/bin/ruby", "/usr/local/bin/ruby", "/usr/bin/ruby"] {
+        for p in [
+            "/opt/homebrew/bin/ruby",
+            "/usr/local/bin/ruby",
+            "/usr/bin/ruby",
+        ] {
             if Path::new(p).exists() {
                 return p.to_string();
             }
@@ -281,11 +285,15 @@ fn run_ours(script: &str, bin: &Path, timeout: Duration) -> RunOut {
 // into a program. Most emit a single deterministic `p`/`puts` probe.
 // ---------------------------------------------------------------------------
 
-const INTS: &[&str] = &["0", "1", "2", "7", "10", "-3", "-7", "42", "100", "-1", "5", "9"];
+const INTS: &[&str] = &[
+    "0", "1", "2", "7", "10", "-3", "-7", "42", "100", "-1", "5", "9",
+];
 const FLOATS: &[&str] = &[
     "0.1", "0.2", "1.5", "3.14", "2.0", "-1.5", "10.0", "0.0", "100.25", "-0.5", "1e10", "1.0",
 ];
-const WORDS: &[&str] = &["foo", "bar", "baz", "hello", "world", "abc", "xyz", "Ruby", "Lang"];
+const WORDS: &[&str] = &[
+    "foo", "bar", "baz", "hello", "world", "abc", "xyz", "Ruby", "Lang",
+];
 
 fn ii<'a>(r: &mut Rng) -> &'a str {
     r.pick(INTS)
@@ -369,7 +377,10 @@ fn gen_interp(seed: u64) -> Vec<String> {
     one(match r.below(5) {
         0 => format!("p \"val=#{{{n} + {}}}\"", ii(r)),
         1 => format!("p \"#{{'{w}'.upcase}}!\""),
-        2 => format!("p \"[#{{[1,2,3].map {{ |x| x * {} }}.join(',')}}]\"", r.range(1, 4)),
+        2 => format!(
+            "p \"[#{{[1,2,3].map {{ |x| x * {} }}.join(',')}}]\"",
+            r.range(1, 4)
+        ),
         3 => format!("p \"#{{{n}}}-#{{'{w}'.length}}\""),
         _ => format!("puts \"a#{{{n} * 2}}b#{{'{w}'.reverse}}c\""),
     })
@@ -408,7 +419,11 @@ fn gen_arraymeth(seed: u64) -> Vec<String> {
         6 => format!("p {a}.max"),
         7 => format!("p {a}.first({})", r.range(1, 3)),
         8 => format!("p {a}.last({})", r.range(1, 3)),
-        9 => format!("p {a}.take({}) + {a}.drop({})", r.range(1, 3), r.range(1, 3)),
+        9 => format!(
+            "p {a}.take({}) + {a}.drop({})",
+            r.range(1, 3),
+            r.range(1, 3)
+        ),
         10 => format!("p {a}.zip({a})"),
         _ => format!("p {a}.each_with_index.map {{ |x, i| x * i }}"),
     })
@@ -440,7 +455,10 @@ fn gen_sorting(seed: u64) -> Vec<String> {
     let a = arr_lit(r);
     let w = format!(
         "[{}]",
-        (0..4).map(|_| format!("{:?}", ww(r))).collect::<Vec<_>>().join(", ")
+        (0..4)
+            .map(|_| format!("{:?}", ww(r)))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     one(match r.below(6) {
         0 => format!("p {a}.sort"),
@@ -645,20 +663,31 @@ fn gen_intmeth(seed: u64) -> Vec<String> {
         4 => format!("p {a}.abs.bit_length"),
         5 => format!("p {a}.abs.digits"),
         6 => format!("p {a}.to_s(2)"),
-        7 => format!("p {}.pow({}, {})", r.range(2, 9), r.range(1, 6), r.range(2, 9)),
+        7 => format!(
+            "p {}.pow({}, {})",
+            r.range(2, 9),
+            r.range(1, 6),
+            r.range(2, 9)
+        ),
         8 => format!("p({a} & {b})"),
         9 => format!("p({a} | {b})"),
         10 => format!("p({a} ^ {b})"),
         11 => format!("p({a} << {})", r.range(0, 5)),
         12 => format!("p [{a}.even?, {a}.odd?, {a}.zero?]"),
-        _ => format!("p {a}.abs.to_s({}).to_i({})", r.range(2, 17), r.range(2, 17)),
+        _ => format!(
+            "p {a}.abs.to_s({}).to_i({})",
+            r.range(2, 17),
+            r.range(2, 17)
+        ),
     })
 }
 
 fn gen_regex(seed: u64) -> Vec<String> {
     let r = &mut Rng::seed(seed);
     let s = format!("{}{}", ww(r), ww(r));
-    let pats = ["[a-c]+", "o+", "[aeiou]", "\\w+", "l+", "[a-z]{2}", "^.", ".$"];
+    let pats = [
+        "[a-c]+", "o+", "[aeiou]", "\\w+", "l+", "[a-z]{2}", "^.", ".$",
+    ];
     let p = r.pick(&pats);
     one(match r.below(10) {
         0 => format!("p(\"{s}\" =~ /{p}/)"),
@@ -704,10 +733,14 @@ fn gen_exceptions(seed: u64) -> Vec<String> {
         1 => format!("p (begin; Integer(\"{w}\"); rescue ArgumentError; :caught; end)"),
         2 => format!("p (begin; {n} / 0; rescue ZeroDivisionError => e; e.message; end)"),
         3 => "p (begin; [].fetch(9); rescue IndexError; :idx; end)".to_string(),
-        4 => format!("p (begin; raise ArgumentError, \"{w}\"; rescue => e; [e.class.to_s, e.message]; end)"),
-        5 => "r = []; begin; r << 1; raise \"x\"; rescue; r << 2; ensure; r << 3; end; p r".to_string(),
+        4 => format!(
+            "p (begin; raise ArgumentError, \"{w}\"; rescue => e; [e.class.to_s, e.message]; end)"
+        ),
+        5 => "r = []; begin; r << 1; raise \"x\"; rescue; r << 2; ensure; r << 3; end; p r"
+            .to_string(),
         6 => format!("p (begin; {{}}.fetch(:{w}); rescue KeyError; :key; end)"),
-        7 => "class E1 < StandardError; end; p (begin; raise E1; rescue E1; :custom; end)".to_string(),
+        7 => "class E1 < StandardError; end; p (begin; raise E1; rescue E1; :custom; end)"
+            .to_string(),
         _ => "p (begin; nil.foo; rescue NoMethodError; :nome; end)".to_string(),
     })
 }
@@ -758,8 +791,13 @@ fn gen_patternmatch(seed: u64) -> Vec<String> {
         3 => format!("case {n}; in 0..5; p :lo; in Integer; p :hi; end"),
         4 => format!("case [{x}, {y}]; in [Integer => a, Integer => b]; p a * b; end"),
         5 => format!("case [1, 2, {x}, {y}]; in [_, _, *rest]; p rest; end"),
-        6 => format!("case {{name: \"{}\", age: {n}}}; in {{name: String => s}}; p s; end", ww(r)),
-        _ => format!("r = (case {n}; in 0 then :z; in n if n > 5 then :big; else :small; end); p r"),
+        6 => format!(
+            "case {{name: \"{}\", age: {n}}}; in {{name: String => s}}; p s; end",
+            ww(r)
+        ),
+        _ => {
+            format!("r = (case {n}; in 0 then :z; in n if n > 5 then :big; else :small; end); p r")
+        }
     })
 }
 
@@ -770,7 +808,10 @@ fn gen_kernelconv(seed: u64) -> Vec<String> {
     one(match r.below(11) {
         0 => format!("p Integer(\"{}\")", r.range(0, 999)),
         1 => "p Integer(\"ff\", 16)".to_string(),
-        2 => format!("p Integer(\"{}\", 2)", if r.below(2) == 0 { "1010" } else { "1101" }),
+        2 => format!(
+            "p Integer(\"{}\", 2)",
+            if r.below(2) == 0 { "1010" } else { "1101" }
+        ),
         3 => format!("p Float(\"{}.5\")", r.range(0, 99)),
         4 => "p Array(nil)".to_string(),
         5 => format!("p Array([{n}])"),
@@ -963,12 +1004,18 @@ fn parse_args() -> Args {
             }
             "--seed" | "-s" => {
                 i += 1;
-                base_seed = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(base_seed);
+                base_seed = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(base_seed);
             }
             "--once" => once = true,
             "--timeout-ms" => {
                 i += 1;
-                timeout_ms = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(timeout_ms);
+                timeout_ms = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(timeout_ms);
             }
             "--out" | "-o" => {
                 i += 1;
@@ -978,7 +1025,10 @@ fn parse_args() -> Args {
             }
             "--max-report" => {
                 i += 1;
-                max_report = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(max_report);
+                max_report = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(max_report);
             }
             "--jobs" | "-j" => {
                 i += 1;

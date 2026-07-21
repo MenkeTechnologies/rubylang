@@ -53,9 +53,12 @@ pub fn build(file: &str) -> Result<String, String> {
         .into_owned();
     let mut deps = Vec::with_capacity(report.files.len());
     for p in &report.files {
-        let fsrc = std::fs::read_to_string(p)
-            .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
-        deps.push((p.to_string_lossy().into_owned(), crate::cache::key_for(&fsrc)));
+        let fsrc =
+            std::fs::read_to_string(p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+        deps.push((
+            p.to_string_lossy().into_owned(),
+            crate::cache::key_for(&fsrc),
+        ));
     }
     crate::cache::store_bundle(&abs, &src, &prog, deps)?;
 

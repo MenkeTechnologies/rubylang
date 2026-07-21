@@ -229,7 +229,12 @@ fn dap_function_breakpoint_stops_on_entry_and_evaluates() {
             json!({ "breakpoints": [{ "name": "greet" }] }),
         );
         send(&mut stdin, &mut seq, "configurationDone", json!({}));
-        send(&mut stdin, &mut seq, "launch", json!({ "program": prog_path }));
+        send(
+            &mut stdin,
+            &mut seq,
+            "launch",
+            json!({ "program": prog_path }),
+        );
 
         let mut fn_bp_verified = false;
         let mut stop_reason = String::new();
@@ -287,7 +292,9 @@ fn dap_function_breakpoint_stops_on_entry_and_evaluates() {
             errs.push("function breakpoint on `greet` not verified".to_string());
         }
         if stop_reason != "function breakpoint" {
-            errs.push(format!("stop reason not function breakpoint: {stop_reason:?}"));
+            errs.push(format!(
+                "stop reason not function breakpoint: {stop_reason:?}"
+            ));
         }
         if top_name != "greet" {
             errs.push(format!("top frame not `greet`: {top_name:?}"));

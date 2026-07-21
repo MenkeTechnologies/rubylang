@@ -86,11 +86,11 @@ fn file_open_with_block_round_trips_and_closes() {
     let p = p.to_str().unwrap();
     std::fs::write(p, b"l1\nl2\nl3\n").unwrap();
     // The block's value is returned, and the handle is closed on exit.
-    eq(&format!("File.open({p:?}) {{ |f| f.read }}"), "\"l1\\nl2\\nl3\\n\"");
     eq(
-        &format!("File.open({p:?}) {{ |f| f.gets }}"),
-        "\"l1\\n\"",
+        &format!("File.open({p:?}) {{ |f| f.read }}"),
+        "\"l1\\nl2\\nl3\\n\"",
     );
+    eq(&format!("File.open({p:?}) {{ |f| f.gets }}"), "\"l1\\n\"");
     // Block-less open returns the IO; inspect shows the path, closed? tracks state.
     eq(
         &format!("f = File.open({p:?}); r = f.inspect; f.close; [r, f.closed?, f.inspect]"),
@@ -115,7 +115,10 @@ fn io_instance_write_read_gets_readlines() {
         &format!("File.open({p:?}) {{ |f| [f.gets, f.gets, f.readlines] }}"),
         "[\"x\\n\", \"y\\n\", [\"z\\n\"]]",
     );
-    eq(&format!("File.readlines({p:?})"), "[\"x\\n\", \"y\\n\", \"z\\n\"]");
+    eq(
+        &format!("File.readlines({p:?})"),
+        "[\"x\\n\", \"y\\n\", \"z\\n\"]",
+    );
 }
 
 #[test]
@@ -161,9 +164,7 @@ fn dir_glob_sorted_and_dotfile_excluded() {
     // `*` sorts and excludes the leading-dot file.
     eq(
         &format!("Dir.glob({base:?} + \"/*\")"),
-        &format!(
-            "[\"{base}/a.txt\", \"{base}/b.txt\", \"{base}/c.rb\", \"{base}/sub\"]"
-        ),
+        &format!("[\"{base}/a.txt\", \"{base}/b.txt\", \"{base}/c.rb\", \"{base}/sub\"]"),
     );
     // `*.txt` filters by extension, sorted.
     eq(
@@ -173,16 +174,12 @@ fn dir_glob_sorted_and_dotfile_excluded() {
     // `**` recurses; results sorted lexicographically.
     eq(
         &format!("Dir.glob({base:?} + \"/**/*.txt\")"),
-        &format!(
-            "[\"{base}/a.txt\", \"{base}/b.txt\", \"{base}/sub/d.txt\"]"
-        ),
+        &format!("[\"{base}/a.txt\", \"{base}/b.txt\", \"{base}/sub/d.txt\"]"),
     );
     // Brace alternation: each group globbed+sorted, concatenated in brace order.
     eq(
         &format!("Dir.glob({base:?} + \"/*.{{txt,rb}}\")"),
-        &format!(
-            "[\"{base}/a.txt\", \"{base}/b.txt\", \"{base}/c.rb\"]"
-        ),
+        &format!("[\"{base}/a.txt\", \"{base}/b.txt\", \"{base}/c.rb\"]"),
     );
     // Dir[] is an alias for Dir.glob.
     eq(
@@ -210,10 +207,7 @@ fn dir_exist_and_mkdir() {
     let nd = d.path().join("made");
     let nd = nd.to_str().unwrap();
     eq(&format!("Dir.exist?({nd:?})"), "false");
-    eq(
-        &format!("Dir.mkdir({nd:?}); Dir.exist?({nd:?})"),
-        "true",
-    );
+    eq(&format!("Dir.mkdir({nd:?}); Dir.exist?({nd:?})"), "true");
 }
 
 #[test]

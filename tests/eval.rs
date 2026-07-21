@@ -314,10 +314,7 @@ fn namespaced_constants_and_nested_modules() {
     );
     // A bare constant read inside a namespace resolves against the lexical
     // nesting (here `M::V`), not just the top level.
-    eq(
-        "module M; V = 42; def self.read; V; end; end; M.read",
-        "42",
-    );
+    eq("module M; V = 42; def self.read; V; end; end; M.read", "42");
     // A nested class opened inside a class body (`class Outer; class Inner`).
     eq(
         "class Outer; class Inner; def v; 7; end; end; end; Outer::Inner.new.v",
@@ -3099,7 +3096,7 @@ fn srand_makes_rand_reproducible() {
 fn integer_pow_with_modulus() {
     eq("3.pow(4, 5)", "1"); // 81 % 5
     eq("2.pow(10, 1000)", "24"); // 1024 % 1000
-    // MRI raises RangeError for a negative exponent with a modulus (no inverse).
+                                 // MRI raises RangeError for a negative exponent with a modulus (no inverse).
     eq(
         "begin; 3.pow(-1, 7); rescue RangeError; :raised; end",
         ":raised",
@@ -3284,7 +3281,10 @@ fn reserved_word_keyword_labels() {
     // reserved-word required keyword parameter, called with reserved-word kwarg
     eq("def opts(in:); :ok; end; opts(in: 9)", ":ok");
     // reserved-word kwarg value flows through **opts (value observable)
-    eq("def g(**o); o; end; g(class: 1, if: 2)", "{class: 1, if: 2}");
+    eq(
+        "def g(**o); o; end; g(class: 1, if: 2)",
+        "{class: 1, if: 2}",
+    );
     // reserved-word symbol hash keys
     eq("{if: 1, class: 2, end: 3}", "{if: 1, class: 2, end: 3}");
     // multiple reserved kwparams
@@ -3563,12 +3563,21 @@ fn case_in_deconstruct_protocol() {
 #[test]
 fn enumerator_new_block_generators() {
     // Finite generator: to_a collects every yielded value.
-    eq("Enumerator.new { |y| y << 1; y << 2; y << 3 }.to_a", "[1, 2, 3]");
+    eq(
+        "Enumerator.new { |y| y << 1; y << 2; y << 3 }.to_a",
+        "[1, 2, 3]",
+    );
     // `Yielder#yield` is an alias of `<<` (paren-less and parenthesized forms
     // both parse — see `parenless_command_call_on_dot_and_const_receiver`).
-    eq("Enumerator.new { |y| y.yield(1); y.yield(2) }.to_a", "[1, 2]");
+    eq(
+        "Enumerator.new { |y| y.yield(1); y.yield(2) }.to_a",
+        "[1, 2]",
+    );
     // first(n) with an explicit count returns an array.
-    eq("Enumerator.new { |y| y << 10; y << 20; y << 30 }.first(2)", "[10, 20]");
+    eq(
+        "Enumerator.new { |y| y << 10; y << 20; y << 30 }.first(2)",
+        "[10, 20]",
+    );
     // Bare next on a finite generator (materialize + cursor).
     eq("Enumerator.new { |y| y << 1 }.next", "1");
     // Infinite fib generator bounded by first(n) via the loop{} early-stop.
@@ -3577,7 +3586,10 @@ fn enumerator_new_block_generators() {
         "[0, 1, 1, 2, 3, 5, 8, 13]",
     );
     // Non-terminal Enumerable method over a finite generator delegates to Array.
-    eq("Enumerator.new { |y| y << 1; y << 2 }.map { |x| x * 10 }", "[10, 20]");
+    eq(
+        "Enumerator.new { |y| y << 1; y << 2 }.map { |x| x * 10 }",
+        "[10, 20]",
+    );
 }
 
 #[test]
@@ -3602,7 +3614,10 @@ fn array_cycle_count() {
 fn enumerator_block_less_still_works() {
     // Guard: block-less each/lazy on real collections is unaffected.
     eq("[1, 2, 3].each.to_a", "[1, 2, 3]");
-    eq("(1..Float::INFINITY).lazy.map { |x| x * x }.first(3)", "[1, 4, 9]");
+    eq(
+        "(1..Float::INFINITY).lazy.map { |x| x * x }.first(3)",
+        "[1, 4, 9]",
+    );
     eq("[10, 20, 30].each.next", "10");
 }
 
@@ -3620,7 +3635,10 @@ fn struct_deconstruct_patterns() {
         "[1, 2]",
     );
     // A hash-pattern subset requests only some keys.
-    eq("S = Struct.new(:a, :b); case S.new(1, 2); in {a:}; a; end", "1");
+    eq(
+        "S = Struct.new(:a, :b); case S.new(1, 2); in {a:}; a; end",
+        "1",
+    );
     // The class/find pattern deconstructs positionally.
     eq(
         "S = Struct.new(:a, :b); case S.new(1, 2); in S[x, y]; [x, y]; end",
@@ -3701,7 +3719,10 @@ fn method_defined_predicate() {
           Foo.method_defined?(:mm), Foo.method_defined?(:nope)]",
         "[true, true, true, false]",
     );
-    eq("class Foo; def a; end; end; Foo.method_defined?(\"a\")", "true");
+    eq(
+        "class Foo; def a; end; end; Foo.method_defined?(\"a\")",
+        "true",
+    );
 }
 
 #[test]
@@ -3858,9 +3879,18 @@ fn fiber_error_conditions() {
 fn break_value_short_circuits_iterators() {
     // `break value` inside a block becomes the iterator's result.
     eq("[1, 2, 3, 4].map { |x| break x if x == 3; x }", "3");
-    eq("[1, 2, 3, 4].select { |x| break :stop if x == 3; x.odd? }", ":stop");
-    eq("[1, 2, 3, 4].filter_map { |x| break 99 if x == 3; x if x.even? }", "99");
-    eq("[1, 2, 3, 4].inject { |a, b| break b if b == 3; a + b }", "3");
+    eq(
+        "[1, 2, 3, 4].select { |x| break :stop if x == 3; x.odd? }",
+        ":stop",
+    );
+    eq(
+        "[1, 2, 3, 4].filter_map { |x| break 99 if x == 3; x if x.even? }",
+        "99",
+    );
+    eq(
+        "[1, 2, 3, 4].inject { |a, b| break b if b == 3; a + b }",
+        "3",
+    );
     eq("loop { break 42 }", "42");
     // Bare `break` before a closing delimiter now parses.
     eq("[1, 2].each { break }", "nil");
@@ -3882,7 +3912,10 @@ fn object_id_identity() {
 #[test]
 fn hash_merge_and_transform_keys_variants() {
     // merge with a conflict-resolution block.
-    eq("{a: 1, b: 2}.merge({b: 3, c: 4}) { |k, o, n| o + n }", "{a: 1, b: 5, c: 4}");
+    eq(
+        "{a: 1, b: 2}.merge({b: 3, c: 4}) { |k, o, n| o + n }",
+        "{a: 1, b: 5, c: 4}",
+    );
     // transform_keys with a mapping hash, and hash + block.
     eq("{a: 1, b: 2}.transform_keys({a: :x})", "{x: 1, b: 2}");
     eq(
@@ -3893,13 +3926,22 @@ fn hash_merge_and_transform_keys_variants() {
 
 #[test]
 fn array_to_h_block_and_lazy_zip() {
-    eq("[1, 2, 3].to_h { |x| [x, x * x] }", "{1 => 1, 2 => 4, 3 => 9}");
-    eq("[1, 2, 3].lazy.zip([4, 5, 6]).to_a", "[[1, 4], [2, 5], [3, 6]]");
+    eq(
+        "[1, 2, 3].to_h { |x| [x, x * x] }",
+        "{1 => 1, 2 => 4, 3 => 9}",
+    );
+    eq(
+        "[1, 2, 3].lazy.zip([4, 5, 6]).to_a",
+        "[[1, 4], [2, 5], [3, 6]]",
+    );
     eq(
         "[1, 2, 3].lazy.zip([4, 5], [7, 8, 9]).to_a",
         "[[1, 4, 7], [2, 5, 8], [3, nil, 9]]",
     );
-    eq("(1..Float::INFINITY).lazy.zip([9, 8, 7]).first(2)", "[[1, 9], [2, 8]]");
+    eq(
+        "(1..Float::INFINITY).lazy.zip([9, 8, 7]).first(2)",
+        "[[1, 9], [2, 8]]",
+    );
 }
 
 #[test]
@@ -3946,7 +3988,10 @@ fn parenless_dot_call_guards_no_regression() {
     eq("5.between?(1, 9)", "true");
     eq("[1].push(2)", "[1, 2]");
     // `= x` after a dot call is a setter, not a command arg.
-    eq("class C; attr_accessor :x; end; c = C.new; c.x = 5; c.x", "5");
+    eq(
+        "class C; attr_accessor :x; end; c = C.new; c.x = 5; c.x",
+        "5",
+    );
     // Blocks bind to the dot call, not consumed as args.
     eq("3.tap { |n| }", "3");
     eq("[1, 2].map { |x| x * 2 }.first", "2");
@@ -4035,7 +4080,10 @@ fn constant_reflection() {
     eq("Object.const_defined?(:NoSuchConst)", "false");
     // A nested path resolves against the flat constant store by its last segment.
     eq("module A; B = 99; end; A.const_get(\"A::B\")", "99");
-    eq("Object.const_set(:Zeta, 1); Object.constants.include?(:Zeta)", "true");
+    eq(
+        "Object.const_set(:Zeta, 1); Object.constants.include?(:Zeta)",
+        "true",
+    );
 }
 
 #[test]
@@ -4150,10 +4198,7 @@ fn ordinary_iteration_block_keeps_lexical_self_unchanged() {
          [1,2].each { |x| a << bump(x) }; a; end; end; F.new.run",
         "[11, 12]",
     );
-    eq(
-        "t = 0; [10, 20].each { |x| t += x }; t",
-        "30",
-    );
+    eq("t = 0; [10, 20].each { |x| t += x }; t", "30");
 }
 
 // ---- stdlib modules: Digest / Base64 / SecureRandom / OpenStruct ----------
@@ -4214,7 +4259,10 @@ fn base64_encode_decode_matches_reference() {
     );
     eq("Base64.decode64(\"aGVsbG8=\\n\")", "\"hello\"");
     eq("Base64.strict_decode64(\"aGVsbG8=\")", "\"hello\"");
-    eq("Base64.urlsafe_decode64(\"c3ViamVjdHM_X2Q=\")", "\"subjects?_d\"");
+    eq(
+        "Base64.urlsafe_decode64(\"c3ViamVjdHM_X2Q=\")",
+        "\"subjects?_d\"",
+    );
     // Round-trip.
     eq(
         "Base64.strict_decode64(Base64.strict_encode64(\"round trip!\"))",
@@ -4227,7 +4275,10 @@ fn securerandom_shapes() {
     // Random output can't match MRI byte-for-byte; assert length/format instead.
     eq("SecureRandom.hex(8).length == 16", "true");
     eq("SecureRandom.hex.length == 32", "true");
-    eq("SecureRandom.hex(8) =~ /\\A[0-9a-f]{16}\\z/ ? true : false", "true");
+    eq(
+        "SecureRandom.hex(8) =~ /\\A[0-9a-f]{16}\\z/ ? true : false",
+        "true",
+    );
     eq(
         "SecureRandom.uuid =~ /\\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\z/ ? true : false",
         "true",
@@ -4262,17 +4313,20 @@ fn openstruct_dynamic_attributes() {
     // A writer responds only for an already-set attribute (MRI semantics).
     eq("OpenStruct.new(a: 1).respond_to?(\"a=\")", "true");
     eq("OpenStruct.new(a: 1).respond_to?(\"x=\")", "false");
-    eq("OpenStruct.new(a: 1, b: 2).inspect", "\"#<OpenStruct a=1, b=2>\"");
+    eq(
+        "OpenStruct.new(a: 1, b: 2).inspect",
+        "\"#<OpenStruct a=1, b=2>\"",
+    );
     eq("OpenStruct.new.inspect", "\"#<OpenStruct>\"");
     // Attribute-wise equality, order-independent, including inside collections.
-    eq("OpenStruct.new(a: 1, b: 2) == OpenStruct.new(a: 1, b: 2)", "true");
+    eq(
+        "OpenStruct.new(a: 1, b: 2) == OpenStruct.new(a: 1, b: 2)",
+        "true",
+    );
     eq("OpenStruct.new(a: 1) == OpenStruct.new(a: 2)", "false");
     eq("[OpenStruct.new(a: 1)] == [OpenStruct.new(a: 1)]", "true");
     // Nested dig.
-    eq(
-        "OpenStruct.new(a: OpenStruct.new(b: 5)).dig(:a, :b)",
-        "5",
-    );
+    eq("OpenStruct.new(a: OpenStruct.new(b: 5)).dig(:a, :b)", "5");
 }
 
 /// ERB templating: `ERB.new(...).result` / `#result_with_hash`, tag syntax
@@ -4542,7 +4596,10 @@ fn string_new_is_a_real_mutable_string() {
 #[test]
 fn array_reverse_each() {
     // Block form yields elements in reverse, returns the receiver.
-    eq("r = []; [1,2,3].reverse_each { |x| r << x }; r", "[3, 2, 1]");
+    eq(
+        "r = []; [1,2,3].reverse_each { |x| r << x }; r",
+        "[3, 2, 1]",
+    );
     // Block-less form is a reverse Enumerator (chainable).
     eq("[1,2,3].reverse_each.to_a", "[3, 2, 1]");
     eq("[1,2,3].reverse_each.map { |x| x * 2 }", "[6, 4, 2]");
@@ -4650,7 +4707,10 @@ fn super_in_exception_initialize_sets_message() {
 
 #[test]
 fn hash_merge_bang_and_update() {
-    eq("h = {a: 1, b: 2}; h.merge!({b: 3, c: 4}); h", "{a: 1, b: 3, c: 4}");
+    eq(
+        "h = {a: 1, b: 2}; h.merge!({b: 3, c: 4}); h",
+        "{a: 1, b: 3, c: 4}",
+    );
     // Returns the receiver (same object).
     eq("h = {a: 1}; h.merge!({b: 2}).equal?(h)", "true");
     // Block resolves collisions; `update` is the alias.
@@ -4659,9 +4719,15 @@ fn hash_merge_bang_and_update() {
         "{a: 1, b: 12}",
     );
     // Multiple hash arguments, left-to-right.
-    eq("h = {a: 1}; h.merge!({b: 2}, {c: 3}); h", "{a: 1, b: 2, c: 3}");
+    eq(
+        "h = {a: 1}; h.merge!({b: 2}, {c: 3}); h",
+        "{a: 1, b: 2, c: 3}",
+    );
     // Non-bang merge with a block is unaffected.
-    eq("{x: 1}.merge({x: 2, y: 3}) { |k, o, n| o + n }", "{x: 3, y: 3}");
+    eq(
+        "{x: 1}.merge({x: 2, y: 3}) { |k, o, n| o + n }",
+        "{x: 3, y: 3}",
+    );
 }
 
 #[test]
@@ -4698,14 +4764,20 @@ fn array_pack_and_string_unpack_round_trip() {
     eq("\"ABC\".unpack(\"C*\")", "[65, 66, 67]");
     eq("\"Hi\".unpack1(\"a*\")", "\"Hi\"");
     // Hex directive (used by digests): decode then re-encode.
-    eq("[\"deadbeef\"].pack(\"H*\").unpack1(\"H*\")", "\"deadbeef\"");
+    eq(
+        "[\"deadbeef\"].pack(\"H*\").unpack1(\"H*\")",
+        "\"deadbeef\"",
+    );
     // Big/little-endian fixed-width integers.
     eq("[1].pack(\"N\").unpack1(\"N\")", "1");
     eq("[65535].pack(\"n\").unpack1(\"n\")", "65535");
     eq("[1].pack(\"V\").unpack1(\"V\")", "1");
     eq("[513].pack(\"v\").unpack1(\"v\")", "513");
     // Every byte value round-trips (the crypto/web property).
-    eq("(0..255).to_a.pack(\"C*\").unpack(\"C*\") == (0..255).to_a", "true");
+    eq(
+        "(0..255).to_a.pack(\"C*\").unpack(\"C*\") == (0..255).to_a",
+        "true",
+    );
     // Integer#chr for a high byte round-trips through unpack.
     eq("200.chr.unpack(\"C*\")", "[200]");
     eq("[\"hi\"].pack(\"A5\")", "\"hi   \"");
@@ -4851,12 +4923,21 @@ fn grep_and_visibility_directives() {
     eq("[1, 2, \"a\", \"b\", 3].grep(Integer)", "[1, 2, 3]");
     eq("[\"x1\", \"y\", \"x2\"].grep(/x/)", "[\"x1\", \"x2\"]");
     eq("(1..10).to_a.grep(3..6)", "[3, 4, 5, 6]");
-    eq("[1, 2, 3, 4].grep(Integer) { |x| x * 10 }", "[10, 20, 30, 40]");
+    eq(
+        "[1, 2, 3, 4].grep(Integer) { |x| x * 10 }",
+        "[10, 20, 30, 40]",
+    );
     eq("[1, \"a\", 2].grep_v(Integer)", "[\"a\"]");
     // Visibility directives with args are accepted (rubylang doesn't enforce
     // visibility); private_constant/private return the name, module_function nil.
-    eq("module M1; X = 5; private_constant :X; def self.g; X; end; end; M1.g", "5");
-    eq("class C1; def a; 1; end; private :a; end; C1.new.send(:a)", "1");
+    eq(
+        "module M1; X = 5; private_constant :X; def self.g; X; end; end; M1.g",
+        "5",
+    );
+    eq(
+        "class C1; def a; 1; end; private :a; end; C1.new.send(:a)",
+        "1",
+    );
 }
 
 /// Operator symbols (`:-@`, `:+@`, `:!~`) and operator method-name defs (`def =~`)

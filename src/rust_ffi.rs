@@ -41,7 +41,8 @@ pub fn desugar(src: &str) -> String {
 mod tests {
     #[test]
     fn desugars_ruby_block() {
-        let src = "rust { pub extern \"C\" fn add(a: i64, b: i64) -> i64 { a + b } }\nputs add(2, 3)\n";
+        let src =
+            "rust { pub extern \"C\" fn add(a: i64, b: i64) -> i64 { a + b } }\nputs add(2, 3)\n";
         let out = super::desugar(src);
         assert!(out.contains("__rust_compile("), "no builtin call: {out}");
         assert!(!out.contains("pub extern"), "Rust body leaked: {out}");

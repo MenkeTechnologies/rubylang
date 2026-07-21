@@ -36,7 +36,11 @@ fn main() {
         eprintln!("gen-docs: cannot write {out}: {e}");
         std::process::exit(1);
     }
-    println!("wrote {out} ({} methods, {} chapters)", corpus.len(), chapters.len());
+    println!(
+        "wrote {out} ({} methods, {} chapters)",
+        corpus.len(),
+        chapters.len()
+    );
 }
 
 /// Render one `<section>` per chapter, each holding one `<article class="doc-entry">`

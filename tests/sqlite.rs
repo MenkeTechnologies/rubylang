@@ -60,7 +60,10 @@ fn sqlite_results_as_hash() {
         db.results_as_hash = true
         db.execute("SELECT name, age FROM users")
     "#;
-    assert_eq!(ev(src).expect("eval"), r#"[{"name" => "Alice", "age" => 30}]"#);
+    assert_eq!(
+        ev(src).expect("eval"),
+        r#"[{"name" => "Alice", "age" => 30}]"#
+    );
 }
 
 /// `get_first_value` returns a scalar; `get_first_row` returns one row; both take
@@ -227,7 +230,10 @@ fn sqlite_file_backed_persistence_roundtrip() {
         "#
     );
     assert_eq!(ev(&write_src).expect("write eval"), "true");
-    assert!(db_path.exists(), "the DB file must exist on disk after write");
+    assert!(
+        db_path.exists(),
+        "the DB file must exist on disk after write"
+    );
 
     // Read phase — a fresh interpreter (host was reset), reopening the file.
     let read_src = format!(
