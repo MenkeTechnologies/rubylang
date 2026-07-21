@@ -6951,11 +6951,11 @@ fn dispatch_thread(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         // by the same process-global store as `Fiber[]` (single-thread-boot scope).
         "[]" => {
             let store = with_host(fiber_store);
-            return dispatch(&store, "[]", args, None);
+            dispatch(&store, "[]", args, None)
         }
         "[]=" => {
             let store = with_host(fiber_store);
-            return dispatch(&store, "[]=", args, None);
+            dispatch(&store, "[]=", args, None)
         }
         "join" => {
             crate::host::thread_join(recv)?;

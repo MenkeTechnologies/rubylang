@@ -82,7 +82,7 @@ pub fn build(file: &str) -> Result<String, String> {
 /// the frontend per fusevm's contract; here it lives in the rubylang library so
 /// the generated frontend links it in via the rubylang rlib.
 ///
-/// It mirrors [`crate::host::run_chunk_on`]'s VM setup (install every rubylang
+/// It mirrors `crate::host::run_chunk_on`'s VM setup (install every rubylang
 /// builtin + the strict numeric hook) so the AOT main chunk dispatches Ruby ops
 /// exactly as the interpreter does, then loads the embedded full `Program`
 /// (methods/classes/begins/procs) into the thread-local host so a method call,

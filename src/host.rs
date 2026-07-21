@@ -673,7 +673,7 @@ pub struct FiddleLib(libloading::os::unix::Library);
 
 /// A column value carried between the `rusqlite` layer and the Ruby object heap.
 /// Re-exports `rusqlite::types::Value` (Null/Integer/Real/Text/Blob) so the SQL
-/// execution in [`RubyHost::db_execute`] never touches `Value`/the heap (which
+/// execution in `RubyHost::db_execute` never touches `Value`/the heap (which
 /// would require a second `&mut self` borrow while the connection is borrowed).
 pub type SqlVal = rusqlite::types::Value;
 
