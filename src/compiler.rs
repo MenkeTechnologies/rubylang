@@ -72,6 +72,12 @@ pub struct Compiler {
     /// (Ruby's lexical constant lookup). Superclass/include names are resolved
     /// against it too.
     nesting: Vec<String>,
+    /// The source line of the statement currently being compiled. Baked into the
+    /// call/read ops that can raise (`CALL*`, `YIELD`, `SUPER*`, var reads,
+    /// index) so `abort` can report an MRI-format backtrace line
+    /// (`<src>:<line>:in '<ctx>'`) for an uncaught exception. Saved/restored
+    /// around nested body compiles so an inner block/def can't leak its line.
+    cur_line: u32,
 }
 
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
@@ -217,6 +223,9 @@ impl Compiler {
             return Ok(());
         }
         for (i, s) in body.iter().enumerate() {
+            if s.line != 0 {
+                self.cur_line = s.line;
+            }
             if self.debug && s.line != 0 {
                 b.emit(Op::Extended(crate::host::ext::DBG_LINE, 0), s.line);
             }
@@ -251,6 +260,7 @@ impl Compiler {
     /// caller omitted (`defined?(p) ? p : <default>`), then the body.
     fn compile_method(&mut self, params: &[Param], body: &[Stmt]) -> Result<MethodDef, String> {
         let saved = std::mem::take(&mut self.loops);
+        let saved_line = self.cur_line;
         let mut b = ChunkBuilder::new();
         for p in params {
             if let Some(default) = &p.default {
@@ -266,6 +276,7 @@ impl Compiler {
         }
         self.compile_seq(&mut b, body)?;
         self.loops = saved;
+        self.cur_line = saved_line;
         // Positional params (name-bound by index) are separate from keyword
         // params (bound from the trailing keyword hash).
         let pnames: Vec<String> = params
@@ -298,9 +309,11 @@ impl Compiler {
         // A method/proc body is its own chunk; a native-loop context from the
         // enclosing chunk does not cross into it (break/next become signals).
         let saved = std::mem::take(&mut self.loops);
+        let saved_line = self.cur_line;
         let mut b = ChunkBuilder::new();
         self.compile_seq(&mut b, body)?;
         self.loops = saved;
+        self.cur_line = saved_line;
         Ok(b.build())
     }
 
@@ -470,13 +483,16 @@ impl Compiler {
                     self.compile_expr(b, recv)?;
                     self.kstr(b, "[]");
                     self.compile_spread(b, idx)?;
-                    b.emit(Op::CallBuiltin(ops::CALL_METHOD_ARR, 3), 0);
+                    b.emit(Op::CallBuiltin(ops::CALL_METHOD_ARR, 3), self.cur_line);
                 } else {
                     self.compile_expr(b, recv)?;
                     for i in idx {
                         self.compile_expr(b, i)?;
                     }
-                    b.emit(Op::CallBuiltin(ops::INDEX_GET, argc(1 + idx.len())?), 0);
+                    b.emit(
+                        Op::CallBuiltin(ops::INDEX_GET, argc(1 + idx.len())?),
+                        self.cur_line,
+                    );
                 }
             }
             Expr::Def {
@@ -564,7 +580,10 @@ impl Compiler {
                 for a in args {
                     self.compile_expr(b, a)?;
                 }
-                b.emit(Op::CallBuiltin(ops::YIELD, argc(args.len())?), 0);
+                b.emit(
+                    Op::CallBuiltin(ops::YIELD, argc(args.len())?),
+                    self.cur_line,
+                );
             }
             Expr::Defined(operand) => self.compile_defined(b, operand)?,
             Expr::Super { args, block } => {
@@ -595,11 +614,14 @@ impl Compiler {
                         for a in args {
                             self.compile_expr(b, a)?;
                         }
-                        b.emit(Op::CallBuiltin(ops::SUPER, argc(args.len())?), 0);
+                        b.emit(
+                            Op::CallBuiltin(ops::SUPER, argc(args.len())?),
+                            self.cur_line,
+                        );
                     }
                     // `super` — forward args and block.
                     (None, false) => {
-                        b.emit(Op::CallBuiltin(ops::SUPER_FWD, 0), 0);
+                        b.emit(Op::CallBuiltin(ops::SUPER_FWD, 0), self.cur_line);
                     }
                     // `super(args) { blk }` / `super(args, &blk)` — explicit args +
                     // a block (the block value rides on top of the args).
@@ -608,12 +630,15 @@ impl Compiler {
                             self.compile_expr(b, a)?;
                         }
                         emit_block(self, b)?;
-                        b.emit(Op::CallBuiltin(ops::SUPER_BLK, argc(args.len() + 1)?), 0);
+                        b.emit(
+                            Op::CallBuiltin(ops::SUPER_BLK, argc(args.len() + 1)?),
+                            self.cur_line,
+                        );
                     }
                     // `super { blk }` / `super(&blk)` — forward args, pass a block.
                     (None, true) => {
                         emit_block(self, b)?;
-                        b.emit(Op::CallBuiltin(ops::SUPER_FWD_BLK, 1), 0);
+                        b.emit(Op::CallBuiltin(ops::SUPER_FWD_BLK, 1), self.cur_line);
                     }
                 }
             }
@@ -682,7 +707,9 @@ impl Compiler {
             VarKind::Const => ops::GETCONST,
         };
         self.kstr(b, name);
-        b.emit(Op::CallBuiltin(op, 1), 0);
+        // A bare-name read (`GETLOCAL`, …) can turn into a zero-arg method call
+        // that raises, so carry the line for the backtrace.
+        b.emit(Op::CallBuiltin(op, 1), self.cur_line);
     }
 
     fn compile_assign(
@@ -717,7 +744,10 @@ impl Compiler {
                     self.compile_expr(b, i)?;
                 }
                 self.compile_expr(b, value)?;
-                b.emit(Op::CallBuiltin(ops::INDEX_SET, argc(2 + idx.len())?), 0);
+                b.emit(
+                    Op::CallBuiltin(ops::INDEX_SET, argc(2 + idx.len())?),
+                    self.cur_line,
+                );
             }
             // `A::B = v` (a capitalized name on a constant-path receiver) is a
             // namespaced constant assignment, stored under the qualified name —
@@ -747,7 +777,7 @@ impl Compiler {
                 self.compile_expr(b, r)?;
                 self.kstr(b, &format!("{name}="));
                 self.compile_expr(b, value)?;
-                b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), 0);
+                b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), self.cur_line);
             }
             _ => return Err("invalid assignment target".into()),
         }
@@ -1165,7 +1195,7 @@ impl Compiler {
                 self.compile_expr(b, label)?;
                 self.kstr(b, "===");
                 self.compile_var_read(b, VarKind::Local, tmp);
-                b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), 0);
+                b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), self.cur_line);
                 b.emit(Op::CallBuiltin(ops::TRUTHY, 1), 0);
                 into_body.push(b.emit(Op::JumpIfTrue(0), 0));
             }
@@ -1236,17 +1266,17 @@ impl Compiler {
             match (recv.is_some(), has_block) {
                 (true, true) => {
                     emit_block(self, b)?;
-                    b.emit(Op::CallBuiltin(ops::CALL_METHOD_ARR_BLK, 4), 0);
+                    b.emit(Op::CallBuiltin(ops::CALL_METHOD_ARR_BLK, 4), self.cur_line);
                 }
                 (true, false) => {
-                    b.emit(Op::CallBuiltin(ops::CALL_METHOD_ARR, 3), 0);
+                    b.emit(Op::CallBuiltin(ops::CALL_METHOD_ARR, 3), self.cur_line);
                 }
                 (false, true) => {
                     emit_block(self, b)?;
-                    b.emit(Op::CallBuiltin(ops::CALL_ARR_BLK, 3), 0);
+                    b.emit(Op::CallBuiltin(ops::CALL_ARR_BLK, 3), self.cur_line);
                 }
                 (false, false) => {
-                    b.emit(Op::CallBuiltin(ops::CALL_ARR, 2), 0);
+                    b.emit(Op::CallBuiltin(ops::CALL_ARR, 2), self.cur_line);
                 }
             }
             return Ok(());
@@ -1262,10 +1292,13 @@ impl Compiler {
                     emit_block(self, b)?;
                     b.emit(
                         Op::CallBuiltin(ops::CALL_METHOD_BLK, argc(3 + args.len())?),
-                        0,
+                        self.cur_line,
                     );
                 } else {
-                    b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(2 + args.len())?), 0);
+                    b.emit(
+                        Op::CallBuiltin(ops::CALL_METHOD, argc(2 + args.len())?),
+                        self.cur_line,
+                    );
                 }
             }
             None => {
@@ -1275,9 +1308,15 @@ impl Compiler {
                 }
                 if has_block {
                     emit_block(self, b)?;
-                    b.emit(Op::CallBuiltin(ops::CALL_BLK, argc(2 + args.len())?), 0);
+                    b.emit(
+                        Op::CallBuiltin(ops::CALL_BLK, argc(2 + args.len())?),
+                        self.cur_line,
+                    );
                 } else {
-                    b.emit(Op::CallBuiltin(ops::CALL, argc(1 + args.len())?), 0);
+                    b.emit(
+                        Op::CallBuiltin(ops::CALL, argc(1 + args.len())?),
+                        self.cur_line,
+                    );
                 }
             }
         }
@@ -1516,7 +1555,7 @@ impl Compiler {
             self.kstr(b, &qname);
             b.emit(Op::CallBuiltin(ops::GETCONST, 1), 0);
             self.kstr(b, &body_name);
-            b.emit(Op::CallBuiltin(ops::CALL_METHOD, 2), 0);
+            b.emit(Op::CallBuiltin(ops::CALL_METHOD, 2), self.cur_line);
             b.emit(Op::Pop, 0);
         }
         // Module hooks fire once the include/prepend/extend relationship is set.

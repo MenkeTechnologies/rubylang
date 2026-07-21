@@ -771,7 +771,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             // not evaluated; double-quoted escapes cover `\0 \n \t \e \\ \"`.
             b':' if i + 1 < b.len()
                 && (b[i + 1] == b'"' || b[i + 1] == b'\'')
-                && (!prev_is_value(&out) || sp) =>
+                && (!prev_is_value(&out) || sp)
+                && !glued_keyword_label(&out, sp) =>
             {
                 let quote = b[i + 1];
                 i += 2;
@@ -803,7 +804,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             }
             b':' if i + 1 < b.len()
                 && op_symbol_at(&src[i + 1..]).is_some()
-                && (!prev_is_value(&out) || sp) =>
+                && (!prev_is_value(&out) || sp)
+                && !glued_keyword_label(&out, sp) =>
             {
                 let op = op_symbol_at(&src[i + 1..]).unwrap();
                 i += 1 + op.len();
@@ -819,7 +821,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 // label colon, not a symbol start — the same disambiguation the
                 // operator-symbol case above uses. `foo :bar` (spaced) and
                 // expression-start `:bar` still lex as symbols.
-                && (!prev_is_value(&out) || sp) =>
+                && (!prev_is_value(&out) || sp)
+                && !glued_keyword_label(&out, sp) =>
             {
                 i += 1;
                 let start = i;
@@ -1112,6 +1115,18 @@ fn percent_string_start(out: &[Token], sp: bool) -> bool {
 
 /// Whether the last significant token is a value (so a following `:op` is a
 /// ternary colon / hash key, not an operator symbol).
+/// A keyword glued directly to a `:` (no preceding space) is a label name, not
+/// the start of a symbol: `class:"x"`, `if: 1`, `def f(in: 5)`, `return:5`. MRI
+/// lexes every glued `keyword:` as a hash/kwarg label (verified against 4.0.6:
+/// `{class:"x"}`→`{class: "x"}`, `{return: 5}`). Distinguishes from `:sym` (the
+/// colon precedes the name) and `foo ? a : b` (the ternary colon carries a
+/// leading space). A preceding KEYWORD counts as non-value in `prev_is_value`,
+/// so without this the symbol branches would swallow `keyword:"…"` / `keyword:x`
+/// as a symbol.
+fn glued_keyword_label(out: &[Token], sp: bool) -> bool {
+    !sp && matches!(out.last().map(|t| &t.kind), Some(Tok::Keyword(_)))
+}
+
 fn prev_is_value(out: &[Token]) -> bool {
     let prev = out.iter().rev().find(|t| t.kind != Tok::Newline);
     match prev.map(|t| &t.kind) {

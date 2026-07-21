@@ -75,7 +75,7 @@ path = "src/bin/parity_fuzz.rs"
 # persistent on-disk cache of compiled native code (keyed by chunk hash), so hot
 # Ruby loops trace-compile and warm runs skip recompilation. `aot` enables the
 # ahead-of-time object emitter behind `ruby --build`.
-fusevm = { version = "0.14.11", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
+fusevm = { version = "0.14.12", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
 
 thiserror = "2.0"
 rustc-hash = "2.1"

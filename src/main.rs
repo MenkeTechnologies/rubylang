@@ -74,7 +74,7 @@ fn main() -> ExitCode {
         }
         return match rubylang::eval_str_cfg(&src, &cfg) {
             Ok(_) => ExitCode::SUCCESS,
-            Err(e) => fail(&e),
+            Err(e) => fail_run(&e),
         };
     }
 
@@ -124,7 +124,7 @@ fn main() -> ExitCode {
         }
         return match rubylang::eval_file_cfg(&file, &cfg) {
             Ok(_) => ExitCode::SUCCESS,
-            Err(e) => fail(&e),
+            Err(e) => fail_run(&e),
         };
     }
 
@@ -144,7 +144,7 @@ fn main() -> ExitCode {
     };
     match rubylang::eval_str_cfg(&src, &cfg) {
         Ok(_) => ExitCode::SUCCESS,
-        Err(e) => fail(&e),
+        Err(e) => fail_run(&e),
     }
 }
 
@@ -273,5 +273,14 @@ fn atty_stdin() -> bool {
 
 fn fail(msg: &str) -> ExitCode {
     eprintln!("ruby: {msg}");
+    ExitCode::FAILURE
+}
+
+/// Print a program-run failure verbatim to stderr. An uncaught Ruby exception is
+/// already MRI-formatted (`<src>:<line>:in '<ctx>': <msg> (<Class>)` + backtrace)
+/// by the run boundary, and MRI never prefixes a program error with `ruby:` — so
+/// this prints the message as-is, unlike `fail` (used for CLI/loader errors).
+fn fail_run(msg: &str) -> ExitCode {
+    eprintln!("{msg}");
     ExitCode::FAILURE
 }

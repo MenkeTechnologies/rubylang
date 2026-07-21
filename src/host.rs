@@ -576,6 +576,12 @@ pub struct RubyHost {
     pub error: Option<String>,
     /// The exception object of the in-flight `raise`, if any (for `rescue`).
     pending_exc: Option<Value>,
+    /// MRI-format backtrace frames per exception heap id, accumulated by `abort`
+    /// as an exception unwinds (innermost first). Kept off the object itself so
+    /// `e.instance_variables` / inspect are unchanged; the exception's heap id is
+    /// stable, so a `rescue`/re-raise still finds its trace. Cleared per run
+    /// (`reset_host` rebuilds the host).
+    exc_backtraces: IndexMap<u32, Vec<String>>,
     signal: Option<Signal>,
     /// The scope local/`self`/block access targets. `None` = the top frame (a
     /// method body / top level); `Some(scope)` = a captured scope while a block
@@ -1150,6 +1156,7 @@ impl RubyHost {
             symbols: IndexMap::new(),
             error: None,
             pending_exc: None,
+            exc_backtraces: IndexMap::new(),
             signal: None,
             active_scope: None,
             frozen: HashSet::new(),
@@ -3215,6 +3222,66 @@ impl RubyHost {
     pub fn take_pending_exc(&mut self) -> Option<Value> {
         self.pending_exc.take()
     }
+    /// The MRI context label for the innermost active frame: `'<main>'` at the top
+    /// level, `'<DefClass>#<method>'` inside a method (an unqualified top-level
+    /// `def` reports `Object#name`, matching MRI's `-e:1:in 'Object#f'`).
+    fn innermost_context(&self) -> String {
+        match self.frames.last() {
+            Some(f) => match &f.scope.method_name {
+                Some(m) => {
+                    let cls = f.scope.def_class.clone().unwrap_or_else(|| "Object".into());
+                    format!("{cls}#{m}")
+                }
+                None => "<main>".into(),
+            },
+            None => "<main>".into(),
+        }
+    }
+    /// Append one MRI-format backtrace frame (`<src>:<line>:in '<ctx>'`) for the
+    /// in-flight exception. Called from `abort` as an exception unwinds through
+    /// each chunk boundary, so frames accumulate innermost-first (MRI's print
+    /// order). Stored in a side table keyed by the exception's heap id (not on the
+    /// object), so `e.instance_variables`/inspect are unaffected and a
+    /// `rescue`/re-raise still finds the trace. No-op when no exception is pending.
+    pub fn record_backtrace_frame(&mut self, src: &str, line: u32) {
+        let Some(Value::Obj(id)) = self.pending_exc else {
+            return;
+        };
+        let ctx = self.innermost_context();
+        self.exc_backtraces
+            .entry(id)
+            .or_default()
+            .push(format!("{src}:{line}:in '{ctx}'"));
+    }
+    /// Format the pending (uncaught) exception in MRI's shape:
+    /// `<src>:<line>:in '<ctx>': <msg> (<Class>)` followed by tab-indented
+    /// `from <src>:<line>:in '<ctx>'` lines for the remaining frames. Returns
+    /// `None` when no exception is pending. Consumes the pending exception.
+    pub fn format_uncaught(&mut self) -> Option<String> {
+        let exc = self.pending_exc.take()?;
+        let class = self.class_of(&exc).to_string();
+        let msg = match self.ivar_of(&exc, "message") {
+            Value::Undef => class.clone(),
+            m => self.to_s(&m),
+        };
+        let frames: Vec<String> = match &exc {
+            Value::Obj(id) => self.exc_backtraces.get(id).cloned().unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let mut out = match frames.split_first() {
+            Some((first, _)) => format!("{first}: {msg} ({class})"),
+            // No captured frame (e.g. an exception raised before any op ran):
+            // fall back to the bare `<msg> (<Class>)` MRI still prints.
+            None => format!("{msg} ({class})"),
+        };
+        for f in frames.iter().skip(1) {
+            out.push('\n');
+            out.push('\t');
+            out.push_str("from ");
+            out.push_str(f);
+        }
+        Some(out)
+    }
     /// Build an exception object of `class` carrying `message`.
     pub fn new_exception(&mut self, class: &str, message: &str) -> Value {
         let msg = self.new_string(message.to_string());
@@ -4371,6 +4438,14 @@ pub fn run_main(chunk: Chunk) -> Result<Value, String> {
     });
     if let Some(tag) = uncaught {
         return Err(format!("uncaught throw {tag} (UncaughtThrowError)"));
+    }
+    // An uncaught Ruby exception prints in MRI's shape (`<src>:<line>:in '<ctx>':
+    // <msg> (<Class>)` + backtrace). `abort` captured each frame as the exception
+    // unwound; format them here at the top-level boundary.
+    if r.is_err() {
+        if let Some(formatted) = with_host(|h| h.format_uncaught()) {
+            return Err(formatted);
+        }
     }
     r
 }

@@ -4995,3 +4995,71 @@ fn loop_with_optional_do_keyword() {
     eq("r = []; [1, 2].each do |x| r << x end; r", "[1, 2]");
     eq("while [1].any? { |x| x > 5 } do\n  break\nend\n:ok", ":ok");
 }
+
+// --- Fanout round 3: reserved-word keyword labels, quoted/op-symbol branches ---
+
+/// The quoted (`class:"x"`) and op-symbol (`if:+1`) colon branches must treat a
+/// glued keyword as a label, not a symbol — the same guard the alphabetic-label
+/// branch uses. Regression for the lexer emitting `:x`/`:+` symbols after a
+/// keyword. vs MRI 4.0.6.
+#[test]
+fn reserved_word_labels_quoted_and_glued() {
+    // quoted label value, no space before the colon (the fixed branch)
+    eq(r#"{class:"x"}"#, r#"{class: "x"}"#);
+    eq(r#"{def:"y", if:"z"}"#, r#"{def: "y", if: "z"}"#);
+    // glued alphabetic keyword label (`class:foo` — foo is a call → nil here)
+    eq("{class:nil, unless:nil}", "{class: nil, unless: nil}");
+    // keyword kwarg with a quoted default and no space; value observed via **o
+    eq(r#"def f(class:"x"); :ok; end; f"#, ":ok");
+    eq(r#"def g(**o); o; end; g(class: "x")"#, r#"{class: "x"}"#);
+    // `return:` glued is a label, matching MRI (`{return: 5}`)
+    eq("{return:5}", "{return: 5}");
+    // GUARD: a real symbol at expression start is untouched
+    eq("[:class, :if, :+]", "[:class, :if, :+]");
+    // GUARD: spaced command-arg symbol after a value is still a symbol
+    eq("[1].push :end", "[1, :end]");
+    // GUARD: ternary colon (spaced, not glued to a keyword) is untouched
+    eq("x = 5; x > 3 ? :big : :small", ":big");
+}
+
+// --- Fanout round 3: additive Enumerable/Array + String method arms ---------
+
+/// `collect_concat` (flat_map alias), `each_entry` (each-yielding), and `chain`
+/// (concatenating Enumerator). vs MRI 4.0.6.
+#[test]
+fn enumerable_collect_concat_each_entry_chain() {
+    // collect_concat splices one array level, like flat_map
+    eq(
+        "[1, 2, 3].collect_concat { |x| [x, x] }",
+        "[1, 1, 2, 2, 3, 3]",
+    );
+    eq("[1, 2].collect_concat { |x| x }", "[1, 2]");
+    // each_entry yields each element and returns the receiver
+    eq(
+        "r = []; [1, 2, 3].each_entry { |x| r << x }; r",
+        "[1, 2, 3]",
+    );
+    eq("[1, 2, 3].each_entry { |x| }", "[1, 2, 3]");
+    // block-less each_entry is an Enumerator whose to_a is the elements
+    eq("[1, 2].each_entry.to_a", "[1, 2]");
+    // chain concatenates the receiver with each argument's elements
+    eq("[1, 2, 3].chain([4, 5]).to_a", "[1, 2, 3, 4, 5]");
+    eq("[1, 2, 3].chain([4, 5], [6]).to_a", "[1, 2, 3, 4, 5, 6]");
+    eq("[1, 2, 3].chain.to_a", "[1, 2, 3]");
+}
+
+/// `String#delete_prefix` / `#delete_suffix` strip one exact leading/trailing
+/// match; a non-match returns an unchanged copy. vs MRI 4.0.6.
+#[test]
+fn string_delete_prefix_suffix() {
+    eq(r#""hello".delete_prefix("hel")"#, r#""lo""#);
+    eq(r#""hello".delete_prefix("xyz")"#, r#""hello""#);
+    eq(r#""hello".delete_suffix("llo")"#, r#""he""#);
+    eq(r#""hello".delete_suffix("xyz")"#, r#""hello""#);
+    // only one occurrence is stripped
+    eq(r#""aa".delete_prefix("a")"#, r#""a""#);
+    eq(r#""aaa".delete_suffix("a")"#, r#""aa""#);
+    // empty receiver / empty argument edge cases
+    eq(r#""".delete_prefix("a")"#, r#""""#);
+    eq(r#""abc".delete_prefix("")"#, r#""abc""#);
+}

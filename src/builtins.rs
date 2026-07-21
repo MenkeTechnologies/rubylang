@@ -326,6 +326,19 @@ fn b_no_match(vm: &mut VM, _: u8) -> Value {
 
 /// Abort the running chunk with an error, halting the VM cleanly.
 fn abort(vm: &mut VM, e: String) -> Value {
+    // Record this frame on the in-flight exception (if any) for the MRI-format
+    // uncaught printer: the source line of the raising op plus the file. Frames
+    // arrive innermost-first as the error unwinds through each chunk's `abort`.
+    // The VM pre-increments `ip` before dispatching an op, so the raising op is
+    // at `ip - 1`.
+    let line = vm
+        .chunk
+        .lines
+        .get(vm.ip.wrapping_sub(1))
+        .copied()
+        .unwrap_or(0);
+    let src = crate::host::current_file_path().unwrap_or_else(|| "-e".into());
+    with_host(|h| h.record_backtrace_frame(&src, line));
     with_host(|h| h.error = Some(e));
     vm.ip = vm.chunk.ops.len();
     Value::Undef
@@ -3952,6 +3965,17 @@ fn dispatch_string(
             let m = char_matcher(args);
             Ok(new_str(s.chars().filter(|&c| !m(c)).collect()))
         }
+        // `delete_prefix`/`delete_suffix` strip one exact leading/trailing match
+        // (no globbing); a non-match returns an unchanged copy (MRI:
+        // `"hello".delete_prefix("hel")`→`"lo"`, `.delete_suffix("xyz")`→`"hello"`).
+        "delete_prefix" => {
+            let p = arg_str(&args[0]);
+            Ok(new_str(s.strip_prefix(&p).unwrap_or(&s).to_string()))
+        }
+        "delete_suffix" => {
+            let p = arg_str(&args[0]);
+            Ok(new_str(s.strip_suffix(&p).unwrap_or(&s).to_string()))
+        }
         "count" => {
             let m = char_matcher(args);
             Ok(Value::Int(s.chars().filter(|&c| m(c)).count() as i64))
@@ -5526,7 +5550,10 @@ fn dispatch_array(
         }
         // `to_set` — a Set of the elements (from `require "set"`).
         "to_set" => Ok(with_host(|h| h.new_set(arr))),
-        "each" => {
+        // `each_entry` yields each element as an entry; for a plain Array that is
+        // just each element (MRI: `[1,2,3].each_entry{…}`→`[1,2,3]`). Shares the
+        // `each` body; blockless returns an Enumerator carrying the method name.
+        "each" | "each_entry" => {
             if let Some(b) = &block {
                 for x in &arr {
                     call_proc(b, std::slice::from_ref(x))?;
@@ -5541,8 +5568,20 @@ fn dispatch_array(
             } else {
                 // Block-less: an Enumerator yielding each element, so external
                 // iteration (`next`/`peek`) and chained Enumerable calls work.
-                Ok(with_host(|h| h.new_enumerator(arr, "each")))
+                Ok(with_host(|h| h.new_enumerator(arr, name)))
             }
+        }
+        // `chain(*enums)` returns an Enumerator over the receiver followed by each
+        // argument's elements (MRI: `[1,2,3].chain([4,5]).to_a`→`[1,2,3,4,5]`).
+        "chain" => {
+            let mut chained = arr.clone();
+            for a in args {
+                match with_host(|h| h.as_array(a)) {
+                    Some(xs) => chained.extend(xs),
+                    None => chained.push(a.clone()),
+                }
+            }
+            Ok(with_host(|h| h.new_enumerator(chained, "each")))
         }
         "reverse_each" => {
             if let Some(b) = &block {
@@ -5583,7 +5622,7 @@ fn dispatch_array(
                 Ok(with_host(|h| h.new_enumerator(pairs, "each_with_index")))
             }
         }
-        "map" | "collect" | "flat_map" => {
+        "map" | "collect" | "flat_map" | "collect_concat" => {
             if block.is_none() {
                 // Block-less `map`/`collect` yields the original elements as an
                 // Enumerator (re-attaching a block later maps them).
@@ -5600,7 +5639,9 @@ fn dispatch_array(
                         }
                         break;
                     }
-                    if name == "flat_map" {
+                    if name == "flat_map" || name == "collect_concat" {
+                        // `collect_concat` is the documented alias of `flat_map`:
+                        // one level of array results is spliced into the output.
                         if let Some(xs) = with_host(|h| h.as_array(&r)) {
                             out.extend(xs);
                             continue;
