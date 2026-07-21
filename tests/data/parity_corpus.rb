@@ -2102,3 +2102,8 @@ p orassign
 u = nil
 r = (true && u ||= 7)
 p [r, u]
+#==#
+# ── punctuation character literals (?c) ──
+p ?.
+p "x/y"[1] == ?/
+p ?A.ord

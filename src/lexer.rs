@@ -729,7 +729,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 && (b[i + 1] == b'\\'
                     || (b[i + 1].is_ascii_alphanumeric()
                         && (i + 2 >= b.len()
-                            || !(b[i + 2].is_ascii_alphanumeric() || b[i + 2] == b'_')))) =>
+                            || !(b[i + 2].is_ascii_alphanumeric() || b[i + 2] == b'_')))
+                    // A punctuation char literal (`?/`, `?.`, `?!`): `?` glued to a
+                    // printable non-alphanumeric char (a space after `?` stays a
+                    // ternary).
+                    || (b[i + 1].is_ascii_graphic() && !b[i + 1].is_ascii_alphanumeric())) =>
             {
                 i += 1;
                 let ch = if b[i] == b'\\' && i + 1 < b.len() {
@@ -901,7 +905,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     pat.push_str(&src[i..i + cl]);
                     i += cl;
                 }
-                i += 1; // consume closing `/`
+                // Consume the closing `/` only if the loop actually reached one
+                // (an unterminated regex leaves `i` at end-of-input — never index
+                // past it).
+                if i < b.len() {
+                    i += 1;
+                }
                 let fstart = i;
                 while i < b.len() && matches!(b[i], b'i' | b'm' | b'x' | b'o' | b'u' | b'n') {
                     i += 1;
