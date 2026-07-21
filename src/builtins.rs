@@ -181,7 +181,10 @@ fn b_mkargs(vm: &mut VM, argc: u8) -> Value {
             // A splat of a Range/Set/Enumerator (`*1..5`, `*set`) expands to its
             // elements via `to_a`; a plain scalar (`*5`) is a one-element run.
             None if with_host(|h| {
-                h.is_a(p, "Range") || h.is_a(p, "Set") || h.is_a(p, "Enumerator")
+                h.is_a(p, "Range")
+                    || h.is_a(p, "Set")
+                    || h.is_a(p, "Enumerator")
+                    || h.is_a(p, "MatchData")
             }) =>
             {
                 match dispatch(p, "to_a", &[], None)
@@ -10698,7 +10701,15 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
                     h.new_array(rows)
                 }),
                 None if matches!(args[0], Value::Undef) => with_host(|h| h.new_array(vec![])),
-                None => with_host(|h| h.new_array(vec![args[0].clone()])),
+                // An object with a `to_a` (MatchData, Struct, Set, Range, …)
+                // converts through it; anything else becomes a one-element array.
+                None => match dispatch(&args[0], "to_a", &[], None)
+                    .ok()
+                    .and_then(|v| with_host(|h| h.as_array(&v)))
+                {
+                    Some(a) => with_host(|h| h.new_array(a)),
+                    None => with_host(|h| h.new_array(vec![args[0].clone()])),
+                },
             },
         }),
         "format" | "sprintf" => {

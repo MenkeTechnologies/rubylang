@@ -793,12 +793,18 @@ impl Compiler {
         values: &[Expr],
     ) -> Result<(), String> {
         let tmp = "__massign__";
-        // rhs = a single Array (splat) or the coerced value list.
+        // rhs = a single Array or the coerced value list. A lone `*x` value
+        // (`a, b = *x`) is just `x` coerced to an array — unwrap the splat so it
+        // is not spread into `Array`'s own arguments.
         let rhs = if values.len() == 1 {
+            let inner = match &values[0] {
+                Expr::Splat(e) => e.as_ref().clone(),
+                other => other.clone(),
+            };
             Expr::Call {
                 recv: None,
                 name: "Array".into(),
-                args: vec![values[0].clone()],
+                args: vec![inner],
                 block: None,
             }
         } else {

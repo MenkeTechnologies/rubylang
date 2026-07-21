@@ -2119,3 +2119,12 @@ class AttrOld
   def initialize(l); @label = l; end
 end
 p AttrOld.new("hi").label
+#==#
+# ── splat on the RHS of parallel assignment + MatchData coercion ──
+a, b, c = *[1, 2, 3]
+p [a, b, c]
+#==#
+_, first, second = *"x-y".match(/(.)-(.)/)
+p [first, second]
+#==#
+p Array("a-b".match(/(.)-(.)/))

@@ -184,6 +184,16 @@ impl Parser {
         Ok(out)
     }
 
+    /// One right-hand-side value of a parallel assignment, allowing a `*expr`
+    /// splat (`a, b = *arr`).
+    fn multi_value(&mut self) -> Result<Expr, String> {
+        if self.eat_op("*") {
+            Ok(Expr::Splat(Box::new(self.ternary()?)))
+        } else {
+            self.ternary()
+        }
+    }
+
     /// A statement is an expression optionally followed by a trailing modifier
     /// (`expr if cond`, `expr while cond`, …).
     fn statement(&mut self) -> Result<Expr, String> {
@@ -209,9 +219,10 @@ impl Parser {
                 }
             }
             self.expect_op("=")?;
-            let mut values = vec![self.ternary()?];
+            // A value may be a `*expr` splat (`a, b = *arr`, `a, b = 1, *rest`).
+            let mut values = vec![self.multi_value()?];
             while self.eat_op(",") {
-                values.push(self.ternary()?);
+                values.push(self.multi_value()?);
             }
             e = Expr::MultiAssign { targets, values };
         }
