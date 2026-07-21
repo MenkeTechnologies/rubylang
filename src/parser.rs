@@ -39,6 +39,13 @@ pub struct Parser {
     /// one-line pattern forms live at the `expr` level, above `arg`). A
     /// parenthesized group resets this so `foo((x in P))` still parses.
     no_pattern: bool,
+    /// True while parsing a call argument, where the `rescue` modifier and the
+    /// low keywords `and`/`or`/`not` are NOT part of the argument — they bind
+    /// looser than the command call, so `p x rescue y` is `(p x) rescue y` and
+    /// `p 1 and puts 2` is `(p 1) and (puts 2)` (both are MRI syntax errors as
+    /// bare call args; the modifier belongs to the enclosing statement). A
+    /// parenthesized group resets this so `foo((x rescue y))` still parses.
+    no_rescue_mod: bool,
 }
 
 /// Parse a full program. Inline `rust { ... }` FFI blocks are desugared to
@@ -52,6 +59,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
         tmp: 0,
         no_do_block: false,
         no_pattern: false,
+        no_rescue_mod: false,
     };
     p.program()
 }
@@ -441,6 +449,12 @@ impl Parser {
     /// left for the statement-level handler.
     fn rescue_mod(&mut self) -> Result<Expr, String> {
         let mut e = self.ternary()?;
+        // In a call-argument context the `rescue` modifier binds looser than the
+        // command call, so it is not consumed here (`p x rescue y` is
+        // `(p x) rescue y`). Left for the enclosing statement to attach.
+        if self.no_rescue_mod {
+            return Ok(e);
+        }
         while self.eat_kw("rescue") {
             let handler = self.ternary()?;
             e = Expr::Begin {
@@ -954,10 +968,18 @@ impl Parser {
     /// trailing `=>` is a hash pair, and MRI rejects the pattern forms as bare
     /// arguments. A nested parenthesized group re-enables them.
     fn arg(&mut self) -> Result<Expr, String> {
-        let saved = self.no_pattern;
+        let saved_pat = self.no_pattern;
+        let saved_resc = self.no_rescue_mod;
         self.no_pattern = true;
-        let e = self.expr();
-        self.no_pattern = saved;
+        self.no_rescue_mod = true;
+        // `not_operand` (leading `not` + assignment level), NOT `expr`: the
+        // binary `and`/`or` (in `low_kw`) and the `rescue` modifier bind looser
+        // than the command call, so they are excluded from a call argument
+        // (`p 1 and puts 2` is `(p 1) and (puts 2)`, an MRI syntax error inside
+        // parens). A leading `not` is still a valid argument (`p not true`).
+        let e = self.not_operand();
+        self.no_pattern = saved_pat;
+        self.no_rescue_mod = saved_resc;
         e
     }
 
@@ -1235,7 +1257,9 @@ impl Parser {
                 // expression. A group is a fresh expression context, so one-line
                 // pattern matching is re-enabled even inside an argument.
                 let saved = self.no_pattern;
+                let saved_resc = self.no_rescue_mod;
                 self.no_pattern = false;
+                self.no_rescue_mod = false;
                 let mut stmts: Vec<Stmt> = vec![self.statement()?.into()];
                 self.skip_terms();
                 while !self.is_op(")") {
@@ -1243,6 +1267,7 @@ impl Parser {
                     self.skip_terms();
                 }
                 self.no_pattern = saved;
+                self.no_rescue_mod = saved_resc;
                 self.expect_op(")")?;
                 if stmts.len() == 1 {
                     Ok(stmts.pop().unwrap().expr)
@@ -1355,7 +1380,9 @@ impl Parser {
             | Tok::GVar(_)
             | Tok::Const(_)
             | Tok::Ident(_) => true,
-            Tok::Keyword(k) => matches!(k.as_str(), "nil" | "true" | "false" | "self"),
+            Tok::Keyword(k) => {
+                matches!(k.as_str(), "nil" | "true" | "false" | "self" | "not")
+            }
             // A tight unary sign (`puts -7` — space before `-`, none after) is a
             // command argument; a spaced `x - 7` stays a binary operator (the
             // caller only reaches here when a space already precedes the token).

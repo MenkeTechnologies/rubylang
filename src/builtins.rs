@@ -1164,6 +1164,14 @@ pub(crate) fn dispatch(
             return Ok(with_host(|h| h.ivar_of(recv, key)));
         }
         "instance_variable_set" => {
+            // A frozen object rejects ivar mutation (MRI raises FrozenError).
+            if with_host(|h| h.is_frozen(recv)) {
+                let cls = with_host(|h| h.class_of(recv));
+                return Err(raise_exc(
+                    "FrozenError",
+                    &format!("can't modify frozen {cls}"),
+                ));
+            }
             let raw = name_of(&args[0]);
             let key = raw.strip_prefix('@').unwrap_or(&raw).to_string();
             let val = args[1].clone();
@@ -1176,6 +1184,15 @@ pub(crate) fn dispatch(
                 let syms: Vec<Value> = names.iter().map(|n| h.new_symbol(n)).collect();
                 h.new_array(syms)
             }));
+        }
+        "instance_variable_defined?" => {
+            // True when the named ivar has been assigned on the receiver.
+            // `ivar_names` reports them with the leading `@`, so normalize the
+            // query (accepting `:@x` and `"@x"`) to the same form.
+            let raw = name_of(&args[0]);
+            let key = format!("@{}", raw.strip_prefix('@').unwrap_or(&raw));
+            let has = with_host(|h| h.ivar_names(recv).iter().any(|n| *n == key));
+            return Ok(Value::Bool(has));
         }
         "tap" => {
             if let Some(b) = &block {
@@ -1584,9 +1601,60 @@ fn dispatch_classref(
         }
         return Ok(cref);
     }
+    // `Data.define(:x, :y)` — an immutable value class. Reuses struct storage.
+    if cls == "Data" && name == "define" {
+        let mut members = Vec::new();
+        for a in args {
+            if let Some(sym) = with_host(|h| h.as_symbol(a)) {
+                members.push(sym);
+            }
+        }
+        let data_name = with_host(|h| h.define_data(members));
+        let cref = with_host(|h| h.class_ref(&data_name));
+        // `Data.define(:x) do ... end` — the block defines instance methods.
+        if let Some(bl) = block {
+            crate::host::eval_block_scoped(
+                &bl,
+                &cref,
+                crate::host::DefTarget::Instance(data_name),
+                std::slice::from_ref(&cref),
+            )?;
+        }
+        return Ok(cref);
+    }
     // Instantiating a struct class: bind positional args (or keyword args) to the
     // member instance variables.
     if let Some((members, keyword_init)) = with_host(|h| h.struct_def(cls)) {
+        // A `Data.define`d class accepts positional *or* keyword args and yields a
+        // frozen instance; a keyword-only hash is detected as the sole argument.
+        if with_host(|h| h.is_data_class(cls)) && (name == "new" || name == "[]") {
+            let obj = with_host(|h| h.new_object(cls));
+            let kw = match args.first() {
+                Some(a) if args.len() == 1 => with_host(|h| h.as_hash(a)),
+                _ => None,
+            };
+            match kw {
+                // Keyword form: `D.new(x: 1, y: 2)`. Missing members read as nil.
+                Some(k) => {
+                    for m in &members {
+                        let v = k
+                            .get(&RKey::Sym(m.clone()))
+                            .cloned()
+                            .unwrap_or(Value::Undef);
+                        with_host(|h| h.set_ivar_of(&obj, m, v));
+                    }
+                }
+                // Positional form: `D.new(1, 2)`.
+                None => {
+                    for (i, m) in members.iter().enumerate() {
+                        let v = args.get(i).cloned().unwrap_or(Value::Undef);
+                        with_host(|h| h.set_ivar_of(&obj, m, v));
+                    }
+                }
+            }
+            with_host(|h| h.freeze_value(&obj));
+            return Ok(obj);
+        }
         if name == "new" || name == "[]" {
             let obj = with_host(|h| h.new_object(cls));
             if keyword_init {
@@ -2466,6 +2534,25 @@ fn struct_method(
             }
             recv.clone()
         }
+        // Blockless `each` yields an Enumerator over the member values, so
+        // `struct.each.to_a` / `.with_index` etc. work as in MRI.
+        "each" => with_host(|h| h.new_enumerator(values(), "each")),
+        // `#values_at(i, …)` — member values at the given indices (negative
+        // counts from the end), in the requested order.
+        "values_at" => {
+            let vals = values();
+            let mut out = Vec::new();
+            for a in args {
+                if let Value::Int(i) = a {
+                    let v = norm_idx(*i, vals.len())
+                        .and_then(|k| vals.get(k))
+                        .cloned()
+                        .unwrap_or(Value::Undef);
+                    out.push(v);
+                }
+            }
+            new_arr(out)
+        }
         "each_pair" if block.is_some() => {
             let bl = block.clone().unwrap();
             for (m, v) in members.iter().zip(values()) {
@@ -2488,9 +2575,76 @@ fn struct_method(
                 .zip(values())
                 .map(|(m, v)| format!("{m}={}", with_host(|h| h.inspect(&v))))
                 .collect();
-            new_str(format!("#<struct {cls} {}>", parts.join(", ")))
+            // `Data` instances inspect as `#<data Name x=…>`; Structs as `#<struct …>`.
+            let kind = if with_host(|h| h.is_data_class(cls)) {
+                "data"
+            } else {
+                "struct"
+            };
+            new_str(format!("#<{kind} {cls} {}>", parts.join(", ")))
         }
-        _ => return Ok(None),
+        // `Data#with(**changes)` — a copy of the receiver with the named members
+        // replaced (unknown keys raise ArgumentError, as in MRI). Result frozen.
+        "with" if with_host(|h| h.is_data_class(cls)) => {
+            let obj = with_host(|h| h.new_object(cls));
+            for m in members {
+                let cur = with_host(|h| h.ivar_of(recv, m));
+                with_host(|h| h.set_ivar_of(&obj, m, cur));
+            }
+            if let Some(k) = args.first().and_then(|a| with_host(|h| h.as_hash(a))) {
+                for (key, v) in &k {
+                    match key {
+                        RKey::Sym(m) if members.iter().any(|mm| mm == m) => {
+                            with_host(|h| h.set_ivar_of(&obj, m, v.clone()));
+                        }
+                        RKey::Sym(m) => {
+                            return Err(raise_exc(
+                                "ArgumentError",
+                                &format!("unknown keyword: :{m}"),
+                            ))
+                        }
+                        _ => {
+                            return Err(raise_exc("ArgumentError", "unknown keyword"));
+                        }
+                    }
+                }
+            }
+            with_host(|h| h.freeze_value(&obj));
+            obj
+        }
+        // `#dig(key, *rest)` — select a member by name (Symbol/String) or index,
+        // then dig into the result with any remaining keys (MRI Struct#dig).
+        "dig" if !args.is_empty() => {
+            let vals = values();
+            let first = match &args[0] {
+                Value::Int(i) => norm_idx(*i, vals.len()).and_then(|k| vals.get(k)).cloned(),
+                other => {
+                    let key = with_host(|h| h.as_symbol(other).or_else(|| h.as_str(other)));
+                    key.and_then(|k| members.iter().position(|m| *m == k))
+                        .and_then(|i| vals.get(i))
+                        .cloned()
+                }
+            }
+            .unwrap_or(Value::Undef);
+            if args.len() == 1 || matches!(first, Value::Undef) {
+                return Ok(Some(first));
+            }
+            return Ok(Some(dispatch(&first, "dig", &args[1..], None)?));
+        }
+        // Struct includes Enumerable: `map`/`select`/`reduce`/`sum`/`min`/`find`/…
+        // run over the member values as an Array (matching MRI). An unrecognized
+        // name falls through (Ok(None)) so normal resolution continues.
+        _ => {
+            let delegated = dispatch_array(&new_arr(values()), name, args, block.clone());
+            return match delegated {
+                Err(e)
+                    if e.starts_with("undefined method") && e.contains("an instance of Array") =>
+                {
+                    Ok(None)
+                }
+                other => other.map(Some),
+            };
+        }
     };
     Ok(Some(r))
 }
@@ -4632,6 +4786,22 @@ fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value,
         "captures" => Ok(new_arr(groups.iter().skip(1).map(strv).collect())),
         "to_s" => Ok(strv(groups.first().unwrap_or(&None))),
         "size" | "length" => Ok(Value::Int(groups.len() as i64)),
+        // `#names` — the (?<name>…) capture names in declaration order.
+        "names" => Ok(new_arr(
+            names.iter().map(|(n, _)| new_str(n.clone())).collect(),
+        )),
+        // `#named_captures` — a Hash mapping each named-capture name (String key,
+        // per MRI) to its captured substring (nil when the group did not match).
+        "named_captures" => {
+            let mut map: IndexMap<RKey, Value> = IndexMap::new();
+            for (n, idx) in &names {
+                map.insert(
+                    RKey::Str(n.clone()),
+                    groups.get(*idx).map(strv).unwrap_or(Value::Undef),
+                );
+            }
+            Ok(with_host(|h| h.new_hash(map)))
+        }
         _ => Err(no_method_error(recv, name)),
     }
 }
@@ -6560,7 +6730,22 @@ fn dispatch_complex(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
             let neg_im = with_host(|h| h.num_op(fusevm::NumOp::Sub, &Value::Int(0), &im))?;
             Ok(with_host(|h| h.new_complex(re.clone(), neg_im)))
         }
-        "rectangular" | "rect" => Ok(new_arr(vec![re, im])),
+        "rectangular" | "rect" => Ok(new_arr(vec![re.clone(), im.clone()])),
+        // Numeric conversions succeed only for a real Complex (imaginary == 0),
+        // delegating to the real part; otherwise MRI raises RangeError.
+        "to_i" | "to_int" | "to_f" | "to_r" if as_f(&im) == 0.0 => dispatch(&re, name, &[], None),
+        "to_i" | "to_int" | "to_f" | "to_r" => Err(raise_exc(
+            "RangeError",
+            &format!(
+                "can't convert {} into {}",
+                with_host(|h| h.complex_to_s(&re, &im)),
+                match name {
+                    "to_f" => "Float",
+                    "to_r" => "Rational",
+                    _ => "Integer",
+                }
+            ),
+        )),
         "-@" => {
             let nr = with_host(|h| h.num_op(fusevm::NumOp::Sub, &Value::Int(0), &re))?;
             let ni = with_host(|h| h.num_op(fusevm::NumOp::Sub, &Value::Int(0), &im))?;
@@ -6607,6 +6792,12 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
         "denominator" => Ok(with_host(|h| h.new_bigint(r.denom().clone()))),
         "to_f" => Ok(Value::Float(r.to_f64().unwrap_or(f64::NAN))),
         "to_i" | "to_int" | "truncate" => Ok(with_host(|h| h.new_bigint(r.to_integer()))),
+        // `#floor`/`#ceil`/`#round` with no digits argument round to the nearest
+        // Integer (toward -inf / +inf / nearest). `num_rational::Ratio` provides
+        // exact rounding; `to_integer` then extracts the BigInt.
+        "floor" if args.is_empty() => Ok(with_host(|h| h.new_bigint(r.floor().to_integer()))),
+        "ceil" if args.is_empty() => Ok(with_host(|h| h.new_bigint(r.ceil().to_integer()))),
+        "round" if args.is_empty() => Ok(with_host(|h| h.new_bigint(r.round().to_integer()))),
         "to_r" => Ok(recv.clone()),
         "abs" | "magnitude" => Ok(rat(r.abs())),
         "-@" => Ok(rat(-r)),
@@ -9805,6 +9996,20 @@ fn dispatch_range(
         "end" => Ok(Value::Int(hi)),
         "size" | "count" | "length" => Ok(Value::Int((end - lo).max(0))),
         "sum" => Ok(Value::Int((lo..end).sum())),
+        // `cover?` (only) accepts a Range argument (Ruby 2.6+): true when the
+        // other range's span lies entirely within self. `include?`/`member?`/
+        // `===` treat the argument as a single element, never a sub-range.
+        "cover?" if with_host(|h| h.as_range(&args[0]).is_some()) => {
+            let (olo, ohi, oexcl) = with_host(|h| h.as_range(&args[0]).unwrap());
+            if olo == crate::host::RANGE_BEGINLESS || ohi == crate::host::RANGE_ENDLESS {
+                // A beginless/endless other range can't be bounded by a finite one.
+                return Ok(Value::Bool(false));
+            }
+            // Effective inclusive maxima (self is bounded here; `end` = hi+ (!excl)).
+            let smax = if excl { hi - 1 } else { hi };
+            let omax = if oexcl { ohi - 1 } else { ohi };
+            Ok(Value::Bool(olo >= lo && omax <= smax))
+        }
         "include?" | "cover?" | "member?" | "===" => {
             let n = as_i(&args[0]);
             Ok(Value::Bool(n >= lo && n < end))
@@ -10712,6 +10917,27 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
                 },
             },
         }),
+        // `Kernel#Hash(x)` — nil and `[]` convert to an empty Hash; a Hash passes
+        // through; anything else raises TypeError (matching MRI, which only
+        // accepts an empty array via the implicit `to_hash`-less path).
+        "Hash" => {
+            if matches!(args[0], Value::Undef) {
+                return Ok(with_host(|h| h.new_hash(IndexMap::new())));
+            }
+            if with_host(|h| h.as_hash(&args[0]).is_some()) {
+                return Ok(args[0].clone());
+            }
+            match with_host(|h| h.as_array(&args[0])) {
+                Some(a) if a.is_empty() => Ok(with_host(|h| h.new_hash(IndexMap::new()))),
+                _ => {
+                    let cls = with_host(|h| h.class_of(&args[0]));
+                    Err(raise_exc(
+                        "TypeError",
+                        &format!("can't convert {cls} into Hash"),
+                    ))
+                }
+            }
+        }
         "format" | "sprintf" => {
             let fmt = arg_str(&args[0]);
             // A lone trailing Hash supplies named references (`%<name>s`).

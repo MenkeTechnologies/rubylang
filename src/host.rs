@@ -610,6 +610,8 @@ pub struct RubyHost {
     /// Anonymous structs start as `Struct:N` and are renamed when first assigned
     /// to a constant (`Point = Struct.new(...)`).
     struct_defs: IndexMap<String, (Vec<String>, bool)>,
+    /// Struct-def names that are actually `Data.define` value classes.
+    data_classes: std::collections::HashSet<String>,
     struct_counter: u32,
     /// Class variables (`@@x`): class name → variable name → value. Shared across
     /// the class hierarchy (looked up by walking the superclass chain).
@@ -1176,6 +1178,7 @@ impl RubyHost {
             fiddle_libs: Vec::new(),
             fiddle_mem: Vec::new(),
             struct_defs: IndexMap::new(),
+            data_classes: std::collections::HashSet::new(),
             struct_counter: 0,
             class_vars: IndexMap::new(),
             class_ivars: IndexMap::new(),
@@ -1227,7 +1230,16 @@ impl RubyHost {
     /// is frozen only once `freeze` has recorded it.
     pub fn is_frozen(&self, v: &Value) -> bool {
         match v {
-            Value::Obj(id) => self.as_symbol(v).is_some() || self.frozen.contains(id),
+            // Ranges are immutable and always frozen (MRI 3.0+), as are Symbols;
+            // any other heap object is frozen only once explicitly `freeze`d.
+            Value::Obj(id) => {
+                self.as_symbol(v).is_some()
+                    || matches!(
+                        self.obj(v),
+                        Some(RObj::Range { .. } | RObj::FloatRange { .. } | RObj::StrRange { .. })
+                    )
+                    || self.frozen.contains(id)
+            }
             _ => true,
         }
     }
@@ -2470,6 +2482,22 @@ impl RubyHost {
     pub fn struct_def(&self, name: &str) -> Option<(Vec<String>, bool)> {
         self.struct_defs.get(name).cloned()
     }
+    /// `Data.define(:x, :y)` — an immutable value class. Reuses the struct member
+    /// store (so accessors / `to_h` / `==` / `members` / Enumerable come for
+    /// free), but is tagged as `Data` so instances are frozen, the constructor
+    /// accepts positional *or* keyword args, `with` is available, and `inspect`
+    /// uses the `#<data …>` form.
+    pub fn define_data(&mut self, members: Vec<String>) -> String {
+        self.struct_counter += 1;
+        let name = format!("Struct:{}", self.struct_counter);
+        self.struct_defs.insert(name.clone(), (members, false));
+        self.data_classes.insert(name.clone());
+        name
+    }
+    /// Whether `name` is a `Data.define`d class (vs a plain `Struct`).
+    pub fn is_data_class(&self, name: &str) -> bool {
+        self.data_classes.contains(name)
+    }
     /// The class name a class variable read/write resolves against, given `self`:
     /// an instance's class, or a class-reference's own name.
     pub fn cvar_owner(&self, this: &Value) -> Option<String> {
@@ -2641,6 +2669,9 @@ impl RubyHost {
     pub fn rename_struct(&mut self, old: &str, new: &str) {
         if let Some(def) = self.struct_defs.shift_remove(old) {
             self.struct_defs.insert(new.to_string(), def);
+        }
+        if self.data_classes.remove(old) {
+            self.data_classes.insert(new.to_string());
         }
     }
     /// Re-register an anonymous class/module (`Class.new`/`Module.new`) under the
@@ -2869,6 +2900,7 @@ impl RubyHost {
                 | "FalseClass"
                 | "Set"
                 | "Struct"
+                | "Data"
                 | "Enumerator"
                 | "Time"
                 | "Date"
@@ -3536,7 +3568,13 @@ impl RubyHost {
                                 format!("{m}={}", self.inspect(&v))
                             })
                             .collect();
-                        format!("#<struct {class} {}>", parts.join(", "))
+                        // `Data.define`d instances print `#<data …>`; Structs `#<struct …>`.
+                        let kind = if self.is_data_class(&class) {
+                            "data"
+                        } else {
+                            "struct"
+                        };
+                        format!("#<{kind} {class} {}>", parts.join(", "))
                     } else {
                         match ivars.get("message") {
                             Some(m) => self.to_s(&m.clone()),
@@ -5005,7 +5043,14 @@ pub fn run_begin(begin_id: usize) -> Result<Value, String> {
                 } else {
                     vec![]
                 };
+                // Ruby exposes the exception being handled as `$!` for the
+                // duration of the clause (whether or not it is bound via
+                // `=> e`), then restores the prior value on exit — supporting
+                // nested begin/rescue.
+                let prev_bang = with_host(|h| h.get_global("!"));
+                with_host(|h| h.set_global("!", excv.clone()));
                 result = run_template(rd.body, &args);
+                with_host(|h| h.set_global("!", prev_bang));
                 handled = true;
                 // A `retry` in the clause clears itself and restarts the body.
                 retrying = take_retry_signal();

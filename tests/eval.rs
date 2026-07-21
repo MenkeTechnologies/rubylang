@@ -5238,3 +5238,195 @@ fn string_binary_encoding() {
         "\"UTF-8\"",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round-3 discovery-sweep parity fixes (byte-verified against MRI 4.0.6).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dollar_bang_is_set_inside_rescue() {
+    // `$!` names the exception being handled, even without a `=> e` binding.
+    eq(
+        r#"begin; raise "boom"; rescue; $!.class.name; end"#,
+        "\"RuntimeError\"",
+    );
+    eq(
+        r#"begin; raise "boom"; rescue; $!.message; end"#,
+        "\"boom\"",
+    );
+    // It resets to nil once the begin block completes normally.
+    eq(r#"begin; raise "x"; rescue; end; $!"#, "nil");
+    // A nested rescue restores the outer `$!` on exit.
+    eq(
+        r#"begin; raise "a"; rescue; (begin; raise "b"; rescue; nil; end); $!.message; end"#,
+        "\"a\"",
+    );
+    // The `rescue` modifier form also exposes `$!`.
+    eq(
+        r#"x = (Integer("z") rescue $!.class.name); x"#,
+        "\"ArgumentError\"",
+    );
+}
+
+#[test]
+fn rescue_modifier_binds_looser_than_command_call() {
+    // `m arg rescue fallback` parses as `(m arg) rescue fallback`, so a raising
+    // argument is caught by the modifier, not folded into the call.
+    eq(r#"def m(a); "got"; end; (m Integer("z") rescue 99)"#, "99");
+    // A non-raising command call returns normally; the modifier does not fire.
+    eq(r#"def m(a); a.to_s; end; (m 5 rescue 99)"#, "\"5\"");
+}
+
+#[test]
+fn low_keywords_bind_looser_than_command_call() {
+    // `m x and y` is `(m x) and y`, never `m(x and y)`.
+    eq(r#"def m(a); a.to_s; end; (m 1 and 2)"#, "2");
+    eq(r#"def m(a); a.to_s; end; (m 5 or 10)"#, "\"5\"");
+    // A leading `not` is still a valid command argument.
+    eq(r#"def m(a); a; end; (m not true)"#, "false");
+}
+
+#[test]
+fn instance_variable_defined_predicate() {
+    eq(
+        "o = Object.new; o.instance_variable_set(:@x, 1); o.instance_variable_defined?(:@x)",
+        "true",
+    );
+    eq("Object.new.instance_variable_defined?(:@z)", "false");
+    eq(
+        r#"class A; def initialize; @a = 1; end; end; A.new.instance_variable_defined?("@a")"#,
+        "true",
+    );
+}
+
+#[test]
+fn frozen_object_rejects_ivar_mutation() {
+    eq(
+        "begin; Object.new.freeze.instance_variable_set(:@x, 1); rescue => e; e.class.name; end",
+        "\"FrozenError\"",
+    );
+}
+
+#[test]
+fn matchdata_names_and_named_captures() {
+    eq(r#"/(?<a>\w)(?<b>\w)/.match("xy").names"#, r#"["a", "b"]"#);
+    eq(
+        r#""2020-01".match(/(?<y>\d+)-(?<m>\d+)/).named_captures"#,
+        r#"{"y" => "2020", "m" => "01"}"#,
+    );
+    // A non-participating optional named group yields nil.
+    eq(
+        r#""x".match(/(?<a>a)?(?<b>x)/).named_captures"#,
+        r#"{"a" => nil, "b" => "x"}"#,
+    );
+}
+
+#[test]
+fn struct_enumerable_and_accessors() {
+    // Blockless `each` yields an Enumerator over the member values.
+    eq("S = Struct.new(:a, :b); S.new(1, 2).each.to_a", "[1, 2]");
+    eq(
+        "S = Struct.new(:a, :b, :c); S.new(1, 2, 3).values_at(0, 2)",
+        "[1, 3]",
+    );
+    // Struct includes Enumerable (map/select/sum/reduce/min over the values).
+    eq(
+        "S = Struct.new(:a, :b); S.new(1, 2).map { |x| x * 2 }",
+        "[2, 4]",
+    );
+    eq(
+        "S = Struct.new(:a, :b); S.new(1, 2).select { |x| x > 1 }",
+        "[2]",
+    );
+    eq("S = Struct.new(:a, :b); S.new(3, 4).sum", "7");
+    // `#dig` selects a member by name, then descends.
+    eq("S = Struct.new(:a, :b); S.new(1, 2).dig(:b)", "2");
+    eq("S = Struct.new(:a); S.new([10]).dig(:a, 0)", "10");
+}
+
+#[test]
+fn rational_floor_ceil_round() {
+    eq("Rational(10, 3).floor", "3");
+    eq("Rational(10, 3).ceil", "4");
+    eq("Rational(-10, 3).floor", "-4");
+    eq("Rational(-10, 3).ceil", "-3");
+    eq("Rational(7, 2).round", "4");
+}
+
+#[test]
+fn complex_numeric_conversions_require_real() {
+    // A real Complex (imaginary == 0) converts; otherwise RangeError.
+    eq("Complex(3, 0).to_i", "3");
+    eq("Complex(3, 0).to_f", "3.0");
+    eq(
+        "begin; Complex(1, 2).to_i; rescue => e; e.class.name; end",
+        "\"RangeError\"",
+    );
+}
+
+#[test]
+fn range_cover_accepts_a_range_argument() {
+    eq("(1..10).cover?(2..5)", "true");
+    eq("(1..10).cover?(2..15)", "false");
+    eq("(1..10).cover?(0..5)", "false");
+    eq("(1..10).cover?(2...11)", "true");
+    eq("(1...10).cover?(2..10)", "false");
+    // `include?`/`===` still treat a Range as a plain (non-member) element.
+    eq("(1..10) === (2..5)", "false");
+    eq("(1..10).include?(2..5)", "false");
+}
+
+#[test]
+fn ranges_are_frozen() {
+    eq("(1..2).frozen?", "true");
+    eq("(1.0..2.0).frozen?", "true");
+    eq(r#"("a".."z").frozen?"#, "true");
+}
+
+#[test]
+fn kernel_hash_conversion() {
+    eq("Hash(nil)", "{}");
+    eq("Hash([])", "{}");
+    eq("Hash({a: 1})", "{a: 1}");
+    eq(
+        r#"begin; Hash("x"); rescue => e; e.class.name; end"#,
+        "\"TypeError\"",
+    );
+}
+
+#[test]
+fn data_define_value_class() {
+    // Positional and keyword construction, both yielding a frozen instance.
+    eq("D = Data.define(:x, :y); D.new(1, 2).x", "1");
+    eq("D = Data.define(:x, :y); D.new(x: 1, y: 2).y", "2");
+    eq("D = Data.define(:x); D.new(1).frozen?", "true");
+    // Value equality, to_h, members, and the `#<data …>` inspect form.
+    eq(
+        "D = Data.define(:x, :y); D.new(1, 2) == D.new(1, 2)",
+        "true",
+    );
+    eq("D = Data.define(:x, :y); D.new(1, 2).to_h", "{x: 1, y: 2}");
+    eq("D = Data.define(:x, :y); D.new(1, 2).members", "[:x, :y]");
+    eq(
+        "D = Data.define(:x, :y); D.new(1, 2).inspect",
+        r##""#<data D x=1, y=2>""##,
+    );
+    // `#with` returns an updated copy; an unknown member raises ArgumentError.
+    eq(
+        "D = Data.define(:x, :y); D.new(1, 2).with(x: 9).to_h",
+        "{x: 9, y: 2}",
+    );
+    eq(
+        "D = Data.define(:x, :y); begin; D.new(1, 2).with(z: 3); rescue => e; e.class.name; end",
+        "\"ArgumentError\"",
+    );
+    // A define block adds instance methods; pattern-matching deconstructs it.
+    eq(
+        "D = Data.define(:a) { def double; a * 2; end }; D.new(5).double",
+        "10",
+    );
+    eq(
+        "D = Data.define(:x, :y); case D.new(1, 2); in {x:, y:}; x + y; end",
+        "3",
+    );
+}
