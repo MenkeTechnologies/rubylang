@@ -1191,7 +1191,7 @@ pub(crate) fn dispatch(
             // query (accepting `:@x` and `"@x"`) to the same form.
             let raw = name_of(&args[0]);
             let key = format!("@{}", raw.strip_prefix('@').unwrap_or(&raw));
-            let has = with_host(|h| h.ivar_names(recv).iter().any(|n| *n == key));
+            let has = with_host(|h| h.ivar_names(recv).contains(&key));
             return Ok(Value::Bool(has));
         }
         "tap" => {
