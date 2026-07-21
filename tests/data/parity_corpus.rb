@@ -2090,3 +2090,15 @@ p Kw.new.bar
 p Encoding::UTF_8
 #==#
 p "abc".encoding == Encoding::UTF_8
+#==#
+# ── and/or are looser than assignment ──
+a = (v = 3 or 9)
+p [a, v]
+#==#
+def orassign; l = 5; l or l += 1; l; end
+p orassign
+#==#
+# ── compound assign rebinds into the rightmost &&/|| operand ──
+u = nil
+r = (true && u ||= 7)
+p [r, u]

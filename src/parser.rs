@@ -272,11 +272,14 @@ impl Parser {
     }
 
     fn expr(&mut self) -> Result<Expr, String> {
-        self.assign()
+        // `and`/`or`/`not` are the loosest operators in Ruby — looser than
+        // assignment — so they wrap the assignment level: `a = b and c` is
+        // `(a = b) and c`, and `x or @y += 1` is `x or (@y += 1)`.
+        self.low_kw()
     }
 
     fn assign(&mut self) -> Result<Expr, String> {
-        let lhs = self.low_kw()?;
+        let lhs = self.rescue_mod()?;
         // op-assignment and plain assignment
         if let Tok::Op(o) = self.peek() {
             let o = o.clone();
@@ -298,7 +301,8 @@ impl Parser {
             if o == "=" {
                 self.advance();
                 let rhs = self.assign()?;
-                return Ok(Self::rebind_assign(lhs, rhs));
+                let make = |t: Expr| Expr::Assign(Box::new(t), Box::new(rhs.clone()));
+                return Ok(Self::rebind_assign(lhs, &make));
             } else if compound {
                 self.advance();
                 let rhs = self.assign()?;
@@ -318,23 +322,29 @@ impl Parser {
                     "||=" => BinOp::Or,
                     _ => unreachable!(),
                 };
-                let combined = Expr::Binary(op, Box::new(lhs.clone()), Box::new(rhs));
-                return Ok(Expr::Assign(Box::new(lhs), Box::new(combined)));
+                let make = |t: Expr| {
+                    let combined =
+                        Expr::Binary(op, Box::new(t.clone()), Box::new(rhs.clone()));
+                    Expr::Assign(Box::new(t), Box::new(combined))
+                };
+                return Ok(Self::rebind_assign(lhs, &make));
             }
         }
         Ok(lhs)
     }
 
-    /// Bind an `=` whose parsed left side is a `||`/`&&` chain to the rightmost
-    /// operand, since that chain is not itself an lvalue: `x || y = z` means
-    /// `x || (y = z)` in Ruby (assignment is lower precedence than `||`/`&&` but
-    /// its target is a restricted lvalue). A plain lvalue just becomes `Assign`.
-    fn rebind_assign(lhs: Expr, rhs: Expr) -> Expr {
+    /// Bind an assignment (`=` or a compound `+=`/`||=`/…) whose parsed left side
+    /// is a `||`/`&&` chain to the rightmost operand, since that chain is not
+    /// itself an lvalue: `x || y = z` is `x || (y = z)` and
+    /// `x && y ||= z` is `x && (y ||= z)` (assignment is lower precedence than
+    /// `||`/`&&` but its target is a restricted lvalue). `make` builds the actual
+    /// assignment from the resolved target; a plain lvalue just uses it directly.
+    fn rebind_assign<F: Fn(Expr) -> Expr>(lhs: Expr, make: &F) -> Expr {
         match lhs {
             Expr::Binary(op @ (BinOp::Or | BinOp::And), a, b) => {
-                Expr::Binary(op, a, Box::new(Self::rebind_assign(*b, rhs)))
+                Expr::Binary(op, a, Box::new(Self::rebind_assign(*b, make)))
             }
-            other => Expr::Assign(Box::new(other), Box::new(rhs)),
+            other => make(other),
         }
     }
 
@@ -355,11 +365,12 @@ impl Parser {
     }
 
     /// An `and`/`or` operand, optionally led by `not` (`not x`, `not not x`).
+    /// Operands are assignment-level, so `x or y = z` is `x or (y = z)`.
     fn not_operand(&mut self) -> Result<Expr, String> {
         if self.eat_kw("not") {
             Ok(Expr::Unary(UnOp::Not, Box::new(self.not_operand()?)))
         } else {
-            self.rescue_mod()
+            self.assign()
         }
     }
 

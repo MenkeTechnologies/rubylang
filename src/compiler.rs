@@ -220,7 +220,15 @@ impl Compiler {
             if self.debug && s.line != 0 {
                 b.emit(Op::Extended(crate::host::ext::DBG_LINE, 0), s.line);
             }
-            self.compile_expr(b, &s.expr)?;
+            // Tag a compile error with the statement's source line so loader walls
+            // in deep gem trees are locatable (`line N: <error>`).
+            self.compile_expr(b, &s.expr).map_err(|e| {
+                if s.line != 0 && !e.starts_with("line ") {
+                    format!("line {}: {e}", s.line)
+                } else {
+                    e
+                }
+            })?;
             if i + 1 < body.len() {
                 b.emit(Op::Pop, 0);
             }

@@ -1285,3 +1285,9 @@ included in Speaker
 #<Encoding:UTF-8>
 #==#
 true
+#==#
+[3, 3]
+#==#
+5
+#==#
+[7, 7]

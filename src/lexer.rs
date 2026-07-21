@@ -522,7 +522,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 // record separator), `$!` (last error), `$:` (load path, alias of
                 // `$LOAD_PATH`), `$"` (loaded features, alias of
                 // `$LOADED_FEATURES`). Otherwise an alphanumeric/underscore name.
-                if i < b.len()
+                // Option globals `$-w` (warnings), `$-v`, `$-d`, `$-i`, `$-a`,
+                // `$-l`, `$-p`, `$-F`, `$-0`, `$-W` — `$-` plus one more char.
+                if i + 1 < b.len() && b[i] == b'-' {
+                    i += 2;
+                } else if i < b.len()
                     && matches!(
                         b[i],
                         // match/output/input-related punctuation globals …
