@@ -719,6 +719,23 @@ impl Compiler {
                 self.compile_expr(b, value)?;
                 b.emit(Op::CallBuiltin(ops::INDEX_SET, argc(2 + idx.len())?), 0);
             }
+            // `A::B = v` (a capitalized name on a constant-path receiver) is a
+            // namespaced constant assignment, stored under the qualified name —
+            // not a `B=` setter call.
+            Expr::Call {
+                recv: Some(r),
+                name,
+                args,
+                block: None,
+            } if args.is_empty()
+                && name.chars().next().is_some_and(|c| c.is_uppercase())
+                && const_path_name(r).is_some() =>
+            {
+                let qualified = format!("{}::{name}", const_path_name(r).unwrap());
+                self.kstr(b, &qualified);
+                self.compile_expr(b, value)?;
+                b.emit(Op::CallBuiltin(ops::SETCONST, 2), 0);
+            }
             // Attribute assignment: `recv.attr = v` is the setter call
             // `recv.attr=(v)`.
             Expr::Call {

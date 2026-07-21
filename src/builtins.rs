@@ -823,12 +823,17 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
         if matches!(name, "include" | "prepend" | "extend") && !args.is_empty() {
             return dispatch(&this, name, args, block);
         }
-        // Runtime `attr_accessor`/`attr_reader`/`attr_writer` (e.g. in a
+        // Runtime `attr`/`attr_accessor`/`attr_reader`/`attr_writer` (e.g. in a
         // `class_eval` / conditional class body) — register native accessors.
-        if matches!(name, "attr_accessor" | "attr_reader" | "attr_writer") {
+        // `attr :x` is a reader (the deprecated `attr :x, true` accessor form is
+        // not modeled).
+        if matches!(name, "attr" | "attr_accessor" | "attr_reader" | "attr_writer") {
             let reader = name != "attr_writer";
-            let writer = name != "attr_reader";
+            let writer = matches!(name, "attr_accessor" | "attr_writer");
             for a in args {
+                if matches!(a, Value::Bool(_)) {
+                    continue; // the old `attr :x, true` boolean flag
+                }
                 let field = name_of(a);
                 with_host(|h| h.add_attr(&cls, &field, reader, writer));
             }
@@ -2062,10 +2067,13 @@ fn dispatch_classref(
         // `included`/`prepended`/`extended` hook.
         // `C.attr_accessor(:x)` / `C.send(:attr_reader, :y)` — register a native
         // accessor directly on the class.
-        "attr_accessor" | "attr_reader" | "attr_writer" => {
+        "attr" | "attr_accessor" | "attr_reader" | "attr_writer" => {
             let reader = name != "attr_writer";
-            let writer = name != "attr_reader";
+            let writer = matches!(name, "attr_accessor" | "attr_writer");
             for a in args {
+                if matches!(a, Value::Bool(_)) {
+                    continue;
+                }
                 let field = name_of(a);
                 with_host(|h| h.add_attr(cls, &field, reader, writer));
             }

@@ -2107,3 +2107,15 @@ p [r, u]
 p ?.
 p "x/y"[1] == ?/
 p ?A.ord
+#==#
+# ── namespaced constant assignment (A::B = v) ──
+module NsMod; end
+NsMod::VALUE = 42
+p NsMod::VALUE
+#==#
+# ── old-style attr (reader) ──
+class AttrOld
+  attr :label
+  def initialize(l); @label = l; end
+end
+p AttrOld.new("hi").label
