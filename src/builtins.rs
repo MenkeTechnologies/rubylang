@@ -15,6 +15,8 @@ use crate::host::{
 };
 use fusevm::{Value, VM};
 use indexmap::IndexMap;
+use unicode_normalization::UnicodeNormalization;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Register every rubylang builtin on `vm`.
 pub fn install(vm: &mut VM) {
@@ -2274,9 +2276,11 @@ fn dispatch_classref(
         }
         _ => {
             // A class method: `def self.m` runs with self bound to the class ref.
-            if let Some(def) = with_host(|h| h.find_class_method(cls, name)) {
+            // Bind `def_class` to the class that actually owns the method (not the
+            // lookup-origin subclass) so `super` resumes above the defining class.
+            if let Some((def, owner)) = with_host(|h| h.find_class_method_owner(cls, name)) {
                 let recv = with_host(|h| h.class_ref(cls));
-                return crate::host::call_class_method(recv, &def, name, cls, args, block);
+                return crate::host::call_class_method(recv, &def, name, &owner, args, block);
             }
             // `Mod::Const` — a namespaced constant or nested class/module. Both
             // `::` and `.` lower to a method call here, so a no-arg capitalized
@@ -3853,6 +3857,66 @@ fn dispatch_string(
             Ok(new_str(out))
         }
         "chars" => Ok(new_arr(s.chars().map(|c| new_str(c.to_string())).collect())),
+        // UAX #29 extended grapheme clusters (`"é"` counts as one even when stored
+        // as base + combining mark). `grapheme_clusters` returns the array.
+        "grapheme_clusters" => Ok(new_arr(
+            UnicodeSegmentation::graphemes(s.as_str(), true)
+                .map(|g| new_str(g.to_string()))
+                .collect(),
+        )),
+        "each_grapheme_cluster" => {
+            if let Some(b) = &block {
+                for g in UnicodeSegmentation::graphemes(s.as_str(), true) {
+                    call_proc(b, &[new_str(g.to_string())])?;
+                    if has_pending_signal() {
+                        take_break();
+                        break;
+                    }
+                }
+                Ok(recv.clone())
+            } else {
+                // Block-less: an Enumerator over the clusters, so external
+                // iteration and chained Enumerable calls work.
+                let gs: Vec<Value> = UnicodeSegmentation::graphemes(s.as_str(), true)
+                    .map(|g| new_str(g.to_string()))
+                    .collect();
+                Ok(with_host(|h| h.new_enumerator(gs, "each")))
+            }
+        }
+        // Unicode normalization to NFC (default), NFD, NFKC, or NFKD.
+        "unicode_normalize" => {
+            let form = args.first().map(arg_str).unwrap_or_else(|| "nfc".into());
+            let out: String = match form.as_str() {
+                "nfc" => s.nfc().collect(),
+                "nfd" => s.nfd().collect(),
+                "nfkc" => s.nfkc().collect(),
+                "nfkd" => s.nfkd().collect(),
+                other => {
+                    return Err(raise_exc(
+                        "ArgumentError",
+                        &format!("Invalid normalization form {other}."),
+                    ))
+                }
+            };
+            Ok(new_str(out))
+        }
+        // Whether the string already equals its normalization (NFC default).
+        "unicode_normalized?" => {
+            let form = args.first().map(arg_str).unwrap_or_else(|| "nfc".into());
+            let normalized: String = match form.as_str() {
+                "nfc" => s.nfc().collect(),
+                "nfd" => s.nfd().collect(),
+                "nfkc" => s.nfkc().collect(),
+                "nfkd" => s.nfkd().collect(),
+                other => {
+                    return Err(raise_exc(
+                        "ArgumentError",
+                        &format!("Invalid normalization form {other}."),
+                    ))
+                }
+            };
+            Ok(Value::Bool(normalized == s))
+        }
         "bytes" => Ok(new_arr(s.bytes().map(|b| Value::Int(b as i64)).collect())),
         // `String#unpack(fmt)` / `#unpack1(fmt)` — the inverse of `Array#pack`.
         // The string is read as a byte sequence via the Latin-1 convention (each
@@ -3901,21 +3965,45 @@ fn dispatch_string(
                 Ok(Value::Int(bytes[idx as usize] as i64))
             }
         }
-        // `b` returns a copy as ASCII-8BIT in real Ruby; we have no separate
-        // encoding, so it returns an equivalent String (byte content unchanged).
-        "b" => Ok(new_str(s.clone())),
+        // `b` returns a copy of the string tagged ASCII-8BIT. Byte content is
+        // unchanged (we store UTF-8 bytes); the BINARY encoding is recorded in a
+        // side table so `#encoding` on the copy answers ASCII-8BIT.
+        "b" => {
+            let copy = new_str(s.clone());
+            with_host(|h| h.mark_binary_string(&copy));
+            Ok(copy)
+        }
         // True when every byte is 7-bit ASCII.
         "ascii_only?" => Ok(Value::Bool(s.is_ascii())),
         // We only carry valid UTF-8 Strings, so this is always true.
         "valid_encoding?" => Ok(Value::Bool(true)),
-        // No real multi-encoding: these are self-returning / string-identity
-        // shims so `force_encoding`/`encode` chains don't break.
-        "force_encoding" => Ok(recv.clone()),
+        // No real multi-encoding: `force_encoding` returns self but records/clears
+        // the ASCII-8BIT tag so `#encoding` tracks it; `encode` is a copy shim.
+        "force_encoding" => {
+            // The argument is a name string or an `Encoding` object (whose `name`
+            // ivar holds the canonical name).
+            let raw = match with_host(|h| h.ivar_of(&args[0], "name")) {
+                Value::Undef => arg_str(&args[0]),
+                nm => arg_str(&nm),
+            };
+            match normalize_encoding_name(&raw).as_deref() {
+                Some("ASCII-8BIT") => with_host(|h| h.mark_binary_string(recv)),
+                _ => with_host(|h| h.unmark_binary_string(recv)),
+            }
+            Ok(recv.clone())
+        }
         "encode" => Ok(new_str(s.clone())),
-        // We only carry UTF-8 Strings, so `encoding` always names UTF-8. The
-        // returned Encoding object answers `name`/`to_s`/`inspect` (dispatched in
+        // We store UTF-8 byte content; `encoding` names UTF-8 unless the string was
+        // tagged ASCII-8BIT (`String#b` / `force_encoding("BINARY")`). The returned
+        // Encoding object answers `name`/`to_s`/`inspect` (dispatched in
         // `dispatch_object` for the `Encoding` class).
-        "encoding" => Ok(encoding_object("UTF-8")),
+        "encoding" => {
+            if with_host(|h| h.is_binary_string(recv)) {
+                Ok(encoding_object("ASCII-8BIT"))
+            } else {
+                Ok(encoding_object("UTF-8"))
+            }
+        }
         "lines" => Ok(new_arr(split_lines(&s).into_iter().map(new_str).collect())),
         "each_line" => {
             // With a block, iterate the lines and return self; without one,
@@ -10126,6 +10214,17 @@ fn dispatch_method(
 }
 
 /// An `Encoding` object named `name` (`String#encoding`, `Encoding::UTF_8`, …).
+/// Canonicalize a `force_encoding` argument (a name string or an `Encoding`
+/// object) to `"ASCII-8BIT"` for the binary aliases, otherwise the raw name.
+/// Only the binary tag is tracked; every other name maps to non-binary.
+fn normalize_encoding_name(raw: &str) -> Option<String> {
+    let name = raw.trim().to_ascii_uppercase();
+    match name.as_str() {
+        "ASCII-8BIT" | "ASCII_8BIT" | "BINARY" => Some("ASCII-8BIT".to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
 fn encoding_object(name: &str) -> Value {
     let enc = with_host(|h| h.new_object("Encoding"));
     let nm = new_str(name.to_string());

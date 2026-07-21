@@ -582,6 +582,11 @@ pub struct RubyHost {
     /// stable, so a `rescue`/re-raise still finds its trace. Cleared per run
     /// (`reset_host` rebuilds the host).
     exc_backtraces: IndexMap<u32, Vec<String>>,
+    /// Heap ids of String objects whose encoding is ASCII-8BIT/BINARY (from
+    /// `String#b` or `force_encoding("BINARY")`). We store only UTF-8 byte content;
+    /// this side table records the encoding tag so `#encoding` answers correctly
+    /// without a representation change. Absent = UTF-8 (the default).
+    binary_strings: HashSet<u32>,
     signal: Option<Signal>,
     /// The scope local/`self`/block access targets. `None` = the top frame (a
     /// method body / top level); `Some(scope)` = a captured scope while a block
@@ -1157,6 +1162,7 @@ impl RubyHost {
             error: None,
             pending_exc: None,
             exc_backtraces: IndexMap::new(),
+            binary_strings: HashSet::new(),
             signal: None,
             active_scope: None,
             frozen: HashSet::new(),
@@ -3059,6 +3065,34 @@ impl RubyHost {
         }
         None
     }
+    /// Like `find_class_method`, but also returns the class that actually owns
+    /// the resolved method (needed as the `def_class` so `super` resumes above
+    /// the defining class, not the lookup-origin subclass).
+    pub fn find_class_method_owner(
+        &self,
+        class: &str,
+        method: &str,
+    ) -> Option<(MethodDef, String)> {
+        let mut cur = Some(class.to_string());
+        while let Some(name) = cur {
+            let def = self.classes.get(&name)?;
+            if let Some(m) = def.class_methods.get(method) {
+                return Some((m.clone(), name.clone()));
+            }
+            for module in def.extends.iter().rev() {
+                let nested = format!("{name}::{module}");
+                for cand in [&nested, module] {
+                    if let Some(md) = self.classes.get(cand) {
+                        if let Some(m) = md.methods.get(method) {
+                            return Some((m.clone(), name.clone()));
+                        }
+                    }
+                }
+            }
+            cur = def.superclass.clone();
+        }
+        None
+    }
     /// A class method (`def self.m`), walking the superclass chain.
     pub fn find_class_method(&self, class: &str, method: &str) -> Option<MethodDef> {
         let mut cur = Some(class.to_string());
@@ -3079,6 +3113,36 @@ impl RubyHost {
                     if let Some(md) = self.classes.get(cand) {
                         if let Some(m) = md.methods.get(method) {
                             return Some(m.clone());
+                        }
+                    }
+                }
+            }
+            cur = def.superclass.clone();
+        }
+        None
+    }
+    /// `super` from a singleton/class method (`def self.m`): resume class-method
+    /// lookup in the singleton-class ancestry above `def_class`, i.e. starting at
+    /// `def_class`'s superclass. Returns the class method and its owner class.
+    pub fn find_super_class_method(
+        &self,
+        def_class: &str,
+        method: &str,
+    ) -> Option<(MethodDef, String)> {
+        let mut cur = self.superclass_of(def_class);
+        while let Some(name) = cur {
+            let def = self.classes.get(&name)?;
+            if let Some(m) = def.class_methods.get(method) {
+                return Some((m.clone(), name.clone()));
+            }
+            // `extend M` on an ancestor contributes M's instance methods as that
+            // ancestor's class methods (after its own `def self.m`, last wins).
+            for module in def.extends.iter().rev() {
+                let nested = format!("{name}::{module}");
+                for cand in [&nested, module] {
+                    if let Some(md) = self.classes.get(cand) {
+                        if let Some(m) = md.methods.get(method) {
+                            return Some((m.clone(), name.clone()));
                         }
                     }
                 }
@@ -3223,14 +3287,22 @@ impl RubyHost {
         self.pending_exc.take()
     }
     /// The MRI context label for the innermost active frame: `'<main>'` at the top
-    /// level, `'<DefClass>#<method>'` inside a method (an unqualified top-level
-    /// `def` reports `Object#name`, matching MRI's `-e:1:in 'Object#f'`).
+    /// level, `'<DefClass>#<method>'` inside an instance method (an unqualified
+    /// top-level `def` reports `Object#name`, matching MRI's `-e:1:in 'Object#f'`),
+    /// and `'<DefClass>.<method>'` inside a class/singleton method (`def self.m`),
+    /// matching MRI's `-e:1:in 'A.f'`.
     fn innermost_context(&self) -> String {
         match self.frames.last() {
             Some(f) => match &f.scope.method_name {
                 Some(m) => {
                     let cls = f.scope.def_class.clone().unwrap_or_else(|| "Object".into());
-                    format!("{cls}#{m}")
+                    // A class/singleton method's `self` is the class ref itself.
+                    let sep = if matches!(self.obj(&f.scope.self_obj), Some(RObj::ClassRef(_))) {
+                        '.'
+                    } else {
+                        '#'
+                    };
+                    format!("{cls}{sep}{m}")
                 }
                 None => "<main>".into(),
             },
@@ -3252,6 +3324,23 @@ impl RubyHost {
             .entry(id)
             .or_default()
             .push(format!("{src}:{line}:in '{ctx}'"));
+    }
+    /// Tag a String heap object as ASCII-8BIT/BINARY (`String#b`,
+    /// `force_encoding("BINARY")`).
+    pub fn mark_binary_string(&mut self, v: &Value) {
+        if let Value::Obj(id) = v {
+            self.binary_strings.insert(*id);
+        }
+    }
+    /// Clear a String's BINARY tag (`force_encoding("UTF-8")` and friends).
+    pub fn unmark_binary_string(&mut self, v: &Value) {
+        if let Value::Obj(id) = v {
+            self.binary_strings.remove(id);
+        }
+    }
+    /// Whether a String heap object is tagged ASCII-8BIT/BINARY.
+    pub fn is_binary_string(&self, v: &Value) -> bool {
+        matches!(v, Value::Obj(id) if self.binary_strings.contains(id))
     }
     /// Format the pending (uncaught) exception in MRI's shape:
     /// `<src>:<line>:in '<ctx>': <msg> (<Class>)` followed by tab-indented
@@ -3510,13 +3599,19 @@ impl RubyHost {
                     out.push('>');
                     out
                 }
-                // `Encoding#inspect`: `#<Encoding:UTF-8>` (we only carry UTF-8).
+                // `Encoding#inspect`: `#<Encoding:UTF-8>`. The binary encoding
+                // inspects as `#<Encoding:BINARY (ASCII-8BIT)>` (MRI names the
+                // object BINARY with its ASCII-8BIT alias in parens).
                 Some(RObj::Object { class, ivars }) if class == "Encoding" => {
                     let name = ivars
                         .get("name")
                         .map(|n| self.to_s(&n.clone()))
                         .unwrap_or_default();
-                    format!("#<Encoding:{name}>")
+                    if name == "ASCII-8BIT" {
+                        "#<Encoding:BINARY (ASCII-8BIT)>".to_string()
+                    } else {
+                        format!("#<Encoding:{name}>")
+                    }
                 }
                 // `OpenStruct#inspect`: `#<OpenStruct a=1, b=2>` (ivars in order).
                 Some(RObj::Object { class, ivars }) if class == "OpenStruct" => {
@@ -4776,6 +4871,26 @@ pub fn call_super_blk(
     let (Some(method), Some(def_class)) = (method, def_class) else {
         return Err("super called outside of a method".to_string());
     };
+    // `super` from a singleton/class method (`def self.m`): the receiver is a
+    // class ref with no object class, so resolve through the singleton-class
+    // ancestry (class methods above `def_class`) rather than the instance chain.
+    if with_host(|h| h.object_class(&self_obj)).is_none() {
+        if let Some(cls) = with_host(|h| h.classref_name(&self_obj)) {
+            if let Some((def, owner)) =
+                with_host(|h| h.find_super_class_method(&def_class, &method))
+            {
+                let args = explicit_args.unwrap_or(cur_args);
+                let block = match block_override {
+                    Some(b) => Some(b),
+                    None => with_host(|h| h.cur_scope().block.clone()),
+                };
+                return run_method(&def, self_obj, &args, block, Some(method), Some(owner));
+            }
+            // No class method above: fall through to the shared error/no-op paths
+            // below with the class name as the linearization root.
+            let _ = cls;
+        }
+    }
     // Linearize from the receiver's actual class so prepend/include super hits
     // the next method in ancestry order; class-method super (self_obj is a class
     // ref, no object class) falls back to the owner's chain.

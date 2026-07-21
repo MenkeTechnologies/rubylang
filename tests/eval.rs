@@ -5063,3 +5063,178 @@ fn string_delete_prefix_suffix() {
     eq(r#""".delete_prefix("a")"#, r#""""#);
     eq(r#""abc".delete_prefix("")"#, r#""abc""#);
 }
+
+/// `super` inside a singleton/class method (`def self.m`) resolves through the
+/// superclass's singleton (the class-method chain), not the instance chain.
+/// Every value byte-verified against MRI 4.0.6.
+#[test]
+fn super_from_class_method() {
+    // Basic: B.f's super reaches A.f.
+    eq(
+        "class A; def self.f; 10; end; end; \
+         class B < A; def self.f; super + 1; end; end; \
+         B.f",
+        "11",
+    );
+    // Forwarded args: bare `super` passes B.f's argument up to A.f.
+    eq(
+        "class A; def self.f(x); x * 2; end; end; \
+         class B < A; def self.f(x); super + 1; end; end; \
+         B.f(5)",
+        "11",
+    );
+    // Explicit args: `super(x)`.
+    eq(
+        "class A; def self.build(x); x * 2; end; end; \
+         class B < A; def self.build(x); super(x) + 1; end; end; \
+         B.build(5)",
+        "11",
+    );
+    // Three-level chain: C inherits B.f; the super in B.f still reaches A.f once
+    // (def_class is the defining class B, not the lookup-origin C).
+    eq(
+        "class A; def self.f; 10; end; end; \
+         class B < A; def self.f; super + 1; end; end; \
+         class C < B; end; \
+         C.f",
+        "11",
+    );
+    // A `super { … }` block override reaches the superclass singleton method that
+    // yields.
+    eq(
+        "class A; def self.f; yield 5; end; end; \
+         class B < A; def self.f; super { |x| x + 100 }; end; end; \
+         B.f",
+        "105",
+    );
+    // `super` from a class method that extends a module reaches the module method.
+    eq(
+        "module M; def greet; \"hi\"; end; end; \
+         class A; extend M; end; \
+         class B < A; extend M; def self.greet; super + \"!\"; end; end; \
+         B.greet",
+        "\"hi!\"",
+    );
+}
+
+/// One-line pattern matching at the statement / expression level: rightward
+/// assignment (`expr => pattern`, raises on no match, binds) and the boolean
+/// match (`expr in pattern`, yields true/false, binds). vs MRI 4.0.6.
+#[test]
+fn one_line_pattern_matching() {
+    // `expr in pattern` yields a boolean.
+    eq("5 in Integer", "true");
+    eq("5 in String", "false");
+    // Bindings from `in` persist into the surrounding scope.
+    eq("{a: 1} in {a: Integer => v}; v", "1");
+    // `and`/`or` are looser than the one-line pattern, so each side is its own
+    // match.
+    eq("(1 in Integer) && (2 in Integer)", "true");
+    // Rightward assignment binds and yields nil.
+    eq(
+        "{name: \"Alice\", age: 30} => {name:, age:}; [name, age]",
+        "[\"Alice\", 30]",
+    );
+    // Array destructuring via `=>`.
+    eq("[1, 2, 3] => [a, b, c]; [a, b, c]", "[1, 2, 3]");
+    // Nested destructuring.
+    eq(
+        "config = {db: {host: \"x\", port: 5}}; \
+         config => {db: {host:, port:}}; [host, port]",
+        "[\"x\", 5]",
+    );
+    // A non-matching `=>` raises NoMatchingPatternError.
+    assert!(ev("1 => String").is_err());
+    // The `=>` inside a hash literal stays a pair separator (no regression).
+    eq("{1 => 2, 3 => 4}", "{1 => 2, 3 => 4}");
+    eq("({:a => 1, :b => 2})", "{a: 1, b: 2}");
+    // The `=>` inside an argument list stays a keyword/hash arg (no regression).
+    eq("[{one: 1}].map { |h| h }", "[{one: 1}]");
+}
+
+/// `String#each_grapheme_cluster` / `#grapheme_clusters` segment by UAX #29
+/// extended grapheme clusters (base + combining marks count as one). vs MRI.
+/// Structural assertions (cluster count / codepoint length) avoid depending on
+/// how a combining mark renders in `inspect`.
+#[test]
+fn string_grapheme_clusters() {
+    // "é" as base 'e' + U+0301 combining acute is ONE cluster of two codepoints,
+    // so "éllo" is 4 clusters and the first has length 2.
+    eq("\"e\\u0301llo\".each_grapheme_cluster.to_a.length", "4");
+    eq(
+        "\"e\\u0301llo\".each_grapheme_cluster.to_a.first.length",
+        "2",
+    );
+    eq("\"e\\u0301llo\".grapheme_clusters.length", "4");
+    // Per-cluster codepoint lengths for a mixed string.
+    eq(
+        "\"cafe\\u0301\".grapheme_clusters.map(&:length)",
+        "[1, 1, 1, 2]",
+    );
+    // ASCII degenerates to per-character.
+    eq(
+        "\"abc\".each_grapheme_cluster.to_a",
+        "[\"a\", \"b\", \"c\"]",
+    );
+    // With a block, returns self.
+    eq("\"ab\".each_grapheme_cluster { |g| g }", "\"ab\"");
+}
+
+/// `String#unicode_normalize` to NFC (default), NFD, NFKC, NFKD. Verified via the
+/// resulting byte sequences against MRI 4.0.6.
+#[test]
+fn string_unicode_normalize() {
+    // NFC (default) composes 'e' + combining acute into precomposed "é" (2 bytes).
+    eq("\"e\\u0301\".unicode_normalize.bytes", "[195, 169]");
+    eq("\"e\\u0301\".unicode_normalize(:nfc).bytes", "[195, 169]");
+    // NFD decomposes precomposed "é" into 'e' + combining acute (3 bytes).
+    eq(
+        "\"\\u00e9\".unicode_normalize(:nfd).bytes",
+        "[101, 204, 129]",
+    );
+    eq("\"\\u00e9\".unicode_normalize(:nfkc).bytes", "[195, 169]");
+    eq(
+        "\"\\u00e9\".unicode_normalize(:nfkd).bytes",
+        "[101, 204, 129]",
+    );
+    // `unicode_normalized?` reports whether the string already equals its form.
+    eq("\"abc\".unicode_normalized?", "true");
+    // An unknown form raises ArgumentError.
+    assert!(ev("\"x\".unicode_normalize(:bogus)").is_err());
+}
+
+/// `String#b` returns an ASCII-8BIT (BINARY) copy; `#encoding` tracks the tag and
+/// `force_encoding` sets/clears it. vs MRI 4.0.6.
+#[test]
+fn string_binary_encoding() {
+    // A default String is UTF-8.
+    eq("\"abc\".encoding.inspect", "\"#<Encoding:UTF-8>\"");
+    // `#b` yields a BINARY-tagged copy whose Encoding inspects with the alias.
+    eq(
+        "\"abc\".b.encoding.inspect",
+        "\"#<Encoding:BINARY (ASCII-8BIT)>\"",
+    );
+    eq("\"abc\".b.encoding.name", "\"ASCII-8BIT\"");
+    // The copy is still a usable String.
+    eq("\"abc\".b.length", "3");
+    eq("\"abc\".b", "\"abc\"");
+    // `force_encoding` sets the BINARY tag (name string or alias).
+    eq(
+        "\"x\".force_encoding(\"ASCII-8BIT\").encoding.name",
+        "\"ASCII-8BIT\"",
+    );
+    eq(
+        "\"x\".force_encoding(\"BINARY\").encoding.name",
+        "\"ASCII-8BIT\"",
+    );
+    // Passing an Encoding object works too.
+    eq(
+        "\"x\".force_encoding(Encoding::ASCII_8BIT).encoding.name",
+        "\"ASCII-8BIT\"",
+    );
+    // Forcing back to UTF-8 clears the tag.
+    eq(
+        "\"x\".b.force_encoding(\"UTF-8\").encoding.name",
+        "\"UTF-8\"",
+    );
+}

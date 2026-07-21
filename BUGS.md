@@ -47,10 +47,12 @@ leading positional before `...`); `Integer#step`, `?c` char literals,
   reaches the class); `class << self … end` defs register as class methods, the
   same as `def self.x`. `super` resolves through the receiver's linearized
   `Module#ancestors` order, so module-`super` (from a prepended or included
-  module) reaches the next method correctly. Runtime instance `obj.extend(M, …)`
-  mixes each module's instance methods (following `M`'s own `include` chain, plus
-  `define_method` blocks) into the object's singleton table. Not modeled: `super`
-  from inside a class method.
+  module) reaches the next method correctly. `super` from inside a class method
+  (`def self.m`) resolves through the singleton-class chain — the superclass's
+  `def self.m`, or a module's method contributed via `extend` — so it reaches the
+  next class method in ancestry order. Runtime instance `obj.extend(M, …)` mixes
+  each module's instance methods (following `M`'s own `include` chain, plus
+  `define_method` blocks) into the object's singleton table.
 - **Class-level instance variables** (`@n` inside a `def self.m` / an `extend`ed
   method) do not persist across calls — the class object has no per-instance
   variable store yet, so `@n ||= 0; @n += 1` restarts each call.

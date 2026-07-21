@@ -34,6 +34,11 @@ pub struct Parser {
     /// belongs to an enclosing `while`/`until`/`for`/`case` whose condition is
     /// being parsed (`while cond do … end`: the `do` binds to `while`).
     no_do_block: bool,
+    /// True while parsing a method/command argument, where a trailing `=>` is a
+    /// hash pair and `in`/`=>` one-line pattern matching is not allowed (MRI: the
+    /// one-line pattern forms live at the `expr` level, above `arg`). A
+    /// parenthesized group resets this so `foo((x in P))` still parses.
+    no_pattern: bool,
 }
 
 /// Parse a full program. Inline `rust { ... }` FFI blocks are desugared to
@@ -46,6 +51,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
         pos: 0,
         tmp: 0,
         no_do_block: false,
+        no_pattern: false,
     };
     p.program()
 }
@@ -367,10 +373,53 @@ impl Parser {
     /// Operands are assignment-level, so `x or y = z` is `x or (y = z)`.
     fn not_operand(&mut self) -> Result<Expr, String> {
         if self.eat_kw("not") {
-            Ok(Expr::Unary(UnOp::Not, Box::new(self.not_operand()?)))
-        } else {
-            self.assign()
+            return Ok(Expr::Unary(UnOp::Not, Box::new(self.not_operand()?)));
         }
+        let e = self.assign()?;
+        self.one_line_pattern(e)
+    }
+
+    /// One-line pattern matching layered above the assignment level and below
+    /// `and`/`or` (matching MRI's `expr : arg keyword_in p_top_expr_body` /
+    /// `arg tASSOC p_top_expr_body`). `subj => pattern` binds and raises
+    /// `NoMatchingPatternError` on failure (yields nil); `subj in pattern` binds
+    /// and yields a boolean. Suppressed inside argument context (`no_pattern`),
+    /// where a trailing `=>` is a hash pair, not a rightward assignment.
+    fn one_line_pattern(&mut self, subj: Expr) -> Result<Expr, String> {
+        if self.no_pattern {
+            return Ok(subj);
+        }
+        // `subj => pattern`: rightward assignment. Desugars to a `case/in` with a
+        // single clause and no `else`, so a non-match raises NoMatchingPatternError.
+        if self.eat_op("=>") {
+            let pattern = self.parse_pattern()?;
+            return Ok(Expr::CaseIn {
+                subject: Box::new(subj),
+                clauses: vec![InClause {
+                    pattern,
+                    guard: None,
+                    body: vec![Expr::Nil.into()],
+                }],
+                els: None,
+            });
+        }
+        // `subj in pattern`: boolean test. A matching clause yields `true`, the
+        // `else` yields `false` (and bindings from a partial match persist, as in
+        // MRI).
+        if self.is_kw("in") {
+            self.advance();
+            let pattern = self.parse_pattern()?;
+            return Ok(Expr::CaseIn {
+                subject: Box::new(subj),
+                clauses: vec![InClause {
+                    pattern,
+                    guard: None,
+                    body: vec![Expr::True.into()],
+                }],
+                els: Some(vec![Expr::False.into()]),
+            });
+        }
+        Ok(subj)
     }
 
     /// Modifier `rescue`: `expr rescue fallback` binds tighter than assignment
@@ -890,8 +939,15 @@ impl Parser {
 
     /// An argument allows `key: val` and `key => val` pair sugar (collapsed into
     /// a trailing hash by the caller is out of scope; here we just parse a value).
+    /// One-line pattern matching (`in`/`=>`) is disabled here: at the `arg` level a
+    /// trailing `=>` is a hash pair, and MRI rejects the pattern forms as bare
+    /// arguments. A nested parenthesized group re-enables them.
     fn arg(&mut self) -> Result<Expr, String> {
-        self.expr()
+        let saved = self.no_pattern;
+        self.no_pattern = true;
+        let e = self.expr();
+        self.no_pattern = saved;
+        e
     }
 
     fn maybe_block(&mut self) -> Result<Option<Block>, String> {
@@ -1165,13 +1221,17 @@ impl Parser {
                 // A parenthesized group takes a full statement (so a trailing
                 // modifier works: `(expr if cond)`), and may hold a `;`/newline-
                 // separated sequence (`(a = 1; b = 2)`) that evaluates to its last
-                // expression.
+                // expression. A group is a fresh expression context, so one-line
+                // pattern matching is re-enabled even inside an argument.
+                let saved = self.no_pattern;
+                self.no_pattern = false;
                 let mut stmts: Vec<Stmt> = vec![self.statement()?.into()];
                 self.skip_terms();
                 while !self.is_op(")") {
                     stmts.push(self.statement()?.into());
                     self.skip_terms();
                 }
+                self.no_pattern = saved;
                 self.expect_op(")")?;
                 if stmts.len() == 1 {
                     Ok(stmts.pop().unwrap().expr)
@@ -2318,12 +2378,14 @@ impl Parser {
         self.expect_op("[")?;
         self.skip_terms();
         let mut items = Vec::new();
+        // Array elements are `arg`-level, so one-line pattern matching (`in`/`=>`)
+        // is not consumed here (it belongs to `expr`).
         let elem = |p: &mut Self| -> Result<Expr, String> {
             if p.is_op("*") {
                 p.advance();
-                Ok(Expr::Splat(Box::new(p.expr()?)))
+                Ok(Expr::Splat(Box::new(p.arg()?)))
             } else {
-                p.expr()
+                p.arg()
             }
         };
         if !self.is_op("]") {
@@ -2363,15 +2425,17 @@ impl Parser {
     fn hash_pair(&mut self) -> Result<(Expr, Expr), String> {
         // `label: value` → symbol key; `key => value` → arbitrary key.
         // The label may be any reserved word (`{if: 1, class: 2}`).
+        // Hash keys and values are `arg`-level: a `=>` here is the pair separator,
+        // never a rightward-assignment pattern, so parse at arg level (`no_pattern`).
         if let Some(name) = self.peek_label() {
             self.advance();
             self.advance();
-            let v = self.expr()?;
+            let v = self.arg()?;
             return Ok((Expr::Symbol(name), v));
         }
-        let k = self.expr()?;
+        let k = self.arg()?;
         self.expect_op("=>")?;
-        let v = self.expr()?;
+        let v = self.arg()?;
         Ok((k, v))
     }
 }

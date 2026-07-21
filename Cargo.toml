@@ -141,6 +141,12 @@ num-traits = "0.2"
 # Exact rational numbers (`Rational(1, 2)`, `1r`) built on the bignum types.
 num-rational = "0.4"
 
+# Unicode segmentation (UAX #29 grapheme clusters) and normalization (NFC/NFD/
+# NFKC/NFKD) for String#each_grapheme_cluster / #unicode_normalize. Foundational
+# rust-lang/unicode-rs crates: table-driven, no build scripts, vendorable.
+unicode-segmentation = "1"
+unicode-normalization = "0.1"
+
 # Real SQLite persistence for `SQLite3::Database` (the sqlite3-gem API shape).
 # The `bundled` feature compiles the SQLite amalgamation in-tree, so there is no
 # external libsqlite3/FFI dependency — self-contained across macOS/Linux, no

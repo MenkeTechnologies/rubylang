@@ -140,8 +140,9 @@ Implemented and checked against the reference `ruby`:
 - **Blocks / `yield` / closures** — scope-sharing blocks with `break` / `next` /
   `return` control flow.
 - **Classes** — `initialize`, `attr_*`, instance variables, single inheritance,
-  `super` (bare-forwarding and explicit-args), ancestor-chain method resolution,
-  method chaining.
+  `super` (bare-forwarding and explicit-args, resolving through the
+  singleton-class chain for `def self.m` class methods too), ancestor-chain
+  method resolution, method chaining.
 - **Modules** — `module` + `include` mixins searched before the superclass; class
   methods via `def self.m`.
 - **Exceptions** — `begin` / `rescue` / `ensure`, method-body and
@@ -343,7 +344,9 @@ with `Regexp`, `MatchData`, and arbitrary-precision `Integer` (auto-promotion on
 overflow) are supported. `extend` / `prepend` / `class << self`, the full
 `case/in` pattern surface (two-sided find patterns, `**nil` exact-key matching,
 alternation binding, the `deconstruct`/`deconstruct_keys` protocol on user
-objects), reserved-word keyword labels (`def f(class:)`), `Date`/`Time`/
+objects) plus the one-line forms (`expr => pattern` rightward assignment and
+`expr in pattern` boolean match), reserved-word keyword labels
+(`def f(class:)`), `Date`/`Time`/
 `DateTime`, bare `%(…)` strings, and `__END__` are all implemented. See
 [`BUGS.md`](BUGS.md) for the full known-gaps list.
 
