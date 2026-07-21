@@ -131,10 +131,13 @@ pub fn eval_str(src: &str) -> Result<Value, String> {
 /// `eval_str` with command-line configuration: seeds `-I` includes, `ARGV`/`$0`,
 /// runs `-r` requires, then the one-liner. `$0`/`__FILE__` default to `-e`.
 pub fn eval_str_cfg(src: &str, cfg: &RunConfig) -> Result<Value, String> {
+    // Install a fresh per-run VM BEFORE taking the GVL: `reset_host` swaps the
+    // thread's current VM, which must not happen while a guard into the old one
+    // is live (see the invariant on `gvl_enter`).
+    host::reset_host();
     // Hold the GVL for the whole run so heap access stays exclusive and any
     // `Thread` spawned inside contends on the same lock (MRI's model).
     host::with_gvl(|| {
-        host::reset_host();
         let cwd = std::env::current_dir().unwrap_or_default();
         host::with_host(|h| h.init_load_path(&cwd.to_string_lossy()));
         host::with_host(|h| h.prepend_load_path(&cfg.includes));
@@ -202,9 +205,10 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
 /// `eval_file` with command-line configuration (`-I`/`-r`/`ARGV`/`$0`).
 pub fn eval_file_cfg(path: &str, cfg: &RunConfig) -> Result<Value, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    // Fresh per-run VM before the GVL (see `eval_str_cfg`).
+    host::reset_host();
     // Hold the GVL for the whole run (see `eval_str_cfg`).
     host::with_gvl(|| {
-        host::reset_host();
         let abs = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
         let dir = abs
             .parent()

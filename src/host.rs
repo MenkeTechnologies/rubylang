@@ -802,17 +802,19 @@ struct FiberContext {
     around_stack: Vec<AroundCall>,
 }
 
-/// The single shared object heap, protected by the GVL mutex — one VM for the
-/// whole process, exactly like MRI. `Thread`s share it; the GVL serializes access
-/// (only the thread holding the lock runs Ruby), so heap mutations stay atomic
-/// w.r.t. other threads the way MRI's GVL guarantees.
-static HOST: std::sync::OnceLock<Mutex<RubyHost>> = std::sync::OnceLock::new();
-
-fn host_lock() -> &'static Mutex<RubyHost> {
-    HOST.get_or_init(|| Mutex::new(RubyHost::new()))
-}
+/// One object heap per running program, protected by that program's GVL mutex.
+/// A top-level run (`eval_str`/`eval_file`, or a test's `eval_to_string`) installs
+/// its own VM; a Ruby `Thread` spawned inside a program installs a *clone* of its
+/// spawner's handle, so threads within one program share the heap and the GVL
+/// serializes them (MRI semantics) — while independent programs on other OS
+/// threads are fully isolated (no shared global).
+type Vm = Arc<Mutex<RubyHost>>;
 
 thread_local! {
+    /// The VM this thread is currently bound to. Unlike `GVL_GUARD`, it persists
+    /// across a `gvl_leave`/`gvl_enter` safepoint cycle, and it retains an `Arc`
+    /// to the `Mutex` so the host stays at a fixed address for the whole slice.
+    static CURRENT_VM: RefCell<Option<Vm>> = const { RefCell::new(None) };
     /// A raw pointer into the GVL-locked host, published while THIS thread holds
     /// the GVL. Null when the thread is not running Ruby. `with_host` uses it to
     /// reach the host without re-locking (the GVL already guarantees exclusivity).
@@ -820,16 +822,55 @@ thread_local! {
         const { std::cell::Cell::new(std::ptr::null_mut()) };
     /// The GVL guard held for this thread's whole execution slice (so a safepoint
     /// deep in the call stack can drop + reacquire it to let another thread run).
-    static GVL_GUARD: RefCell<Option<std::sync::MutexGuard<'static, RubyHost>>> =
-        const { RefCell::new(None) };
+    static GVL_GUARD: RefCell<Option<GvlHold>> = const { RefCell::new(None) };
 }
 
-/// Acquire the GVL: lock the shared host, publish the pointer, stash the guard.
+/// A held GVL: the lock guard plus a clone of the `Arc` it was taken from. Fields
+/// drop in declaration order, so `guard` (unlock) runs while `_vm` still keeps the
+/// `Mutex` alive — the guard can never outlive its `Mutex`, even at `process::exit`
+/// where `CURRENT_VM`'s own `Arc` may be torn down first in unspecified order.
+struct GvlHold {
+    // Both fields are held only for their `Drop` (RAII): `_guard` unlocks the
+    // `Mutex`, then `_vm` releases the `Arc`. Declaration order is the drop order.
+    _guard: std::sync::MutexGuard<'static, RubyHost>,
+    _vm: Vm,
+}
+
+/// Clone of this thread's current VM handle, lazily creating a private one the
+/// first time (the fallback for standalone tool/aot/lsp `with_host` calls that
+/// never ran `reset_host`). The clone keeps the `Mutex` alive for the caller.
+fn current_vm() -> Vm {
+    CURRENT_VM.with(|c| {
+        c.borrow_mut()
+            .get_or_insert_with(|| Arc::new(Mutex::new(RubyHost::new())))
+            .clone()
+    })
+}
+
+/// Bind the calling thread to `vm` (used by a spawned `Thread` to join its
+/// parent's heap). Must run with the GVL released — see the invariant on
+/// `gvl_enter`.
+fn install_current_vm(vm: Vm) {
+    CURRENT_VM.with(|c| *c.borrow_mut() = Some(vm));
+}
+
+/// Acquire the GVL: lock the current VM, publish the pointer, stash the guard.
 fn gvl_enter() {
-    let mut guard = host_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let vm = current_vm();
+    let mut guard = vm.lock().unwrap_or_else(|p| p.into_inner());
     let ptr: *mut RubyHost = &mut *guard;
+    // SAFETY: the guard is stored in `GvlHold` next to a clone of `vm`, whose
+    // `Arc` keeps this `Mutex` alive (at a fixed address) for the guard's whole
+    // life and drops only after it. `CURRENT_VM` is additionally only swapped
+    // while the GVL is released. So the `'static` extension is sound.
+    let guard: std::sync::MutexGuard<'static, RubyHost> = unsafe { std::mem::transmute(guard) };
     HOST_PTR.with(|p| p.set(ptr));
-    GVL_GUARD.with(|g| *g.borrow_mut() = Some(guard));
+    GVL_GUARD.with(|g| {
+        *g.borrow_mut() = Some(GvlHold {
+            _guard: guard,
+            _vm: vm,
+        })
+    });
 }
 
 /// Release the GVL: clear the pointer and drop the guard (unlocking the host).
@@ -876,13 +917,22 @@ pub fn with_host<R>(f: impl FnOnce(&mut RubyHost) -> R) -> R {
         // at the locked host and no other thread can touch it concurrently.
         return f(unsafe { &mut *ptr });
     }
-    let mut guard = host_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let vm = current_vm();
+    let mut guard = vm.lock().unwrap_or_else(|p| p.into_inner());
     f(&mut guard)
 }
 
-/// Reset the host to a clean slate (fresh top-level frame).
+/// Begin a fresh program: install a brand-new VM on this thread, so an
+/// independent run never shares state with (or corrupts) a program running
+/// concurrently on another OS thread. Must run with the GVL released — the
+/// `'static` guard extension in `gvl_enter` depends on the current VM not being
+/// swapped out while a guard into it is live.
 pub fn reset_host() {
-    with_host(|h| *h = RubyHost::new());
+    debug_assert!(
+        GVL_GUARD.with(|g| g.borrow().is_none()),
+        "reset_host must run with the GVL released"
+    );
+    CURRENT_VM.with(|c| *c.borrow_mut() = Some(Arc::new(Mutex::new(RubyHost::new()))));
     crate::intercepts::clear();
     FILE_DIR_STACK.with(|s| s.borrow_mut().clear());
     FILE_PATH_STACK.with(|s| s.borrow_mut().clear());
@@ -5270,7 +5320,15 @@ pub fn spawn_thread(block: Value) -> Value {
     let exc: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
     let done = Arc::new(AtomicBool::new(false));
     let (r2, e2, d2) = (result.clone(), exc.clone(), done.clone());
+    // Capture the spawner's VM so the child shares this program's heap (not a
+    // fresh one). Cloning the `Arc` here is safe even though we hold the GVL:
+    // it only bumps the refcount, it does not lock or swap the current VM.
+    let parent_vm = current_vm();
     let handle = std::thread::spawn(move || {
+        // Bind this OS thread to the parent's VM before running any Ruby, so its
+        // `gvl_enter` locks the shared host (and blocks until the spawner yields
+        // the GVL) instead of creating an isolated one.
+        install_current_vm(parent_vm);
         let (out, raised) = run_thread_body(&block);
         *r2.lock().unwrap() = Some(out);
         *e2.lock().unwrap() = raised;
