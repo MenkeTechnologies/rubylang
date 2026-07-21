@@ -4,7 +4,7 @@ version = "0.1.3"
 edition = "2021"
 rust-version = "1.80"
 authors = ["MenkeTechnologies <linux.dev25@gmail.com>"]
-description = "Ruby as a fusevm frontend: a lexer/parser and compiler to fusevm::Chunk on a RubyHost object heap, with no bespoke VM or JIT — the first compiled standalone Ruby runtime"
+description = "Ruby as a fusevm frontend: lexer, parser, and compiler to fusevm::Chunk on a RubyHost heap — the first compiled standalone Ruby runtime"
 license = "MIT"
 repository = "https://github.com/MenkeTechnologies/rubylang"
 homepage = "https://menketechnologies.github.io/rubylang/"
@@ -23,7 +23,6 @@ exclude = [
     "/.github/",
     "/tests/",
     "/examples/",
-    "/scripts/",
     "/BUGS.md",
 ]
 
