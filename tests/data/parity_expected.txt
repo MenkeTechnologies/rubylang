@@ -1275,3 +1275,13 @@ included in Speaker
 "set at runtime"
 #==#
 7
+#==#
+[1, 2, 3]
+#==#
+"ell"
+#==#
+42
+#==#
+#<Encoding:UTF-8>
+#==#
+true

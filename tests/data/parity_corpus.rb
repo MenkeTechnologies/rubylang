@@ -2068,3 +2068,25 @@ Dyn2.send(:attr_writer, :a)
 d2 = Dyn2.new
 d2.a = 7
 p d2.a
+#==#
+# ── return / break with multiple values yields an Array ──
+def multi; return 1, 2, 3; end
+p multi
+#==#
+# ── multi-line index / subscript ──
+s = "hello"
+p s[
+  1, 3
+]
+#==#
+# ── alias to a keyword-named method ──
+class Kw
+  def foo; 42; end
+  alias bar foo
+end
+p Kw.new.bar
+#==#
+# ── Encoding constants ──
+p Encoding::UTF_8
+#==#
+p "abc".encoding == Encoding::UTF_8

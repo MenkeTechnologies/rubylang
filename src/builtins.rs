@@ -1613,6 +1613,26 @@ fn dispatch_classref(
     }
     // `Etc` (from `require "etc"`, a C-ext stdlib) — only the CPU-count surface
     // gems actually use for pool sizing.
+    // `Encoding::UTF_8` / `::ASCII_8BIT` / … — the encoding constants. We carry
+    // only UTF-8 semantically, but name each object as requested so identity/name
+    // checks pass.
+    if cls == "Encoding" {
+        let enc_name = match name {
+            "UTF_8" => Some("UTF-8"),
+            "ASCII_8BIT" | "BINARY" => Some("ASCII-8BIT"),
+            "US_ASCII" | "ASCII" => Some("US-ASCII"),
+            "UTF_16" => Some("UTF-16"),
+            "UTF_16LE" => Some("UTF-16LE"),
+            "UTF_16BE" => Some("UTF-16BE"),
+            _ => None,
+        };
+        if let Some(en) = enc_name {
+            return Ok(encoding_object(en));
+        }
+        if name == "default_external" || name == "default_internal" {
+            return Ok(encoding_object("UTF-8"));
+        }
+    }
     if cls == "Etc" {
         match name {
             "nprocessors" => {
@@ -3842,12 +3862,7 @@ fn dispatch_string(
         // We only carry UTF-8 Strings, so `encoding` always names UTF-8. The
         // returned Encoding object answers `name`/`to_s`/`inspect` (dispatched in
         // `dispatch_object` for the `Encoding` class).
-        "encoding" => {
-            let enc = with_host(|h| h.new_object("Encoding"));
-            let name = new_str("UTF-8".to_string());
-            with_host(|h| h.set_ivar_of(&enc, "name", name));
-            Ok(enc)
-        }
+        "encoding" => Ok(encoding_object("UTF-8")),
         "lines" => Ok(new_arr(split_lines(&s).into_iter().map(new_str).collect())),
         "each_line" => {
             // With a block, iterate the lines and return self; without one,
@@ -9967,6 +9982,14 @@ fn dispatch_method(
         "to_proc" => Ok(recv.clone()),
         _ => Err(no_method_error(recv, name)),
     }
+}
+
+/// An `Encoding` object named `name` (`String#encoding`, `Encoding::UTF_8`, …).
+fn encoding_object(name: &str) -> Value {
+    let enc = with_host(|h| h.new_object("Encoding"));
+    let nm = new_str(name.to_string());
+    with_host(|h| h.set_ivar_of(&enc, "name", nm));
+    enc
 }
 
 /// Escape regex metacharacters in `s` (`Regexp.escape`/`quote`), matching MRI's

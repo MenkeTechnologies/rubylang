@@ -618,11 +618,17 @@ impl Parser {
                 }
             } else if self.is_op("[") {
                 self.advance();
+                // Newlines inside `[ … ]` index args are insignificant (a
+                // multi-line index / subscript), like inside a call paren.
+                self.skip_nl();
                 let mut idx = Vec::new();
                 if !self.is_op("]") {
                     idx.push(self.index_arg()?);
+                    self.skip_nl();
                     while self.eat_op(",") {
+                        self.skip_nl();
                         idx.push(self.index_arg()?);
+                        self.skip_nl();
                     }
                 }
                 self.expect_op("]")?;
@@ -1398,7 +1404,17 @@ impl Parser {
         {
             Ok(None)
         } else {
-            Ok(Some(Box::new(self.expr()?)))
+            // `return a, b, c` / `break x, y` yields an Array of the values.
+            let first = self.expr()?;
+            if self.is_op(",") {
+                let mut items = vec![first];
+                while self.eat_op(",") {
+                    items.push(self.arg()?);
+                }
+                Ok(Some(Box::new(Expr::Array(items))))
+            } else {
+                Ok(Some(Box::new(first)))
+            }
         }
     }
 
@@ -1608,6 +1624,8 @@ impl Parser {
                 }
             }
             Tok::Symbol(s) => Ok(s),
+            // A keyword-named method (`alias increment next`, `def next`).
+            Tok::Keyword(k) => Ok(k),
             // `[]` / `[]=` operator method names (`alias store []=`).
             Tok::Op(o) if o == "[" => {
                 self.expect_op("]")?;
