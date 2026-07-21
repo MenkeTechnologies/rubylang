@@ -2128,3 +2128,10 @@ _, first, second = *"x-y".match(/(.)-(.)/)
 p [first, second]
 #==#
 p Array("a-b".match(/(.)-(.)/))
+#==#
+# ── /=/ is a regex in match position; /= stays divide-assign after a value ──
+p("a=b" =~ /=/)
+#==#
+n = 10
+n /= 2
+p n

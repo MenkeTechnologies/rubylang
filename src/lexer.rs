@@ -1053,10 +1053,6 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
 /// or — after a value — when there's a space before `/` but not after (the
 /// command-argument form `scan /re/`, versus `a / b` division).
 fn regex_start(out: &[Token], sp: bool, next: Option<u8>) -> bool {
-    // `/=` is always the divide-assign operator, never a regex.
-    if next == Some(b'=') {
-        return false;
-    }
     let prev = out.iter().rev().find(|t| t.kind != Tok::Newline);
     let prev_is_value = match prev.map(|t| &t.kind) {
         None => false,
@@ -1074,9 +1070,15 @@ fn regex_start(out: &[Token], sp: bool, next: Option<u8>) -> bool {
         _ => false,
     };
     if !prev_is_value {
+        // A regex position (`=~ /=/`, `(/=/)`): even `/=…` is a regex, not the
+        // divide-assign operator.
         return true;
     }
-    // After a value: a command-argument regex needs a leading space and no space
+    // After a value, `/=` is the divide-assign operator (`x /= 2`), never a regex.
+    if next == Some(b'=') {
+        return false;
+    }
+    // Otherwise a command-argument regex needs a leading space and no space
     // immediately after the `/` (so `foo /re/` is a regex, `a / b` is division).
     sp && !matches!(next, Some(b' ') | Some(b'\t') | None)
 }
