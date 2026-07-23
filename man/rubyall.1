@@ -1,0 +1,120 @@
+.\" rubyall(1) — comprehensive all-in-one man page for rubylang (the `ruby` binary).
+.\" Modeled after zshall(1): every section of the reference in one document.
+.\" Render with:  man -l man/rubyall.1
+.\" Install:      cp man/rubyall.1 /usr/local/share/man/man1/
+.TH RUBYALL 1 "2026-07-23" "rubyrs 0.1.3" "User Commands"
+.SH NAME
+rubyall \- the rubylang comprehensive reference (invocation, language, architecture,
+bytecode VM + Cranelift JIT, LSP, DAP, inline-Rust FFI)
+.SH OVERVIEW
+This is the all\-in\-one
+.B rubylang
+manual, modeled on
+.BR zshall (1).
+It concatenates the major sections of the rubylang reference into a single page so
+you can grep with `/`:
+.RS 2
+.PP
+.B 1.  INVOCATION
+.RB "\(em " "flags, files, exit status"
+.br
+.B 2.  LANGUAGE
+.RB "\(em " "the Ruby the runtime parses and runs"
+.br
+.B 3.  ARCHITECTURE
+.RB "\(em " "lex \[->] parse \[->] lower \[->] fusevm VM + JIT"
+.br
+.B 4.  TOOLING
+.RB "\(em " "\-\-lsp, \-\-dap, inline-Rust FFI, dumps"
+.br
+.B 5.  DIAGNOSTICS
+.RB "\(em " "error format and common messages"
+.RE
+.SH 1. INVOCATION
+.B ruby
+[\fIOPTIONS\fR] \fIFILE\fR runs a Ruby script.
+.B \-e \fISRC\fR
+executes a one\-liner (repeatable; snippets are joined with newlines),
+.B \-I \fIDIR\fR
+prepends
+.I DIR
+to
+.BR $LOAD_PATH ,
+and
+.B \-r \fILIB\fR
+requires a library before the script.
+.B \-\-lsp
+and
+.B \-\-dap
+speak their protocols over stdio and take no file. See
+.BR ruby (1)
+for the per\-flag table.
+.SH 2. LANGUAGE
+rubylang runs Ruby programs outside MRI. It lexes and parses Ruby to an AST, lowers
+it to
+.B fusevm
+bytecode, and runs on the shared JIT; method dispatch, blocks, and object
+construction run on a thread\-local
+.B RubyHost
+heap. The implemented surface includes classes with
+.BR super ,
+modules and
+.BR include ,
+exceptions, splat parameters, and the
+.B &:sym
+block\-pass shorthand \(em checked against reference
+.B ruby
+by a 35\-snippet differential parity harness. A persistent REPL runs on the same
+host.
+.SH 3. ARCHITECTURE
+.EX
+Ruby source \[->] lexer \[->] parser (AST) \[->] lower to fusevm bytecode \[->] fusevm VM + Cranelift JIT
+.EE
+.PP
+There is no bespoke VM or JIT; arithmetic lowers to native fusevm ops so the tracing
+JIT can compile hot loops, while Ruby object semantics are served by the
+.B RubyHost
+heap. The same fusevm engine hosts strykelang, zshrs, awkrs, vimlrs, and elisprs.
+A transparent rkyv bytecode cache and AOP intercepts ride on top.
+.SH 4. TOOLING
+.SS Language server (\-\-lsp)
+.B ruby \-\-lsp
+speaks LSP over stdio: completion and hover from the symbol corpus (the same table
+that generates
+.IR docs/reference.html ),
+and diagnostics from the runtime's own parser. It is read\-only; no output reaches
+the terminal.
+.SS Debugger (\-\-dap)
+.B ruby \-\-dap
+speaks the Debug Adapter Protocol over stdio: line breakpoints, single\-stepping,
+a stack trace, and inspection of a frame's locals. Program output is captured and
+forwarded as
+.B output
+events so it never corrupts the protocol channel.
+.SS Inline-Rust FFI
+A
+.B rust { pub extern "C" fn \[u2026] }
+block desugars to an internal
+.BR __rust_compile ,
+compiles to a cached
+.B cdylib
+on first run (via the shared
+.B fusevm
+FFI runtime), and its exports become callable by name from Ruby
+.RB ( src/rust_ffi.rs ).
+.SS Dumps
+.B \-\-dump\-tokens
+prints the token stream,
+.B \-\-dump\-ast
+the parsed AST, and
+.B \-\-disasm
+a fusevm bytecode disassembly \(em each then exits.
+.SH 5. DIAGNOSTICS
+Errors are written to standard error in Ruby's own exception form. The process
+exits non\-zero on an unhandled exception and 0 on success.
+.SH SEE ALSO
+.BR ruby (1)
+The focused invocation page. Source and issue tracker:
+https://github.com/MenkeTechnologies/rubylang
+.SH AUTHOR
+Part of the fusevm language family.
