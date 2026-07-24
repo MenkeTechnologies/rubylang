@@ -13322,6 +13322,7 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "digest"
             | "base64"
             | "bigdecimal"
+            | "bigdecimal/util"
             | "pp"
             | "prettyprint"
             | "ostruct"

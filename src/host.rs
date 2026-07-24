@@ -3094,6 +3094,7 @@ impl RubyHost {
             "Integer"
                 | "Float"
                 | "Numeric"
+                | "BigDecimal"
                 | "String"
                 | "Symbol"
                 | "Array"
