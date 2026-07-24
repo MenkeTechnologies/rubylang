@@ -725,15 +725,11 @@ impl Parser {
                 // (`foo ::Bar` → `foo(::Bar)`), so require no preceding space.
                 self.advance();
                 let name = self.method_name()?;
-                // `Foo::bar(args){blk}` is a method call via `::` (equivalent to
-                // `Foo.bar(...)`), used for module functions. Parse the call tail
-                // only when `(` immediately follows; a bare `Foo::Bar` stays a
-                // no-arg constant/method access.
-                let (args, block) = if self.is_op("(") && !self.cur_space() {
-                    self.dot_call_tail()?
-                } else {
-                    (vec![], None)
-                };
+                // `Foo::bar(args){blk}` / `Foo::bar do…end` is a method call via
+                // `::` (equivalent to `Foo.bar(...)`), used for module functions
+                // (concurrent-ruby `Concurrent::atomically do…end`). The tail
+                // parser yields no args for a bare `Foo::Bar` constant access.
+                let (args, block) = self.dot_call_tail()?;
                 e = Expr::Call {
                     recv: Some(Box::new(e)),
                     name,
