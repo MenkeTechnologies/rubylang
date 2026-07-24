@@ -1235,7 +1235,12 @@ pub(crate) fn dispatch(
         // { super().merge(opts) }` on a subclass relies on this.
         if with_host(|h| h.has_own_define_method(&cls, name) && !h.has_own_method(&cls, name)) {
             if let Some(proc) = with_host(|h| h.find_define_method(&cls, name)) {
-                return crate::host::call_proc_self(&proc, args, Some(recv));
+                return crate::host::call_proc_self_ctx(
+                    &proc,
+                    args,
+                    Some(recv),
+                    Some((name.to_string(), cls.clone())),
+                );
             }
         }
         if with_host(|h| h.find_method_owner(&cls, name)).is_some() {
@@ -3257,7 +3262,12 @@ fn dispatch_object(
     // ambiguous same-class conflict).
     if with_host(|h| h.has_own_define_method(cls, name) && !h.has_own_method(cls, name)) {
         if let Some(proc) = with_host(|h| h.find_define_method(cls, name)) {
-            return crate::host::call_proc_self(&proc, args, Some(recv));
+            return crate::host::call_proc_self_ctx(
+                &proc,
+                args,
+                Some(recv),
+                Some((name.to_string(), cls.to_string())),
+            );
         }
     }
     if with_host(|h| h.find_method_owner(cls, name)).is_some() {
@@ -3265,7 +3275,12 @@ fn dispatch_object(
     }
     // A `define_method` block runs as an instance method with `self` = receiver.
     if let Some(proc) = with_host(|h| h.find_define_method(cls, name)) {
-        return crate::host::call_proc_self(&proc, args, Some(recv));
+        return crate::host::call_proc_self_ctx(
+            &proc,
+            args,
+            Some(recv),
+            Some((name.to_string(), cls.to_string())),
+        );
     }
     // An `alias_method`/`alias` name forwards to its target method.
     if let Some(target) = with_host(|h| h.find_alias(cls, name)) {

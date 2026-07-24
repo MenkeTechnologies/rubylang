@@ -6906,6 +6906,20 @@ pub fn call_proc_self(
     args: &[Value],
     self_override: Option<&Value>,
 ) -> Result<Value, String> {
+    call_proc_self_ctx(proc_val, args, self_override, None)
+}
+
+/// Like [`call_proc_self`], but `method_ctx = Some((name, owner))` marks the proc
+/// as running as a `define_method`-created instance method: `super` inside the
+/// body then resolves against `name` in `owner`'s ancestry (not the proc's
+/// defining scope). Without this, `define_method(:m) { super() }` would `super`
+/// on the enclosing `__class_body__`.
+pub fn call_proc_self_ctx(
+    proc_val: &Value,
+    args: &[Value],
+    self_override: Option<&Value>,
+    method_ctx: Option<(String, String)>,
+) -> Result<Value, String> {
     let (template, scope, kind, is_lambda) = match with_host(|h| h.obj(proc_val).cloned()) {
         Some(RObj::Proc {
             template,
@@ -7057,13 +7071,19 @@ pub fn call_proc_self(
             }
         }
     }
-    let block_scope = Scope {
+    let mut block_scope = Scope {
         locals: child,
         self_obj: self_override
             .cloned()
             .unwrap_or_else(|| scope.self_obj.clone()),
         ..scope
     };
+    // Running as a `define_method` method: rebind the super context so `super`
+    // resolves against this method name in the owner's ancestry.
+    if let Some((name, owner)) = method_ctx {
+        block_scope.method_name = Some(name);
+        block_scope.def_class = Some(owner);
+    }
     let prev_active = with_host(|h| h.active_scope.replace(block_scope));
     let r = run_chunk_on(def.chunk.clone());
     with_host(|h| {
