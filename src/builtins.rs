@@ -431,6 +431,10 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     if let Some(cls) = with_host(|h| h.object_class(&this)) {
         if with_host(|h| h.attr_access(&cls, &name)).is_some()
             || with_host(|h| h.find_define_method(&cls, &name)).is_some()
+            // A bare argless universal object method (`dup`, `freeze`, `itself`,
+            // `tap`, …) on a user object dispatches on `self` (sinatra: `dup`
+            // inside `call`), instead of falling through to Kernel and reading nil.
+            || is_universal_object_method(&name)
         {
             return match dispatch(&this, &name, &[], None) {
                 Ok(v) => propagate(vm, v),
