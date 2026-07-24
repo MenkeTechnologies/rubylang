@@ -2638,10 +2638,16 @@ impl Parser {
         if !kwparams.is_empty() || kwsplat.is_some() {
             Self::desugar_block_kwargs(&mut params, &mut preludes, kwparams, kwsplat);
         }
-        // The body is a `{ … }` or `do … end` block.
-        let block = self
-            .maybe_block()?
-            .ok_or_else(|| format!("line {}: lambda without a body", self.line()))?;
+        // The body is a `{ … }` or `do … end` block. A lambda's `do…end` is
+        // unambiguously its own body, so re-enable `do` here even inside a
+        // no-paren command arg (`set :x, ->() do … end`), where surrounding arg
+        // parsing suppresses `do`.
+        let saved_no_do = self.no_do_block;
+        self.no_do_block = false;
+        let block = self.maybe_block()?;
+        self.no_do_block = saved_no_do;
+        let block =
+            block.ok_or_else(|| format!("line {}: lambda without a body", self.line()))?;
         // Params from the `->()` header win (with its destructuring preludes
         // prepended to the body); if there were none, adopt the block's own
         // `{ |x| }` params/splat/body verbatim.
