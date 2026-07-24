@@ -1228,6 +1228,16 @@ pub(crate) fn dispatch(
     // full class (`class_of`: "String"/"Array"/…) when it is not a user object.
     {
         let cls = with_host(|h| h.object_class(recv).unwrap_or_else(|| h.class_of(recv)));
+        // A `define_method` on the object's *own* class overrides a bytecode method
+        // inherited from an ancestor (define_method registers in a table separate
+        // from the bytecode method table, so a plain `find_method_owner` would find
+        // the ancestor's first). rack-protection's `define_method(:default_options)
+        // { super().merge(opts) }` on a subclass relies on this.
+        if with_host(|h| h.has_own_define_method(&cls, name) && !h.has_own_method(&cls, name)) {
+            if let Some(proc) = with_host(|h| h.find_define_method(&cls, name)) {
+                return crate::host::call_proc_self(&proc, args, Some(recv));
+            }
+        }
         if with_host(|h| h.find_method_owner(&cls, name)).is_some() {
             return call_instance_method(recv.clone(), &cls, name, args, block);
         }
@@ -3240,6 +3250,16 @@ fn dispatch_object(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    // A `define_method` on the receiver's *own* class overrides a method
+    // inherited from an ancestor (rack-protection: a subclass `define_method
+    // (:default_options) { super().merge(opts) }` over a base bytecode method).
+    // Skipped when the own class also has a same-named bytecode method (an
+    // ambiguous same-class conflict).
+    if with_host(|h| h.has_own_define_method(cls, name) && !h.has_own_method(cls, name)) {
+        if let Some(proc) = with_host(|h| h.find_define_method(cls, name)) {
+            return crate::host::call_proc_self(&proc, args, Some(recv));
+        }
+    }
     if with_host(|h| h.find_method_owner(cls, name)).is_some() {
         return call_instance_method(recv.clone(), cls, name, args, block);
     }

@@ -2834,6 +2834,18 @@ impl RubyHost {
             .or_default()
             .insert(name.to_string(), proc);
     }
+    /// Whether `class` *itself* (not an ancestor) has a `define_method` for `name`.
+    pub fn has_own_define_method(&self, class: &str, name: &str) -> bool {
+        self.define_methods
+            .get(class)
+            .is_some_and(|m| m.contains_key(name))
+    }
+    /// Whether `class` *itself* (not an ancestor) defines the bytecode method `name`.
+    pub fn has_own_method(&self, class: &str, name: &str) -> bool {
+        self.classes
+            .get(class)
+            .is_some_and(|d| d.methods.contains_key(name))
+    }
     /// A `define_method` block for `name`, walking the superclass chain.
     pub fn find_define_method(&self, class: &str, name: &str) -> Option<Value> {
         let mut cur = Some(class.to_string());
