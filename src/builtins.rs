@@ -13901,6 +13901,7 @@ pub(crate) fn embedded_stdlib(name: &str) -> Option<&'static str> {
         "uri" => Some(include_str!("../stdlib/uri.rb")),
         "forwardable" => Some(include_str!("../stdlib/forwardable.rb")),
         "delegate" => Some(include_str!("../stdlib/delegate.rb")),
+        "logger" => Some(include_str!("../stdlib/logger.rb")),
         "strscan" => Some(include_str!("../stdlib/strscan.rb")),
         "rubygems/version" => Some(include_str!("../stdlib/rubygems_version.rb")),
         "csv" => Some(include_str!("../stdlib/csv.rb")),
@@ -13947,7 +13948,6 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "cgi/util"
             | "timeout"
             | "erb"
-            | "logger"
             | "open3"
             | "etc"
             | "socket"
