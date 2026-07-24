@@ -1478,6 +1478,28 @@ impl Parser {
                         args,
                         block,
                     })
+                } else if matches!(
+                    s.as_str(),
+                    "Array" | "Integer" | "Float" | "String" | "Hash" | "Rational" | "Complex"
+                ) && self.cur_space()
+                    && self.starts_command_arg()
+                {
+                    // A capitalized Kernel conversion method called command-style
+                    // without parens (`Array options[:x]`, `Integer str`): a call,
+                    // not a constant read (rack-protection: `Array options[:except]`).
+                    let mut args = Vec::new();
+                    let mut amp_block = None;
+                    let mut kwargs: Vec<(Expr, Expr)> = Vec::new();
+                    let mut kwsplats: Vec<Expr> = Vec::new();
+                    self.command_args_no_do(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
+                    Self::push_trailing_kwargs(&mut args, kwargs, kwsplats);
+                    let block = self.maybe_block()?.or(amp_block);
+                    Ok(Expr::Call {
+                        recv: None,
+                        name: s,
+                        args,
+                        block,
+                    })
                 } else {
                     Ok(Expr::Var(VarKind::Const, s))
                 }
