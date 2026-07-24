@@ -2782,13 +2782,47 @@ fn dispatch_classref(
             // while its own methods and `#class` report the subclass. rack's
             // `Rack::QueryParser::Params < Hash` and DelegateClass rely on this.
             if let Some(root) = with_host(|h| h.builtin_container_root(cls)) {
-                let obj = with_host(|h| match root {
-                    "Array" => h.new_array(vec![]),
-                    "String" => h.new_string(String::new()),
-                    _ => h.new_hash(IndexMap::new()),
-                });
+                let has_init = with_host(|h| h.find_method(cls, "initialize")).is_some();
+                // With a custom `initialize` (often calling `super`/`update`), start
+                // empty and let it fill the backing. Without one, build the native
+                // backing from the constructor args like `String.new(str)` /
+                // `Array.new(n[, val])` / `Hash.new(default)` — so
+                // `StringInquirer.new("prod")` actually holds "prod".
+                let obj = if has_init {
+                    with_host(|h| match root {
+                        "Array" => h.new_array(vec![]),
+                        "String" => h.new_string(String::new()),
+                        _ => h.new_hash(IndexMap::new()),
+                    })
+                } else {
+                    match root {
+                        "String" => with_host(|h| {
+                            let s = args
+                                .first()
+                                .and_then(|a| h.as_str(a))
+                                .unwrap_or_default();
+                            h.new_string(s)
+                        }),
+                        "Array" => {
+                            let n = args.first().map(as_i).unwrap_or(0).max(0) as usize;
+                            let items: Vec<Value> = if let Some(bl) = &block {
+                                (0..n)
+                                    .map(|i| call_proc(bl, &[Value::Int(i as i64)]))
+                                    .collect::<Result<_, _>>()?
+                            } else {
+                                let fill = args.get(1).cloned().unwrap_or(Value::Undef);
+                                vec![fill; n]
+                            };
+                            with_host(|h| h.new_array(items))
+                        }
+                        _ => with_host(|h| {
+                            let default = args.first().cloned().unwrap_or(Value::Undef);
+                            h.new_hash_with_default(IndexMap::new(), default)
+                        }),
+                    }
+                };
                 with_host(|h| h.set_class_override(&obj, cls));
-                if with_host(|h| h.find_method(cls, "initialize")).is_some() {
+                if has_init {
                     call_instance_method(obj.clone(), cls, "initialize", args, block)?;
                 }
                 return Ok(obj);
