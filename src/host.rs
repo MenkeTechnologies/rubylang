@@ -3304,11 +3304,22 @@ impl RubyHost {
         }
         // A constant holding a class — an alias (`Alias = Base`) or a runtime-
         // selected implementation (`Impl = case … end`). Resolve recursively so a
-        // short name the constant points to is itself fully qualified.
-        let c = self.get_const(name);
-        if let Some(RObj::ClassRef(real)) = self.obj(&c) {
-            if real != name && real != from {
-                return self.resolve_class_alias(real, from);
+        // short name the constant points to is itself fully qualified. Try the
+        // name as-is, then qualified against `from`'s enclosing namespaces: a
+        // `class Concurrent::Map < Collection::MapImplementation` names the const
+        // `Concurrent::Collection::MapImplementation`, not a bare one.
+        let mut const_candidates = vec![name.to_string()];
+        let mut cprefix = from;
+        while let Some(idx) = cprefix.rfind("::") {
+            cprefix = &cprefix[..idx];
+            const_candidates.push(format!("{cprefix}::{name}"));
+        }
+        for cand in &const_candidates {
+            let c = self.get_const(cand);
+            if let Some(RObj::ClassRef(real)) = self.obj(&c) {
+                if real != name && real != from {
+                    return self.resolve_class_alias(real, from);
+                }
             }
         }
         if !name.contains("::") {

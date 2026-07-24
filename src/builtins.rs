@@ -1602,7 +1602,10 @@ pub(crate) fn dispatch(
         // `Object#methods` — the receiver's instance methods (own + user-defined
         // ancestors) as symbols. Bounded to user-defined method surface; builtin
         // Kernel methods are not enumerated.
-        "methods" if args.is_empty() => {
+        // rubylang does not track method visibility, so `public_methods` mirrors
+        // `methods`. `private_methods`/`protected_methods` return empty (used by
+        // Delegator to exclude names from forwarding).
+        "methods" | "public_methods" if args.is_empty() || matches!(args.first(), Some(Value::Bool(_))) => {
             if let Some(cls) = with_host(|h| h.object_class(recv)) {
                 return Ok(with_host(|h| {
                     let names = h.instance_method_names(&cls, true);
