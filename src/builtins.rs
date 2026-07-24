@@ -1550,7 +1550,8 @@ pub(crate) fn dispatch(
     }
 
     let class = with_host(|h| h.class_of(recv));
-    match class.as_str() {
+    let fallback_block = block.clone();
+    let result = match class.as_str() {
         "Integer" | "Float" => dispatch_number(recv, name, args, block),
         "String" => dispatch_string(recv, name, args, block),
         "Array" => dispatch_array(recv, name, args, block),
@@ -1581,7 +1582,22 @@ pub(crate) fn dispatch(
         "Complex" => dispatch_complex(recv, name, args),
         "TrueClass" | "FalseClass" | "NilClass" => dispatch_bool(recv, name, args),
         _ => Err(no_method_error(recv, name)),
+    };
+    // Builtin values inherit from `Object`. When native dispatch above does not
+    // handle the method, fall back to a *user-defined* method on Object (or a
+    // module included into Object). activesupport core-ext defines Object#deep_dup,
+    // #try, #presence, #in?, #then, etc. this way — they must be callable on
+    // Integers/Strings/Arrays/Hashes too. This runs *after* native dispatch so a
+    // native method (e.g. Array#length) always wins over a same-named Object method.
+    if let Err(ref e) = result {
+        if e.starts_with("undefined method")
+            && class != "Object"
+            && with_host(|h| h.find_method_owner("Object", name)).is_some()
+        {
+            return call_instance_method(recv.clone(), "Object", name, args, fallback_block);
+        }
     }
+    result
 }
 
 /// `true`/`false`/`nil` boolean logic operators (`&` `|` `^` `!`). Ruby treats
