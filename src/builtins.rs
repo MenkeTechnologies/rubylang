@@ -441,6 +441,19 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
                 Err(e) => abort(vm, e),
             };
         }
+        // An object with a user `method_missing` (e.g. a `Delegator`) can handle a
+        // bare name for which it has no materialized method — it forwards to the
+        // wrapped object. Dispatch on `self` so `method_missing` fires; fall
+        // through to Kernel only if it genuinely doesn't handle it. mustermann's
+        // AST decorators call `each_with_index`/`map` bare inside their translate
+        // blocks, resolved through DelegateClass's `method_missing`.
+        if with_host(|h| h.find_method_owner(&cls, "method_missing").is_some()) {
+            match dispatch(&this, &name, &[], None) {
+                Ok(v) => return propagate(vm, v),
+                Err(e) if e.starts_with("undefined method") => {}
+                Err(e) => return abort(vm, e),
+            }
+        }
     }
     // A bare `module_function` in a module body flags the module so its instance
     // methods (including ones defined at runtime inside an `if`/`else`) double as
@@ -3487,8 +3500,11 @@ fn dispatch_object(
         }
         // `NameError#name` / `NoMethodError#name` — the missing method/constant
         // name (a Symbol). Stored as an ivar when raised natively, else parsed
-        // from the message (`undefined method 'foo' …`).
-        "name" => {
+        // from the message (`undefined method 'foo' …`). Guarded to exception
+        // objects: a plain user object's `name` must reach its own method or
+        // `method_missing` (mustermann's Capture aliases `name` to `payload`, read
+        // through a DelegateClass — an unguarded handler returned an empty Symbol).
+        "name" if with_host(|h| h.is_exception_class(cls)) => {
             let stored = with_host(|h| h.ivar_of(recv, "name"));
             if !matches!(stored, Value::Undef) {
                 return Ok(stored);
@@ -3498,7 +3514,9 @@ fn dispatch_object(
             Ok(with_host(|h| h.new_symbol(nm)))
         }
         // `NameError#receiver` / `NoMethodError#receiver`.
-        "receiver" => Ok(with_host(|h| h.ivar_of(recv, "receiver"))),
+        "receiver" if with_host(|h| h.is_exception_class(cls)) => {
+            Ok(with_host(|h| h.ivar_of(recv, "receiver")))
+        }
         // Exception backtrace surface. rubylang does not retain a per-exception
         // Ruby backtrace, so report an empty one (never nil, which callers splat
         // or `.first` on); `cause` is nil, `full_message` the message.

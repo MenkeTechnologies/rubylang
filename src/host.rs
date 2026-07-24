@@ -5638,6 +5638,22 @@ pub fn call_super_blk(
             });
             return Ok(Value::Bool(ans));
         }
+        // `super` from a `method_missing` override: the default `BasicObject#
+        // method_missing` raises NoMethodError for the unhandled name. A
+        // `Delegator#method_missing` calls `super` when the wrapped object does
+        // not respond to the forwarded method.
+        if method == "method_missing" {
+            let args = explicit_args.clone().unwrap_or_else(|| cur_args.clone());
+            let mname = args.first().map(|a| with_host(|h| h.to_s(a))).unwrap_or_default();
+            let target = with_host(|h| match h.classref_name(&self_obj) {
+                Some(c) => format!("class {c}"),
+                None => format!("an instance of {}", h.class_of(&self_obj)),
+            });
+            return Err(crate::builtins::raise_exc(
+                "NoMethodError",
+                &format!("undefined method '{mname}' for {target}"),
+            ));
+        }
         // `super` from a `def self.new` override — the default `Class#new`:
         // allocate an instance of the *receiver* class (so a subclass's `new`
         // makes the subclass) and run its `initialize`.
