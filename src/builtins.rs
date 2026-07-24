@@ -923,6 +923,10 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
                 | "const_defined?"
                 | "const_get"
                 | "const_set"
+                | "class_variable_get"
+                | "class_variable_set"
+                | "class_variable_defined?"
+                | "class_variables"
         ) && !args.is_empty()
         {
             return dispatch(&this, name, args, block);
@@ -988,6 +992,11 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
         // core-ext macros like `delegate`, called bare in a class body). Names
         // that are neither (`puts`, `raise`, …) fall through to Kernel.
         if name == "new"
+            // Common Module/Class builtin reflection called bare in a class body
+            // or method (`self` is the class): `name`/`to_s`/`inspect`. These
+            // arrive as calls only when no local shadows them, so routing to the
+            // class is safe. activesupport's autoload path derivation uses `name`.
+            || matches!(name, "name" | "to_s" | "inspect")
             || with_host(|h| {
                 h.find_class_method(&cls, name).is_some()
                     || h.find_method("Class", name).is_some()
@@ -2368,6 +2377,41 @@ fn dispatch_classref(
             let m = name_of(&args[0]);
             Ok(Value::Bool(with_host(|h| h.is_method_defined(cls, &m))))
         }
+        // `Module#class_variable_get/set/defined?` and `class_variables`. The
+        // reflective name arrives with its `@@` sigil (`:@@x`); the store keys
+        // are bare, so strip it.
+        "class_variable_get" => {
+            let raw = name_of(&args[0]);
+            let key = raw.strip_prefix("@@").unwrap_or(&raw);
+            let v = with_host(|h| h.get_cvar(cls, key));
+            if matches!(v, Value::Undef) {
+                return Err(raise_exc(
+                    "NameError",
+                    &format!("uninitialized class variable {raw} in {cls}"),
+                ));
+            }
+            Ok(v)
+        }
+        "class_variable_set" => {
+            let raw = name_of(&args[0]);
+            let key = raw.strip_prefix("@@").unwrap_or(&raw).to_string();
+            let val = args[1].clone();
+            with_host(|h| h.set_cvar(cls, &key, val.clone()));
+            Ok(val)
+        }
+        "class_variable_defined?" => {
+            let raw = name_of(&args[0]);
+            let key = raw.strip_prefix("@@").unwrap_or(&raw);
+            Ok(Value::Bool(with_host(|h| h.cvar_defined(cls, key))))
+        }
+        "class_variables" => Ok(with_host(|h| {
+            let syms: Vec<Value> = h
+                .class_var_names(cls)
+                .iter()
+                .map(|n| h.new_symbol(&format!("@@{n}")))
+                .collect();
+            h.new_array(syms)
+        })),
         // `Module#instance_method(:name)` — an UnboundMethod, modeled as a
         // receiver-less Method (`recv` = nil) that `bind`/`bind_call` re-target.
         "instance_method" => {
@@ -4077,6 +4121,19 @@ fn dispatch_string(
     frozen_guard(recv, name, STRING_MUTATORS)?;
     let s = with_host(|h| h.as_str(recv).unwrap_or_default());
     match name {
+        // In-place bang variants delegate to the non-bang transform, write the
+        // result back into the receiver, and return self — or nil when nothing
+        // changed (Ruby's String mutator convention).
+        "gsub!" | "sub!" | "upcase!" | "downcase!" | "capitalize!" | "swapcase!"
+        | "strip!" | "lstrip!" | "rstrip!" | "chomp!" | "chop!" | "reverse!"
+        | "squeeze!" | "tr!" | "tr_s!" | "delete!" => {
+            let base = name.strip_suffix('!').unwrap();
+            let result = dispatch_string(recv, base, args, block)?;
+            let new = with_host(|h| h.as_str(&result).unwrap_or_default());
+            let changed = new != s;
+            with_host(|h| h.set_str(recv, new));
+            Ok(if changed { recv.clone() } else { Value::Undef })
+        }
         "length" | "size" => Ok(Value::Int(s.chars().count() as i64)),
         // The `:ascii` option restricts case conversion to the ASCII letters,
         // leaving non-ASCII code points (ß, ü, …) untouched.

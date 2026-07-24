@@ -2229,7 +2229,15 @@ impl RubyHost {
     pub fn responds_to(&self, name: &str) -> bool {
         let this = self.current_self();
         if let Some(cls) = self.classref_name(&this) {
-            return name == "new" || self.find_class_method(&cls, name).is_some();
+            // A class object responds to its class methods, the common Module
+            // reflection builtins, and — as an instance of `Class < Module` — to
+            // Module/Class instance methods (Rails core-ext macros). Mirrors the
+            // bare-call routing in `dispatch_call`.
+            return name == "new"
+                || matches!(name, "name" | "to_s" | "inspect")
+                || self.find_class_method(&cls, name).is_some()
+                || self.find_method("Class", name).is_some()
+                || self.find_method("Module", name).is_some();
         }
         if let Some(cls) = self.object_class(&this) {
             if self.find_method(&cls, name).is_some()
@@ -2725,6 +2733,34 @@ impl RubyHost {
         }
         Value::Undef
     }
+    /// Bare names (no `@@`) of every class variable visible from `class_name`,
+    /// walking the superclass chain (`Module#class_variables`).
+    pub fn class_var_names(&self, class_name: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut cur = Some(class_name.to_string());
+        while let Some(c) = cur {
+            if let Some(m) = self.class_vars.get(&c) {
+                for k in m.keys() {
+                    if !names.contains(k) {
+                        names.push(k.clone());
+                    }
+                }
+            }
+            cur = self.superclass_of(&c);
+        }
+        names
+    }
+    /// Whether `var` (bare, no `@@`) is defined on `class_name` or an ancestor.
+    pub fn cvar_defined(&self, class_name: &str, var: &str) -> bool {
+        let mut cur = Some(class_name.to_string());
+        while let Some(c) = cur {
+            if self.class_vars.get(&c).is_some_and(|m| m.contains_key(var)) {
+                return true;
+            }
+            cur = self.superclass_of(&c);
+        }
+        false
+    }
     /// Assign a class variable: reuse the ancestor that already defines it,
     /// otherwise store it on `class_name`.
     pub fn set_cvar(&mut self, class_name: &str, var: &str, val: Value) {
@@ -3088,6 +3124,15 @@ impl RubyHost {
             }
             if let Some(m) = def.methods.get(method) {
                 return Some((m.clone(), name.clone()));
+            }
+            // An `alias`/`alias_method` on this class resolves to its target
+            // method (e.g. activesupport's `alias :cattr_accessor :mattr_accessor`
+            // on `Module`). Resolve the target from this class onward.
+            if let Some(target) = self.method_aliases.get(&name).and_then(|m| m.get(method)) {
+                let target = target.clone();
+                if let Some(found) = self.find_method_owner(&name, &target) {
+                    return Some(found);
+                }
             }
             // Included modules take priority over the superclass (last include
             // wins, matching Ruby's reverse-order ancestor insertion).
@@ -5053,6 +5098,40 @@ pub fn call_super_blk(
         // `name.start_with?("x") || super` in an override resolves cleanly.
         if method == "respond_to_missing?" {
             return Ok(Value::Bool(false));
+        }
+        // `super` from an override of a Module/Class lifecycle hook whose default
+        // is a native no-op. activesupport concerns call `super` in `included`/
+        // `extended` to chain up the ancestry; the base hook returns nil.
+        if matches!(
+            method.as_str(),
+            "included"
+                | "extended"
+                | "prepended"
+                | "inherited"
+                | "method_added"
+                | "method_removed"
+                | "method_undefined"
+                | "singleton_method_added"
+                | "singleton_method_removed"
+                | "singleton_method_undefined"
+        ) {
+            return Ok(Value::Undef);
+        }
+        // `super` from an override of the native `Module#autoload`. activesupport's
+        // `Autoload#autoload` derives a path from the constant name by convention,
+        // then calls `super(const, path)` to register it. Register natively under
+        // the receiver's namespace.
+        if method == "autoload" {
+            let args = explicit_args.unwrap_or(cur_args);
+            if let (Some(const_arg), Some(path_arg)) = (args.first(), args.get(1)) {
+                if let Some(cls) = with_host(|h| h.classref_name(&self_obj)) {
+                    let const_name = with_host(|h| h.to_s(const_arg));
+                    let path = with_host(|h| h.as_str(path_arg)).unwrap_or_default();
+                    let full = format!("{cls}::{const_name}");
+                    with_host(|h| h.set_autoload(&full, &path));
+                }
+            }
+            return Ok(Value::Undef);
         }
         return Err(format!("super: no superclass method '{method}'"));
     };
