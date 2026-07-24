@@ -14395,6 +14395,7 @@ pub(crate) fn embedded_stdlib(name: &str) -> Option<&'static str> {
         "csv" => Some(include_str!("../stdlib/csv.rb")),
         "optparse" => Some(include_str!("../stdlib/optparse.rb")),
         "yaml" | "psych" => Some(include_str!("../stdlib/yaml.rb")),
+        "openssl" => Some(include_str!("../stdlib/openssl.rb")),
         _ => None,
     }
 }
@@ -14412,7 +14413,6 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "digest/md5"
             | "digest/sha1"
             | "digest/sha2"
-            | "openssl"
             | "base64"
             | "bigdecimal"
             | "bigdecimal/util"
