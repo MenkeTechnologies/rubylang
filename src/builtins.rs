@@ -2385,6 +2385,15 @@ fn dispatch_classref(
         if name == "default_external" || name == "default_internal" {
             return Ok(encoding_object("UTF-8"));
         }
+        // rubylang is UTF-8 throughout, so setting the default external/internal
+        // encoding is a no-op that echoes the assigned value (Rails' bootstrap
+        // sets `Encoding.default_external = Encoding::UTF_8`).
+        if name == "default_external=" || name == "default_internal=" {
+            return Ok(args.first().cloned().unwrap_or(Value::Undef));
+        }
+        if name == "list" || name == "name_list" {
+            return Ok(with_host(|h| h.new_array(vec![])));
+        }
     }
     if cls == "Etc" {
         match name {
@@ -3291,10 +3300,19 @@ fn dispatch_classref(
             // can invoke it — e.g. `method(:Array)` bound to a class and called via
             // `flat_map(&method(:Array))` (sinatra's error handler registration).
             match kernel(name, args, block) {
-                Err(e) if e.starts_with("undefined method") => Err(raise_exc(
-                    "NoMethodError",
-                    &format!("undefined method '{name}' for class {cls}"),
-                )),
+                // Only rewrite when `name` itself is the unknown Kernel function.
+                // A nested "undefined method 'other'" from inside the call (e.g. a
+                // Kernel builtin that dispatched onward and hit a real gap) must
+                // propagate verbatim, not be masked as `name for class cls`.
+                Err(e)
+                    if e == format!("undefined method '{name}'")
+                        || e.starts_with(&format!("undefined method '{name}' ")) =>
+                {
+                    Err(raise_exc(
+                        "NoMethodError",
+                        &format!("undefined method '{name}' for class {cls}"),
+                    ))
+                }
                 other => other,
             }
         }
@@ -8556,6 +8574,30 @@ fn dispatch_file_class(
         "expand_path" => {
             let base = args.get(1).and_then(|a| with_host(|h| h.as_str(a)));
             Ok(new_str(path_expand(&str_arg(args, 0), base.as_deref())))
+        }
+        // `File.realpath`/`realdirpath` — the canonical absolute path with symlinks
+        // resolved. realpath requires the file to exist; realdirpath does not (only
+        // the directory portion must). Fall back to expand_path when canonicalize
+        // can't resolve (matching realdirpath's leniency).
+        "realpath" | "realdirpath" => {
+            let base = args.get(1).and_then(|a| with_host(|h| h.as_str(a)));
+            let expanded = path_expand(&str_arg(args, 0), base.as_deref());
+            match std::fs::canonicalize(&expanded) {
+                Ok(p) => Ok(new_str(p.to_string_lossy().into_owned())),
+                Err(e) if name == "realpath" => Err(sys_err(
+                    "No such file or directory @ rb_check_realpath_internal",
+                    &expanded,
+                    &e,
+                )),
+                Err(_) => Ok(new_str(expanded)),
+            }
+        }
+        "absolute_path" => {
+            let base = args.get(1).and_then(|a| with_host(|h| h.as_str(a)));
+            Ok(new_str(path_expand(&str_arg(args, 0), base.as_deref())))
+        }
+        "absolute_path?" => {
+            Ok(Value::Bool(str_arg(args, 0).starts_with('/')))
         }
         _ => return None,
     })
