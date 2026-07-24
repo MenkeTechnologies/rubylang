@@ -13968,6 +13968,7 @@ pub(crate) fn embedded_stdlib(name: &str) -> Option<&'static str> {
         "forwardable" => Some(include_str!("../stdlib/forwardable.rb")),
         "delegate" => Some(include_str!("../stdlib/delegate.rb")),
         "logger" => Some(include_str!("../stdlib/logger.rb")),
+        "ipaddr" => Some(include_str!("../stdlib/ipaddr.rb")),
         "strscan" => Some(include_str!("../stdlib/strscan.rb")),
         "rubygems/version" => Some(include_str!("../stdlib/rubygems_version.rb")),
         "csv" => Some(include_str!("../stdlib/csv.rb")),
@@ -13991,7 +13992,6 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "digest/sha1"
             | "digest/sha2"
             | "openssl"
-            | "ipaddr"
             | "base64"
             | "bigdecimal"
             | "bigdecimal/util"
