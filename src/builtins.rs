@@ -1700,7 +1700,14 @@ fn dispatch_bool(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
         // `nil.to_a` is `[]`; `nil.to_h` is `{}` — the empty-conversion methods.
         "to_a" if matches!(recv, Value::Undef) => Ok(new_arr(vec![])),
         "to_h" if matches!(recv, Value::Undef) => Ok(with_host(|h| h.new_hash(IndexMap::new()))),
-        _ => Err(no_method_error(recv, name)),
+        // A Kernel function (`require`/`require_relative`/`format`/`raise`/…) is a
+        // private method of every object, `nil`/`true`/`false` included, so a call
+        // reaching here (e.g. a bare call whose `self` is `nil`) resolves through
+        // Kernel rather than raising.
+        _ => match kernel(name, args, None) {
+            Err(e) if e.starts_with("undefined method") => Err(no_method_error(recv, name)),
+            other => other,
+        },
     }
 }
 
