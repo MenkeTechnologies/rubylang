@@ -1868,6 +1868,24 @@ fn dispatch_classref(
             _ => {}
         }
     }
+    // `CGI` module methods used by activesupport's `to_query`/`to_param` and by
+    // gems (faraday): URL and HTML escaping.
+    if cls == "CGI" {
+        match name {
+            "escape" => return Ok(new_str(cgi_escape(&arg_str(&args[0])))),
+            "unescape" => return Ok(new_str(cgi_unescape(&arg_str(&args[0])))),
+            "escapeHTML" | "escape_html" => {
+                return Ok(new_str(cgi_escape_html(&arg_str(&args[0]))))
+            }
+            "unescapeHTML" | "unescape_html" => {
+                return Ok(new_str(cgi_unescape_html(&arg_str(&args[0]))))
+            }
+            "escapeURIComponent" | "escapeURI" => {
+                return Ok(new_str(cgi_escape(&arg_str(&args[0])).replace('+', "%20")))
+            }
+            _ => {}
+        }
+    }
     // `Etc` (from `require "etc"`, a C-ext stdlib) — only the CPU-count surface
     // gems actually use for pool sizing.
     // `Encoding::UTF_8` / `::ASCII_8BIT` / … — the encoding constants. We carry
@@ -2444,7 +2462,7 @@ fn dispatch_classref(
         "singleton_class" => Ok(with_host(|h| h.class_ref(&format!("#<Class:{cls}>")))),
         // `Module#instance_method(:name)` — an UnboundMethod, modeled as a
         // receiver-less Method (`recv` = nil) that `bind`/`bind_call` re-target.
-        "instance_method" => {
+        "instance_method" | "public_instance_method" => {
             let m = name_of(&args[0]);
             Ok(with_host(|h| h.new_method(Value::Undef, &m)))
         }
@@ -10713,6 +10731,78 @@ fn backtrace_location(path: &str, lineno: i64, label: &str) -> Value {
     })
 }
 
+/// `CGI.escape` — percent-encode for `application/x-www-form-urlencoded`: keep
+/// `[A-Za-z0-9_.-]`, space becomes `+`, everything else `%XX`.
+fn cgi_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// `CGI.unescape` — inverse of `cgi_escape`: `+` → space, `%XX` → byte.
+fn cgi_unescape(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < b.len() => {
+                let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok();
+                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `CGI.escapeHTML` — escape the five HTML metacharacters.
+fn cgi_escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// `CGI.unescapeHTML` — inverse of `cgi_escape_html` for the common entities.
+fn cgi_unescape_html(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
 fn encoding_object(name: &str) -> Value {
     let enc = with_host(|h| h.new_object("Encoding"));
     let nm = new_str(name.to_string());
@@ -13196,6 +13286,8 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             // `uri`, `csv`, `yaml`, `optparse` are real pure-Ruby libs bundled via
             // `embedded_stdlib`, not no-op names — kept out of this list on purpose.
             | "cgi"
+            | "cgi/escape"
+            | "cgi/util"
             | "erb"
             | "logger"
             | "open3"
