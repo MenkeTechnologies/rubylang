@@ -7,6 +7,18 @@
 # custom object (de)serialization). `dump` output round-trips through `load`.
 
 module YAML
+  # Registries mapping YAML tags <-> Ruby class names (Psych uses these for
+  # custom object (de)serialization). rubylang does not (de)serialize tagged
+  # objects, but Rails/activesupport register tags at load time, so provide the
+  # persistent hashes so `YAML.load_tags[tag] = class_name` works.
+  def self.load_tags
+    @load_tags ||= {}
+  end
+
+  def self.dump_tags
+    @dump_tags ||= {}
+  end
+
   # Serialize `obj` to a YAML document string (`---` header + block body).
   def self.dump(obj, io = nil)
     body = Emitter.new.emit(obj)
