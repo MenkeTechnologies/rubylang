@@ -3390,6 +3390,18 @@ impl RubyHost {
         if self.classes.contains_key(&nested) {
             return nested;
         }
+        // Walk outward through the enclosing namespace: inside `module ActiveSupport`
+        // a `module Callbacks` doing `extend Concern` names the sibling
+        // `ActiveSupport::Concern`, not `ActiveSupport::Callbacks::Concern` or a
+        // top-level `Concern`. Mirrors lexical constant resolution.
+        let mut prefix = enclosing;
+        while let Some(idx) = prefix.rfind("::") {
+            prefix = &prefix[..idx];
+            let cand = format!("{prefix}::{module}");
+            if self.classes.contains_key(&cand) {
+                return cand;
+            }
+        }
         if self.classes.contains_key(module) {
             return module.to_string();
         }
@@ -3838,14 +3850,12 @@ impl RubyHost {
                 return Some((m.clone(), name.clone()));
             }
             for module in def.extends.iter().rev() {
-                let nested = format!("{name}::{module}");
-                for cand in [nested.as_str(), module] {
-                    if self.classes.contains_key(cand) {
-                        // Resolve through the module's own aliases and includes.
-                        if let Some((m, _)) = self.find_in_module(cand, method) {
-                            return Some((m, name.clone()));
-                        }
-                    }
+                // Resolve the extended module lexically (nested, then outward
+                // through the enclosing namespace) then through its own aliases
+                // and includes.
+                let resolved = self.resolve_module_name(module, &name);
+                if let Some((m, _)) = self.find_in_module(&resolved, method) {
+                    return Some((m, name.clone()));
                 }
             }
             cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &name));
@@ -3867,13 +3877,9 @@ impl RubyHost {
             // when the extend was compiled — so try the class's own namespace
             // first, then the stored/top-level name.
             for module in def.extends.iter().rev() {
-                let nested = format!("{name}::{module}");
-                for cand in [nested.as_str(), module] {
-                    if self.classes.contains_key(cand) {
-                        if let Some((m, _)) = self.find_in_module(cand, method) {
-                            return Some(m);
-                        }
-                    }
+                let resolved = self.resolve_module_name(module, &name);
+                if let Some((m, _)) = self.find_in_module(&resolved, method) {
+                    return Some(m);
                 }
             }
             cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &name));
@@ -3897,12 +3903,10 @@ impl RubyHost {
             // `extend M` on an ancestor contributes M's instance methods as that
             // ancestor's class methods (after its own `def self.m`, last wins).
             for module in def.extends.iter().rev() {
-                let nested = format!("{name}::{module}");
-                for cand in [&nested, module] {
-                    if let Some(md) = self.classes.get(cand) {
-                        if let Some(m) = md.methods.get(method) {
-                            return Some((m.clone(), name.clone()));
-                        }
+                let resolved = self.resolve_module_name(module, &name);
+                if let Some(md) = self.classes.get(&resolved) {
+                    if let Some(m) = md.methods.get(method) {
+                        return Some((m.clone(), name.clone()));
                     }
                 }
             }
