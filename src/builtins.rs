@@ -1763,11 +1763,22 @@ fn dispatch_classref(
         return call_instance_method(recv, &sclass, name, args, block);
     }
     // A class-method alias (`class << self; alias new! new; end` /
-    // `singleton_class.alias_method`), registered on the *singleton* class only —
-    // never the instance-method alias table on `cls` (mustermann aliases the
-    // instance method `name` to `payload`; `Klass.name` must stay Module#name).
-    // Resolve to the target and re-dispatch, covering a native target (`new`).
-    if let Some(target) = with_host(|h| h.find_alias(&format!("#<Class:{cls}>"), name)) {
+    // `singleton_class.alias_method`), registered on the *singleton* class of the
+    // receiver or an ancestor — never the instance-method alias table on `cls`
+    // (mustermann aliases the instance method `name` to `payload`; `Klass.name`
+    // must stay Module#name). Resolve to the target and re-dispatch.
+    if let Some(target) = with_host(|h| h.find_class_alias(cls, name)) {
+        if target == "new" {
+            // Ruby's `alias new! new` (before a later `def self.new`) snapshots the
+            // *original* constructor. Run native `new` — allocate an instance of the
+            // receiver class and its `initialize` — bypassing a user `def new`
+            // override (sinatra's `new!` is the un-wrapped constructor).
+            let obj = with_host(|h| h.new_object(cls));
+            if with_host(|h| h.find_method_owner(cls, "initialize")).is_some() {
+                call_instance_method(obj.clone(), cls, "initialize", args, block)?;
+            }
+            return Ok(obj);
+        }
         if target != name {
             return dispatch_classref(cls, &target, args, block);
         }

@@ -2302,6 +2302,7 @@ impl RubyHost {
             || self.find_class_method(cls, name).is_some()
             || self.find_class_define_method(cls, name).is_some()
             || self.find_singleton_class_method(cls, name).is_some()
+            || self.find_class_alias(cls, name).is_some()
             || self.find_method("Class", name).is_some()
             || self.find_method("Module", name).is_some()
     }
@@ -2857,6 +2858,26 @@ impl RubyHost {
         while let Some(c) = cur {
             if let Some(t) = self.method_aliases.get(&c).and_then(|m| m.get(name)) {
                 return Some(t.clone());
+            }
+            cur = self.superclass_of(&c);
+        }
+        None
+    }
+    /// A *class-method* alias for `name` — one registered on the singleton class
+    /// of `class` or any of its superclasses (`class << self; alias new! new`).
+    /// Walks the object superclass chain (singleton classes are not linked here),
+    /// so a subclass inherits an alias defined on an ancestor's singleton.
+    pub fn find_class_alias(&self, class: &str, name: &str) -> Option<String> {
+        let mut cur = Some(class.to_string());
+        let mut guard = 0;
+        while let Some(c) = cur {
+            let sclass = format!("#<Class:{c}>");
+            if let Some(t) = self.method_aliases.get(&sclass).and_then(|m| m.get(name)) {
+                return Some(t.clone());
+            }
+            guard += 1;
+            if guard > 100 {
+                break;
             }
             cur = self.superclass_of(&c);
         }
