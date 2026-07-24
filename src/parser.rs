@@ -2458,6 +2458,16 @@ impl Parser {
                 }
             }
             self.expect_op(")")?;
+        } else {
+            // `-> v { … }` / `->v{ … }` / `-> a, b { … }` — parameters without
+            // parentheses, terminated by the `{`/`do` body.
+            while matches!(self.peek(), Tok::Ident(_)) || self.is_op("*") || self.is_op("&") {
+                had_parens = true;
+                self.block_param(&mut params, &mut splat, &mut preludes)?;
+                if !self.eat_op(",") {
+                    break;
+                }
+            }
         }
         // The body is a `{ … }` or `do … end` block.
         let block = self
