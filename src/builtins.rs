@@ -1634,6 +1634,25 @@ fn dispatch_classref(
         let recv = with_host(|h| h.class_ref(cls));
         return crate::host::call_class_method(recv, &def, name, &owner, args, block);
     }
+    // `Mod.autoload :Const, "path"` — a module registering a lazy require on a
+    // *receiver* (`Tilt.autoload :Foo, "tilt/foo"`), namespaced under the module.
+    // The self-call and `super`-override forms are handled elsewhere; this is the
+    // explicit-receiver form.
+    if name == "autoload" && args.len() >= 2 {
+        let const_name = name_of(&args[0]);
+        let path = with_host(|h| h.as_str(&args[1])).unwrap_or_default();
+        let full = format!("{cls}::{const_name}");
+        with_host(|h| h.set_autoload(&full, &path));
+        return Ok(Value::Undef);
+    }
+    if name == "autoload?" && !args.is_empty() {
+        let const_name = name_of(&args[0]);
+        let full = format!("{cls}::{const_name}");
+        return Ok(with_host(|h| match h.autoload_path(&full) {
+            Some(p) => h.new_string(p),
+            None => Value::Undef,
+        }));
+    }
     // `ENV` — the process environment as a hash-like object (backed by std::env).
     if cls == "ENV" {
         return dispatch_env(name, args, block);
