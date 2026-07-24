@@ -2301,11 +2301,7 @@ impl RubyHost {
             )
             || self.find_class_method(cls, name).is_some()
             || self.find_class_define_method(cls, name).is_some()
-            || {
-                let sclass = format!("#<Class:{cls}>");
-                self.find_define_method(&sclass, name).is_some()
-                    || self.find_method_owner(&sclass, name).is_some()
-            }
+            || self.find_singleton_class_method(cls, name).is_some()
             || self.find_method("Class", name).is_some()
             || self.find_method("Module", name).is_some()
     }
@@ -2769,6 +2765,29 @@ impl RubyHost {
             .entry(class.to_string())
             .or_default()
             .insert(name.to_string(), proc);
+    }
+    /// A method defined on the singleton class of `class` or any of its
+    /// superclasses (`Klass.singleton_class.class_eval { def m }` / `define_method`)
+    /// — an *inherited* class method. Returns the owning singleton-class name (so
+    /// the caller can invoke it), walking the object superclass chain because a
+    /// singleton class's own superclass link is not modeled here.
+    pub fn find_singleton_class_method(&self, class: &str, name: &str) -> Option<String> {
+        let mut cur = Some(class.to_string());
+        let mut guard = 0;
+        while let Some(c) = cur {
+            let sclass = format!("#<Class:{c}>");
+            let has = self.define_methods.get(&sclass).is_some_and(|m| m.contains_key(name))
+                || self.classes.get(&sclass).is_some_and(|d| d.methods.contains_key(name));
+            if has {
+                return Some(sclass);
+            }
+            guard += 1;
+            if guard > 100 {
+                break;
+            }
+            cur = self.superclass_of(&c);
+        }
+        None
     }
     /// A `Klass.define_singleton_method` block for `name`, walking the superclass
     /// chain (a class-level singleton method is inherited like any class method).

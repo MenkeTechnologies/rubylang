@@ -1731,16 +1731,12 @@ fn dispatch_classref(
     // `{ def m; … end }` (sinatra's `set` DSL defines its accessors this way).
     // The singleton class is registered under the synthetic name `#<Class:Klass>`;
     // its instance methods run with `self` = the class ref.
-    {
-        let sclass = format!("#<Class:{cls}>");
+    if let Some(sclass) = with_host(|h| h.find_singleton_class_method(cls, name)) {
+        let recv = with_host(|h| h.class_ref(cls));
         if let Some(proc) = with_host(|h| h.find_define_method(&sclass, name)) {
-            let recv = with_host(|h| h.class_ref(cls));
             return crate::host::call_proc_self(&proc, args, Some(&recv));
         }
-        if let Some((_, owner)) = with_host(|h| h.find_method_owner(&sclass, name)) {
-            let recv = with_host(|h| h.class_ref(cls));
-            return call_instance_method(recv, &owner, name, args, block);
-        }
+        return call_instance_method(recv, &sclass, name, args, block);
     }
     // `Mod.autoload :Const, "path"` — a module registering a lazy require on a
     // *receiver* (`Tilt.autoload :Foo, "tilt/foo"`), namespaced under the module.
