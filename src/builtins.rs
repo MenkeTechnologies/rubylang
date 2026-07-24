@@ -3058,6 +3058,20 @@ fn dispatch_object(
                 Ok(m)
             }
         }
+        // `NameError#name` / `NoMethodError#name` — the missing method/constant
+        // name (a Symbol). Stored as an ivar when raised natively, else parsed
+        // from the message (`undefined method 'foo' …`).
+        "name" => {
+            let stored = with_host(|h| h.ivar_of(recv, "name"));
+            if !matches!(stored, Value::Undef) {
+                return Ok(stored);
+            }
+            let msg = with_host(|h| h.as_str(&h.ivar_of(recv, "message"))).unwrap_or_default();
+            let nm = msg.split('\'').nth(1).unwrap_or("");
+            Ok(with_host(|h| h.new_symbol(nm)))
+        }
+        // `NameError#receiver` / `NoMethodError#receiver`.
+        "receiver" => Ok(with_host(|h| h.ivar_of(recv, "receiver"))),
         // A runtime-declared attribute accessor (`class_eval { attr_accessor :x }`)
         // reads/writes the `@field` ivar natively, ahead of method_missing.
         _ if with_host(|h| h.attr_access(cls, name)).is_some() => {
