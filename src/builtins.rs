@@ -996,6 +996,7 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
                 | "private_class_method"
                 | "public_class_method"
                 | "deprecate_constant"
+                | "ruby2_keywords"
         ) {
             return Ok(match args {
                 [one] if name != "module_function" => one.clone(),
