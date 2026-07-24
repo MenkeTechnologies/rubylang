@@ -2649,6 +2649,16 @@ fn dispatch_classref(
             let cname = name_of(&args[0]);
             let val = args.get(1).cloned().unwrap_or(Value::Undef);
             let key = const_key_under(cls, &cname);
+            // Naming an anonymous class/module via `const_set` gives it the
+            // constant's qualified name (MRI behavior) so it registers under that
+            // name — a subclass `class Sub < Mod::Anon` then resolves correctly.
+            let val = with_host(|h| match h.classref_name(&val) {
+                Some(cref) if h.is_anon_class(&cref) => {
+                    h.rename_class(&cref, &key);
+                    h.class_ref(&key)
+                }
+                _ => val.clone(),
+            });
             with_host(|h| h.set_const(&key, val.clone()));
             Ok(val)
         }

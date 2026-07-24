@@ -2900,6 +2900,9 @@ impl RubyHost {
         if let Some(v) = self.define_methods.shift_remove(old) {
             self.define_methods.insert(new.to_string(), v);
         }
+        if let Some(v) = self.class_define_methods.shift_remove(old) {
+            self.class_define_methods.insert(new.to_string(), v);
+        }
         if let Some(v) = self.method_aliases.shift_remove(old) {
             self.method_aliases.insert(new.to_string(), v);
         }
@@ -2948,6 +2951,23 @@ impl RubyHost {
         // nested user class that merely shares the suffix.
         if self.is_builtin_class(name) || is_builtin_exception_name(name) {
             return name.to_string();
+        }
+        // Prefer the lexically-nearest class: walk `from`'s enclosing namespaces
+        // and return the first registered `<namespace>::<name>`. This resolves a
+        // bare superclass to the copy in the innermost enclosing scope — e.g. a
+        // per-subclass nested class an `inherited` hook created at runtime
+        // (`class Capture < NodeTranslator` inside `Compiler` → the runtime-made
+        // `Compiler::NodeTranslator`, not the base one) — mirroring Ruby's lexical
+        // constant lookup for the superclass, instead of an arbitrary suffix match.
+        if !name.contains("::") {
+            let mut prefix = from;
+            while let Some(idx) = prefix.rfind("::") {
+                prefix = &prefix[..idx];
+                let cand = format!("{prefix}::{name}");
+                if cand != from && self.classes.contains_key(&cand) {
+                    return cand;
+                }
+            }
         }
         // A partial or short nested-class name that names a class registered
         // under its *fully-qualified* form. `class C < Foo::Bar` inside another
