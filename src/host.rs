@@ -3210,6 +3210,41 @@ impl RubyHost {
     /// Look up `method` on `class`, walking the ancestor chain (own methods,
     /// then included modules, then the superclass), returning the method and the
     /// class/module it was defined in.
+    /// Search a module (and its transitively prepended/included modules) for an
+    /// instance method, resolving a partial module name to its registered class.
+    /// This is what makes module-including-module work: a class that includes `A`
+    /// finds `B`'s methods when `A` includes `B` (concurrent-ruby's `Obligation`
+    /// includes `Dereferenceable`). Returns the method and its owning module.
+    fn find_in_module(&self, module: &str, method: &str) -> Option<(MethodDef, String)> {
+        let name = if self.classes.contains_key(module) {
+            module.to_string()
+        } else {
+            self.resolve_class_alias(module, "")
+        };
+        let def = self.classes.get(&name)?;
+        for p in def.prepends.iter().rev() {
+            if let Some(r) = self.find_in_module(p, method) {
+                return Some(r);
+            }
+        }
+        if let Some(m) = def.methods.get(method) {
+            return Some((m.clone(), name.clone()));
+        }
+        if let Some(target) = self.method_aliases.get(&name).and_then(|a| a.get(method)) {
+            let target = target.clone();
+            if target != method {
+                if let Some(r) = self.find_in_module(&name, &target) {
+                    return Some(r);
+                }
+            }
+        }
+        for i in def.includes.iter().rev() {
+            if let Some(r) = self.find_in_module(i, method) {
+                return Some(r);
+            }
+        }
+        None
+    }
     pub fn find_method_owner(&self, class: &str, method: &str) -> Option<(MethodDef, String)> {
         let mut cur = Some(class.to_string());
         while let Some(name) = cur {
@@ -3217,10 +3252,8 @@ impl RubyHost {
             // Prepended modules sit ahead of the class's own methods (last
             // prepend wins, matching Ruby's reverse-order ancestor insertion).
             for module in def.prepends.iter().rev() {
-                if let Some(md) = self.classes.get(module) {
-                    if let Some(m) = md.methods.get(method) {
-                        return Some((m.clone(), module.clone()));
-                    }
+                if let Some(r) = self.find_in_module(module, method) {
+                    return Some(r);
                 }
             }
             if let Some(m) = def.methods.get(method) {
@@ -3235,13 +3268,11 @@ impl RubyHost {
                     return Some(found);
                 }
             }
-            // Included modules take priority over the superclass (last include
-            // wins, matching Ruby's reverse-order ancestor insertion).
+            // Included modules (transitively) take priority over the superclass
+            // (last include wins, matching Ruby's reverse-order ancestor insertion).
             for module in def.includes.iter().rev() {
-                if let Some(md) = self.classes.get(module) {
-                    if let Some(m) = md.methods.get(method) {
-                        return Some((m.clone(), module.clone()));
-                    }
+                if let Some(r) = self.find_in_module(module, method) {
+                    return Some(r);
                 }
             }
             cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &name));

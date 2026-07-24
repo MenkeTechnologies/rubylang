@@ -13345,6 +13345,7 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             // Core libs that are no-ops in modern Ruby (their classes are built
             // in) or that gems require defensively.
             | "thread"
+            | "fiber"
             | "monitor"
             | "mutex_m"
             | "weakref"
