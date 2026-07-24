@@ -123,9 +123,14 @@ fn b_defined_desc(vm: &mut VM, _: u8) -> Value {
     let set = |v: Value| !matches!(v, Value::Undef);
     let desc: Option<&str> = match kind.as_str() {
         "const" => {
+            // A *qualified* name (`A::B`) is defined only if it is actually
+            // registered — the builtin-exception name heuristic (`*Error`) must not
+            // fire on it, or `defined?(Mustermann::Error)` falsely reports a
+            // constant before the module defines it (skipping the `unless defined?`
+            // guard that gems use to define it once).
             let defined = with_host(|h| {
                 set(h.get_const(&name)) || h.class_exists(&name) || h.is_builtin_class(&name)
-            }) || is_builtin_exception(&name);
+            }) || (!name.contains("::") && is_builtin_exception(&name));
             defined.then_some("constant")
         }
         "ivar" => with_host(|h| set(h.get_ivar(&name))).then_some("instance-variable"),
