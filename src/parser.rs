@@ -220,6 +220,11 @@ impl Parser {
         if leading_splat || self.is_op(",") {
             let mut targets = vec![e];
             while self.eat_op(",") {
+                // A trailing comma with no further target (`x, = arr`) is a
+                // single-element destructure — bind the first element of the RHS.
+                if self.is_op("=") {
+                    break;
+                }
                 if self.eat_op("*") {
                     targets.push(Expr::Splat(Box::new(self.ternary()?)));
                 } else {
