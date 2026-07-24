@@ -2879,26 +2879,36 @@ impl RubyHost {
     /// otherwise name a non-class constant and break the ancestry chain. A name
     /// that is already a registered class is returned unchanged.
     pub fn resolve_class_alias(&self, name: &str) -> String {
+        // Already the fully-qualified registered class — use as-is.
         if self.classes.contains_key(name) {
             return name.to_string();
         }
+        // A partial or short nested-class name that names a class registered
+        // under its *fully-qualified* form. `class C < Foo::Bar` inside another
+        // module captures `Foo::Bar`, but compile-time resolution only qualifies
+        // names already registered, so forward/runtime references stay partial
+        // (concurrent-ruby: `Concurrent::Delay` super `Synchronization::Lockable-
+        // Object`, real class `Concurrent::Synchronization::LockableObject`).
+        // Match the registered class whose qualified name ends with `::name`.
+        let suffix = format!("::{name}");
+        if let Some(full) = self.classes.keys().find(|k| k.ends_with(&suffix)) {
+            return full.clone();
+        }
+        // A constant holding a class — an alias (`Alias = Base`) or a runtime-
+        // selected implementation (`Impl = case … end`). Resolve recursively so a
+        // short name the constant points to is itself fully qualified.
         let c = self.get_const(name);
         if let Some(RObj::ClassRef(real)) = self.obj(&c) {
             if real != name {
-                return real.clone();
+                return self.resolve_class_alias(real);
             }
         }
-        // The alias constant may be namespaced (`Mod::Alias`) while the captured
-        // superclass name is the short form (the const is assigned at runtime, so
-        // compile-time resolution left it unqualified). Find a qualified constant
-        // ending in `::name` that holds a class.
         if !name.contains("::") {
-            let suffix = format!("::{name}");
             for (k, v) in &self.consts {
                 if k.ends_with(&suffix) {
                     if let Some(RObj::ClassRef(real)) = self.obj(v) {
                         if real != name {
-                            return real.clone();
+                            return self.resolve_class_alias(real);
                         }
                     }
                 }
