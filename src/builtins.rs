@@ -8176,6 +8176,25 @@ fn dispatch_file_class(
             let ext = args.get(1).and_then(|a| with_host(|h| h.as_str(a)));
             Ok(new_str(path_basename(&str_arg(args, 0), ext.as_deref())))
         }
+        // `File.fnmatch(pattern, path[, flags])` — glob-style match (`*`, `?`,
+        // `[...]`). sinatra matches media types (`*/*`, `text/*`) this way.
+        "fnmatch" | "fnmatch?" => {
+            let pattern = str_arg(args, 0);
+            let path = str_arg(args, 1);
+            let flags = args.get(2).map(as_i).unwrap_or(0);
+            let case_insensitive = flags & 0x08 != 0; // FNM_CASEFOLD
+            let re_src = format!("(?s){}", fnmatch_to_regex(&pattern));
+            let re_src = if case_insensitive {
+                format!("(?i){re_src}")
+            } else {
+                re_src
+            };
+            let matched = fancy_regex::Regex::new(&re_src)
+                .ok()
+                .and_then(|re| re.is_match(&path).ok())
+                .unwrap_or(false);
+            Ok(Value::Bool(matched))
+        }
         "dirname" => Ok(new_str(path_dirname(&str_arg(args, 0)))),
         "extname" => Ok(new_str(path_extname(&str_arg(args, 0)))),
         "join" => Ok(new_str(path_join(args))),
@@ -9405,6 +9424,47 @@ fn brace_expand(pattern: &str) -> Vec<String> {
             out.push(tail);
         }
     }
+    out
+}
+
+/// Anchored regex source for a `File.fnmatch` glob: `*`→`.*`, `?`→`.`, `[…]`
+/// character classes pass through, everything else is escaped literally.
+fn fnmatch_to_regex(pattern: &str) -> String {
+    let mut out = String::from("\\A");
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            '[' => {
+                out.push('[');
+                // Copy the character class verbatim up to the closing `]`.
+                if matches!(chars.peek(), Some('!')) {
+                    chars.next();
+                    out.push('^');
+                }
+                for cc in chars.by_ref() {
+                    out.push(cc);
+                    if cc == ']' {
+                        break;
+                    }
+                }
+            }
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    out.push('\\');
+                    out.push(n);
+                }
+            }
+            // Escape regex metacharacters that are literal in a glob.
+            '.' | '(' | ')' | '+' | '^' | '$' | '{' | '}' | '|' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out.push_str("\\z");
     out
 }
 
