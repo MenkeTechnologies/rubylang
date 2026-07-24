@@ -1868,6 +1868,19 @@ fn dispatch_classref(
             _ => {}
         }
     }
+    // `Timeout.timeout(sec, klass = nil, msg = nil) { … }` — runs the block and
+    // returns its value. Wall-clock enforcement (interrupting a running block via
+    // a watcher thread) is not modeled; the common defensive use — where the
+    // block completes well within the limit — works. `sec == nil`/`0` disables it.
+    if cls == "Timeout" && name == "timeout" {
+        return match block {
+            Some(b) => {
+                let arg = args.first().cloned().unwrap_or(Value::Undef);
+                call_proc(&b, std::slice::from_ref(&arg))
+            }
+            None => Ok(Value::Undef),
+        };
+    }
     // `CGI` module methods used by activesupport's `to_query`/`to_param` and by
     // gems (faraday): URL and HTML escaping.
     if cls == "CGI" {
@@ -13308,6 +13321,7 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "cgi"
             | "cgi/escape"
             | "cgi/util"
+            | "timeout"
             | "erb"
             | "logger"
             | "open3"
