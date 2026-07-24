@@ -1311,6 +1311,15 @@ fn decode_dquote_escapes(body: &str) -> String {
 /// local-variable table; this lexer has none, so a spaced identifier is always
 /// read as a command call (see BUGS.md for the edge cost).
 fn percent_string_start(out: &[Token], sp: bool) -> bool {
+    // A statement boundary (newline/`;`) immediately before `%` is an expression
+    // start, so `%(…)` is a string — `prev_is_value` skips newlines and would
+    // otherwise see a `)` from the preceding line's `def foo(x)` and read modulo.
+    if matches!(
+        out.last().map(|t| &t.kind),
+        None | Some(Tok::Newline) | Some(Tok::Semicolon)
+    ) {
+        return true;
+    }
     let prev = out.iter().rev().find(|t| t.kind != Tok::Newline);
     match prev.map(|t| &t.kind) {
         // Bare method name in command position: `p %(x)`.
