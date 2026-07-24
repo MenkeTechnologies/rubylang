@@ -4780,7 +4780,8 @@ fn dispatch_string(
         // changed (Ruby's String mutator convention).
         "gsub!" | "sub!" | "upcase!" | "downcase!" | "capitalize!" | "swapcase!"
         | "strip!" | "lstrip!" | "rstrip!" | "chomp!" | "chop!" | "reverse!"
-        | "squeeze!" | "tr!" | "tr_s!" | "delete!" => {
+        | "squeeze!" | "tr!" | "tr_s!" | "delete!" | "delete_prefix!"
+        | "delete_suffix!" => {
             let base = name.strip_suffix('!').unwrap();
             let result = dispatch_string(recv, base, args, block)?;
             let new = with_host(|h| h.as_str(&result).unwrap_or_default());
@@ -10863,7 +10864,17 @@ fn dispatch_hash(
             with_host(|h| h.set_hash_default(recv, args[0].clone()));
             Ok(args[0].clone())
         }
+        // The block called for a missing key (`Hash#default_proc` / `#default_proc=`).
+        // HashWithIndifferentAccess copies the source hash's default_proc.
+        "default_proc" => Ok(with_host(|h| h.hash_default_proc(recv)).unwrap_or(Value::Undef)),
+        "default_proc=" => {
+            with_host(|h| h.set_hash_default_proc(recv, args[0].clone()));
+            Ok(args[0].clone())
+        }
         "to_h" => Ok(recv.clone()),
+        // `Hash#to_hash` — the implicit-conversion form, returns the hash itself.
+        // activesupport's `with_indifferent_access` calls it on the source hash.
+        "to_hash" => Ok(recv.clone()),
         "except" => {
             // Return a copy without the given keys (original order preserved).
             let drop: Vec<_> = args

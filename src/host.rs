@@ -1479,6 +1479,16 @@ impl RubyHost {
             *d = default;
         }
     }
+    /// `Hash#default_proc=` — set (or clear, with nil) the miss block.
+    pub fn set_hash_default_proc(&mut self, v: &Value, proc: Value) {
+        if let Some(RObj::Hash { default_proc: p, .. }) = self.obj_mut(v) {
+            *p = if matches!(proc, Value::Undef) {
+                None
+            } else {
+                Some(proc)
+            };
+        }
+    }
     /// `Hash.new { |h,k| ... }` — a hash whose `[]` calls the block on a miss.
     pub fn new_hash_with_proc(&mut self, map: IndexMap<RKey, Value>, proc: Value) -> Value {
         self.alloc(RObj::Hash {
