@@ -1054,6 +1054,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
 /// command-argument form `scan /re/`, versus `a / b` division).
 fn regex_start(out: &[Token], sp: bool, next: Option<u8>) -> bool {
     let prev = out.iter().rev().find(|t| t.kind != Tok::Newline);
+    // In a method-name position — right after `def`, or after a `.`/`::` call dot
+    // — a `/` is the division operator method name (`def /(other)`, `x./(y)`),
+    // never a regex.
+    match prev.map(|t| &t.kind) {
+        Some(Tok::Keyword(k)) if k == "def" => return false,
+        Some(Tok::Op(o)) if o == "." || o == "::" || o == "&." => return false,
+        _ => {}
+    }
     let prev_is_value = match prev.map(|t| &t.kind) {
         None => false,
         Some(Tok::Int(_))
