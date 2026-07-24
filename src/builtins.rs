@@ -13325,6 +13325,7 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "time"
             | "securerandom"
             | "digest"
+            | "openssl"
             | "base64"
             | "bigdecimal"
             | "bigdecimal/util"
