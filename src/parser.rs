@@ -1215,11 +1215,24 @@ impl Parser {
             }
             Tok::Str(s, dq) => {
                 self.advance();
-                if dq {
-                    Ok(Expr::Str(scan_interp(&s)?))
+                let mut parts = if dq {
+                    scan_interp(&s)?
                 } else {
-                    Ok(Expr::Str(vec![StrPart::Lit(s)]))
+                    vec![StrPart::Lit(s)]
+                };
+                // Adjacent string literals concatenate at parse time
+                // (`"a" "b"` → `"ab"`, including `\`-newline continuation) — a
+                // common idiom for long strings (activesupport deprecation text).
+                while let Tok::Str(s2, dq2) = self.peek().clone() {
+                    self.advance();
+                    let more = if dq2 {
+                        scan_interp(&s2)?
+                    } else {
+                        vec![StrPart::Lit(s2)]
+                    };
+                    parts.extend(more);
                 }
+                Ok(Expr::Str(parts))
             }
             Tok::Regex(pat, flags) => {
                 self.advance();
