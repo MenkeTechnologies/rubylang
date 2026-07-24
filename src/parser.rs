@@ -1550,7 +1550,10 @@ impl Parser {
                         ))
                     }
                 };
-                Ok(Expr::Var(VarKind::Const, s))
+                // A leading `::` forces top-level scope resolution — mark it so the
+                // compiler ignores the lexical nesting (`::Logger` inside a class
+                // also named `Logger` must be the top-level one).
+                Ok(Expr::Var(VarKind::Const, format!("::{s}")))
             }
             Tok::Keyword(k) => self.keyword_primary(&k),
             Tok::Ident(name) => {
@@ -2283,7 +2286,11 @@ impl Parser {
     /// from an expression superclass.
     fn const_ref_path(e: &Expr) -> Option<String> {
         match e {
-            Expr::Var(VarKind::Const, name) => Some(name.clone()),
+            // Strip a leading `::` marker (top-level scope): rubylang's constants
+            // are effectively flat, so `::StandardError` is just `StandardError`.
+            Expr::Var(VarKind::Const, name) => {
+                Some(name.strip_prefix("::").unwrap_or(name).to_string())
+            }
             Expr::Call {
                 recv: Some(r),
                 name,

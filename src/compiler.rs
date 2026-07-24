@@ -762,6 +762,11 @@ impl Compiler {
     /// For `X` inside `module A; module B` this is `A::B::X`, `A::X`, `X`
     /// (innermost nesting first, then the top level) — Ruby's constant search.
     fn const_candidates(&self, name: &str) -> String {
+        // A `::`-prefixed name is absolute (top-level `::Logger`): strip the marker
+        // and resolve only the bare name, ignoring the lexical nesting.
+        if let Some(abs) = name.strip_prefix("::") {
+            return abs.to_string();
+        }
         if self.nesting.is_empty() {
             return name.to_string();
         }
@@ -1979,7 +1984,9 @@ fn sym_name(e: &Expr) -> Option<String> {
 /// `"A::B"`. Returns `None` for anything that is not a constant path.
 fn const_path_name(e: &Expr) -> Option<String> {
     match e {
-        Expr::Var(VarKind::Const, n) => Some(n.clone()),
+        // Strip a leading `::` marker (top-level scope) — rubylang's constants are
+        // effectively flat, so `::Foo` resolves as `Foo`.
+        Expr::Var(VarKind::Const, n) => Some(n.strip_prefix("::").unwrap_or(n).to_string()),
         Expr::Call {
             recv: Some(r),
             name,
