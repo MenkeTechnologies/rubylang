@@ -4369,6 +4369,16 @@ impl RubyHost {
         }
     }
 
+    /// `Object#hash`: a stable integer hash consistent with `eql?`/`==` (equal
+    /// values hash equally), derived from the value's canonical `RKey` — the same
+    /// key Hash uses. So `"a".hash == "a".hash` and `[1,2].hash == [1,2].hash`,
+    /// which gems' own hash-keyed caches (mustermann's `EqualityMap`) rely on.
+    pub fn value_hash(&self, v: &Value) -> i64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.to_key(v).hash(&mut hasher);
+        hasher.finish() as i64
+    }
     fn to_key(&self, v: &Value) -> RKey {
         match v {
             Value::Int(n) => RKey::Int(*n),

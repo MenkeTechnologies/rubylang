@@ -1347,6 +1347,13 @@ pub(crate) fn dispatch(
             }));
         }
         "nil?" => return Ok(Value::Bool(matches!(recv, Value::Undef))),
+        // `Object#hash` — a stable integer consistent with `eql?`. Every value
+        // (String/Integer/Symbol/nil/Hash/…) responds; gems key their own caches
+        // on it (mustermann's EqualityMap). A user `hash` override wins via the
+        // find_method_owner check above.
+        "hash" if args.is_empty() => {
+            return Ok(Value::Int(with_host(|h| h.value_hash(recv))))
+        }
         // `to_json` on any value (a user class that defines its own wins via the
         // find_method_owner check above). Ignores the optional generator-state arg.
         "to_json" => {
