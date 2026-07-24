@@ -1132,8 +1132,12 @@ pub(crate) fn dispatch(
         return crate::host::call_proc_self(&proc, args, Some(recv));
     }
     // A user-defined method wins over the universal fallbacks (so a class can
-    // override `to_s`, `==`, `inspect`, etc.).
-    if let Some(cls) = with_host(|h| h.object_class(recv)) {
+    // override `to_s`, `==`, `inspect`, etc.). This also covers methods added to
+    // a *builtin* class by reopening it (`class String; def pluralize; …`) —
+    // Rails/activesupport core-ext defines hundreds this way — so use the value's
+    // full class (`class_of`: "String"/"Array"/…) when it is not a user object.
+    {
+        let cls = with_host(|h| h.object_class(recv).unwrap_or_else(|| h.class_of(recv)));
         if with_host(|h| h.find_method_owner(&cls, name)).is_some() {
             return call_instance_method(recv.clone(), &cls, name, args, block);
         }
@@ -1862,6 +1866,12 @@ fn dispatch_classref(
             "UTF_16" => Some("UTF-16"),
             "UTF_16LE" => Some("UTF-16LE"),
             "UTF_16BE" => Some("UTF-16BE"),
+            "GB18030" => Some("GB18030"),
+            "GBK" => Some("GBK"),
+            "SHIFT_JIS" | "SJIS" => Some("Shift_JIS"),
+            "EUC_JP" => Some("EUC-JP"),
+            "ISO_8859_1" | "ISO8859_1" => Some("ISO-8859-1"),
+            "Windows_1252" | "WINDOWS_1252" => Some("Windows-1252"),
             _ => None,
         };
         if let Some(en) = enc_name {
