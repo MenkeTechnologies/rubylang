@@ -2754,6 +2754,19 @@ impl RubyHost {
             list.push(m);
         }
     }
+    /// Undo a `class_mixin`: drop `module` from the class's include/prepend/extend
+    /// list. Used when re-routing a compile-time-registered include through a
+    /// user `append_features` whose `super` re-adds it (ActiveSupport::Concern).
+    pub fn remove_mixin(&mut self, class: &str, module: &str, kind: &str) {
+        if let Some(def) = self.classes.get_mut(class) {
+            let list = match kind {
+                "prepend" => &mut def.prepends,
+                "extend" => &mut def.extends,
+                _ => &mut def.includes,
+            };
+            list.retain(|m| m != module);
+        }
+    }
     pub fn class_exists(&self, name: &str) -> bool {
         self.classes.contains_key(name)
     }
@@ -5731,6 +5744,25 @@ pub fn call_super_blk(
         // `name.start_with?("x") || super` in an override resolves cleanly.
         if method == "respond_to_missing?" {
             return Ok(Value::Bool(false));
+        }
+        // `super` from an override of `Module#append_features`/`prepend_features`
+        // (self is the module, arg is the base) performs the real mixin: the
+        // default native behavior adds the module's instance methods to the base.
+        // ActiveSupport::Concern#append_features calls `super` to do exactly this.
+        if matches!(method.as_str(), "append_features" | "prepend_features") {
+            let args = explicit_args.clone().unwrap_or_else(|| cur_args.clone());
+            if let (Some(module), Some(base)) = (
+                with_host(|h| h.classref_name(&self_obj)),
+                args.first().and_then(|a| with_host(|h| h.classref_name(a))),
+            ) {
+                let kind = if method == "append_features" {
+                    "include"
+                } else {
+                    "prepend"
+                };
+                with_host(|h| h.class_mixin(&base, &module, kind));
+            }
+            return Ok(Value::Undef);
         }
         // `super` from an override of a Module/Class lifecycle hook whose default
         // is a native no-op. activesupport concerns call `super` in `included`/

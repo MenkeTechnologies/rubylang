@@ -732,6 +732,30 @@ fn b_fire_hook(vm: &mut VM, _: u8) -> Value {
         }
         module.clone()
     });
+    // Ruby runs `append_features`/`prepend_features` as part of `include`/`prepend`
+    // before the `included`/`prepended` hook. ActiveSupport::Concern overrides the
+    // feature method to `extend ClassMethods` and run the `included` block, so when
+    // the module defines it, route there. The compile-time include already
+    // registered the mixin, but Concern's `return false if base < self` guard needs
+    // the relationship absent — drop it first; the feature method's `super` re-adds
+    // it. The plain `included`/`prepended` hook (a Concern's is a no-op `super`)
+    // then still fires below.
+    let feature = match hook.as_str() {
+        "included" => Some(("append_features", "include")),
+        "prepended" => Some(("prepend_features", "prepend")),
+        _ => None,
+    };
+    if let Some((feat, kind)) = feature {
+        if let Some(def) = with_host(|h| h.find_class_method(&module, feat)) {
+            with_host(|h| h.remove_mixin(&target, &module, kind));
+            let recv = with_host(|h| h.class_ref(&module));
+            let arg = with_host(|h| h.class_ref(&target));
+            if let Err(e) = crate::host::call_class_method(recv, &def, feat, &module, &[arg], None)
+            {
+                return abort(vm, e);
+            }
+        }
+    }
     if let Some(def) = with_host(|h| h.find_class_method(&module, &hook)) {
         let recv = with_host(|h| h.class_ref(&module));
         let arg = with_host(|h| h.class_ref(&target));
@@ -1766,7 +1790,15 @@ pub(crate) fn dispatch(
         }
         // `obj.extend(M, …)` — mix each module's instance methods into the
         // receiver's singleton table (MRI returns the receiver).
-        "extend" if matches!(recv, Value::Obj(_)) => {
+        // Object-level extend adds a module's instance methods as singleton
+        // methods of the receiver *object*. A class/module reference is itself a
+        // `Value::Obj`, but `Klass.extend(M)` must add M's methods as *class*
+        // methods (via the classref handler's `class_mixin`), so let class refs
+        // fall through.
+        "extend"
+            if matches!(recv, Value::Obj(_))
+                && with_host(|h| h.classref_name(recv)).is_none() =>
+        {
             if let Value::Obj(id) = recv {
                 for a in args {
                     if let Some(mname) = with_host(|h| h.classref_name(a)) {
@@ -2865,7 +2897,26 @@ fn dispatch_classref(
         "include" | "prepend" | "extend" if !args.is_empty() => {
             for a in args {
                 if let Some(m) = with_host(|h| h.classref_name(a)) {
-                    with_host(|h| h.class_mixin(cls, &m, name));
+                    // `include`/`prepend` first invoke the module's
+                    // `append_features`/`prepend_features` (its `super` performs
+                    // the real mixin). ActiveSupport::Concern overrides these to
+                    // also `extend ClassMethods` and run the `included` block, so
+                    // routing through them is mandatory — otherwise a concern's
+                    // class methods and included block never apply.
+                    let feat = match name {
+                        "include" => Some("append_features"),
+                        "prepend" => Some("prepend_features"),
+                        _ => None,
+                    };
+                    let has_feat = feat
+                        .map(|f| with_host(|h| h.find_class_method(&m, f)).is_some())
+                        .unwrap_or(false);
+                    if let (true, Some(f)) = (has_feat, feat) {
+                        let target = with_host(|h| h.class_ref(cls));
+                        dispatch(a, f, &[target], None)?;
+                    } else {
+                        with_host(|h| h.class_mixin(cls, &m, name));
+                    }
                     let hook = match name {
                         "include" => "included",
                         "prepend" => "prepended",
