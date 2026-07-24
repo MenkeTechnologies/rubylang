@@ -187,6 +187,12 @@ class File
   Separator = "/"
 end
 
+class Regexp
+  IGNORECASE = 1
+  EXTENDED = 2
+  MULTILINE = 4
+end
+
 class ObjectSpace::WeakMap
   def initialize; @__wm = {}; end
   def [](k); @__wm[k]; end
