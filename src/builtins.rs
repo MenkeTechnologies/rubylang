@@ -423,6 +423,21 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
             Err(e) => return abort(vm, e),
         }
     }
+    // A bare argless read of a *runtime* `attr_reader` (or a `define_method`) on
+    // the current object — dispatch through object dispatch. `responds_to` only
+    // tracks materialized methods (static-body attrs are compiled to methods, but
+    // a runtime `attr_reader` lives in the attr table), so without this the read
+    // falls through to a `method_missing` (e.g. Delegator's) or nil.
+    if let Some(cls) = with_host(|h| h.object_class(&this)) {
+        if with_host(|h| h.attr_access(&cls, &name)).is_some()
+            || with_host(|h| h.find_define_method(&cls, &name)).is_some()
+        {
+            return match dispatch(&this, &name, &[], None) {
+                Ok(v) => propagate(vm, v),
+                Err(e) => abort(vm, e),
+            };
+        }
+    }
     if with_host(|h| h.responds_to(&name)) {
         return match dispatch_call(&name, &[], None) {
             Ok(v) => propagate(vm, v),
@@ -1078,6 +1093,11 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
     if let Some(cls) = with_host(|h| h.object_class(&this)) {
         if with_host(|h| h.find_define_method(&cls, name)).is_some()
             || is_universal_object_method(name)
+            // A bare call to a runtime `attr_reader`/`attr_writer` accessor
+            // (`tag` / `tag=`) must route through object dispatch — otherwise it
+            // falls through to a `method_missing` (e.g. Delegator's, which forwards
+            // to the wrapped object) instead of reading the ivar.
+            || with_host(|h| h.attr_access(&cls, name)).is_some()
         {
             return dispatch(&this, name, args, block);
         }

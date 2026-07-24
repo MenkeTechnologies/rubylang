@@ -2317,6 +2317,7 @@ impl RubyHost {
         if let Some(cls) = self.object_class(&this) {
             if self.find_method(&cls, name).is_some()
                 || self.find_define_method(&cls, name).is_some()
+                || self.attr_access(&cls, name).is_some()
             {
                 return true;
             }
