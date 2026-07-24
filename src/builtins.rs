@@ -13705,6 +13705,7 @@ pub(crate) fn embedded_stdlib(name: &str) -> Option<&'static str> {
         "uri" => Some(include_str!("../stdlib/uri.rb")),
         "forwardable" => Some(include_str!("../stdlib/forwardable.rb")),
         "delegate" => Some(include_str!("../stdlib/delegate.rb")),
+        "strscan" => Some(include_str!("../stdlib/strscan.rb")),
         "rubygems/version" => Some(include_str!("../stdlib/rubygems_version.rb")),
         "csv" => Some(include_str!("../stdlib/csv.rb")),
         "optparse" => Some(include_str!("../stdlib/optparse.rb")),
@@ -13739,7 +13740,6 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "enumerable"
             | "benchmark"
             | "stringio"
-            | "strscan"
             | "pathname"
             | "fileutils"
             | "tmpdir"
