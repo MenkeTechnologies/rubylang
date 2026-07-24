@@ -79,6 +79,9 @@ fusevm = { version = "0.14.17", features = ["jit", "jit-disk-cache", "aot", "ffi
 
 thiserror = "2.0"
 rustc-hash = "2.1"
+# `require "zlib"` — DEFLATE/zlib/gzip streams (Zlib::Deflate/Inflate/Gzip*,
+# crc32/adler32). rack/rails compress cookies, assets, and responses with it.
+flate2 = "1"
 # Ruby Hash preserves insertion order (observable in `each`/`to_a`/inspect).
 indexmap = "2"
 

@@ -12254,6 +12254,99 @@ fn digest_of(algo: &str, data: &[u8]) -> Vec<u8> {
 
 /// Class-method dispatch for the dependency-free stdlib modules. Returns `None`
 /// when `cls` is not one of them (so normal class-ref dispatch continues).
+/// A binary String from raw bytes. rubylang strings are UTF-8 (no ASCII-8BIT
+/// representation), so map each byte to the same Unicode codepoint (Latin-1):
+/// this preserves every byte losslessly and round-trips through [`latin1_bytes`],
+/// so `Zlib.inflate(Zlib.deflate(x)) == x` holds within the process. (`bytesize`
+/// of the returned string over-counts bytes ≥ 128, a known cost of the UTF-8-only
+/// string model — real ASCII-8BIT support is a separate, larger change.)
+fn bin_str(bytes: Vec<u8>) -> Value {
+    let s: String = bytes.iter().map(|&b| b as char).collect();
+    with_host(|h| h.new_string(s))
+}
+
+/// Recover the raw bytes of a [`bin_str`]-encoded string: each char's codepoint
+/// (0..=255) is one byte. Non-Latin-1 chars are truncated to their low byte.
+fn latin1_bytes(v: &Value) -> Vec<u8> {
+    with_host(|h| h.as_str(v))
+        .unwrap_or_default()
+        .chars()
+        .map(|c| c as u32 as u8)
+        .collect()
+}
+
+/// zlib-wrapped DEFLATE (`Zlib.deflate`). `level` is -1 (default) or 0..=9.
+fn zlib_deflate(data: &[u8], level: i64) -> Result<Vec<u8>, String> {
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::io::Write;
+    let comp = if (0..=9).contains(&level) {
+        Compression::new(level as u32)
+    } else {
+        Compression::default()
+    };
+    let mut enc = ZlibEncoder::new(Vec::new(), comp);
+    enc.write_all(data).map_err(|e| e.to_string())?;
+    enc.finish().map_err(|e| e.to_string())
+}
+
+/// Inverse of [`zlib_deflate`] (`Zlib.inflate`).
+fn zlib_inflate(data: &[u8]) -> Result<Vec<u8>, String> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+    let mut dec = ZlibDecoder::new(data);
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out)
+        .map_err(|_| raise_exc("Zlib::DataError", "invalid zlib stream"))?;
+    Ok(out)
+}
+
+/// gzip compress (`Zlib.gzip`).
+fn gzip_compress(data: &[u8]) -> Result<Vec<u8>, String> {
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(data).map_err(|e| e.to_string())?;
+    enc.finish().map_err(|e| e.to_string())
+}
+
+/// gzip decompress (`Zlib.gunzip`).
+fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut dec = GzDecoder::new(data);
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out)
+        .map_err(|_| raise_exc("Zlib::DataError", "invalid gzip stream"))?;
+    Ok(out)
+}
+
+/// CRC-32 (`Zlib.crc32`), continuable via `init`.
+fn zlib_crc32(data: &[u8], init: u32) -> u32 {
+    let mut crc = init ^ 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+/// Adler-32 (`Zlib.adler32`), continuable via `init` (1 for a fresh checksum).
+fn zlib_adler32(data: &[u8], init: u32) -> u32 {
+    let mut a = init & 0xFFFF;
+    let mut b = (init >> 16) & 0xFFFF;
+    for &byte in data {
+        a = (a + byte as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
 fn dispatch_stdlib_module(cls: &str, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     let str_arg = |i: usize| -> Vec<u8> {
         args.get(i)
@@ -12283,6 +12376,40 @@ fn dispatch_stdlib_module(cls: &str, name: &str, args: &[Value]) -> Option<Resul
             _ => None,
         },
         "SecureRandom" => Some(dispatch_secure_random(name, args)),
+        // `Zlib` — DEFLATE/zlib/gzip via `flate2`. `Zlib.deflate`/`Zlib::Deflate
+        // .deflate` produce zlib-wrapped streams; `Zlib.gzip`/`gunzip` gzip ones.
+        "Zlib" | "Zlib::Deflate" | "Zlib::Inflate" => {
+            match (cls, name) {
+                ("Zlib" | "Zlib::Deflate", "deflate") => {
+                    let level = args.get(1).map(as_i).unwrap_or(-1);
+                    // Input is ordinary text — its UTF-8 bytes are the payload.
+                    Some(zlib_deflate(&str_arg(0), level).map(bin_str))
+                }
+                ("Zlib" | "Zlib::Inflate", "inflate") => {
+                    // Input is compressed binary (a `bin_str` from deflate).
+                    let out = zlib_inflate(&latin1_bytes(args.first().unwrap_or(&Value::Undef)));
+                    Some(out.map(|b| with_host(|h| h.new_string(String::from_utf8_lossy(&b).into_owned()))))
+                }
+                ("Zlib", "gzip") => Some(gzip_compress(&str_arg(0)).map(bin_str)),
+                ("Zlib", "gunzip") => {
+                    let out = gzip_decompress(&latin1_bytes(args.first().unwrap_or(&Value::Undef)));
+                    Some(out.map(|b| with_host(|h| h.new_string(String::from_utf8_lossy(&b).into_owned()))))
+                }
+                ("Zlib", "crc32") => {
+                    let init = args.get(1).map(as_i).unwrap_or(0) as u32;
+                    Some(Ok(Value::Int(zlib_crc32(&str_arg(0), init) as i64)))
+                }
+                ("Zlib", "adler32") => {
+                    let init = args.get(1).map(as_i).unwrap_or(1) as u32;
+                    Some(Ok(Value::Int(zlib_adler32(&str_arg(0), init) as i64)))
+                }
+                // `Zlib::Deflate` / `Zlib::Inflate` sub-refs from the `Zlib` module.
+                ("Zlib", "Deflate" | "Inflate" | "GzipWriter" | "GzipReader") => {
+                    Some(Ok(with_host(|h| h.class_ref(&format!("Zlib::{name}")))))
+                }
+                _ => None,
+            }
+        }
         "Base64" => match name {
             "encode64" => Some(Ok(new_str(base64_encode64(&str_arg(0))))),
             "strict_encode64" => Some(Ok(new_str(base64_encode_bytes(&str_arg(0), B64_STD, true)))),
@@ -13592,6 +13719,7 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             // in) or that gems require defensively.
             | "thread"
             | "fiber"
+            | "zlib"
             | "monitor"
             | "mutex_m"
             | "weakref"

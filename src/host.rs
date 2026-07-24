@@ -3257,6 +3257,13 @@ impl RubyHost {
                 // no-op here; ObjectSpace's heap enumeration is limited).
                 | "GC"
                 | "ObjectSpace"
+                // `Zlib` and its stream classes — DEFLATE/zlib/gzip via `flate2`,
+                // dispatched through `dispatch_classref`.
+                | "Zlib"
+                | "Zlib::Deflate"
+                | "Zlib::Inflate"
+                | "Zlib::GzipWriter"
+                | "Zlib::GzipReader"
                 // `ENV` is modeled as a class-ref so its `[]`/`fetch`/… dispatch
                 // through `dispatch_classref` (it is the process environment).
                 | "ENV"
