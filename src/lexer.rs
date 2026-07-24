@@ -35,6 +35,10 @@ pub enum Tok {
     /// A regex literal: `/pattern/flags` — (pattern, flags).
     Regex(String, String),
     Symbol(String),
+    /// A double-quoted symbol with `#{…}` interpolation: `:"pre_#{name}"`. The
+    /// raw body (escapes and `#{…}` intact) is re-scanned by the parser, which
+    /// builds an interpolated string and symbolizes it.
+    DSymbol(String),
     Ident(String),
     Const(String), // capitalized identifier
     IVar(String),  // @foo
@@ -54,7 +58,7 @@ impl fmt::Display for Tok {
             Tok::Float(x) => write!(f, "{x}"),
             Tok::Str(s, _) => write!(f, "\"{s}\""),
             Tok::Regex(s, fl) => write!(f, "/{s}/{fl}"),
-            Tok::Symbol(s) => write!(f, ":{s}"),
+            Tok::Symbol(s) | Tok::DSymbol(s) => write!(f, ":{s}"),
             Tok::Ident(s) | Tok::Const(s) | Tok::Keyword(s) => write!(f, "{s}"),
             Tok::IVar(s) => write!(f, "@{s}"),
             Tok::CVar(s) => write!(f, "@@{s}"),
@@ -875,27 +879,70 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 let quote = b[i + 1];
                 i += 2;
                 let mut bytes: Vec<u8> = Vec::new();
+                let mut has_interp = false;
                 while i < b.len() && b[i] != quote {
-                    if quote == b'"' && b[i] == b'\\' && i + 1 < b.len() {
-                        i += 1;
-                        match b[i] {
-                            b'n' => bytes.push(b'\n'),
-                            b't' => bytes.push(b'\t'),
-                            b'0' => bytes.push(0),
-                            b'e' => bytes.push(0x1b),
-                            b'\\' => bytes.push(b'\\'),
-                            b'"' => bytes.push(b'"'),
-                            other => bytes.push(other),
+                    // A `#{ … }` in a double-quoted symbol is interpolation: copy it
+                    // verbatim (braces balanced, nested string literals skipped so an
+                    // inner quote doesn't end us) for the parser to re-scan.
+                    if quote == b'"' && b[i] == b'#' && i + 1 < b.len() && b[i + 1] == b'{' {
+                        has_interp = true;
+                        bytes.push(b'#');
+                        bytes.push(b'{');
+                        i += 2;
+                        let mut depth = 1u32;
+                        while i < b.len() && depth > 0 {
+                            match b[i] {
+                                b'{' => depth += 1,
+                                b'}' => depth -= 1,
+                                q @ (b'"' | b'\'') => {
+                                    bytes.push(q);
+                                    i += 1;
+                                    while i < b.len() && b[i] != q {
+                                        if b[i] == b'\\' && i + 1 < b.len() {
+                                            bytes.push(b[i]);
+                                            bytes.push(b[i + 1]);
+                                            i += 2;
+                                            continue;
+                                        }
+                                        bytes.push(b[i]);
+                                        i += 1;
+                                    }
+                                    if i < b.len() {
+                                        bytes.push(q);
+                                        i += 1;
+                                    }
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                            bytes.push(b[i]);
+                            i += 1;
                         }
-                        i += 1;
+                        continue;
+                    }
+                    if quote == b'"' && b[i] == b'\\' && i + 1 < b.len() {
+                        // With interpolation the parser's scan decodes escapes, so
+                        // keep them raw; otherwise decode the essentials here.
+                        bytes.push(b'\\');
+                        bytes.push(b[i + 1]);
+                        i += 2;
                     } else {
                         bytes.push(b[i]);
                         i += 1;
                     }
                 }
                 i += 1; // closing quote
+                let body = String::from_utf8_lossy(&bytes).into_owned();
+                let kind = if has_interp {
+                    Tok::DSymbol(body)
+                } else if quote == b'"' {
+                    // No interpolation: decode the double-quote escapes now.
+                    Tok::Symbol(decode_dquote_escapes(&body))
+                } else {
+                    Tok::Symbol(body)
+                };
                 out.push(Token {
-                    kind: Tok::Symbol(String::from_utf8_lossy(&bytes).into_owned()),
+                    kind,
                     line,
                     space: core::mem::take(&mut sp),
                 });
@@ -1227,6 +1274,32 @@ const OP_SYMBOLS: &[&str] = &[
 /// The operator symbol beginning `s` (text right after `:`), or `None`.
 fn op_symbol_at(s: &str) -> Option<&'static str> {
     OP_SYMBOLS.iter().find(|op| s.starts_with(**op)).copied()
+}
+
+/// Decode the double-quote escapes a non-interpolating `:"…"` symbol supports
+/// (`\n \t \0 \e \\ \"`), leaving any other escaped char as its literal.
+fn decode_dquote_escapes(body: &str) -> String {
+    let b = body.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() {
+            match b[i + 1] {
+                b'n' => out.push(b'\n'),
+                b't' => out.push(b'\t'),
+                b'0' => out.push(0),
+                b'e' => out.push(0x1b),
+                b'\\' => out.push(b'\\'),
+                b'"' => out.push(b'"'),
+                other => out.push(other),
+            }
+            i += 2;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Whether a `%` here begins a `%(…)`-style double-quoted string rather than

@@ -1465,6 +1465,16 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Symbol(s))
             }
+            Tok::DSymbol(s) => {
+                self.advance();
+                let parts = scan_interp(&s)?;
+                Ok(Expr::Call {
+                    recv: Some(Box::new(Expr::Str(parts))),
+                    name: "to_sym".to_string(),
+                    args: vec![],
+                    block: None,
+                })
+            }
             Tok::IVar(s) => {
                 self.advance();
                 Ok(Expr::Var(VarKind::Instance, s))
@@ -1655,6 +1665,7 @@ impl Parser {
             | Tok::Str(_, _)
             | Tok::Regex(_, _)
             | Tok::Symbol(_)
+            | Tok::DSymbol(_)
             | Tok::IVar(_)
             | Tok::CVar(_)
             | Tok::GVar(_)
