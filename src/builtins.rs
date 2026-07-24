@@ -1013,7 +1013,20 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
             // or method (`self` is the class): `name`/`to_s`/`inspect`. These
             // arrive as calls only when no local shadows them, so routing to the
             // class is safe. activesupport's autoload path derivation uses `name`.
-            || matches!(name, "name" | "to_s" | "inspect" | "singleton_class")
+            || matches!(
+                name,
+                "name"
+                    | "to_s"
+                    | "inspect"
+                    | "singleton_class"
+                    | "instance_methods"
+                    | "public_instance_methods"
+                    | "private_instance_methods"
+                    | "class_variables"
+                    | "constants"
+                    | "ancestors"
+                    | "superclass"
+            )
             || with_host(|h| {
                 h.find_class_method(&cls, name).is_some()
                     || h.find_method("Class", name).is_some()
@@ -1582,6 +1595,15 @@ fn dispatch_classref(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    // A user-defined class method takes precedence over the native builtin
+    // handlers below: a reopened builtin's `def self.m`, and the synthetic
+    // `__class_body__` that runs a reopened module/class body. Without this,
+    // reopening a builtin module (`module SecureRandom; <non-def statement>; end`)
+    // fails because its `__class_body__` call hits the builtin dispatch.
+    if let Some((def, owner)) = with_host(|h| h.find_class_method_owner(cls, name)) {
+        let recv = with_host(|h| h.class_ref(cls));
+        return crate::host::call_class_method(recv, &def, name, &owner, args, block);
+    }
     // `ENV` — the process environment as a hash-like object (backed by std::env).
     if cls == "ENV" {
         return dispatch_env(name, args, block);

@@ -2267,7 +2267,20 @@ impl RubyHost {
             // Module/Class instance methods (Rails core-ext macros). Mirrors the
             // bare-call routing in `dispatch_call`.
             return name == "new"
-                || matches!(name, "name" | "to_s" | "inspect" | "singleton_class")
+                || matches!(
+                    name,
+                    "name"
+                        | "to_s"
+                        | "inspect"
+                        | "singleton_class"
+                        | "instance_methods"
+                        | "public_instance_methods"
+                        | "private_instance_methods"
+                        | "class_variables"
+                        | "constants"
+                        | "ancestors"
+                        | "superclass"
+                )
                 || self.find_class_method(&cls, name).is_some()
                 || self.find_method("Class", name).is_some()
                 || self.find_method("Module", name).is_some();
