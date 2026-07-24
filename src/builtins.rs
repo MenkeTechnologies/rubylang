@@ -1764,6 +1764,12 @@ fn dispatch_classref(
             "garbage_collect" => return Ok(Value::Undef),
             "count_objects" => return Ok(with_host(|h| h.new_hash(IndexMap::new()))),
             "each_object" => return Ok(Value::Int(0)),
+            // Finalizers fire at object collection, which rubylang does not expose;
+            // accept the registration/removal as a no-op (mustermann registers one
+            // to prune its cache; the cache simply never auto-prunes).
+            "define_finalizer" => return Ok(args.first().cloned().unwrap_or(Value::Undef)),
+            "undefine_finalizer" => return Ok(args.first().cloned().unwrap_or(Value::Undef)),
+            "_id2ref" => return Ok(Value::Undef),
             // A capitalized name (`ObjectSpace::WeakMap`) is a nested constant /
             // class — fall through to the constant/nested-class resolution below.
             _ if name.chars().next().is_some_and(|c| c.is_uppercase()) => {}
