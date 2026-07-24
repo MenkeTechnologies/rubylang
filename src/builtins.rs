@@ -447,6 +447,17 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
         // through to Kernel only if it genuinely doesn't handle it. mustermann's
         // AST decorators call `each_with_index`/`map` bare inside their translate
         // blocks, resolved through DelegateClass's `method_missing`.
+        // A bare name identical to the method currently running, with no such
+        // local bound, reads as nil: it is a local assigned only on an unexecuted
+        // path, shadowing the method (Ruby hoists locals to nil from their parse
+        // position). Dispatching it would re-enter the method and recurse forever
+        // — including via a `Delegator#method_missing` below. mustermann's
+        // `converter` method reads its own local `converter` via `return unless
+        // converter` after a `case` that may not have assigned it. Checked before
+        // method_missing so the recursion never starts.
+        if with_host(|h| h.super_context().1).as_deref() == Some(name.as_str()) {
+            return Value::Undef;
+        }
         if with_host(|h| h.find_method_owner(&cls, "method_missing").is_some()) {
             match dispatch(&this, &name, &[], None) {
                 Ok(v) => return propagate(vm, v),
@@ -454,15 +465,6 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
                 Err(e) => return abort(vm, e),
             }
         }
-    }
-    // A bare name identical to the method currently running, with no such local
-    // bound, reads as nil: it is a local assigned only on an unexecuted path,
-    // shadowing the method (Ruby hoists locals to nil from their parse position).
-    // Dispatching it would re-enter the method and recurse forever. mustermann's
-    // `converter` method reads its own local `converter` via `return unless
-    // converter` after a `case` that may not have assigned it.
-    if with_host(|h| h.super_context().1).as_deref() == Some(name.as_str()) {
-        return Value::Undef;
     }
     // A bare `module_function` in a module body flags the module so its instance
     // methods (including ones defined at runtime inside an `if`/`else`) double as
@@ -559,6 +561,27 @@ fn b_getconst(vm: &mut VM, _: u8) -> Value {
         let v = with_host(|h| h.get_const(name));
         if !matches!(v, Value::Undef) {
             return v;
+        }
+        // Inherited constant: a candidate `Namespace::CONST` may be defined on an
+        // ANCESTOR of `Namespace`, not on it directly. mustermann references
+        // `URI_PARSER` (defined on `Translator`) from a class nested in
+        // `Compiler < Translator`, so the `Compiler::URI_PARSER` candidate must
+        // fall back to `Translator::URI_PARSER`.
+        if let Some((ns, cn)) = name.rsplit_once("::") {
+            let inherited = with_host(|h| {
+                let mut cur = h.superclass_of(ns);
+                while let Some(sup) = cur {
+                    let val = h.get_const(&format!("{sup}::{cn}"));
+                    if !matches!(val, Value::Undef) {
+                        return val;
+                    }
+                    cur = h.superclass_of(&sup);
+                }
+                Value::Undef
+            });
+            if !matches!(inherited, Value::Undef) {
+                return inherited;
+            }
         }
         // An unassigned constant that names a class (user-defined, or a builtin
         // exception like `RuntimeError`) resolves to a class reference. The

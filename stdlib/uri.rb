@@ -239,6 +239,16 @@ module URI
     def unescape(str)
       str.to_s.gsub(/%([0-9a-fA-F]{2})/) { $1.to_i(16).chr }
     end
+
+    # The component-regexp table (`parser.regexp[:UNSAFE]` etc.). mustermann's
+    # AST compiler escapes literal characters with `URI_PARSER.regexp[:UNSAFE]`.
+    def regexp(component = nil)
+      table = {
+        UNSAFE: DEFAULT_UNSAFE,
+        ESCAPED: /%[a-fA-F0-9]{2}/,
+      }
+      component ? table[component] : table
+    end
   end
 
   # The shared default parser instance (rack/rails read `URI::DEFAULT_PARSER`).
