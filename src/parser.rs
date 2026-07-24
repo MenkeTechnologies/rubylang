@@ -2667,7 +2667,7 @@ fn matchop(op: &str) -> BinOp {
 
 /// Scan a double-quoted string body for `#{ … }` interpolation, decoding the
 /// common backslash escapes in the literal segments.
-fn scan_interp(raw: &str) -> Result<Vec<StrPart>, String> {
+pub(crate) fn scan_interp(raw: &str) -> Result<Vec<StrPart>, String> {
     let b = raw.as_bytes();
     let mut i = 0;
     let mut parts = Vec::new();

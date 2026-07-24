@@ -431,7 +431,15 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::MKLAMBDA, 1), 0);
             }
             Expr::Regex(source, flags) => {
-                self.kstr(b, source);
+                // `/…#{expr}…/` — build the pattern string at runtime by compiling
+                // the interpolation like a double-quoted string, then compile the
+                // Regexp. A static pattern (no `#{`) pushes the source directly.
+                if source.contains("#{") {
+                    let parts = crate::parser::scan_interp(source)?;
+                    self.compile_expr(b, &Expr::Str(parts))?;
+                } else {
+                    self.kstr(b, source);
+                }
                 self.kstr(b, flags);
                 b.emit(Op::CallBuiltin(ops::MKREGEX, 2), 0);
             }

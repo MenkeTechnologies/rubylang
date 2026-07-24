@@ -931,6 +931,26 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         i += 2;
                         continue;
                     }
+                    // `#{ … }` interpolation — copy the whole expression through
+                    // (balanced braces) so a `/`, `[`, etc. inside it does not end
+                    // the regex or toggle a char class. The compiler evaluates it.
+                    if ch == b'#' && i + 1 < b.len() && b[i + 1] == b'{' {
+                        pat.push_str("#{");
+                        i += 2;
+                        let mut depth = 1;
+                        while i < b.len() && depth > 0 {
+                            match b[i] {
+                                b'{' => depth += 1,
+                                b'}' => depth -= 1,
+                                b'\n' => line += 1,
+                                _ => {}
+                            }
+                            let cl = utf8_len(b[i]);
+                            pat.push_str(&src[i..i + cl]);
+                            i += cl;
+                        }
+                        continue;
+                    }
                     match ch {
                         b'[' => in_class = true,
                         b']' => in_class = false,
