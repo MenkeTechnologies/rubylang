@@ -658,7 +658,16 @@ impl Parser {
             return Ok(Expr::Unary(UnOp::BitNot, Box::new(self.unary()?)));
         }
         if self.eat_op("+") {
-            return self.unary();
+            // Unary plus is `+@`: a no-op for numbers, but on a String it returns
+            // a mutable (unfrozen) copy when the receiver is frozen — the idiom
+            // `buf = +""` for a mutable buffer under `frozen_string_literal: true`.
+            let operand = self.unary()?;
+            return Ok(Expr::Call {
+                recv: Some(Box::new(operand)),
+                name: "+@".to_string(),
+                args: vec![],
+                block: None,
+            });
         }
         self.pow()
     }

@@ -1507,6 +1507,17 @@ pub(crate) fn dispatch(
         // to the original; the copy is never frozen. `clone` also shallow-copies
         // but preserves the frozen state of the original.
         "dup" => return Ok(with_host(|h| h.dup_value(recv))),
+        // Unary plus (`+@`): on a String, a mutable copy when the receiver is
+        // frozen (`buf = +""` under frozen_string_literal), else the receiver
+        // itself; a no-op returning self for every other type (numbers included).
+        "+@" if args.is_empty() => {
+            if with_host(|h| h.dispatch_class(recv)) == "String"
+                && with_host(|h| h.is_frozen(recv))
+            {
+                return Ok(with_host(|h| h.dup_value(recv)));
+            }
+            return Ok(recv.clone());
+        }
         "clone" => {
             return Ok(with_host(|h| {
                 let copy = h.dup_value(recv);
