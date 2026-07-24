@@ -1680,9 +1680,9 @@ impl Parser {
         }
         let mut whens = Vec::new();
         while self.eat_kw("when") {
-            let mut labels = vec![self.expr()?];
+            let mut labels = vec![self.when_label()?];
             while self.eat_op(",") {
-                labels.push(self.expr()?);
+                labels.push(self.when_label()?);
             }
             self.eat_kw("then");
             let body = self.body_until(&["when", "else", "end"])?;
@@ -1699,6 +1699,15 @@ impl Parser {
             whens,
             els,
         })
+    }
+
+    /// A single `when` label. A leading `*` splats an array of candidates
+    /// (`when *close`): each element is tested with `===` against the subject.
+    fn when_label(&mut self) -> Result<Expr, String> {
+        if self.eat_op("*") {
+            return Ok(Expr::Splat(Box::new(self.expr()?)));
+        }
+        self.expr()
     }
 
     /// Subject-less `case` → an `if`/`elsif` chain. Each `when a, b` clause tests

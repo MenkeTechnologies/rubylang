@@ -1282,6 +1282,31 @@ impl Compiler {
             // Jump into this arm's body when any label matches.
             let mut into_body = Vec::new();
             for label in labels {
+                if let Expr::Splat(inner) = label {
+                    // `when *arr` — the array is expanded into candidates, each
+                    // tested with `===`. Compile as `arr.any? { |__e| __e === subj }`
+                    // so Range/Class/Regexp case-equality still applies per element.
+                    let any = Expr::Call {
+                        recv: Some(inner.clone()),
+                        name: "any?".into(),
+                        args: Vec::new(),
+                        block: Some(Block {
+                            params: vec!["__e".into()],
+                            splat: None,
+                            body: vec![Expr::Call {
+                                recv: Some(Box::new(Expr::Var(VarKind::Local, "__e".into()))),
+                                name: "===".into(),
+                                args: vec![Expr::Var(VarKind::Local, tmp.into())],
+                                block: None,
+                            }
+                            .into()],
+                        }),
+                    };
+                    self.compile_expr(b, &any)?;
+                    b.emit(Op::CallBuiltin(ops::TRUTHY, 1), 0);
+                    into_body.push(b.emit(Op::JumpIfTrue(0), 0));
+                    continue;
+                }
                 // label === subject   (CALL_METHOD wants [recv, name, arg])
                 self.compile_expr(b, label)?;
                 self.kstr(b, "===");
@@ -1826,6 +1851,14 @@ impl Compiler {
             Expr::Var(VarKind::Class, n) => check(self, b, "cvar", n),
             Expr::Var(VarKind::Local, n) => check(self, b, "local", n),
             Expr::Yield(_) => check(self, b, "yield", ""),
+            // A qualified constant path (`A::B`, `URI::RFC2396_PARSER`) parses as a
+            // no-arg capitalized method call on a constant path. `defined?` must
+            // treat it as a constant reference — returning nil (not raising) when
+            // the constant is absent — rather than reporting "method".
+            Expr::Call { .. } if const_path_name(operand).is_some() => {
+                let path = const_path_name(operand).unwrap();
+                check(self, b, "const", &path);
+            }
             // A bare name with no receiver/args is a local-or-method reference.
             Expr::Call {
                 recv: None,
