@@ -3636,50 +3636,67 @@ impl RubyHost {
             _ => None,
         }
     }
+    /// The builtin modules a builtin type includes — so a method added to a
+    /// reopened `Enumerable`/`Comparable` is found from an `Array`/`Integer`
+    /// receiver. activesupport reopens `Enumerable` with `index_by`/`pluck`/… and
+    /// `Comparable`; every collection/number must inherit them.
+    fn builtin_modules(name: &str) -> &'static [&'static str] {
+        match name {
+            "Array" | "Hash" | "Range" | "Set" | "Struct" | "Enumerator" => &["Enumerable"],
+            "Integer" | "Float" | "Rational" | "Numeric" | "String" | "Symbol" | "Time"
+            | "Date" | "DateTime" => &["Comparable"],
+            _ => &[],
+        }
+    }
     pub fn find_method_owner(&self, class: &str, method: &str) -> Option<(MethodDef, String)> {
         let mut cur = Some(class.to_string());
         while let Some(name) = cur {
-            let Some(def) = self.classes.get(&name) else {
-                // Not reopened: skip to the builtin superclass so a plain `Float`
-                // still inherits a reopened `Numeric`. `builtin_superclass` is
-                // `None` for non-numeric builtins, so they still stop immediately.
-                cur = Self::builtin_superclass(&name);
-                continue;
-            };
-            // Prepended modules sit ahead of the class's own methods (last
-            // prepend wins, matching Ruby's reverse-order ancestor insertion).
-            for module in def.prepends.iter().rev() {
-                let m = self.resolve_module_name(module, &name);
-                if let Some(r) = self.find_in_module(&m, method) {
-                    return Some(r);
+            if let Some(def) = self.classes.get(&name) {
+                // Prepended modules sit ahead of the class's own methods (last
+                // prepend wins, matching Ruby's reverse-order ancestor insertion).
+                for module in def.prepends.iter().rev() {
+                    let m = self.resolve_module_name(module, &name);
+                    if let Some(r) = self.find_in_module(&m, method) {
+                        return Some(r);
+                    }
+                }
+                if let Some(m) = def.methods.get(method) {
+                    return Some((m.clone(), name.clone()));
+                }
+                // An `alias`/`alias_method` on this class resolves to its target
+                // method (activesupport's `alias :cattr_accessor :mattr_accessor`
+                // on `Module`). Resolve the target from this class onward.
+                if let Some(target) = self.method_aliases.get(&name).and_then(|m| m.get(method)) {
+                    let target = target.clone();
+                    if let Some(found) = self.find_method_owner(&name, &target) {
+                        return Some(found);
+                    }
+                }
+                // Included modules (transitively) take priority over the
+                // superclass (last include wins). Resolve each include against
+                // *this* class's namespace so a bare `include Helpers` inside
+                // `Rack::Request` finds `Rack::Request::Helpers`, not an unrelated
+                // `Sinatra::Helpers` a suffix match picks.
+                for module in def.includes.iter().rev() {
+                    let m = self.resolve_module_name(module, &name);
+                    if let Some(r) = self.find_in_module(&m, method) {
+                        return Some(r);
+                    }
                 }
             }
-            if let Some(m) = def.methods.get(method) {
-                return Some((m.clone(), name.clone()));
-            }
-            // An `alias`/`alias_method` on this class resolves to its target
-            // method (e.g. activesupport's `alias :cattr_accessor :mattr_accessor`
-            // on `Module`). Resolve the target from this class onward.
-            if let Some(target) = self.method_aliases.get(&name).and_then(|m| m.get(method)) {
-                let target = target.clone();
-                if let Some(found) = self.find_method_owner(&name, &target) {
-                    return Some(found);
+            // Builtin included modules (Enumerable/Comparable) — checked even when
+            // the class itself was not reopened, since the *module* may have been.
+            for module_name in Self::builtin_modules(&name) {
+                if self.classes.contains_key(*module_name) {
+                    if let Some(r) = self.find_in_module(module_name, method) {
+                        return Some(r);
+                    }
                 }
             }
-            // Included modules (transitively) take priority over the superclass
-            // (last include wins, matching Ruby's reverse-order ancestor insertion).
-            // Resolve each include against *this* class's namespace so a bare
-            // `include Helpers` inside `Rack::Request` finds `Rack::Request::
-            // Helpers`, not an unrelated `Sinatra::Helpers` a suffix match picks.
-            for module in def.includes.iter().rev() {
-                let m = self.resolve_module_name(module, &name);
-                if let Some(r) = self.find_in_module(&m, method) {
-                    return Some(r);
-                }
-            }
-            cur = def
-                .superclass
-                .clone()
+            cur = self
+                .classes
+                .get(&name)
+                .and_then(|d| d.superclass.clone())
                 .map(|s| self.resolve_class_alias(&s, &name))
                 .or_else(|| Self::builtin_superclass(&name));
         }
