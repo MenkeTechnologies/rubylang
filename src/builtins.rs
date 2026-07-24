@@ -13462,6 +13462,7 @@ pub(crate) fn embedded_stdlib(name: &str) -> Option<&'static str> {
         "uri" => Some(include_str!("../stdlib/uri.rb")),
         "forwardable" => Some(include_str!("../stdlib/forwardable.rb")),
         "delegate" => Some(include_str!("../stdlib/delegate.rb")),
+        "rubygems/version" => Some(include_str!("../stdlib/rubygems_version.rb")),
         "csv" => Some(include_str!("../stdlib/csv.rb")),
         "optparse" => Some(include_str!("../stdlib/optparse.rb")),
         "yaml" | "psych" => Some(include_str!("../stdlib/yaml.rb")),
