@@ -4525,14 +4525,14 @@ fn dispatch_string(
             if base != 0 && !(2..=36).contains(&base) {
                 return Err(raise_exc("ArgumentError", &format!("invalid radix {base}")));
             }
-            Ok(Value::Int(scan_int(&s, base).map(|(v, _)| v).unwrap_or(0)))
+            Ok(scan_int_value(&s, base).unwrap_or(Value::Int(0)))
         }
-        "hex" => Ok(Value::Int(scan_int(&s, 16).map(|(v, _)| v).unwrap_or(0))),
+        "hex" => Ok(scan_int_value(&s, 16).unwrap_or(Value::Int(0))),
         "oct" => {
             // Ruby `String#oct` defaults to base 8 but honours a
             // `0x`/`0b`/`0o`/`0d` prefix, which flips it to auto-detect.
             let base = if has_radix_prefix(&s) { 0 } else { 8 };
-            Ok(Value::Int(scan_int(&s, base).map(|(v, _)| v).unwrap_or(0)))
+            Ok(scan_int_value(&s, base).unwrap_or(Value::Int(0)))
         }
         "to_f" => Ok(Value::Float(parse_leading_float(&s))),
         // `String#to_r` parses a leading rational: `"3/4"` → `3/4`, `"3.14"` →
@@ -14281,6 +14281,49 @@ fn scan_int(s: &str, base: i64) -> Option<(i64, usize)> {
         return None;
     }
     Some((if neg { -val } else { val }, i))
+}
+
+/// Like `scan_int`, but returns a full-precision Integer `Value` — promoting to a
+/// BigInt when the parsed number exceeds the `i64` range (`"0x8000000000000000"`,
+/// large decimals). `new_bigint` demotes back to an `i64` immediate when it fits.
+fn scan_int_value(s: &str, base: i64) -> Option<Value> {
+    // Reuse `scan_int` for the prefix/sign/radix logic and the end position, then
+    // re-parse the exact consumed slice with arbitrary precision. Detect the radix
+    // by re-running the same prefix detection on the trimmed input.
+    let (_, end) = scan_int(s, base)?;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < end && (bytes[i] as char).is_ascii_whitespace() {
+        i += 1;
+    }
+    let neg = i < end && bytes[i] == b'-';
+    if i < end && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
+    let mut radix = if (2..=36).contains(&base) { base as u32 } else { 10 };
+    if i + 1 < end && bytes[i] == b'0' {
+        let pb = match bytes[i + 1] {
+            b'x' | b'X' => Some(16),
+            b'b' | b'B' => Some(2),
+            b'o' | b'O' => Some(8),
+            b'd' | b'D' => Some(10),
+            _ => None,
+        };
+        if let Some(pb) = pb {
+            if base == 0 || base == pb {
+                radix = pb as u32;
+                i += 2;
+            }
+        } else if base == 0 {
+            radix = 8; // bare leading 0 → octal
+        }
+    } else if base == 0 {
+        radix = 10;
+    }
+    let digits: String = s[i..end].chars().filter(|c| *c != '_').collect();
+    let big = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix)?;
+    let big = if neg { -big } else { big };
+    Some(with_host(|h| h.new_bigint(big)))
 }
 
 /// True when `s` (after leading whitespace and an optional sign) opens with a

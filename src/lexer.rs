@@ -305,13 +305,34 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                             }
                         }
                         let digits: String = src[dstart..j].chars().filter(|c| *c != '_').collect();
-                        let n = i64::from_str_radix(&digits, radix)
-                            .map_err(|_| format!("bad integer literal: {}", &src[i..j]))?;
-                        out.push(Token {
-                            kind: Tok::Int(n),
-                            line,
-                            space: core::mem::take(&mut sp),
-                        });
+                        let this_sp = core::mem::take(&mut sp);
+                        match i64::from_str_radix(&digits, radix) {
+                            Ok(n) => out.push(Token {
+                                kind: Tok::Int(n),
+                                line,
+                                space: this_sp,
+                            }),
+                            // Overflows i64 — emit `"<digits>".to_i(<radix>)` so it
+                            // parses as a BigInt at runtime (Ruby Integers auto-
+                            // promote past the i64 range; `0x8000000000000000`).
+                            Err(_) => {
+                                let toks = [
+                                    Tok::Str(digits.clone(), false),
+                                    Tok::Op(".".into()),
+                                    Tok::Ident("to_i".into()),
+                                    Tok::Op("(".into()),
+                                    Tok::Int(radix as i64),
+                                    Tok::Op(")".into()),
+                                ];
+                                for (k, kind) in toks.into_iter().enumerate() {
+                                    out.push(Token {
+                                        kind,
+                                        line,
+                                        space: k == 0 && this_sp,
+                                    });
+                                }
+                            }
+                        }
                         i = j;
                         continue;
                     }
@@ -347,7 +368,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         space: core::mem::take(&mut sp),
                     });
                 } else {
-                    let n: i64 = raw.parse().map_err(|_| format!("bad integer: {raw}"))?;
+                    let n_res = raw.parse::<i64>();
                     // A trailing `r`/`i` (not part of an identifier) makes a
                     // Rational (`4r` → `Rational(4)`) or imaginary Complex
                     // (`3i` → `Complex(0, 3)`) literal, desugared into a call.
@@ -361,14 +382,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         })
                         .copied();
                     let this_sp = core::mem::take(&mut sp);
-                    let synth: Vec<Tok> = match suffix {
-                        Some(b'r') => vec![
+                    let synth: Vec<Tok> = match (suffix, n_res) {
+                        (Some(b'r'), Ok(n)) => vec![
                             Tok::Ident("Rational".into()),
                             Tok::Op("(".into()),
                             Tok::Int(n),
                             Tok::Op(")".into()),
                         ],
-                        Some(b'i') => vec![
+                        (Some(b'i'), Ok(n)) => vec![
                             Tok::Ident("Complex".into()),
                             Tok::Op("(".into()),
                             Tok::Int(0),
@@ -376,7 +397,17 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                             Tok::Int(n),
                             Tok::Op(")".into()),
                         ],
-                        _ => vec![Tok::Int(n)],
+                        (_, Ok(n)) => vec![Tok::Int(n)],
+                        // Overflows i64 — emit `"<digits>".to_i(10)` so it parses
+                        // as a BigInt at runtime (large decimal literals).
+                        (_, Err(_)) => vec![
+                            Tok::Str(raw.clone(), false),
+                            Tok::Op(".".into()),
+                            Tok::Ident("to_i".into()),
+                            Tok::Op("(".into()),
+                            Tok::Int(10),
+                            Tok::Op(")".into()),
+                        ],
                     };
                     if suffix.is_some() {
                         i += 1;
