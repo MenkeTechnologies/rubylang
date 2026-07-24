@@ -5389,6 +5389,26 @@ pub fn call_super_blk(
             }
             return Ok(Value::Undef);
         }
+        // A user override of a universal type query that calls `super` gets the
+        // native behavior. Re-dispatching would re-enter the override (infinite
+        // recursion), so compute it directly here (mustermann's `Node#is_a?`
+        // normalizes a Symbol type then `super(type)`).
+        if matches!(method.as_str(), "is_a?" | "kind_of?" | "instance_of?") {
+            let args = explicit_args.clone().unwrap_or_else(|| cur_args.clone());
+            let ans = args
+                .first()
+                .and_then(|arg| {
+                    with_host(|h| h.classref_name(arg)).map(|cname| {
+                        if method == "instance_of?" {
+                            with_host(|h| h.class_of(&self_obj)) == cname
+                        } else {
+                            with_host(|h| h.is_a(&self_obj, &cname))
+                        }
+                    })
+                })
+                .unwrap_or(false);
+            return Ok(Value::Bool(ans));
+        }
         // `super` from a `def self.new` override — the default `Class#new`:
         // allocate an instance of the *receiver* class (so a subclass's `new`
         // makes the subclass) and run its `initialize`.
