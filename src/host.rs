@@ -3503,6 +3503,31 @@ impl RubyHost {
                 }
             })
     }
+    /// Immediate subclasses of `class` — every registered class whose direct
+    /// superclass is `class` (`Class#subclasses`, Ruby 3.1+). Anonymous helper
+    /// classes (`#<Class:N>`) are excluded, matching how Rails filters them.
+    pub fn direct_subclasses(&self, class: &str) -> Vec<String> {
+        self.classes
+            .keys()
+            .filter(|k| !k.starts_with("#<"))
+            .filter(|k| self.class_superclass(k).as_deref() == Some(class))
+            .cloned()
+            .collect()
+    }
+    /// All transitive descendants of `class` (`ActiveSupport`'s `descendants`),
+    /// breadth-first over `direct_subclasses`.
+    pub fn all_descendants(&self, class: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut queue = self.direct_subclasses(class);
+        while let Some(c) = queue.pop() {
+            if out.contains(&c) {
+                continue;
+            }
+            queue.extend(self.direct_subclasses(&c));
+            out.push(c);
+        }
+        out
+    }
     /// The Ruby `<` class relation: `Some(true)` when `a` is a proper descendant
     /// of `b`, `Some(false)` when `a == b` or `a` is an ancestor of `b`, and
     /// `None` when the two classes are unrelated.
@@ -5748,6 +5773,25 @@ pub fn call_super_blk(
         // `name.start_with?("x") || super` in an override resolves cleanly.
         if method == "respond_to_missing?" {
             return Ok(Value::Bool(false));
+        }
+        // `super` from a user override of `Class#subclasses`/`descendants` reaches
+        // the native hierarchy walk. Rails stacks overrides (Railtie#subclasses ->
+        // DescendantsTracker::ReloadedClassesFiltering#subclasses -> super) that all
+        // bottom out here.
+        if matches!(method.as_str(), "subclasses" | "descendants") {
+            if let Some(cls) = with_host(|h| h.classref_name(&self_obj)) {
+                let names = with_host(|h| {
+                    if method == "subclasses" {
+                        h.direct_subclasses(&cls)
+                    } else {
+                        h.all_descendants(&cls)
+                    }
+                });
+                let refs: Vec<Value> =
+                    names.iter().map(|n| with_host(|h| h.class_ref(n))).collect();
+                return Ok(with_host(|h| h.new_array(refs)));
+            }
+            return Ok(with_host(|h| h.new_array(vec![])));
         }
         // `super` from a user override of `Module#include`/`prepend`/`extend`
         // (self is the class, args are the modules) performs the real mixin. e.g.

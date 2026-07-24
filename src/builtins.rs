@@ -2939,6 +2939,22 @@ fn dispatch_classref(
             Some(sc) => h.class_ref(&sc),
             None => Value::Undef,
         })),
+        // `Class#subclasses` (immediate) / `descendants` (transitive) — Rails'
+        // DescendantsTracker and railtie discovery walk these.
+        "subclasses" | "descendants" => {
+            let names = with_host(|h| {
+                if name == "subclasses" {
+                    h.direct_subclasses(cls)
+                } else {
+                    h.all_descendants(cls)
+                }
+            });
+            let refs: Vec<Value> = names
+                .iter()
+                .map(|n| with_host(|h| h.class_ref(n)))
+                .collect();
+            Ok(with_host(|h| h.new_array(refs)))
+        }
         // `Module#singleton_class?` — true only for a singleton class, registered
         // as `#<Class:AttachedName>`. An *anonymous* class (`Class.new`) is named
         // `#<Class:N>` with a numeric counter, so exclude a purely-numeric inner
