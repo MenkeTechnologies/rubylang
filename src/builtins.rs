@@ -1521,6 +1521,11 @@ pub(crate) fn dispatch(
             match name_of(&args[0]).as_str() {
                 "deconstruct" => return Ok(Value::Bool(with_host(|h| h.is_a(recv, "Array")))),
                 "deconstruct_keys" => return Ok(Value::Bool(with_host(|h| h.is_a(recv, "Hash")))),
+                // Class-only methods are never instance methods of a value: a
+                // Symbol/String/Integer does not respond to `new`/`allocate`.
+                // mustermann's `Mustermann[type]` branches on `type.respond_to?
+                // (:new)` to tell a factory class from a bare type symbol.
+                "new" | "allocate" | "superclass" => return Ok(Value::Bool(false)),
                 _ => {}
             }
             return Ok(Value::Bool(true));
