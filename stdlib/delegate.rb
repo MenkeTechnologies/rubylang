@@ -66,10 +66,27 @@ end
 # `DelegateClass(superklass)` returns a Delegator subclass that forwards every
 # public instance method of `superklass` to the wrapped object. Subclass it:
 # `class Foo < DelegateClass(Bar)`.
+# Identity, reflection, and control methods that must stay on the delegator
+# itself rather than forwarding to the wrapped object — mirrors Ruby's
+# `Delegator::NOT_DELEGATED`. Delegating these breaks core behavior: e.g. a
+# delegated `is_a?` reports the *wrapped* object's class, so `decorator.is_a?
+# (DecoratorClass)` is wrongly false (this collapses mustermann's AST Translator,
+# whose unwrap loop tests `result.is_a? NodeTranslator`).
+DELEGATOR_NOT_DELEGATED = %i[
+  == != ! =~ !~ === <=> hash to_s inspect
+  is_a? kind_of? instance_of? class object_id __id__ equal?
+  respond_to? respond_to_missing? send public_send __send__
+  method methods public_methods private_methods protected_methods singleton_methods
+  instance_variable_get instance_variable_set instance_variables instance_variable_defined?
+  nil? frozen? freeze dup clone tap itself then yield_self display
+  define_singleton_method singleton_class extend instance_eval instance_exec
+  __getobj__ __setobj__ initialize method_missing marshal_dump marshal_load
+].freeze
+
 def DelegateClass(superklass, &block)
   klass = Class.new(Delegator)
   methods = superklass.public_instance_methods
-  methods -= [:__getobj__, :__setobj__, :==, :!=, :!, :to_s, :inspect]
+  methods -= DELEGATOR_NOT_DELEGATED
   methods -= ::Delegator.public_instance_methods
   klass.class_eval do
     def __getobj__

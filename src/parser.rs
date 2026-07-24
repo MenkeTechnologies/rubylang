@@ -1288,10 +1288,20 @@ impl Parser {
                 return Ok(());
             }
         }
-        // `&block` — a block-param capturing the block; bind the name (it stays
-        // nil unless a block flows in, which is rare for a block's own block arg).
+        // `&block` — a block's own block-param captures the block passed to the
+        // block, NOT a positional argument. Binding it as a positional param (after
+        // a `*splat`) would make it consume the last positional arg — so
+        // `{ |*args, &blk| }` called with one Array arg would splat that array and
+        // hand its last element to `blk`, corrupting `*args`. This is exactly how
+        // stdlib `DelegateClass`'s `define_method(:x=) { |*a, &b| … }` forwarder
+        // collapsed an assigned array to its first element. Bind it as a nil local
+        // via a prelude instead, keeping it out of positional binding.
         if self.eat_op("&") {
-            params.push(self.ident_name()?);
+            let name = self.ident_name()?;
+            preludes.push(Expr::Assign(
+                Box::new(Expr::Var(VarKind::Local, name)),
+                Box::new(Expr::Nil),
+            ));
             return Ok(());
         }
         // `**rest` — a keyword-splat collector (desugared from the trailing hash).
