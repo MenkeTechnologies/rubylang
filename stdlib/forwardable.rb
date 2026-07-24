@@ -4,21 +4,17 @@
 # accessor (an ivar `:@name` or a reader method `:name`).
 
 module Forwardable
-  # Define `ali` to forward to `accessor.method(*args, &block)`. `accessor` may
-  # be an instance variable name (`:@buffer`) or a method name (`:buffer`).
+  # Define `ali` to forward to `accessor.method(*args, &block)`. `accessor` is
+  # spliced as *code* (MRI behavior): an ivar (`:@buffer`), a reader method
+  # (`:buffer`), or an arbitrary expression (`'self.class'`).
   def def_instance_delegator(accessor, method, ali = method)
     accessor = accessor.to_s
     method = method.to_sym
-    if accessor.start_with?("@")
-      define_method(ali) do |*args, &block|
-        instance_variable_get(accessor).__send__(method, *args, &block)
-      end
-    else
-      reader = accessor.to_sym
-      define_method(ali) do |*args, &block|
-        __send__(reader).__send__(method, *args, &block)
-      end
-    end
+    module_eval(
+      "def #{ali}(*args, &block)\n" \
+      "  #{accessor}.__send__(#{method.inspect}, *args, &block)\n" \
+      "end"
+    )
   end
   alias def_delegator def_instance_delegator
 
@@ -46,16 +42,11 @@ module SingleForwardable
   def def_single_delegator(accessor, method, ali = method)
     accessor = accessor.to_s
     method = method.to_sym
-    if accessor.start_with?("@")
-      define_singleton_method(ali) do |*args, &block|
-        instance_variable_get(accessor).__send__(method, *args, &block)
-      end
-    else
-      reader = accessor.to_sym
-      define_singleton_method(ali) do |*args, &block|
-        __send__(reader).__send__(method, *args, &block)
-      end
-    end
+    instance_eval(
+      "def #{ali}(*args, &block)\n" \
+      "  #{accessor}.__send__(#{method.inspect}, *args, &block)\n" \
+      "end"
+    )
   end
   alias def_delegator def_single_delegator
 
