@@ -2932,6 +2932,9 @@ impl RubyHost {
         if let Some(v) = self.class_define_methods.shift_remove(old) {
             self.class_define_methods.insert(new.to_string(), v);
         }
+        if let Some(v) = self.attr_accessors.shift_remove(old) {
+            self.attr_accessors.insert(new.to_string(), v);
+        }
         if let Some(v) = self.method_aliases.shift_remove(old) {
             self.method_aliases.insert(new.to_string(), v);
         }
