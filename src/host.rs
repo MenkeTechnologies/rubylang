@@ -3741,6 +3741,10 @@ impl RubyHost {
             "Array" | "Hash" | "Range" | "Set" | "Struct" | "Enumerator" => &["Enumerable"],
             "Integer" | "Float" | "Rational" | "Numeric" | "String" | "Symbol" | "Time"
             | "Date" | "DateTime" => &["Comparable"],
+            // Object includes Kernel, so a reopened `module Kernel` (activesupport's
+            // core-ext: silence_warnings, suppress, …) resolves for every object
+            // and for bareword self-calls at the top level (self = main : Object).
+            "Object" => &["Kernel"],
             _ => &[],
         }
     }
