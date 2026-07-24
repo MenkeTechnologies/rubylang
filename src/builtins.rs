@@ -2553,6 +2553,15 @@ fn dispatch_classref(
             let key = const_key_under(cls, &cname);
             Ok(with_host(|h| h.remove_const(&key)))
         }
+        // `Klass.undef_method(:m)` / `remove_method(:m)` — drop the instance
+        // method (activesupport undefs `#with` on immediate classes).
+        "undef_method" | "remove_method" => {
+            for a in args {
+                let m = name_of(a);
+                with_host(|h| h.remove_instance_method(cls, &m));
+            }
+            Ok(with_host(|h| h.class_ref(cls)))
+        }
         // `Mod.constants` — the user-defined constant names (flat store), as
         // symbols. Class names are not enumerated (matching neither MRI exactly
         // nor hiding user constants set via assignment / const_set).
@@ -13333,6 +13342,7 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "securerandom"
             | "digest"
             | "openssl"
+            | "ipaddr"
             | "base64"
             | "bigdecimal"
             | "bigdecimal/util"
