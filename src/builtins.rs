@@ -2884,9 +2884,14 @@ fn dispatch_classref(
             None => Value::Undef,
         })),
         // `Module#singleton_class?` — true only for a singleton class, registered
-        // under the synthetic `#<Class:...>` name. activesupport's class_attribute
-        // branches on it to decide where to define the accessor.
-        "singleton_class?" => Ok(Value::Bool(cls.starts_with("#<Class:"))),
+        // as `#<Class:AttachedName>`. An *anonymous* class (`Class.new`) is named
+        // `#<Class:N>` with a numeric counter, so exclude a purely-numeric inner
+        // part. activesupport's class_attribute branches on this.
+        "singleton_class?" => Ok(Value::Bool(
+            cls.strip_prefix("#<Class:")
+                .and_then(|s| s.strip_suffix('>'))
+                .is_some_and(|inner| !inner.is_empty() && !inner.bytes().all(|b| b.is_ascii_digit())),
+        )),
         // `Module.nesting` — best-effort. The runtime does not track the lexical
         // nesting of the call site (class bodies are flattened at compile time),
         // so this returns the empty array (correct at the top level; a namespaced
