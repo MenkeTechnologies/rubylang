@@ -1437,7 +1437,17 @@ impl RubyHost {
             Some(RObj::Symbol(_)) | Some(RObj::ClassRef(_)) => v.clone(),
             Some(obj) => {
                 let copy = obj.clone();
-                self.alloc(copy)
+                let new = self.alloc(copy);
+                // Preserve a native-backed builtin-subclass override (`class
+                // Params < Hash`): the copy must report the same class, or a
+                // `dup`/`merge` on a `Sinatra::IndifferentHash` degrades to a
+                // plain Hash and loses its indifferent (symbol/string) access.
+                if let Value::Obj(oid) = v {
+                    if let Some(cls) = self.class_overrides.get(oid).cloned() {
+                        self.set_class_override(&new, &cls);
+                    }
+                }
+                new
             }
             None => v.clone(),
         }
