@@ -46,6 +46,11 @@ pub struct Parser {
     /// bare call args; the modifier belongs to the enclosing statement). A
     /// parenthesized group resets this so `foo((x rescue y))` still parses.
     no_rescue_mod: bool,
+    /// Per-block stack tracking the highest numbered parameter (`_1`..`_9`) and
+    /// `it` referenced in a block that declared no explicit `|params|`. Top of
+    /// stack is the block currently being parsed; a bare `_2` sets it to ≥2. When
+    /// the block closes, a non-zero max synthesizes params `_1.._max`.
+    nparam_stack: Vec<u32>,
 }
 
 /// Parse a full program. Inline `rust { ... }` FFI blocks are desugared to
@@ -60,6 +65,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
         no_do_block: false,
         no_pattern: false,
         no_rescue_mod: false,
+        nparam_stack: Vec::new(),
     };
     p.program()
 }
@@ -1053,11 +1059,21 @@ impl Parser {
         // Inside a loop/case condition a `do` binds to the enclosing keyword, not
         // to a call in the condition — leave it for the loop parser to consume.
         if !self.no_do_block && self.eat_kw("do") {
-            let (params, splat, preludes) = self.block_params()?;
+            let (mut params, splat, preludes) = self.block_params()?;
+            let track = params.is_empty() && splat.is_none();
+            if track {
+                self.nparam_stack.push(0);
+            }
             // A `do … rescue … else … ensure … end` block carries an implicit
             // begin (Ruby 2.6+), so parse the rescue tail like a method body.
             let rest = self.body_with_rescue()?;
             self.expect_kw("end")?;
+            if track {
+                let max = self.nparam_stack.pop().unwrap_or(0);
+                for n in 1..=max {
+                    params.push(format!("_{n}"));
+                }
+            }
             let body = self.prepend_preludes(preludes, rest);
             return Ok(Some(Block {
                 params,
@@ -1067,7 +1083,11 @@ impl Parser {
         }
         if self.is_op("{") {
             self.advance();
-            let (params, splat, preludes) = self.block_params()?;
+            let (mut params, splat, preludes) = self.block_params()?;
+            let track = params.is_empty() && splat.is_none();
+            if track {
+                self.nparam_stack.push(0);
+            }
             let mut body = Vec::new();
             self.skip_terms();
             while !self.is_op("}") && !matches!(self.peek(), Tok::Eof) {
@@ -1077,6 +1097,12 @@ impl Parser {
                 self.skip_terms();
             }
             self.expect_op("}")?;
+            if track {
+                let max = self.nparam_stack.pop().unwrap_or(0);
+                for n in 1..=max {
+                    params.push(format!("_{n}"));
+                }
+            }
             let body = self.prepend_preludes(preludes, body);
             return Ok(Some(Block {
                 params,
@@ -1557,6 +1583,20 @@ impl Parser {
                 args: vec![],
                 block,
             });
+        }
+        // A bare `_1`..`_9` in a block with no explicit params is an implicit
+        // numbered parameter — record the highest one seen so the block
+        // synthesizes params `_1.._max` when it closes.
+        if let Some(top) = self.nparam_stack.last_mut() {
+            if let Some(rest) = name.strip_prefix('_') {
+                if rest.len() == 1 {
+                    if let Some(d) = rest.chars().next().and_then(|c| c.to_digit(10)) {
+                        if (1..=9).contains(&d) {
+                            *top = (*top).max(d);
+                        }
+                    }
+                }
+            }
         }
         Ok(Expr::Var(VarKind::Local, name))
     }
