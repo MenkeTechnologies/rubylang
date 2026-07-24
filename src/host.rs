@@ -2542,7 +2542,11 @@ impl RubyHost {
                     return Some((field.to_string(), writer));
                 }
             }
-            cur = self.classes.get(&c).and_then(|d| d.superclass.clone());
+            cur = self
+                .classes
+                .get(&c)
+                .and_then(|d| d.superclass.clone())
+                .map(|s| self.resolve_class_alias(&s));
         }
         None
     }
@@ -2864,7 +2868,43 @@ impl RubyHost {
     }
     /// The direct superclass of a user class, if registered.
     pub fn superclass_of(&self, name: &str) -> Option<String> {
-        self.classes.get(name).and_then(|d| d.superclass.clone())
+        self.classes
+            .get(name)
+            .and_then(|d| d.superclass.clone())
+            .map(|s| self.resolve_class_alias(&s))
+    }
+    /// Resolve a class name that may be a constant *alias* to a class value
+    /// (`Alias = Base; class C < Alias`) to the real class it refers to. `class
+    /// C < expr` stores `expr` as a static name, so an aliased superclass would
+    /// otherwise name a non-class constant and break the ancestry chain. A name
+    /// that is already a registered class is returned unchanged.
+    pub fn resolve_class_alias(&self, name: &str) -> String {
+        if self.classes.contains_key(name) {
+            return name.to_string();
+        }
+        let c = self.get_const(name);
+        if let Some(RObj::ClassRef(real)) = self.obj(&c) {
+            if real != name {
+                return real.clone();
+            }
+        }
+        // The alias constant may be namespaced (`Mod::Alias`) while the captured
+        // superclass name is the short form (the const is assigned at runtime, so
+        // compile-time resolution left it unqualified). Find a qualified constant
+        // ending in `::name` that holds a class.
+        if !name.contains("::") {
+            let suffix = format!("::{name}");
+            for (k, v) in &self.consts {
+                if k.ends_with(&suffix) {
+                    if let Some(RObj::ClassRef(real)) = self.obj(v) {
+                        if real != name {
+                            return real.clone();
+                        }
+                    }
+                }
+            }
+        }
+        name.to_string()
     }
     /// Whether `class` is an ancestor of (or equal to) `start` — walking the
     /// superclass chain and included modules.
@@ -2880,7 +2920,7 @@ impl RubyHost {
             if def.includes.iter().any(|m| m == class) {
                 return true;
             }
-            cur = def.superclass.clone();
+            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s));
         }
         false
     }
@@ -2953,7 +2993,7 @@ impl RubyHost {
                                 for m in def.includes.iter().rev() {
                                     out.push(m.clone());
                                 }
-                                cur = def.superclass.clone();
+                                cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s));
                             }
                             None => {
                                 // Superclass is a builtin (e.g. StandardError):
@@ -3178,7 +3218,7 @@ impl RubyHost {
                     }
                 }
             }
-            cur = def.superclass.clone();
+            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s));
         }
         None
     }
@@ -3279,7 +3319,7 @@ impl RubyHost {
                     }
                 }
             }
-            cur = def.superclass.clone();
+            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s));
         }
         None
     }
@@ -3307,7 +3347,7 @@ impl RubyHost {
                     }
                 }
             }
-            cur = def.superclass.clone();
+            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s));
         }
         None
     }
@@ -3337,7 +3377,7 @@ impl RubyHost {
                     }
                 }
             }
-            cur = def.superclass.clone();
+            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s));
         }
         None
     }
@@ -3629,7 +3669,11 @@ impl RubyHost {
             if name == rescued {
                 return true;
             }
-            cur = self.classes.get(&name).and_then(|d| d.superclass.clone());
+            cur = self
+                .classes
+                .get(&name)
+                .and_then(|d| d.superclass.clone())
+                .map(|s| self.resolve_class_alias(&s));
         }
         false
     }
