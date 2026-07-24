@@ -11579,6 +11579,16 @@ fn mutex_method(recv: &Value, name: &str, block: Option<Value>) -> Result<Option
             set(true);
             Ok(Some(recv.clone()))
         }
+        // `Monitor#new_cond` / `MonitorMixin#new_cond` — a condition variable bound
+        // to this monitor (concurrent-ruby's ConditionSignalling uses it).
+        "new_cond" => {
+            let cvid = crate::host::new_condvar();
+            Ok(Some(with_host(|h| {
+                let o = h.new_object("ConditionVariable");
+                h.set_ivar_of(&o, "__cvid", Value::Int(cvid as i64));
+                o
+            })))
+        }
         "unlock" => {
             set(false);
             Ok(Some(recv.clone()))
