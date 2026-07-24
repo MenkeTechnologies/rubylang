@@ -1036,6 +1036,7 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
             )
             || with_host(|h| {
                 h.find_class_method(&cls, name).is_some()
+                    || h.find_class_define_method(&cls, name).is_some()
                     || h.find_method("Class", name).is_some()
                     || h.find_method("Module", name).is_some()
             })
@@ -1500,6 +1501,14 @@ pub(crate) fn dispatch(
                 .ok_or_else(|| {
                     raise_exc("ArgumentError", "tried to create Proc without a block")
                 })?;
+            // On a class/module object a singleton method is a *class method*,
+            // inherited by subclasses — register it under the class name rather
+            // than the classref value's heap id (which is recreated per reference,
+            // so an id-keyed singleton would be lost on the next `Klass.m` call).
+            if let Some(cls) = with_host(|h| h.classref_name(recv)) {
+                with_host(|h| h.add_class_define_method(&cls, &mname, proc));
+                return Ok(with_host(|h| h.new_symbol(&mname)));
+            }
             if let Value::Obj(id) = recv {
                 with_host(|h| h.add_singleton_define_method(*id, &mname, proc));
             }
@@ -1645,6 +1654,12 @@ fn dispatch_classref(
     if let Some((def, owner)) = with_host(|h| h.find_class_method_owner(cls, name)) {
         let recv = with_host(|h| h.class_ref(cls));
         return crate::host::call_class_method(recv, &def, name, &owner, args, block);
+    }
+    // A `Klass.define_singleton_method(:m) { … }` class method (proc-backed,
+    // inherited by subclasses). Runs with `self` = the class ref.
+    if let Some(proc) = with_host(|h| h.find_class_define_method(cls, name)) {
+        let recv = with_host(|h| h.class_ref(cls));
+        return crate::host::call_proc_self(&proc, args, Some(&recv));
     }
     // `Mod.autoload :Const, "path"` — a module registering a lazy require on a
     // *receiver* (`Tilt.autoload :Foo, "tilt/foo"`), namespaced under the module.
@@ -2784,13 +2799,25 @@ fn const_key_under(cls: &str, name: &str) -> String {
 /// path (`Object.const_get("A::B")`), and finally the bare leaf segment (legacy
 /// flat lookup). Each is resolved through `const_lookup`.
 fn const_lookup_under(cls: &str, name: &str) -> Option<Value> {
-    let qualified = const_key_under(cls, name);
-    const_lookup(&qualified)
-        .or_else(|| const_lookup(name))
-        .or_else(|| {
-            let leaf = name.rsplit("::").next().unwrap_or(name);
-            const_lookup(leaf)
-        })
+    // Ruby resolves a constant through the receiver's superclass chain, so a
+    // subclass sees a constant defined on its ancestor (`Child.const_get(:Inner)`
+    // finds `Base::Inner`). Walk from `cls` up its superclasses first.
+    let mut cur = Some(cls.to_string());
+    let mut guard = 0;
+    while let Some(c) = cur {
+        if let Some(v) = const_lookup(&const_key_under(&c, name)) {
+            return Some(v);
+        }
+        guard += 1;
+        if guard > 100 {
+            break; // cycle guard
+        }
+        cur = with_host(|h| h.superclass_of(&c));
+    }
+    const_lookup(name).or_else(|| {
+        let leaf = name.rsplit("::").next().unwrap_or(name);
+        const_lookup(leaf)
+    })
 }
 
 /// Resolve a constant name against the flat constant store, falling back to a

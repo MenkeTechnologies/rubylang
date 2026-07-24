@@ -641,6 +641,11 @@ pub struct RubyHost {
     /// Proc. Proc-based (closes over its defining scope), parallel to
     /// `define_methods` but per-object rather than per-class.
     singleton_define_methods: IndexMap<u32, IndexMap<String, Value>>,
+    /// `Klass.define_singleton_method`-created class methods: class name → name →
+    /// block Proc. A singleton method on a *class* object is a class method, so it
+    /// is inherited by subclasses (looked up through the superclass chain) — unlike
+    /// per-object singletons which are keyed by a heap id (recreated per classref).
+    class_define_methods: IndexMap<String, IndexMap<String, Value>>,
     /// `alias_method`/`alias` mappings: class → alias name → target method name.
     method_aliases: IndexMap<String, IndexMap<String, String>>,
     /// Live `Thread`s, indexed by `RObj::Thread.id`: the OS-thread `JoinHandle`
@@ -1244,6 +1249,7 @@ impl RubyHost {
             define_methods: IndexMap::new(),
             singleton_methods: IndexMap::new(),
             singleton_define_methods: IndexMap::new(),
+            class_define_methods: IndexMap::new(),
             method_aliases: IndexMap::new(),
         };
         // Seed the standard streams as `STDOUT`/`STDERR`/`STDIN` constants and
@@ -2282,6 +2288,7 @@ impl RubyHost {
                         | "superclass"
                 )
                 || self.find_class_method(&cls, name).is_some()
+                || self.find_class_define_method(&cls, name).is_some()
                 || self.find_method("Class", name).is_some()
                 || self.find_method("Module", name).is_some();
         }
@@ -2724,6 +2731,34 @@ impl RubyHost {
                 .cloned(),
             _ => None,
         }
+    }
+    /// Register a `Klass.define_singleton_method` block as a class method (proc-
+    /// backed, inherited by subclasses).
+    pub fn add_class_define_method(&mut self, class: &str, name: &str, proc: Value) {
+        self.class_define_methods
+            .entry(class.to_string())
+            .or_default()
+            .insert(name.to_string(), proc);
+    }
+    /// A `Klass.define_singleton_method` block for `name`, walking the superclass
+    /// chain (a class-level singleton method is inherited like any class method).
+    pub fn find_class_define_method(&self, class: &str, name: &str) -> Option<Value> {
+        if self.class_define_methods.is_empty() {
+            return None;
+        }
+        let mut cur = Some(class.to_string());
+        let mut guard = 0;
+        while let Some(c) = cur {
+            if let Some(p) = self.class_define_methods.get(&c).and_then(|m| m.get(name)) {
+                return Some(p.clone());
+            }
+            guard += 1;
+            if guard > 100 {
+                break;
+            }
+            cur = self.superclass_of(&c);
+        }
+        None
     }
     /// Register a class method (`def self.m` equivalent) on a class at runtime
     /// (`def Klass.m`, `Klass.instance_eval { def m }`).
