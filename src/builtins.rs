@@ -1006,7 +1006,7 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
         // `alias_method(:new, :old)` — register an alias on the class.
         if name == "alias_method" && args.len() >= 2 {
             let (new_name, old_name) = (name_of(&args[0]), name_of(&args[1]));
-            with_host(|h| h.add_alias(&cls, &new_name, &old_name));
+            with_host(|h| h.register_alias(&cls, &new_name, &old_name));
             return Ok(with_host(|h| h.new_symbol(&new_name)));
         }
         // A bare `include`/`prepend`/`extend M` in a class body (e.g. a
@@ -3033,7 +3033,7 @@ fn dispatch_classref(
         // `Klass.alias_method(:new, :old)` — register an alias on the class.
         "alias_method" if args.len() >= 2 => {
             let (new_name, old_name) = (name_of(&args[0]), name_of(&args[1]));
-            with_host(|h| h.add_alias(cls, &new_name, &old_name));
+            with_host(|h| h.register_alias(cls, &new_name, &old_name));
             Ok(with_host(|h| h.new_symbol(&new_name)))
         }
         _ => {

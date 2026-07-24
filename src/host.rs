@@ -2407,6 +2407,10 @@ impl RubyHost {
                 _ => break,
             }
         }
+        // A snapshot alias of a native method resolves to that native method name.
+        if let Some(native) = Self::native_alias_target(&cur) {
+            return Some(native.to_string());
+        }
         changed.then_some(cur)
     }
     /// Record that native value `v` is really an instance of user subclass
@@ -2964,6 +2968,76 @@ impl RubyHost {
             .entry(class.to_string())
             .or_default()
             .insert(alias_name.to_string(), target.to_string());
+    }
+    /// `alias`/`alias_method` with Ruby snapshot semantics: the alias captures the
+    /// target method *as it is now*, so a later redefinition of the target does
+    /// not change what the alias resolves to. A user (bytecode/`define_method`)
+    /// target is copied under the alias name; a native builtin target is recorded
+    /// with a `\x01native:` marker so the alias forwards to the native method even
+    /// after a subclass overrides the target — `HashWithIndifferentAccess` aliases
+    /// the native `[]=` to `regular_writer`, then overrides `[]=`; without the
+    /// snapshot the override recurses into itself through the alias.
+    /// Whether `method` is a native method of builtin `base` that a subclass
+    /// commonly aliases to save before overriding. Not exhaustive — it only needs
+    /// to cover the "alias the inherited native method, then redefine it" idiom.
+    fn is_native_builtin_method(base: &str, method: &str) -> bool {
+        match base {
+            "Hash" => matches!(
+                method,
+                "[]" | "[]=" | "store" | "fetch" | "delete" | "update" | "merge"
+                    | "merge!" | "each" | "each_pair" | "keys" | "values" | "key?"
+                    | "has_key?" | "include?" | "dig" | "to_hash" | "to_a" | "size"
+                    | "length" | "default" | "default=" | "default_proc"
+                    | "default_proc=" | "replace" | "clear" | "assoc" | "rassoc"
+                    | "select" | "reject" | "invert" | "key" | "values_at" | "slice"
+            ),
+            "Array" => matches!(
+                method,
+                "[]" | "[]=" | "push" | "<<" | "pop" | "shift" | "unshift" | "each"
+                    | "map" | "size" | "length" | "first" | "last" | "to_a" | "to_ary"
+                    | "concat" | "replace" | "insert" | "delete" | "index" | "include?"
+            ),
+            "String" => matches!(
+                method,
+                "[]" | "[]=" | "<<" | "concat" | "replace" | "length" | "size"
+                    | "to_s" | "to_str" | "each_char" | "gsub" | "sub"
+            ),
+            _ => false,
+        }
+    }
+    pub fn register_alias(&mut self, class: &str, alias_name: &str, target: &str) {
+        // A builtin-backed subclass aliasing a native method of its base captures
+        // the native method, even if the subclass also overrides it (rubylang
+        // hoists the override into the method table, so a plain lookup would find
+        // it and recurse). HashWithIndifferentAccess aliases native `[]=` to
+        // `regular_writer`, then overrides `[]=` to call `regular_writer`.
+        if let Some(base) = self.builtin_container_root(class) {
+            if Self::is_native_builtin_method(base, target) {
+                self.method_aliases
+                    .entry(class.to_string())
+                    .or_default()
+                    .insert(alias_name.to_string(), format!("\u{1}native:{target}"));
+                return;
+            }
+        }
+        if let Some((def, _)) = self.find_method_owner(class, target) {
+            self.add_instance_method(class, alias_name, def);
+        } else if let Some(proc) = self.find_define_method(class, target) {
+            self.define_methods
+                .entry(class.to_string())
+                .or_default()
+                .insert(alias_name.to_string(), proc);
+        } else {
+            self.method_aliases
+                .entry(class.to_string())
+                .or_default()
+                .insert(alias_name.to_string(), format!("\u{1}native:{target}"));
+        }
+    }
+    /// If `target` is a `\x01native:<name>` marker (a snapshot alias of a native
+    /// method), the underlying native method name; else `None`.
+    pub fn native_alias_target(target: &str) -> Option<&str> {
+        target.strip_prefix("\u{1}native:")
     }
     /// The method an alias points to (walking the superclass chain), if any.
     pub fn find_alias(&self, class: &str, name: &str) -> Option<String> {
