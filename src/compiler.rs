@@ -1721,6 +1721,17 @@ impl Compiler {
                 class_methods,
             },
         ));
+        // A named superclass may be an autoloaded constant (`class Sub < Base`
+        // where `autoload :Base, …`, as rack-protection does). Read it here so the
+        // pending autoload fires and the superclass is fully defined before the
+        // subclass body and `inherited` hook run. `const_candidates` resolves it
+        // against the enclosing nesting (already popped above).
+        if let Some(sc) = superclass {
+            let encoded = self.const_candidates(sc);
+            self.kstr(b, &encoded);
+            b.emit(Op::CallBuiltin(ops::GETCONST, 1), 0);
+            b.emit(Op::Pop, 0);
+        }
         // `inherited(subclass)` fires when the subclass is opened — before its body.
         if let Some(sc) = &resolved_super {
             self.emit_hook(b, sc, "inherited", &qname);
