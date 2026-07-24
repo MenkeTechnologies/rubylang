@@ -10788,13 +10788,19 @@ fn dispatch_hash(
                     }
                 }
             }
-            // No block: a `[k, v]` pair is always truthy, so `any?` is `!empty?`,
-            // `none?` is `empty?`, and `all?` is always true (vacuously for an
-            // empty hash). sinatra guards `@params.merge(captures) if params.any?`.
-            let result = match name {
-                "any?" => !map.is_empty(),
-                "none?" => map.is_empty(),
-                _ => true,
+            // Reached when no block was given, or the block ran to completion
+            // without an early return. With a block that never matched: `any?` is
+            // false, `all?`/`none?` are true. With NO block, a `[k, v]` pair is
+            // always truthy, so `any?` is `!empty?`, `none?` is `empty?`, `all?`
+            // true — sinatra guards `@params.merge(captures) if params.any?`.
+            let result = if block.is_none() {
+                match name {
+                    "any?" => !map.is_empty(),
+                    "none?" => map.is_empty(),
+                    _ => true,
+                }
+            } else {
+                name != "any?"
             };
             Ok(Value::Bool(result))
         }
