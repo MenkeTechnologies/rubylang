@@ -2573,6 +2573,15 @@ fn dispatch_classref(
                 let recv = with_host(|h| h.class_ref(cls));
                 return crate::host::call_class_method(recv, &def, name, &owner, args, block);
             }
+            // A class-method alias registered on the singleton class via
+            // `singleton_class.alias_method :new_name, :old` — re-dispatch to the
+            // target (which may be a native class method like `new`, so this can't
+            // resolve to a `MethodDef`). concurrent-ruby: `Node.[]` aliases `new`.
+            if let Some(target) = with_host(|h| h.find_alias(&format!("#<Class:{cls}>"), name)) {
+                if target != name {
+                    return dispatch_classref(cls, &target, args, block);
+                }
+            }
             // A class/module object is an instance of `Class < Module`, so an
             // instance method added by reopening `class Module`/`class Class`
             // is callable on it, run with `self` bound to the class. This is how
