@@ -1521,11 +1521,20 @@ impl Parser {
                     let (args, blk) = self.call_tail()?;
                     (Some(args), blk)
                 } else if self.cur_space() && !is_block_next && self.starts_command_arg() {
-                    let mut args = vec![self.arg()?];
+                    // Command-style `super a, b, *rest, k: v, &blk` — parse via the
+                    // full arg parser so splats, keyword args, and a `&block` pass
+                    // are handled (concurrent-ruby: `super a, b, args, &task`).
+                    let mut args = Vec::new();
+                    let mut amp_block = None;
+                    let mut kwargs: Vec<(Expr, Expr)> = Vec::new();
+                    let mut kwsplats: Vec<Expr> = Vec::new();
+                    self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
                     while self.eat_op(",") {
-                        args.push(self.arg()?);
+                        self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
                     }
-                    (Some(args), self.maybe_block()?)
+                    Self::push_trailing_kwargs(&mut args, kwargs, kwsplats);
+                    let block = self.maybe_block()?.or(amp_block);
+                    (Some(args), block)
                 } else {
                     (None, self.maybe_block()?)
                 };
