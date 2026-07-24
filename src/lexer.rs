@@ -557,7 +557,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             b'%' if i + 2 < b.len()
                 && matches!(b[i + 1], b'q' | b'Q' | b'r' | b's')
                 && !b[i + 2].is_ascii_alphanumeric()
-                && !matches!(b[i + 2], b' ' | b'\t' | b'\n' | b'=') =>
+                && !matches!(b[i + 2], b' ' | b'\t' | b'\n' | b'=')
+                && !method_name_pos(&out) =>
             {
                 let letter = b[i + 1];
                 let open = b[i + 2];
@@ -615,7 +616,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             // the parser handles them as ordinary array literals.
             b'%' if i + 2 < b.len()
                 && matches!(b[i + 1], b'w' | b'i' | b'W' | b'I')
-                && matches!(b[i + 2], b'[' | b'(' | b'{' | b'<' | b'|') =>
+                && matches!(b[i + 2], b'[' | b'(' | b'{' | b'<' | b'|')
+                && !method_name_pos(&out) =>
             {
                 let symbols = matches!(b[i + 1], b'i' | b'I');
                 let open = b[i + 2];
@@ -683,7 +685,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             // delimiter immediately after `%` (a space means modulo).
             b'%' if i + 1 < b.len()
                 && matches!(b[i + 1], b'(' | b'{' | b'[' | b'<')
-                && percent_string_start(&out, sp) =>
+                && percent_string_start(&out, sp)
+                && !method_name_pos(&out) =>
             {
                 let open = b[i + 1];
                 let close = match open {
@@ -1052,16 +1055,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
 /// the previous real token is not a value (so `/` sits at an expression start),
 /// or — after a value — when there's a space before `/` but not after (the
 /// command-argument form `scan /re/`, versus `a / b` division).
-fn regex_start(out: &[Token], sp: bool, next: Option<u8>) -> bool {
-    let prev = out.iter().rev().find(|t| t.kind != Tok::Newline);
-    // In a method-name position — right after `def`, or after a `.`/`::` call dot
-    // — a `/` is the division operator method name (`def /(other)`, `x./(y)`),
-    // never a regex.
-    match prev.map(|t| &t.kind) {
-        Some(Tok::Keyword(k)) if k == "def" => return false,
-        Some(Tok::Op(o)) if o == "." || o == "::" || o == "&." => return false,
-        _ => {}
+/// True in a method-name position — right after `def`, or after a `.`/`::`/`&.`
+/// call dot — where an operator char (`/`, `%`, …) is a method name, not the
+/// start of a regex / percent-literal (`def /(o)`, `def %(o)`, `x./(y)`).
+fn method_name_pos(out: &[Token]) -> bool {
+    match out.iter().rev().find(|t| t.kind != Tok::Newline).map(|t| &t.kind) {
+        Some(Tok::Keyword(k)) if k == "def" => true,
+        Some(Tok::Op(o)) => o == "." || o == "::" || o == "&.",
+        _ => false,
     }
+}
+
+fn regex_start(out: &[Token], sp: bool, next: Option<u8>) -> bool {
+    if method_name_pos(out) {
+        return false;
+    }
+    let prev = out.iter().rev().find(|t| t.kind != Tok::Newline);
     let prev_is_value = match prev.map(|t| &t.kind) {
         None => false,
         Some(Tok::Int(_))
