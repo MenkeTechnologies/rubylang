@@ -1841,11 +1841,29 @@ pub(crate) fn dispatch(
     // Integers/Strings/Arrays/Hashes too. This runs *after* native dispatch so a
     // native method (e.g. Array#length) always wins over a same-named Object method.
     if let Err(ref e) = result {
-        if e.starts_with("undefined method")
-            && class != "Object"
-            && with_host(|h| h.find_method_owner("Object", name)).is_some()
-        {
-            return call_instance_method(recv.clone(), "Object", name, args, fallback_block);
+        if e.starts_with("undefined method") {
+            // A native-backed builtin subclass (StringInquirer < String,
+            // OrderedOptions < Hash) can define `method_missing` for dynamic
+            // methods (`prod?`, `foo=`); route there when native dispatch and the
+            // subclass's own methods didn't resolve the name.
+            let ovr = with_host(|h| h.class_of(recv));
+            if ovr != class && with_host(|h| h.find_method_owner(&ovr, "method_missing").is_some())
+            {
+                let mut mm_args = vec![with_host(|h| h.new_symbol(name))];
+                mm_args.extend_from_slice(args);
+                return call_instance_method(
+                    recv.clone(),
+                    &ovr,
+                    "method_missing",
+                    &mm_args,
+                    fallback_block,
+                );
+            }
+            if class != "Object"
+                && with_host(|h| h.find_method_owner("Object", name)).is_some()
+            {
+                return call_instance_method(recv.clone(), "Object", name, args, fallback_block);
+            }
         }
     }
     result
