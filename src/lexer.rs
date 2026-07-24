@@ -463,6 +463,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         s.push('{');
                         i += 2;
                         let mut depth = 1u32;
+                        // Track the previous significant byte so a `/` can be
+                        // classified as a regex start vs. a division operator.
+                        // `#{` opens an expression context, so a leading `/` is a
+                        // regex. Regex-start context = expression start or after an
+                        // operator/opening bracket.
+                        let mut last: u8 = b'{';
                         while i < b.len() && depth > 0 {
                             let d = b[i];
                             match d {
@@ -491,6 +497,54 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                                         s.push(q as char);
                                         i += 1;
                                     }
+                                    last = q;
+                                    continue;
+                                }
+                                b'/' if matches!(
+                                    last,
+                                    b'{' | b'(' | b'[' | b',' | b';' | b':' | b'='
+                                    | b'<' | b'>' | b'!' | b'&' | b'|' | b'^' | b'~'
+                                    | b'+' | b'-' | b'*' | b'/' | b'%' | b'?'
+                                ) =>
+                                {
+                                    // Skip a regex literal wholesale: quotes inside
+                                    // it are literal, not string delimiters. A `/`
+                                    // inside a `[...]` character class is literal too.
+                                    s.push('/');
+                                    i += 1;
+                                    let mut in_class = false;
+                                    while i < b.len() {
+                                        let c = b[i];
+                                        if c == b'\\' && i + 1 < b.len() {
+                                            s.push('\\');
+                                            s.push(b[i + 1] as char);
+                                            i += 2;
+                                            continue;
+                                        }
+                                        if c == b'[' {
+                                            in_class = true;
+                                        } else if c == b']' {
+                                            in_class = false;
+                                        } else if c == b'/' && !in_class {
+                                            break;
+                                        }
+                                        if c == b'\n' {
+                                            line += 1;
+                                        }
+                                        let cl = utf8_len(c);
+                                        s.push_str(&src[i..i + cl]);
+                                        i += cl;
+                                    }
+                                    if i < b.len() {
+                                        s.push('/');
+                                        i += 1;
+                                    }
+                                    // Regex flags (imxounse…).
+                                    while i < b.len() && b[i].is_ascii_alphabetic() {
+                                        s.push(b[i] as char);
+                                        i += 1;
+                                    }
+                                    last = b'/';
                                     continue;
                                 }
                                 b'\n' => line += 1,
@@ -500,6 +554,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                                 s.push('}');
                                 i += 1;
                                 break;
+                            }
+                            if !d.is_ascii_whitespace() {
+                                last = d;
                             }
                             let cl = utf8_len(d);
                             s.push_str(&src[i..i + cl]);
