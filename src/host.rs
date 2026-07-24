@@ -652,6 +652,12 @@ pub struct RubyHost {
     class_define_methods: IndexMap<String, IndexMap<String, Value>>,
     /// `alias_method`/`alias` mappings: class → alias name → target method name.
     method_aliases: IndexMap<String, IndexMap<String, String>>,
+    /// Modules that ran a bare `module_function` at runtime: their instance
+    /// methods are also callable as module (class) methods. The compile-time path
+    /// promotes direct class-body `def`s, but a `def` nested in an `if`/`else`
+    /// (rack's `Rack::Utils.escape_html`) is defined at runtime — this set lets
+    /// class-method dispatch fall back to such an instance method.
+    module_function_modules: std::collections::HashSet<String>,
     /// Class override for a native-backed instance of a *user subclass of a
     /// builtin collection* (`class Params < Hash`): heap id → user class name.
     /// The value stays a native `RObj::Hash`/`Array`/`Str` so builtin ops work
@@ -1261,6 +1267,7 @@ impl RubyHost {
             singleton_define_methods: IndexMap::new(),
             class_define_methods: IndexMap::new(),
             method_aliases: IndexMap::new(),
+            module_function_modules: std::collections::HashSet::new(),
             class_overrides: IndexMap::new(),
         };
         // Seed the standard streams as `STDOUT`/`STDERR`/`STDIN` constants and
@@ -3085,6 +3092,15 @@ impl RubyHost {
     }
     pub fn class_ref(&mut self, name: &str) -> Value {
         self.alloc(RObj::ClassRef(name.to_string()))
+    }
+    /// Flag `class` as having run a bare `module_function` (its instance methods
+    /// double as module methods).
+    pub fn mark_module_function(&mut self, class: &str) {
+        self.module_function_modules.insert(class.to_string());
+    }
+    /// Whether `class` (or an ancestor) ran a bare `module_function`.
+    pub fn is_module_function_module(&self, class: &str) -> bool {
+        self.module_function_modules.contains(class)
     }
     /// The class name of a user object, if `v` is one.
     pub fn object_class(&self, v: &Value) -> Option<String> {
@@ -5343,6 +5359,14 @@ fn run_method(
             return Ok(val);
         }
     }
+    // A synthetic class/module body (`__class_body__N`) runs with `self` = the
+    // class. A `def` directly in its body — including one nested in an `if`/`else`
+    // the compiler couldn't hoist — must register on that class, so make the class
+    // the active `def` target for the body's duration.
+    let class_body_target = match (&method_name, &def_class) {
+        (Some(n), Some(c)) if n.starts_with("__class_body__") => Some(c.clone()),
+        _ => None,
+    };
     let saved_active = with_host(|h| {
         let mut binding = h.bind_params(
             &def.params,
@@ -5375,7 +5399,10 @@ fn run_method(
     // Only touched when an eval is actually in flight (empty stack = no-op).
     let def_target_pushed = DEF_TARGET.with(|t| {
         let mut b = t.borrow_mut();
-        if b.is_empty() {
+        if let Some(cls) = &class_body_target {
+            b.push(DefTarget::Instance(cls.clone()));
+            true
+        } else if b.is_empty() {
             false
         } else {
             b.push(DefTarget::None);

@@ -442,6 +442,15 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
             };
         }
     }
+    // A bare `module_function` in a module body flags the module so its instance
+    // methods (including ones defined at runtime inside an `if`/`else`) double as
+    // module methods — see `is_module_function_module` and the classref fallback.
+    if name == "module_function" {
+        if let Some(cls) = with_host(|h| h.classref_name(&h.current_self())) {
+            with_host(|h| h.mark_module_function(&cls));
+        }
+        return Value::Undef;
+    }
     if with_host(|h| h.responds_to(&name)) {
         return match dispatch_call(&name, &[], None) {
             Ok(v) => propagate(vm, v),
@@ -1044,6 +1053,15 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
                 | "deprecate_constant"
                 | "ruby2_keywords"
         ) {
+            // A bare `module_function` (no args) in a module body flags the module
+            // so instance methods defined afterward — including ones defined at
+            // runtime inside an `if`/`else` the compile-time promotion can't see —
+            // are also reachable as module methods.
+            if name == "module_function" && args.is_empty() {
+                if let Some(cls) = with_host(|h| h.classref_name(&h.current_self())) {
+                    with_host(|h| h.mark_module_function(&cls));
+                }
+            }
             return Ok(match args {
                 [one] if name != "module_function" => one.clone(),
                 _ => Value::Undef,
@@ -3024,6 +3042,15 @@ fn dispatch_classref(
                         return Ok(with_host(|h| h.class_ref(&qualified)));
                     }
                 }
+            }
+            // A bare `module_function` module (`Rack::Utils`) exposes its instance
+            // methods as module methods too. When no class method matched above but
+            // the module ran `module_function` and defines the instance method
+            // (including one defined at runtime inside an `if`/`else`), dispatch it
+            // as an instance method with the class object as `self`.
+            if with_host(|h| h.is_module_function_module(cls) && h.is_method_defined(cls, name)) {
+                let recv = with_host(|h| h.class_ref(cls));
+                return call_instance_method(recv, cls, name, args, block);
             }
             // `Mod::Const` for an unresolved constant calls `Mod.const_missing`
             // (Rails autoloading depends on this). The `::` form reaches here as a

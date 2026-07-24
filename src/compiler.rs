@@ -1569,8 +1569,12 @@ impl Compiler {
                     }
                 }
                 // Bare `module_function` (parses as a local read) turns on the mode.
+                // Also emit it to the runtime body so the module is flagged for the
+                // class-method fallback (covers `def`s the compiler can't promote
+                // because they are nested in an `if`/`else`).
                 Expr::Var(VarKind::Local, v) if v == "module_function" => {
                     module_function_mode = true;
+                    init_body.push(stmt.clone());
                 }
                 // `module_function :a, :b` promotes the named (already-defined)
                 // instance methods to module methods.
@@ -1582,6 +1586,7 @@ impl Compiler {
                 } if m == "module_function" => {
                     if args.is_empty() {
                         module_function_mode = true;
+                        init_body.push(stmt.clone());
                     } else {
                         for a in args {
                             if let Some(field) = sym_name(a) {
