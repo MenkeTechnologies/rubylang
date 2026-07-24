@@ -897,7 +897,13 @@ impl Parser {
         if let Some(key) = self.peek_label() {
             self.advance(); // key
             self.advance(); // :
-            let v = self.arg()?;
+            // Ruby 3.1 shorthand: `f(x:)` ≡ `f(x: x)` — omitted value refers to
+            // the local variable / method named after the label.
+            let v = if self.label_value_omitted() {
+                Expr::Var(VarKind::Local, key.clone())
+            } else {
+                self.arg()?
+            };
             kwargs.push((Expr::Symbol(key), v));
             return Ok(());
         }
@@ -2482,13 +2488,28 @@ impl Parser {
         if let Some(name) = self.peek_label() {
             self.advance();
             self.advance();
-            let v = self.arg()?;
+            let v = if self.label_value_omitted() {
+                Expr::Var(VarKind::Local, name.clone())
+            } else {
+                self.arg()?
+            };
             return Ok((Expr::Symbol(name), v));
         }
         let k = self.arg()?;
         self.expect_op("=>")?;
         let v = self.arg()?;
         Ok((k, v))
+    }
+
+    /// True when a `label:` is immediately followed by a token that ends the pair
+    /// — Ruby 3.1 value-omitted shorthand (`{x:}`, `f(x:)`), where the value is
+    /// the local variable / method named after the label.
+    fn label_value_omitted(&self) -> bool {
+        self.is_op(",")
+            || self.is_op("}")
+            || self.is_op(")")
+            || self.is_op("]")
+            || matches!(self.peek(), Tok::Newline | Tok::Eof)
     }
 }
 
