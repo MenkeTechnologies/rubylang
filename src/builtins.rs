@@ -2883,6 +2883,10 @@ fn dispatch_classref(
             Some(sc) => h.class_ref(&sc),
             None => Value::Undef,
         })),
+        // `Module#singleton_class?` — true only for a singleton class, registered
+        // under the synthetic `#<Class:...>` name. activesupport's class_attribute
+        // branches on it to decide where to define the accessor.
+        "singleton_class?" => Ok(Value::Bool(cls.starts_with("#<Class:"))),
         // `Module.nesting` — best-effort. The runtime does not track the lexical
         // nesting of the call site (class bodies are flattened at compile time),
         // so this returns the empty array (correct at the top level; a namespaced
@@ -2932,6 +2936,11 @@ fn dispatch_classref(
             let m = name_of(&args[0]);
             Ok(Value::Bool(with_host(|h| h.is_method_defined(cls, &m))))
         }
+        // Visibility is not modeled — every defined method reads as public, so
+        // `private_method_defined?`/`protected_method_defined?` are false.
+        // activesupport's `silence_redefinition_of_method` guards on
+        // `method_defined?(m) || private_method_defined?(m)`; the first covers it.
+        "private_method_defined?" | "protected_method_defined?" => Ok(Value::Bool(false)),
         // `Module#class_variable_get/set/defined?` and `class_variables`. The
         // reflective name arrives with its `@@` sigil (`:@@x`); the store keys
         // are bare, so strip it.
