@@ -3058,10 +3058,15 @@ impl RubyHost {
                 .or_default()
                 .insert(alias_name.to_string(), proc);
         } else {
+            // The target is neither a user method nor a native method of a builtin
+            // base — e.g. a class-method alias of `new`/`allocate` (concurrent-ruby
+            // does `singleton_class.alias_method(:[], :new)`). A native-instance
+            // marker would not dispatch here, so store a plain name alias, resolved
+            // through the normal (class-)alias path.
             self.method_aliases
                 .entry(class.to_string())
                 .or_default()
-                .insert(alias_name.to_string(), format!("\u{1}native:{target}"));
+                .insert(alias_name.to_string(), target.to_string());
         }
     }
     /// If `target` is a `\x01native:<name>` marker (a snapshot alias of a native
