@@ -10707,6 +10707,34 @@ fn dispatch_hash(
             }
             Ok(with_host(|h| h.new_hash(out)))
         }
+        // In-place filters. `select!`/`keep_if` keep entries the block accepts;
+        // `reject!`/`delete_if` drop them. The `!` forms return the receiver when
+        // they changed it, else nil; `keep_if`/`delete_if` always return it.
+        // activesupport's Duration builds its parts hash then `reject!`s zeros.
+        "select!" | "filter!" | "keep_if" | "reject!" | "delete_if" => {
+            let keep_when = matches!(name, "select!" | "filter!" | "keep_if");
+            let mut out = IndexMap::new();
+            let mut changed = false;
+            if let Some(b) = &block {
+                for (k, v) in &map {
+                    let kv = with_host(|h| h.key_value(k));
+                    let r = call_proc(b, &[kv, v.clone()])?;
+                    let accepted = with_host(|h| h.truthy(&r));
+                    if accepted == keep_when {
+                        out.insert(k.clone(), v.clone());
+                    } else {
+                        changed = true;
+                    }
+                }
+            }
+            with_host(|h| h.set_hash(recv, out));
+            let bang = matches!(name, "select!" | "filter!" | "reject!");
+            if bang && !changed {
+                Ok(Value::Undef)
+            } else {
+                Ok(recv.clone())
+            }
+        }
         "transform_values" => {
             let mut out = IndexMap::new();
             if let Some(b) = &block {
