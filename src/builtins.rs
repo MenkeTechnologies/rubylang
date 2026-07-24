@@ -2889,10 +2889,17 @@ fn dispatch_classref(
                     &format!("uninitialized constant {cls}::{name}"),
                 ));
             }
-            Err(raise_exc(
-                "NoMethodError",
-                &format!("undefined method '{name}' for class {cls}"),
-            ))
+            // A Kernel function (`Array`/`Integer`/`format`/`puts`/…) is a private
+            // method of every object, including a class object, so a class receiver
+            // can invoke it — e.g. `method(:Array)` bound to a class and called via
+            // `flat_map(&method(:Array))` (sinatra's error handler registration).
+            match kernel(name, args, block) {
+                Err(e) if e.starts_with("undefined method") => Err(raise_exc(
+                    "NoMethodError",
+                    &format!("undefined method '{name}' for class {cls}"),
+                )),
+                other => other,
+            }
         }
     }
 }
@@ -11727,6 +11734,11 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
         })),
         "Array" => Ok(match with_host(|h| h.as_array(&args[0])) {
             Some(a) => with_host(|h| h.new_array(a)),
+            // A class/module has no `to_a`/`to_ary`, so wrap it as a one-element
+            // array without attempting a conversion that would raise.
+            None if with_host(|h| h.classref_name(&args[0])).is_some() => {
+                with_host(|h| h.new_array(vec![args[0].clone()]))
+            }
             // A hash converts to its `to_a` form: an array of `[key, value]`
             // pairs (`Array({a: 1}) # => [[:a, 1]]`).
             None => match with_host(|h| h.as_hash(&args[0])) {
