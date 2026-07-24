@@ -202,10 +202,19 @@ impl Parser {
     /// splat (`a, b = *arr`).
     fn multi_value(&mut self) -> Result<Expr, String> {
         if self.eat_op("*") {
-            Ok(Expr::Splat(Box::new(self.ternary()?)))
-        } else {
-            self.ternary()
+            return Ok(Expr::Splat(Box::new(self.ternary()?)));
         }
+        let lhs = self.ternary()?;
+        // A chained assignment as the RHS: `a, b = c = expr` assigns `expr` to `c`
+        // and yields its value for the outer destructure (rack: `_, _, body =
+        // response = @app.call(env)`). `==`/`<=`/etc. are consumed by `ternary`,
+        // so a bare `=` here is always an assignment.
+        if self.is_op("=") {
+            self.advance();
+            let rhs = self.multi_value()?;
+            return Ok(Expr::Assign(Box::new(lhs), Box::new(rhs)));
+        }
+        Ok(lhs)
     }
 
     /// A statement is an expression optionally followed by a trailing modifier
