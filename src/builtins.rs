@@ -2411,8 +2411,26 @@ fn dispatch_classref(
                 } else {
                     None
                 };
-                let name = with_host(|h| h.define_anon_class(superclass));
+                let name = with_host(|h| h.define_anon_class(superclass.clone()));
                 let cref = with_host(|h| h.class_ref(&name));
+                // Fire the superclass's `inherited` hook — MRI runs it when the
+                // class is created (before the body block), just as the compiler
+                // does for a static `class X < Y`. Without this a runtime
+                // `Class.new(Super)` skips per-subclass setup an `inherited` hook
+                // performs (e.g. mustermann's per-subclass NodeTranslator).
+                if let Some(sc) = &superclass {
+                    if let Some(def) = with_host(|h| h.find_class_method(sc, "inherited")) {
+                        let recv = with_host(|h| h.class_ref(sc));
+                        crate::host::call_class_method(
+                            recv,
+                            &def,
+                            "inherited",
+                            sc,
+                            &[cref.clone()],
+                            None,
+                        )?;
+                    }
+                }
                 if let Some(bl) = block {
                     crate::host::eval_block_scoped(
                         &bl,
