@@ -10134,9 +10134,17 @@ fn dispatch_hash(
         "delete" => {
             let mut m = map;
             let k = with_host(|h| h.value_to_key(&args[0]));
-            let v = m.shift_remove(&k).unwrap_or(Value::Undef);
+            let removed = m.shift_remove(&k);
             with_host(|h| h.set_hash(recv, m));
-            Ok(v)
+            match removed {
+                Some(v) => Ok(v),
+                // On a missing key, `delete(k) { |k| … }` returns the block's value
+                // (mustermann: `options.delete(:cache) { true }`); else nil.
+                None => match &block {
+                    Some(bl) => call_proc(bl, std::slice::from_ref(&args[0])),
+                    None => Ok(Value::Undef),
+                },
+            }
         }
         "merge" => {
             // `merge` with no argument returns a copy; each hash argument is
