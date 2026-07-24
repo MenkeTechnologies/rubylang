@@ -5000,6 +5000,13 @@ fn dispatch_string(
             Ok(recv.clone())
         }
         "encode" => Ok(new_str(s.clone())),
+        // In-place transcode: content is stored as UTF-8, so this is a no-op that
+        // clears any BINARY tag and returns the receiver. sinatra's force_encoding
+        // does `val.force_encoding(enc).encode!` on every captured route param.
+        "encode!" => {
+            with_host(|h| h.unmark_binary_string(recv));
+            Ok(recv.clone())
+        }
         // We store UTF-8 byte content; `encoding` names UTF-8 unless the string was
         // tagged ASCII-8BIT (`String#b` / `force_encoding("BINARY")`). The returned
         // Encoding object answers `name`/`to_s`/`inspect` (dispatched in
@@ -10781,7 +10788,15 @@ fn dispatch_hash(
                     }
                 }
             }
-            Ok(Value::Bool(name != "any?"))
+            // No block: a `[k, v]` pair is always truthy, so `any?` is `!empty?`,
+            // `none?` is `empty?`, and `all?` is always true (vacuously for an
+            // empty hash). sinatra guards `@params.merge(captures) if params.any?`.
+            let result = match name {
+                "any?" => !map.is_empty(),
+                "none?" => map.is_empty(),
+                _ => true,
+            };
+            Ok(Value::Bool(result))
         }
         // Enumerable methods that iterate the hash as `[k, v]` pairs: delegate
         // to the array of pairs (blocks receive the pair, auto-splat to `|k, v|`
