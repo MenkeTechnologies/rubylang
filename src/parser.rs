@@ -366,7 +366,11 @@ impl Parser {
     /// assignment from the resolved target; a plain lvalue just uses it directly.
     fn rebind_assign<F: Fn(Expr) -> Expr>(lhs: Expr, make: &F) -> Expr {
         match lhs {
-            Expr::Binary(op @ (BinOp::Or | BinOp::And), a, b) => {
+            // The assignment binds to the operator's right operand, not the whole
+            // expression: `x || y = z` → `x || (y = z)`, and the shovel idiom
+            // `arr << x = val` → `arr << (x = val)` (activesupport `groups <<
+            // last_group = slice(...)`).
+            Expr::Binary(op @ (BinOp::Or | BinOp::And | BinOp::Shl), a, b) => {
                 Expr::Binary(op, a, Box::new(Self::rebind_assign(*b, make)))
             }
             other => make(other),
