@@ -1711,6 +1711,23 @@ fn dispatch_bool(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
     }
 }
 
+/// Dispatch `recv.name(args)` as a *probe* — a conversion (`to_a`/`to_ary`/
+/// `to_str`/`coerce`/…) the caller falls back on when it is absent. `raise_exc`
+/// records a pending exception on failure; a probe that swallows the Rust `Err`
+/// must clear it, else it surfaces at the next VM boundary as a spurious raise
+/// (this silently broke sinatra's `Array(sym)`/`Array(class)` conversions).
+fn probe_dispatch(recv: &Value, name: &str, args: &[Value]) -> Option<Value> {
+    match dispatch(recv, name, args, None) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            with_host(|h| {
+                h.take_pending_exc();
+            });
+            None
+        }
+    }
+}
+
 /// Methods on a class reference: `new` (allocate + `initialize`), `name`.
 fn dispatch_classref(
     cls: &str,
@@ -11762,8 +11779,7 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
                 None if matches!(args[0], Value::Undef) => with_host(|h| h.new_array(vec![])),
                 // An object with a `to_a` (MatchData, Struct, Set, Range, …)
                 // converts through it; anything else becomes a one-element array.
-                None => match dispatch(&args[0], "to_a", &[], None)
-                    .ok()
+                None => match probe_dispatch(&args[0], "to_a", &[])
                     .and_then(|v| with_host(|h| h.as_array(&v)))
                 {
                     Some(a) => with_host(|h| h.new_array(a)),
