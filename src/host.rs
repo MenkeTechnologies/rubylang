@@ -3389,10 +3389,11 @@ impl RubyHost {
             }
             for module in def.extends.iter().rev() {
                 let nested = format!("{name}::{module}");
-                for cand in [&nested, module] {
-                    if let Some(md) = self.classes.get(cand) {
-                        if let Some(m) = md.methods.get(method) {
-                            return Some((m.clone(), name.clone()));
+                for cand in [nested.as_str(), module] {
+                    if self.classes.contains_key(cand) {
+                        // Resolve through the module's own aliases and includes.
+                        if let Some((m, _)) = self.find_in_module(cand, method) {
+                            return Some((m, name.clone()));
                         }
                     }
                 }
@@ -3417,10 +3418,10 @@ impl RubyHost {
             // first, then the stored/top-level name.
             for module in def.extends.iter().rev() {
                 let nested = format!("{name}::{module}");
-                for cand in [&nested, module] {
-                    if let Some(md) = self.classes.get(cand) {
-                        if let Some(m) = md.methods.get(method) {
-                            return Some(m.clone());
+                for cand in [nested.as_str(), module] {
+                    if self.classes.contains_key(cand) {
+                        if let Some((m, _)) = self.find_in_module(cand, method) {
+                            return Some(m);
                         }
                     }
                 }

@@ -13409,6 +13409,7 @@ pub(crate) fn embedded_stdlib(name: &str) -> Option<&'static str> {
     let n = name.strip_suffix(".rb").unwrap_or(name);
     match n {
         "uri" => Some(include_str!("../stdlib/uri.rb")),
+        "forwardable" => Some(include_str!("../stdlib/forwardable.rb")),
         "csv" => Some(include_str!("../stdlib/csv.rb")),
         "optparse" => Some(include_str!("../stdlib/optparse.rb")),
         "yaml" | "psych" => Some(include_str!("../stdlib/yaml.rb")),
@@ -13434,7 +13435,6 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "pp"
             | "prettyprint"
             | "ostruct"
-            | "forwardable"
             | "singleton"
             | "comparable"
             | "enumerable"
