@@ -2033,6 +2033,7 @@ fn dispatch_classref(
             "GBK" => Some("GBK"),
             "SHIFT_JIS" | "SJIS" => Some("Shift_JIS"),
             "EUC_JP" => Some("EUC-JP"),
+            "ISO_2022_JP" => Some("ISO-2022-JP"),
             "ISO_8859_1" | "ISO8859_1" => Some("ISO-8859-1"),
             "Windows_1252" | "WINDOWS_1252" => Some("Windows-1252"),
             _ => None,
