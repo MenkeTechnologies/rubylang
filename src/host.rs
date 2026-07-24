@@ -5331,9 +5331,14 @@ pub fn run_required_main(chunk: Chunk) -> Result<Value, String> {
     let saved_active = with_host(|h| {
         h.frames.push(Frame {
             scope: Scope {
+                // A required file always runs at the top level with `self` = the
+                // `main` object (heap slot 0), regardless of where `require` was
+                // called from. Using nil here broke a top-level `require` inside a
+                // file that was itself required from a class body (concurrent-ruby
+                // → `require` on nil).
                 locals: new_env(),
                 block: None,
-                self_obj: Value::Undef,
+                self_obj: Value::Obj(0),
                 method_name: None,
                 def_class: None,
             },
