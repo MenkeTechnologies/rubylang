@@ -725,11 +725,20 @@ impl Parser {
                 // (`foo ::Bar` → `foo(::Bar)`), so require no preceding space.
                 self.advance();
                 let name = self.method_name()?;
+                // `Foo::bar(args){blk}` is a method call via `::` (equivalent to
+                // `Foo.bar(...)`), used for module functions. Parse the call tail
+                // only when `(` immediately follows; a bare `Foo::Bar` stays a
+                // no-arg constant/method access.
+                let (args, block) = if self.is_op("(") && !self.cur_space() {
+                    self.dot_call_tail()?
+                } else {
+                    (vec![], None)
+                };
                 e = Expr::Call {
                     recv: Some(Box::new(e)),
                     name,
-                    args: vec![],
-                    block: None,
+                    args,
+                    block,
                 };
             } else {
                 break;
