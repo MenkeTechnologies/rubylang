@@ -5588,6 +5588,19 @@ pub fn call_super_blk(
                 .unwrap_or(false);
             return Ok(Value::Bool(ans));
         }
+        // `super` from a user override of `respond_to?` (`name == :x || super`):
+        // the default `Object#respond_to?` reports whether the object actually
+        // has the named method. Compute directly to avoid re-entering the override.
+        if method == "respond_to?" {
+            let args = explicit_args.clone().unwrap_or_else(|| cur_args.clone());
+            let mname = args.first().map(|a| with_host(|h| h.to_s(a))).unwrap_or_default();
+            let cls = with_host(|h| h.class_of(&self_obj));
+            let ans = with_host(|h| {
+                h.is_method_defined(&cls, &mname)
+                    || h.attr_access(&cls, &mname).is_some()
+            });
+            return Ok(Value::Bool(ans));
+        }
         // `super` from a `def self.new` override — the default `Class#new`:
         // allocate an instance of the *receiver* class (so a subclass's `new`
         // makes the subclass) and run its `initialize`.

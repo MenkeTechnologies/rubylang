@@ -1618,6 +1618,24 @@ pub(crate) fn dispatch(
             match name_of(&args[0]).as_str() {
                 "deconstruct" => return Ok(Value::Bool(with_host(|h| h.is_a(recv, "Array")))),
                 "deconstruct_keys" => return Ok(Value::Bool(with_host(|h| h.is_a(recv, "Hash")))),
+                // The strict *implicit conversion* protocol: only the exact
+                // builtin type responds. Gems branch on these to tell a real
+                // String/Integer/Array/Hash from something merely coercible —
+                // rack-protection's `frame_options.respond_to?(:to_str)` must be
+                // false for a Symbol so the Symbol gets `.to_s.upcase` first.
+                "to_str" => return Ok(Value::Bool(with_host(|h| h.is_a(recv, "String")))),
+                "to_int" => return Ok(Value::Bool(with_host(|h| h.is_a(recv, "Integer")))),
+                "to_ary" => return Ok(Value::Bool(with_host(|h| h.is_a(recv, "Array")))),
+                "to_hash" => return Ok(Value::Bool(with_host(|h| h.is_a(recv, "Hash")))),
+                // String-only encoding/mutation surface — gems probe these to tell
+                // a String from any other value (sinatra's `force_encoding` walks
+                // `respond_to?(:force_encoding)` then `:each_value`/`:each`, so a
+                // Hash must report the String method absent to reach the Hash arm).
+                "force_encoding" | "encode" | "encode!" | "encoding" | "unpack"
+                | "unpack1" | "valid_encoding?" | "scrub" | "bytesize" | "getbyte"
+                | "setbyte" | "b" => {
+                    return Ok(Value::Bool(with_host(|h| h.is_a(recv, "String"))))
+                }
                 // Class-only methods are never instance methods of a value: a
                 // Symbol/String/Integer does not respond to `new`/`allocate`.
                 // mustermann's `Mustermann[type]` branches on `type.respond_to?
@@ -5519,6 +5537,17 @@ fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value,
         }
         "pre_match" => Ok(new_str(pre)),
         "post_match" => Ok(new_str(post)),
+        // `#regexp` — the pattern the match ran against. The runtime does not
+        // retain it on the MatchData, so report nil; mustermann's
+        // `Match#initialize` then falls back to `pattern.regexp`.
+        "regexp" => Ok(Value::Undef),
+        // `#string` — the entire subject the match ran against: the text before
+        // the match, the whole match, and the text after. mustermann's
+        // `Match#initialize` captures it via `match.string`.
+        "string" => {
+            let matched = groups.first().and_then(|o| o.clone()).unwrap_or_default();
+            Ok(new_str(format!("{pre}{matched}{post}")))
+        }
         "to_a" => Ok(new_arr(groups.iter().map(strv).collect())),
         "captures" => Ok(new_arr(groups.iter().skip(1).map(strv).collect())),
         "to_s" => Ok(strv(groups.first().unwrap_or(&None))),
@@ -10515,6 +10544,31 @@ fn dispatch_hash(
                 for (k, v) in &map {
                     let kv = with_host(|h| h.key_value(k));
                     call_proc(b, &[kv, v.clone()])?;
+                    if has_pending_signal() {
+                        take_break();
+                        break;
+                    }
+                }
+            }
+            Ok(recv.clone())
+        }
+        "each_value" => {
+            if let Some(b) = &block {
+                for v in map.values() {
+                    call_proc(b, &[v.clone()])?;
+                    if has_pending_signal() {
+                        take_break();
+                        break;
+                    }
+                }
+            }
+            Ok(recv.clone())
+        }
+        "each_key" => {
+            if let Some(b) = &block {
+                for k in map.keys() {
+                    let kv = with_host(|h| h.key_value(k));
+                    call_proc(b, &[kv])?;
                     if has_pending_signal() {
                         take_break();
                         break;
