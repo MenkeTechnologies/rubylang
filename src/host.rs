@@ -5290,6 +5290,26 @@ pub fn call_super_blk(
             }
             return Ok(Value::Undef);
         }
+        // `super` from a `def self.new` override — the default `Class#new`:
+        // allocate an instance of the *receiver* class (so a subclass's `new`
+        // makes the subclass) and run its `initialize`.
+        if method == "new" {
+            let args = explicit_args.unwrap_or(cur_args);
+            let target =
+                with_host(|h| h.classref_name(&self_obj)).unwrap_or_else(|| recv_class.clone());
+            let obj = with_host(|h| h.new_object(&target));
+            if let Some((def, owner)) = with_host(|h| h.find_method_owner(&target, "initialize")) {
+                run_method(
+                    &def,
+                    obj.clone(),
+                    &args,
+                    block_override,
+                    Some("initialize".into()),
+                    Some(owner),
+                )?;
+            }
+            return Ok(obj);
+        }
         return Err(format!("super: no superclass method '{method}'"));
     };
     let args = explicit_args.unwrap_or(cur_args);

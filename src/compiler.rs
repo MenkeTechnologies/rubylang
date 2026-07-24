@@ -535,8 +535,8 @@ impl Compiler {
                 name,
                 params,
                 body,
+                singleton,
                 singleton_recv,
-                ..
             } => {
                 match singleton_recv {
                     // `def obj.m` / `def Klass.m` — evaluate the receiver and
@@ -545,6 +545,19 @@ impl Compiler {
                     Some(recv) => {
                         let synth = self.stash_method(params, body)?;
                         self.compile_expr(b, recv)?;
+                        self.kstr(b, name);
+                        self.kstr(b, &synth);
+                        b.emit(Op::CallBuiltin(ops::DEFINE_SINGLETON, 3), 0);
+                    }
+                    // `def self.m` in a runtime position (inside a conditional /
+                    // loop, not the class body's top level where it is extracted
+                    // at compile time) — register as a singleton method on the
+                    // current `self`, i.e. a class method when self is a class
+                    // (concurrent-ruby defines `def self.full_memory_barrier`
+                    // inside a `case … else`).
+                    None if *singleton => {
+                        let synth = self.stash_method(params, body)?;
+                        self.compile_expr(b, &Expr::SelfExpr)?;
                         self.kstr(b, name);
                         self.kstr(b, &synth);
                         b.emit(Op::CallBuiltin(ops::DEFINE_SINGLETON, 3), 0);
