@@ -11118,6 +11118,57 @@ fn regex_escape(s: &str) -> String {
     out
 }
 
+/// The named capture groups of a regex source as `(name, group_index)` pairs, in
+/// source order (`(?<name>…)` / `(?'name'…)`). Group indices count capturing
+/// groups only — `(?:…)`, lookarounds, and atomic groups do not advance the count.
+fn regex_named_groups(source: &str) -> Vec<(String, i64)> {
+    let b = source.as_bytes();
+    let mut out = Vec::new();
+    let mut group_index = 0i64;
+    let mut i = 0;
+    let mut in_class = false; // inside `[...]`, `(` is literal
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                i += 2; // skip an escaped char
+                continue;
+            }
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'(' if !in_class => {
+                if b.get(i + 1) == Some(&b'?') {
+                    // `(?<name>` / `(?'name'` is a named capture; `(?<=`/`(?<!`
+                    // are lookbehind (no capture); `(?:`/`(?=`/`(?!`/`(?>` no capture.
+                    let after = b.get(i + 2).copied();
+                    let named = (after == Some(b'<')
+                        && !matches!(b.get(i + 3), Some(b'=') | Some(b'!')))
+                        || after == Some(b'\'');
+                    if named {
+                        group_index += 1;
+                        let close = if after == Some(b'\'') { b'\'' } else { b'>' };
+                        let start = i + 3;
+                        let mut j = start;
+                        while j < b.len() && b[j] != close {
+                            j += 1;
+                        }
+                        if let Ok(nm) = std::str::from_utf8(&b[start..j]) {
+                            out.push((nm.to_string(), group_index));
+                        }
+                        i = j + 1;
+                        continue;
+                    }
+                    // Any other `(?…)` is a non-capturing construct.
+                } else {
+                    group_index += 1; // a plain capturing group
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
 fn dispatch_regexp(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     let (re, source) = with_host(|h| h.as_regex(recv)).unwrap();
     match name {
@@ -11163,7 +11214,36 @@ fn dispatch_regexp(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
             let flags = with_host(|h| h.regex_flags(recv)).unwrap_or_default();
             Ok(Value::Bool(flags.contains('i')))
         }
-        "names" => Ok(new_arr(Vec::new())),
+        // `named_captures` — `{ "name" => [group_index, …] }`; `names` — the
+        // capture names in order. Parsed from the source (`(?<name>…)`).
+        "named_captures" => {
+            let groups = regex_named_groups(&source);
+            let mut map: IndexMap<RKey, Value> = IndexMap::new();
+            for (nm, idx) in groups {
+                let key = RKey::Str(nm);
+                match map.get_mut(&key) {
+                    Some(v) => {
+                        if let Some(mut arr) = with_host(|h| h.as_array(v)) {
+                            arr.push(Value::Int(idx));
+                            *v = new_arr(arr);
+                        }
+                    }
+                    None => {
+                        map.insert(key, new_arr(vec![Value::Int(idx)]));
+                    }
+                }
+            }
+            Ok(with_host(|h| h.new_hash(map)))
+        }
+        "names" => {
+            let mut seen: Vec<String> = Vec::new();
+            for (nm, _) in regex_named_groups(&source) {
+                if !seen.contains(&nm) {
+                    seen.push(nm);
+                }
+            }
+            Ok(new_arr(seen.into_iter().map(new_str).collect()))
+        }
         "to_s" => {
             // `(?<on>-<off>:source)` — Ruby renders the on/off flag groups.
             let flags = with_host(|h| h.regex_flags(recv)).unwrap_or_default();
