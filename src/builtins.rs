@@ -455,6 +455,15 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
             }
         }
     }
+    // A bare name identical to the method currently running, with no such local
+    // bound, reads as nil: it is a local assigned only on an unexecuted path,
+    // shadowing the method (Ruby hoists locals to nil from their parse position).
+    // Dispatching it would re-enter the method and recurse forever. mustermann's
+    // `converter` method reads its own local `converter` via `return unless
+    // converter` after a `case` that may not have assigned it.
+    if with_host(|h| h.super_context().1).as_deref() == Some(name.as_str()) {
+        return Value::Undef;
+    }
     // A bare `module_function` in a module body flags the module so its instance
     // methods (including ones defined at runtime inside an `if`/`else`) double as
     // module methods — see `is_module_function_module` and the classref fallback.
