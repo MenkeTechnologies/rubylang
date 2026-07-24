@@ -1070,6 +1070,18 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
             }
         }
     }
+    // A bare call inside a method whose `self` is a builtin-typed value (String,
+    // Array, Hash, Integer, …): dispatch its native/reopened methods FIRST, so
+    // `transform_keys { … }` / `map(&:sym)` inside a reopened builtin method reach
+    // the native method rather than a same-named global (mirrors the argless
+    // path in `b_getlocal`). A genuine miss falls through to the global path.
+    if with_host(|h| h.object_class(&this).is_none() && h.classref_name(&this).is_none()) {
+        match dispatch(&this, name, args, block.clone()) {
+            Ok(v) => return Ok(v),
+            Err(e) if e.starts_with("undefined method") => {}
+            Err(e) => return Err(e),
+        }
+    }
     if with_host(|h| h.responds_to(name)) {
         return call_method(name, args, block);
     }
