@@ -3552,10 +3552,26 @@ impl RubyHost {
         }
         None
     }
+    /// The builtin superclass of a reopened builtin class that carries no
+    /// recorded `superclass` — so a method added to a reopened `Numeric` is found
+    /// from an `Integer` receiver. activesupport reopens `Numeric` with
+    /// `days`/`hours`/… that `Integer`/`Float` must inherit.
+    fn builtin_superclass(name: &str) -> Option<String> {
+        match name {
+            "Integer" | "Float" | "Rational" | "Complex" => Some("Numeric".to_string()),
+            _ => None,
+        }
+    }
     pub fn find_method_owner(&self, class: &str, method: &str) -> Option<(MethodDef, String)> {
         let mut cur = Some(class.to_string());
         while let Some(name) = cur {
-            let def = self.classes.get(&name)?;
+            let Some(def) = self.classes.get(&name) else {
+                // Not reopened: skip to the builtin superclass so a plain `Float`
+                // still inherits a reopened `Numeric`. `builtin_superclass` is
+                // `None` for non-numeric builtins, so they still stop immediately.
+                cur = Self::builtin_superclass(&name);
+                continue;
+            };
             // Prepended modules sit ahead of the class's own methods (last
             // prepend wins, matching Ruby's reverse-order ancestor insertion).
             for module in def.prepends.iter().rev() {
@@ -3587,7 +3603,11 @@ impl RubyHost {
                     return Some(r);
                 }
             }
-            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &name));
+            cur = def
+                .superclass
+                .clone()
+                .map(|s| self.resolve_class_alias(&s, &name))
+                .or_else(|| Self::builtin_superclass(&name));
         }
         None
     }
