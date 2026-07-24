@@ -2770,9 +2770,11 @@ fn dispatch_classref(
             // name is a constant lookup under the fully-qualified path.
             if args.is_empty() && name.chars().next().is_some_and(|c| c.is_uppercase()) {
                 let qualified = format!("{cls}::{name}");
-                let v = with_host(|h| h.get_const(&qualified));
-                if !matches!(v, Value::Undef) {
-                    return Ok(v);
+                // A registered constant — return its value even when nil (a
+                // deliberately-nil constant like `File::ALT_SEPARATOR` reads back
+                // as nil rather than falling through to `const_missing`/NameError).
+                if with_host(|h| h.has_const(&qualified)) {
+                    return Ok(with_host(|h| h.get_const(&qualified)));
                 }
                 if with_host(|h| h.class_exists(&qualified)) {
                     return Ok(with_host(|h| h.class_ref(&qualified)));
@@ -2864,9 +2866,10 @@ fn const_lookup_under(cls: &str, name: &str) -> Option<Value> {
 /// class reference for a name that denotes a (user or builtin) class.
 fn const_lookup(name: &str) -> Option<Value> {
     with_host(|h| {
-        let v = h.get_const(name);
-        if !matches!(v, Value::Undef) {
-            return Some(v);
+        // A registered constant — return its value even when nil (a deliberately
+        // nil constant like `File::ALT_SEPARATOR` must read back as nil, not raise).
+        if h.has_const(name) {
+            return Some(h.get_const(name));
         }
         if h.class_exists(name) || h.is_builtin_class(name) {
             return Some(h.class_ref(name));

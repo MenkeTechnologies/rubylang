@@ -2456,6 +2456,13 @@ impl RubyHost {
     pub fn get_const(&self, name: &str) -> Value {
         self.consts.get(name).cloned().unwrap_or(Value::Undef)
     }
+    /// Whether `name` is a registered constant — true even when its value is nil
+    /// (`Value::Undef`), which `get_const` cannot distinguish from unset. Lets a
+    /// deliberately-nil constant (`File::ALT_SEPARATOR = nil`) read back as nil
+    /// instead of raising `uninitialized constant`.
+    pub fn has_const(&self, name: &str) -> bool {
+        self.consts.contains_key(name)
+    }
     pub fn set_const(&mut self, name: &str, v: Value) {
         self.consts.insert(name.to_string(), v);
     }

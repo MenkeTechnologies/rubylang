@@ -180,6 +180,13 @@ module RbConfig
   }
 end
 
+class File
+  SEPARATOR = "/"
+  ALT_SEPARATOR = nil
+  PATH_SEPARATOR = ":"
+  Separator = "/"
+end
+
 class ObjectSpace::WeakMap
   def initialize; @__wm = {}; end
   def [](k); @__wm[k]; end
