@@ -1046,12 +1046,7 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
                     | "ancestors"
                     | "superclass"
             )
-            || with_host(|h| {
-                h.find_class_method(&cls, name).is_some()
-                    || h.find_class_define_method(&cls, name).is_some()
-                    || h.find_method("Class", name).is_some()
-                    || h.find_method("Module", name).is_some()
-            })
+            || with_host(|h| h.class_responds_to(&cls, name))
         {
             return dispatch_classref(&cls, name, args, block);
         }
