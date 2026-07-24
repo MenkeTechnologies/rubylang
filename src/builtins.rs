@@ -10686,6 +10686,18 @@ fn dispatch_method(
         // `Method#unbind` — drop the receiver, yielding an UnboundMethod.
         "unbind" => Ok(with_host(|h| h.new_method(Value::Undef, &mname))),
         "arity" => Ok(Value::Int(with_host(|h| h.method_arity(&mrecv, &mname)))),
+        "parameters" => Ok(with_host(|h| {
+            let pairs = h.method_parameters(&mrecv, &mname);
+            let arr: Vec<Value> = pairs
+                .iter()
+                .map(|(kind, pname)| {
+                    let k = h.new_symbol(kind);
+                    let n = h.new_symbol(pname);
+                    h.new_array(vec![k, n])
+                })
+                .collect();
+            h.new_array(arr)
+        })),
         "name" => Ok(with_host(|h| h.new_symbol(&mname))),
         "receiver" => Ok(mrecv),
         // A `Method` is itself callable via `call_proc`, so `to_proc` is identity.

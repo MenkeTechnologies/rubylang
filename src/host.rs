@@ -2131,6 +2131,36 @@ impl RubyHost {
     /// positional parameters, negated (`-(n+1)`) when a `*rest` splat is present.
     /// For a built-in method the exact arity is unknown here, so it reports `-1`
     /// (variadic), matching Ruby's convention for optional/variadic methods.
+    /// `Method#parameters` descriptors: `(kind, name)` pairs. Optional-vs-required
+    /// and keyreq-vs-key aren't tracked (no default info on `MethodDef`), so
+    /// positional params report `req` and keyword params `key`; the splat/kwsplat/
+    /// block kinds (which delegation forwarding actually keys on) are exact.
+    pub fn method_parameters(&self, recv: &Value, name: &str) -> Vec<(&'static str, String)> {
+        let def = if let Some(cls) = self.object_class(recv) {
+            self.find_method_owner(&cls, name).map(|(d, _)| d)
+        } else if let Some(cls) = self.classref_name(recv) {
+            self.find_class_method(&cls, name)
+        } else {
+            self.methods.get(name).cloned()
+        };
+        let mut out = Vec::new();
+        if let Some(d) = def {
+            for (i, p) in d.params.iter().enumerate() {
+                let pname = p.trim_start_matches('*').to_string();
+                out.push((if Some(i) == d.splat { "rest" } else { "req" }, pname));
+            }
+            for k in &d.kwparams {
+                out.push(("key", k.clone()));
+            }
+            if let Some(ks) = &d.kwsplat {
+                out.push(("keyrest", ks.trim_start_matches('*').to_string()));
+            }
+            if let Some(bp) = &d.blockparam {
+                out.push(("block", bp.trim_start_matches('&').to_string()));
+            }
+        }
+        out
+    }
     pub fn method_arity(&self, recv: &Value, name: &str) -> i64 {
         let def = if let Some(cls) = self.object_class(recv) {
             self.find_method_owner(&cls, name).map(|(d, _)| d)
