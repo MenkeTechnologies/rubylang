@@ -474,6 +474,9 @@ pub struct BeginDef {
 #[derive(Clone)]
 pub struct RescueDef {
     pub classes: Vec<String>,
+    /// Proc id of a `rescue *expr` splat body (evaluates to a class or array of
+    /// classes), matched at runtime in addition to `classes`. `None` when absent.
+    pub splat: Option<usize>,
     pub binding: Option<String>,
     pub body: usize,
 }
@@ -5211,11 +5214,31 @@ pub fn run_begin(begin_id: usize) -> Result<Value, String> {
         let mut handled = false;
         let mut retrying = false;
         for rd in &bd.rescues {
-            let matches = rd.classes.is_empty()
-                || rd
-                    .classes
-                    .iter()
-                    .any(|c| with_host(|h| h.exc_matches(&exc_class, c)));
+            // A bare `rescue` (no classes, no splat) catches StandardError.
+            let is_bare = rd.classes.is_empty() && rd.splat.is_none();
+            let static_match = rd
+                .classes
+                .iter()
+                .any(|c| with_host(|h| h.exc_matches(&exc_class, c)));
+            // A `rescue *expr` splat: run its proc for the class(es) and match.
+            let splat_match = if !is_bare && !static_match {
+                match rd.splat {
+                    Some(sid) => {
+                        let cv = run_template(sid, &[])?;
+                        let names: Vec<String> = with_host(|h| match h.as_array(&cv) {
+                            Some(arr) => arr.iter().filter_map(|v| h.classref_name(v)).collect(),
+                            None => h.classref_name(&cv).into_iter().collect(),
+                        });
+                        names
+                            .iter()
+                            .any(|c| with_host(|h| h.exc_matches(&exc_class, c)))
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+            let matches = is_bare || static_match || splat_match;
             if matches {
                 let args = if rd.binding.is_some() {
                     vec![excv.clone()]

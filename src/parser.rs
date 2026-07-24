@@ -284,6 +284,7 @@ impl Parser {
                     body: vec![e.into()],
                     rescues: vec![Rescue {
                         classes: vec![],
+                        splat: None,
                         binding: None,
                         body: vec![handler.into()],
                     }],
@@ -461,6 +462,7 @@ impl Parser {
                 body: vec![e.into()],
                 rescues: vec![Rescue {
                     classes: vec![],
+                    splat: None,
                     binding: None,
                     body: vec![handler.into()],
                 }],
@@ -2065,10 +2067,21 @@ impl Parser {
         let mut rescues = Vec::new();
         while self.eat_kw("rescue") {
             let mut classes = Vec::new();
+            let mut splat = None;
             // optional list of exception class names, each possibly namespaced
             // (`rescue Foo::Bar => e`) or top-level-scoped (`rescue ::NameError`)
-            // — stored under its qualified name.
+            // — stored under its qualified name. A `*expr` entry (`rescue
+            // *error_classes => e`) is a runtime array of classes, evaluated at
+            // match time.
             loop {
+                if self.is_op("*") {
+                    self.advance(); // *
+                    splat = Some(self.ternary()?);
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                    continue;
+                }
                 self.eat_op("::"); // optional leading top-level `::`
                 let Tok::Const(c) = self.peek().clone() else {
                     break;
@@ -2105,6 +2118,7 @@ impl Parser {
             let body = self.body_until(&["rescue", "else", "ensure", "end"])?;
             rescues.push(Rescue {
                 classes,
+                splat,
                 binding,
                 body,
             });

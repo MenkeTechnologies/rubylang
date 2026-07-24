@@ -54,8 +54,9 @@ type CClass = (
     Vec<String>,
     Vec<CMethod>,
 );
-/// (rescue classes, binding, proc id) — a serde-flat rescue clause.
-type CRescue = (Vec<String>, Option<String>, usize);
+/// (rescue classes, splat proc id, binding, body proc id) — a serde-flat rescue
+/// clause. `splat` is the proc for a `rescue *expr` dynamic class list.
+type CRescue = (Vec<String>, Option<usize>, Option<String>, usize);
 /// (body proc id, rescues, ensure proc id) — a serde-flat begin block.
 type CBegin = (usize, Vec<CRescue>, Option<usize>);
 /// (params, splat index, chunk) — a serde-flat proc template.
@@ -252,7 +253,7 @@ fn to_cprog(prog: &Program) -> CProg {
                 let rescues = bd
                     .rescues
                     .iter()
-                    .map(|r| (r.classes.clone(), r.binding.clone(), r.body))
+                    .map(|r| (r.classes.clone(), r.splat, r.binding.clone(), r.body))
                     .collect();
                 (bd.body, rescues, bd.ensure)
             })
@@ -296,8 +297,9 @@ fn from_cprog(cp: CProg) -> Program {
             .map(|(body, rescues, ensure)| {
                 let rescues = rescues
                     .into_iter()
-                    .map(|(classes, binding, body)| RescueDef {
+                    .map(|(classes, splat, binding, body)| RescueDef {
                         classes,
+                        splat,
                         binding,
                         body,
                     })

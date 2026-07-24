@@ -144,6 +144,9 @@ pub fn rebase_program(prog: &mut Program, proc_off: usize, begin_off: usize) {
         }
         for r in &mut bd.rescues {
             r.body += proc_off;
+            if let Some(s) = &mut r.splat {
+                *s += proc_off;
+            }
         }
     }
 }
@@ -1703,8 +1706,19 @@ impl Compiler {
         for r in rescues {
             let params: Vec<String> = r.binding.iter().cloned().collect();
             let rid = self.compile_proc_body(&r.body, &params, None)?;
+            // A `rescue *expr` splat compiles to a zero-arg proc returning the
+            // class (or array of classes) to match at runtime.
+            let splat = match &r.splat {
+                Some(e) => Some(self.compile_proc_body(
+                    std::slice::from_ref(&Stmt::from(e.clone())),
+                    &[],
+                    None,
+                )?),
+                None => None,
+            };
             rdefs.push(RescueDef {
                 classes: r.classes.clone(),
+                splat,
                 binding: r.binding.clone(),
                 body: rid,
             });
