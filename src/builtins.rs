@@ -1762,6 +1762,16 @@ fn dispatch_classref(
         }
         return call_instance_method(recv, &sclass, name, args, block);
     }
+    // A class-method alias (`class << self; alias new! new; end` /
+    // `singleton_class.alias_method`), registered on the *singleton* class only —
+    // never the instance-method alias table on `cls` (mustermann aliases the
+    // instance method `name` to `payload`; `Klass.name` must stay Module#name).
+    // Resolve to the target and re-dispatch, covering a native target (`new`).
+    if let Some(target) = with_host(|h| h.find_alias(&format!("#<Class:{cls}>"), name)) {
+        if target != name {
+            return dispatch_classref(cls, &target, args, block);
+        }
+    }
     // `Mod.autoload :Const, "path"` — a module registering a lazy require on a
     // *receiver* (`Tilt.autoload :Foo, "tilt/foo"`), namespaced under the module.
     // The self-call and `super`-override forms are handled elsewhere; this is the

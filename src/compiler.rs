@@ -595,6 +595,7 @@ impl Compiler {
             // becomes a singleton method of `recv` (or the current `self` for
             // `class << self`), registered at runtime. Evaluates to nil.
             Expr::SingletonClass { recv, body } => {
+                let mut nondefs: Vec<Stmt> = Vec::new();
                 for s in body {
                     if let Expr::Def {
                         name, params, body, ..
@@ -611,7 +612,35 @@ impl Compiler {
                         self.kstr(b, &synth);
                         b.emit(Op::CallBuiltin(ops::DEFINE_SINGLETON, 3), 0);
                         b.emit(Op::Pop, 0);
+                    } else {
+                        nondefs.push(s.clone());
                     }
+                }
+                // Non-`def` statements (`alias_method`, `attr_*`, directives) run
+                // with `self` = the singleton class, i.e. `<recv>.singleton_class
+                // .class_eval { … }`, so they operate on the class's own methods.
+                if !nondefs.is_empty() {
+                    let recv_expr = match recv {
+                        Some(r) => (**r).clone(),
+                        None => Expr::SelfExpr,
+                    };
+                    let call = Expr::Call {
+                        recv: Some(Box::new(Expr::Call {
+                            recv: Some(Box::new(recv_expr)),
+                            name: "singleton_class".into(),
+                            args: Vec::new(),
+                            block: None,
+                        })),
+                        name: "class_eval".into(),
+                        args: Vec::new(),
+                        block: Some(Block {
+                            params: Vec::new(),
+                            splat: None,
+                            body: nondefs,
+                        }),
+                    };
+                    self.compile_expr(b, &call)?;
+                    b.emit(Op::Pop, 0);
                 }
                 b.emit(Op::LoadUndef, 0);
             }
@@ -1594,6 +1623,7 @@ impl Compiler {
                 // `class << self … end` — its `def`s are class (singleton)
                 // methods, the same as `def self.x`.
                 Expr::SingletonClass { recv: None, body } => {
+                    let mut sc_nondefs: Vec<Stmt> = Vec::new();
                     for s in body {
                         match &s.expr {
                             Expr::Def {
@@ -1629,8 +1659,33 @@ impl Compiler {
                                     }
                                 }
                             }
-                            _ => {}
+                            // Any other directive (`alias_method`, `private`, …)
+                            // runs at definition time with `self` = the singleton
+                            // class, so it operates on the class's own methods.
+                            _ => sc_nondefs.push(s.clone()),
                         }
+                    }
+                    if !sc_nondefs.is_empty() {
+                        // `self.singleton_class.class_eval { <nondefs> }` — deferred
+                        // to `init_body`, which runs with `self` = the class.
+                        init_body.push(
+                            Expr::Call {
+                                recv: Some(Box::new(Expr::Call {
+                                    recv: Some(Box::new(Expr::SelfExpr)),
+                                    name: "singleton_class".into(),
+                                    args: Vec::new(),
+                                    block: None,
+                                })),
+                                name: "class_eval".into(),
+                                args: Vec::new(),
+                                block: Some(Block {
+                                    params: Vec::new(),
+                                    splat: None,
+                                    body: sc_nondefs,
+                                }),
+                            }
+                            .into(),
+                        );
                     }
                 }
                 // `class << obj … end` inside a class body — an explicit receiver;
