@@ -1711,6 +1711,17 @@ pub(crate) fn dispatch(
                 // mustermann's `Mustermann[type]` branches on `type.respond_to?
                 // (:new)` to tell a factory class from a bare type symbol.
                 "new" | "allocate" | "superclass" => return Ok(Value::Bool(false)),
+                // Framework duck-type probes: gems test `respond_to?` for a method
+                // that only a special response/template/stream object carries, to
+                // distinguish it from a plain value. A plain builtin value has none,
+                // so a permissive `true` sends it a missing method. sinatra checks
+                // a response body's `content_type` to tell a template from a String.
+                "content_type" => return Ok(Value::Bool(false)),
+                "to_path" => {
+                    return Ok(Value::Bool(
+                        with_host(|h| h.is_a(recv, "IO") || h.is_a(recv, "File")),
+                    ))
+                }
                 _ => {}
             }
             // nil / true / false have a small, fixed method surface — report it
