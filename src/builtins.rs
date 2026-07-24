@@ -5644,6 +5644,14 @@ fn dispatch_array(
             };
             Ok(new_arr(out))
         }
+        // `Array#intersect?(other)` — true if any element is shared (Ruby 3.1+).
+        "intersect?" if !args.is_empty() => {
+            let other = with_host(|h| h.as_array(&args[0]).unwrap_or_default());
+            Ok(Value::Bool(
+                arr.iter()
+                    .any(|v| other.iter().any(|w| with_host(|h| h.eq_values(v, w)))),
+            ))
+        }
         "length" | "size" | "count"
             if !(name == "count" && (!args.is_empty() || block.is_some())) =>
         {
