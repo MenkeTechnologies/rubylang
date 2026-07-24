@@ -492,6 +492,21 @@ fn b_getconst(vm: &mut VM, _: u8) -> Value {
         {
             return with_host(|h| h.class_ref(name));
         }
+        // A pending `autoload name, "path"`: require the file (once), then retry
+        // this candidate — the required file defines the constant/class.
+        if let Some(path) = with_host(|h| h.take_autoload(name)) {
+            let pv = with_host(|h| h.new_string(path));
+            if let Err(e) = do_require(&[pv], ReqMode::Require) {
+                return abort(vm, e);
+            }
+            let v = with_host(|h| h.get_const(name));
+            if !matches!(v, Value::Undef) {
+                return v;
+            }
+            if with_host(|h| h.class_exists(name) || h.is_builtin_class(name)) {
+                return with_host(|h| h.class_ref(name));
+            }
+        }
     }
     Value::Undef
 }
@@ -583,6 +598,26 @@ fn b_fire_hook(vm: &mut VM, _: u8) -> Value {
     let target = name_of(&vm.pop());
     let hook = name_of(&vm.pop());
     let module = name_of(&vm.pop());
+    // `module` may be the unqualified name of a module nested in `target`'s
+    // namespace: `extend LazyLoadHooks` inside `module ActiveSupport` compiles
+    // the short `LazyLoadHooks` (the nested module isn't registered yet at
+    // compile time, so `resolve_class_name` can't qualify it), but its class
+    // methods register under `ActiveSupport::LazyLoadHooks`. Canonicalize
+    // against the target's namespace before the hook lookup — mirroring
+    // `find_class_method`'s extends resolution — else `self.extended` /
+    // `self.included` silently never fires.
+    let module = with_host(|h| {
+        if h.class_exists(&module) {
+            module.clone()
+        } else {
+            let nested = format!("{target}::{module}");
+            if h.class_exists(&nested) {
+                nested
+            } else {
+                module.clone()
+            }
+        }
+    });
     if let Some(def) = with_host(|h| h.find_class_method(&module, &hook)) {
         let recv = with_host(|h| h.class_ref(&module));
         let arg = with_host(|h| h.class_ref(&target));
@@ -819,6 +854,30 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
     // Inside a class method `self` is a class ref — `new` and class methods
     // dispatch on the class; anything else (raise, puts, …) is a Kernel call.
     let this = with_host(|h| h.current_self());
+    // `autoload :Const, "path"` — register a lazy require, namespaced to the
+    // current `self` when it is a module (`I18n::Backend`), else top-level.
+    // `b_getconst` fires the require on first reference of the constant.
+    if name == "autoload" && args.len() >= 2 {
+        let const_name = name_of(&args[0]);
+        let path = with_host(|h| h.as_str(&args[1])).unwrap_or_default();
+        let full = match with_host(|h| h.classref_name(&this)) {
+            Some(cls) => format!("{cls}::{const_name}"),
+            None => const_name,
+        };
+        with_host(|h| h.set_autoload(&full, &path));
+        return Ok(Value::Undef);
+    }
+    if name == "autoload?" && !args.is_empty() {
+        let const_name = name_of(&args[0]);
+        let full = match with_host(|h| h.classref_name(&this)) {
+            Some(cls) => format!("{cls}::{const_name}"),
+            None => const_name,
+        };
+        return Ok(with_host(|h| match h.autoload_path(&full) {
+            Some(p) => h.new_string(p),
+            None => Value::Undef,
+        }));
+    }
     if let Some(cls) = with_host(|h| h.classref_name(&this)) {
         // `define_method(:name) { ... }` in a class body registers an instance
         // method whose body is the block.
@@ -841,6 +900,48 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
         // handler doesn't extract) — dispatch on the class itself.
         if matches!(name, "include" | "prepend" | "extend") && !args.is_empty() {
             return dispatch(&this, name, args, block);
+        }
+        // A bare `class_eval`/`module_eval` (string or block) in a class/module
+        // body — `self` is the class, so dispatch on it to reach the receiver
+        // handler. i18n defines its delegators this way (`module_eval <<-STR`).
+        if matches!(name, "class_eval" | "module_eval") {
+            return dispatch(&this, name, args, block);
+        }
+        // Bare Module reflection/definition calls in a class/module body (`self`
+        // is the class): route to the receiver handler. Gems call these
+        // unqualified inside `class X … end` (activesupport: `method_defined?`).
+        if matches!(
+            name,
+            "method_defined?"
+                | "public_method_defined?"
+                | "private_method_defined?"
+                | "protected_method_defined?"
+                | "instance_methods"
+                | "public_instance_methods"
+                | "private_instance_methods"
+                | "instance_method"
+                | "const_defined?"
+                | "const_get"
+                | "const_set"
+        ) && !args.is_empty()
+        {
+            return dispatch(&this, name, args, block);
+        }
+        // Bare universal object method in a class body (`self` is the class, an
+        // object like any other): `instance_variable_defined?`, `respond_to?`,
+        // `send`, `instance_variable_get/set`, … — dispatch on the class object.
+        if is_universal_object_method(name) {
+            return dispatch(&this, name, args, block);
+        }
+        // Bare `undef :m` (keyword), `undef_method :m`, `remove_method :m` in a
+        // class body — drop the named instance method(s). `undef :sym` parses as
+        // a plain call, so it arrives here (activesupport, HashWithIndifferentAccess).
+        if matches!(name, "undef" | "undef_method" | "remove_method") && !args.is_empty() {
+            for a in args {
+                let m = name_of(a);
+                with_host(|h| h.remove_instance_method(&cls, &m));
+            }
+            return Ok(Value::Undef);
         }
         // Runtime `attr`/`attr_accessor`/`attr_reader`/`attr_writer` (e.g. in a
         // `class_eval` / conditional class body) — register native accessors.
@@ -882,7 +983,17 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
                 _ => Value::Undef,
             });
         }
-        if name == "new" || with_host(|h| h.find_class_method(&cls, name)).is_some() {
+        // Route to class-receiver dispatch for the class's own class methods and
+        // for instance methods it inherits as a `Class < Module` object (Rails
+        // core-ext macros like `delegate`, called bare in a class body). Names
+        // that are neither (`puts`, `raise`, …) fall through to Kernel.
+        if name == "new"
+            || with_host(|h| {
+                h.find_class_method(&cls, name).is_some()
+                    || h.find_method("Class", name).is_some()
+                    || h.find_method("Module", name).is_some()
+            })
+        {
             return dispatch_classref(&cls, name, args, block);
         }
         return kernel(name, args, block);
@@ -1711,6 +1822,9 @@ fn dispatch_classref(
                 };
                 return crate::host::fiber_yield(v);
             }
+            // `Fiber.current` — the running fiber (a stable object; i18n stores
+            // it as a config owner and compares identity).
+            "current" => return Ok(crate::host::current_fiber()),
             // `Fiber[:key]` / `Fiber[:key] = value` — fiber-scoped storage
             // (Ruby 3.2+). Backed by one process-global hash: correct for the
             // common single-fiber use (e.g. i18n config); per-fiber isolation is
@@ -2353,6 +2467,17 @@ fn dispatch_classref(
                 let recv = with_host(|h| h.class_ref(cls));
                 return crate::host::call_class_method(recv, &def, name, &owner, args, block);
             }
+            // A class/module object is an instance of `Class < Module`, so an
+            // instance method added by reopening `class Module`/`class Class`
+            // is callable on it, run with `self` bound to the class. This is how
+            // Rails core-extensions attach class-body macros (`delegate`,
+            // `mattr_accessor`, `thread_mattr_accessor`, …).
+            for base in ["Class", "Module"] {
+                if let Some((def, owner)) = with_host(|h| h.find_method_owner(base, name)) {
+                    let recv = with_host(|h| h.class_ref(cls));
+                    return crate::host::call_class_method(recv, &def, name, &owner, args, block);
+                }
+            }
             // `Mod::Const` — a namespaced constant or nested class/module. Both
             // `::` and `.` lower to a method call here, so a no-arg capitalized
             // name is a constant lookup under the fully-qualified path.
@@ -2364,6 +2489,20 @@ fn dispatch_classref(
                 }
                 if with_host(|h| h.class_exists(&qualified)) {
                     return Ok(with_host(|h| h.class_ref(&qualified)));
+                }
+                // A pending `autoload :Const, "path"` on this namespace: require
+                // the file, then retry — the scoped `Mod::Const` form must fire
+                // autoload just like the bare read in `b_getconst` does.
+                if let Some(path) = with_host(|h| h.take_autoload(&qualified)) {
+                    let pv = with_host(|h| h.new_string(path));
+                    do_require(&[pv], ReqMode::Require)?;
+                    let v = with_host(|h| h.get_const(&qualified));
+                    if !matches!(v, Value::Undef) {
+                        return Ok(v);
+                    }
+                    if with_host(|h| h.class_exists(&qualified)) {
+                        return Ok(with_host(|h| h.class_ref(&qualified)));
+                    }
                 }
             }
             // `Mod::Const` for an unresolved constant calls `Mod.const_missing`
@@ -6377,6 +6516,22 @@ fn dispatch_array(
             }
             with_host(|h| h.set_array(recv, a));
             Ok(recv.clone())
+        }
+        // `Array#delete(obj)` — remove every element equal to `obj`; return the
+        // object if any were removed, else the block's value (if given) or nil.
+        "delete" => {
+            let mut a = arr;
+            let before = a.len();
+            a.retain(|x| !with_host(|h| h.eq_values(x, &args[0])));
+            let removed = a.len() < before;
+            with_host(|h| h.set_array(recv, a));
+            if removed {
+                Ok(args[0].clone())
+            } else if let Some(bl) = &block {
+                call_proc(bl, std::slice::from_ref(&args[0]))
+            } else {
+                Ok(Value::Undef)
+            }
         }
         "delete_at" => {
             let mut a = arr;
@@ -10433,6 +10588,31 @@ fn normalize_encoding_name(raw: &str) -> Option<String> {
     }
 }
 
+/// A best-effort `Thread::Backtrace::Location` for `caller_locations`. Carries
+/// path/lineno/label as ivars with attr-readers registered once, so
+/// `.path`/`.lineno`/`.label`/`.absolute_path`/`.base_label` resolve. Precise
+/// live stack frames aren't tracked outside `--dap`; callers use it for
+/// `module_eval` backtrace attribution only.
+fn backtrace_location(path: &str, lineno: i64, label: &str) -> Value {
+    with_host(|h| {
+        let cls = "Thread::Backtrace::Location";
+        if h.find_method(cls, "path").is_none() {
+            for f in ["path", "lineno", "label", "absolute_path", "base_label"] {
+                h.add_attr(cls, f, true, false);
+            }
+        }
+        let obj = h.new_object(cls);
+        let p = h.new_string(path.to_string());
+        h.set_ivar_of(&obj, "path", p.clone());
+        h.set_ivar_of(&obj, "absolute_path", p);
+        h.set_ivar_of(&obj, "lineno", Value::Int(lineno));
+        let l = h.new_string(label.to_string());
+        h.set_ivar_of(&obj, "label", l.clone());
+        h.set_ivar_of(&obj, "base_label", l);
+        obj
+    })
+}
+
 fn encoding_object(name: &str) -> Value {
     let enc = with_host(|h| h.new_object("Encoding"));
     let nm = new_str(name.to_string());
@@ -10665,6 +10845,15 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
         "eval" => {
             let src = arg_str(&args[0]);
             crate::host::eval_in_place(&src)
+        }
+        // `caller` / `caller_locations` — the call stack. A precise live
+        // backtrace isn't tracked outside `--dap`, so return a best-effort single
+        // frame from the current file. activesupport uses this only for
+        // `module_eval` backtrace attribution (reads `.path`/`.lineno`).
+        "caller" => Ok(new_arr(vec![])),
+        "caller_locations" => {
+            let path = crate::host::current_file_path().unwrap_or_else(|| "(eval)".to_string());
+            Ok(new_arr(vec![backtrace_location(&path, 0, "<main>")]))
         }
         "puts" => {
             if args.is_empty() {

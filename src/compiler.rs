@@ -58,9 +58,6 @@ pub struct Compiler {
     loops: Vec<LoopCtx>,
     /// Monotonic counter for unique temporaries (`case/in` subject slots).
     tmp: usize,
-    /// Monotonic counter for the synthetic retrieval names under which method
-    /// bodies for runtime `def`s (singleton / eval-target) are registered.
-    def_ctr: usize,
     /// When true (`--dap`), emit a per-statement `Op::Extended(DBG_LINE)` marker
     /// carrying the source line so the debugger can pause at statement
     /// boundaries. Off for normal runs — zero extra ops in the chunk.
@@ -81,6 +78,22 @@ pub struct Compiler {
 }
 
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
+/// Process-global counter for synthetic method names (`__class_body__N`,
+/// `__def N__`). These must be unique across *all* compilation units, not just
+/// within one file: a per-compiler counter (reset to 0 each `compile()`) makes
+/// two files that reopen the same class both emit `__class_body__0`, and merging
+/// their `ClassDef`s clobbers one class body with the other — so a reopened
+/// class's init-body silently never runs (this broke i18n/activesupport, whose
+/// `module I18n` is reopened across version.rb/utils.rb/i18n.rb). The names are
+/// only ever referenced within the same Program's own bytecode (call site uses
+/// the exact name it minted), so a global counter stays self-consistent and
+/// cache-safe.
+fn next_synth_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SYNTH_CTR: AtomicU64 = AtomicU64::new(0);
+    SYNTH_CTR.fetch_add(1, Ordering::Relaxed)
+}
+
 pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
     let mut c = Compiler {
         debug,
@@ -250,8 +263,7 @@ impl Compiler {
     /// `MethodDef` from the host by that name. Returns the synthetic name.
     fn stash_method(&mut self, params: &[Param], body: &[Stmt]) -> Result<String, String> {
         let def = self.compile_method(params, body)?;
-        let synth = format!("__def{}__", self.def_ctr);
-        self.def_ctr += 1;
+        let synth = format!("__def{}__", next_synth_id());
         self.methods.push((synth.clone(), def));
         Ok(synth)
     }
@@ -318,6 +330,27 @@ impl Compiler {
     }
 
     fn compile_expr(&mut self, b: &mut ChunkBuilder, e: &Expr) -> Result<(), String> {
+        // `__LINE__` is a keyword the compiler resolves to the current source
+        // line — MRI substitutes the integer literal, it is never a runtime
+        // call. Depending on context it parses as a bare call or an unassigned
+        // local; handle both. Ubiquitous in the `class_eval <<-CODE, __FILE__,
+        // __LINE__ + 1` gem idiom (i18n, thor, activesupport all use it).
+        match e {
+            Expr::Call {
+                recv: None,
+                name,
+                args,
+                ..
+            } if name == "__LINE__" && args.is_empty() => {
+                b.emit(Op::LoadInt(self.cur_line as i64), 0);
+                return Ok(());
+            }
+            Expr::Var(VarKind::Local, name) if name == "__LINE__" => {
+                b.emit(Op::LoadInt(self.cur_line as i64), 0);
+                return Ok(());
+            }
+            _ => {}
+        }
         match e {
             Expr::Nil => {
                 b.emit(Op::LoadUndef, 0);
@@ -519,8 +552,7 @@ impl Compiler {
                     // target when one is in effect. `def` evaluates to `:name`.
                     None => {
                         let def = self.compile_method(params, body)?;
-                        let synth = format!("__def{}__", self.def_ctr);
-                        self.def_ctr += 1;
+                        let synth = format!("__def{}__", next_synth_id());
                         self.methods.push((name.clone(), def.clone()));
                         self.methods.push((synth.clone(), def));
                         self.kstr(b, name);
@@ -739,15 +771,26 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(op, 2), 0);
             }
             Expr::Index(recv, idx) => {
-                self.compile_expr(b, recv)?;
-                for i in idx {
-                    self.compile_expr(b, i)?;
+                // `recv[i] = v` evaluates to `v` — never `[]=`'s return value
+                // (Ruby drops it). Evaluate operands into temps in source order,
+                // call `[]=`, discard its result, yield the RHS.
+                let tr = self.eval_to_temp(b, recv)?;
+                let tis = idx
+                    .iter()
+                    .map(|i| self.eval_to_temp(b, i))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let tv = self.eval_to_temp(b, value)?;
+                self.compile_expr(b, &Expr::Var(VarKind::Local, tr))?;
+                for ti in &tis {
+                    self.compile_expr(b, &Expr::Var(VarKind::Local, ti.clone()))?;
                 }
-                self.compile_expr(b, value)?;
+                self.compile_expr(b, &Expr::Var(VarKind::Local, tv.clone()))?;
                 b.emit(
                     Op::CallBuiltin(ops::INDEX_SET, argc(2 + idx.len())?),
                     self.cur_line,
                 );
+                b.emit(Op::Pop, 0);
+                self.compile_expr(b, &Expr::Var(VarKind::Local, tv))?;
             }
             // `A::B = v` (a capitalized name on a constant-path receiver) is a
             // namespaced constant assignment, stored under the qualified name —
@@ -774,14 +817,32 @@ impl Compiler {
                 args,
                 block: None,
             } if args.is_empty() => {
-                self.compile_expr(b, r)?;
+                // `recv.attr = v` evaluates to `v`, never the setter's return
+                // value (Ruby discards it). Evaluate `recv` then `v` into temps
+                // (source order), call the setter, drop its result, yield `v`.
+                let tr = self.eval_to_temp(b, r)?;
+                let tv = self.eval_to_temp(b, value)?;
+                self.compile_expr(b, &Expr::Var(VarKind::Local, tr))?;
                 self.kstr(b, &format!("{name}="));
-                self.compile_expr(b, value)?;
+                self.compile_expr(b, &Expr::Var(VarKind::Local, tv.clone()))?;
                 b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), self.cur_line);
+                b.emit(Op::Pop, 0);
+                self.compile_expr(b, &Expr::Var(VarKind::Local, tv))?;
             }
             _ => return Err("invalid assignment target".into()),
         }
         Ok(())
+    }
+
+    /// Evaluate `e` once and stash it in a fresh synthetic local, leaving the
+    /// stack clean; returns the local's name. Used to reorder operand evaluation
+    /// out of a builder while yielding a value the caller loads back later.
+    fn eval_to_temp(&mut self, b: &mut ChunkBuilder, e: &Expr) -> Result<String, String> {
+        self.tmp += 1;
+        let name = format!("__asgn{}__", self.tmp);
+        self.compile_assign(b, &Expr::Var(VarKind::Local, name.clone()), e)?;
+        b.emit(Op::Pop, 0);
+        Ok(name)
     }
 
     /// Parallel assignment: normalize the right-hand side to an array in a
@@ -1472,6 +1533,12 @@ impl Compiler {
                     for a in args {
                         if let Some(module) = const_path_name(a) {
                             extends.push(self.resolve_class_name(&module));
+                        } else if matches!(a, Expr::SelfExpr) {
+                            // `extend self` — the module gains its own instance
+                            // methods as module methods. Register it in its own
+                            // extends list (activesupport Inflector, and the
+                            // common `module M; extend self; …` singleton idiom).
+                            extends.push(qname.clone());
                         }
                     }
                 }
@@ -1527,8 +1594,7 @@ impl Compiler {
         // `self` = the class. Each class opening (including reopenings of the same
         // name) gets a *unique* body name so a later reopening's `__class_body__`
         // never clobbers an earlier one after the two ClassDefs are merged.
-        let body_name = format!("__class_body__{}", self.def_ctr);
-        self.def_ctr += 1;
+        let body_name = format!("__class_body__{}", next_synth_id());
         if !init_body.is_empty() {
             class_methods.insert(body_name.clone(), self.compile_method(&[], &init_body)?);
         }

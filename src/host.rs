@@ -568,6 +568,10 @@ pub struct RubyHost {
     frames: Vec<Frame>,
     globals: IndexMap<String, Value>,
     consts: IndexMap<String, Value>,
+    // `autoload :Const, "path"`: a constant registered to lazily `require "path"`
+    // on first reference. Keyed by the constant's fully-qualified name
+    // (`I18n::Backend`). Consumed on the triggering read so the require runs once.
+    autoloads: IndexMap<String, String>,
     methods: IndexMap<String, MethodDef>,
     classes: IndexMap<String, ClassDef>,
     begins: Vec<BeginDef>,
@@ -1206,6 +1210,7 @@ impl RubyHost {
             }],
             globals: IndexMap::new(),
             consts: IndexMap::new(),
+            autoloads: IndexMap::new(),
             methods: IndexMap::new(),
             classes: IndexMap::new(),
             begins: Vec::new(),
@@ -2397,6 +2402,20 @@ impl RubyHost {
     pub fn const_names(&self) -> Vec<String> {
         self.consts.keys().cloned().collect()
     }
+    /// Register `autoload name, path`: a lazy `require path` fired the first time
+    /// the fully-qualified constant `name` is read and found undefined.
+    pub fn set_autoload(&mut self, name: &str, path: &str) {
+        self.autoloads.insert(name.to_string(), path.to_string());
+    }
+    /// The pending autoload path for `name`, if any (`Module#autoload?`).
+    pub fn autoload_path(&self, name: &str) -> Option<String> {
+        self.autoloads.get(name).cloned()
+    }
+    /// Consume and return `name`'s autoload path, removing it so the require runs
+    /// at most once even if the required file doesn't define the constant.
+    pub fn take_autoload(&mut self, name: &str) -> Option<String> {
+        self.autoloads.shift_remove(name)
+    }
     // Instance vars live on the current `self` object; at the top level (self is
     // the main object) they fall back to a global-keyed table.
     pub fn get_ivar(&self, name: &str) -> Value {
@@ -2503,6 +2522,15 @@ impl RubyHost {
     }
     pub fn class_exists(&self, name: &str) -> bool {
         self.classes.contains_key(name)
+    }
+    /// `undef`/`undef_method`/`remove_method` — drop the class's own instance
+    /// method `name`. Inherited definitions are left intact (a full `undef` would
+    /// install a shadowing tombstone; removing the own method is enough for the
+    /// load-time uses gems make of it).
+    pub fn remove_instance_method(&mut self, cls: &str, name: &str) {
+        if let Some(def) = self.classes.get_mut(cls) {
+            def.methods.shift_remove(name);
+        }
     }
     /// Register an anonymous class/module (`Class.new`/`Module.new`) under a fresh
     /// name and return it. The optional superclass seeds the `ClassDef`; the block
@@ -3247,11 +3275,35 @@ impl RubyHost {
     pub fn ivar_of(&self, obj: &Value, name: &str) -> Value {
         match self.obj(obj) {
             Some(RObj::Object { ivars, .. }) => ivars.get(name).cloned().unwrap_or(Value::Undef),
+            // A Class/Module receiver: its instance variables are class-level
+            // ivars, stored in `class_ivars` (mirrors `get_ivar`). Reflective
+            // `instance_variable_get` must read the same store bare `@x` uses.
+            Some(RObj::ClassRef(cls)) => self
+                .class_ivars
+                .get(cls)
+                .and_then(|m| m.get(name))
+                .cloned()
+                .unwrap_or(Value::Undef),
             _ => Value::Undef,
         }
     }
     /// Set the instance variable `name` (bare, no `@`) on a specific object.
     pub fn set_ivar_of(&mut self, obj: &Value, name: &str, v: Value) {
+        // A Class/Module receiver writes into `class_ivars` (mirrors `set_ivar`),
+        // so reflective `instance_variable_set` and `class_eval { @x = … }` land
+        // where `ivar_of`/bare `@x` read. Resolve the class name first so the
+        // immutable `obj` borrow ends before the mutable store access.
+        let cls = match self.obj(obj) {
+            Some(RObj::ClassRef(cls)) => Some(cls.clone()),
+            _ => None,
+        };
+        if let Some(cls) = cls {
+            self.class_ivars
+                .entry(cls)
+                .or_default()
+                .insert(name.to_string(), v);
+            return;
+        }
         if let Value::Obj(i) = obj {
             if let Some(RObj::Object { ivars, .. }) = self.heap.get_mut(*i as usize) {
                 ivars.insert(name.to_string(), v);
@@ -3262,6 +3314,11 @@ impl RubyHost {
     pub fn ivar_names(&self, obj: &Value) -> Vec<String> {
         match self.obj(obj) {
             Some(RObj::Object { ivars, .. }) => ivars.keys().map(|k| format!("@{k}")).collect(),
+            Some(RObj::ClassRef(cls)) => self
+                .class_ivars
+                .get(cls)
+                .map(|m| m.keys().map(|k| format!("@{k}")).collect())
+                .unwrap_or_default(),
             _ => Vec::new(),
         }
     }
@@ -4458,9 +4515,11 @@ fn dedup_keep_first(items: Vec<String>) -> Vec<String> {
 
 /// Every installed gem's `lib/` directory, so `require "gem"` resolves like
 /// RubyGems (modern Ruby auto-activates gem libs onto $LOAD_PATH). Gem roots come
-/// from `GEM_HOME`/`GEM_PATH` (colon-separated) when set, else common system
-/// locations. Each root holds `gems/<name>-<ver>/`, whose `lib/` (when present)
-/// goes on the load path. Best-effort — unreadable dirs are skipped silently.
+/// from `GEM_HOME`/`GEM_PATH` (colon-separated) when set, else rubylang's own gem
+/// home `~/.rubylang` — rubylang is self-contained and does not read a system MRI
+/// install (`gem install` writes into `~/.rubylang`, see `gem.rs`). Each root
+/// holds `gems/<name>-<ver>/`, whose `lib/` (when present) goes on the load path.
+/// Best-effort — unreadable dirs are skipped silently.
 fn gem_lib_dirs() -> Vec<String> {
     use std::path::PathBuf;
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -4472,20 +4531,11 @@ fn gem_lib_dirs() -> Vec<String> {
         }
     }
     if roots.is_empty() {
-        // Default gem roots: `<base>/<ruby-version>/` each holds a `gems/` dir.
-        for base in [
-            "/opt/homebrew/lib/ruby/gems",
-            "/usr/local/lib/ruby/gems",
-            "/usr/lib/ruby/gems",
-        ] {
-            if let Ok(rd) = std::fs::read_dir(base) {
-                roots.extend(rd.flatten().map(|e| e.path()));
-            }
-        }
+        // rubylang's own gem home: `~/.rubylang` holds `gems/` + `specifications/`
+        // exactly like a RubyGems root, so the scan below reads it unchanged. No
+        // MRI system path is consulted — the runtime is standalone.
         if let Some(home) = dirs::home_dir() {
-            if let Ok(rd) = std::fs::read_dir(home.join(".local/share/gem/ruby")) {
-                roots.extend(rd.flatten().map(|e| e.path()));
-            }
+            roots.push(home.join(".rubylang"));
         }
     }
     let mut libs = Vec::new();
@@ -5150,6 +5200,23 @@ thread_local! {
 
     /// This OS thread's own `Thread.current` object, created on first request.
     static CURRENT_THREAD: RefCell<Option<Value>> = const { RefCell::new(None) };
+
+    /// A stable "main fiber" object returned by `Fiber.current` at the root
+    /// (outside any `Fiber.new` body), created on first request.
+    static MAIN_FIBER: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+/// `Fiber.current` — a stable object identifying the running fiber. At the root
+/// this is a cached main-fiber object; only identity is modeled (i18n stores it
+/// as a config `owner` and later compares), not resume/alive state. Full
+/// per-fiber identity inside a `Fiber.new` body is not distinguished yet.
+pub fn current_fiber() -> Value {
+    if let Some(v) = MAIN_FIBER.with(|c| c.borrow().clone()) {
+        return v;
+    }
+    let v = with_host(|h| h.new_object("Fiber"));
+    MAIN_FIBER.with(|c| *c.borrow_mut() = Some(v.clone()));
+    v
 }
 
 /// `Thread.current` — a stable `Thread` object for the running OS thread, cached
