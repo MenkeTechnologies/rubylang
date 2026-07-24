@@ -3393,6 +3393,13 @@ fn dispatch_object(
             Ok(args.first().cloned().unwrap_or(Value::Undef))
         }
         "cause" if is_exception_class(cls) => Ok(Value::Undef),
+        // `detailed_message(highlight:, …)` (Ruby 3.2+) — the message with the
+        // class appended (`msg (ClassName)`), as `Exception#full_message` renders.
+        "detailed_message" if is_exception_class(cls) => {
+            let m = with_host(|h| h.as_str(&h.ivar_of(recv, "message")))
+                .unwrap_or_else(|| cls.to_string());
+            Ok(new_str(format!("{m} ({cls})")))
+        }
         "full_message" if is_exception_class(cls) => {
             let m = with_host(|h| h.ivar_of(recv, "message"));
             Ok(if matches!(m, Value::Undef) {
