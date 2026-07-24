@@ -652,6 +652,12 @@ pub struct RubyHost {
     class_define_methods: IndexMap<String, IndexMap<String, Value>>,
     /// `alias_method`/`alias` mappings: class → alias name → target method name.
     method_aliases: IndexMap<String, IndexMap<String, String>>,
+    /// Class override for a native-backed instance of a *user subclass of a
+    /// builtin collection* (`class Params < Hash`): heap id → user class name.
+    /// The value stays a native `RObj::Hash`/`Array`/`Str` so builtin ops work
+    /// unchanged, while `class_of`/`is_a?`/method resolution report the subclass
+    /// so its own methods and `#class` behave like MRI.
+    class_overrides: IndexMap<u32, String>,
     /// Live `Thread`s, indexed by `RObj::Thread.id`: the OS-thread `JoinHandle`
     /// plus the shared result/done cells the thread body publishes into. Shared
     /// (not thread-local) — a `Thread` object is visible from any thread.
@@ -1255,6 +1261,7 @@ impl RubyHost {
             singleton_define_methods: IndexMap::new(),
             class_define_methods: IndexMap::new(),
             method_aliases: IndexMap::new(),
+            class_overrides: IndexMap::new(),
         };
         // Seed the standard streams as `STDOUT`/`STDERR`/`STDIN` constants and
         // the `$stdout`/`$stderr`/`$stdin` globals. Slots 0/1/2 in `io_handles`
@@ -2339,11 +2346,65 @@ impl RubyHost {
     /// The class name of any value — the dynamic class for a user object, the
     /// builtin class name otherwise.
     pub fn class_of(&self, v: &Value) -> String {
+        if let Value::Obj(id) = v {
+            if let Some(cls) = self.class_overrides.get(id) {
+                return cls.clone();
+            }
+        }
         match self.obj(v) {
             Some(RObj::Object { class, .. }) => class.clone(),
             Some(RObj::ClassRef(_)) => "Class".to_string(),
             _ => self.class_name(v).to_string(),
         }
+    }
+    /// The class used to *route* a value to its builtin method table: the raw
+    /// native type for an override-backed builtin-subclass instance (so `Hash`
+    /// ops still reach `dispatch_hash`), else `class_of`. Method resolution and
+    /// `#class` use `class_of` (the override); only the native-op router uses this.
+    pub fn dispatch_class(&self, v: &Value) -> String {
+        if let Value::Obj(id) = v {
+            if self.class_overrides.contains_key(id) {
+                return self.class_name(v).to_string();
+            }
+        }
+        self.class_of(v)
+    }
+    /// Record that native value `v` is really an instance of user subclass
+    /// `class` (a `X < Hash`/`Array`/`String`). See `class_overrides`.
+    pub fn set_class_override(&mut self, v: &Value, class: &str) {
+        if let Value::Obj(id) = v {
+            self.class_overrides.insert(*id, class.to_string());
+        }
+    }
+    /// If `class` is a *user* class whose superclass chain roots at a builtin
+    /// collection, the builtin base (`"Hash"`/`"Array"`/`"String"`) whose native
+    /// representation should back its instances; else `None`.
+    pub fn builtin_container_root(&self, class: &str) -> Option<&'static str> {
+        // Only user-defined classes need native backing; a bare `Hash`/`Array`
+        // is already native.
+        if !self.classes.contains_key(class) {
+            return None;
+        }
+        let mut cur = Some(class.to_string());
+        let mut guard = 0;
+        while let Some(n) = cur {
+            guard += 1;
+            if guard > 100 {
+                break;
+            }
+            match n.as_str() {
+                "Hash" => return Some("Hash"),
+                "Array" => return Some("Array"),
+                "String" => return Some("String"),
+                _ => {}
+            }
+            cur = self
+                .classes
+                .get(&n)
+                .and_then(|d| d.superclass.clone())
+                .map(|s| self.resolve_class_alias(&s, &n));
+        }
+        None
     }
     pub fn value_to_key(&self, v: &Value) -> RKey {
         self.to_key(v)
@@ -3133,8 +3194,12 @@ impl RubyHost {
         if actual == "DateTime" && matches!(class, "Date" | "Comparable") {
             return true;
         }
-        if let Some(oc) = self.object_class(v) {
-            return self.class_is_ancestor(&oc, class);
+        // Walk the ancestry of the value's class when that class is user-defined
+        // — covers both a plain user object and a native-backed builtin subclass
+        // (`class Params < Hash`), whose `class_of` is the override, so
+        // `params.is_a?(Hash)` and `is_a?(Enumerable)` hold.
+        if self.classes.contains_key(&actual) {
+            return self.class_is_ancestor(&actual, class);
         }
         false
     }

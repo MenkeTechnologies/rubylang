@@ -1669,7 +1669,7 @@ pub(crate) fn dispatch(
         return dispatch_object(recv, &cls, name, args, block);
     }
 
-    let class = with_host(|h| h.class_of(recv));
+    let class = with_host(|h| h.dispatch_class(recv));
     let fallback_block = block.clone();
     let result = match class.as_str() {
         "Integer" | "Float" => dispatch_number(recv, name, args, block),
@@ -2626,6 +2626,23 @@ fn dispatch_classref(
                 return Ok(with_host(|h| {
                     h.new_hash_with_default(IndexMap::new(), default)
                 }));
+            }
+            // A user subclass of a builtin collection (`class Params < Hash`)
+            // gets a native `RObj::Hash`/`Array`/`Str` backing tagged with the
+            // subclass, so builtin ops (`[]`, `[]=`, `each`, `to_h`) work natively
+            // while its own methods and `#class` report the subclass. rack's
+            // `Rack::QueryParser::Params < Hash` and DelegateClass rely on this.
+            if let Some(root) = with_host(|h| h.builtin_container_root(cls)) {
+                let obj = with_host(|h| match root {
+                    "Array" => h.new_array(vec![]),
+                    "String" => h.new_string(String::new()),
+                    _ => h.new_hash(IndexMap::new()),
+                });
+                with_host(|h| h.set_class_override(&obj, cls));
+                if with_host(|h| h.find_method(cls, "initialize")).is_some() {
+                    call_instance_method(obj.clone(), cls, "initialize", args, block)?;
+                }
+                return Ok(obj);
             }
             // A user `initialize` wins. Otherwise an exception class's default
             // `new(msg)` stores the message (defaulting to the class name).
