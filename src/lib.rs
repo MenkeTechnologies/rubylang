@@ -162,6 +162,11 @@ pub fn eval_str_cfg(src: &str, cfg: &RunConfig) -> Result<Value, String> {
 /// MRI; here it is an ordinary hash (no weak semantics), which is enough for the
 /// callers that use it as a registry/set (activesupport DescendantsTracker).
 const PRELUDE: &str = r#"
+# Real Ruby always has rubygems loaded, so Gem::Version is universally available
+# (rack-test, bundler, and countless gems assume it at load time without a
+# require). Preload the bundled definition here.
+require "rubygems/version"
+
 module RbConfig
   CONFIG = {
     "host_os" => "linux-gnu",
