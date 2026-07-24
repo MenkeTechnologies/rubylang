@@ -240,6 +240,9 @@ module URI
       str.to_s.gsub(/%([0-9a-fA-F]{2})/) { $1.to_i(16).chr }
     end
   end
+
+  # The shared default parser instance (rack/rails read `URI::DEFAULT_PARSER`).
+  DEFAULT_PARSER = RFC2396_Parser.new
 end
 
 # `URI("string")` — the shorthand constructor (a private Kernel method), same as
