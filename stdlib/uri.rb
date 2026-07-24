@@ -219,6 +219,27 @@ module URI
   def self.decode_www_form_component(str)
     str.to_s.tr("+", " ").gsub(/%([0-9a-fA-F]{2})/) { $1.to_i(16).chr }
   end
+
+  # The RFC2396 escaping engine. MRI keeps a shared instance for percent-encoding
+  # arbitrary strings against a caller-supplied "unsafe" character pattern; sinatra
+  # (via mustermann) uses only `escape`/`unescape`.
+  class RFC2396_Parser
+    # Everything outside the RFC2396 unreserved + reserved set is escaped by default.
+    DEFAULT_UNSAFE = /[^\-_.!~*'()a-zA-Z\d;\/?:@&=+$,\[\]]/
+
+    # Percent-encode each character of `str` that matches `unsafe` (a Regexp),
+    # leaving the rest literal. Multibyte characters are encoded byte-by-byte.
+    def escape(str, unsafe = DEFAULT_UNSAFE)
+      str.to_s.gsub(unsafe) do |c|
+        c.each_byte.map { |b| format("%%%02X", b) }.join
+      end
+    end
+
+    # Reverse `escape`: turn every `%XX` sequence back into its byte.
+    def unescape(str)
+      str.to_s.gsub(/%([0-9a-fA-F]{2})/) { $1.to_i(16).chr }
+    end
+  end
 end
 
 # `URI("string")` — the shorthand constructor (a private Kernel method), same as

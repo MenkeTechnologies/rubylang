@@ -815,7 +815,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             // `?c` character literal → a one-char string. Only when `?` is at an
             // expression start (leading space) and directly followed by an escape
             // (`?\n`) or a lone alnum char (not `?ab`, and not the `? :` ternary).
-            b'?' if sp
+            // A char literal is only possible where a `?` ternary can't be: at an
+            // expression start (leading space, or right after a non-value token such
+            // as `(`, `,`, an operator, or another `?`). `include?(??)` glues `??`
+            // straight after `(`, so a whitespace-only guard would miss it.
+            b'?' if (sp || !prev_is_value(&out))
                 && i + 1 < b.len()
                 && (b[i + 1] == b'\\'
                     || (b[i + 1].is_ascii_alphanumeric()
