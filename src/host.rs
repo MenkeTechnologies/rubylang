@@ -2546,7 +2546,7 @@ impl RubyHost {
                 .classes
                 .get(&c)
                 .and_then(|d| d.superclass.clone())
-                .map(|s| self.resolve_class_alias(&s));
+                .map(|s| self.resolve_class_alias(&s, &c));
         }
         None
     }
@@ -2871,16 +2871,27 @@ impl RubyHost {
         self.classes
             .get(name)
             .and_then(|d| d.superclass.clone())
-            .map(|s| self.resolve_class_alias(&s))
+            .map(|s| self.resolve_class_alias(&s, name))
     }
     /// Resolve a class name that may be a constant *alias* to a class value
     /// (`Alias = Base; class C < Alias`) to the real class it refers to. `class
     /// C < expr` stores `expr` as a static name, so an aliased superclass would
     /// otherwise name a non-class constant and break the ancestry chain. A name
     /// that is already a registered class is returned unchanged.
-    pub fn resolve_class_alias(&self, name: &str) -> String {
+    /// Resolve a superclass name to the actual registered class. `from` is the
+    /// class whose superclass is being resolved, so a suffix match that would
+    /// point back at `from` (a self-inheritance cycle) is skipped — the common
+    /// `class Ns::X < ::X` pattern (`ActiveSupport::Logger < ::Logger`,
+    /// `I18n::ArgumentError < ::ArgumentError`) must resolve `X` to the top-level
+    /// class, not the nested one being defined.
+    pub fn resolve_class_alias(&self, name: &str, from: &str) -> String {
         // Already the fully-qualified registered class — use as-is.
         if self.classes.contains_key(name) {
+            return name.to_string();
+        }
+        // A builtin class/exception name refers to the top-level builtin, never a
+        // nested user class that merely shares the suffix.
+        if self.is_builtin_class(name) || is_builtin_exception_name(name) {
             return name.to_string();
         }
         // A partial or short nested-class name that names a class registered
@@ -2889,9 +2900,14 @@ impl RubyHost {
         // names already registered, so forward/runtime references stay partial
         // (concurrent-ruby: `Concurrent::Delay` super `Synchronization::Lockable-
         // Object`, real class `Concurrent::Synchronization::LockableObject`).
-        // Match the registered class whose qualified name ends with `::name`.
+        // Match the registered class whose qualified name ends with `::name`,
+        // never `from` itself.
         let suffix = format!("::{name}");
-        if let Some(full) = self.classes.keys().find(|k| k.ends_with(&suffix)) {
+        if let Some(full) = self
+            .classes
+            .keys()
+            .find(|k| k.as_str() != from && k.ends_with(&suffix))
+        {
             return full.clone();
         }
         // A constant holding a class — an alias (`Alias = Base`) or a runtime-
@@ -2899,16 +2915,16 @@ impl RubyHost {
         // short name the constant points to is itself fully qualified.
         let c = self.get_const(name);
         if let Some(RObj::ClassRef(real)) = self.obj(&c) {
-            if real != name {
-                return self.resolve_class_alias(real);
+            if real != name && real != from {
+                return self.resolve_class_alias(real, from);
             }
         }
         if !name.contains("::") {
             for (k, v) in &self.consts {
                 if k.ends_with(&suffix) {
                     if let Some(RObj::ClassRef(real)) = self.obj(v) {
-                        if real != name {
-                            return self.resolve_class_alias(real);
+                        if real != name && real != from {
+                            return self.resolve_class_alias(real, from);
                         }
                     }
                 }
@@ -2930,7 +2946,7 @@ impl RubyHost {
             if def.includes.iter().any(|m| m == class) {
                 return true;
             }
-            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s));
+            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &name));
         }
         false
     }
@@ -3003,7 +3019,7 @@ impl RubyHost {
                                 for m in def.includes.iter().rev() {
                                     out.push(m.clone());
                                 }
-                                cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s));
+                                cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &n));
                             }
                             None => {
                                 // Superclass is a builtin (e.g. StandardError):
@@ -3228,7 +3244,7 @@ impl RubyHost {
                     }
                 }
             }
-            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s));
+            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &name));
         }
         None
     }
@@ -3329,7 +3345,7 @@ impl RubyHost {
                     }
                 }
             }
-            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s));
+            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &name));
         }
         None
     }
@@ -3357,7 +3373,7 @@ impl RubyHost {
                     }
                 }
             }
-            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s));
+            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &name));
         }
         None
     }
@@ -3387,7 +3403,7 @@ impl RubyHost {
                     }
                 }
             }
-            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s));
+            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &name));
         }
         None
     }
@@ -3683,7 +3699,7 @@ impl RubyHost {
                 .classes
                 .get(&name)
                 .and_then(|d| d.superclass.clone())
-                .map(|s| self.resolve_class_alias(&s));
+                .map(|s| self.resolve_class_alias(&s, &name));
         }
         false
     }
