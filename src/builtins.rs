@@ -938,6 +938,7 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
                 | "const_defined?"
                 | "const_get"
                 | "const_set"
+                | "remove_const"
                 | "class_variable_get"
                 | "class_variable_set"
                 | "class_variable_defined?"
@@ -2545,6 +2546,12 @@ fn dispatch_classref(
         "const_defined?" => {
             let cname = name_of(&args[0]);
             Ok(Value::Bool(const_lookup_under(cls, &cname).is_some()))
+        }
+        // `Mod.remove_const(:X)` — remove and return the constant (or class).
+        "remove_const" => {
+            let cname = name_of(&args[0]);
+            let key = const_key_under(cls, &cname);
+            Ok(with_host(|h| h.remove_const(&key)))
         }
         // `Mod.constants` — the user-defined constant names (flat store), as
         // symbols. Class names are not enumerated (matching neither MRI exactly

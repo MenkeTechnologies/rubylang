@@ -2439,6 +2439,13 @@ impl RubyHost {
     pub fn set_const(&mut self, name: &str, v: Value) {
         self.consts.insert(name.to_string(), v);
     }
+    /// `Module#remove_const` — remove the constant (and, if it named a class/
+    /// module, its registration). Returns the previous value.
+    pub fn remove_const(&mut self, name: &str) -> Value {
+        let old = self.consts.shift_remove(name).unwrap_or(Value::Undef);
+        self.classes.shift_remove(name);
+        old
+    }
     /// The names of user-defined constants in the flat store (`Module#constants`).
     pub fn const_names(&self) -> Vec<String> {
         self.consts.keys().cloned().collect()
