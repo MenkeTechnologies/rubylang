@@ -1627,6 +1627,15 @@ impl Compiler {
                             includes.push(self.resolve_class_name(&module));
                         }
                     }
+                    // Also run the include inline at its lexical position, so a
+                    // module's `append_features`/`included` (ActiveSupport::Concern
+                    // extends ClassMethods and runs the `included` block there) takes
+                    // effect before later body statements — e.g. a `define_callbacks`
+                    // macro on the line after `include ActiveSupport::Callbacks`.
+                    // The compile-time `includes` above still registers the mixin for
+                    // method resolution; the runtime path dedups and, for a concern,
+                    // drops+re-adds it so its `base < self` guard passes.
+                    init_body.push(stmt.clone());
                 }
                 // `prepend ModuleName` — record a module that precedes the class.
                 Expr::Call {
@@ -1640,6 +1649,9 @@ impl Compiler {
                             prepends.push(self.resolve_class_name(&module));
                         }
                     }
+                    // Run inline too (see the `include` arm) so a concern's
+                    // `prepend_features` fires at the statement's position.
+                    init_body.push(stmt.clone());
                 }
                 // `extend ModuleName` — mix the module's instance methods in as
                 // class methods.
@@ -1743,9 +1755,10 @@ impl Compiler {
         if !init_body.is_empty() {
             class_methods.insert(body_name.clone(), self.compile_method(&[], &init_body)?);
         }
-        // Capture the mixin lists for hook firing before they move into ClassDef.
-        let hook_includes = includes.clone();
-        let hook_prepends = prepends.clone();
+        // `extend` still fires its `extended` hook after the body. `include`/
+        // `prepend` now run inline (pushed into init_body above), so their
+        // `included`/`prepended`/append_features hooks fire at the statement's
+        // lexical position — deferring them here would double-fire.
         let hook_extends = extends.clone();
         // Done with this namespace: everything referenced below (the class ref
         // to run the body on, hook targets) uses the qualified name, so pop
@@ -1786,13 +1799,7 @@ impl Compiler {
             b.emit(Op::CallBuiltin(ops::CALL_METHOD, 2), self.cur_line);
             b.emit(Op::Pop, 0);
         }
-        // Module hooks fire once the include/prepend/extend relationship is set.
-        for m in &hook_includes {
-            self.emit_hook(b, m, "included", &qname);
-        }
-        for m in &hook_prepends {
-            self.emit_hook(b, m, "prepended", &qname);
-        }
+        // The `extended` hook fires once the extend relationship is set.
         for m in &hook_extends {
             self.emit_hook(b, m, "extended", &qname);
         }

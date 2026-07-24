@@ -5749,6 +5749,21 @@ pub fn call_super_blk(
         if method == "respond_to_missing?" {
             return Ok(Value::Bool(false));
         }
+        // `super` from a user override of `Module#include`/`prepend`/`extend`
+        // (self is the class, args are the modules) performs the real mixin. e.g.
+        // concurrent-ruby's ReInclude#include calls `super(*modules)` then replays
+        // the include into dependents.
+        if matches!(method.as_str(), "include" | "prepend" | "extend") {
+            let args = explicit_args.clone().unwrap_or_else(|| cur_args.clone());
+            if let Some(cls) = with_host(|h| h.classref_name(&self_obj)) {
+                for a in &args {
+                    if let Some(m) = with_host(|h| h.classref_name(a)) {
+                        with_host(|h| h.class_mixin(&cls, &m, &method));
+                    }
+                }
+            }
+            return Ok(self_obj.clone());
+        }
         // `super` from an override of `Module#append_features`/`prepend_features`
         // (self is the module, arg is the base) performs the real mixin: the
         // default native behavior adds the module's instance methods to the base.

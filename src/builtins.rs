@@ -2912,6 +2912,11 @@ fn dispatch_classref(
                         .map(|f| with_host(|h| h.find_class_method(&m, f)).is_some())
                         .unwrap_or(false);
                     if let (true, Some(f)) = (has_feat, feat) {
+                        // The compile-time class-body extraction may already have
+                        // registered this mixin; drop it so the feature method's
+                        // `return false if base < self` guard passes (its `super`
+                        // re-adds it). Mirrors b_fire_hook.
+                        with_host(|h| h.remove_mixin(cls, &m, name));
                         let target = with_host(|h| h.class_ref(cls));
                         dispatch(a, f, &[target], None)?;
                     } else {
