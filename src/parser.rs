@@ -828,6 +828,29 @@ impl Parser {
     /// without parens. A `[` with no leading space stays indexing, `= x` stays a
     /// setter, `{ }`/`do` stays a block — all excluded because `starts_command_arg`
     /// rejects `=`/`{`/`do` and the `cur_space` guard rejects a tight `[`/`(`.
+    /// Parse the comma-separated arguments of a no-paren command call with `do`
+    /// blocks suppressed, so a trailing `do…end` binds to the *command* (the
+    /// outermost call) rather than to a call inside an argument. Ruby binds
+    /// `do…end` to the leftmost command: `translate AST::Pattern do…end` gives the
+    /// block to `translate`, not to the `AST::Pattern` const path. `{}` blocks are
+    /// unaffected (they bind to the nearest call, as Ruby does).
+    fn command_args_no_do(
+        &mut self,
+        args: &mut Vec<Expr>,
+        amp_block: &mut Option<Block>,
+        kwargs: &mut Vec<(Expr, Expr)>,
+        kwsplats: &mut Vec<Expr>,
+    ) -> Result<(), String> {
+        let saved = self.no_do_block;
+        self.no_do_block = true;
+        let mut r = self.arg_or_amp(args, amp_block, kwargs, kwsplats);
+        while r.is_ok() && self.eat_op(",") {
+            r = self.arg_or_amp(args, amp_block, kwargs, kwsplats);
+        }
+        self.no_do_block = saved;
+        r
+    }
+
     fn dot_call_tail(&mut self) -> Result<(Vec<Expr>, Option<Block>), String> {
         // `obj.meth(args)` — no space before `(` — parenthesized call.
         if self.is_op("(") && !self.cur_space() {
@@ -841,10 +864,7 @@ impl Parser {
             let mut amp_block = None;
             let mut kwargs: Vec<(Expr, Expr)> = Vec::new();
             let mut kwsplats: Vec<Expr> = Vec::new();
-            self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
-            while self.eat_op(",") {
-                self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
-            }
+            self.command_args_no_do(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
             Self::push_trailing_kwargs(&mut args, kwargs, kwsplats);
             let block = self.maybe_block()?.or(amp_block);
             return Ok((args, block));
@@ -1513,10 +1533,7 @@ impl Parser {
             let mut amp_block = None;
             let mut kwargs: Vec<(Expr, Expr)> = Vec::new();
             let mut kwsplats: Vec<Expr> = Vec::new();
-            self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
-            while self.eat_op(",") {
-                self.arg_or_amp(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
-            }
+            self.command_args_no_do(&mut args, &mut amp_block, &mut kwargs, &mut kwsplats)?;
             Self::push_trailing_kwargs(&mut args, kwargs, kwsplats);
             let block = self.maybe_block()?.or(amp_block);
             return Ok(Expr::Call {
