@@ -1491,6 +1491,33 @@ pub(crate) fn dispatch(
                 }
                 return Ok(Value::Bool(false));
             }
+            // A class/module receiver reports accurately: sinatra's `set` DSL
+            // branches on `respond_to?("opt=")` and must see a setter as absent
+            // until it is defined. Class methods, a `define_singleton_method`, a
+            // singleton-class instance method, and the reflection surface count;
+            // `respond_to_missing?` on the singleton class is the final say.
+            if let Some(cname) = with_host(|h| h.classref_name(recv)) {
+                if with_host(|h| h.class_responds_to(&cname, &m)) {
+                    return Ok(Value::Bool(true));
+                }
+                let sclass = format!("#<Class:{cname}>");
+                if with_host(|h| h.find_method_owner(&sclass, "respond_to_missing?")).is_some() {
+                    let include_private = args.get(1).cloned().unwrap_or(Value::Bool(false));
+                    let sym = with_host(|h| h.new_symbol(&m));
+                    return call_instance_method(
+                        recv.clone(),
+                        &sclass,
+                        "respond_to_missing?",
+                        &[sym, include_private],
+                        None,
+                    );
+                }
+                // A builtin class (Dir, File, …) has native class methods that are
+                // not enumerable here, so stay permissive; a *user* class has all
+                // its class methods registered, so report an undefined one as absent
+                // (sinatra's `set` needs `respond_to?("opt=")` false until defined).
+                return Ok(Value::Bool(with_host(|h| h.is_builtin_class(&cname))));
+            }
             // Built-in receivers are otherwise permissive, but the pattern-match
             // deconstruction protocol must be accurate: only Arrays respond to
             // `deconstruct`, only Hashes to `deconstruct_keys`. Reporting `true`
@@ -1672,6 +1699,22 @@ fn dispatch_classref(
     if let Some(proc) = with_host(|h| h.find_class_define_method(cls, name)) {
         let recv = with_host(|h| h.class_ref(cls));
         return crate::host::call_proc_self(&proc, args, Some(&recv));
+    }
+    // A method defined on the class's *singleton class* is a class method:
+    // `Klass.singleton_class.class_eval { define_method(:m) { … } }` /
+    // `{ def m; … end }` (sinatra's `set` DSL defines its accessors this way).
+    // The singleton class is registered under the synthetic name `#<Class:Klass>`;
+    // its instance methods run with `self` = the class ref.
+    {
+        let sclass = format!("#<Class:{cls}>");
+        if let Some(proc) = with_host(|h| h.find_define_method(&sclass, name)) {
+            let recv = with_host(|h| h.class_ref(cls));
+            return crate::host::call_proc_self(&proc, args, Some(&recv));
+        }
+        if let Some((_, owner)) = with_host(|h| h.find_method_owner(&sclass, name)) {
+            let recv = with_host(|h| h.class_ref(cls));
+            return call_instance_method(recv, &owner, name, args, block);
+        }
     }
     // `Mod.autoload :Const, "path"` — a module registering a lazy require on a
     // *receiver* (`Tilt.autoload :Foo, "tilt/foo"`), namespaced under the module.

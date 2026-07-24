@@ -2265,32 +2265,42 @@ impl RubyHost {
     /// Whether a bare name resolves as a callable method — a class method (or
     /// `new`) when `self` is a class ref, an instance method on `self`'s class,
     /// or a top-level method.
+    /// Whether the class/module `cls` responds to `name` as a class method: its
+    /// own class methods, a `define_singleton_method`, an instance method on its
+    /// singleton class (`Klass.singleton_class.class_eval { def m }`), the common
+    /// Module/Class reflection surface, and inherited Class/Module instance
+    /// methods. Used by both `responds_to` (bare self-calls) and `respond_to?` on
+    /// a class receiver — sinatra's `set` DSL branches on `respond_to?("opt=")`.
+    pub fn class_responds_to(&self, cls: &str, name: &str) -> bool {
+        name == "new"
+            || matches!(
+                name,
+                "name"
+                    | "to_s"
+                    | "inspect"
+                    | "singleton_class"
+                    | "instance_methods"
+                    | "public_instance_methods"
+                    | "private_instance_methods"
+                    | "class_variables"
+                    | "constants"
+                    | "ancestors"
+                    | "superclass"
+            )
+            || self.find_class_method(cls, name).is_some()
+            || self.find_class_define_method(cls, name).is_some()
+            || {
+                let sclass = format!("#<Class:{cls}>");
+                self.find_define_method(&sclass, name).is_some()
+                    || self.find_method_owner(&sclass, name).is_some()
+            }
+            || self.find_method("Class", name).is_some()
+            || self.find_method("Module", name).is_some()
+    }
     pub fn responds_to(&self, name: &str) -> bool {
         let this = self.current_self();
         if let Some(cls) = self.classref_name(&this) {
-            // A class object responds to its class methods, the common Module
-            // reflection builtins, and — as an instance of `Class < Module` — to
-            // Module/Class instance methods (Rails core-ext macros). Mirrors the
-            // bare-call routing in `dispatch_call`.
-            return name == "new"
-                || matches!(
-                    name,
-                    "name"
-                        | "to_s"
-                        | "inspect"
-                        | "singleton_class"
-                        | "instance_methods"
-                        | "public_instance_methods"
-                        | "private_instance_methods"
-                        | "class_variables"
-                        | "constants"
-                        | "ancestors"
-                        | "superclass"
-                )
-                || self.find_class_method(&cls, name).is_some()
-                || self.find_class_define_method(&cls, name).is_some()
-                || self.find_method("Class", name).is_some()
-                || self.find_method("Module", name).is_some();
+            return self.class_responds_to(&cls, name);
         }
         if let Some(cls) = self.object_class(&this) {
             if self.find_method(&cls, name).is_some()
