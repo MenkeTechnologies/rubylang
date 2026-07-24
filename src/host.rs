@@ -250,6 +250,10 @@ pub enum RObj {
     Regexp {
         source: String,
         re: fancy_regex::Regex,
+        /// The literal Ruby flag letters present at construction (`i`, `m`, `x`),
+        /// kept so `Regexp#options`/`#casefold?`/`#to_s` can report them (the
+        /// compiled `re` bakes them in and can't be read back).
+        flags: String,
     },
     /// The result of a successful `String#match` / `Regexp#match`: the group
     /// captures (index 0 is the whole match; `None` = an unmatched optional
@@ -1896,6 +1900,7 @@ impl RubyHost {
             Ok(re) => Ok(self.alloc(RObj::Regexp {
                 source: source.to_string(),
                 re,
+                flags: flags.chars().filter(|c| "imx".contains(*c)).collect(),
             })),
             Err(e) => Err(format!("invalid regex /{source}/: {e}")),
         }
@@ -1919,7 +1924,14 @@ impl RubyHost {
     /// The compiled matcher + source of a regex value, if `v` is one.
     pub fn as_regex(&self, v: &Value) -> Option<(fancy_regex::Regex, String)> {
         match self.obj(v) {
-            Some(RObj::Regexp { re, source }) => Some((re.clone(), source.clone())),
+            Some(RObj::Regexp { re, source, .. }) => Some((re.clone(), source.clone())),
+            _ => None,
+        }
+    }
+    /// The Ruby flag letters (`imx`) a Regexp was built with, for `#options` etc.
+    pub fn regex_flags(&self, v: &Value) -> Option<String> {
+        match self.obj(v) {
+            Some(RObj::Regexp { flags, .. }) => Some(flags.clone()),
             _ => None,
         }
     }
@@ -3921,7 +3933,11 @@ impl RubyHost {
                 Some(RObj::Method { recv, name }) => {
                     format!("#<Method: {}#{name}>", self.class_of(&recv))
                 }
-                Some(RObj::Regexp { source, .. }) => format!("(?-mix:{source})"),
+                Some(RObj::Regexp { source, flags, .. }) => {
+                    let on: String = "mix".chars().filter(|c| flags.contains(*c)).collect();
+                    let off: String = "mix".chars().filter(|c| !flags.contains(*c)).collect();
+                    format!("(?{on}-{off}:{source})")
+                }
                 // MatchData#to_s is the whole matched substring (group 0).
                 Some(RObj::MatchData { groups, .. }) => {
                     groups.first().and_then(|g| g.clone()).unwrap_or_default()
@@ -3994,7 +4010,10 @@ impl RubyHost {
                 }
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash { map, .. }) => self.inspect_hash(&map),
-                Some(RObj::Regexp { source, .. }) => format!("/{source}/"),
+                Some(RObj::Regexp { source, flags, .. }) => {
+                    let f: String = "mix".chars().filter(|c| flags.contains(*c)).collect();
+                    format!("/{source}/{f}")
+                }
                 // `Time#inspect` shows a fractional second (unlike `#to_s`).
                 Some(RObj::Time { secs }) => self.time_to_s(secs, true),
                 Some(RObj::Date { days }) => self.date_inspect(days),

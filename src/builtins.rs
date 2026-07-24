@@ -11144,8 +11144,38 @@ fn dispatch_regexp(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
             let s = arg_str(&args[0]);
             Ok(scan_regex(&re, &s))
         }
-        "to_s" => Ok(new_str(format!("(?-mix:{source})"))),
-        "inspect" => Ok(new_str(format!("/{source}/"))),
+        // `options` — the Ruby flag bitmask: IGNORECASE=1, EXTENDED=2, MULTILINE=4.
+        "options" => {
+            let flags = with_host(|h| h.regex_flags(recv)).unwrap_or_default();
+            let mut opts = 0i64;
+            if flags.contains('i') {
+                opts |= 1;
+            }
+            if flags.contains('x') {
+                opts |= 2;
+            }
+            if flags.contains('m') {
+                opts |= 4;
+            }
+            Ok(Value::Int(opts))
+        }
+        "casefold?" => {
+            let flags = with_host(|h| h.regex_flags(recv)).unwrap_or_default();
+            Ok(Value::Bool(flags.contains('i')))
+        }
+        "names" => Ok(new_arr(Vec::new())),
+        "to_s" => {
+            // `(?<on>-<off>:source)` — Ruby renders the on/off flag groups.
+            let flags = with_host(|h| h.regex_flags(recv)).unwrap_or_default();
+            let on: String = "mix".chars().filter(|c| flags.contains(*c)).collect();
+            let off: String = "mix".chars().filter(|c| !flags.contains(*c)).collect();
+            Ok(new_str(format!("(?{on}-{off}:{source})")))
+        }
+        "inspect" => {
+            let flags = with_host(|h| h.regex_flags(recv)).unwrap_or_default();
+            let f: String = "mix".chars().filter(|c| flags.contains(*c)).collect();
+            Ok(new_str(format!("/{source}/{f}")))
+        }
         _ => Err(no_method_error(recv, name)),
     }
 }
