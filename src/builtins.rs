@@ -6446,6 +6446,26 @@ fn dispatch_array(
                 Ok(with_host(|h| h.new_enumerator(pairs, "each_with_index")))
             }
         }
+        // `map!`/`collect!` — replace each element with the block's result in place,
+        // returning the mutated receiver.
+        "map!" | "collect!" => {
+            if block.is_none() {
+                return Ok(with_host(|h| h.new_enumerator(arr, "map")));
+            }
+            let mut out = Vec::with_capacity(arr.len());
+            if let Some(b) = &block {
+                for x in &arr {
+                    let r = call_proc(b, std::slice::from_ref(x))?;
+                    if has_pending_signal() {
+                        take_break();
+                        break;
+                    }
+                    out.push(r);
+                }
+            }
+            with_host(|h| h.set_array(recv, out));
+            Ok(recv.clone())
+        }
         "map" | "collect" | "flat_map" | "collect_concat" => {
             if block.is_none() {
                 // Block-less `map`/`collect` yields the original elements as an
