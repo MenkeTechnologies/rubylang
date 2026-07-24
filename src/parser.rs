@@ -1661,7 +1661,15 @@ impl Parser {
             | Tok::Const(_)
             | Tok::Ident(_) => true,
             Tok::Keyword(k) => {
-                matches!(k.as_str(), "nil" | "true" | "false" | "self" | "not")
+                // `def`/`defined?` are expressions (a `def` returns the method
+                // name symbol), so they can be a command argument:
+                // `silence_redefinition_of_method def name; … end` — a pattern
+                // activesupport/Rails use pervasively. (`if`/`unless`/`while`/
+                // `until` are excluded: after a command they read as modifiers.)
+                matches!(
+                    k.as_str(),
+                    "nil" | "true" | "false" | "self" | "not" | "def" | "defined?"
+                )
             }
             // A tight unary sign (`puts -7` — space before `-`, none after) is a
             // command argument; a spaced `x - 7` stays a binary operator (the
@@ -2522,11 +2530,17 @@ impl Parser {
                 self.push_param(&mut params)?;
             }
         }
+        // The def body (and an endless def's expression) is a fresh statement
+        // context: do-blocks are allowed even when the `def` is itself a no-do
+        // command argument (`private def foo; bar do … end; end` — activesupport
+        // and concurrent-ruby use this pervasively).
+        let saved_no_do = std::mem::replace(&mut self.no_do_block, false);
         // Endless method definition (Ruby 3+): `def name(params) = expression`.
         // The body is a single expression and there is no `end`.
         if self.eat_op("=") {
             let line = self.line();
             let expr = self.statement()?;
+            self.no_do_block = saved_no_do;
             return Ok(Expr::Def {
                 name,
                 params,
@@ -2537,6 +2551,7 @@ impl Parser {
         }
         let body = self.body_with_rescue()?;
         self.expect_kw("end")?;
+        self.no_do_block = saved_no_do;
         Ok(Expr::Def {
             name,
             params,
