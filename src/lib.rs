@@ -151,9 +151,40 @@ pub fn eval_str_cfg(src: &str, cfg: &RunConfig) -> Result<Value, String> {
         host::push_file_path(name.clone());
         host::with_host(|h| h.set_program_args(&cfg.argv, &name));
         seed_verbosity(cfg);
+        run_prelude()?;
         run_requires(&cfg.requires)?;
         run_compiled(compile(src)?)
     })
+}
+
+/// Core classes that MRI provides in C but rubylang defines in Ruby, run on the
+/// fresh host before any user code. `ObjectSpace::WeakMap` is a weak-key hash in
+/// MRI; here it is an ordinary hash (no weak semantics), which is enough for the
+/// callers that use it as a registry/set (activesupport DescendantsTracker).
+const PRELUDE: &str = r#"
+class ObjectSpace::WeakMap
+  def initialize; @__wm = {}; end
+  def [](k); @__wm[k]; end
+  def []=(k, v); @__wm[k] = v; end
+  def delete(k); @__wm.delete(k); end
+  def key?(k); @__wm.key?(k); end
+  def include?(k); @__wm.key?(k); end
+  def member?(k); @__wm.key?(k); end
+  def each(&b); @__wm.each(&b); end
+  def each_key(&b); @__wm.each_key(&b); end
+  def each_value(&b); @__wm.each_value(&b); end
+  def each_pair(&b); @__wm.each_pair(&b); end
+  def keys; @__wm.keys; end
+  def values; @__wm.values; end
+  def size; @__wm.size; end
+  def length; @__wm.size; end
+end
+"#;
+
+/// Compile and run [`PRELUDE`] on the current host. Silent and fast; runs once per
+/// fresh VM before requires and the program.
+fn run_prelude() -> Result<(), String> {
+    run_compiled(compile(PRELUDE)?).map(|_| ())
 }
 
 /// Run each `-r LIB` on the current host before the program. Requires share the
@@ -222,6 +253,7 @@ pub fn eval_file_cfg(path: &str, cfg: &RunConfig) -> Result<Value, String> {
         host::push_file_path(path.to_string());
         host::with_host(|h| h.set_program_args(&cfg.argv, path));
         seed_verbosity(cfg);
+        run_prelude()?;
         run_requires(&cfg.requires)?;
         // If `ruby --build FILE` warmed the cache, the stored program is the whole
         // bundled app (every statically-required file inlined). Run it directly —

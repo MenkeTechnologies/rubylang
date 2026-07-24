@@ -1606,15 +1606,20 @@ fn dispatch_classref(
     // `ObjectSpace` — the heap is not enumerable by class here, so the
     // enumeration surface returns 0/empty rather than pretending to walk objects.
     if cls == "ObjectSpace" {
-        return match name {
-            "garbage_collect" => Ok(Value::Undef),
-            "count_objects" => Ok(with_host(|h| h.new_hash(IndexMap::new()))),
-            "each_object" => Ok(Value::Int(0)),
-            _ => Err(raise_exc(
-                "NoMethodError",
-                &format!("undefined method '{name}' for ObjectSpace:Module"),
-            )),
-        };
+        match name {
+            "garbage_collect" => return Ok(Value::Undef),
+            "count_objects" => return Ok(with_host(|h| h.new_hash(IndexMap::new()))),
+            "each_object" => return Ok(Value::Int(0)),
+            // A capitalized name (`ObjectSpace::WeakMap`) is a nested constant /
+            // class — fall through to the constant/nested-class resolution below.
+            _ if name.chars().next().is_some_and(|c| c.is_uppercase()) => {}
+            _ => {
+                return Err(raise_exc(
+                    "NoMethodError",
+                    &format!("undefined method '{name}' for ObjectSpace:Module"),
+                ))
+            }
+        }
     }
     // `Mutex.new` / `Thread::Mutex.new` / `Monitor.new` — a lock object. Under the
     // GVL a critical section with no blocking call is already exclusive, so the
