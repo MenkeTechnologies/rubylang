@@ -407,6 +407,21 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
             Err(e) => abort(vm, e),
         };
     }
+    // A bare name inside a method whose `self` is a builtin-typed value (a String,
+    // Array, Integer, …, not a user object or class) is a call on that value —
+    // e.g. bare `upcase`/`length` inside a reopened `class String` method.
+    // `responds_to` can't confirm native methods, so try object dispatch here and
+    // fall through only on a genuine miss.
+    let this = with_host(|h| h.current_self());
+    let builtin_self =
+        with_host(|h| h.object_class(&this).is_none() && h.classref_name(&this).is_none());
+    if builtin_self {
+        match dispatch(&this, &name, &[], None) {
+            Ok(v) => return propagate(vm, v),
+            Err(e) if e.starts_with("undefined method") => {}
+            Err(e) => return abort(vm, e),
+        }
+    }
     match kernel(&name, &[], None) {
         Ok(v) => propagate(vm, v),
         Err(e) if e.starts_with("undefined method") => Value::Undef,
