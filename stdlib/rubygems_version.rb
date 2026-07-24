@@ -110,4 +110,30 @@ module Gem
       segments.hash
     end
   end
+
+  # The gem home directory (where gems install): GEM_HOME, else the first
+  # GEM_PATH entry, else the per-user default.
+  def self.dir
+    ENV["GEM_HOME"] ||
+      (ENV["GEM_PATH"] || "").split(File::PATH_SEPARATOR).first ||
+      "#{ENV['HOME']}/.gem"
+  end
+
+  def self.default_dir
+    dir
+  end
+
+  # Every directory gems are searched in: the gem home plus each GEM_PATH entry.
+  # Rails' file-update checkers and backtrace cleaner filter paths against this.
+  def self.path
+    paths = [dir]
+    if (gp = ENV["GEM_PATH"])
+      paths.concat(gp.split(File::PATH_SEPARATOR))
+    end
+    paths.compact.uniq
+  end
+
+  def self.loaded_specs
+    {}
+  end
 end
