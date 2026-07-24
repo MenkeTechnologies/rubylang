@@ -1098,6 +1098,12 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
             // falls through to a `method_missing` (e.g. Delegator's, which forwards
             // to the wrapped object) instead of reading the ivar.
             || with_host(|h| h.attr_access(&cls, name)).is_some()
+            // A bare call inside a method whose `self` defines `method_missing`
+            // (a Delegator/SimpleDelegator) must route to object dispatch so the
+            // hook fires (`each { … }` inside a delegator forwards to the wrapped
+            // object). Kernel functions (`puts`, `raise`, …) stay Kernel calls.
+            || (!is_kernel_function(name)
+                && with_host(|h| h.find_method_owner(&cls, "method_missing")).is_some())
         {
             return dispatch(&this, name, args, block);
         }
