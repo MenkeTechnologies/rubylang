@@ -916,15 +916,30 @@ impl Parser {
             kwargs.push((Expr::Symbol(key), v));
             return Ok(());
         }
-        // `*expr` — splat the array's elements into the argument list.
+        // `*expr` — splat the array's elements into the argument list. A bare `*`
+        // (`foo(*)`) forwards the anonymous splat parameter.
         if self.is_op("*") {
             self.advance();
+            if self.is_op(")") || self.is_op(",") || matches!(self.peek(), Tok::Newline) {
+                args.push(Expr::Splat(Box::new(Expr::Var(VarKind::Local, "*".into()))));
+                return Ok(());
+            }
             args.push(Expr::Splat(Box::new(self.arg()?)));
             return Ok(());
         }
         if self.is_op("&") {
             self.advance(); // &
-                            // `&:sym` — inline the send as `{ |__blkx__| __blkx__.sym }`.
+                            // A bare `&` (`foo(&)`) forwards the anonymous block param.
+            if self.is_op(")") || self.is_op(",") || matches!(self.peek(), Tok::Newline) {
+                *amp_block = Some(Block {
+                    params: vec![],
+                    splat: None,
+                    body: vec![Expr::BlockPass(Box::new(Expr::Var(VarKind::Local, "&".into())))
+                        .into()],
+                });
+                return Ok(());
+            }
+            // `&:sym` — inline the send as `{ |__blkx__| __blkx__.sym }`.
             if let Tok::Symbol(s) = self.peek().clone() {
                 self.advance(); // :sym
                                 // `{ |*__symargs__| :sym.to_proc.call(*__symargs__) }` —
@@ -2322,9 +2337,18 @@ impl Parser {
     }
 
     fn param(&mut self) -> Result<Param, String> {
-        // `&blk` — capture the passed block as a Proc.
+        // `&blk` — capture the passed block as a Proc. A bare `&` is an anonymous
+        // block (`def f(&)`, Ruby 3.1) that forwards the block; give it a
+        // synthetic non-colliding name.
         if self.eat_op("&") {
-            let name = self.ident_name()?;
+            let name = if self.is_op(")")
+                || self.is_op(",")
+                || matches!(self.peek(), Tok::Newline | Tok::Semicolon)
+            {
+                "&".to_string()
+            } else {
+                self.ident_name()?
+            };
             return Ok(Param {
                 name,
                 default: None,
