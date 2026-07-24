@@ -450,7 +450,14 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     }
     match kernel(&name, &[], None) {
         Ok(v) => propagate(vm, v),
-        Err(e) if e.starts_with("undefined method") => Value::Undef,
+        // Swallow only the *soft* "this bareword isn't a method" signal (no
+        // exception pending) — a bare identifier that resolves to nothing reads
+        // as nil. A genuine raise sets a pending exception, and a re-raised
+        // NoMethodError's *message* also starts with "undefined method"; those
+        // must propagate (bare `raise` re-raising `$!` inside a rescue).
+        Err(e) if e.starts_with("undefined method") && !with_host(|h| h.has_pending_exc()) => {
+            Value::Undef
+        }
         Err(e) => abort(vm, e),
     }
 }
@@ -1209,6 +1216,51 @@ fn eval_target(recv: &Value, instance: bool) -> crate::host::DefTarget {
 }
 
 /// A receiver method call. Universal methods first, then per-class.
+/// Route `name` to `recv`'s *native* builtin method table by `class` (the raw
+/// builtin type). Factored out of `dispatch` so `super` from a user override of
+/// a builtin method can reach the native implementation directly, bypassing the
+/// user-method lookup that would otherwise re-enter the override.
+pub(crate) fn dispatch_by_type(
+    class: &str,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    match class {
+        "Integer" | "Float" => dispatch_number(recv, name, args, block),
+        "String" => dispatch_string(recv, name, args, block),
+        "Array" => dispatch_array(recv, name, args, block),
+        "Hash" => dispatch_hash(recv, name, args, block),
+        "Range" => dispatch_range(recv, name, args, block),
+        "Symbol" => dispatch_symbol(recv, name, args),
+        "Proc" => dispatch_proc(recv, name, args),
+        "Method" => dispatch_method(recv, name, args, block),
+        "Regexp" => dispatch_regexp(recv, name, args),
+        "MatchData" => dispatch_matchdata(recv, name, args),
+        "Set" => dispatch_set(recv, name, args, block),
+        "Time" => dispatch_time(recv, name, args),
+        "Date" => dispatch_date(recv, name, args),
+        "DateTime" => dispatch_datetime(recv, name, args),
+        "Enumerator" => dispatch_enumerator(recv, name, args, block),
+        "Fiber" => dispatch_fiber(recv, name, args),
+        "Thread" => dispatch_thread(recv, name, args),
+        "IO" | "File" => dispatch_io(recv, name, args, block),
+        "TCPServer" => dispatch_tcp_server(recv, name, args, block),
+        "TCPSocket" => dispatch_tcp_socket(recv, name, args, block),
+        "SQLite3::Database" => dispatch_sqlite_db(recv, name, args, block),
+        "Fiddle::Handle" => dispatch_fiddle_handle(recv, name, args),
+        "Fiddle::Function" => dispatch_fiddle_function(recv, name, args),
+        "Fiddle::Pointer" => dispatch_fiddle_pointer(recv, name, args),
+        "Enumerator::Lazy" => dispatch_lazy(recv, name, args, block),
+        "Enumerator::Yielder" => dispatch_yielder(recv, name, args),
+        "Rational" => dispatch_rational(recv, name, args),
+        "Complex" => dispatch_complex(recv, name, args),
+        "TrueClass" | "FalseClass" | "NilClass" => dispatch_bool(recv, name, args),
+        _ => Err(no_method_error(recv, name)),
+    }
+}
+
 pub(crate) fn dispatch(
     recv: &Value,
     name: &str,
@@ -1669,40 +1721,20 @@ pub(crate) fn dispatch(
         return dispatch_object(recv, &cls, name, args, block);
     }
 
+    // A class-level alias whose target is a *native* builtin method slips past
+    // find_method_owner (which only follows aliases to bytecode methods); resolve
+    // it here so the native dispatch below sees the real method name.
+    let aliased;
+    let name = match with_host(|h| h.alias_target(&h.class_of(recv), name)) {
+        Some(t) => {
+            aliased = t;
+            aliased.as_str()
+        }
+        None => name,
+    };
     let class = with_host(|h| h.dispatch_class(recv));
     let fallback_block = block.clone();
-    let result = match class.as_str() {
-        "Integer" | "Float" => dispatch_number(recv, name, args, block),
-        "String" => dispatch_string(recv, name, args, block),
-        "Array" => dispatch_array(recv, name, args, block),
-        "Hash" => dispatch_hash(recv, name, args, block),
-        "Range" => dispatch_range(recv, name, args, block),
-        "Symbol" => dispatch_symbol(recv, name, args),
-        "Proc" => dispatch_proc(recv, name, args),
-        "Method" => dispatch_method(recv, name, args, block),
-        "Regexp" => dispatch_regexp(recv, name, args),
-        "MatchData" => dispatch_matchdata(recv, name, args),
-        "Set" => dispatch_set(recv, name, args, block),
-        "Time" => dispatch_time(recv, name, args),
-        "Date" => dispatch_date(recv, name, args),
-        "DateTime" => dispatch_datetime(recv, name, args),
-        "Enumerator" => dispatch_enumerator(recv, name, args, block),
-        "Fiber" => dispatch_fiber(recv, name, args),
-        "Thread" => dispatch_thread(recv, name, args),
-        "IO" | "File" => dispatch_io(recv, name, args, block),
-        "TCPServer" => dispatch_tcp_server(recv, name, args, block),
-        "TCPSocket" => dispatch_tcp_socket(recv, name, args, block),
-        "SQLite3::Database" => dispatch_sqlite_db(recv, name, args, block),
-        "Fiddle::Handle" => dispatch_fiddle_handle(recv, name, args),
-        "Fiddle::Function" => dispatch_fiddle_function(recv, name, args),
-        "Fiddle::Pointer" => dispatch_fiddle_pointer(recv, name, args),
-        "Enumerator::Lazy" => dispatch_lazy(recv, name, args, block),
-        "Enumerator::Yielder" => dispatch_yielder(recv, name, args),
-        "Rational" => dispatch_rational(recv, name, args),
-        "Complex" => dispatch_complex(recv, name, args),
-        "TrueClass" | "FalseClass" | "NilClass" => dispatch_bool(recv, name, args),
-        _ => Err(no_method_error(recv, name)),
-    };
+    let result = dispatch_by_type(&class, recv, name, args, block);
     // Builtin values inherit from `Object`. When native dispatch above does not
     // handle the method, fall back to a *user-defined* method on Object (or a
     // module included into Object). activesupport core-ext defines Object#deep_dup,
@@ -11814,7 +11846,16 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
                 }
             };
             let exc = match args {
-                [] => with_host(|h| h.new_exception("RuntimeError", "RuntimeError")),
+                // Bare `raise` re-raises the exception currently being handled
+                // (`$!`), set for the duration of a `rescue` clause; only when
+                // none is active does it raise a fresh `RuntimeError`. sinatra's
+                // `process_route` rescues, records params, then bare `raise`.
+                [] => match with_host(|h| h.get_global("!")) {
+                    Value::Undef => {
+                        with_host(|h| h.new_exception("RuntimeError", "unhandled exception"))
+                    }
+                    e => e,
+                },
                 [a] => {
                     if let Some(cls) = with_host(|h| h.classref_name(a)) {
                         build(&cls, &[])?

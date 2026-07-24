@@ -2369,6 +2369,29 @@ impl RubyHost {
         }
         self.class_of(v)
     }
+    /// Follow the `alias_method`/`alias` chain for `name` on `class` (and its
+    /// ancestors) to the underlying target name, when that target is *not* a
+    /// bytecode method `find_method_owner` already resolves — i.e. a native
+    /// builtin method (`class Params < Hash; alias_method :to_params_hash, :to_h`)
+    /// or a reopened-builtin alias. Returns `None` when no alias applies.
+    pub fn alias_target(&self, class: &str, name: &str) -> Option<String> {
+        let anc = self.class_ancestry(class);
+        let mut cur = name.to_string();
+        let mut changed = false;
+        for _ in 0..50 {
+            let next = anc
+                .iter()
+                .find_map(|a| self.method_aliases.get(a).and_then(|m| m.get(&cur)));
+            match next {
+                Some(t) if *t != cur => {
+                    cur = t.clone();
+                    changed = true;
+                }
+                _ => break,
+            }
+        }
+        changed.then_some(cur)
+    }
     /// Record that native value `v` is really an instance of user subclass
     /// `class` (a `X < Hash`/`Array`/`String`). See `class_overrides`.
     pub fn set_class_override(&mut self, v: &Value, class: &str) {
@@ -3865,6 +3888,11 @@ impl RubyHost {
     }
     pub fn take_pending_exc(&mut self) -> Option<Value> {
         self.pending_exc.take()
+    }
+    /// Whether a raised exception is currently pending (an `Err` in flight is a
+    /// real raise, not a soft "bareword isn't a method" signal).
+    pub fn has_pending_exc(&self) -> bool {
+        self.pending_exc.is_some()
     }
     /// The MRI context label for the innermost active frame: `'<main>'` at the top
     /// level, `'<DefClass>#<method>'` inside an instance method (an unqualified
@@ -5579,6 +5607,26 @@ pub fn call_super_blk(
                 )?;
             }
             return Ok(obj);
+        }
+        // `super` reaching a *native* builtin method: a user override on a
+        // subclass of (or reopening of) Hash/Array/String/etc. calling `super`
+        // (`class Params < Hash; def delete(k); …; super; end`). Dispatch straight
+        // to the builtin table by the receiver's raw type, bypassing user methods
+        // so we don't re-enter the override. Only attempt when the raw type
+        // differs from the linearization root (i.e. there is a builtin base).
+        let base = with_host(|h| h.dispatch_class(&self_obj));
+        if base != recv_class {
+            let args = explicit_args.clone().unwrap_or_else(|| cur_args.clone());
+            let block = match block_override.clone() {
+                Some(b) => Some(b),
+                None => with_host(|h| h.cur_scope().block.clone()),
+            };
+            let r = crate::builtins::dispatch_by_type(&base, &self_obj, &method, &args, block);
+            match &r {
+                Ok(_) => return r,
+                Err(e) if !e.starts_with("undefined method") => return r,
+                _ => {}
+            }
         }
         return Err(format!("super: no superclass method '{method}'"));
     };
