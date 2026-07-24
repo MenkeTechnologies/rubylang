@@ -760,6 +760,15 @@ impl Parser {
                     Ok("[]".to_string())
                 }
             }
+            // Unary operator method names `def +@` / `def -@`. A bare `@` (no name)
+            // lexes as an empty `IVar`, so match that after `+`/`-`.
+            Tok::Op(o)
+                if (o == "+" || o == "-")
+                    && matches!(self.peek(), Tok::IVar(s) if s.is_empty()) =>
+            {
+                self.advance(); // the empty `@`
+                Ok(format!("{o}@"))
+            }
             Tok::Op(o) if is_operator_method(&o) => Ok(o),
             other => Err(format!(
                 "line {}: expected method name, found '{}'",
