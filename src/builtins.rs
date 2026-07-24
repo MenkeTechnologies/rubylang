@@ -5863,6 +5863,17 @@ fn dispatch_array(
     frozen_guard(recv, name, ARRAY_MUTATORS)?;
     let arr = with_host(|h| h.as_array(recv).unwrap_or_default());
     match name {
+        // `arr.hash` — an order-sensitive digest of the elements, so two arrays
+        // that are `==` hash alike (mustermann's EqualityMap keys on it).
+        "hash" => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = rustc_hash::FxHasher::default();
+            arr.len().hash(&mut hasher);
+            for v in &arr {
+                with_host(|h| h.value_to_key(v)).hash(&mut hasher);
+            }
+            return Ok(Value::Int(hasher.finish() as i64));
+        }
         // `arr <=> other` — element-wise comparison: the first non-equal pair
         // decides; if one is a prefix of the other, the shorter is less. Returns
         // nil when the operand is not an Array.
