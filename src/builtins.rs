@@ -12444,7 +12444,9 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             }
             std::process::exit(1);
         }
-        _ => Err(format!("undefined method '{name}'")),
+        _ => {
+            Err(format!("undefined method '{name}'"))
+        }
     }
 }
 

@@ -1140,9 +1140,29 @@ pub fn eval_in_place(src: &str) -> Result<Value, String> {
     let (proc_base, begin_base) = with_host(|h| (h.procs.len(), h.begins.len()));
     let prog = crate::compiler::compile_at(&stmts, proc_base, begin_base)?;
     let main = prog.main;
+    // A `def` at the top level of the eval'd source belongs to the active eval
+    // target — `C.class_eval("def m; … end")` defines `m` on C, not as a global
+    // top-level (Object) method. Without this, activesupport's `class_eval
+    // ("def warn …")` registered `warn` globally and shadowed `Kernel#warn`,
+    // which then routed every bare `warn` into a deprecation path.
+    let target = DEF_TARGET.with(|t| t.borrow().last().cloned());
     with_host(|h| {
         for (name, def) in prog.methods {
-            h.methods.insert(name, def);
+            // Synthetic bodies (`__def123__` stashes for a runtime `def obj.m` /
+            // `class << self; def m`, `__class_body__N`) are looked up by name in
+            // the top-level table by their DEFINE op — they must stay there. Only
+            // real method names follow the eval target.
+            let synthetic = name.starts_with("__");
+            match &target {
+                Some(DefTarget::Instance(c)) if !synthetic => h.add_instance_method(c, &name, def),
+                Some(DefTarget::ClassMethod(c)) if !synthetic => h.add_class_method(c, &name, def),
+                Some(DefTarget::Singleton(id)) if !synthetic => {
+                    h.add_singleton_method(*id, &name, def)
+                }
+                _ => {
+                    h.methods.insert(name, def);
+                }
+            }
         }
         for (name, def) in prog.classes {
             merge_class(&mut h.classes, name, def);
