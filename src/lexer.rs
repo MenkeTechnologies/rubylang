@@ -214,8 +214,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         match out.iter().rev().find(|t| t.kind != Tok::Newline) {
             None => true,
             Some(t) => {
+                // `!` and `~` are prefix-only operators: they never end a line
+                // that continues onto the next, but they *can* be a bare method
+                // name (`def !`, `def ~`), so a trailing one must keep its newline.
                 matches!(&t.kind,
-                Tok::Op(o) if o != ")" && o != "]" && o != "}" )
+                Tok::Op(o) if o != ")" && o != "]" && o != "}" && o != "!" && o != "~" )
                     || matches!(&t.kind, Tok::Keyword(k)
                     if matches!(k.as_str(), "and"|"or"|"not"|"if"|"unless"|"while"|"until"|"do"|"then"|"else"|"in"))
             }

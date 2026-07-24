@@ -1037,6 +1037,13 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
         {
             return dispatch_classref(&cls, name, args, block);
         }
+        // A top-level `def` is a private method of Object, so it is callable by
+        // bareword from anywhere — including a class/module body, where `self` is
+        // a class object (itself an Object). `DelegateClass(...)` used as a nested
+        // class's superclass expression is exactly this case.
+        if with_host(|h| h.has_method(name)) {
+            return call_method(name, args, block);
+        }
         return kernel(name, args, block);
     }
     // A per-object singleton method (`def obj.m`, `class << obj`) or a
@@ -13410,6 +13417,7 @@ pub(crate) fn embedded_stdlib(name: &str) -> Option<&'static str> {
     match n {
         "uri" => Some(include_str!("../stdlib/uri.rb")),
         "forwardable" => Some(include_str!("../stdlib/forwardable.rb")),
+        "delegate" => Some(include_str!("../stdlib/delegate.rb")),
         "csv" => Some(include_str!("../stdlib/csv.rb")),
         "optparse" => Some(include_str!("../stdlib/optparse.rb")),
         "yaml" | "psych" => Some(include_str!("../stdlib/yaml.rb")),
@@ -13458,7 +13466,6 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "socket"
             | "io/console"
             | "abbrev"
-            | "delegate"
             | "sqlite3"
             | "fiddle"
             // Core libs that are no-ops in modern Ruby (their classes are built
