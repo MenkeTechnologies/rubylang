@@ -2663,6 +2663,19 @@ fn dispatch_classref(
                 .collect();
             h.new_array(refs)
         })),
+        // `Module#include?(mod)` — whether `mod` is one of the class's ancestors
+        // (excluding the class itself). rack-protection checks `Array.include?`.
+        "include?" if !args.is_empty() => {
+            let target = with_host(|h| h.classref_name(&args[0]));
+            Ok(Value::Bool(match target {
+                Some(t) => with_host(|h| {
+                    h.class_ancestry(cls)
+                        .iter()
+                        .any(|n| *n != cls && *n == t)
+                }),
+                None => false,
+            }))
+        }
         // `Module#instance_methods([include_inherited=true])` — the instance
         // method names as symbols. `false` gives only the class's own methods;
         // `true`/no arg walks the user-defined ancestor chain. Visibility is not
@@ -3331,6 +3344,24 @@ fn dispatch_object(
         }
         // `NameError#receiver` / `NoMethodError#receiver`.
         "receiver" => Ok(with_host(|h| h.ivar_of(recv, "receiver"))),
+        // Exception backtrace surface. rubylang does not retain a per-exception
+        // Ruby backtrace, so report an empty one (never nil, which callers splat
+        // or `.first` on); `cause` is nil, `full_message` the message.
+        "backtrace" | "backtrace_locations" if is_exception_class(cls) => {
+            Ok(new_arr(Vec::new()))
+        }
+        "set_backtrace" if is_exception_class(cls) => {
+            Ok(args.first().cloned().unwrap_or(Value::Undef))
+        }
+        "cause" if is_exception_class(cls) => Ok(Value::Undef),
+        "full_message" if is_exception_class(cls) => {
+            let m = with_host(|h| h.ivar_of(recv, "message"));
+            Ok(if matches!(m, Value::Undef) {
+                new_str(cls.to_string())
+            } else {
+                m
+            })
+        }
         // A runtime-declared attribute accessor (`class_eval { attr_accessor :x }`)
         // reads/writes the `@field` ivar natively, ahead of method_missing.
         _ if with_host(|h| h.attr_access(cls, name)).is_some() => {
