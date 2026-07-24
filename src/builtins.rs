@@ -1573,6 +1573,21 @@ pub(crate) fn dispatch(
                 "new" | "allocate" | "superclass" => return Ok(Value::Bool(false)),
                 _ => {}
             }
+            // nil / true / false have a small, fixed method surface — report it
+            // accurately. sinatra's `dump_errors!` guards on `boom.respond_to?
+            // (:detailed_message)`; when the caught exception is nil, a permissive
+            // `true` would call `nil.detailed_message` and crash the error path.
+            if matches!(recv, Value::Undef | Value::Bool(_)) {
+                let q = name_of(&args[0]);
+                let known = is_universal_object_method(&q)
+                    || matches!(
+                        q.as_str(),
+                        "to_s" | "inspect" | "to_a" | "to_h" | "to_r" | "to_c" | "&" | "|" | "^"
+                            | "!" | "==" | "===" | "!=" | "nil?" | "class" | "hash" | "object_id"
+                            | "dup" | "clone" | "to_i" | "to_f" | "to_proc"
+                    );
+                return Ok(Value::Bool(known));
+            }
             return Ok(Value::Bool(true));
         }
         // `obj.define_singleton_method(:name) { body }` — a per-object method from

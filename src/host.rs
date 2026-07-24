@@ -3142,6 +3142,27 @@ impl RubyHost {
     /// `Module#ancestors`. Builtin types use a fixed table; user classes walk
     /// their superclass chain and included modules, then close with the
     /// `Object`/`Kernel`/`BasicObject` root.
+    /// Resolve a `prepend`/`include`/`extend` module reference recorded in a
+    /// class body to its registered class-table name. A bare `Helpers` written
+    /// inside `Rack::Request` names the nested `Rack::Request::Helpers`, which
+    /// only registers at runtime; so try the enclosing namespace first, then the
+    /// name as written, then a class alias. Falls back to the given name so the
+    /// ancestor chain still lists it (matching Ruby, which shows the module even
+    /// when unresolved here).
+    pub fn resolve_module_name(&self, module: &str, enclosing: &str) -> String {
+        let nested = format!("{enclosing}::{module}");
+        if self.classes.contains_key(&nested) {
+            return nested;
+        }
+        if self.classes.contains_key(module) {
+            return module.to_string();
+        }
+        let alias = self.resolve_class_alias(module, enclosing);
+        if self.classes.contains_key(&alias) {
+            return alias;
+        }
+        module.to_string()
+    }
     pub fn class_ancestry(&self, name: &str) -> Vec<String> {
         let own = |mods: &[&str]| {
             let mut v = vec![name.to_string()];
@@ -3169,15 +3190,17 @@ impl RubyHost {
                     while let Some(n) = cur {
                         // Prepended modules precede the class in the chain.
                         if let Some(def) = self.classes.get(&n) {
-                            for m in def.prepends.iter().rev() {
-                                out.push(m.clone());
+                            let mods: Vec<String> = def.prepends.clone();
+                            for m in mods.iter().rev() {
+                                out.push(self.resolve_module_name(m, &n));
                             }
                         }
                         out.push(n.clone());
                         match self.classes.get(&n) {
                             Some(def) => {
-                                for m in def.includes.iter().rev() {
-                                    out.push(m.clone());
+                                let mods: Vec<String> = def.includes.clone();
+                                for m in mods.iter().rev() {
+                                    out.push(self.resolve_module_name(m, &n));
                                 }
                                 cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &n));
                             }
@@ -3391,7 +3414,8 @@ impl RubyHost {
         };
         let def = self.classes.get(&name)?;
         for p in def.prepends.iter().rev() {
-            if let Some(r) = self.find_in_module(p, method) {
+            let rp = self.resolve_module_name(p, &name);
+            if let Some(r) = self.find_in_module(&rp, method) {
                 return Some(r);
             }
         }
@@ -3407,7 +3431,8 @@ impl RubyHost {
             }
         }
         for i in def.includes.iter().rev() {
-            if let Some(r) = self.find_in_module(i, method) {
+            let ri = self.resolve_module_name(i, &name);
+            if let Some(r) = self.find_in_module(&ri, method) {
                 return Some(r);
             }
         }
@@ -3420,7 +3445,8 @@ impl RubyHost {
             // Prepended modules sit ahead of the class's own methods (last
             // prepend wins, matching Ruby's reverse-order ancestor insertion).
             for module in def.prepends.iter().rev() {
-                if let Some(r) = self.find_in_module(module, method) {
+                let m = self.resolve_module_name(module, &name);
+                if let Some(r) = self.find_in_module(&m, method) {
                     return Some(r);
                 }
             }
@@ -3438,8 +3464,12 @@ impl RubyHost {
             }
             // Included modules (transitively) take priority over the superclass
             // (last include wins, matching Ruby's reverse-order ancestor insertion).
+            // Resolve each include against *this* class's namespace so a bare
+            // `include Helpers` inside `Rack::Request` finds `Rack::Request::
+            // Helpers`, not an unrelated `Sinatra::Helpers` a suffix match picks.
             for module in def.includes.iter().rev() {
-                if let Some(r) = self.find_in_module(module, method) {
+                let m = self.resolve_module_name(module, &name);
+                if let Some(r) = self.find_in_module(&m, method) {
                     return Some(r);
                 }
             }
@@ -5530,6 +5560,46 @@ fn run_template(id: usize, args: &[Value]) -> Result<Value, String> {
     r
 }
 
+/// Infer a Ruby exception class from a bare error message produced by a builtin
+/// that returned `Err(msg)` without an explicit `raise_exc`. Mirrors the class
+/// MRI would raise for the same condition; defaults to `RuntimeError` (Ruby's
+/// default for a bare `raise "msg"`).
+fn infer_exc_class(msg: &str) -> String {
+    let m = msg;
+    if m.starts_with("undefined method") || m.starts_with("undefined singleton method") {
+        "NoMethodError"
+    } else if m.starts_with("undefined local variable")
+        || m.starts_with("uninitialized constant")
+        || m.starts_with("undefined method 'const")
+    {
+        "NameError"
+    } else if m.starts_with("wrong number of arguments")
+        || m.contains("wrong number of arguments")
+    {
+        "ArgumentError"
+    } else if m.starts_with("can't modify frozen") {
+        "FrozenError"
+    } else if m.starts_with("no implicit conversion")
+        || m.contains("can't be coerced")
+        || m.contains("is not a class")
+        || m.contains("is not a module")
+        || m.contains("is not a symbol")
+    {
+        "TypeError"
+    } else if m.contains("divided by 0") {
+        "ZeroDivisionError"
+    } else if m.starts_with("key not found") || m.starts_with("index") && m.contains("out of") {
+        "KeyError"
+    } else if m.starts_with("No such file") || m.contains("Errno::") {
+        "IOError"
+    } else if m.starts_with("stack level too deep") {
+        "SystemStackError"
+    } else {
+        "RuntimeError"
+    }
+    .to_string()
+}
+
 /// Run a `begin`/`rescue`/`ensure` block. The body runs; a raised exception is
 /// matched against each `rescue` clause (by class); `ensure` always runs. An
 /// unrescued exception is re-raised so an outer `begin` (or the top level) sees
@@ -5554,7 +5624,18 @@ pub fn run_begin(begin_id: usize) -> Result<Value, String> {
         if has_signal {
             break result;
         }
-        let exc = with_host(|h| h.take_pending_exc());
+        let mut exc = with_host(|h| h.take_pending_exc());
+        // A Rust-level `Err(msg)` with no pending-exception object still marks a
+        // raised Ruby exception — many builtins `return Err(msg)` directly rather
+        // than routing through `raise_exc`. Without an object, `rescue => e` would
+        // bind `e` to nil (sinatra's `handle_exception!` then crashes on
+        // `boom.message`). Synthesize one, inferring the class from the message so
+        // `rescue NoMethodError`/etc. still matches.
+        if exc.is_none() {
+            let class = infer_exc_class(&e);
+            let v = with_host(|h| h.new_exception(&class, &e));
+            exc = Some(v);
+        }
         let exc_class = exc
             .as_ref()
             .and_then(|v| with_host(|h| h.object_class(v)))
