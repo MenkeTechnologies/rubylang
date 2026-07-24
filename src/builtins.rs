@@ -630,15 +630,27 @@ fn b_fire_hook(vm: &mut VM, _: u8) -> Value {
     // `self.included` silently never fires.
     let module = with_host(|h| {
         if h.class_exists(&module) {
-            module.clone()
-        } else {
-            let nested = format!("{target}::{module}");
-            if h.class_exists(&nested) {
-                nested
-            } else {
-                module.clone()
+            return module.clone();
+        }
+        let nested = format!("{target}::{module}");
+        if h.class_exists(&nested) {
+            return nested;
+        }
+        // A superclass named unqualified because it lives in a *required* file
+        // (so it wasn't registered when this `class Kid < Parent` was compiled and
+        // couldn't be qualified): resolve it against the target's namespace,
+        // walking outward. `target = A::B::Kid`, `module = Parent` → try
+        // `A::B::Parent`, then `A::Parent`. Without this, an `inherited` hook on a
+        // required superclass never fires.
+        let mut prefix = target.as_str();
+        while let Some(idx) = prefix.rfind("::") {
+            prefix = &prefix[..idx];
+            let cand = format!("{prefix}::{module}");
+            if h.class_exists(&cand) {
+                return cand;
             }
         }
+        module.clone()
     });
     if let Some(def) = with_host(|h| h.find_class_method(&module, &hook)) {
         let recv = with_host(|h| h.class_ref(&module));
