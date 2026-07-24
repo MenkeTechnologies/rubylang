@@ -1083,19 +1083,119 @@ impl Parser {
         let mut params = Vec::new();
         let mut splat = None;
         let mut preludes = Vec::new();
+        let mut kwparams: Vec<(String, Option<Expr>)> = Vec::new();
+        let mut kwsplat: Option<String> = None;
         if self.eat_op("|") {
             if !self.is_op("|") {
-                self.block_param(&mut params, &mut splat, &mut preludes)?;
+                self.block_param(&mut params, &mut splat, &mut preludes, &mut kwparams, &mut kwsplat)?;
                 while self.eat_op(",") {
                     if self.is_op("|") {
                         break; // trailing comma
                     }
-                    self.block_param(&mut params, &mut splat, &mut preludes)?;
+                    self.block_param(&mut params, &mut splat, &mut preludes, &mut kwparams, &mut kwsplat)?;
                 }
             }
             self.expect_op("|")?;
         }
+        // Block keyword params (`|a:, b: default, **rest|`) — the ProcDef carries
+        // only positional names, so desugar: capture the trailing keyword Hash into
+        // a synthetic positional param and extract each keyword in a prelude.
+        if !kwparams.is_empty() || kwsplat.is_some() {
+            Self::desugar_block_kwargs(&mut params, &mut preludes, kwparams, kwsplat);
+        }
         Ok((params, splat, preludes))
+    }
+
+    /// The default expression of a keyword block param (`name: <default>`), or
+    /// `None` when the param is required (`name:` followed by `,`/`|`/newline).
+    /// Parses tighter than bitwise `|` so the block-param list's closing `|` is
+    /// not swallowed as an operator.
+    fn block_kw_default(&mut self) -> Result<Option<Expr>, String> {
+        if self.is_op(",")
+            || self.is_op("|")
+            || self.is_op(")")
+            || matches!(self.peek(), Tok::Newline | Tok::Semicolon)
+        {
+            Ok(None)
+        } else {
+            Ok(Some(self.binary(6)?))
+        }
+    }
+
+    /// Desugar block keyword params. Appends a synthetic `__blockkw` positional
+    /// (bound to the trailing Hash argument) and, for each keyword, a prelude that
+    /// reads it from that hash (falling back to the default), plus a `**rest`
+    /// collector of the unconsumed keys.
+    fn desugar_block_kwargs(
+        params: &mut Vec<String>,
+        preludes: &mut Vec<Expr>,
+        kwparams: Vec<(String, Option<Expr>)>,
+        kwsplat: Option<String>,
+    ) {
+        let cap = "__blockkw";
+        params.push(cap.to_string());
+        let cap_var = || Expr::Var(VarKind::Local, cap.to_string());
+        let is_hash = |e: Expr| Expr::Call {
+            recv: Some(Box::new(e)),
+            name: "is_a?".into(),
+            args: vec![Expr::Var(VarKind::Const, "Hash".into())],
+            block: None,
+        };
+        let mut consumed: Vec<Expr> = Vec::new();
+        for (kname, default) in &kwparams {
+            consumed.push(Expr::Symbol(kname.clone()));
+            // name = (__blockkw.is_a?(Hash) && __blockkw.key?(:name)) ? __blockkw[:name] : default
+            let has_key = Expr::Binary(
+                BinOp::And,
+                Box::new(is_hash(cap_var())),
+                Box::new(Expr::Call {
+                    recv: Some(Box::new(cap_var())),
+                    name: "key?".into(),
+                    args: vec![Expr::Symbol(kname.clone())],
+                    block: None,
+                }),
+            );
+            let fetched = Expr::Index(Box::new(cap_var()), vec![Expr::Symbol(kname.clone())]);
+            let value = Expr::If {
+                cond: Box::new(has_key),
+                then: vec![fetched.into()],
+                elifs: Vec::new(),
+                els: Some(vec![default.clone().unwrap_or(Expr::Nil).into()]),
+            };
+            preludes.push(Expr::Assign(
+                Box::new(Expr::Var(VarKind::Local, kname.clone())),
+                Box::new(value),
+            ));
+        }
+        if let Some(ks) = kwsplat {
+            // rest = __blockkw.is_a?(Hash) ? __blockkw.reject { |k, _| [consumed].include?(k) } : {}
+            let reject = Expr::Call {
+                recv: Some(Box::new(cap_var())),
+                name: "reject".into(),
+                args: Vec::new(),
+                block: Some(Block {
+                    params: vec!["__k".into(), "__v".into()],
+                    splat: None,
+                    body: vec![Expr::Call {
+                        recv: Some(Box::new(Expr::Array(consumed))),
+                        name: "include?".into(),
+                        args: vec![Expr::Var(VarKind::Local, "__k".into())],
+                        block: None,
+                    }
+                    .into()],
+                }),
+            };
+            let value = Expr::If {
+                cond: Box::new(is_hash(cap_var())),
+                then: vec![reject.into()],
+                elifs: Vec::new(),
+                els: Some(vec![Expr::Hash(Vec::new()).into()]),
+            };
+            preludes.push(Expr::Assign(
+                Box::new(Expr::Var(VarKind::Local, ks)),
+                Box::new(value),
+            ));
+        }
     }
 
     /// One block/lambda parameter: `name`, `*rest` (the splat collects surplus
@@ -1107,6 +1207,8 @@ impl Parser {
         params: &mut Vec<String>,
         splat: &mut Option<usize>,
         preludes: &mut Vec<Expr>,
+        kwparams: &mut Vec<(String, Option<Expr>)>,
+        kwsplat: &mut Option<String>,
     ) -> Result<(), String> {
         if self.is_op("(") {
             let (temp, assigns) = self.destructure_param()?;
@@ -1132,12 +1234,30 @@ impl Parser {
             params.push(self.ident_name()?);
             return Ok(());
         }
-        // `**rest` — a keyword-splat in a block param; bind the name.
+        // `**rest` — a keyword-splat collector (desugared from the trailing hash).
         if self.eat_op("**") {
-            params.push(self.ident_name().unwrap_or_else(|_| "**".to_string()));
+            *kwsplat = Some(self.ident_name().unwrap_or_else(|_| "__kwrest".to_string()));
+            return Ok(());
+        }
+        // A keyword param label may be a reserved word (`|in: 1|`).
+        if matches!(self.peek(), Tok::Keyword(_)) && self.label_colon_ahead() {
+            let kname = match self.advance() {
+                Tok::Keyword(k) => k,
+                _ => unreachable!(),
+            };
+            self.advance(); // the `:`
+            let default = self.block_kw_default()?;
+            kwparams.push((kname, default));
             return Ok(());
         }
         let name = self.ident_name()?;
+        // `name:` / `name: default` — a keyword block param.
+        if self.is_op(":") {
+            self.advance(); // the `:`
+            let default = self.block_kw_default()?;
+            kwparams.push((name, default));
+            return Ok(());
+        }
         // `name = default` — a block-param default. A block binds a missing
         // positional to nil, so apply the default when the bound value is nil
         // (`name = name.nil? ? default : name`); a passed-nil is treated as unset.
@@ -2475,13 +2595,15 @@ impl Parser {
         let mut params = Vec::new();
         let mut splat = None;
         let mut preludes = Vec::new();
+        let mut kwparams: Vec<(String, Option<Expr>)> = Vec::new();
+        let mut kwsplat: Option<String> = None;
         let mut had_parens = false;
         if self.eat_op("(") {
             had_parens = true;
             if !self.is_op(")") {
-                self.block_param(&mut params, &mut splat, &mut preludes)?;
+                self.block_param(&mut params, &mut splat, &mut preludes, &mut kwparams, &mut kwsplat)?;
                 while self.eat_op(",") {
-                    self.block_param(&mut params, &mut splat, &mut preludes)?;
+                    self.block_param(&mut params, &mut splat, &mut preludes, &mut kwparams, &mut kwsplat)?;
                 }
             }
             self.expect_op(")")?;
@@ -2490,11 +2612,14 @@ impl Parser {
             // parentheses, terminated by the `{`/`do` body.
             while matches!(self.peek(), Tok::Ident(_)) || self.is_op("*") || self.is_op("&") {
                 had_parens = true;
-                self.block_param(&mut params, &mut splat, &mut preludes)?;
+                self.block_param(&mut params, &mut splat, &mut preludes, &mut kwparams, &mut kwsplat)?;
                 if !self.eat_op(",") {
                     break;
                 }
             }
+        }
+        if !kwparams.is_empty() || kwsplat.is_some() {
+            Self::desugar_block_kwargs(&mut params, &mut preludes, kwparams, kwsplat);
         }
         // The body is a `{ … }` or `do … end` block.
         let block = self
