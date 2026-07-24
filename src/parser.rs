@@ -2375,6 +2375,18 @@ impl Parser {
                     self.advance();
                     singleton_recv = Some(Box::new(Expr::Var(VarKind::Global, s)));
                 }
+                // `def @ivar.m` / `def @@cvar.m` — a singleton method on the object
+                // held by an ivar/cvar (sinatra: `def @@eats_errors.flush(*) end`).
+                Tok::IVar(s) => {
+                    self.advance();
+                    self.advance();
+                    singleton_recv = Some(Box::new(Expr::Var(VarKind::Instance, s)));
+                }
+                Tok::CVar(s) => {
+                    self.advance();
+                    self.advance();
+                    singleton_recv = Some(Box::new(Expr::Var(VarKind::Class, s)));
+                }
                 _ => {}
             }
         }
