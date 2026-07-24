@@ -996,7 +996,7 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
             // or method (`self` is the class): `name`/`to_s`/`inspect`. These
             // arrive as calls only when no local shadows them, so routing to the
             // class is safe. activesupport's autoload path derivation uses `name`.
-            || matches!(name, "name" | "to_s" | "inspect")
+            || matches!(name, "name" | "to_s" | "inspect" | "singleton_class")
             || with_host(|h| {
                 h.find_class_method(&cls, name).is_some()
                     || h.find_method("Class", name).is_some()
@@ -2412,6 +2412,11 @@ fn dispatch_classref(
                 .collect();
             h.new_array(syms)
         })),
+        // `Module#singleton_class` — the class object's own metaclass. Modeled as
+        // a classref named `#<Class:cls>`; `attr_accessor`/`def`/`define_method`
+        // on it register class-level members on `cls` (see the accessor check in
+        // the `_` arm below). activesupport: `singleton_class.attr_accessor :x`.
+        "singleton_class" => Ok(with_host(|h| h.class_ref(&format!("#<Class:{cls}>")))),
         // `Module#instance_method(:name)` — an UnboundMethod, modeled as a
         // receiver-less Method (`recv` = nil) that `bind`/`bind_call` re-target.
         "instance_method" => {
@@ -2521,6 +2526,19 @@ fn dispatch_classref(
                     let recv = with_host(|h| h.class_ref(cls));
                     return crate::host::call_class_method(recv, &def, name, &owner, args, block);
                 }
+            }
+            // Class-level attr accessor from `singleton_class.attr_accessor :x`
+            // (registered on the `#<Class:cls>` metaclass): read/write the class
+            // ivar `@field` on `cls`.
+            let sing = format!("#<Class:{cls}>");
+            if let Some((field, writer)) = with_host(|h| h.attr_access(&sing, name)) {
+                let recv = with_host(|h| h.class_ref(cls));
+                if writer {
+                    let val = args[0].clone();
+                    with_host(|h| h.set_ivar_of(&recv, &field, val.clone()));
+                    return Ok(val);
+                }
+                return Ok(with_host(|h| h.ivar_of(&recv, &field)));
             }
             // `Mod::Const` — a namespaced constant or nested class/module. Both
             // `::` and `.` lower to a method call here, so a no-arg capitalized
