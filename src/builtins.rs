@@ -401,17 +401,13 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     // A bare name that is not a local is a zero-arg call: a method on `self` /
     // top-level method (errors propagate), else a Kernel function (`puts`, …).
     // An unknown bare name reads as nil, matching rubylang's lenient behaviour.
-    if with_host(|h| h.responds_to(&name)) {
-        return match dispatch_call(&name, &[], None) {
-            Ok(v) => propagate(vm, v),
-            Err(e) => abort(vm, e),
-        };
-    }
-    // A bare name inside a method whose `self` is a builtin-typed value (a String,
-    // Array, Integer, …, not a user object or class) is a call on that value —
-    // e.g. bare `upcase`/`length` inside a reopened `class String` method.
-    // `responds_to` can't confirm native methods, so try object dispatch here and
-    // fall through only on a genuine miss.
+    //
+    // When `self` is a builtin-typed value (a String, Array, Integer, …, not a
+    // user object or class), dispatch on that value FIRST — its native/reopened
+    // methods (`empty?`, `upcase`, `length`) must win over the `responds_to`
+    // path, which can spuriously report a *global* method of the same name after
+    // a gem defines one (`empty?` after activesupport loads). `responds_to`
+    // cannot confirm native methods, so a genuine miss falls through below.
     let this = with_host(|h| h.current_self());
     let builtin_self =
         with_host(|h| h.object_class(&this).is_none() && h.classref_name(&this).is_none());
@@ -421,6 +417,12 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
             Err(e) if e.starts_with("undefined method") => {}
             Err(e) => return abort(vm, e),
         }
+    }
+    if with_host(|h| h.responds_to(&name)) {
+        return match dispatch_call(&name, &[], None) {
+            Ok(v) => propagate(vm, v),
+            Err(e) => abort(vm, e),
+        };
     }
     match kernel(&name, &[], None) {
         Ok(v) => propagate(vm, v),
