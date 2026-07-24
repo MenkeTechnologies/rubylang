@@ -1881,6 +1881,12 @@ pub(crate) fn dispatch(
             let ovr = with_host(|h| h.class_of(recv));
             if ovr != class && with_host(|h| h.find_method_owner(&ovr, "method_missing").is_some())
             {
+                // The native dispatch above may have raised (set a pending
+                // exception) via `no_method_error` — e.g. dispatch_hash's terminal
+                // arm for an OrderedOptions setter. Clear it before handling the
+                // call through the subclass's `method_missing`, else the stale
+                // NoMethodError surfaces even though method_missing succeeds.
+                with_host(|h| h.take_pending_exc());
                 let mut mm_args = vec![with_host(|h| h.new_symbol(name))];
                 mm_args.extend_from_slice(args);
                 return call_instance_method(
@@ -1894,6 +1900,7 @@ pub(crate) fn dispatch(
             if class != "Object"
                 && with_host(|h| h.find_method_owner("Object", name)).is_some()
             {
+                with_host(|h| h.take_pending_exc());
                 return call_instance_method(recv.clone(), "Object", name, args, fallback_block);
             }
         }
