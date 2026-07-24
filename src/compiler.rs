@@ -1539,6 +1539,10 @@ impl Compiler {
         // constant assignments) run at class-definition time with `self` bound to
         // the class.
         let mut init_body: Vec<Stmt> = Vec::new();
+        // After a bare `module_function` (no args) in a module body, every
+        // following `def` becomes both an instance method and a module (class)
+        // method — as `Rack::Utils` exposes its helpers.
+        let mut module_function_mode = false;
         for stmt in body {
             match &stmt.expr {
                 // `def Klass.m` / `def obj.m` inside a class body carries an
@@ -1558,7 +1562,34 @@ impl Compiler {
                     if *singleton {
                         class_methods.insert(name.clone(), def);
                     } else {
+                        if module_function_mode {
+                            class_methods.insert(name.clone(), def.clone());
+                        }
                         methods.insert(name.clone(), def);
+                    }
+                }
+                // Bare `module_function` (parses as a local read) turns on the mode.
+                Expr::Var(VarKind::Local, v) if v == "module_function" => {
+                    module_function_mode = true;
+                }
+                // `module_function :a, :b` promotes the named (already-defined)
+                // instance methods to module methods.
+                Expr::Call {
+                    recv: None,
+                    name: m,
+                    args,
+                    ..
+                } if m == "module_function" => {
+                    if args.is_empty() {
+                        module_function_mode = true;
+                    } else {
+                        for a in args {
+                            if let Some(field) = sym_name(a) {
+                                if let Some(def) = methods.get(&field) {
+                                    class_methods.insert(field.clone(), def.clone());
+                                }
+                            }
+                        }
                     }
                 }
                 Expr::Call {
