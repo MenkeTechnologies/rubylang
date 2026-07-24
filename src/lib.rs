@@ -162,6 +162,24 @@ pub fn eval_str_cfg(src: &str, cfg: &RunConfig) -> Result<Value, String> {
 /// MRI; here it is an ordinary hash (no weak semantics), which is enough for the
 /// callers that use it as a registry/set (activesupport DescendantsTracker).
 const PRELUDE: &str = r#"
+module RbConfig
+  CONFIG = {
+    "host_os" => "linux-gnu",
+    "arch" => "x86_64-linux",
+    "ruby_version" => "3.4.0",
+    "MAJOR" => "3",
+    "MINOR" => "4",
+    "TEENY" => "0",
+    "ruby_install_name" => "ruby",
+    "RUBY_INSTALL_NAME" => "ruby",
+    "UNICODE_VERSION" => "15.0.0",
+    "UNICODE_EMOJI_VERSION" => "15.0",
+    "bindir" => "/usr/bin",
+    "rubylibdir" => "/usr/lib/ruby",
+    "EXEEXT" => "",
+  }
+end
+
 class ObjectSpace::WeakMap
   def initialize; @__wm = {}; end
   def [](k); @__wm[k]; end
