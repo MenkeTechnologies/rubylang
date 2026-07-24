@@ -2947,7 +2947,11 @@ fn const_lookup(name: &str) -> Option<Value> {
         None
     })
     .or_else(|| {
-        if is_builtin_exception(name) {
+        // The `*Error`/`Exception` name heuristic resolves a *bare* builtin
+        // exception (`rescue RuntimeError`). It must not fire on a qualified name
+        // (`Mustermann::AST::Node::FooError`), which is a user constant that is
+        // absent unless registered — matching the `defined?` const check.
+        if !name.contains("::") && is_builtin_exception(name) {
             Some(with_host(|h| h.class_ref(name)))
         } else {
             None
