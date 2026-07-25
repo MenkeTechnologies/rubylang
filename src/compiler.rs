@@ -748,6 +748,13 @@ impl Compiler {
     /// itself, returning the first that a class/module was registered under. If
     /// none match (a forward or builtin reference) the written name is kept.
     fn resolve_class_name(&self, written: &str) -> String {
+        // A leading `::` is an absolute (top-level) reference — never qualify it
+        // with the lexical nesting (`class C < ::Rails::Railtie::Configuration`
+        // must not become `Rails::Engine::::Rails::…`, which would leave the `::`
+        // prefix and break superclass resolution).
+        if let Some(abs) = written.strip_prefix("::") {
+            return abs.to_string();
+        }
         for ns in self.nesting.iter().rev() {
             let cand = format!("{ns}::{written}");
             if self.classes.iter().any(|(n, _)| *n == cand) {

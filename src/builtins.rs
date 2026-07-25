@@ -3289,24 +3289,11 @@ fn dispatch_classref(
                 if with_host(|h| h.class_exists(&qualified)) {
                     return Ok(with_host(|h| h.class_ref(&qualified)));
                 }
-                // A constant inherited from a superclass: `ActiveSupport::Logger::WARN`
-                // resolves to `Logger::WARN` (the severity constant). Walk cls's
-                // ancestry and return the first `<ancestor>::<name>` that exists.
-                for anc in with_host(|h| h.class_ancestry(cls)) {
-                    if anc == cls {
-                        continue;
-                    }
-                    let inherited = format!("{anc}::{name}");
-                    if with_host(|h| h.has_const(&inherited)) {
-                        return Ok(with_host(|h| h.get_const(&inherited)));
-                    }
-                    if with_host(|h| h.class_exists(&inherited)) {
-                        return Ok(with_host(|h| h.class_ref(&inherited)));
-                    }
-                }
-                // A pending `autoload :Const, "path"` on this namespace: require
-                // the file, then retry — the scoped `Mod::Const` form must fire
-                // autoload just like the bare read in `b_getconst` does.
+                // A pending `autoload :Const, "path"` on THIS namespace fires first
+                // (before any inherited-constant fallback): `Rails::Engine` and
+                // `Rails::Railtie` both `autoload :Configuration` to different files,
+                // so `Rails::Engine::Configuration` must load its own file, not
+                // resolve to the already-loaded `Rails::Railtie::Configuration`.
                 if let Some(path) = with_host(|h| h.take_autoload(&qualified)) {
                     let pv = with_host(|h| h.new_string(path));
                     do_require(&[pv], ReqMode::Require)?;
@@ -3316,6 +3303,26 @@ fn dispatch_classref(
                     }
                     if with_host(|h| h.class_exists(&qualified)) {
                         return Ok(with_host(|h| h.class_ref(&qualified)));
+                    }
+                }
+                // A constant inherited from a superclass: `ActiveSupport::Logger::WARN`
+                // resolves to `Logger::WARN` (the severity constant). Walk cls's
+                // ancestry, firing an ancestor's own autoload if pending, and return
+                // the first `<ancestor>::<name>` that exists.
+                for anc in with_host(|h| h.class_ancestry(cls)) {
+                    if anc == cls {
+                        continue;
+                    }
+                    let inherited = format!("{anc}::{name}");
+                    if let Some(path) = with_host(|h| h.take_autoload(&inherited)) {
+                        let pv = with_host(|h| h.new_string(path));
+                        do_require(&[pv], ReqMode::Require)?;
+                    }
+                    if with_host(|h| h.has_const(&inherited)) {
+                        return Ok(with_host(|h| h.get_const(&inherited)));
+                    }
+                    if with_host(|h| h.class_exists(&inherited)) {
+                        return Ok(with_host(|h| h.class_ref(&inherited)));
                     }
                 }
             }
