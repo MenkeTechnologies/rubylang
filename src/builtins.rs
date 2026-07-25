@@ -3329,6 +3329,7 @@ fn dispatch_classref(
             // method of every object, including a class object, so a class receiver
             // can invoke it — e.g. `method(:Array)` bound to a class and called via
             // `flat_map(&method(:Array))` (sinatra's error handler registration).
+            let kernel_block = block.clone();
             match kernel(name, args, block) {
                 // Only rewrite when `name` itself is the unknown Kernel function.
                 // A nested "undefined method 'other'" from inside the call (e.g. a
@@ -3338,6 +3339,24 @@ fn dispatch_classref(
                     if e == format!("undefined method '{name}'")
                         || e.starts_with(&format!("undefined method '{name}' ")) =>
                 {
+                    // A class-level `method_missing` (Rails::Railtie's
+                    // `class << self; def method_missing` forwards unknown class
+                    // calls to the application instance, e.g. `MyApp.initialize!`)
+                    // handles the call before we give up.
+                    if let Some(def) = with_host(|h| h.find_class_method(cls, "method_missing")) {
+                        let recv = with_host(|h| h.class_ref(cls));
+                        let sym = with_host(|h| h.new_symbol(name));
+                        let mut mm_args = vec![sym];
+                        mm_args.extend_from_slice(args);
+                        return crate::host::call_class_method(
+                            recv,
+                            &def,
+                            "method_missing",
+                            cls,
+                            &mm_args,
+                            kernel_block,
+                        );
+                    }
                     Err(raise_exc(
                         "NoMethodError",
                         &format!("undefined method '{name}' for class {cls}"),
