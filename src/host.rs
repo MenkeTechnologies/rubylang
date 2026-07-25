@@ -2919,6 +2919,15 @@ impl RubyHost {
             def.methods.shift_remove(name);
         }
     }
+    /// Drop a class method (`def self.m`) so a later `singleton_class.define_method`
+    /// redefinition wins over it — the two are the same singleton method in MRI,
+    /// but rubylang stores them separately with the `def self.m` taking dispatch
+    /// precedence (ActiveSupport's `redefine_singleton_method`).
+    pub fn remove_class_method(&mut self, cls: &str, name: &str) {
+        if let Some(def) = self.classes.get_mut(cls) {
+            def.class_methods.shift_remove(name);
+        }
+    }
     /// Register an anonymous class/module (`Class.new`/`Module.new`) under a fresh
     /// name and return it. The optional superclass seeds the `ClassDef`; the block
     /// body (if any) is run afterwards as a `class_eval` by the caller.

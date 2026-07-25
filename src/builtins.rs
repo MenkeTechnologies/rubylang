@@ -1053,6 +1053,16 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
                 raise_exc("ArgumentError", "tried to create method without a block")
             })?;
             with_host(|h| h.add_define_method(&cls, &mname, proc));
+            // `define_method` on a singleton class `#<Class:X>` redefines X's class
+            // method: drop `def self.m` so this wins (ActiveSupport's
+            // `redefine_singleton_method` → `singleton_class.define_method`).
+            if let Some(attached) = cls
+                .strip_prefix("#<Class:")
+                .and_then(|s| s.strip_suffix('>'))
+            {
+                let attached = attached.to_string();
+                with_host(|h| h.remove_class_method(&attached, &mname));
+            }
             return Ok(with_host(|h| h.new_symbol(&mname)));
         }
         // `alias_method(:new, :old)` — register an alias on the class.
@@ -3409,6 +3419,17 @@ fn dispatch_classref(
                 raise_exc("ArgumentError", "tried to create method without a block")
             })?;
             with_host(|h| h.add_define_method(cls, &mname, proc));
+            // Defining a method on a singleton class `#<Class:X>` is a class-method
+            // (re)definition on X: drop X's `def self.m` so this wins (they are the
+            // same method in MRI). ActiveSupport's `redefine_singleton_method`
+            // routes through `singleton_class.define_method`.
+            if let Some(attached) = cls
+                .strip_prefix("#<Class:")
+                .and_then(|s| s.strip_suffix('>'))
+            {
+                let attached = attached.to_string();
+                with_host(|h| h.remove_class_method(&attached, &mname));
+            }
             Ok(with_host(|h| h.new_symbol(&mname)))
         }
         // `Klass.alias_method(:new, :old)` — register an alias on the class.
