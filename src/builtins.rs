@@ -2032,6 +2032,12 @@ fn dispatch_bool(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
         // `nil.to_a` is `[]`; `nil.to_h` is `{}` — the empty-conversion methods.
         "to_a" if matches!(recv, Value::Undef) => Ok(new_arr(vec![])),
         "to_h" if matches!(recv, Value::Undef) => Ok(with_host(|h| h.new_hash(IndexMap::new()))),
+        // nil's small method surface: `nil =~ x` is always nil (NilClass#=~),
+        // `nil.to_i`/`to_f` are 0, `nil.to_r` 0/1. Rails' exception page does
+        // `header =~ /…/` where a missing header is nil.
+        "=~" if matches!(recv, Value::Undef) => Ok(Value::Undef),
+        "to_i" | "to_int" if matches!(recv, Value::Undef) => Ok(Value::Int(0)),
+        "to_f" if matches!(recv, Value::Undef) => Ok(Value::Float(0.0)),
         // A Kernel function (`require`/`require_relative`/`format`/`raise`/…) is a
         // private method of every object, `nil`/`true`/`false` included, so a call
         // reaching here (e.g. a bare call whose `self` is `nil`) resolves through
