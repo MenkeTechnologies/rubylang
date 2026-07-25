@@ -3036,6 +3036,11 @@ fn dispatch_classref(
                 h.new_array(syms)
             }))
         }
+        // Visibility is not modeled — every method reads as public, so the private
+        // and protected instance-method sets are empty.
+        "private_instance_methods" | "protected_instance_methods" => {
+            Ok(with_host(|h| h.new_array(vec![])))
+        }
         // `Module#method_defined?(sym)` — true if the method is defined on the
         // class or any ancestor. Visibility is not modeled, so this also serves
         // `public_method_defined?`.
