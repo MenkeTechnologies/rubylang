@@ -255,6 +255,8 @@ module URI
   DEFAULT_PARSER = RFC2396_Parser.new
   # Rails' routing mapper reads `URI::RFC2396_PARSER` to escape path segments.
   RFC2396_PARSER = DEFAULT_PARSER
+  # `URI::Parser` is the legacy name rack's MockRequest uses (`URI::Parser.new`).
+  Parser = RFC2396_Parser
 end
 
 # `URI("string")` — the shorthand constructor (a private Kernel method), same as
