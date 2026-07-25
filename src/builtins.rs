@@ -1308,6 +1308,8 @@ fn is_universal_object_method(name: &str) -> bool {
             | "dup"
             | "clone"
             | "methods"
+            | "enum_for"
+            | "to_enum"
             | "instance_eval"
             | "instance_exec"
             | "define_singleton_method"
@@ -1634,6 +1636,24 @@ pub(crate) fn dispatch(
                 return call_proc(b, std::slice::from_ref(recv));
             }
             return Ok(recv.clone());
+        }
+        // `enum_for(method=:each, *args)` / `to_enum` — an Enumerator that drives
+        // `method`. rubylang materializes eagerly: run the method with a collector
+        // block and wrap the yielded values.
+        "to_enum" | "enum_for" => {
+            let method = args
+                .first()
+                .map(name_of)
+                .unwrap_or_else(|| "each".to_string());
+            let rest: Vec<Value> = if args.len() > 1 {
+                args[1..].to_vec()
+            } else {
+                vec![]
+            };
+            let sink = with_host(|h| h.new_enum_sink());
+            dispatch(recv, &method, &rest, Some(sink))?;
+            let collected = with_host(|h| h.take_enum_sink());
+            return Ok(with_host(|h| h.new_enumerator(collected, &method)));
         }
         // `.lazy` wraps an enumerable in a lazy pipeline. A range (possibly
         // endless) stays a range source; anything else materializes to an array.
