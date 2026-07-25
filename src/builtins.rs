@@ -1800,11 +1800,13 @@ pub(crate) fn dispatch(
                 // so a permissive `true` sends it a missing method. sinatra checks
                 // a response body's `content_type` to tell a template from a String.
                 "content_type" => return Ok(Value::Bool(false)),
-                // Rails' railtie-detection probes: `ordered_railties` tests each
-                // entry of `config.railties_order` (which holds the Symbol `:all`)
-                // with `respond_to?(:instance)`, and `initializers_chain` probes
-                // `respond_to?(:initializers)`. A plain built-in value has neither.
-                "instance" | "initializers" => return Ok(Value::Bool(false)),
+                // Rails duck-type probes that a plain built-in value never answers,
+                // where a permissive `true` would send it a missing method:
+                // `ordered_railties`/`initializers_chain` test `:instance`/
+                // `:initializers`; ActionDispatch's parameter_parsers= converts Mime
+                // keys via `key.respond_to?(:symbol) ? key.symbol : key` (a Symbol
+                // key must stay itself, not call the nonexistent `Symbol#symbol`).
+                "instance" | "initializers" | "symbol" => return Ok(Value::Bool(false)),
                 "to_path" => {
                     return Ok(Value::Bool(
                         with_host(|h| h.is_a(recv, "IO") || h.is_a(recv, "File")),
