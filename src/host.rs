@@ -551,6 +551,13 @@ pub struct MethodDef {
     /// `&blk` block-capture parameter name, if any.
     pub blockparam: Option<String>,
     pub chunk: Chunk,
+    /// Number of leading positional params bound directly into the body's fusevm
+    /// frame slots `0..slot_params` (native-lowerable) instead of the host env.
+    /// Non-zero only for a simple signature (all required positional, no defaults/
+    /// splat/keyword/block, none captured by a closure) whose body slot-lowers;
+    /// the dispatcher seeds those slots with the call's positional args before
+    /// running the chunk. 0 = every param is host-bound as usual.
+    pub slot_params: u16,
 }
 
 /// A compiled block template.
@@ -5772,6 +5779,28 @@ pub fn set_debug_mode(on: bool) {
 
 /// Register every rubylang builtin + the numeric hook on a VM, then run it.
 fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
+    run_chunk_seeded(chunk, &[])
+}
+
+/// Run a method's body chunk, seeding the leading frame slots with the call's
+/// positional args when the method binds its params into slots (`slot_params`,
+/// Slice 2). Identical to `run_chunk_on(def.chunk.clone())` when `slot_params` is
+/// 0 (every param host-bound).
+fn run_method_chunk(def: &MethodDef, args: &[Value]) -> Result<Value, String> {
+    let n = def.slot_params as usize;
+    if n == 0 {
+        return run_chunk_on(def.chunk.clone());
+    }
+    let seed: Vec<Value> = (0..n)
+        .map(|i| args.get(i).cloned().unwrap_or(Value::Undef))
+        .collect();
+    run_chunk_seeded(def.chunk.clone(), &seed)
+}
+
+/// Build the VM for `chunk`, seed its leading frame slots with `slot_seed`
+/// (`slot_params` binding, empty for the common case), and run it — via the
+/// linked AOT native driver when the chunk carries one, else the interpreter.
+fn run_chunk_seeded(chunk: Chunk, slot_seed: &[Value]) -> Result<Value, String> {
     // In a `--build --native` binary each method/block chunk carries a non-zero
     // `native_id` and its AOT-lowered native driver is linked in (see aot.rs). Run
     // that machine code directly on the VM instead of interpreting the ops — the
@@ -5783,6 +5812,11 @@ fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
     vm.set_numeric_hook(std::sync::Arc::new(|op, a, b| {
         crate::builtins::numeric_hook(op, a, b)
     }));
+    // Seed the leading frame slots with the caller's positional args before the
+    // body runs (native driver or interpreter both read them via `GetSlot`).
+    for (i, v) in slot_seed.iter().enumerate() {
+        vm.set_slot(i as u16, v.clone());
+    }
     let outcome = if let Some(entry) = native {
         // AOT native: the linked driver runs the chunk and stores its result.
         let _ = entry(&mut vm as *mut VM);
@@ -6082,7 +6116,7 @@ fn run_method(
             true
         }
     });
-    let r = run_chunk_on(def.chunk.clone());
+    let r = run_method_chunk(def, args);
     if def_target_pushed {
         DEF_TARGET.with(|t| {
             t.borrow_mut().pop();

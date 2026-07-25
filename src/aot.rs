@@ -245,18 +245,25 @@ pub fn build_native(file: &str) -> Result<String, String> {
     // main + each method/block body — into one object, each method/block under
     // `fusevm_aot_fn_{native_id}`. This is what makes method bodies run as native
     // machine code instead of the interpreter, not just the top-level chunk.
+    // Carry each method's `slot_params` into the chunk's `aot_seeded_slots` so the
+    // native driver treats the leading param slots as caller-seeded (definite-
+    // assignment + integer entry guard). Procs bind their params host-side, so they
+    // stay at 0.
     let mut next_id = 1u32;
     for (_, m) in &mut prog.methods {
         m.chunk.native_id = next_id;
+        m.chunk.aot_seeded_slots = m.slot_params;
         next_id += 1;
     }
     for (_, c) in &mut prog.classes {
         for (_, m) in &mut c.methods {
             m.chunk.native_id = next_id;
+            m.chunk.aot_seeded_slots = m.slot_params;
             next_id += 1;
         }
         for (_, m) in &mut c.class_methods {
             m.chunk.native_id = next_id;
+            m.chunk.aot_seeded_slots = m.slot_params;
             next_id += 1;
         }
     }

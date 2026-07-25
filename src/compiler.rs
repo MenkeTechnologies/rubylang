@@ -793,14 +793,12 @@ impl Compiler {
                 Self::collect_default_locals(default, &mut default_locals);
             }
         }
-        // Slot-lower the body's locals. Params and any parameter-default locals are
-        // bound by the host prologue below (`SETLOCAL`), so exclude them — a slot
-        // local must be written only by the plain assignments the body compiles,
-        // never by the host prologue. (Binding params into slots is Slice 2.)
-        let mut host_bound: std::collections::HashSet<String> =
-            params.iter().map(|p| p.name.clone()).collect();
-        host_bound.extend(default_locals.iter().cloned());
-        self.enter_slot_scope(&host_bound, body);
+        // Slot-lower the body's locals, binding simple positional params directly
+        // into leading frame slots when it is safe (the dispatcher seeds them from
+        // the call args). `n_slot_params` rides into the `MethodDef` so dispatch
+        // knows how many args to place. A non-simple signature keeps every param
+        // host-bound (the prologue's `SETLOCAL`s), slot-lowering only body locals.
+        let n_slot_params = self.enter_method_slot_scope(params, &default_locals, body);
         for lname in &default_locals {
             if params.iter().any(|p| &p.name == lname) {
                 continue;
@@ -856,6 +854,7 @@ impl Compiler {
             kwsplat,
             blockparam,
             chunk: b.build(),
+            slot_params: n_slot_params,
         })
     }
 
@@ -1374,6 +1373,57 @@ impl Compiler {
 
     fn exit_slot_scope(&mut self) {
         self.slot_scopes.pop();
+    }
+
+    /// Plan slot lowering for a method body, additionally binding simple
+    /// positional params into the leading frame slots `0..N` when it is safe (the
+    /// dispatcher seeds those slots from the call's positional args before running
+    /// the chunk). Returns `N` (`slot_params`); 0 keeps every param host-bound.
+    ///
+    /// Params slot-bind only for a *simple* signature — all required positional,
+    /// no default/splat/keyword/kwsplat/block param, no parameter-default local,
+    /// none captured by a nested closure — and a body the analysis didn't
+    /// disqualify. Otherwise params (and default locals) stay host-bound and only
+    /// body locals slot-lower, exactly as `enter_slot_scope`.
+    fn enter_method_slot_scope(
+        &mut self,
+        params: &[Param],
+        default_locals: &[String],
+        body: &[Stmt],
+    ) -> u16 {
+        let (caps, disq) = slot_scan(body);
+        let simple = !disq
+            && !params.is_empty()
+            && default_locals.is_empty()
+            && params
+                .iter()
+                .all(|p| !p.keyword && !p.kwsplat && !p.block && !p.splat && p.default.is_none())
+            && params.iter().all(|p| !caps.contains(&p.name));
+        if !simple {
+            // Fall back to body-only slot lowering; params stay host-bound.
+            let mut host_bound: std::collections::HashSet<String> =
+                params.iter().map(|p| p.name.clone()).collect();
+            host_bound.extend(default_locals.iter().cloned());
+            self.enter_slot_scope(&host_bound, body);
+            return 0;
+        }
+        // Params occupy slots `0..N` in declaration order; body locals follow.
+        let mut slots = std::collections::HashMap::new();
+        let mut idx = 0u16;
+        for p in params {
+            slots.insert(p.name.clone(), idx);
+            idx += 1;
+        }
+        let n_params = idx;
+        for name in scope_plain_assigns(body) {
+            if slots.contains_key(&name) || caps.contains(&name) {
+                continue;
+            }
+            slots.insert(name, idx);
+            idx += 1;
+        }
+        self.slot_scopes.push(slots);
+        n_params
     }
 
     /// The frame slot assigned to local `name` in the current scope, if it was
@@ -2458,6 +2508,7 @@ impl Compiler {
             kwsplat: None,
             blockparam: None,
             chunk: b.build(),
+            slot_params: 0,
         }
     }
 
@@ -2477,6 +2528,7 @@ impl Compiler {
             kwsplat: None,
             blockparam: None,
             chunk: b.build(),
+            slot_params: 0,
         }
     }
 

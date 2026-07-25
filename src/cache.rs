@@ -34,7 +34,9 @@ struct Entry {
     blob: Vec<u8>,
 }
 
-/// (name, params, splat, kwparams, kwsplat, blockparam, chunk) — serde-flat.
+/// (name, params, splat, kwparams, kwsplat, blockparam, chunk, slot_params) —
+/// serde-flat. `slot_params` is the count of leading params bound into frame
+/// slots (native-lowerable), 0 for the ordinary host-bound convention.
 type CMethod = (
     String,
     Vec<String>,
@@ -43,6 +45,7 @@ type CMethod = (
     Option<String>,
     Option<String>,
     Chunk,
+    u16,
 );
 /// (name, superclass, methods, includes, prepends, extends, class methods).
 type CClass = (
@@ -206,10 +209,11 @@ fn m_to(name: &str, m: &MethodDef) -> CMethod {
         m.kwsplat.clone(),
         m.blockparam.clone(),
         m.chunk.clone(),
+        m.slot_params,
     )
 }
 fn m_from(
-    (name, params, splat, kwparams, kwsplat, blockparam, chunk): CMethod,
+    (name, params, splat, kwparams, kwsplat, blockparam, chunk, slot_params): CMethod,
 ) -> (String, MethodDef) {
     (
         name,
@@ -220,6 +224,7 @@ fn m_from(
             kwsplat,
             blockparam,
             chunk,
+            slot_params,
         },
     )
 }
