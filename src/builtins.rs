@@ -14561,6 +14561,7 @@ pub(crate) fn embedded_stdlib(name: &str) -> Option<&'static str> {
         "optparse" => Some(include_str!("../stdlib/optparse.rb")),
         "yaml" | "psych" => Some(include_str!("../stdlib/yaml.rb")),
         "openssl" => Some(include_str!("../stdlib/openssl.rb")),
+        "pathname" => Some(include_str!("../stdlib/pathname.rb")),
         _ => None,
     }
 }
@@ -14589,7 +14590,6 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "enumerable"
             | "benchmark"
             | "stringio"
-            | "pathname"
             | "fileutils"
             | "tmpdir"
             | "tempfile"
