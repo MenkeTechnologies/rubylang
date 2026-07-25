@@ -3145,11 +3145,24 @@ fn dispatch_classref(
                 h.new_array(syms)
             }))
         }
-        // Visibility is not modeled — every method reads as public, so the private
-        // and protected instance-method sets are empty.
-        "private_instance_methods" | "protected_instance_methods" => {
-            Ok(with_host(|h| h.new_array(vec![])))
+        // Visibility is not modeled: rubylang can't tell a `private def` from a
+        // public one, so `private_instance_methods` returns the class's methods
+        // (own with `false`, inherited otherwise). ActionDispatch::Journey's
+        // visitors build their dispatch table from `private_instance_methods
+        // (false)` matching /^visit_/, so an empty set would leave it unable to
+        // dispatch. `protected_instance_methods` stays empty.
+        "private_instance_methods" => {
+            let inherited = args
+                .first()
+                .map(|a| with_host(|h| h.truthy(a)))
+                .unwrap_or(true);
+            Ok(with_host(|h| {
+                let names = h.instance_method_names(cls, inherited);
+                let syms: Vec<Value> = names.iter().map(|n| h.new_symbol(n)).collect();
+                h.new_array(syms)
+            }))
         }
+        "protected_instance_methods" => Ok(with_host(|h| h.new_array(vec![]))),
         // `Module#method_defined?(sym)` — true if the method is defined on the
         // class or any ancestor. Visibility is not modeled, so this also serves
         // `public_method_defined?`.
@@ -7302,8 +7315,33 @@ fn dispatch_array(
                         return Ok(Value::Bool(false));
                     }
                 }
+            } else {
+                for x in &arr {
+                    if with_host(|h| h.truthy(x)) {
+                        return Ok(Value::Bool(false));
+                    }
+                }
             }
             Ok(Value::Bool(true))
+        }
+        // `one?` — exactly one element is truthy (or yields truthy under a block).
+        "one?" => {
+            let mut n = 0usize;
+            for x in &arr {
+                let hit = if let Some(b) = &block {
+                    let r = call_proc(b, std::slice::from_ref(x))?;
+                    with_host(|h| h.truthy(&r))
+                } else {
+                    with_host(|h| h.truthy(x))
+                };
+                if hit {
+                    n += 1;
+                    if n > 1 {
+                        return Ok(Value::Bool(false));
+                    }
+                }
+            }
+            Ok(Value::Bool(n == 1))
         }
         "count" => {
             if let Some(b) = &block {
@@ -11794,6 +11832,9 @@ fn dispatch_symbol(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         "to_s" | "id2name" | "name" => Ok(new_str(s)),
         // `to_sym` returns self; `itself`/`intern` are Ruby aliases in this context.
         "to_sym" | "intern" => Ok(recv.clone()),
+        // `=~`/`match`/`match?` operate on the symbol's name (Journey's visitors
+        // do `private_instance_method_symbol =~ /^visit_/`).
+        "=~" | "match" | "match?" => dispatch_string(&new_str(s), name, args, None),
         "length" | "size" => Ok(Value::Int(s.chars().count() as i64)),
         "empty?" => Ok(Value::Bool(s.is_empty())),
         // Case/`succ`/`capitalize` all return a Symbol (unlike String's String).
