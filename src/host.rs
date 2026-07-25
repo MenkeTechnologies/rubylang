@@ -652,6 +652,13 @@ pub struct RubyHost {
     class_define_methods: IndexMap<String, IndexMap<String, Value>>,
     /// `alias_method`/`alias` mappings: class → alias name → target method name.
     method_aliases: IndexMap<String, IndexMap<String, String>>,
+    /// For an alias whose target is a USER method (the body is copied under the
+    /// alias name): class → alias name → original method name. `super` from the
+    /// alias must resolve as the original (Ruby aliases preserve the super
+    /// binding): `alias raw_request_method request_method`, whose copied body does
+    /// `check_method(super)`, must find `request_method`'s super, not the
+    /// non-existent `raw_request_method` super.
+    alias_originals: IndexMap<String, IndexMap<String, String>>,
     /// Modules that ran a bare `module_function` at runtime: their instance
     /// methods are also callable as module (class) methods. The compile-time path
     /// promotes direct class-body `def`s, but a `def` nested in an `if`/`else`
@@ -1287,6 +1294,7 @@ impl RubyHost {
             singleton_define_methods: IndexMap::new(),
             class_define_methods: IndexMap::new(),
             method_aliases: IndexMap::new(),
+            alias_originals: IndexMap::new(),
             module_function_modules: std::collections::HashSet::new(),
             class_overrides: IndexMap::new(),
         };
@@ -3088,6 +3096,19 @@ impl RubyHost {
         }
         if let Some((def, _)) = self.find_method_owner(class, target) {
             self.add_instance_method(class, alias_name, def);
+            // Remember the original so `super` from the alias resolves as `target`
+            // (the copied body may call `super`). Chase through an existing alias
+            // so `alias a b; alias c a` records c's original as b's.
+            let original = self
+                .alias_originals
+                .get(class)
+                .and_then(|m| m.get(target))
+                .cloned()
+                .unwrap_or_else(|| target.to_string());
+            self.alias_originals
+                .entry(class.to_string())
+                .or_default()
+                .insert(alias_name.to_string(), original);
         } else if let Some(proc) = self.find_define_method(class, target) {
             self.define_methods
                 .entry(class.to_string())
@@ -3914,6 +3935,16 @@ impl RubyHost {
     /// owner). Walking the receiver's full ancestry — not just `def_class`'s
     /// superclass — is what makes `prepend`/`include` super reach the class
     /// method that follows in `Module#ancestors` order.
+    /// The original method name an alias was created from, for `super` resolution
+    /// (walking `class` and its ancestors, since the alias may live on an ancestor).
+    pub fn alias_original(&self, class: &str, alias_name: &str) -> Option<String> {
+        for anc in self.class_ancestry(class) {
+            if let Some(orig) = self.alias_originals.get(&anc).and_then(|m| m.get(alias_name)) {
+                return Some(orig.clone());
+            }
+        }
+        None
+    }
     pub fn find_super(
         &self,
         recv_class: &str,
@@ -5814,6 +5845,9 @@ pub fn call_super_blk(
     let (Some(method), Some(def_class)) = (method, def_class) else {
         return Err("super called outside of a method".to_string());
     };
+    // If the running method is an alias of a user method, `super` resolves as the
+    // original name (Ruby aliases preserve the super binding).
+    let method = with_host(|h| h.alias_original(&def_class, &method)).unwrap_or(method);
     // `super` from a singleton/class method (`def self.m`): the receiver is a
     // class ref with no object class, so resolve through the singleton-class
     // ancestry (class methods above `def_class`) rather than the instance chain.
