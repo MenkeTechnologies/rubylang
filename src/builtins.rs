@@ -886,7 +886,13 @@ fn b_mkrange(vm: &mut VM, _: u8) -> Value {
             let hs = with_host(|h| h.as_str(&hi));
             match (ls, hs) {
                 (Some(a), Some(b)) => with_host(|h| h.new_str_range(a, b, excl)),
-                _ => abort(vm, "bad value for range".into()),
+                // rubylang has no generic object-range (only Int/Float/String
+                // endpoints). Ruby builds a range from any `<=>`-comparable pair;
+                // where rubylang can't, raise a *catchable* ArgumentError (the
+                // message MRI uses for genuinely non-comparable endpoints) so a
+                // guarding `rescue ArgumentError` — ActionDispatch::RemoteIp's
+                // `sanitize_ips` around `IPAddr#to_range` — degrades gracefully.
+                _ => abort(vm, raise_exc("ArgumentError", "bad value for range")),
             }
         }
     }
