@@ -253,6 +253,8 @@ module URI
 
   # The shared default parser instance (rack/rails read `URI::DEFAULT_PARSER`).
   DEFAULT_PARSER = RFC2396_Parser.new
+  # Rails' routing mapper reads `URI::RFC2396_PARSER` to escape path segments.
+  RFC2396_PARSER = DEFAULT_PARSER
 end
 
 # `URI("string")` — the shorthand constructor (a private Kernel method), same as
