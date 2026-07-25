@@ -5940,6 +5940,20 @@ pub fn call_super_blk(
             }
             return Ok(with_host(|h| h.new_array(vec![])));
         }
+        // `super` from an override of an Exception introspection method (Rails
+        // wraps exceptions and overrides these, chaining up via `super`). The
+        // native default is the stored value, or empty/nil.
+        if matches!(method.as_str(), "backtrace" | "backtrace_locations") {
+            let stored = with_host(|h| h.ivar_of(&self_obj, "backtrace"));
+            return Ok(if matches!(stored, Value::Undef) {
+                with_host(|h| h.new_array(vec![]))
+            } else {
+                stored
+            });
+        }
+        if method == "cause" {
+            return Ok(with_host(|h| h.ivar_of(&self_obj, "cause")));
+        }
         // `super` from a user override of `Module#include`/`prepend`/`extend`
         // (self is the class, args are the modules) performs the real mixin. e.g.
         // concurrent-ruby's ReInclude#include calls `super(*modules)` then replays
