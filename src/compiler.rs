@@ -1679,6 +1679,14 @@ impl Compiler {
                             extends.push(qname.clone());
                         }
                     }
+                    // Run inline too (see the `include` arm) so the module's
+                    // `self.extended` hook fires at the statement's position —
+                    // ActiveSupport::Concern.extended sets @_dependencies, which a
+                    // later `include AnotherConcern` in the same body checks to
+                    // decide whether to defer. Deferring the hook to after the body
+                    // would leave @_dependencies unset and run the included block
+                    // immediately with the wrong self.
+                    init_body.push(stmt.clone());
                 }
                 // `class << self … end` — its `def`s are class (singleton)
                 // methods, the same as `def self.x`.
@@ -1762,11 +1770,10 @@ impl Compiler {
         if !init_body.is_empty() {
             class_methods.insert(body_name.clone(), self.compile_method(&[], &init_body)?);
         }
-        // `extend` still fires its `extended` hook after the body. `include`/
-        // `prepend` now run inline (pushed into init_body above), so their
-        // `included`/`prepended`/append_features hooks fire at the statement's
-        // lexical position — deferring them here would double-fire.
-        let hook_extends = extends.clone();
+        // `include`/`prepend`/`extend` now all run inline (pushed into init_body
+        // above), so their `included`/`prepended`/`extended`/append_features hooks
+        // fire at the statement's lexical position — deferring them here would
+        // double-fire (and, for `extend Concern`, run too late).
         // Done with this namespace: everything referenced below (the class ref
         // to run the body on, hook targets) uses the qualified name, so pop
         // before emitting those so they resolve at the enclosing level.
@@ -1805,10 +1812,6 @@ impl Compiler {
             self.kstr(b, &body_name);
             b.emit(Op::CallBuiltin(ops::CALL_METHOD, 2), self.cur_line);
             b.emit(Op::Pop, 0);
-        }
-        // The `extended` hook fires once the extend relationship is set.
-        for m in &hook_extends {
-            self.emit_hook(b, m, "extended", &qname);
         }
         // A class/module definition evaluates to nil here.
         b.emit(Op::LoadUndef, 0);
