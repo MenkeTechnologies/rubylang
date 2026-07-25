@@ -9,6 +9,20 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // Run on a worker thread with a large stack. The interpreter's per-Ruby-call
+    // native depth is many Rust frames deep, so the OS main-thread stack (8 MB on
+    // macOS) caps recursion far below what real programs (Rails' boot) need. A big
+    // worker stack lifts that ceiling; the frame-depth guard in run_method still
+    // turns genuinely-unbounded recursion into a catchable SystemStackError.
+    std::thread::Builder::new()
+        .stack_size(1024 * 1024 * 1024)
+        .spawn(run)
+        .expect("spawn main worker thread")
+        .join()
+        .unwrap_or(ExitCode::FAILURE)
+}
+
+fn run() -> ExitCode {
     let cli = match rubylang::cli::parse() {
         Ok(c) => c,
         // MRI prints option errors to stderr and exits 1.

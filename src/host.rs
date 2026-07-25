@@ -5541,6 +5541,16 @@ fn run_method(
     method_name: Option<String>,
     def_class: Option<String>,
 ) -> Result<Value, String> {
+    // Ruby-level recursion guard: cap the frame depth well below the Rust stack
+    // limit so runaway Ruby recursion raises a catchable SystemStackError
+    // (host.rs maps "stack level too deep" to it) with a Ruby backtrace, instead
+    // of overflowing the native stack and aborting the process.
+    if with_host(|h| h.frame_depth()) > 2000 {
+        return Err(format!(
+            "stack level too deep: {}",
+            method_name.as_deref().unwrap_or("(unknown)")
+        ));
+    }
     // AOP weave. Fast path: `intercepts::any()` is an O(1) empty-check, so a call
     // with no registered advice pays only one bool test and takes `None`. The
     // `in_advice` guard keeps a handler's own calls from being advised.
