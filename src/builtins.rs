@@ -1875,6 +1875,21 @@ pub(crate) fn dispatch(
                 // keys via `key.respond_to?(:symbol) ? key.symbol : key` (a Symbol
                 // key must stay itself, not call the nonexistent `Symbol#symbol`).
                 "instance" | "initializers" | "symbol" => return Ok(Value::Bool(false)),
+                // Rails duck-type probes on a plain value. `permitted?` is the
+                // ActionController::Parameters marker — AbstractController::Rendering
+                // does `action.permitted? if action.respond_to?(:permitted?)` on the
+                // render argument (a plain options Hash must answer false). `to_model`
+                // / `to_partial_path` are the ActiveModel surface a Hash/String lacks.
+                "permitted?" | "to_model" | "to_partial_path" | "render_in" => {
+                    return Ok(Value::Bool(false))
+                }
+                // ActionController::Rendering's format-conversion protocol:
+                // `options[format].to_text if options[format].respond_to?(:to_text)`
+                // (and the `:html`/`:js` variants). A plain String/Hash render value
+                // IS the content and carries none of these — a permissive `true`
+                // sends it a missing `to_text`/`to_html`. (`to_json`/`to_xml` are
+                // excluded: real values often do define those.)
+                "to_text" | "to_html" | "to_js" => return Ok(Value::Bool(false)),
                 // Rack/endpoint duck-type probes. A plain String/Array/Hash/Integer
                 // is not a routing endpoint, so `:action` must be false: Rails'
                 // routing mapper branches on
@@ -2138,6 +2153,18 @@ fn dispatch_classref(
     // `__class_body__` that runs a reopened module/class body. Without this,
     // reopening a builtin module (`module SecureRandom; <non-def statement>; end`)
     // fails because its `__class_body__` call hits the builtin dispatch.
+    // A `define_method` on the class's OWN singleton class (`redefine_singleton_method`)
+    // is the class's own singleton method: it beats a class method inherited from an
+    // extended module's `ClassMethods`. Rails' AbstractController::Helpers redefines
+    // `_helpers` this way to win over ActionView::Rendering::ClassMethods#_helpers
+    // (a `def _helpers; end` placeholder returning nil). Checked before
+    // `find_class_method_owner`, whose `extends` walk would otherwise find the module.
+    if !native_only {
+        if let Some(proc) = with_host(|h| h.own_singleton_define_method(cls, name)) {
+            let recv = with_host(|h| h.class_ref(cls));
+            return crate::host::call_proc_self(&proc, args, Some(&recv));
+        }
+    }
     if !native_only {
         if let Some((def, owner)) = with_host(|h| h.find_class_method_owner(cls, name)) {
             let recv = with_host(|h| h.class_ref(cls));
@@ -3981,6 +4008,14 @@ fn dispatch_object(
     // ConditionVariable: wait releases the mutex + GVL and parks until signalled.
     if cls == "ConditionVariable" {
         if let Some(r) = condvar_method(recv, name, args)? {
+            return Ok(r);
+        }
+    }
+    // A `Digest::SHA256`/`SHA1`/`MD5` INSTANCE (`Digest::SHA256.new`), which
+    // accumulates data via `<<`/`update` and finalizes with `hexdigest`/`digest`.
+    // ActiveSupport::Digest / ActionDispatch ETag computation streams the body in.
+    if matches!(cls, "Digest::SHA256" | "Digest::SHA1" | "Digest::MD5") {
+        if let Some(r) = digest_instance_method(recv, cls, name, args)? {
             return Ok(r);
         }
     }
@@ -11156,6 +11191,26 @@ fn dispatch_hash(
             h.new_array(ks)
         })),
         "values" => Ok(new_arr(map.values().cloned().collect())),
+        // `Hash#values_at(*keys)` — the value for each key (default/nil for a miss),
+        // in argument order. `fetch_values` raises KeyError on a miss instead.
+        "values_at" | "fetch_values" => {
+            let mut out = Vec::with_capacity(args.len());
+            for a in args {
+                let k = with_host(|h| h.hash_key(recv, a));
+                match map.get(&k) {
+                    Some(v) => out.push(v.clone()),
+                    None if name == "fetch_values" && block.is_none() => {
+                        let ins = with_host(|h| h.inspect(a));
+                        return Err(raise_exc("KeyError", &format!("key not found: {ins}")));
+                    }
+                    None => match &block {
+                        Some(b) => out.push(call_proc(b, std::slice::from_ref(a))?),
+                        None => out.push(with_host(|h| h.hash_default(recv))),
+                    },
+                }
+            }
+            Ok(new_arr(out))
+        }
         "compare_by_identity" => {
             with_host(|h| h.set_hash_by_identity(recv));
             Ok(recv.clone())
@@ -13121,6 +13176,17 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             None => Ok(Value::Undef),
         },
         "mon_enter" | "mon_exit" | "mon_initialize" | "mon_try_enter" => Ok(Value::Undef),
+        // `MonitorMixin#new_cond` on an implicit self that includes it (Rails'
+        // ActionDispatch::Response does `@cv = new_cond` and later `@cv.broadcast`).
+        // Return a real ConditionVariable so the wait/broadcast surface resolves.
+        "new_cond" => {
+            let cvid = crate::host::new_condvar();
+            Ok(with_host(|h| {
+                let o = h.new_object("ConditionVariable");
+                h.set_ivar_of(&o, "__cvid", Value::Int(cvid as i64));
+                o
+            }))
+        }
         _ => {
             Err(format!("undefined method '{name}'"))
         }
@@ -13303,6 +13369,50 @@ fn queue_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Value
 /// `ConditionVariable` instance methods, keyed by the `__cvid` ivar. `wait`
 /// unlocks the given `Mutex`, releases the GVL, parks until `signal`/`broadcast`,
 /// then relocks the mutex (MRI semantics).
+/// Instance methods on a streaming `Digest::SHA256`/`SHA1`/`MD5` object created by
+/// `Digest::<Algo>.new`: `<<`/`update` append to an internal buffer (returning
+/// self, so `d << a << b` chains), and `hexdigest`/`digest`/`to_s`/`base64digest`
+/// finalize it. `reset` empties the buffer. The buffer is kept as the object's
+/// `__buf` ivar and hashed on demand — sufficient for the ETag/cache-key use.
+fn digest_instance_method(
+    recv: &Value,
+    cls: &str,
+    name: &str,
+    args: &[Value],
+) -> Result<Option<Value>, String> {
+    let buf = || match with_host(|h| h.ivar_of(recv, "__buf")) {
+        Value::Undef => String::new(),
+        v => with_host(|h| h.as_str(&v)).unwrap_or_default(),
+    };
+    match name {
+        "<<" | "update" => {
+            let data = str_arg(args, 0);
+            let mut cur = buf();
+            cur.push_str(&data);
+            with_host(|h| {
+                let s = h.new_string(cur);
+                h.set_ivar_of(recv, "__buf", s);
+            });
+            Ok(Some(recv.clone()))
+        }
+        "reset" => {
+            with_host(|h| {
+                let s = h.new_string(String::new());
+                h.set_ivar_of(recv, "__buf", s);
+            });
+            Ok(Some(recv.clone()))
+        }
+        "hexdigest" | "to_s" => Ok(Some(new_str(hex_encode(&digest_of(cls, buf().as_bytes()))))),
+        "digest" => Ok(Some(bin_str(digest_of(cls, buf().as_bytes())))),
+        "base64digest" => Ok(Some(new_str(base64_encode_bytes(
+            &digest_of(cls, buf().as_bytes()),
+            B64_STD,
+            true,
+        )))),
+        _ => Ok(None),
+    }
+}
+
 fn condvar_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Value>, String> {
     let cvid = match with_host(|h| h.ivar_of(recv, "__cvid")) {
         Value::Int(n) => n as u32,
@@ -13327,6 +13437,24 @@ fn condvar_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Val
         }
         "broadcast" => {
             crate::host::condvar_notify(cvid, true);
+            Ok(Some(recv.clone()))
+        }
+        // `MonitorMixin::ConditionVariable#wait_until { cond }` — block until the
+        // predicate holds. Under the single-thread boot GVL the state that the
+        // predicate observes is already settled by the time it is checked (the
+        // committer ran synchronously), so evaluate it once and only wait if it is
+        // still false, re-checking after each wake — avoiding a deadlock while
+        // staying faithful when the predicate is already true.
+        "wait_until" => {
+            if let Some(b) = current_block() {
+                for _ in 0..1_000_000 {
+                    let r = call_proc(&b, &[])?;
+                    if with_host(|h| h.truthy(&r)) {
+                        break;
+                    }
+                    crate::host::condvar_wait(cvid);
+                }
+            }
             Ok(Some(recv.clone()))
         }
         _ => Ok(None),
@@ -13765,6 +13893,13 @@ fn dispatch_stdlib_module(cls: &str, name: &str, args: &[Value]) -> Option<Resul
             _ => None,
         },
         "Digest::MD5" | "Digest::SHA1" | "Digest::SHA256" => match name {
+            // A streaming digest object (see `digest_instance_method`).
+            "new" => Some(Ok(with_host(|h| {
+                let o = h.new_object(cls);
+                let s = h.new_string(String::new());
+                h.set_ivar_of(&o, "__buf", s);
+                o
+            }))),
             "hexdigest" => Some(Ok(new_str(hex_encode(&digest_of(cls, &str_arg(0)))))),
             "digest" => Some(Ok(new_str(
                 String::from_utf8_lossy(&digest_of(cls, &str_arg(0))).into_owned(),

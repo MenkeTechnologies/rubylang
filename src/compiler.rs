@@ -1755,19 +1755,15 @@ impl Compiler {
                     args,
                     ..
                 } if m == "include" => {
-                    for a in args {
-                        if let Some(module) = const_path_name(a) {
-                            includes.push(self.resolve_class_name(&module));
-                        }
-                    }
-                    // Also run the include inline at its lexical position, so a
-                    // module's `append_features`/`included` (ActiveSupport::Concern
-                    // extends ClassMethods and runs the `included` block there) takes
-                    // effect before later body statements — e.g. a `define_callbacks`
-                    // macro on the line after `include ActiveSupport::Callbacks`.
-                    // The compile-time `includes` above still registers the mixin for
-                    // method resolution; the runtime path dedups and, for a concern,
-                    // drops+re-adds it so its `base < self` guard passes.
+                    // Run the include inline ONLY (at its lexical position); do NOT
+                    // pre-populate the compile-time `includes` list. Building the
+                    // ancestry incrementally as each inline `include` executes is what
+                    // gives a mid-body `alias :a, :b` the lexically-correct target: an
+                    // `alias :_cache_control, :cache_control` between `include
+                    // Rack::Response::Helpers` and `include AD::Http::Cache::Response`
+                    // must snapshot Rack's `cache_control`, not the later one. A
+                    // pre-populated list makes every include visible before any body
+                    // statement runs, so the alias would capture the wrong method.
                     init_body.push(stmt.clone());
                 }
                 // `prepend ModuleName` — record a module that precedes the class.

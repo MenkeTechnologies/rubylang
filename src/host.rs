@@ -3078,6 +3078,19 @@ impl RubyHost {
             .or_default()
             .insert(name.to_string(), proc);
     }
+    /// A `define_method` on the class's OWN singleton class `#<Class:class>`
+    /// (`class.singleton_class.define_method`, `redefine_singleton_method`) — the
+    /// class's own singleton method, which in MRI takes precedence over a class
+    /// method inherited from an extended module's `ClassMethods`. Only the direct
+    /// singleton class is consulted (not superclasses / includes), so it stays a
+    /// same-level own-method check.
+    pub fn own_singleton_define_method(&self, class: &str, name: &str) -> Option<Value> {
+        let sclass = format!("#<Class:{class}>");
+        self.define_methods
+            .get(&sclass)
+            .and_then(|m| m.get(name))
+            .cloned()
+    }
     /// A method defined on the singleton class of `class` or any of its
     /// superclasses (`Klass.singleton_class.class_eval { def m }` / `define_method`)
     /// — an *inherited* class method. Returns the owning singleton-class name (so
@@ -6397,6 +6410,38 @@ pub fn call_super_blk(
                 Err(e) if !e.starts_with("undefined method") => return r,
                 _ => {}
             }
+        }
+        // `super` reaching an alias whose target is a native method: `alias
+        // send_action send` in AbstractController::Base, which Rails'
+        // BasicImplicitRender#send_action overrides with a `super` call. The alias
+        // is stored as a native marker (not a user MethodDef), so `find_super`
+        // above misses it — resolve the native target and dispatch it. (Unlike
+        // `native_kernel_alias`, this accepts any native target, e.g. `send`.)
+        if let Some(native) = with_host(|h| {
+            h.find_alias(&recv_class, &method)
+                .and_then(|t| RubyHost::native_alias_target(&t).map(str::to_string))
+        }) {
+            let args = explicit_args.clone().unwrap_or_else(|| cur_args.clone());
+            let block = match block_override.clone() {
+                Some(b) => Some(b),
+                None => with_host(|h| h.cur_scope().block.clone()),
+            };
+            return crate::builtins::dispatch(&self_obj, &native, &args, block);
+        }
+        // `super` reaching a native attr accessor above the override: Rails'
+        // AbstractController::Base does `attr_internal :response_body`, and
+        // ActionController::Metal#response_body= (a real method override) calls
+        // `super` to reach that base writer. `find_super` only walks real methods,
+        // so resolve the attr accessor and read/write its field.
+        if let Some((field, is_writer)) = with_host(|h| h.attr_access(&recv_class, &method)) {
+            let args = explicit_args.clone().unwrap_or_else(|| cur_args.clone());
+            return Ok(if is_writer {
+                let v = args.first().cloned().unwrap_or(Value::Undef);
+                with_host(|h| h.set_ivar_of(&self_obj, &field, v.clone()));
+                v
+            } else {
+                with_host(|h| h.ivar_of(&self_obj, &field))
+            });
         }
         return Err(format!("super: no superclass method '{method}'"));
     };
