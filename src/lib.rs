@@ -167,6 +167,16 @@ const PRELUDE: &str = r#"
 # require). Preload the bundled definition here.
 require "rubygems/version"
 
+module Process
+  # clock_gettime clock ids (values match Linux; rubylang ignores the specific
+  # clock and returns a wall-clock reading — enough for timing/instrumentation).
+  CLOCK_REALTIME = 0
+  CLOCK_MONOTONIC = 1
+  CLOCK_PROCESS_CPUTIME_ID = 2
+  CLOCK_THREAD_CPUTIME_ID = 3
+  CLOCK_MONOTONIC_RAW = 4
+end
+
 module RbConfig
   CONFIG = {
     "host_os" => "linux-gnu",

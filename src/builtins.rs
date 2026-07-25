@@ -2474,6 +2474,32 @@ fn dispatch_classref(
             _ => {}
         }
     }
+    if cls == "Process" {
+        match name {
+            "pid" => return Ok(Value::Int(std::process::id() as i64)),
+            "ppid" => return Ok(Value::Int(0)),
+            // `clock_gettime(clock, unit = :float_second)`: rubylang returns a
+            // wall-clock reading in the requested unit (the specific clock id is
+            // ignored — sufficient for elapsed-time measurement).
+            "clock_gettime" => {
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                let unit = args.get(1).map(name_of);
+                return Ok(match unit.as_deref() {
+                    Some("nanosecond") => Value::Int((secs * 1e9) as i64),
+                    Some("microsecond") => Value::Int((secs * 1e6) as i64),
+                    Some("millisecond") => Value::Int((secs * 1e3) as i64),
+                    Some("second") => Value::Int(secs as i64),
+                    Some("float_millisecond") => Value::Float(secs * 1e3),
+                    Some("float_microsecond") => Value::Float(secs * 1e6),
+                    _ => Value::Float(secs),
+                });
+            }
+            _ => {}
+        }
+    }
     // `Ractor` — rubylang has no real Ractors, but gems (concurrent-ruby) probe
     // `Ractor.shareable?`/`make_shareable` unconditionally on Ruby 3+. Model just
     // the shareability surface: immutable/frozen values are shareable.
