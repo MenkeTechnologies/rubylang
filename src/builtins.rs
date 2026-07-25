@@ -1196,6 +1196,12 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
             // falls through to a `method_missing` (e.g. Delegator's, which forwards
             // to the wrapped object) instead of reading the ivar.
             || with_host(|h| h.attr_access(&cls, name)).is_some()
+            // A method the class genuinely resolves (its own, an ancestor's, or a
+            // reopened Kernel method reached via Object) is called on `self` — even
+            // when the class also defines `method_missing`. Without this, a bare
+            // `silence_warnings` inside a class that has `method_missing`
+            // (Rails::Application::Configuration) wrongly hit method_missing.
+            || with_host(|h| h.find_method_owner(&cls, name)).is_some()
             // A bare call inside a method whose `self` defines `method_missing`
             // (a Delegator/SimpleDelegator) must route to object dispatch so the
             // hook fires (`each { … }` inside a delegator forwards to the wrapped

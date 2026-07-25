@@ -3832,7 +3832,21 @@ impl RubyHost {
                 .get(&name)
                 .and_then(|d| d.superclass.clone())
                 .map(|s| self.resolve_class_alias(&s, &name))
-                .or_else(|| Self::builtin_superclass(&name));
+                .or_else(|| Self::builtin_superclass(&name))
+                .or_else(|| {
+                    // A user class with no explicit superclass inherits from Object
+                    // (whose builtin_modules include Kernel), so continue the walk
+                    // there — a reopened `module Kernel` method (silence_warnings)
+                    // must resolve for instances of any user class, not just main.
+                    if self.classes.contains_key(&name)
+                        && name != "Object"
+                        && name != "BasicObject"
+                    {
+                        Some("Object".to_string())
+                    } else {
+                        None
+                    }
+                });
         }
         None
     }

@@ -215,16 +215,27 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
     // Whether a newline here continues the previous expression (last real token
     // is a binary op / comma / dot / open bracket / `=`).
     let continues = |out: &[Token]| -> bool {
-        match out.iter().rev().find(|t| t.kind != Tok::Newline) {
+        let mut iter = out.iter().rev().filter(|t| t.kind != Tok::Newline);
+        match iter.next() {
             None => true,
             Some(t) => {
+                // A block-introducing keyword (`then`/`in`/`do`/…) normally
+                // continues onto the next line, EXCEPT when it is a method name —
+                // `def in` / `def then` (prism/node.rb) is a no-param def whose
+                // body is on the next line, so the newline must be kept.
+                if matches!(&t.kind, Tok::Keyword(k)
+                    if matches!(k.as_str(), "and"|"or"|"not"|"if"|"unless"|"while"|"until"|"do"|"then"|"else"|"in"))
+                {
+                    return !matches!(
+                        iter.next().map(|p| &p.kind),
+                        Some(Tok::Keyword(k)) if k == "def"
+                    );
+                }
                 // `!` and `~` are prefix-only operators: they never end a line
                 // that continues onto the next, but they *can* be a bare method
                 // name (`def !`, `def ~`), so a trailing one must keep its newline.
                 matches!(&t.kind,
                 Tok::Op(o) if o != ")" && o != "]" && o != "}" && o != "!" && o != "~" )
-                    || matches!(&t.kind, Tok::Keyword(k)
-                    if matches!(k.as_str(), "and"|"or"|"not"|"if"|"unless"|"while"|"until"|"do"|"then"|"else"|"in"))
             }
         }
     };
@@ -272,6 +283,30 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         line += lines;
                     }
                 }
+            }
+            // `=begin` … `=end` block comment: both markers must sit at the start
+            // of a line (column 0). Everything between is skipped (prism/node.rb
+            // and many generated gem files open with one).
+            b'=' if (i == 0 || b[i - 1] == b'\n') && src[i..].starts_with("=begin") => {
+                loop {
+                    // Advance to the next line.
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    if i >= b.len() {
+                        break;
+                    }
+                    i += 1; // consume '\n'
+                    line += 1;
+                    if src[i..].starts_with("=end") {
+                        // Skip the `=end` line entirely.
+                        while i < b.len() && b[i] != b'\n' {
+                            i += 1;
+                        }
+                        break;
+                    }
+                }
+                sp = true;
             }
             b'#' => {
                 while i < b.len() && b[i] != b'\n' {
