@@ -562,27 +562,6 @@ fn b_getconst(vm: &mut VM, _: u8) -> Value {
         if !matches!(v, Value::Undef) {
             return v;
         }
-        // Inherited constant: a candidate `Namespace::CONST` may be defined on an
-        // ANCESTOR of `Namespace`, not on it directly. mustermann references
-        // `URI_PARSER` (defined on `Translator`) from a class nested in
-        // `Compiler < Translator`, so the `Compiler::URI_PARSER` candidate must
-        // fall back to `Translator::URI_PARSER`.
-        if let Some((ns, cn)) = name.rsplit_once("::") {
-            let inherited = with_host(|h| {
-                let mut cur = h.superclass_of(ns);
-                while let Some(sup) = cur {
-                    let val = h.get_const(&format!("{sup}::{cn}"));
-                    if !matches!(val, Value::Undef) {
-                        return val;
-                    }
-                    cur = h.superclass_of(&sup);
-                }
-                Value::Undef
-            });
-            if !matches!(inherited, Value::Undef) {
-                return inherited;
-            }
-        }
         // An unassigned constant that names a class (user-defined, or a builtin
         // exception like `RuntimeError`) resolves to a class reference. The
         // builtin-exception fallback is a name heuristic (`*Error`), so it must
@@ -607,6 +586,35 @@ fn b_getconst(vm: &mut VM, _: u8) -> Value {
             }
             if with_host(|h| h.class_exists(name) || h.is_builtin_class(name)) {
                 return with_host(|h| h.class_ref(name));
+            }
+        }
+        // Inherited constant: a candidate `Namespace::CONST` may be defined on an
+        // ANCESTOR of `Namespace` — a superclass (mustermann's `URI_PARSER` on
+        // `Translator`, read from `Compiler < Translator`) OR an included module
+        // (`class Parser; include Journey::Nodes`, referencing `Literal` for
+        // `Nodes::Literal`). Checked LAST, after this candidate's own autoload has
+        // had a chance to fire — otherwise `Rails::Application::Configuration` would
+        // resolve to the inherited `Rails::Engine::Configuration` before its own
+        // autoloaded file defines it.
+        if let Some((ns, cn)) = name.rsplit_once("::") {
+            let inherited = with_host(|h| {
+                for anc in h.class_ancestry(ns) {
+                    if anc == ns {
+                        continue;
+                    }
+                    let qualified = format!("{anc}::{cn}");
+                    let val = h.get_const(&qualified);
+                    if !matches!(val, Value::Undef) {
+                        return val;
+                    }
+                    if h.class_exists(&qualified) {
+                        return h.class_ref(&qualified);
+                    }
+                }
+                Value::Undef
+            });
+            if !matches!(inherited, Value::Undef) {
+                return inherited;
             }
         }
     }
