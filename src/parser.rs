@@ -1082,9 +1082,14 @@ impl Parser {
             if track {
                 self.nparam_stack.push(0);
             }
+            // The block body is a fresh statement context: a nested `do` block is
+            // allowed even when this block is itself a no-do command argument
+            // (`extend Module.new { define_method(:m) do … end }`).
+            let saved_no_do = std::mem::replace(&mut self.no_do_block, false);
             // A `do … rescue … else … ensure … end` block carries an implicit
             // begin (Ruby 2.6+), so parse the rescue tail like a method body.
             let rest = self.body_with_rescue()?;
+            self.no_do_block = saved_no_do;
             self.expect_kw("end")?;
             if track {
                 let max = self.nparam_stack.pop().unwrap_or(0);
@@ -1106,6 +1111,8 @@ impl Parser {
             if track {
                 self.nparam_stack.push(0);
             }
+            // Fresh statement context inside the block (see the `do` branch).
+            let saved_no_do = std::mem::replace(&mut self.no_do_block, false);
             let mut body = Vec::new();
             self.skip_terms();
             while !self.is_op("}") && !matches!(self.peek(), Tok::Eof) {
@@ -1114,6 +1121,7 @@ impl Parser {
                 body.push(Stmt { expr, line });
                 self.skip_terms();
             }
+            self.no_do_block = saved_no_do;
             self.expect_op("}")?;
             if track {
                 let max = self.nparam_stack.pop().unwrap_or(0);
