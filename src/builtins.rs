@@ -10816,6 +10816,17 @@ fn dispatch_hash(
         // `merge!` / `update` — the in-place form of `merge`: each hash argument
         // is merged into the receiver left-to-right, a block resolves collisions
         // by `block.call(key, old, new)`, and the receiver itself is returned.
+        "clear" => {
+            let mut m = map;
+            m.clear();
+            with_host(|h| h.set_hash(recv, m));
+            Ok(recv.clone())
+        }
+        // rubylang keys hashes by value equality; identity-keyed hashes
+        // (zeitwerk's cref map) are accepted as a no-op returning self. Exact
+        // object-identity semantics are not modeled.
+        "compare_by_identity" => Ok(recv.clone()),
+        "compare_by_identity?" => Ok(Value::Bool(false)),
         "merge!" | "update" => {
             let mut m = map;
             for a in args {
