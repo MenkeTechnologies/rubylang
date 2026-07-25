@@ -15071,6 +15071,11 @@ pub(crate) fn embedded_stdlib(name: &str) -> Option<&'static str> {
         "openssl" => Some(include_str!("../stdlib/openssl.rb")),
         "pathname" => Some(include_str!("../stdlib/pathname.rb")),
         "singleton" => Some(include_str!("../stdlib/singleton.rb")),
+        // A skeleton Nokogiri so rails-html-sanitizer/Loofah load (the real gem
+        // is a native C extension). Intercepting the top `nokogiri` name keeps
+        // the gem's own `require "nokogiri/nokogiri"` (the missing .so) from ever
+        // running. See stdlib/nokogiri.rb for the scope/limits.
+        "nokogiri" => Some(include_str!("../stdlib/nokogiri.rb")),
         _ => None,
     }
 }

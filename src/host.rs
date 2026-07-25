@@ -4142,31 +4142,95 @@ impl RubyHost {
         }
         None
     }
-    /// `super` from a singleton/class method (`def self.m`): resume class-method
-    /// lookup in the singleton-class ancestry above `def_class`, i.e. starting at
-    /// `def_class`'s superclass. Returns the class method and its owner class.
+    /// A module's own ancestry (the module, its prepends, and its includes,
+    /// recursively) in resolution order. Used to linearize an extended module's
+    /// contribution to a class's singleton (class-method) ancestry.
+    fn module_self_ancestry(&self, module: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        self.collect_module_ancestry(module, &mut out, 0);
+        out
+    }
+    fn collect_module_ancestry(&self, module: &str, out: &mut Vec<String>, depth: usize) {
+        if depth > 50 || out.iter().any(|m| m == module) {
+            return;
+        }
+        if let Some(def) = self.classes.get(module) {
+            let prepends = def.prepends.clone();
+            for p in prepends.iter().rev() {
+                let rp = self.resolve_module_name(p, module);
+                self.collect_module_ancestry(&rp, out, depth + 1);
+            }
+            out.push(module.to_string());
+            let includes = def.includes.clone();
+            for i in includes.iter().rev() {
+                let ri = self.resolve_module_name(i, module);
+                self.collect_module_ancestry(&ri, out, depth + 1);
+            }
+        } else {
+            out.push(module.to_string());
+        }
+    }
+    /// `super` from a singleton/class method: resume class-method lookup in the
+    /// receiver's singleton (class-method) ancestry *after* the currently-running
+    /// method's owner (`def_class`). `recv_class` is the actual receiver class, so
+    /// the walk spans its whole superclass chain — a `def self.m` (`class << self`)
+    /// AND an extended-module class method (`extend ClassMethods`) both resume
+    /// correctly. `def_class` may be one of the extended modules (its owner), which
+    /// has no superclass of its own, so a plain `superclass_of(def_class)` walk
+    /// would miss the rest of the chain.
     pub fn find_super_class_method(
         &self,
+        recv_class: &str,
         def_class: &str,
         method: &str,
     ) -> Option<(MethodDef, String)> {
-        let mut cur = self.superclass_of(def_class);
+        // Linearize the class-method ancestry: for each class up the superclass
+        // chain, its own `def self.m` methods, then its extended modules (last
+        // extend first) each expanded through their own include/prepend ancestry,
+        // mirroring `find_class_method_owner`'s order. Expanding the module
+        // ancestry is what lets `def_class` (which may be a module nested inside an
+        // extended module) be found in the list.
+        let mut sources: Vec<(String, bool)> = Vec::new(); // (name, is_extend_module)
+        let mut cur = Some(recv_class.to_string());
         while let Some(name) = cur {
-            let def = self.classes.get(&name)?;
-            if let Some(m) = def.class_methods.get(method) {
-                return Some((m.clone(), name.clone()));
-            }
-            // `extend M` on an ancestor contributes M's instance methods as that
-            // ancestor's class methods (after its own `def self.m`, last wins).
+            let Some(def) = self.classes.get(&name) else {
+                break;
+            };
+            sources.push((name.clone(), false));
             for module in def.extends.iter().rev() {
                 let resolved = self.resolve_module_name(module, &name);
-                if let Some(md) = self.classes.get(&resolved) {
-                    if let Some(m) = md.methods.get(method) {
-                        return Some((m.clone(), name.clone()));
-                    }
+                for anc in self.module_self_ancestry(&resolved) {
+                    sources.push((anc, true));
                 }
             }
             cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &name));
+        }
+        // Dedup by name (keep first occurrence): a module reachable via more than
+        // one path must appear once, else `super` could resume at a later copy of
+        // the *same* owner and re-invoke the running method forever.
+        {
+            let mut seen = std::collections::HashSet::new();
+            sources.retain(|(n, _)| seen.insert(n.clone()));
+        }
+        // Resume just after `def_class` (the running method's owner). If it is not
+        // in the linearized ancestry, there is no super — returning None here (vs.
+        // restarting at the top) avoids re-selecting the same method and recursing.
+        let Some(pos) = sources.iter().position(|(n, _)| n == def_class) else {
+            return None;
+        };
+        let start = pos + 1;
+        for (name, is_module) in sources.iter().skip(start) {
+            if *is_module {
+                // An extended module's instance method becomes a class method;
+                // `find_in_module` follows the module's own include/prepend chain.
+                if let Some((m, owner)) = self.find_in_module(name, method) {
+                    return Some((m, owner));
+                }
+            } else if let Some(def) = self.classes.get(name) {
+                if let Some(m) = def.class_methods.get(method) {
+                    return Some((m.clone(), name.clone()));
+                }
+            }
         }
         None
     }
@@ -6072,7 +6136,7 @@ pub fn call_super_blk(
     if with_host(|h| h.object_class(&self_obj)).is_none() {
         if let Some(cls) = with_host(|h| h.classref_name(&self_obj)) {
             if let Some((def, owner)) =
-                with_host(|h| h.find_super_class_method(&def_class, &method))
+                with_host(|h| h.find_super_class_method(&cls, &def_class, &method))
             {
                 let args = explicit_args.unwrap_or(cur_args);
                 let block = match block_override {
