@@ -5772,12 +5772,22 @@ pub fn set_debug_mode(on: bool) {
 
 /// Register every rubylang builtin + the numeric hook on a VM, then run it.
 fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
+    // In a `--build --native` binary each method/block chunk carries a non-zero
+    // `native_id` and its AOT-lowered native driver is linked in (see aot.rs). Run
+    // that machine code directly on the VM instead of interpreting the ops — the
+    // driver still needs the builtins + numeric hook installed (its threaded ops
+    // call back through them), just not the interpreter loop or the tracing JIT.
+    let native = crate::aot::native_entry(chunk.native_id);
     let mut vm = VM::new(chunk);
     crate::builtins::install(&mut vm);
     vm.set_numeric_hook(std::sync::Arc::new(|op, a, b| {
         crate::builtins::numeric_hook(op, a, b)
     }));
-    if DEBUG_MODE.with(|d| d.get()) {
+    let outcome = if let Some(entry) = native {
+        // AOT native: the linked driver runs the chunk and stores its result.
+        let _ = entry(&mut vm as *mut VM);
+        vm.take_aot_result()
+    } else if DEBUG_MODE.with(|d| d.get()) {
         // The DAP line marker pauses the interpreter; the tracing JIT would
         // compile hot loops and skip the markers, so it stays off in debug mode.
         vm.set_extension_handler(Box::new(|vm, id, _| {
@@ -5785,10 +5795,11 @@ fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
                 crate::dap::on_debug_line(vm);
             }
         }));
+        vm.run()
     } else {
         vm.enable_tracing_jit();
-    }
-    let outcome = vm.run();
+        vm.run()
+    };
     if let Some(e) = with_host(|h| h.take_error()) {
         return Err(e);
     }
