@@ -213,6 +213,14 @@ pub enum RObj {
         hi: String,
         exclusive: bool,
     },
+    /// A Range over arbitrary `<=>`-comparable objects (`IPAddr#to_range`, custom
+    /// Comparable). Membership uses `<=>`; iteration uses `succ` (raising if the
+    /// endpoints don't provide one, like MRI).
+    ObjRange {
+        lo: Value,
+        hi: Value,
+        exclusive: bool,
+    },
     /// A block/proc/lambda: its compiled template plus the captured lexical
     /// scope (Ruby blocks read and write the variables of the scope where they
     /// appear, even after that method has returned). `is_lambda` distinguishes a
@@ -1346,7 +1354,7 @@ impl RubyHost {
                 self.as_symbol(v).is_some()
                     || matches!(
                         self.obj(v),
-                        Some(RObj::Range { .. } | RObj::FloatRange { .. } | RObj::StrRange { .. })
+                        Some(RObj::Range { .. } | RObj::FloatRange { .. } | RObj::StrRange { .. } | RObj::ObjRange { .. })
                     )
                     || self.frozen.contains(id)
             }
@@ -1916,6 +1924,9 @@ impl RubyHost {
     pub fn new_str_range(&mut self, lo: String, hi: String, exclusive: bool) -> Value {
         self.alloc(RObj::StrRange { lo, hi, exclusive })
     }
+    pub fn new_obj_range(&mut self, lo: Value, hi: Value, exclusive: bool) -> Value {
+        self.alloc(RObj::ObjRange { lo, hi, exclusive })
+    }
     pub fn new_float_range(&mut self, lo: f64, hi: f64, exclusive: bool) -> Value {
         self.alloc(RObj::FloatRange { lo, hi, exclusive })
     }
@@ -1928,6 +1939,14 @@ impl RubyHost {
     pub fn as_str_range(&self, v: &Value) -> Option<(String, String, bool)> {
         match self.obj(v) {
             Some(RObj::StrRange { lo, hi, exclusive }) => {
+                Some((lo.clone(), hi.clone(), *exclusive))
+            }
+            _ => None,
+        }
+    }
+    pub fn as_obj_range(&self, v: &Value) -> Option<(Value, Value, bool)> {
+        match self.obj(v) {
+            Some(RObj::ObjRange { lo, hi, exclusive }) => {
                 Some((lo.clone(), hi.clone(), *exclusive))
             }
             _ => None,
@@ -4424,6 +4443,14 @@ impl RubyHost {
                 Some(RObj::StrRange { lo, hi, exclusive }) => {
                     format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
                 }
+                Some(RObj::ObjRange { lo, hi, exclusive }) => {
+                    format!(
+                        "{}{}{}",
+                        self.inspect(&lo),
+                        if exclusive { "..." } else { ".." },
+                        self.inspect(&hi)
+                    )
+                }
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash { map, .. }) => self.inspect_hash(&map),
                 Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) | Some(RObj::CycleProc(_)) => {
@@ -4659,6 +4686,7 @@ impl RubyHost {
                 Some(RObj::Range { .. }) => "Range",
                 Some(RObj::FloatRange { .. }) => "Range",
                 Some(RObj::StrRange { .. }) => "Range",
+                Some(RObj::ObjRange { .. }) => "Range",
                 Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) | Some(RObj::CycleProc(_)) => {
                     "Proc"
                 }

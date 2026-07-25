@@ -886,13 +886,14 @@ fn b_mkrange(vm: &mut VM, _: u8) -> Value {
             let hs = with_host(|h| h.as_str(&hi));
             match (ls, hs) {
                 (Some(a), Some(b)) => with_host(|h| h.new_str_range(a, b, excl)),
-                // rubylang has no generic object-range (only Int/Float/String
-                // endpoints). Ruby builds a range from any `<=>`-comparable pair;
-                // where rubylang can't, raise a *catchable* ArgumentError (the
-                // message MRI uses for genuinely non-comparable endpoints) so a
-                // guarding `rescue ArgumentError` — ActionDispatch::RemoteIp's
-                // `sanitize_ips` around `IPAddr#to_range` — degrades gracefully.
-                _ => abort(vm, raise_exc("ArgumentError", "bad value for range")),
+                // Any other endpoints form a generic object-range over `<=>`-
+                // comparable values (IPAddr#to_range, custom Comparable). nil
+                // endpoints are the beginless/endless forms, handled above; a lone
+                // nil here is genuinely bad.
+                _ if matches!(lo, Value::Undef) && matches!(hi, Value::Undef) => {
+                    abort(vm, raise_exc("ArgumentError", "bad value for range"))
+                }
+                _ => with_host(|h| h.new_obj_range(lo.clone(), hi.clone(), excl)),
             }
         }
     }
@@ -11515,6 +11516,11 @@ fn dispatch_range(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    // Object ranges (IPAddr#to_range, custom Comparable): membership by `<=>`,
+    // iteration by `succ`.
+    if let Some((lo, hi, excl)) = with_host(|h| h.as_obj_range(recv)) {
+        return dispatch_obj_range(recv, name, args, block, lo, hi, excl);
+    }
     // String ranges (`'a'..'e'`) iterate with `String#succ` succession.
     if let Some((lo, hi, excl)) = with_host(|h| h.as_str_range(recv)) {
         return dispatch_str_range(recv, name, args, block, lo, hi, excl);
@@ -11802,6 +11808,90 @@ fn dispatch_float_range(
         }
         _ => Err(no_method_error(recv, name)),
     }
+}
+
+/// A Range over arbitrary `<=>`-comparable objects. Membership uses `<=>`;
+/// iteration (materialized to an Array for the Enumerable methods) uses `succ`.
+fn dispatch_obj_range(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+    lo: Value,
+    hi: Value,
+    excl: bool,
+) -> Result<Value, String> {
+    // `a <=> b` as an i64, or None if the comparison yields nil.
+    let cmp = |a: &Value, b: &Value| -> Result<Option<i64>, String> {
+        let r = dispatch(a, "<=>", std::slice::from_ref(b), None)?;
+        Ok(match r {
+            Value::Int(n) => Some(n),
+            Value::Undef => None,
+            other => Some(as_i(&other)),
+        })
+    };
+    match name {
+        "begin" | "first" if args.is_empty() => return Ok(lo),
+        "end" | "last" if args.is_empty() => return Ok(hi),
+        "exclude_end?" => return Ok(Value::Bool(excl)),
+        "include?" | "member?" | "cover?" | "===" if !args.is_empty() => {
+            let x = &args[0];
+            let above_lo = cmp(&lo, x)?.map(|c| c <= 0).unwrap_or(false);
+            let below_hi = cmp(x, &hi)?
+                .map(|c| if excl { c < 0 } else { c <= 0 })
+                .unwrap_or(false);
+            return Ok(Value::Bool(above_lo && below_hi));
+        }
+        "==" if !args.is_empty() => {
+            let eq = with_host(|h| h.as_obj_range(&args[0]))
+                .map(|(l2, h2, e2)| {
+                    e2 == excl
+                        && cmp(&lo, &l2).ok().flatten() == Some(0)
+                        && cmp(&hi, &h2).ok().flatten() == Some(0)
+                })
+                .unwrap_or(false);
+            return Ok(Value::Bool(eq));
+        }
+        "to_s" => {
+            let s = format!(
+                "{}{}{}",
+                with_host(|h| h.to_s(&lo)),
+                if excl { "..." } else { ".." },
+                with_host(|h| h.to_s(&hi))
+            );
+            return Ok(new_str(s));
+        }
+        "inspect" => {
+            let s = format!(
+                "{}{}{}",
+                with_host(|h| h.inspect(&lo)),
+                if excl { "..." } else { ".." },
+                with_host(|h| h.inspect(&hi))
+            );
+            return Ok(new_str(s));
+        }
+        _ => {}
+    }
+    // Everything else materializes the range by walking `succ` from lo to hi,
+    // then delegates to the eager Array implementation (Enumerable methods).
+    let mut elems = Vec::new();
+    let mut cur = lo.clone();
+    // Bound the walk so a pathological/huge object range can't hang the VM.
+    for _ in 0..1_000_000 {
+        match cmp(&cur, &hi)? {
+            Some(c) if c > 0 => break,
+            Some(c) if c == 0 && excl => break,
+            None => break,
+            _ => {}
+        }
+        elems.push(cur.clone());
+        if cmp(&cur, &hi)? == Some(0) {
+            break;
+        }
+        cur = dispatch(&cur, "succ", &[], None)?;
+    }
+    let arr = new_arr(elems);
+    dispatch_array(&arr, name, args, block)
 }
 
 fn dispatch_str_range(
