@@ -11877,9 +11877,9 @@ fn dispatch_symbol(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         "to_s" | "id2name" | "name" => Ok(new_str(s)),
         // `to_sym` returns self; `itself`/`intern` are Ruby aliases in this context.
         "to_sym" | "intern" => Ok(recv.clone()),
-        // `=~`/`match`/`match?` operate on the symbol's name (Journey's visitors
-        // do `private_instance_method_symbol =~ /^visit_/`).
-        "=~" | "match" | "match?" => dispatch_string(&new_str(s), name, args, None),
+        // `=~`/`match` operate on the symbol's name (Journey's visitors do
+        // `private_instance_method_symbol =~ /^visit_/`). `match?` is below.
+        "=~" | "match" => dispatch_string(&new_str(s), name, args, None),
         "length" | "size" => Ok(Value::Int(s.chars().count() as i64)),
         "empty?" => Ok(Value::Bool(s.is_empty())),
         // Case/`succ`/`capitalize` all return a Symbol (unlike String's String).
