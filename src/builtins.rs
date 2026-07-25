@@ -7255,6 +7255,28 @@ fn dispatch_array(
             }
             Ok(new_arr(out))
         }
+        // In-place keep filters: `select!`/`filter!` keep matching elements and
+        // return nil when nothing changed (MRI); `keep_if` always returns the
+        // array. (`reject!`/`delete_if` are handled below.)
+        "select!" | "filter!" | "keep_if" => {
+            let Some(b) = &block else {
+                return Ok(with_host(|h| h.new_enumerator(arr, name)));
+            };
+            let mut kept = Vec::with_capacity(arr.len());
+            for x in &arr {
+                let r = call_proc(b, std::slice::from_ref(x))?;
+                if with_host(|h| h.truthy(&r)) {
+                    kept.push(x.clone());
+                }
+            }
+            let changed = kept.len() != arr.len();
+            with_host(|h| h.set_array(recv, kept));
+            if name.ends_with('!') && !changed {
+                Ok(Value::Undef)
+            } else {
+                Ok(recv.clone())
+            }
+        }
         // `filter_map` maps each element and keeps only the truthy results.
         "filter_map" => {
             let mut out = Vec::new();
