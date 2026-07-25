@@ -2515,6 +2515,15 @@ impl RubyHost {
     pub fn frame_depth(&self) -> usize {
         self.frames.len()
     }
+    /// The innermost `n` frame method names (deepest first) — debug aid.
+    pub fn frame_method_tail(&self, n: usize) -> Vec<String> {
+        self.frames
+            .iter()
+            .rev()
+            .take(n)
+            .filter_map(|f| f.scope.method_name.clone())
+            .collect()
+    }
     /// DAP: record the source line currently executing in the top frame.
     pub fn set_cur_line(&mut self, line: u32) {
         if let Some(f) = self.frames.last_mut() {
