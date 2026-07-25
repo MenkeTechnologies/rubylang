@@ -14761,6 +14761,7 @@ pub(crate) fn embedded_stdlib(name: &str) -> Option<&'static str> {
         "yaml" | "psych" => Some(include_str!("../stdlib/yaml.rb")),
         "openssl" => Some(include_str!("../stdlib/openssl.rb")),
         "pathname" => Some(include_str!("../stdlib/pathname.rb")),
+        "singleton" => Some(include_str!("../stdlib/singleton.rb")),
         _ => None,
     }
 }
@@ -14784,7 +14785,6 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "pp"
             | "prettyprint"
             | "ostruct"
-            | "singleton"
             | "comparable"
             | "enumerable"
             | "benchmark"
