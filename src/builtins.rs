@@ -3289,6 +3289,21 @@ fn dispatch_classref(
                 if with_host(|h| h.class_exists(&qualified)) {
                     return Ok(with_host(|h| h.class_ref(&qualified)));
                 }
+                // A constant inherited from a superclass: `ActiveSupport::Logger::WARN`
+                // resolves to `Logger::WARN` (the severity constant). Walk cls's
+                // ancestry and return the first `<ancestor>::<name>` that exists.
+                for anc in with_host(|h| h.class_ancestry(cls)) {
+                    if anc == cls {
+                        continue;
+                    }
+                    let inherited = format!("{anc}::{name}");
+                    if with_host(|h| h.has_const(&inherited)) {
+                        return Ok(with_host(|h| h.get_const(&inherited)));
+                    }
+                    if with_host(|h| h.class_exists(&inherited)) {
+                        return Ok(with_host(|h| h.class_ref(&inherited)));
+                    }
+                }
                 // A pending `autoload :Const, "path"` on this namespace: require
                 // the file, then retry — the scoped `Mod::Const` form must fire
                 // autoload just like the bare read in `b_getconst` does.
@@ -8617,6 +8632,27 @@ fn dispatch_file_class(
         )),
         "directory?" => Ok(Value::Bool(
             std::path::Path::new(&str_arg(args, 0)).is_dir(),
+        )),
+        // `symlink?` inspects the link itself (symlink_metadata does not follow).
+        "symlink?" => Ok(Value::Bool(
+            std::fs::symlink_metadata(str_arg(args, 0))
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+        )),
+        "readable?" | "writable?" | "executable?" => Ok(Value::Bool(
+            std::path::Path::new(&str_arg(args, 0)).exists(),
+        )),
+        "size?" => {
+            let path = str_arg(args, 0);
+            Ok(match std::fs::metadata(&path) {
+                Ok(m) if m.len() > 0 => Value::Int(m.len() as i64),
+                _ => Value::Undef,
+            })
+        }
+        "zero?" | "empty?" => Ok(Value::Bool(
+            std::fs::metadata(str_arg(args, 0))
+                .map(|m| m.len() == 0)
+                .unwrap_or(false),
         )),
         "size" => {
             let path = str_arg(args, 0);
