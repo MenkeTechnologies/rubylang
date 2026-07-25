@@ -953,10 +953,16 @@ impl Parser {
             });
             return Ok(());
         }
-        // `**hash` — spread a hash as keyword arguments.
+        // `**hash` — spread a hash as keyword arguments. A bare `**` (next token
+        // `)`/`,`) is anonymous keyword-splat forwarding (`yield(*, **)`, Ruby
+        // 3.2): re-spread the anonymous `**` param the enclosing def captured.
         if self.is_op("**") {
             self.advance();
-            kwsplats.push(self.arg()?);
+            if self.is_op(")") || self.is_op(",") {
+                kwsplats.push(Expr::Var(VarKind::Local, "**".into()));
+            } else {
+                kwsplats.push(self.arg()?);
+            }
             return Ok(());
         }
         // `key: value` keyword argument (symbol key). The label may be any
