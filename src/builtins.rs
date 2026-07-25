@@ -14688,7 +14688,24 @@ enum ReqMode {
 pub(crate) fn embedded_stdlib(name: &str) -> Option<&'static str> {
     let n = name.strip_suffix(".rb").unwrap_or(name);
     match n {
-        "uri" => Some(include_str!("../stdlib/uri.rb")),
+        // `uri` and its sub-files all map to the bundled URI: the real uri gem
+        // splits into uri/common, uri/rfc2396_parser, etc., whose parser classes
+        // reference constants the bundle doesn't define (URI::REGEXP::PATTERN::
+        // ESCAPED). Serving the bundle for every sub-path keeps the gem's files
+        // from loading.
+        "uri"
+        | "uri/common"
+        | "uri/generic"
+        | "uri/rfc2396_parser"
+        | "uri/rfc3986_parser"
+        | "uri/http"
+        | "uri/https"
+        | "uri/ftp"
+        | "uri/file"
+        | "uri/ws"
+        | "uri/wss"
+        | "uri/ldap"
+        | "uri/mailto" => Some(include_str!("../stdlib/uri.rb")),
         "forwardable" => Some(include_str!("../stdlib/forwardable.rb")),
         "delegate" => Some(include_str!("../stdlib/delegate.rb")),
         "logger" => Some(include_str!("../stdlib/logger.rb")),
