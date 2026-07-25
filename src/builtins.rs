@@ -7543,6 +7543,41 @@ fn dispatch_array(
             with_host(|h| h.set_array(recv, a));
             Ok(v)
         }
+        // `slice!(i)` / `slice!(start, len)` / `slice!(range)` — remove the
+        // selected element(s), mutating the array, and return what was removed
+        // (a single element for an index, an Array for a length/range).
+        "slice!" => {
+            let mut a = arr;
+            let len = a.len();
+            let removed = match args {
+                [Value::Int(i)] => match norm_idx(*i, len) {
+                    Some(k) => a.remove(k),
+                    None => Value::Undef,
+                },
+                [Value::Int(i), Value::Int(l)] => {
+                    let start = norm_idx(*i, len).unwrap_or(len);
+                    if start > len {
+                        Value::Undef
+                    } else {
+                        let end = (start + (*l).max(0) as usize).min(len);
+                        new_arr(a.drain(start..end).collect())
+                    }
+                }
+                [rng] => {
+                    if let Some((lo, hi, excl)) = with_host(|h| h.as_range(rng)) {
+                        match range_bounds(lo, hi, excl, len) {
+                            Some((s, e)) => new_arr(a.drain(s..e).collect()),
+                            None => Value::Undef,
+                        }
+                    } else {
+                        Value::Undef
+                    }
+                }
+                _ => Value::Undef,
+            };
+            with_host(|h| h.set_array(recv, a));
+            Ok(removed)
+        }
         "delete_if" | "reject!" => {
             let mut a = arr;
             if let Some(bl) = &block {
