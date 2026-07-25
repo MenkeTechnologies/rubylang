@@ -227,6 +227,16 @@ module URI
     # Everything outside the RFC2396 unreserved + reserved set is escaped by default.
     DEFAULT_UNSAFE = /[^\-_.!~*'()a-zA-Z\d;\/?:@&=+$,\[\]]/
 
+    # Parse a URI string into a URI object / split it into components — rack's
+    # MockRequest calls `URI::Parser.new.parse(uri)` / `.split(uri)`.
+    def parse(uri)
+      URI.parse(uri)
+    end
+
+    def split(uri)
+      URI.split(uri)
+    end
+
     # Percent-encode each character of `str` that matches `unsafe` (a Regexp),
     # leaving the rest literal. Multibyte characters are encoded byte-by-byte.
     def escape(str, unsafe = DEFAULT_UNSAFE)
