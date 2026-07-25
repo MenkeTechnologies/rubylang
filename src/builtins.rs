@@ -2026,52 +2026,70 @@ fn dispatch_classref(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    // A native-marker alias (`\u{1}native:X`, e.g. `at_without_coercion` snapshot
+    // of native `Time.at`) dispatches the builtin X directly, skipping the user
+    // method/alias resolution below — so a later redefinition of X (activesupport's
+    // alias_method_chain: `at` becomes `at_with_coercion`) doesn't recapture it.
+    let (name, native_only) = match name.strip_prefix("\u{1}native:") {
+        Some(n) => (n, true),
+        None => (name, false),
+    };
     // A user-defined class method takes precedence over the native builtin
     // handlers below: a reopened builtin's `def self.m`, and the synthetic
     // `__class_body__` that runs a reopened module/class body. Without this,
     // reopening a builtin module (`module SecureRandom; <non-def statement>; end`)
     // fails because its `__class_body__` call hits the builtin dispatch.
-    if let Some((def, owner)) = with_host(|h| h.find_class_method_owner(cls, name)) {
-        let recv = with_host(|h| h.class_ref(cls));
-        return crate::host::call_class_method(recv, &def, name, &owner, args, block);
+    if !native_only {
+        if let Some((def, owner)) = with_host(|h| h.find_class_method_owner(cls, name)) {
+            let recv = with_host(|h| h.class_ref(cls));
+            return crate::host::call_class_method(recv, &def, name, &owner, args, block);
+        }
     }
     // A `Klass.define_singleton_method(:m) { … }` class method (proc-backed,
     // inherited by subclasses). Runs with `self` = the class ref.
-    if let Some(proc) = with_host(|h| h.find_class_define_method(cls, name)) {
-        let recv = with_host(|h| h.class_ref(cls));
-        return crate::host::call_proc_self(&proc, args, Some(&recv));
+    if !native_only {
+        if let Some(proc) = with_host(|h| h.find_class_define_method(cls, name)) {
+            let recv = with_host(|h| h.class_ref(cls));
+            return crate::host::call_proc_self(&proc, args, Some(&recv));
+        }
     }
     // A method defined on the class's *singleton class* is a class method:
     // `Klass.singleton_class.class_eval { define_method(:m) { … } }` /
     // `{ def m; … end }` (sinatra's `set` DSL defines its accessors this way).
     // The singleton class is registered under the synthetic name `#<Class:Klass>`;
     // its instance methods run with `self` = the class ref.
-    if let Some(sclass) = with_host(|h| h.find_singleton_class_method(cls, name)) {
-        let recv = with_host(|h| h.class_ref(cls));
-        if let Some(proc) = with_host(|h| h.find_define_method(&sclass, name)) {
-            return crate::host::call_proc_self(&proc, args, Some(&recv));
+    if !native_only {
+        if let Some(sclass) = with_host(|h| h.find_singleton_class_method(cls, name)) {
+            let recv = with_host(|h| h.class_ref(cls));
+            if let Some(proc) = with_host(|h| h.find_define_method(&sclass, name)) {
+                return crate::host::call_proc_self(&proc, args, Some(&recv));
+            }
+            return call_instance_method(recv, &sclass, name, args, block);
         }
-        return call_instance_method(recv, &sclass, name, args, block);
     }
     // A class-method alias (`class << self; alias new! new; end` /
     // `singleton_class.alias_method`), registered on the *singleton* class of the
     // receiver or an ancestor — never the instance-method alias table on `cls`
     // (mustermann aliases the instance method `name` to `payload`; `Klass.name`
     // must stay Module#name). Resolve to the target and re-dispatch.
-    if let Some(target) = with_host(|h| h.find_class_alias(cls, name)) {
-        if target == "new" {
-            // Ruby's `alias new! new` (before a later `def self.new`) snapshots the
-            // *original* constructor. Run native `new` — allocate an instance of the
-            // receiver class and its `initialize` — bypassing a user `def new`
-            // override (sinatra's `new!` is the un-wrapped constructor).
-            let obj = with_host(|h| h.new_object(cls));
-            if with_host(|h| h.find_method_owner(cls, "initialize")).is_some() {
-                call_instance_method(obj.clone(), cls, "initialize", args, block)?;
+    if !native_only {
+        if let Some(target) = with_host(|h| h.find_class_alias(cls, name)) {
+            if target == "new" {
+                // Ruby's `alias new! new` (before a later `def self.new`) snapshots
+                // the *original* constructor. Run native `new` — allocate an instance
+                // of the receiver class and its `initialize` — bypassing a user
+                // `def new` override (sinatra's `new!` is the un-wrapped constructor).
+                let obj = with_host(|h| h.new_object(cls));
+                if with_host(|h| h.find_method_owner(cls, "initialize")).is_some() {
+                    call_instance_method(obj.clone(), cls, "initialize", args, block)?;
+                }
+                return Ok(obj);
             }
-            return Ok(obj);
-        }
-        if target != name {
-            return dispatch_classref(cls, &target, args, block);
+            if target != name {
+                // The target may be a `\u{1}native:X` marker — re-dispatch resolves
+                // it in native-only mode (skipping the user resolution above).
+                return dispatch_classref(cls, &target, args, block);
+            }
         }
     }
     // `Mod.autoload :Const, "path"` — a module registering a lazy require on a

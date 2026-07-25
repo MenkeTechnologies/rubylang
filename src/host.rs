@@ -3094,15 +3094,18 @@ impl RubyHost {
                 .or_default()
                 .insert(alias_name.to_string(), proc);
         } else {
-            // The target is neither a user method, a native method of a builtin
-            // base, nor a Kernel function — e.g. a class-method alias of
-            // `new`/`allocate` (concurrent-ruby: `singleton_class.alias_method
-            // (:[], :new)`). Store a plain name alias, resolved through the normal
-            // (class-)alias path.
+            // The target has no user definition — it is a native method (a class
+            // method like `new`/`allocate`/`Time.at`, or an unresolved forward
+            // reference). Snapshot it with the native marker so a *later*
+            // redefinition of the target does not capture the alias (activesupport's
+            // alias_method_chain: `alias_method :at_without_coercion, :at` before
+            // `alias_method :at, :at_with_coercion` — a plain name alias would make
+            // at_without_coercion resolve to at_with_coercion and recurse). The
+            // native-marker dispatch invokes the builtin directly.
             self.method_aliases
                 .entry(class.to_string())
                 .or_default()
-                .insert(alias_name.to_string(), target.to_string());
+                .insert(alias_name.to_string(), format!("\u{1}native:{target}"));
         }
     }
     /// If a bareword/Kernel call `name` resolves (through the alias chain visible
