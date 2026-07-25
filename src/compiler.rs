@@ -75,6 +75,18 @@ pub struct Compiler {
     /// (`<src>:<line>:in '<ctx>'`) for an uncaught exception. Saved/restored
     /// around nested body compiles so an inner block/def can't leak its line.
     cur_line: u32,
+    /// Per-scope set of names that are LOCAL VARIABLES (a parameter, or assigned
+    /// somewhere in the method/block). A bare lowercase identifier compiles to a
+    /// local read only when it is in this set; otherwise it is a zero-arg method
+    /// call — Ruby's rule, and what lets `countdown`/`parse_expressions` recurse
+    /// by bareword (a same-named-as-method local would shadow, but a never-
+    /// assigned name is unambiguously a call). Innermost scope is last; a block
+    /// inherits the enclosing scope's locals (closures) plus its own.
+    scope_locals: Vec<std::collections::HashSet<String>>,
+    /// The name of the method currently being compiled (a stack for nested
+    /// `def`s). A bare identifier equal to this — and not shadowed by a local —
+    /// is a self-recursive call, not a nil local read.
+    cur_method: Vec<String>,
 }
 
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
@@ -274,8 +286,22 @@ impl Compiler {
     /// Compile a method: a prologue that fills in any defaulted parameter the
     /// caller omitted (`defined?(p) ? p : <default>`), then the body.
     fn compile_method(&mut self, params: &[Param], body: &[Stmt]) -> Result<MethodDef, String> {
+        self.compile_method_named("", params, body)
+    }
+
+    fn compile_method_named(
+        &mut self,
+        name: &str,
+        params: &[Param],
+        body: &[Stmt],
+    ) -> Result<MethodDef, String> {
         let saved = std::mem::take(&mut self.loops);
         let saved_line = self.cur_line;
+        // A fresh local scope: parameters are its initial locals.
+        let param_locals: std::collections::HashSet<String> =
+            params.iter().map(|p| p.name.clone()).collect();
+        self.scope_locals.push(param_locals);
+        self.cur_method.push(name.to_string());
         let mut b = ChunkBuilder::new();
         for p in params {
             if let Some(default) = &p.default {
@@ -290,6 +316,8 @@ impl Compiler {
             }
         }
         self.compile_seq(&mut b, body)?;
+        self.scope_locals.pop();
+        self.cur_method.pop();
         self.loops = saved;
         self.cur_line = saved_line;
         // Positional params (name-bound by index) are separate from keyword
@@ -489,6 +517,19 @@ impl Compiler {
                 );
                 b.emit(Op::CallBuiltin(ops::MKRANGE, 3), 0);
             }
+            // A bare identifier equal to the enclosing method's name, not shadowed
+            // by a local, is a self-recursive call — compile it as one so it
+            // actually re-enters the method (`countdown`, Journey's
+            // `parse_expressions`), instead of reading a nil local.
+            Expr::Var(VarKind::Local, name)
+                if self.cur_method.last().map(String::as_str) == Some(name.as_str())
+                    && !self
+                        .scope_locals
+                        .last()
+                        .is_some_and(|s| s.contains(name)) =>
+            {
+                self.compile_call(b, &None, name, &[], &None)?;
+            }
             Expr::Var(kind, name) => self.compile_var_read(b, *kind, name),
             Expr::Assign(target, value) => self.compile_assign(b, target, value)?,
             Expr::MultiAssign { targets, values } => {
@@ -575,7 +616,7 @@ impl Compiler {
                     // that registers it on the active `class_eval`/`instance_eval`
                     // target when one is in effect. `def` evaluates to `:name`.
                     None => {
-                        let def = self.compile_method(params, body)?;
+                        let def = self.compile_method_named(name, params, body)?;
                         let synth = format!("__def{}__", next_synth_id());
                         self.methods.push((name.clone(), def.clone()));
                         self.methods.push((synth.clone(), def));
@@ -817,6 +858,13 @@ impl Compiler {
     ) -> Result<(), String> {
         match target {
             Expr::Var(kind, name) => {
+                if let VarKind::Local = kind {
+                    // From this assignment on, the name is a local in this scope
+                    // (so a later bare read of it is a variable, not a call).
+                    if let Some(scope) = self.scope_locals.last_mut() {
+                        scope.insert(name.clone());
+                    }
+                }
                 let op = match kind {
                     VarKind::Local => ops::SETLOCAL,
                     VarKind::Instance => ops::SETIVAR,
@@ -1565,7 +1613,7 @@ impl Compiler {
                     singleton,
                     singleton_recv: None,
                 } => {
-                    let def = self.compile_method(params, body)?;
+                    let def = self.compile_method_named(name, params, body)?;
                     if *singleton {
                         class_methods.insert(name.clone(), def);
                     } else {

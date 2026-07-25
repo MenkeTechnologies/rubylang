@@ -5303,6 +5303,29 @@ fn dispatch_string(
                 Ok(Value::Int(bytes[idx as usize] as i64))
             }
         }
+        // `byteslice(start, len=1)` / `byteslice(range)` — a substring by BYTE
+        // offset (not character), used by ActionDispatch::Journey's scanner. A
+        // negative start counts from the end; out-of-range start returns nil.
+        "byteslice" => {
+            let bytes = s.as_bytes();
+            let blen = bytes.len() as i64;
+            let (start, end) = if let Some((lo, hi, excl)) = with_host(|h| h.as_range(&args[0])) {
+                match range_bounds(lo, hi, excl, bytes.len()) {
+                    Some((st, en)) => (st, en),
+                    None => return Ok(Value::Undef),
+                }
+            } else {
+                let raw = as_i(&args[0]);
+                let st = if raw < 0 { raw + blen } else { raw };
+                let len = args.get(1).map(as_i).unwrap_or(1);
+                if st < 0 || st > blen || len < 0 {
+                    return Ok(Value::Undef);
+                }
+                (st as usize, ((st + len).min(blen)) as usize)
+            };
+            let slice = &bytes[start..end];
+            Ok(new_str(String::from_utf8_lossy(slice).into_owned()))
+        }
         // `b` returns a copy of the string tagged ASCII-8BIT. Byte content is
         // unchanged (we store UTF-8 bytes); the BINARY encoding is recorded in a
         // side table so `#encoding` on the copy answers ASCII-8BIT.
