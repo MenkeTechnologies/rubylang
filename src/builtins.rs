@@ -14975,6 +14975,8 @@ fn binstr_to_bytes(s: &str) -> Vec<u8> {
 struct PackDir {
     kind: char,
     count: Option<usize>,
+    // Endianness modifier from a trailing `<` (little) / `>` (big); None = native.
+    endian: Option<bool>,
 }
 
 /// Parse a pack/unpack template into directives, ignoring whitespace (MRI does).
@@ -14985,26 +14987,48 @@ fn parse_pack_template(fmt: &str) -> Vec<PackDir> {
         if k.is_whitespace() {
             continue;
         }
-        let count = match it.peek() {
-            Some('*') => {
-                it.next();
-                None
-            }
-            Some(d) if d.is_ascii_digit() => {
-                let mut n = 0usize;
-                while let Some(d) = it.peek().copied() {
-                    if let Some(v) = d.to_digit(10) {
-                        n = n * 10 + v as usize;
-                        it.next();
-                    } else {
-                        break;
-                    }
+        // Endianness (`<`/`>`) and native-size (`!`) modifiers may appear before
+        // and/or after the count (`l<`, `l<2`, `s!`). Collect them alongside the
+        // count, which is digits or `*`.
+        let mut count = Some(1usize);
+        let mut endian = None;
+        loop {
+            match it.peek().copied() {
+                Some('<') => {
+                    it.next();
+                    endian = Some(true);
                 }
-                Some(n)
+                Some('>') => {
+                    it.next();
+                    endian = Some(false);
+                }
+                Some('!') | Some('_') => {
+                    it.next();
+                }
+                Some('*') => {
+                    it.next();
+                    count = None;
+                }
+                Some(d) if d.is_ascii_digit() => {
+                    let mut n = 0usize;
+                    while let Some(d) = it.peek().copied() {
+                        if let Some(v) = d.to_digit(10) {
+                            n = n * 10 + v as usize;
+                            it.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    count = Some(n);
+                }
+                _ => break,
             }
-            _ => Some(1),
-        };
-        dirs.push(PackDir { kind: k, count });
+        }
+        dirs.push(PackDir {
+            kind: k,
+            count,
+            endian,
+        });
     }
     dirs
 }
@@ -15059,6 +15083,52 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
                     out.extend_from_slice(&w);
                 }
             }
+            // Native-endian integers (little-endian on x86-64/aarch64): s/S 16-bit,
+            // l/L 32-bit, q/Q 64-bit, i/I/j/J native word (modeled as 64-bit).
+            's' | 'S' | 'l' | 'L' | 'q' | 'Q' | 'i' | 'I' | 'j' | 'J' => {
+                let width = match d.kind {
+                    's' | 'S' => 2usize,
+                    'l' | 'L' => 4,
+                    _ => 8,
+                };
+                let n = d.count.unwrap_or(items.len().saturating_sub(idx));
+                let big = d.endian == Some(false);
+                for _ in 0..n {
+                    let v = items.get(idx).map(as_i).unwrap_or(0) as u64;
+                    idx += 1;
+                    if big {
+                        out.extend_from_slice(&v.to_be_bytes()[8 - width..]);
+                    } else {
+                        out.extend_from_slice(&v.to_le_bytes()[..width]);
+                    }
+                }
+            }
+            // Floats: `D`/`d`/`G` double, `F`/`f`/`e`/`g` single. Endianness:
+            // `E`/`e` little, `G`/`g` big, `D`/`d`/`F`/`f` native (little here).
+            'D' | 'd' | 'E' | 'F' | 'f' | 'e' | 'G' | 'g' => {
+                let double = matches!(d.kind, 'D' | 'd' | 'E' | 'G');
+                let big = matches!(d.kind, 'G' | 'g');
+                let n = d.count.unwrap_or(items.len().saturating_sub(idx));
+                for _ in 0..n {
+                    let f = items.get(idx).map(as_f).unwrap_or(0.0);
+                    idx += 1;
+                    if double {
+                        let b = if big {
+                            f.to_be_bytes()
+                        } else {
+                            f.to_le_bytes()
+                        };
+                        out.extend_from_slice(&b);
+                    } else {
+                        let b = if big {
+                            (f as f32).to_be_bytes()
+                        } else {
+                            (f as f32).to_le_bytes()
+                        };
+                        out.extend_from_slice(&b);
+                    }
+                }
+            }
             // Hex strings: `H` high-nibble-first, `h` low-nibble-first. Consumes
             // one element; a count limits the nibbles taken (`*` = all).
             'H' | 'h' => {
@@ -15081,6 +15151,27 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
                     out.push(byte);
                     i += 2;
                 }
+            }
+            // `@N` moves to absolute byte position N (null-fill forward, truncate
+            // back). Consumes no array element.
+            '@' => {
+                let n = d.count.unwrap_or(0);
+                if n > out.len() {
+                    out.resize(n, 0);
+                } else {
+                    out.truncate(n);
+                }
+            }
+            // `xN` emits N null bytes; `XN` backs up N bytes. Neither consumes an
+            // element.
+            'x' => {
+                let n = d.count.unwrap_or(1);
+                out.resize(out.len() + n, 0);
+            }
+            'X' => {
+                let n = d.count.unwrap_or(1);
+                let target = out.len().saturating_sub(n);
+                out.truncate(target);
             }
             other => {
                 return Err(raise_exc(
