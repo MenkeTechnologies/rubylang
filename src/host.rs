@@ -658,6 +658,13 @@ pub struct RubyHost {
     /// is inherited by subclasses (looked up through the superclass chain) — unlike
     /// per-object singletons which are keyed by a heap id (recreated per classref).
     class_define_methods: IndexMap<String, IndexMap<String, Value>>,
+    /// Instance variables for heap objects that aren't plain `RObj::Object`
+    /// (Thread, Fiber, IO, and other native-handle values), keyed by heap id.
+    /// ActiveSupport reopens `Thread`/`Fiber` with `attr_accessor
+    /// :active_support_execution_state`; without somewhere to store the ivar the
+    /// accessor silently drops the value and every request loses its execution
+    /// state. `RObj::Object` keeps its own inline `ivars`; this covers the rest.
+    obj_ivars: IndexMap<u32, IndexMap<String, Value>>,
     /// `alias_method`/`alias` mappings: class → alias name → target method name.
     method_aliases: IndexMap<String, IndexMap<String, String>>,
     /// For an alias whose target is a USER method (the body is copied under the
@@ -1301,6 +1308,7 @@ impl RubyHost {
             singleton_methods: IndexMap::new(),
             singleton_define_methods: IndexMap::new(),
             class_define_methods: IndexMap::new(),
+            obj_ivars: IndexMap::new(),
             method_aliases: IndexMap::new(),
             alias_originals: IndexMap::new(),
             module_function_modules: std::collections::HashSet::new(),
@@ -2686,7 +2694,7 @@ impl RubyHost {
     // the main object) they fall back to a global-keyed table.
     pub fn get_ivar(&self, name: &str) -> Value {
         match self.current_self() {
-            Value::Obj(_) => {
+            Value::Obj(id) => {
                 match self.obj(&self.current_self()) {
                     Some(RObj::Object { ivars, .. }) => {
                         ivars.get(name).cloned().unwrap_or(Value::Undef)
@@ -2698,7 +2706,13 @@ impl RubyHost {
                         .and_then(|m| m.get(name))
                         .cloned()
                         .unwrap_or(Value::Undef),
-                    _ => Value::Undef,
+                    // A native-handle self (a Thread/Fiber method body): side table.
+                    _ => self
+                        .obj_ivars
+                        .get(&id)
+                        .and_then(|m| m.get(name))
+                        .cloned()
+                        .unwrap_or(Value::Undef),
                 }
             }
             _ => self
@@ -2723,7 +2737,10 @@ impl RubyHost {
                         .or_default()
                         .insert(name.to_string(), v);
                 }
-                _ => {}
+                // A native-handle self (Thread/Fiber method body): side table.
+                _ => {
+                    self.obj_ivars.entry(i).or_default().insert(name.to_string(), v);
+                }
             },
             _ => {
                 self.globals.insert(format!("@{name}"), v);
@@ -4087,7 +4104,16 @@ impl RubyHost {
                 .and_then(|m| m.get(name))
                 .cloned()
                 .unwrap_or(Value::Undef),
-            _ => Value::Undef,
+            // Native-handle objects (Thread/Fiber/…): read from the side table.
+            _ => match obj {
+                Value::Obj(i) => self
+                    .obj_ivars
+                    .get(i)
+                    .and_then(|m| m.get(name))
+                    .cloned()
+                    .unwrap_or(Value::Undef),
+                _ => Value::Undef,
+            },
         }
     }
     /// Set the instance variable `name` (bare, no `@`) on a specific object.
@@ -4108,8 +4134,18 @@ impl RubyHost {
             return;
         }
         if let Value::Obj(i) = obj {
-            if let Some(RObj::Object { ivars, .. }) = self.heap.get_mut(*i as usize) {
-                ivars.insert(name.to_string(), v);
+            match self.heap.get_mut(*i as usize) {
+                Some(RObj::Object { ivars, .. }) => {
+                    ivars.insert(name.to_string(), v);
+                }
+                // Native-handle objects (Thread/Fiber/IO/…) store ivars in the
+                // side table keyed by heap id.
+                _ => {
+                    self.obj_ivars
+                        .entry(*i)
+                        .or_default()
+                        .insert(name.to_string(), v);
+                }
             }
         }
     }
