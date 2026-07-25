@@ -1730,7 +1730,13 @@ pub(crate) fn dispatch(
                 // not enumerable here, so stay permissive; a *user* class has all
                 // its class methods registered, so report an undefined one as absent
                 // (sinatra's `set` needs `respond_to?("opt=")` false until defined).
-                return Ok(Value::Bool(with_host(|h| h.is_builtin_class(&cname))));
+                // The root classes/modules are the exception: they carry no hidden
+                // gem-specific class methods, and Rails walks `ancestors` calling
+                // `respond_to?(:initializers)` on each — a permissive BasicObject/
+                // Object would wrongly claim the method and then fail on the call.
+                let permissive = with_host(|h| h.is_builtin_class(&cname))
+                    && !matches!(cname.as_str(), "BasicObject" | "Object" | "Kernel");
+                return Ok(Value::Bool(permissive));
             }
             // Built-in receivers are otherwise permissive, but the pattern-match
             // deconstruction protocol must be accurate: only Arrays respond to
