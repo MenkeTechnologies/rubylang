@@ -3063,6 +3063,20 @@ impl RubyHost {
                 return;
             }
         }
+        // A snapshot alias of a native Kernel function (`alias_method
+        // :zeitwerk_original_require, :require`, taken *before* Zeitwerk's
+        // `def require` in source order). This MUST precede the user-method
+        // lookup: rubylang hoists a same-body `def require` into the method table
+        // before the runtime `alias_method` runs, so a plain lookup would capture
+        // the override — whose body calls the alias — and recurse forever. The
+        // native marker forwards to the builtin instead.
+        if crate::builtins::is_kernel_function(target) {
+            self.method_aliases
+                .entry(class.to_string())
+                .or_default()
+                .insert(alias_name.to_string(), format!("\u{1}native:{target}"));
+            return;
+        }
         if let Some((def, _)) = self.find_method_owner(class, target) {
             self.add_instance_method(class, alias_name, def);
         } else if let Some(proc) = self.find_define_method(class, target) {
@@ -3071,16 +3085,36 @@ impl RubyHost {
                 .or_default()
                 .insert(alias_name.to_string(), proc);
         } else {
-            // The target is neither a user method nor a native method of a builtin
-            // base — e.g. a class-method alias of `new`/`allocate` (concurrent-ruby
-            // does `singleton_class.alias_method(:[], :new)`). A native-instance
-            // marker would not dispatch here, so store a plain name alias, resolved
-            // through the normal (class-)alias path.
+            // The target is neither a user method, a native method of a builtin
+            // base, nor a Kernel function — e.g. a class-method alias of
+            // `new`/`allocate` (concurrent-ruby: `singleton_class.alias_method
+            // (:[], :new)`). Store a plain name alias, resolved through the normal
+            // (class-)alias path.
             self.method_aliases
                 .entry(class.to_string())
                 .or_default()
                 .insert(alias_name.to_string(), target.to_string());
         }
+    }
+    /// If a bareword/Kernel call `name` resolves (through the alias chain visible
+    /// from `class`) to a snapshot alias of a native Kernel function, the native
+    /// function name — so the caller can invoke the builtin directly, bypassing a
+    /// later user redefinition of that name (Zeitwerk's `require` override).
+    pub fn native_kernel_alias(&self, class: &str, name: &str) -> Option<String> {
+        let anc = self.class_ancestry(class);
+        let mut cur = name.to_string();
+        for _ in 0..50 {
+            let next = anc
+                .iter()
+                .find_map(|a| self.method_aliases.get(a).and_then(|m| m.get(&cur)));
+            match next {
+                Some(t) if *t != cur => cur = t.clone(),
+                _ => break,
+            }
+        }
+        Self::native_alias_target(&cur)
+            .filter(|n| crate::builtins::is_kernel_function(n))
+            .map(|n| n.to_string())
     }
     /// If `target` is a `\x01native:<name>` marker (a snapshot alias of a native
     /// method), the underlying native method name; else `None`.

@@ -75,7 +75,7 @@ pub fn install(vm: &mut VM) {
 /// Whether `name` is a built-in Kernel function (so `defined?(puts)` and the
 /// like report `"method"`). These are dispatched by `kernel()`, not registered
 /// as ordinary methods, so `responds_to` doesn't see them.
-fn is_kernel_function(name: &str) -> bool {
+pub(crate) fn is_kernel_function(name: &str) -> bool {
     matches!(
         name,
         "puts"
@@ -1228,6 +1228,14 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
     }
     if with_host(|h| h.responds_to(name)) {
         return call_method(name, args, block);
+    }
+    // A snapshot alias of a native Kernel function (Zeitwerk's
+    // `zeitwerk_original_require` → native `require`): invoke the builtin
+    // directly. Resolving by the aliased name would hit the user override that
+    // shadows `require` and recurse forever.
+    let self_cls = with_host(|h| h.class_of(&this));
+    if let Some(nat) = with_host(|h| h.native_kernel_alias(&self_cls, name)) {
+        return kernel(&nat, args, block);
     }
     // A `rust { ... }` block's exported functions are callable by bareword.
     // User-defined Ruby methods still win (resolved above); the registry is only
