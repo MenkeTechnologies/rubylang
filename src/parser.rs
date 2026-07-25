@@ -1717,9 +1717,12 @@ impl Parser {
                 !self.toks.get(self.pos + 1).map(|t| t.space).unwrap_or(true)
             }
             // A lambda literal (`p ->(x){ x }`), an array/paren group, a
-            // top-level constant (`foo ::Bar`), or a symbol-array percent literal
-            // all begin a command argument.
-            Tok::Op(o) => o == "[" || o == "(" || o == "->" || o == "::",
+            // top-level constant (`foo ::Bar`), or a unary `!expr`/`~expr`
+            // (`link_to_if !condition, …, &block`) all begin a command argument.
+            // `!`/`~` are only unary, so they unambiguously start an argument.
+            Tok::Op(o) => {
+                o == "[" || o == "(" || o == "->" || o == "::" || o == "!" || o == "~"
+            }
             _ => false,
         }
     }

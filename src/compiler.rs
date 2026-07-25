@@ -289,6 +289,59 @@ impl Compiler {
         self.compile_method_named("", params, body)
     }
 
+    /// Collect the `VarKind::Local` names assigned anywhere inside a parameter
+    /// default expression (e.g. `no_default` in `default = (no_default = true)`),
+    /// so they can be hoisted to nil at method entry — Ruby scopes them as method
+    /// locals from their parse position regardless of whether the default runs.
+    fn collect_default_locals(e: &Expr, out: &mut Vec<String>) {
+        match e {
+            Expr::Assign(target, value) => {
+                if let Expr::Var(VarKind::Local, n) = &**target {
+                    if !out.contains(n) {
+                        out.push(n.clone());
+                    }
+                }
+                Self::collect_default_locals(value, out);
+            }
+            Expr::MultiAssign { targets, values } => {
+                for t in targets {
+                    if let Expr::Var(VarKind::Local, n) = t {
+                        if !out.contains(n) {
+                            out.push(n.clone());
+                        }
+                    }
+                }
+                for v in values {
+                    Self::collect_default_locals(v, out);
+                }
+            }
+            Expr::Binary(_, l, r) => {
+                Self::collect_default_locals(l, out);
+                Self::collect_default_locals(r, out);
+            }
+            Expr::Unary(_, x) | Expr::Splat(x) => Self::collect_default_locals(x, out),
+            Expr::Index(r, idx) => {
+                Self::collect_default_locals(r, out);
+                for i in idx {
+                    Self::collect_default_locals(i, out);
+                }
+            }
+            Expr::Array(items) => {
+                for i in items {
+                    Self::collect_default_locals(i, out);
+                }
+            }
+            Expr::Call { recv, args, .. } => {
+                if let Some(r) = recv {
+                    Self::collect_default_locals(r, out);
+                }
+                for a in args {
+                    Self::collect_default_locals(a, out);
+                }
+            }
+            _ => {}
+        }
+    }
     fn compile_method_named(
         &mut self,
         name: &str,
@@ -303,6 +356,31 @@ impl Compiler {
         self.scope_locals.push(param_locals);
         self.cur_method.push(name.to_string());
         let mut b = ChunkBuilder::new();
+        // Ruby hoists a local to nil from its first assignment position, even when
+        // that assignment lives inside a *parameter default* that may not run.
+        // `def index_with(default = (no_default = true))` introduces `no_default`
+        // as a method local; when a `default` arg is passed the assignment is
+        // skipped, yet a later bare read of `no_default` must see nil (a local),
+        // not dispatch as a method. Pre-bind every such local to nil so a skipped
+        // default still leaves it declared (a run default overwrites it).
+        let mut default_locals: Vec<String> = Vec::new();
+        for p in params {
+            if let Some(default) = &p.default {
+                Self::collect_default_locals(default, &mut default_locals);
+            }
+        }
+        for lname in &default_locals {
+            if params.iter().any(|p| &p.name == lname) {
+                continue;
+            }
+            if let Some(scope) = self.scope_locals.last_mut() {
+                scope.insert(lname.clone());
+            }
+            self.kstr(&mut b, lname);
+            self.compile_expr(&mut b, &Expr::Nil)?;
+            b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), 0);
+            b.emit(Op::Pop, 0);
+        }
         for p in params {
             if let Some(default) = &p.default {
                 // if !defined?(p) { p = default }

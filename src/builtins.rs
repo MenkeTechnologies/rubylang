@@ -11230,11 +11230,6 @@ fn dispatch_hash(
             with_host(|h| h.set_hash(recv, m));
             Ok(recv.clone())
         }
-        // rubylang keys hashes by value equality; identity-keyed hashes
-        // (zeitwerk's cref map) are accepted as a no-op returning self. Exact
-        // object-identity semantics are not modeled.
-        "compare_by_identity" => Ok(recv.clone()),
-        "compare_by_identity?" => Ok(Value::Bool(false)),
         "merge!" | "update" => {
             let mut m = map;
             for a in args {
