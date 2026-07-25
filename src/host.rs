@@ -3117,14 +3117,27 @@ impl RubyHost {
     /// A `Klass.define_singleton_method` block for `name`, walking the superclass
     /// chain (a class-level singleton method is inherited like any class method).
     pub fn find_class_define_method(&self, class: &str, name: &str) -> Option<Value> {
-        if self.class_define_methods.is_empty() {
-            return None;
-        }
         let mut cur = Some(class.to_string());
         let mut guard = 0;
         while let Some(c) = cur {
+            // A `def self.m` via define_singleton_method / class-level define_method.
             if let Some(p) = self.class_define_methods.get(&c).and_then(|m| m.get(name)) {
                 return Some(p.clone());
+            }
+            // `extend M` where M has an INSTANCE `define_method(:m)`: the module's
+            // define-methods become the class's class methods. Rails'
+            // AbstractController::Callbacks::ClassMethods defines before_action /
+            // after_action / around_action this way (a `define_method` in a loop).
+            if let Some(def) = self.classes.get(&c) {
+                let extends = def.extends.clone();
+                for module in extends.iter().rev() {
+                    let resolved = self.resolve_module_name(module, &c);
+                    for anc in self.module_self_ancestry(&resolved) {
+                        if let Some(p) = self.define_methods.get(&anc).and_then(|m| m.get(name)) {
+                            return Some(p.clone());
+                        }
+                    }
+                }
             }
             guard += 1;
             if guard > 100 {
@@ -3172,12 +3185,15 @@ impl RubyHost {
     }
     /// A `define_method` block for `name`, walking the superclass chain.
     pub fn find_define_method(&self, class: &str, name: &str) -> Option<Value> {
-        let mut cur = Some(class.to_string());
-        while let Some(c) = cur {
+        // Walk the full ancestry (included/prepended modules AND superclasses):
+        // a `define_method` in a module body (`module M; define_method(:m){…}; end`,
+        // as AbstractController::Callbacks generates `before_action`/`after_action`
+        // in a loop) must be inherited by a class that includes M, not only found
+        // on the class's own superclass chain.
+        for c in self.class_ancestry(class) {
             if let Some(p) = self.define_methods.get(&c).and_then(|m| m.get(name)) {
                 return Some(p.clone());
             }
-            cur = self.superclass_of(&c);
         }
         None
     }

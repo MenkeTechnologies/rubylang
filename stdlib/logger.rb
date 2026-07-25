@@ -128,6 +128,13 @@ class Logger
     @logdev.close if @logdev.respond_to?(:close)
   end
 
+  # Flush the underlying device if it can be flushed (ActiveSupport::Logger
+  # overrides `flush` and chains up with `super`). A no-op otherwise.
+  def flush
+    @logdev.flush if @logdev.respond_to?(:flush)
+    self
+  end
+
   private
 
   def format_message(label, message, progname)
