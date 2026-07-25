@@ -1400,7 +1400,15 @@ pub(crate) fn dispatch(
                 );
             }
         }
-        if with_host(|h| h.find_method_owner(&cls, name)).is_some() {
+        // A class/module reference resolves its methods through dispatch_classref
+        // and the native class-operation handlers below (class_eval, define_method,
+        // include, …), NOT as instance methods of `Class`/`Module`. Resolving here
+        // would let a reopened `Kernel#class_eval` (activesupport delegates it to
+        // `singleton_class.class_eval`) shadow the native Module#class_eval and
+        // recurse forever. Skip for class refs.
+        if with_host(|h| h.classref_name(recv)).is_none()
+            && with_host(|h| h.find_method_owner(&cls, name)).is_some()
+        {
             return call_instance_method(recv.clone(), &cls, name, args, block);
         }
     }
