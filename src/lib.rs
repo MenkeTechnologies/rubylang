@@ -167,6 +167,24 @@ const PRELUDE: &str = r#"
 # require). Preload the bundled definition here.
 require "rubygems/version"
 
+# `Thread::Backtrace::Location` — the class of the objects `caller_locations`
+# returns natively; declared here so it exists as a constant (activesupport's
+# SyntaxErrorProxy does `DelegateClass(Thread::Backtrace::Location)`, which reads
+# its public_instance_methods).
+class Thread
+  class Backtrace
+    class Location
+      def path; @path; end
+      def lineno; @lineno; end
+      def label; @label; end
+      def base_label; @base_label || @label; end
+      def absolute_path; @absolute_path || @path; end
+      def to_s; @path.to_s + ":" + @lineno.to_s + ":in " + @label.to_s; end
+      def inspect; to_s; end
+    end
+  end
+end
+
 module Process
   # clock_gettime clock ids (values match Linux; rubylang ignores the specific
   # clock and returns a wall-clock reading — enough for timing/instrumentation).
