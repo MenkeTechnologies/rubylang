@@ -1913,6 +1913,19 @@ pub(crate) fn dispatch(
     // native method (e.g. Array#length) always wins over a same-named Object method.
     if let Err(ref e) = result {
         if e.starts_with("undefined method") {
+            // A reopened builtin class may declare attr accessors that native
+            // dispatch doesn't know about (activesupport reopens Thread with
+            // `attr_accessor :active_support_execution_state`): read/write the
+            // backing ivar on the instance.
+            if let Some((field, writer)) = with_host(|h| h.attr_access(&class, name)) {
+                with_host(|h| h.take_pending_exc());
+                if writer {
+                    let val = args.first().cloned().unwrap_or(Value::Undef);
+                    with_host(|h| h.set_ivar_of(recv, &field, val.clone()));
+                    return Ok(val);
+                }
+                return Ok(with_host(|h| h.ivar_of(recv, &field)));
+            }
             // A native-backed builtin subclass (StringInquirer < String,
             // OrderedOptions < Hash) can define `method_missing` for dynamic
             // methods (`prod?`, `foo=`); route there when native dispatch and the
@@ -2154,21 +2167,21 @@ fn dispatch_classref(
     // `Thread` class methods. `Thread.new { }` spawns a real OS thread that runs
     // under the GVL (only one Ruby thread executes at a time, like MRI).
     if cls == "Thread" {
-        return match name {
+        match name {
             "new" | "start" | "fork" => {
                 let b =
                     block.ok_or_else(|| raise_exc("ThreadError", "must be called with a block"))?;
-                Ok(crate::host::spawn_thread(b))
+                return Ok(crate::host::spawn_thread(b));
             }
-            "current" | "main" => Ok(crate::host::current_thread()),
+            "current" | "main" => return Ok(crate::host::current_thread()),
             // Cooperative-scheduler hints; the GVL already serializes execution.
-            "pass" => Ok(Value::Undef),
-            "list" => Ok(new_arr(vec![crate::host::current_thread()])),
-            _ => Err(raise_exc(
-                "NoMethodError",
-                &format!("undefined method '{name}' for Thread"),
-            )),
-        };
+            "pass" => return Ok(Value::Undef),
+            "list" => return Ok(new_arr(vec![crate::host::current_thread()])),
+            // Anything else (attr_accessor and other Module macros from a
+            // `class Thread` reopening, class methods) falls through to the
+            // general class-receiver handling below.
+            _ => {}
+        }
     }
     // `Random` class methods; `Random.new(seed)` builds an object with its own
     // reproducible PRNG stream (see `random_advance`).
