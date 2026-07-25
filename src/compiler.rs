@@ -87,6 +87,16 @@ pub struct Compiler {
     /// `def`s). A bare identifier equal to this — and not shadowed by a local —
     /// is a self-recursive call, not a nil local read.
     cur_method: Vec<String>,
+    /// Per-scope slot lowering, parallel in depth to `scope_locals`. A name in
+    /// the top map is a fusevm frame slot (`GetSlot`/`SetSlot`) instead of a host
+    /// `GETLOCAL`/`SETLOCAL` dispatch — which is what lets fusevm's AOT/JIT native
+    /// path lower the surrounding arithmetic to registers (a host `CallBuiltin`
+    /// is opaque and forces the interpreter). Only locals proven **not** captured
+    /// by a nested closure and **not** introspected (`binding`/`eval`/`defined?`/
+    /// `local_variables`) get a slot; every other name keeps the host path so
+    /// closure sharing and reflection stay correct. Empty top map = no slot
+    /// lowering in this scope (a closure/class body, or an introspecting scope).
+    slot_scopes: Vec<std::collections::HashMap<String, u16>>,
 }
 
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
@@ -106,13 +116,423 @@ fn next_synth_id() -> u64 {
     SYNTH_CTR.fetch_add(1, Ordering::Relaxed)
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Slot lowering analysis (see `Compiler::slot_scopes`)
+//
+// A local is lowered to a fusevm frame slot (native-lowerable) instead of a host
+// `GETLOCAL`/`SETLOCAL` dispatch only when it is provably safe: not shared with a
+// closure, not reached by reflection, and written only by plain assignment. The
+// analysis is deliberately conservative — any construct it can't reason about
+// disqualifies the whole scope, so a missed case costs speed, never correctness.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Bare-call names that can read or mutate a scope's locals by reflection, so any
+/// of them anywhere in the scope tree (including nested closures — a captured
+/// `binding` reaches outer locals) forbids slot lowering.
+const INTROSPECT_CALLS: &[&str] = &[
+    "eval",
+    "binding",
+    "local_variables",
+    "instance_eval",
+    "instance_exec",
+    "class_eval",
+    "module_eval",
+    "class_exec",
+    "module_exec",
+];
+
+/// Walk a scope body collecting (a) local names referenced inside a nested
+/// closure — which must stay host-bound so the closure and its parent share one
+/// binding — and (b) a "disqualified" flag set when the scope uses reflection or
+/// an implicit/complex binding form (`for`, `case/in`, multiple assignment,
+/// `rescue => e`, `defined?` on a local) that slot lowering can't track. A nested
+/// `def`/`class`/`module` is a *separate* scope (no shared locals), so the walk
+/// stops at it.
+fn slot_scan(body: &[Stmt]) -> (std::collections::HashSet<String>, bool) {
+    let mut caps = std::collections::HashSet::new();
+    let mut disq = false;
+    for s in body {
+        slot_scan_expr(&s.expr, &mut caps, &mut disq, false);
+    }
+    (caps, disq)
+}
+
+fn slot_scan_block(b: &Block, caps: &mut std::collections::HashSet<String>, disq: &mut bool) {
+    // A block body is a closure: every local it names is shared with the parent.
+    for s in &b.body {
+        slot_scan_expr(&s.expr, caps, disq, true);
+    }
+}
+
+fn slot_scan_body(
+    body: &[Stmt],
+    caps: &mut std::collections::HashSet<String>,
+    disq: &mut bool,
+    in_closure: bool,
+) {
+    for s in body {
+        slot_scan_expr(&s.expr, caps, disq, in_closure);
+    }
+}
+
+fn slot_scan_expr(
+    e: &Expr,
+    caps: &mut std::collections::HashSet<String>,
+    disq: &mut bool,
+    in_closure: bool,
+) {
+    match e {
+        Expr::Var(VarKind::Local, n) => {
+            if in_closure {
+                caps.insert(n.clone());
+            }
+        }
+        Expr::Nil
+        | Expr::True
+        | Expr::False
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Symbol(_)
+        | Expr::SelfExpr
+        | Expr::Regex(_, _)
+        | Expr::Retry
+        | Expr::Var(_, _) => {}
+        Expr::Str(parts) => {
+            for p in parts {
+                if let StrPart::Interp(x) = p {
+                    slot_scan_expr(x, caps, disq, in_closure);
+                }
+            }
+        }
+        Expr::Array(xs) => {
+            for x in xs {
+                slot_scan_expr(x, caps, disq, in_closure);
+            }
+        }
+        Expr::Hash(kvs) => {
+            for (k, v) in kvs {
+                slot_scan_expr(k, caps, disq, in_closure);
+                slot_scan_expr(v, caps, disq, in_closure);
+            }
+        }
+        Expr::Range { lo, hi, .. } => {
+            if let Some(x) = lo {
+                slot_scan_expr(x, caps, disq, in_closure);
+            }
+            if let Some(x) = hi {
+                slot_scan_expr(x, caps, disq, in_closure);
+            }
+        }
+        Expr::Assign(t, v) => {
+            slot_scan_expr(t, caps, disq, in_closure);
+            slot_scan_expr(v, caps, disq, in_closure);
+        }
+        Expr::MultiAssign { targets, values } => {
+            if !in_closure {
+                *disq = true;
+            }
+            for t in targets {
+                slot_scan_expr(t, caps, disq, in_closure);
+            }
+            for v in values {
+                slot_scan_expr(v, caps, disq, in_closure);
+            }
+        }
+        Expr::Unary(_, x) => slot_scan_expr(x, caps, disq, in_closure),
+        Expr::Binary(_, a, b) => {
+            slot_scan_expr(a, caps, disq, in_closure);
+            slot_scan_expr(b, caps, disq, in_closure);
+        }
+        Expr::If {
+            cond,
+            then,
+            elifs,
+            els,
+        } => {
+            slot_scan_expr(cond, caps, disq, in_closure);
+            slot_scan_body(then, caps, disq, in_closure);
+            for (c, b) in elifs {
+                slot_scan_expr(c, caps, disq, in_closure);
+                slot_scan_body(b, caps, disq, in_closure);
+            }
+            if let Some(b) = els {
+                slot_scan_body(b, caps, disq, in_closure);
+            }
+        }
+        Expr::While { cond, body } | Expr::DoWhile { cond, body } => {
+            slot_scan_expr(cond, caps, disq, in_closure);
+            slot_scan_body(body, caps, disq, in_closure);
+        }
+        Expr::For { iter, body, .. } => {
+            // `for v in …` binds `v` in the enclosing scope with no assignment
+            // node the plan can see — disqualify rather than risk an unwritten
+            // slot.
+            if !in_closure {
+                *disq = true;
+            }
+            slot_scan_expr(iter, caps, disq, in_closure);
+            slot_scan_body(body, caps, disq, in_closure);
+        }
+        Expr::Case {
+            subject,
+            whens,
+            els,
+        } => {
+            slot_scan_expr(subject, caps, disq, in_closure);
+            for (pats, b) in whens {
+                for p in pats {
+                    slot_scan_expr(p, caps, disq, in_closure);
+                }
+                slot_scan_body(b, caps, disq, in_closure);
+            }
+            if let Some(b) = els {
+                slot_scan_body(b, caps, disq, in_closure);
+            }
+        }
+        Expr::CaseIn {
+            subject, els, ..
+        } => {
+            // Pattern matching binds locals structurally — disqualify.
+            if !in_closure {
+                *disq = true;
+            }
+            slot_scan_expr(subject, caps, disq, in_closure);
+            if let Some(b) = els {
+                slot_scan_body(b, caps, disq, in_closure);
+            }
+        }
+        Expr::Call {
+            recv,
+            name,
+            args,
+            block,
+        } => {
+            if INTROSPECT_CALLS.contains(&name.as_str()) {
+                *disq = true;
+            }
+            if let Some(r) = recv {
+                slot_scan_expr(r, caps, disq, in_closure);
+            }
+            for a in args {
+                slot_scan_expr(a, caps, disq, in_closure);
+            }
+            if let Some(b) = block {
+                slot_scan_block(b, caps, disq);
+            }
+        }
+        Expr::Index(r, idxs) => {
+            slot_scan_expr(r, caps, disq, in_closure);
+            for i in idxs {
+                slot_scan_expr(i, caps, disq, in_closure);
+            }
+        }
+        Expr::BlockPass(x) | Expr::Splat(x) => slot_scan_expr(x, caps, disq, in_closure),
+        // Separate scopes: a nested def/class/module/singleton-class body cannot
+        // reference this scope's locals, so it neither captures nor disqualifies.
+        Expr::Def { .. }
+        | Expr::Class { .. }
+        | Expr::Module { .. }
+        | Expr::SingletonClass { .. } => {}
+        Expr::Begin {
+            body,
+            rescues,
+            ensure,
+        } => {
+            // `begin`/`rescue`/`ensure` bodies each compile to their own proc
+            // frame (`compile_begin`), so from this scope they are closures: any
+            // local they touch is shared cross-frame and must stay host-bound.
+            slot_scan_body(body, caps, disq, true);
+            for r in rescues {
+                if let Some(s) = &r.splat {
+                    slot_scan_expr(s, caps, disq, true);
+                }
+                slot_scan_body(&r.body, caps, disq, true);
+            }
+            if let Some(en) = ensure {
+                slot_scan_body(en, caps, disq, true);
+            }
+        }
+        Expr::Return(o) | Expr::Break(o) | Expr::Next(o) => {
+            if let Some(x) = o {
+                slot_scan_expr(x, caps, disq, in_closure);
+            }
+        }
+        Expr::Yield(xs) => {
+            for x in xs {
+                slot_scan_expr(x, caps, disq, in_closure);
+            }
+        }
+        Expr::Defined(inner) => {
+            if let Expr::Var(VarKind::Local, _) = &**inner {
+                *disq = true;
+            }
+            slot_scan_expr(inner, caps, disq, in_closure);
+        }
+        Expr::Super { args, block } => {
+            if let Some(a) = args {
+                for x in a {
+                    slot_scan_expr(x, caps, disq, in_closure);
+                }
+            }
+            if let Some(b) = block {
+                slot_scan_block(b, caps, disq);
+            }
+        }
+        Expr::Lambda(b) => slot_scan_block(b, caps, disq),
+    }
+}
+
+/// Collect, in first-seen order, every local written by a plain
+/// `Assign(Var(Local), …)` at this scope's own level (not inside a nested closure
+/// or def). In a non-disqualified scope these are the *only* local writes, so the
+/// set is exactly the slot candidates before removing params/captures.
+fn scope_plain_assigns(body: &[Stmt]) -> Vec<String> {
+    let mut out = Vec::new();
+    for s in body {
+        collect_plain_assigns(&s.expr, &mut out);
+    }
+    out
+}
+
+fn collect_plain_assigns(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Assign(t, v) => {
+            if let Expr::Var(VarKind::Local, n) = &**t {
+                if !out.iter().any(|x| x == n) {
+                    out.push(n.clone());
+                }
+            }
+            collect_plain_assigns(v, out);
+        }
+        Expr::Nil
+        | Expr::True
+        | Expr::False
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Symbol(_)
+        | Expr::SelfExpr
+        | Expr::Regex(_, _)
+        | Expr::Retry
+        | Expr::Var(_, _) => {}
+        Expr::Str(parts) => {
+            for p in parts {
+                if let StrPart::Interp(x) = p {
+                    collect_plain_assigns(x, out);
+                }
+            }
+        }
+        Expr::Array(xs) => xs.iter().for_each(|x| collect_plain_assigns(x, out)),
+        Expr::Hash(kvs) => kvs.iter().for_each(|(k, v)| {
+            collect_plain_assigns(k, out);
+            collect_plain_assigns(v, out);
+        }),
+        Expr::Range { lo, hi, .. } => {
+            if let Some(x) = lo {
+                collect_plain_assigns(x, out);
+            }
+            if let Some(x) = hi {
+                collect_plain_assigns(x, out);
+            }
+        }
+        Expr::MultiAssign { values, .. } => {
+            values.iter().for_each(|v| collect_plain_assigns(v, out))
+        }
+        Expr::Unary(_, x) | Expr::BlockPass(x) | Expr::Splat(x) => collect_plain_assigns(x, out),
+        Expr::Binary(_, a, b) => {
+            collect_plain_assigns(a, out);
+            collect_plain_assigns(b, out);
+        }
+        Expr::If {
+            cond,
+            then,
+            elifs,
+            els,
+        } => {
+            collect_plain_assigns(cond, out);
+            then.iter().for_each(|s| collect_plain_assigns(&s.expr, out));
+            for (c, b) in elifs {
+                collect_plain_assigns(c, out);
+                b.iter().for_each(|s| collect_plain_assigns(&s.expr, out));
+            }
+            if let Some(b) = els {
+                b.iter().for_each(|s| collect_plain_assigns(&s.expr, out));
+            }
+        }
+        Expr::While { cond, body } | Expr::DoWhile { cond, body } => {
+            collect_plain_assigns(cond, out);
+            body.iter().for_each(|s| collect_plain_assigns(&s.expr, out));
+        }
+        Expr::For { iter, body, .. } => {
+            collect_plain_assigns(iter, out);
+            body.iter().for_each(|s| collect_plain_assigns(&s.expr, out));
+        }
+        Expr::Case {
+            subject,
+            whens,
+            els,
+        } => {
+            collect_plain_assigns(subject, out);
+            for (pats, b) in whens {
+                pats.iter().for_each(|p| collect_plain_assigns(p, out));
+                b.iter().for_each(|s| collect_plain_assigns(&s.expr, out));
+            }
+            if let Some(b) = els {
+                b.iter().for_each(|s| collect_plain_assigns(&s.expr, out));
+            }
+        }
+        Expr::CaseIn { subject, els, .. } => {
+            collect_plain_assigns(subject, out);
+            if let Some(b) = els {
+                b.iter().for_each(|s| collect_plain_assigns(&s.expr, out));
+            }
+        }
+        Expr::Call {
+            recv, args, ..
+        } => {
+            if let Some(r) = recv {
+                collect_plain_assigns(r, out);
+            }
+            args.iter().for_each(|a| collect_plain_assigns(a, out));
+        }
+        Expr::Index(r, idxs) => {
+            collect_plain_assigns(r, out);
+            idxs.iter().for_each(|i| collect_plain_assigns(i, out));
+        }
+        // Separate scopes / closures: their assignments are not this scope's.
+        // `begin`/`rescue`/`ensure` each compile to their own proc frame, so —
+        // like a def/class/lambda — their internal assignments belong to that
+        // frame, not this one, and must not become slot candidates here.
+        Expr::Def { .. }
+        | Expr::Class { .. }
+        | Expr::Module { .. }
+        | Expr::SingletonClass { .. }
+        | Expr::Lambda(_)
+        | Expr::Begin { .. } => {}
+        Expr::Return(o) | Expr::Break(o) | Expr::Next(o) => {
+            if let Some(x) = o {
+                collect_plain_assigns(x, out);
+            }
+        }
+        Expr::Yield(xs) => xs.iter().for_each(|x| collect_plain_assigns(x, out)),
+        Expr::Defined(inner) => collect_plain_assigns(inner, out),
+        Expr::Super { args, .. } => {
+            if let Some(a) = args {
+                a.iter().for_each(|x| collect_plain_assigns(x, out));
+            }
+        }
+    }
+}
+
 pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
     let mut c = Compiler {
         debug,
         ..Default::default()
     };
     let mut b = ChunkBuilder::new();
+    // The top-level script is a scope with no parameters; slot-lower its locals.
+    c.enter_slot_scope(&std::collections::HashSet::new(), stmts);
     c.compile_seq(&mut b, stmts)?;
+    c.exit_slot_scope();
     Ok(Program {
         main: b.build(),
         methods: c.methods,
@@ -223,7 +643,11 @@ pub fn compile_at(stmts: &[Stmt], proc_base: usize, begin_base: usize) -> Result
         ..Default::default()
     };
     let mut b = ChunkBuilder::new();
+    // `eval` shares the caller's binding, so its locals must stay host-bound; push
+    // an empty (inactive) slot scope so nothing here is slot-lowered.
+    c.slot_scopes.push(std::collections::HashMap::new());
     c.compile_seq(&mut b, stmts)?;
+    c.slot_scopes.pop();
     Ok(Program {
         main: b.build(),
         methods: c.methods,
@@ -369,6 +793,14 @@ impl Compiler {
                 Self::collect_default_locals(default, &mut default_locals);
             }
         }
+        // Slot-lower the body's locals. Params and any parameter-default locals are
+        // bound by the host prologue below (`SETLOCAL`), so exclude them — a slot
+        // local must be written only by the plain assignments the body compiles,
+        // never by the host prologue. (Binding params into slots is Slice 2.)
+        let mut host_bound: std::collections::HashSet<String> =
+            params.iter().map(|p| p.name.clone()).collect();
+        host_bound.extend(default_locals.iter().cloned());
+        self.enter_slot_scope(&host_bound, body);
         for lname in &default_locals {
             if params.iter().any(|p| &p.name == lname) {
                 continue;
@@ -394,6 +826,7 @@ impl Compiler {
             }
         }
         self.compile_seq(&mut b, body)?;
+        self.exit_slot_scope();
         self.scope_locals.pop();
         self.cur_method.pop();
         self.loops = saved;
@@ -432,7 +865,13 @@ impl Compiler {
         let saved = std::mem::take(&mut self.loops);
         let saved_line = self.cur_line;
         let mut b = ChunkBuilder::new();
+        // A proc/block body runs in its own fusevm frame, so the enclosing scope's
+        // slot indices don't apply here. Push an empty (inactive) slot scope: block
+        // locals stay host-bound (shared with the enclosing binding, which is why
+        // the capture analysis already forces any block-referenced local host).
+        self.slot_scopes.push(std::collections::HashMap::new());
         self.compile_seq(&mut b, body)?;
+        self.slot_scopes.pop();
         self.loops = saved;
         self.cur_line = saved_line;
         Ok(b.build())
@@ -906,6 +1345,43 @@ impl Compiler {
         cands.join("\u{1f}")
     }
 
+    /// Plan slot lowering for a scope about to be compiled and push the map onto
+    /// `slot_scopes`. Slot candidates are the scope's plainly-assigned locals,
+    /// minus `params` (host-bound until the calling convention lands) and minus
+    /// captured/introspected names (`slot_scan`). No pre-`nil` store is needed: an
+    /// unset fusevm slot reads back as `Undef`, which is exactly how rubylang
+    /// represents `nil` (`Expr::Nil` lowers to `Op::LoadUndef`), so a read before
+    /// the first assignment already yields Ruby's hoisted `nil`.
+    fn enter_slot_scope(
+        &mut self,
+        params: &std::collections::HashSet<String>,
+        body: &[Stmt],
+    ) {
+        let (caps, disq) = slot_scan(body);
+        let mut slots = std::collections::HashMap::new();
+        if !disq {
+            let mut idx = 0u16;
+            for name in scope_plain_assigns(body) {
+                if params.contains(&name) || caps.contains(&name) {
+                    continue;
+                }
+                slots.insert(name, idx);
+                idx += 1;
+            }
+        }
+        self.slot_scopes.push(slots);
+    }
+
+    fn exit_slot_scope(&mut self) {
+        self.slot_scopes.pop();
+    }
+
+    /// The frame slot assigned to local `name` in the current scope, if it was
+    /// slot-lowered (else `None`, meaning the host `GETLOCAL`/`SETLOCAL` path).
+    fn local_slot(&self, name: &str) -> Option<u16> {
+        self.slot_scopes.last().and_then(|m| m.get(name)).copied()
+    }
+
     fn compile_var_read(&mut self, b: &mut ChunkBuilder, kind: VarKind, name: &str) {
         // A constant read inside a namespace lowers to a candidate chain so the
         // runtime can walk the lexical nesting; every other var reads by name.
@@ -914,6 +1390,14 @@ impl Compiler {
             self.kstr(b, &encoded);
             b.emit(Op::CallBuiltin(ops::GETCONST, 1), 0);
             return;
+        }
+        // A slot-lowered local reads from the frame slot (native-lowerable) rather
+        // than a host dispatch.
+        if let VarKind::Local = kind {
+            if let Some(slot) = self.local_slot(name) {
+                b.emit(Op::GetSlot(slot), self.cur_line);
+                return;
+            }
         }
         let op = match kind {
             VarKind::Local => ops::GETLOCAL,
@@ -941,6 +1425,16 @@ impl Compiler {
                     // (so a later bare read of it is a variable, not a call).
                     if let Some(scope) = self.scope_locals.last_mut() {
                         scope.insert(name.clone());
+                    }
+                    // A slot-lowered local writes its frame slot. Assignment is an
+                    // expression yielding the RHS, and `SetSlot` pops without
+                    // pushing, so `Dup` the value to leave it on the stack (matching
+                    // `SETLOCAL`, whose builtin returns the assigned value).
+                    if let Some(slot) = self.local_slot(name) {
+                        self.compile_expr(b, value)?;
+                        b.emit(Op::Dup, 0);
+                        b.emit(Op::SetSlot(slot), 0);
+                        return Ok(());
                     }
                 }
                 let op = match kind {
@@ -1126,7 +1620,7 @@ impl Compiler {
                 b.emit(Op::Negate, 0);
             }
             UnOp::Not => {
-                b.emit(Op::CallBuiltin(ops::TRUTHY, 1), 0);
+                b.emit(Op::RubyTruthy, 0);
                 b.emit(Op::LogNot, 0);
             }
             UnOp::BitNot => {
@@ -1147,7 +1641,7 @@ impl Compiler {
         if op == BinOp::And || op == BinOp::Or {
             self.compile_expr(b, l)?;
             b.emit(Op::Dup, 0);
-            b.emit(Op::CallBuiltin(ops::TRUTHY, 1), 0);
+            b.emit(Op::RubyTruthy, 0);
             let jmp = if op == BinOp::And {
                 b.emit(Op::JumpIfFalse(0), 0)
             } else {
@@ -1205,7 +1699,7 @@ impl Compiler {
             b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), 0);
             // `!~` is the negation of `=~`.
             if op == BinOp::NMatch {
-                b.emit(Op::CallBuiltin(ops::TRUTHY, 1), 0);
+                b.emit(Op::RubyTruthy, 0);
                 b.emit(Op::LogNot, 0);
             }
             return Ok(());
@@ -1239,7 +1733,7 @@ impl Compiler {
 
     fn compile_cond(&mut self, b: &mut ChunkBuilder, cond: &Expr) -> Result<(), String> {
         self.compile_expr(b, cond)?;
-        b.emit(Op::CallBuiltin(ops::TRUTHY, 1), 0);
+        b.emit(Op::RubyTruthy, 0);
         Ok(())
     }
 
@@ -1470,7 +1964,7 @@ impl Compiler {
                         }),
                     };
                     self.compile_expr(b, &any)?;
-                    b.emit(Op::CallBuiltin(ops::TRUTHY, 1), 0);
+                    b.emit(Op::RubyTruthy, 0);
                     into_body.push(b.emit(Op::JumpIfTrue(0), 0));
                     continue;
                 }
@@ -1479,7 +1973,7 @@ impl Compiler {
                 self.kstr(b, "===");
                 self.compile_var_read(b, VarKind::Local, tmp);
                 b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), self.cur_line);
-                b.emit(Op::CallBuiltin(ops::TRUTHY, 1), 0);
+                b.emit(Op::RubyTruthy, 0);
                 into_body.push(b.emit(Op::JumpIfTrue(0), 0));
             }
             // No label matched → skip this arm's body.
