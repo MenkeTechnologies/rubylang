@@ -2874,13 +2874,37 @@ impl RubyHost {
     /// list. Used when re-routing a compile-time-registered include through a
     /// user `append_features` whose `super` re-adds it (ActiveSupport::Concern).
     pub fn remove_mixin(&mut self, class: &str, module: &str, kind: &str) {
+        // Match by RESOLVED module name: the compile-time class-body extraction may
+        // have stored an include unqualified ("Redirecting") because the module was
+        // not yet registered when the class body compiled, while the runtime caller
+        // passes the fully-qualified name ("ActionController::Redirecting"). Without
+        // resolving, the entry is never dropped, so a Concern's `return false if
+        // base < self` guard stays true and its dependencies are never included.
+        let target = self.resolve_module_name(module, class);
+        let list_names: Vec<String> = match self.classes.get(class) {
+            Some(def) => match kind {
+                "prepend" => def.prepends.clone(),
+                "extend" => def.extends.clone(),
+                _ => def.includes.clone(),
+            },
+            None => return,
+        };
+        let keep: Vec<bool> = list_names
+            .iter()
+            .map(|e| e != module && self.resolve_module_name(e, class) != target)
+            .collect();
         if let Some(def) = self.classes.get_mut(class) {
             let list = match kind {
                 "prepend" => &mut def.prepends,
                 "extend" => &mut def.extends,
                 _ => &mut def.includes,
             };
-            list.retain(|m| m != module);
+            let mut i = 0;
+            list.retain(|_| {
+                let k = keep[i];
+                i += 1;
+                k
+            });
         }
     }
     pub fn class_exists(&self, name: &str) -> bool {
