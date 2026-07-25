@@ -24,6 +24,41 @@ class Logger
 
   LABELS = %w[DEBUG INFO WARN ERROR FATAL ANY].freeze
 
+  # The default log-line formatter. Subclasses (ActiveSupport::Logger::Simple-
+  # Formatter) override `call` and chain up via `super`.
+  class Formatter
+    Format = "%s, [%s] %5s -- %s: %s\n"
+
+    attr_accessor :datetime_format
+
+    def initialize
+      @datetime_format = nil
+    end
+
+    def call(severity, time, progname, msg)
+      format(Format, severity.to_s[0..0], format_datetime(time), severity, progname, msg2str(msg))
+    end
+
+    def format_datetime(time)
+      if time.respond_to?(:strftime)
+        time.strftime(@datetime_format || "%Y-%m-%dT%H:%M:%S.%6N")
+      else
+        time.to_s
+      end
+    end
+
+    def msg2str(msg)
+      case msg
+      when ::String
+        msg
+      when ::Exception
+        "#{msg.message} (#{msg.class})"
+      else
+        msg.inspect
+      end
+    end
+  end
+
   class LogDevice
     attr_reader :dev
     def initialize(dev)
