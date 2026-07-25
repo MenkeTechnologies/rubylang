@@ -393,6 +393,18 @@ impl Parser {
             Expr::Binary(op @ (BinOp::Or | BinOp::And | BinOp::Shl), a, b) => {
                 Expr::Binary(op, a, Box::new(Self::rebind_assign(*b, make)))
             }
+            // A range whose high bound is itself the assignment target:
+            // `a...b += c` is `a...(b += c)` — arel's SqlString collector does
+            // `(@bind_index...@bind_index += binds.size)`.
+            Expr::Range {
+                lo,
+                hi: Some(h),
+                exclusive,
+            } => Expr::Range {
+                lo,
+                hi: Some(Box::new(Self::rebind_assign(*h, make))),
+                exclusive,
+            },
             other => make(other),
         }
     }
@@ -798,10 +810,10 @@ impl Parser {
                     Ok("[]".to_string())
                 }
             }
-            // Unary operator method names `def +@` / `def -@`. A bare `@` (no name)
-            // lexes as an empty `IVar`, so match that after `+`/`-`.
+            // Unary operator method names `def +@` / `def -@` / `def ~@`. A bare
+            // `@` (no name) lexes as an empty `IVar`, so match that after the sign.
             Tok::Op(o)
-                if (o == "+" || o == "-")
+                if (o == "+" || o == "-" || o == "~")
                     && matches!(self.peek(), Tok::IVar(s) if s.is_empty()) =>
             {
                 self.advance(); // the empty `@`
@@ -2305,27 +2317,39 @@ impl Parser {
                     superclass: Some(sup),
                     body,
                 }),
-                // An expression superclass (`Struct.new(...)`, `Data.define(...)`,
-                // `Class.new(Base)`): desugar to `NAME = <expr> do BODY end` — the
-                // class body becomes the constructor call's definition block.
+                // An expression superclass. A constructor call (`Struct.new(...)`,
+                // `Data.define(...)`, `Class.new(Base)`) takes the class body as its
+                // own definition block. Any other expression (`Migration[8.1]`,
+                // `some_method`) yields an EXISTING class to subclass, so wrap it in
+                // `Class.new(<expr>) do BODY end` — otherwise the body would be lost.
                 None => {
+                    let is_ctor = matches!(
+                        &e,
+                        Expr::Call { name: cn, .. } if cn == "new" || cn == "define"
+                    );
+                    let block = Block {
+                        params: Vec::new(),
+                        splat: None,
+                        body,
+                    };
                     let call = match e {
                         Expr::Call {
                             recv,
                             name: cn,
                             args,
                             ..
-                        } => Expr::Call {
+                        } if is_ctor => Expr::Call {
                             recv,
                             name: cn,
                             args,
-                            block: Some(Block {
-                                params: Vec::new(),
-                                splat: None,
-                                body,
-                            }),
+                            block: Some(block),
                         },
-                        other => other,
+                        other => Expr::Call {
+                            recv: Some(Box::new(Expr::Var(VarKind::Const, "Class".into()))),
+                            name: "new".into(),
+                            args: vec![other],
+                            block: Some(block),
+                        },
                     };
                     Ok(Expr::Assign(
                         Box::new(Expr::Var(VarKind::Const, name)),
@@ -2976,6 +3000,7 @@ fn is_operator_method(op: &str) -> bool {
             | "!"
             | "-@"
             | "+@"
+            | "~@"
     )
 }
 

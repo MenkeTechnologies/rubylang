@@ -5,6 +5,18 @@
 # scheme, no `URI.extract`, no IPv6 zone ids).
 
 module URI
+  # Registry of scheme name => URI subclass. globalid registers `URI::GID` here
+  # (`URI.register_scheme('GID', GID)`); MRI keeps the same `@@schemes` map.
+  @@schemes = {}
+
+  def self.register_scheme(scheme, klass)
+    @@schemes[scheme.to_s.upcase] = klass
+  end
+
+  def self.scheme_list
+    @@schemes
+  end
+
   class Error < StandardError; end
   class InvalidURIError < Error; end
   class InvalidComponentError < Error; end
@@ -267,6 +279,11 @@ module URI
   RFC2396_PARSER = DEFAULT_PARSER
   # `URI::Parser` is the legacy name rack's MockRequest uses (`URI::Parser.new`).
   Parser = RFC2396_Parser
+  # RFC 3986 is the modern parser; globalid does `URI::RFC3986_Parser.new`. Our
+  # single parser covers the surface both use (parse/split/escape/unescape), so
+  # alias it rather than implement a second grammar.
+  RFC3986_Parser = RFC2396_Parser
+  RFC3986_PARSER = DEFAULT_PARSER
 end
 
 # `URI("string")` — the shorthand constructor (a private Kernel method), same as

@@ -2682,6 +2682,15 @@ fn dispatch_classref(
                 return with_host(|h| h.new_regex(&src, flags));
             }
             "escape" | "quote" => return Ok(new_str(regex_escape(&arg_str(&args[0])))),
+            // `Regexp.timeout` / `Regexp.timeout=` (Ruby 3.2 ReDoS guard). Rails 8
+            // sets a global regexp timeout; the Rust `fancy_regex` engine has its
+            // own backtrack limit, so accept and report the value as a no-op.
+            "timeout=" => {
+                let v = args.first().cloned().unwrap_or(Value::Undef);
+                with_host(|h| h.set_global("__regexp_timeout", v.clone()));
+                return Ok(v);
+            }
+            "timeout" => return Ok(with_host(|h| h.get_global("__regexp_timeout"))),
             "union" => {
                 // Flatten a single array arg; each element contributes its source
                 // (a String is escaped, a Regexp uses its pattern), joined by `|`.
@@ -3940,6 +3949,14 @@ fn dispatch_object(
     // An `alias_method`/`alias` name forwards to its target method.
     if let Some(target) = with_host(|h| h.find_alias(cls, name)) {
         return dispatch(recv, &target, args, block);
+    }
+    // A native-marker alias inherited from a module (Zeitwerk aliases
+    // `zeitwerk_original_require` to native `require` on Kernel): invoke the
+    // builtin directly — dispatching `require` would re-enter Zeitwerk's override
+    // and recurse. `find_alias` above walks only superclasses, so it misses the
+    // Kernel-module alias; `native_kernel_alias` walks the full ancestry.
+    if let Some(nat) = with_host(|h| h.native_kernel_alias(cls, name)) {
+        return kernel(&nat, args, block);
     }
     // Struct instance methods (accessors, ==, to_a/to_h, members, [], each, …).
     if let Some((members, _)) = with_host(|h| h.struct_def(cls)) {
@@ -15232,6 +15249,10 @@ pub(crate) fn embedded_stdlib(name: &str) -> Option<&'static str> {
         // the gem's own `require "nokogiri/nokogiri"` (the missing .so) from ever
         // running. See stdlib/nokogiri.rb for the scope/limits.
         "nokogiri" => Some(include_str!("../stdlib/nokogiri.rb")),
+        // A minimal Bundler shim: `require "bundler/setup"` (from a generated
+        // app's config/boot.rb) and `Bundler.require`. Gem resolution is via
+        // GEM_PATH, so bundler's load-path pinning is a no-op here.
+        "bundler" | "bundler/setup" => Some(include_str!("../stdlib/bundler.rb")),
         _ => None,
     }
 }
@@ -15290,6 +15311,10 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "ripper"
             | "objspace"
             | "date/format"
+            // Prism (Ruby's parser, a C extension) — no-op the require so railties'
+            // source_annotation_extractor loads. Only its `rails notes` command uses
+            // it; serving never does.
+            | "prism"
     )
 }
 
