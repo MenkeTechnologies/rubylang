@@ -63,6 +63,23 @@ pub struct Scope {
     block: Option<Value>,
     method_name: Option<String>,
     def_class: Option<String>,
+    /// A unique id for the method activation this scope belongs to. A block
+    /// captures its defining scope's `frame_id` as its "home"; a non-local
+    /// `return` from that block unwinds to the method frame with this id (MRI
+    /// block-return semantics), passing through any intermediate yielder frames.
+    frame_id: u64,
+}
+
+thread_local! {
+    static NEXT_FRAME_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+/// Allocate a fresh, process-unique method-activation id (for `Scope::frame_id`).
+fn next_frame_id() -> u64 {
+    NEXT_FRAME_ID.with(|c| {
+        let v = c.get();
+        c.set(v.wrapping_add(1));
+        v
+    })
 }
 
 impl std::fmt::Debug for Scope {
@@ -170,6 +187,8 @@ pub enum RObj {
         map: IndexMap<RKey, Value>,
         default: Value,
         default_proc: Option<Value>,
+        /// `compare_by_identity` mode: keys hash/compare by object identity.
+        by_identity: bool,
     },
     Symbol(String),
     /// A `Set`: insertion-ordered, deduplicated by `RKey` (the value form of a
@@ -513,6 +532,10 @@ pub enum RKey {
     Range(i64, i64, bool),
     StrRange(String, String, bool),
     FloatRange(u64, u64, bool),
+    /// An identity key: the heap-object index of a `Value::Obj`, used when a Hash
+    /// is in `compare_by_identity` mode so distinct-but-equal objects (two `[1]`
+    /// arrays, two `"ab"` strings) hash as separate keys.
+    Identity(u32),
 }
 
 /// A compiled method: positional parameter names, the index of a splat
@@ -554,7 +577,11 @@ struct Frame {
 enum Signal {
     Break(Value),
     Next(Value),
-    Return(Value),
+    /// `return` value plus an optional target frame id. `None` is a local
+    /// method-body return (consumed by the enclosing `run_method`); `Some(id)` is
+    /// a block's non-local return targeting the method activation with that
+    /// `frame_id` — intermediate frames re-propagate it until they match.
+    Return(Value, Option<u64>),
     /// `retry` inside a `rescue` clause — restarts the enclosing `begin` body.
     Retry,
     /// `throw(tag, value)` — unwinds to the matching `catch(tag)`. The first
@@ -644,6 +671,11 @@ pub struct RubyHost {
     /// Checked in dispatch as an `@field` get/set, so no bytecode method is
     /// synthesized. Compile-time `attr_*` still builds real methods.
     attr_accessors: IndexMap<String, IndexMap<String, (bool, bool)>>,
+    /// `alias_method`s whose target is a native attr accessor, mapping the alias
+    /// method name (with any trailing `=`) to the underlying `(field, is_writer)`.
+    /// ActiveSupport's `attr_internal` builds `view_runtime`/`view_runtime=` this
+    /// way: `attr_writer :_view_runtime; alias_method :view_runtime=, :_view_runtime=`.
+    attr_aliases: IndexMap<String, IndexMap<String, (String, bool)>>,
     /// `define_method`-created instance methods: class → name → block Proc.
     define_methods: IndexMap<String, IndexMap<String, Value>>,
     /// Per-object singleton methods (`def obj.m`, `class << obj`, and bare `def`
@@ -1103,6 +1135,7 @@ pub fn eval_string_scoped(src: &str, self_val: &Value, target: DefTarget) -> Res
                 self_obj: self_val.clone(),
                 method_name: None,
                 def_class: None,
+                frame_id: next_frame_id(),
             },
             args: Vec::new(),
             line: 0,
@@ -1140,6 +1173,7 @@ pub fn eval_erb_with_locals(src: &str, locals: Vec<(String, Value)>) -> Result<V
                 self_obj,
                 method_name: None,
                 def_class: None,
+                frame_id: next_frame_id(),
             },
             args: Vec::new(),
             line: 0,
@@ -1270,6 +1304,7 @@ impl RubyHost {
                     self_obj: Value::Obj(0),
                     method_name: None,
                     def_class: None,
+                    frame_id: next_frame_id(),
                 },
                 args: Vec::new(),
                 line: 0,
@@ -1304,6 +1339,7 @@ impl RubyHost {
             class_vars: IndexMap::new(),
             class_ivars: IndexMap::new(),
             attr_accessors: IndexMap::new(),
+            attr_aliases: IndexMap::new(),
             define_methods: IndexMap::new(),
             singleton_methods: IndexMap::new(),
             singleton_define_methods: IndexMap::new(),
@@ -1507,6 +1543,7 @@ impl RubyHost {
             map,
             default: Value::Undef,
             default_proc: None,
+            by_identity: false,
         })
     }
     /// `Hash.new(default)` — a hash whose `[]` returns `default` for absent keys.
@@ -1515,6 +1552,7 @@ impl RubyHost {
             map,
             default,
             default_proc: None,
+            by_identity: false,
         })
     }
     /// Set the value returned for missing keys (`Hash#default=`), in place.
@@ -1539,7 +1577,30 @@ impl RubyHost {
             map,
             default: Value::Undef,
             default_proc: Some(proc),
+            by_identity: false,
         })
+    }
+    /// Enable `compare_by_identity` on a hash (in place). MRI also re-keys any
+    /// existing entries, but the idiom (and the only caller that matters — the
+    /// Journey GTG builder) sets it on a fresh empty hash, so subsequent inserts
+    /// pick up identity keying via `hash_key`.
+    pub fn set_hash_by_identity(&mut self, v: &Value) {
+        if let Some(RObj::Hash { by_identity, .. }) = self.obj_mut(v) {
+            *by_identity = true;
+        }
+    }
+    /// Whether a hash is in `compare_by_identity` mode.
+    pub fn hash_is_by_identity(&self, v: &Value) -> bool {
+        matches!(self.obj(v), Some(RObj::Hash { by_identity: true, .. }))
+    }
+    /// Build a Hash key for `v` against the receiver hash's identity mode.
+    pub fn hash_key(&self, recv: &Value, v: &Value) -> RKey {
+        if self.hash_is_by_identity(recv) {
+            if let Value::Obj(i) = v {
+                return RKey::Identity(*i);
+            }
+        }
+        self.to_key(v)
     }
     /// The value `Hash#[]` yields for a missing key (nil unless `Hash.new(d)`).
     pub fn hash_default(&self, v: &Value) -> Value {
@@ -2777,18 +2838,20 @@ impl RubyHost {
             Some(f) => (f, true),
             None => (method, false),
         };
-        let mut cur = Some(class.to_string());
-        while let Some(c) = cur {
+        // Walk the full ancestry (superclasses AND included/prepended modules):
+        // ActionController mixes its `attr_internal` accessors (`view_runtime`) in
+        // via modules, so a plain superclass-only walk would miss them.
+        for c in self.class_ancestry(class) {
             if let Some((r, w)) = self.attr_accessors.get(&c).and_then(|m| m.get(field)) {
                 if (writer && *w) || (!writer && *r) {
                     return Some((field.to_string(), writer));
                 }
             }
-            cur = self
-                .classes
-                .get(&c)
-                .and_then(|d| d.superclass.clone())
-                .map(|s| self.resolve_class_alias(&s, &c));
+            // An `alias_method` of a native attr accessor (ActiveSupport's
+            // `attr_internal`): the alias name maps to the underlying field.
+            if let Some((f, w)) = self.attr_aliases.get(&c).and_then(|m| m.get(method)) {
+                return Some((f.clone(), *w));
+            }
         }
         None
     }
@@ -2880,6 +2943,20 @@ impl RubyHost {
     /// an instance's class, or a class-reference's own name.
     pub fn cvar_owner(&self, this: &Value) -> Option<String> {
         self.object_class(this).or_else(|| self.classref_name(this))
+    }
+    /// The class a `@@cvar` reference resolves against: the lexical class/module
+    /// where the running code was defined (`def_class`), NOT the runtime receiver.
+    /// A method mixed into another class via `extend`/`include` still reads its
+    /// original module's class variables — ActionView's `register_template_handler`
+    /// (defined in `Template::Handlers`, extended onto `Template`) mutates
+    /// `Handlers`' `@@template_handlers`, not the extending class's. Falls back to
+    /// the receiver's class for top-level code with no defining class.
+    pub fn cvar_class(&self) -> Option<String> {
+        let s = self.cur_scope();
+        match &s.def_class {
+            Some(dc) => Some(dc.clone()),
+            None => self.cvar_owner(&s.self_obj),
+        }
     }
     /// Fetch a compiled method body previously registered under `name` (used to
     /// retrieve the body of a runtime `def` by its synthetic retrieval name).
@@ -3150,6 +3227,14 @@ impl RubyHost {
                 .entry(class.to_string())
                 .or_default()
                 .insert(alias_name.to_string(), proc);
+        } else if let Some((field, writer)) = self.attr_access(class, target) {
+            // Aliasing a native attr accessor (ActiveSupport's `attr_internal`:
+            // `alias_method :view_runtime=, :_view_runtime=`): the alias name reads
+            // or writes the same underlying `@field`.
+            self.attr_aliases
+                .entry(class.to_string())
+                .or_default()
+                .insert(alias_name.to_string(), (field, writer));
         } else {
             // The target has no user definition — it is a native method (a class
             // method like `new`/`allocate`/`Time.at`, or an unresolved forward
@@ -4019,10 +4104,14 @@ impl RubyHost {
             for module in def.extends.iter().rev() {
                 // Resolve the extended module lexically (nested, then outward
                 // through the enclosing namespace) then through its own aliases
-                // and includes.
+                // and includes. The owner is the MODULE the method actually lives
+                // in (not the extending class) so `def_class` is correct — a `super`
+                // resumes above the module, and a `@@cvar` reference resolves to the
+                // module's class variables (ActionView's `register_template_handler`
+                // extended onto `Template` still mutates `Handlers`' cvars).
                 let resolved = self.resolve_module_name(module, &name);
-                if let Some((m, _)) = self.find_in_module(&resolved, method) {
-                    return Some((m, name.clone()));
+                if let Some((m, owner)) = self.find_in_module(&resolved, method) {
+                    return Some((m, owner));
                 }
             }
             cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &name));
@@ -4246,14 +4335,63 @@ impl RubyHost {
     }
 
     /// The `self`, method name, and defining class of the current frame (`super`).
-    pub fn super_context(&self) -> (Value, Option<String>, Option<String>, Vec<Value>) {
+    pub fn super_context(&mut self) -> (Value, Option<String>, Option<String>, Vec<Value>) {
         let s = self.cur_scope();
-        (
-            s.self_obj.clone(),
-            s.method_name.clone(),
-            s.def_class.clone(),
-            self.frames.last().unwrap().args.clone(),
-        )
+        let self_obj = s.self_obj.clone();
+        let method_name = s.method_name.clone();
+        let def_class = s.def_class.clone();
+        (self_obj, method_name, def_class, self.zsuper_args())
+    }
+    /// The arguments a bare `super` (no parens) forwards: the CURRENT values of
+    /// the enclosing method's formal parameters — positional (splat expanded)
+    /// plus a rebuilt trailing keyword hash — read from the live locals. This
+    /// matches MRI, where `super` re-passes the parameters as they stand now
+    /// (including default values and any reassignment inside the method), not the
+    /// raw arguments the method was originally called with. Falls back to the
+    /// frame's original args when the method def can't be resolved.
+    fn zsuper_args(&mut self) -> Vec<Value> {
+        let s = self.cur_scope();
+        let (Some(method), Some(def_class)) = (s.method_name.clone(), s.def_class.clone()) else {
+            return self.frames.last().map(|f| f.args.clone()).unwrap_or_default();
+        };
+        let Some(def) = self.find_method(&def_class, &method) else {
+            return self.frames.last().map(|f| f.args.clone()).unwrap_or_default();
+        };
+        let mut out = Vec::new();
+        for (i, p) in def.params.iter().enumerate() {
+            let v = self.get_local(p);
+            if def.splat == Some(i) {
+                // A `*rest` parameter holds an array — expand it inline.
+                match self.as_array(&v) {
+                    Some(items) => out.extend(items),
+                    None => out.push(v),
+                }
+            } else {
+                out.push(v);
+            }
+        }
+        // Rebuild the trailing keyword hash from `name:` params and any `**opts`
+        // collector, so `super` forwards keyword arguments too.
+        if !def.kwparams.is_empty() || def.kwsplat.is_some() {
+            let mut map: IndexMap<RKey, Value> = IndexMap::new();
+            for kw in &def.kwparams {
+                let v = self.get_local(kw);
+                map.insert(RKey::Sym(kw.clone()), v);
+            }
+            if let Some(ks) = &def.kwsplat {
+                let hv = self.get_local(ks);
+                if let Some(h) = self.as_hash(&hv) {
+                    for (k, val) in h {
+                        map.insert(k, val);
+                    }
+                }
+            }
+            if !map.is_empty() {
+                let hash = self.new_hash(map);
+                out.push(hash);
+            }
+        }
+        out
     }
 
     // ---- exceptions -------------------------------------------------------
@@ -4681,6 +4819,7 @@ impl RubyHost {
                 if *excl { "..." } else { ".." },
                 fmt_float(f64::from_bits(*hi))
             ),
+            RKey::Identity(i) => self.inspect(&Value::Obj(*i)),
         }
     }
 
@@ -4791,6 +4930,7 @@ impl RubyHost {
             RKey::FloatRange(lo, hi, excl) => {
                 self.new_float_range(f64::from_bits(*lo), f64::from_bits(*hi), *excl)
             }
+            RKey::Identity(i) => Value::Obj(*i),
         }
     }
 
@@ -5578,6 +5718,7 @@ pub fn run_required_main(chunk: Chunk) -> Result<Value, String> {
                 self_obj: Value::Obj(0),
                 method_name: None,
                 def_class: None,
+                frame_id: next_frame_id(),
             },
             args: Vec::new(),
             line: 0,
@@ -5760,6 +5901,7 @@ fn run_method(
         (Some(n), Some(c)) if n.starts_with("__class_body__") => Some(c.clone()),
         _ => None,
     };
+    let frame_id = next_frame_id();
     let saved_active = with_host(|h| {
         let mut binding = h.bind_params(
             &def.params,
@@ -5779,6 +5921,7 @@ fn run_method(
                 self_obj,
                 method_name,
                 def_class,
+                frame_id,
             },
             args: args.to_vec(),
             line: 0,
@@ -5814,7 +5957,18 @@ fn run_method(
         h.signal.take()
     });
     let result = match sig {
-        Some(Signal::Return(v)) => Ok(v),
+        // A local method-body `return` (untagged) ends this method.
+        Some(Signal::Return(v, None)) => Ok(v),
+        // A block's non-local `return` targeting THIS activation ends it too;
+        // one targeting an outer frame keeps unwinding (re-arm and propagate).
+        Some(Signal::Return(v, Some(home))) => {
+            if home == frame_id {
+                Ok(v)
+            } else {
+                with_host(|h| h.signal = Some(Signal::Return(v, Some(home))));
+                r
+            }
+        }
         // A `throw` must keep unwinding past this method boundary to reach its
         // `catch`; re-arm the signal so the caller's chunk halts too.
         Some(other @ Signal::Throw(..)) => {
@@ -6435,6 +6589,7 @@ fn fiber_root_frame() -> Frame {
             self_obj: Value::Undef,
             method_name: None,
             def_class: None,
+            frame_id: next_frame_id(),
         },
         args: Vec::new(),
         line: 0,
@@ -7784,6 +7939,9 @@ pub fn call_proc_self_ctx(
             }
         }
     }
+    // The block's "home": the method activation it was defined in. A non-local
+    // `return` from this block unwinds to that frame.
+    let home_frame = scope.frame_id;
     let mut block_scope = Scope {
         locals: child,
         self_obj: self_override
@@ -7807,9 +7965,16 @@ pub fn call_proc_self_ctx(
     match sig {
         Some(Signal::Next(v)) => Ok(v),
         // In a lambda, `return` and `break` are local — they end the lambda and
-        // become its value (MRI lambda semantics). In a plain block/proc both
-        // keep propagating to the defining method / enclosing loop.
-        Some(Signal::Return(v) | Signal::Break(v)) if is_lambda => Ok(v),
+        // become its value (MRI lambda semantics).
+        Some(Signal::Return(v, _)) | Some(Signal::Break(v)) if is_lambda => Ok(v),
+        // A plain block's `return` is non-local: tag the still-untagged signal
+        // with this block's home frame so it unwinds to its defining method,
+        // passing through any intermediate yielder frames. An already-tagged
+        // return (from a nested block) keeps its original target.
+        Some(Signal::Return(v, None)) => {
+            with_host(|h| h.signal = Some(Signal::Return(v, Some(home_frame))));
+            r
+        }
         Some(other) => {
             with_host(|h| h.signal = Some(other));
             r
@@ -7831,7 +7996,7 @@ pub fn raise_signal_next(v: Value) {
     with_host(|h| h.signal = Some(Signal::Next(v)));
 }
 pub fn raise_signal_return(v: Value) {
-    with_host(|h| h.signal = Some(Signal::Return(v)));
+    with_host(|h| h.signal = Some(Signal::Return(v, None)));
 }
 pub fn raise_signal_retry() {
     with_host(|h| h.signal = Some(Signal::Retry));

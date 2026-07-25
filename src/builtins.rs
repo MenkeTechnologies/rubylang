@@ -466,6 +466,23 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
             }
         }
     }
+    // A bare argless read of a class-level attr accessor on a classref self —
+    // `singleton_class.attr_accessor :registered_details` then a bare
+    // `registered_details` inside a `def self.m` (ActionView::LookupContext).
+    // The object branch above only covers an instance self; a class body / class
+    // method has a classref self whose singleton-class attrs live under
+    // `#<Class:Name>`, so dispatch on the class ref to reach the reader.
+    if let Some(cls) = with_host(|h| h.classref_name(&this)) {
+        let sclass = format!("#<Class:{cls}>");
+        if with_host(|h| h.attr_access(&sclass, &name)).is_some()
+            || with_host(|h| h.find_class_define_method(&cls, &name)).is_some()
+        {
+            return match dispatch(&this, &name, &[], None) {
+                Ok(v) => propagate(vm, v),
+                Err(e) => abort(vm, e),
+            };
+        }
+    }
     // A bare `module_function` in a module body flags the module so its instance
     // methods (including ones defined at runtime inside an `if`/`else`) double as
     // module methods — see `is_module_function_module` and the classref fallback.
@@ -522,20 +539,16 @@ fn b_setivar(vm: &mut VM, _: u8) -> Value {
 }
 fn b_getcvar(vm: &mut VM, _: u8) -> Value {
     let name = name_of(&vm.pop());
-    with_host(|h| {
-        let this = h.current_self();
-        match h.cvar_owner(&this) {
-            Some(cls) => h.get_cvar(&cls, &name),
-            None => Value::Undef,
-        }
+    with_host(|h| match h.cvar_class() {
+        Some(cls) => h.get_cvar(&cls, &name),
+        None => Value::Undef,
     })
 }
 fn b_setcvar(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let name = name_of(&vm.pop());
     with_host(|h| {
-        let this = h.current_self();
-        if let Some(cls) = h.cvar_owner(&this) {
+        if let Some(cls) = h.cvar_class() {
             h.set_cvar(&cls, &name, val.clone());
         }
     });
@@ -1566,6 +1579,20 @@ pub(crate) fn dispatch(
             }
             return Ok(recv.clone());
         }
+        // Unary minus (`-@`): on a String, a frozen (deduplicated) copy — Rails'
+        // routing mapper does `to.split("#").map!(&:-@)` to intern the controller
+        // and action names. Already-frozen receiver returns itself; otherwise a
+        // frozen dup. Non-String types fall through to normal dispatch.
+        "-@" if args.is_empty() && with_host(|h| h.dispatch_class(recv)) == "String" => {
+            if with_host(|h| h.is_frozen(recv)) {
+                return Ok(recv.clone());
+            }
+            return Ok(with_host(|h| {
+                let copy = h.dup_value(recv);
+                h.freeze_value(&copy);
+                copy
+            }));
+        }
         "clone" => {
             return Ok(with_host(|h| {
                 let copy = h.dup_value(recv);
@@ -1838,6 +1865,21 @@ pub(crate) fn dispatch(
                 // keys via `key.respond_to?(:symbol) ? key.symbol : key` (a Symbol
                 // key must stay itself, not call the nonexistent `Symbol#symbol`).
                 "instance" | "initializers" | "symbol" => return Ok(Value::Bool(false)),
+                // Rack/endpoint duck-type probes. A plain String/Array/Hash/Integer
+                // is not a routing endpoint, so `:action` must be false: Rails'
+                // routing mapper branches on
+                // `to.respond_to?(:action) || to.respond_to?(:call)` to tell a
+                // `"controller#action"` string from a mounted Rack app — a
+                // permissive `true` sends the string down the Rack-app path and the
+                // controller/action defaults are never parsed.
+                "action" => return Ok(Value::Bool(false)),
+                // `call`/`arity` are the Proc/Method surface — true for an actual
+                // callable (a mounted Rack app or lambda), false for a plain value.
+                "call" | "arity" => {
+                    return Ok(Value::Bool(with_host(|h| {
+                        matches!(h.dispatch_class(recv).as_str(), "Proc" | "Method")
+                    })))
+                }
                 "to_path" => {
                     return Ok(Value::Bool(
                         with_host(|h| h.is_a(recv, "IO") || h.is_a(recv, "File")),
@@ -3271,6 +3313,13 @@ fn dispatch_classref(
         "===" => Ok(Value::Bool(with_host(|h| h.is_a(&args[0], cls)))),
         // `Hash[...]` / `Array[...]` constructors.
         "[]" if cls == "Hash" => {
+            // `Hash[a_hash]` (one Hash arg) returns a copy of that hash. Rails'
+            // routing mapper builds route defaults with `Hash[options.reject{…}]`
+            // where the reject yields a Hash, so this form is load-bearing.
+            if args.len() == 1 && with_host(|h| h.as_hash(&args[0]).is_some()) {
+                let m = with_host(|h| h.as_hash(&args[0]).unwrap());
+                return Ok(with_host(|h| h.new_hash(m)));
+            }
             let mut map = IndexMap::new();
             // `Hash[[[k,v],...]]` (one array-of-pairs arg) vs `Hash[k,v,k,v]`.
             let pairs: Vec<Value> =
@@ -8708,7 +8757,32 @@ fn dispatch_thread(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         "name" => Ok(Value::Undef),
         // A Thread compares/inspects by identity like any object.
         "inspect" | "to_s" => Ok(new_str(with_host(|h| h.inspect(recv)))),
-        _ => Err(no_method_error(recv, name)),
+        // A reopened `class Thread` may add `attr_accessor`s (ActiveSupport's
+        // `Thread.attr_accessor :active_support_execution_state`) or plain
+        // instance methods. Consult the runtime attr table and user methods on
+        // the Thread class — backed by the `obj_ivars` side table for Thread —
+        // before erroring.
+        _ => {
+            if let Some((field, is_writer)) = with_host(|h| h.attr_access("Thread", name)) {
+                return Ok(if is_writer {
+                    let v = args.first().cloned().unwrap_or(Value::Undef);
+                    with_host(|h| h.set_ivar_of(recv, &field, v.clone()));
+                    v
+                } else {
+                    with_host(|h| h.ivar_of(recv, &field))
+                });
+            }
+            if with_host(|h| h.find_method_owner("Thread", name)).is_some() {
+                return crate::host::call_instance_method(
+                    recv.clone(),
+                    "Thread",
+                    name,
+                    args,
+                    None,
+                );
+            }
+            Err(no_method_error(recv, name))
+        }
     }
 }
 
@@ -11061,8 +11135,13 @@ fn dispatch_hash(
             h.new_array(ks)
         })),
         "values" => Ok(new_arr(map.values().cloned().collect())),
+        "compare_by_identity" => {
+            with_host(|h| h.set_hash_by_identity(recv));
+            Ok(recv.clone())
+        }
+        "compare_by_identity?" => Ok(Value::Bool(with_host(|h| h.hash_is_by_identity(recv)))),
         "key?" | "has_key?" | "include?" | "member?" => {
-            let k = with_host(|h| h.value_to_key(&args[0]));
+            let k = with_host(|h| h.hash_key(recv, &args[0]));
             Ok(Value::Bool(map.contains_key(&k)))
         }
         "value?" | "has_value?" => Ok(Value::Bool(
@@ -11070,7 +11149,7 @@ fn dispatch_hash(
                 .any(|v| with_host(|h| h.eq_values(v, &args[0]))),
         )),
         "[]" => {
-            let k = with_host(|h| h.value_to_key(&args[0]));
+            let k = with_host(|h| h.hash_key(recv, &args[0]));
             // A missing key calls the default block (`Hash.new { |h,k| ... }`,
             // which may itself mutate the hash), else yields the plain default
             // (nil unless `Hash.new(d)`).
@@ -11083,7 +11162,7 @@ fn dispatch_hash(
             }
         }
         "fetch" => {
-            let k = with_host(|h| h.value_to_key(&args[0]));
+            let k = with_host(|h| h.hash_key(recv, &args[0]));
             if let Some(v) = map.get(&k) {
                 Ok(v.clone())
             } else if let Some(b) = &block {
@@ -11098,14 +11177,14 @@ fn dispatch_hash(
         }
         "[]=" | "store" => {
             let mut m = map;
-            let k = with_host(|h| h.value_to_key(&args[0]));
+            let k = with_host(|h| h.hash_key(recv, &args[0]));
             m.insert(k, args[1].clone());
             with_host(|h| h.set_hash(recv, m));
             Ok(args[1].clone())
         }
         "delete" => {
             let mut m = map;
-            let k = with_host(|h| h.value_to_key(&args[0]));
+            let k = with_host(|h| h.hash_key(recv, &args[0]));
             let removed = m.shift_remove(&k);
             with_host(|h| h.set_hash(recv, m));
             match removed {
@@ -13016,6 +13095,16 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             }
             std::process::exit(1);
         }
+        // Bare `synchronize { … }` / `mon_synchronize { … }` — the MonitorMixin
+        // surface called on an implicit self that includes it (concurrent-ruby's
+        // synchronized objects wrap their operations this way). The boot runs
+        // single-threaded under one GVL, so the lock is uncontended: just run the
+        // block. The lock/enter/exit forms without a block are no-ops.
+        "synchronize" | "mon_synchronize" => match block {
+            Some(b) => call_proc(&b, &[]),
+            None => Ok(Value::Undef),
+        },
+        "mon_enter" | "mon_exit" | "mon_initialize" | "mon_try_enter" => Ok(Value::Undef),
         _ => {
             Err(format!("undefined method '{name}'"))
         }
