@@ -2835,20 +2835,46 @@ impl Parser {
     fn hash_lit(&mut self) -> Result<Expr, String> {
         self.expect_op("{")?;
         self.skip_terms();
-        let mut pairs = Vec::new();
-        if !self.is_op("}") {
-            pairs.push(self.hash_pair()?);
-            while self.eat_op(",") {
-                self.skip_terms();
-                if self.is_op("}") {
-                    break;
+        // Build left-to-right. A `**expr` double-splat merges `expr`'s pairs in at
+        // its position (`{a: 1, **h, b: 2}` → `{a:1}.merge(h).merge({b:2})`), so
+        // later keys override earlier ones exactly as Ruby specifies.
+        let mut chain: Option<Expr> = None;
+        let mut pairs: Vec<(Expr, Expr)> = Vec::new();
+        let merge = |chain: Option<Expr>, next: Expr| -> Expr {
+            match chain {
+                Some(prev) => Expr::Call {
+                    recv: Some(Box::new(prev)),
+                    name: "merge".into(),
+                    args: vec![next],
+                    block: None,
+                },
+                None => next,
+            }
+        };
+        while !self.is_op("}") {
+            if self.eat_op("**") {
+                if !pairs.is_empty() {
+                    chain = Some(merge(chain.take(), Expr::Hash(std::mem::take(&mut pairs))));
                 }
+                let splat = self.arg()?;
+                // Start from an empty hash so `{**h}` copies rather than aliasing h.
+                let base = chain.take().unwrap_or_else(|| Expr::Hash(Vec::new()));
+                chain = Some(merge(Some(base), splat));
+            } else {
                 pairs.push(self.hash_pair()?);
             }
+            self.skip_terms();
+            if !self.eat_op(",") {
+                break;
+            }
+            self.skip_terms();
         }
         self.skip_terms();
         self.expect_op("}")?;
-        Ok(Expr::Hash(pairs))
+        if !pairs.is_empty() || chain.is_none() {
+            chain = Some(merge(chain.take(), Expr::Hash(pairs)));
+        }
+        Ok(chain.unwrap_or_else(|| Expr::Hash(Vec::new())))
     }
 
     fn hash_pair(&mut self) -> Result<(Expr, Expr), String> {
