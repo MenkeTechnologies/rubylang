@@ -1821,6 +1821,10 @@ pub(crate) fn dispatch(
                 // mustermann's `Mustermann[type]` branches on `type.respond_to?
                 // (:new)` to tell a factory class from a bare type symbol.
                 "new" | "allocate" | "superclass" => return Ok(Value::Bool(false)),
+                // Rack's body-close protocol: middleware calls `body.close` only
+                // if the body responds to it. An Array/String body does not, so a
+                // permissive `true` would send Array#close (which doesn't exist).
+                "close" => return Ok(Value::Bool(false)),
                 // Framework duck-type probes: gems test `respond_to?` for a method
                 // that only a special response/template/stream object carries, to
                 // distinguish it from a plain value. A plain builtin value has none,
