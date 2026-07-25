@@ -1170,6 +1170,13 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
         if with_host(|h| h.has_method(name)) {
             return call_method(name, args, block);
         }
+        // A snapshot alias of a native Kernel function reached from a class-ref
+        // `self` (Zeitwerk's `require` override runs with `self` = a class when the
+        // triggering `require` had a class receiver; its `zeitwerk_original_require`
+        // bareword must still hit native `require`).
+        if let Some(nat) = with_host(|h| h.native_kernel_alias(&cls, name)) {
+            return kernel(&nat, args, block);
+        }
         return kernel(name, args, block);
     }
     // A per-object singleton method (`def obj.m`, `class << obj`) or a
@@ -1232,16 +1239,18 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
             Err(e) => return Err(e),
         }
     }
-    if with_host(|h| h.responds_to(name)) {
-        return call_method(name, args, block);
-    }
     // A snapshot alias of a native Kernel function (Zeitwerk's
     // `zeitwerk_original_require` → native `require`): invoke the builtin
-    // directly. Resolving by the aliased name would hit the user override that
-    // shadows `require` and recurse forever.
+    // directly. This must precede the `responds_to`/`call_method` resolution:
+    // `responds_to` reports true for the alias, but `call_method` cannot resolve
+    // the native marker to a MethodDef and would raise. Resolving by the aliased
+    // name would also hit the user override that shadows `require` and recurse.
     let self_cls = with_host(|h| h.class_of(&this));
     if let Some(nat) = with_host(|h| h.native_kernel_alias(&self_cls, name)) {
         return kernel(&nat, args, block);
+    }
+    if with_host(|h| h.responds_to(name)) {
+        return call_method(name, args, block);
     }
     // A `rust { ... }` block's exported functions are callable by bareword.
     // User-defined Ruby methods still win (resolved above); the registry is only
