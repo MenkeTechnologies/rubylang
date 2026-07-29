@@ -267,6 +267,7 @@ rather than silently mis-running.
 | `--dump-ast FILE` | Print the parsed AST and exit. |
 | `--dump-bytecode FILE` | Print the lowered fusevm chunk and exit. |
 | `--disasm FILE` | Print a fusevm bytecode disassembly and exit. |
+| `--tiers FILE` | Run it, then report which fusevm execution tier took each of its chunks. |
 
 ---
 

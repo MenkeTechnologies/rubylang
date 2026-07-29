@@ -22,6 +22,7 @@ pub mod lsp;
 pub mod parser;
 pub mod repl;
 pub mod rust_ffi;
+pub mod tiers;
 
 pub use fusevm::Value;
 

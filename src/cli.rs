@@ -62,6 +62,8 @@ pub struct Cli {
     pub dump_tokens: bool,
     pub dump_ast: bool,
     pub disasm: bool,
+    /// `--tiers`: run the script, then report which fusevm tiers took its chunks.
+    pub tiers: bool,
 }
 
 /// Parse the real process arguments (skipping `argv[0]`).
@@ -146,6 +148,7 @@ fn apply_long(cli: &mut Cli, long: &str) -> Result<(), String> {
         "dump-tokens" => cli.dump_tokens = true,
         "dump-ast" => cli.dump_ast = true,
         "disasm" => cli.disasm = true,
+        "tiers" => cli.tiers = true,
         // Accepted for compat, no effect: rubylang has no RubyGems to disable and
         // no external encodings to select.
         "disable-gems" | "enable-gems" | "disable-all" | "enable-all" | "dump" => {}
