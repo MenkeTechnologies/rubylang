@@ -179,5 +179,3 @@ libffi = "5"
 [dev-dependencies]
 tempfile = "3"
 
-[patch.crates-io]
-fusevm = { path = "../fusevm" }
