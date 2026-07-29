@@ -4284,9 +4284,7 @@ impl RubyHost {
         // Resume just after `def_class` (the running method's owner). If it is not
         // in the linearized ancestry, there is no super — returning None here (vs.
         // restarting at the top) avoids re-selecting the same method and recursing.
-        let Some(pos) = sources.iter().position(|(n, _)| n == def_class) else {
-            return None;
-        };
+        let pos = sources.iter().position(|(n, _)| n == def_class)?;
         let start = pos + 1;
         for (name, is_module) in sources.iter().skip(start) {
             if *is_module {

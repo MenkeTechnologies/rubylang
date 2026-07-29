@@ -3022,7 +3022,7 @@ fn dispatch_classref(
                             &def,
                             "inherited",
                             sc,
-                            &[cref.clone()],
+                            std::slice::from_ref(&cref),
                             None,
                         )?;
                     }
@@ -6759,7 +6759,7 @@ fn dispatch_array(
             for v in &arr {
                 with_host(|h| h.value_to_key(v)).hash(&mut hasher);
             }
-            return Ok(Value::Int(hasher.finish() as i64));
+            Ok(Value::Int(hasher.finish() as i64))
         }
         // `arr <=> other` — element-wise comparison: the first non-equal pair
         // decides; if one is a prefix of the other, the shorter is less. Returns
@@ -11371,7 +11371,7 @@ fn dispatch_hash(
         "each_value" => {
             if let Some(b) = &block {
                 for v in map.values() {
-                    call_proc(b, &[v.clone()])?;
+                    call_proc(b, std::slice::from_ref(v))?;
                     if has_pending_signal() {
                         take_break();
                         break;
@@ -11990,7 +11990,7 @@ fn dispatch_float_range(
 /// A Range over arbitrary `<=>`-comparable objects. Membership uses `<=>`;
 /// iteration (materialized to an Array for the Enumerable methods) uses `succ`.
 fn dispatch_obj_range(
-    recv: &Value,
+    _recv: &Value,
     name: &str,
     args: &[Value],
     block: Option<Value>,

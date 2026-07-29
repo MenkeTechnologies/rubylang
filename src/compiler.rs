@@ -2209,7 +2209,7 @@ impl Compiler {
         self.nesting.push(qname.clone());
         let mut methods: indexmap::IndexMap<String, MethodDef> = indexmap::IndexMap::new();
         let mut class_methods: indexmap::IndexMap<String, MethodDef> = indexmap::IndexMap::new();
-        let mut includes: Vec<String> = Vec::new();
+        let includes: Vec<String> = Vec::new();
         let mut prepends: Vec<String> = Vec::new();
         let mut extends: Vec<String> = Vec::new();
         // Class-body statements that aren't defs/attrs/includes (e.g. `@@x = 0`,
