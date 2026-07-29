@@ -982,8 +982,8 @@ impl Parser {
         if let Some(key) = self.peek_label() {
             self.advance(); // key
             self.advance(); // :
-            // Ruby 3.1 shorthand: `f(x:)` ≡ `f(x: x)` — omitted value refers to
-            // the local variable / method named after the label.
+                            // Ruby 3.1 shorthand: `f(x:)` ≡ `f(x: x)` — omitted value refers to
+                            // the local variable / method named after the label.
             let v = if self.label_value_omitted() {
                 Expr::Var(VarKind::Local, key.clone())
             } else {
@@ -1010,8 +1010,9 @@ impl Parser {
                 *amp_block = Some(Block {
                     params: vec![],
                     splat: None,
-                    body: vec![Expr::BlockPass(Box::new(Expr::Var(VarKind::Local, "&".into())))
-                        .into()],
+                    body: vec![
+                        Expr::BlockPass(Box::new(Expr::Var(VarKind::Local, "&".into()))).into(),
+                    ],
                 });
                 return Ok(());
             }
@@ -1182,12 +1183,24 @@ impl Parser {
         let mut kwsplat: Option<String> = None;
         if self.eat_op("|") {
             if !self.is_op("|") {
-                self.block_param(&mut params, &mut splat, &mut preludes, &mut kwparams, &mut kwsplat)?;
+                self.block_param(
+                    &mut params,
+                    &mut splat,
+                    &mut preludes,
+                    &mut kwparams,
+                    &mut kwsplat,
+                )?;
                 while self.eat_op(",") {
                     if self.is_op("|") {
                         break; // trailing comma
                     }
-                    self.block_param(&mut params, &mut splat, &mut preludes, &mut kwparams, &mut kwsplat)?;
+                    self.block_param(
+                        &mut params,
+                        &mut splat,
+                        &mut preludes,
+                        &mut kwparams,
+                        &mut kwsplat,
+                    )?;
                 }
             }
             self.expect_op("|")?;
@@ -1732,9 +1745,7 @@ impl Parser {
             // top-level constant (`foo ::Bar`), or a unary `!expr`/`~expr`
             // (`link_to_if !condition, …, &block`) all begin a command argument.
             // `!`/`~` are only unary, so they unambiguously start an argument.
-            Tok::Op(o) => {
-                o == "[" || o == "(" || o == "->" || o == "::" || o == "!" || o == "~"
-            }
+            Tok::Op(o) => o == "[" || o == "(" || o == "->" || o == "::" || o == "!" || o == "~",
             _ => false,
         }
     }
@@ -2799,9 +2810,21 @@ impl Parser {
         if self.eat_op("(") {
             had_parens = true;
             if !self.is_op(")") {
-                self.block_param(&mut params, &mut splat, &mut preludes, &mut kwparams, &mut kwsplat)?;
+                self.block_param(
+                    &mut params,
+                    &mut splat,
+                    &mut preludes,
+                    &mut kwparams,
+                    &mut kwsplat,
+                )?;
                 while self.eat_op(",") {
-                    self.block_param(&mut params, &mut splat, &mut preludes, &mut kwparams, &mut kwsplat)?;
+                    self.block_param(
+                        &mut params,
+                        &mut splat,
+                        &mut preludes,
+                        &mut kwparams,
+                        &mut kwsplat,
+                    )?;
                 }
             }
             self.expect_op(")")?;
@@ -2810,7 +2833,13 @@ impl Parser {
             // parentheses, terminated by the `{`/`do` body.
             while matches!(self.peek(), Tok::Ident(_)) || self.is_op("*") || self.is_op("&") {
                 had_parens = true;
-                self.block_param(&mut params, &mut splat, &mut preludes, &mut kwparams, &mut kwsplat)?;
+                self.block_param(
+                    &mut params,
+                    &mut splat,
+                    &mut preludes,
+                    &mut kwparams,
+                    &mut kwsplat,
+                )?;
                 if !self.eat_op(",") {
                     break;
                 }
@@ -2827,8 +2856,7 @@ impl Parser {
         self.no_do_block = false;
         let block = self.maybe_block()?;
         self.no_do_block = saved_no_do;
-        let block =
-            block.ok_or_else(|| format!("line {}: lambda without a body", self.line()))?;
+        let block = block.ok_or_else(|| format!("line {}: lambda without a body", self.line()))?;
         // Params from the `->()` header win (with its destructuring preludes
         // prepended to the body); if there were none, adopt the block's own
         // `{ |x| }` params/splat/body verbatim.

@@ -544,9 +544,25 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                                 }
                                 b'/' if matches!(
                                     last,
-                                    b'{' | b'(' | b'[' | b',' | b';' | b':' | b'='
-                                    | b'<' | b'>' | b'!' | b'&' | b'|' | b'^' | b'~'
-                                    | b'+' | b'-' | b'*' | b'/' | b'%' | b'?'
+                                    b'{' | b'('
+                                        | b'['
+                                        | b','
+                                        | b';'
+                                        | b':'
+                                        | b'='
+                                        | b'<'
+                                        | b'>'
+                                        | b'!'
+                                        | b'&'
+                                        | b'|'
+                                        | b'^'
+                                        | b'~'
+                                        | b'+'
+                                        | b'-'
+                                        | b'*'
+                                        | b'/'
+                                        | b'%'
+                                        | b'?'
                                 ) =>
                                 {
                                     // Skip a regex literal wholesale: quotes inside
@@ -1256,7 +1272,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
 /// call dot — where an operator char (`/`, `%`, …) is a method name, not the
 /// start of a regex / percent-literal (`def /(o)`, `def %(o)`, `x./(y)`).
 fn method_name_pos(out: &[Token]) -> bool {
-    match out.iter().rev().find(|t| t.kind != Tok::Newline).map(|t| &t.kind) {
+    match out
+        .iter()
+        .rev()
+        .find(|t| t.kind != Tok::Newline)
+        .map(|t| &t.kind)
+    {
         Some(Tok::Keyword(k)) if k == "def" => true,
         Some(Tok::Op(o)) => o == "." || o == "::" || o == "&.",
         _ => false,

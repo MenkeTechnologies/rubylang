@@ -289,9 +289,7 @@ fn slot_scan_expr(
                 slot_scan_body(b, caps, disq, in_closure);
             }
         }
-        Expr::CaseIn {
-            subject, els, ..
-        } => {
+        Expr::CaseIn { subject, els, .. } => {
             // Pattern matching binds locals structurally — disqualify.
             if !in_closure {
                 *disq = true;
@@ -449,7 +447,8 @@ fn collect_plain_assigns(e: &Expr, out: &mut Vec<String>) {
             els,
         } => {
             collect_plain_assigns(cond, out);
-            then.iter().for_each(|s| collect_plain_assigns(&s.expr, out));
+            then.iter()
+                .for_each(|s| collect_plain_assigns(&s.expr, out));
             for (c, b) in elifs {
                 collect_plain_assigns(c, out);
                 b.iter().for_each(|s| collect_plain_assigns(&s.expr, out));
@@ -460,11 +459,13 @@ fn collect_plain_assigns(e: &Expr, out: &mut Vec<String>) {
         }
         Expr::While { cond, body } | Expr::DoWhile { cond, body } => {
             collect_plain_assigns(cond, out);
-            body.iter().for_each(|s| collect_plain_assigns(&s.expr, out));
+            body.iter()
+                .for_each(|s| collect_plain_assigns(&s.expr, out));
         }
         Expr::For { iter, body, .. } => {
             collect_plain_assigns(iter, out);
-            body.iter().for_each(|s| collect_plain_assigns(&s.expr, out));
+            body.iter()
+                .for_each(|s| collect_plain_assigns(&s.expr, out));
         }
         Expr::Case {
             subject,
@@ -486,9 +487,7 @@ fn collect_plain_assigns(e: &Expr, out: &mut Vec<String>) {
                 b.iter().for_each(|s| collect_plain_assigns(&s.expr, out));
             }
         }
-        Expr::Call {
-            recv, args, ..
-        } => {
+        Expr::Call { recv, args, .. } => {
             if let Some(r) = recv {
                 collect_plain_assigns(r, out);
             }
@@ -1039,10 +1038,7 @@ impl Compiler {
             // `parse_expressions`), instead of reading a nil local.
             Expr::Var(VarKind::Local, name)
                 if self.cur_method.last().map(String::as_str) == Some(name.as_str())
-                    && !self
-                        .scope_locals
-                        .last()
-                        .is_some_and(|s| s.contains(name)) =>
+                    && !self.scope_locals.last().is_some_and(|s| s.contains(name)) =>
             {
                 self.compile_call(b, &None, name, &[], &None)?;
             }
@@ -1351,11 +1347,7 @@ impl Compiler {
     /// unset fusevm slot reads back as `Undef`, which is exactly how rubylang
     /// represents `nil` (`Expr::Nil` lowers to `Op::LoadUndef`), so a read before
     /// the first assignment already yields Ruby's hoisted `nil`.
-    fn enter_slot_scope(
-        &mut self,
-        params: &std::collections::HashSet<String>,
-        body: &[Stmt],
-    ) {
+    fn enter_slot_scope(&mut self, params: &std::collections::HashSet<String>, body: &[Stmt]) {
         let (caps, disq) = slot_scan(body);
         let mut slots = std::collections::HashMap::new();
         if !disq {

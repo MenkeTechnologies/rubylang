@@ -1405,7 +1405,12 @@ impl RubyHost {
                 self.as_symbol(v).is_some()
                     || matches!(
                         self.obj(v),
-                        Some(RObj::Range { .. } | RObj::FloatRange { .. } | RObj::StrRange { .. } | RObj::ObjRange { .. })
+                        Some(
+                            RObj::Range { .. }
+                                | RObj::FloatRange { .. }
+                                | RObj::StrRange { .. }
+                                | RObj::ObjRange { .. }
+                        )
                     )
                     || self.frozen.contains(id)
             }
@@ -1570,7 +1575,10 @@ impl RubyHost {
     }
     /// `Hash#default_proc=` — set (or clear, with nil) the miss block.
     pub fn set_hash_default_proc(&mut self, v: &Value, proc: Value) {
-        if let Some(RObj::Hash { default_proc: p, .. }) = self.obj_mut(v) {
+        if let Some(RObj::Hash {
+            default_proc: p, ..
+        }) = self.obj_mut(v)
+        {
             *p = if matches!(proc, Value::Undef) {
                 None
             } else {
@@ -1598,7 +1606,13 @@ impl RubyHost {
     }
     /// Whether a hash is in `compare_by_identity` mode.
     pub fn hash_is_by_identity(&self, v: &Value) -> bool {
-        matches!(self.obj(v), Some(RObj::Hash { by_identity: true, .. }))
+        matches!(
+            self.obj(v),
+            Some(RObj::Hash {
+                by_identity: true,
+                ..
+            })
+        )
     }
     /// Build a Hash key for `v` against the receiver hash's identity mode.
     pub fn hash_key(&self, recv: &Value, v: &Value) -> RKey {
@@ -2807,7 +2821,10 @@ impl RubyHost {
                 }
                 // A native-handle self (Thread/Fiber method body): side table.
                 _ => {
-                    self.obj_ivars.entry(i).or_default().insert(name.to_string(), v);
+                    self.obj_ivars
+                        .entry(i)
+                        .or_default()
+                        .insert(name.to_string(), v);
                 }
             },
             _ => {
@@ -3108,8 +3125,14 @@ impl RubyHost {
         let mut guard = 0;
         while let Some(c) = cur {
             let sclass = format!("#<Class:{c}>");
-            let has = self.define_methods.get(&sclass).is_some_and(|m| m.contains_key(name))
-                || self.classes.get(&sclass).is_some_and(|d| d.methods.contains_key(name));
+            let has = self
+                .define_methods
+                .get(&sclass)
+                .is_some_and(|m| m.contains_key(name))
+                || self
+                    .classes
+                    .get(&sclass)
+                    .is_some_and(|d| d.methods.contains_key(name));
             if has {
                 return Some(sclass);
             }
@@ -3226,23 +3249,76 @@ impl RubyHost {
         match base {
             "Hash" => matches!(
                 method,
-                "[]" | "[]=" | "store" | "fetch" | "delete" | "update" | "merge"
-                    | "merge!" | "each" | "each_pair" | "keys" | "values" | "key?"
-                    | "has_key?" | "include?" | "dig" | "to_hash" | "to_a" | "size"
-                    | "length" | "default" | "default=" | "default_proc"
-                    | "default_proc=" | "replace" | "clear" | "assoc" | "rassoc"
-                    | "select" | "reject" | "invert" | "key" | "values_at" | "slice"
+                "[]" | "[]="
+                    | "store"
+                    | "fetch"
+                    | "delete"
+                    | "update"
+                    | "merge"
+                    | "merge!"
+                    | "each"
+                    | "each_pair"
+                    | "keys"
+                    | "values"
+                    | "key?"
+                    | "has_key?"
+                    | "include?"
+                    | "dig"
+                    | "to_hash"
+                    | "to_a"
+                    | "size"
+                    | "length"
+                    | "default"
+                    | "default="
+                    | "default_proc"
+                    | "default_proc="
+                    | "replace"
+                    | "clear"
+                    | "assoc"
+                    | "rassoc"
+                    | "select"
+                    | "reject"
+                    | "invert"
+                    | "key"
+                    | "values_at"
+                    | "slice"
             ),
             "Array" => matches!(
                 method,
-                "[]" | "[]=" | "push" | "<<" | "pop" | "shift" | "unshift" | "each"
-                    | "map" | "size" | "length" | "first" | "last" | "to_a" | "to_ary"
-                    | "concat" | "replace" | "insert" | "delete" | "index" | "include?"
+                "[]" | "[]="
+                    | "push"
+                    | "<<"
+                    | "pop"
+                    | "shift"
+                    | "unshift"
+                    | "each"
+                    | "map"
+                    | "size"
+                    | "length"
+                    | "first"
+                    | "last"
+                    | "to_a"
+                    | "to_ary"
+                    | "concat"
+                    | "replace"
+                    | "insert"
+                    | "delete"
+                    | "index"
+                    | "include?"
             ),
             "String" => matches!(
                 method,
-                "[]" | "[]=" | "<<" | "concat" | "replace" | "length" | "size"
-                    | "to_s" | "to_str" | "each_char" | "gsub" | "sub"
+                "[]" | "[]="
+                    | "<<"
+                    | "concat"
+                    | "replace"
+                    | "length"
+                    | "size"
+                    | "to_s"
+                    | "to_str"
+                    | "each_char"
+                    | "gsub"
+                    | "sub"
             ),
             _ => false,
         }
@@ -3606,7 +3682,10 @@ impl RubyHost {
             if def.includes.iter().any(|m| m == class) {
                 return true;
             }
-            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &name));
+            cur = def
+                .superclass
+                .clone()
+                .map(|s| self.resolve_class_alias(&s, &name));
         }
         false
     }
@@ -3718,7 +3797,10 @@ impl RubyHost {
                                 for m in mods.iter().rev() {
                                     out.push(self.resolve_module_name(m, &n));
                                 }
-                                cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &n));
+                                cur = def
+                                    .superclass
+                                    .clone()
+                                    .map(|s| self.resolve_class_alias(&s, &n));
                             }
                             None => {
                                 // Superclass is a builtin (e.g. StandardError):
@@ -4061,9 +4143,7 @@ impl RubyHost {
                     // (whose builtin_modules include Kernel), so continue the walk
                     // there — a reopened `module Kernel` method (silence_warnings)
                     // must resolve for instances of any user class, not just main.
-                    if self.classes.contains_key(&name)
-                        && name != "Object"
-                        && name != "BasicObject"
+                    if self.classes.contains_key(&name) && name != "Object" && name != "BasicObject"
                     {
                         Some("Object".to_string())
                     } else {
@@ -4129,7 +4209,11 @@ impl RubyHost {
     /// (walking `class` and its ancestors, since the alias may live on an ancestor).
     pub fn alias_original(&self, class: &str, alias_name: &str) -> Option<String> {
         for anc in self.class_ancestry(class) {
-            if let Some(orig) = self.alias_originals.get(&anc).and_then(|m| m.get(alias_name)) {
+            if let Some(orig) = self
+                .alias_originals
+                .get(&anc)
+                .and_then(|m| m.get(alias_name))
+            {
                 return Some(orig.clone());
             }
         }
@@ -4183,7 +4267,10 @@ impl RubyHost {
                     return Some((m, owner));
                 }
             }
-            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &name));
+            cur = def
+                .superclass
+                .clone()
+                .map(|s| self.resolve_class_alias(&s, &name));
         }
         None
     }
@@ -4207,7 +4294,10 @@ impl RubyHost {
                     return Some(m);
                 }
             }
-            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &name));
+            cur = def
+                .superclass
+                .clone()
+                .map(|s| self.resolve_class_alias(&s, &name));
         }
         None
     }
@@ -4272,7 +4362,10 @@ impl RubyHost {
                     sources.push((anc, true));
                 }
             }
-            cur = def.superclass.clone().map(|s| self.resolve_class_alias(&s, &name));
+            cur = def
+                .superclass
+                .clone()
+                .map(|s| self.resolve_class_alias(&s, &name));
         }
         // Dedup by name (keep first occurrence): a module reachable via more than
         // one path must appear once, else `super` could resume at a later copy of
@@ -4483,10 +4576,18 @@ impl RubyHost {
     fn zsuper_args(&mut self) -> Vec<Value> {
         let s = self.cur_scope();
         let (Some(method), Some(def_class)) = (s.method_name.clone(), s.def_class.clone()) else {
-            return self.frames.last().map(|f| f.args.clone()).unwrap_or_default();
+            return self
+                .frames
+                .last()
+                .map(|f| f.args.clone())
+                .unwrap_or_default();
         };
         let Some(def) = self.find_method(&def_class, &method) else {
-            return self.frames.last().map(|f| f.args.clone()).unwrap_or_default();
+            return self
+                .frames
+                .last()
+                .map(|f| f.args.clone())
+                .unwrap_or_default();
         };
         let mut out = Vec::new();
         for (i, p) in def.params.iter().enumerate() {
@@ -6293,8 +6394,10 @@ pub fn call_super_blk(
                         h.all_descendants(&cls)
                     }
                 });
-                let refs: Vec<Value> =
-                    names.iter().map(|n| with_host(|h| h.class_ref(n))).collect();
+                let refs: Vec<Value> = names
+                    .iter()
+                    .map(|n| with_host(|h| h.class_ref(n)))
+                    .collect();
                 return Ok(with_host(|h| h.new_array(refs)));
             }
             return Ok(with_host(|h| h.new_array(vec![])));
@@ -6406,11 +6509,13 @@ pub fn call_super_blk(
         // has the named method. Compute directly to avoid re-entering the override.
         if method == "respond_to?" {
             let args = explicit_args.clone().unwrap_or_else(|| cur_args.clone());
-            let mname = args.first().map(|a| with_host(|h| h.to_s(a))).unwrap_or_default();
+            let mname = args
+                .first()
+                .map(|a| with_host(|h| h.to_s(a)))
+                .unwrap_or_default();
             let cls = with_host(|h| h.class_of(&self_obj));
             let ans = with_host(|h| {
-                h.is_method_defined(&cls, &mname)
-                    || h.attr_access(&cls, &mname).is_some()
+                h.is_method_defined(&cls, &mname) || h.attr_access(&cls, &mname).is_some()
             });
             return Ok(Value::Bool(ans));
         }
@@ -6420,7 +6525,10 @@ pub fn call_super_blk(
         // not respond to the forwarded method.
         if method == "method_missing" {
             let args = explicit_args.clone().unwrap_or_else(|| cur_args.clone());
-            let mname = args.first().map(|a| with_host(|h| h.to_s(a))).unwrap_or_default();
+            let mname = args
+                .first()
+                .map(|a| with_host(|h| h.to_s(a)))
+                .unwrap_or_default();
             let target = with_host(|h| match h.classref_name(&self_obj) {
                 Some(c) => format!("class {c}"),
                 None => format!("an instance of {}", h.class_of(&self_obj)),
@@ -6560,8 +6668,7 @@ fn infer_exc_class(msg: &str) -> String {
         || m.starts_with("undefined method 'const")
     {
         "NameError"
-    } else if m.starts_with("wrong number of arguments")
-        || m.contains("wrong number of arguments")
+    } else if m.starts_with("wrong number of arguments") || m.contains("wrong number of arguments")
     {
         "ArgumentError"
     } else if m.starts_with("can't modify frozen") {

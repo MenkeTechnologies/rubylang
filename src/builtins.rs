@@ -1491,9 +1491,7 @@ pub(crate) fn dispatch(
         // (String/Integer/Symbol/nil/Hash/…) responds; gems key their own caches
         // on it (mustermann's EqualityMap). A user `hash` override wins via the
         // find_method_owner check above.
-        "hash" if args.is_empty() => {
-            return Ok(Value::Int(with_host(|h| h.value_hash(recv))))
-        }
+        "hash" if args.is_empty() => return Ok(Value::Int(with_host(|h| h.value_hash(recv)))),
         // `to_json` on any value (a user class that defines its own wins via the
         // find_method_owner check above). Ignores the optional generator-state arg.
         "to_json" => {
@@ -1582,8 +1580,7 @@ pub(crate) fn dispatch(
         // frozen (`buf = +""` under frozen_string_literal), else the receiver
         // itself; a no-op returning self for every other type (numbers included).
         "+@" if args.is_empty() => {
-            if with_host(|h| h.dispatch_class(recv)) == "String"
-                && with_host(|h| h.is_frozen(recv))
+            if with_host(|h| h.dispatch_class(recv)) == "String" && with_host(|h| h.is_frozen(recv))
             {
                 return Ok(with_host(|h| h.dup_value(recv)));
             }
@@ -1719,7 +1716,9 @@ pub(crate) fn dispatch(
         // rubylang does not track method visibility, so `public_methods` mirrors
         // `methods`. `private_methods`/`protected_methods` return empty (used by
         // Delegator to exclude names from forwarding).
-        "methods" | "public_methods" if args.is_empty() || matches!(args.first(), Some(Value::Bool(_))) => {
+        "methods" | "public_methods"
+            if args.is_empty() || matches!(args.first(), Some(Value::Bool(_))) =>
+        {
             if let Some(cls) = with_host(|h| h.object_class(recv)) {
                 return Ok(with_host(|h| {
                     let names = h.instance_method_names(&cls, true);
@@ -1848,9 +1847,8 @@ pub(crate) fn dispatch(
                 // a String from any other value (sinatra's `force_encoding` walks
                 // `respond_to?(:force_encoding)` then `:each_value`/`:each`, so a
                 // Hash must report the String method absent to reach the Hash arm).
-                "force_encoding" | "encode" | "encode!" | "encoding" | "unpack"
-                | "unpack1" | "valid_encoding?" | "scrub" | "bytesize" | "getbyte"
-                | "setbyte" | "b" => {
+                "force_encoding" | "encode" | "encode!" | "encoding" | "unpack" | "unpack1"
+                | "valid_encoding?" | "scrub" | "bytesize" | "getbyte" | "setbyte" | "b" => {
                     return Ok(Value::Bool(with_host(|h| h.is_a(recv, "String"))))
                 }
                 // Class-only methods are never instance methods of a value: a
@@ -1906,9 +1904,9 @@ pub(crate) fn dispatch(
                     })))
                 }
                 "to_path" => {
-                    return Ok(Value::Bool(
-                        with_host(|h| h.is_a(recv, "IO") || h.is_a(recv, "File")),
-                    ))
+                    return Ok(Value::Bool(with_host(|h| {
+                        h.is_a(recv, "IO") || h.is_a(recv, "File")
+                    })))
                 }
                 _ => {}
             }
@@ -1921,9 +1919,28 @@ pub(crate) fn dispatch(
                 let known = is_universal_object_method(&q)
                     || matches!(
                         q.as_str(),
-                        "to_s" | "inspect" | "to_a" | "to_h" | "to_r" | "to_c" | "&" | "|" | "^"
-                            | "!" | "==" | "===" | "!=" | "nil?" | "class" | "hash" | "object_id"
-                            | "dup" | "clone" | "to_i" | "to_f" | "to_proc"
+                        "to_s"
+                            | "inspect"
+                            | "to_a"
+                            | "to_h"
+                            | "to_r"
+                            | "to_c"
+                            | "&"
+                            | "|"
+                            | "^"
+                            | "!"
+                            | "=="
+                            | "==="
+                            | "!="
+                            | "nil?"
+                            | "class"
+                            | "hash"
+                            | "object_id"
+                            | "dup"
+                            | "clone"
+                            | "to_i"
+                            | "to_f"
+                            | "to_proc"
                     );
                 return Ok(Value::Bool(known));
             }
@@ -1960,8 +1977,7 @@ pub(crate) fn dispatch(
         // methods (via the classref handler's `class_mixin`), so let class refs
         // fall through.
         "extend"
-            if matches!(recv, Value::Obj(_))
-                && with_host(|h| h.classref_name(recv)).is_none() =>
+            if matches!(recv, Value::Obj(_)) && with_host(|h| h.classref_name(recv)).is_none() =>
         {
             if let Value::Obj(id) = recv {
                 for a in args {
@@ -2074,9 +2090,7 @@ pub(crate) fn dispatch(
                     fallback_block,
                 );
             }
-            if class != "Object"
-                && with_host(|h| h.find_method_owner("Object", name)).is_some()
-            {
+            if class != "Object" && with_host(|h| h.find_method_owner("Object", name)).is_some() {
                 with_host(|h| h.take_pending_exc());
                 return call_instance_method(recv.clone(), "Object", name, args, fallback_block);
             }
@@ -3093,10 +3107,7 @@ fn dispatch_classref(
                 } else {
                     match root {
                         "String" => with_host(|h| {
-                            let s = args
-                                .first()
-                                .and_then(|a| h.as_str(a))
-                                .unwrap_or_default();
+                            let s = args.first().and_then(|a| h.as_str(a)).unwrap_or_default();
                             h.new_string(s)
                         }),
                         "Array" => {
@@ -3226,7 +3237,9 @@ fn dispatch_classref(
         "singleton_class?" => Ok(Value::Bool(
             cls.strip_prefix("#<Class:")
                 .and_then(|s| s.strip_suffix('>'))
-                .is_some_and(|inner| !inner.is_empty() && !inner.bytes().all(|b| b.is_ascii_digit())),
+                .is_some_and(|inner| {
+                    !inner.is_empty() && !inner.bytes().all(|b| b.is_ascii_digit())
+                }),
         )),
         // `Module.nesting` — best-effort. The runtime does not track the lexical
         // nesting of the call site (class bodies are flattened at compile time),
@@ -3247,11 +3260,9 @@ fn dispatch_classref(
         "include?" if !args.is_empty() => {
             let target = with_host(|h| h.classref_name(&args[0]));
             Ok(Value::Bool(match target {
-                Some(t) => with_host(|h| {
-                    h.class_ancestry(cls)
-                        .iter()
-                        .any(|n| *n != cls && *n == t)
-                }),
+                Some(t) => {
+                    with_host(|h| h.class_ancestry(cls).iter().any(|n| *n != cls && *n == t))
+                }
                 None => false,
             }))
         }
@@ -4067,9 +4078,7 @@ fn dispatch_object(
         // Exception backtrace surface. rubylang does not retain a per-exception
         // Ruby backtrace, so report an empty one (never nil, which callers splat
         // or `.first` on); `cause` is nil, `full_message` the message.
-        "backtrace" | "backtrace_locations" if is_exception_class(cls) => {
-            Ok(new_arr(Vec::new()))
-        }
+        "backtrace" | "backtrace_locations" if is_exception_class(cls) => Ok(new_arr(Vec::new())),
         "set_backtrace" if is_exception_class(cls) => {
             Ok(args.first().cloned().unwrap_or(Value::Undef))
         }
@@ -5285,10 +5294,9 @@ fn dispatch_string(
         // In-place bang variants delegate to the non-bang transform, write the
         // result back into the receiver, and return self — or nil when nothing
         // changed (Ruby's String mutator convention).
-        "gsub!" | "sub!" | "upcase!" | "downcase!" | "capitalize!" | "swapcase!"
-        | "strip!" | "lstrip!" | "rstrip!" | "chomp!" | "chop!" | "reverse!"
-        | "squeeze!" | "tr!" | "tr_s!" | "delete!" | "delete_prefix!"
-        | "delete_suffix!" => {
+        "gsub!" | "sub!" | "upcase!" | "downcase!" | "capitalize!" | "swapcase!" | "strip!"
+        | "lstrip!" | "rstrip!" | "chomp!" | "chop!" | "reverse!" | "squeeze!" | "tr!"
+        | "tr_s!" | "delete!" | "delete_prefix!" | "delete_suffix!" => {
             let base = name.strip_suffix('!').unwrap();
             let result = dispatch_string(recv, base, args, block)?;
             let new = with_host(|h| h.as_str(&result).unwrap_or_default());
@@ -6800,10 +6808,9 @@ fn dispatch_array(
         // `Array#intersect?(other)` — true if any element is shared (Ruby 3.1+).
         "intersect?" if !args.is_empty() => {
             let other = with_host(|h| h.as_array(&args[0]).unwrap_or_default());
-            Ok(Value::Bool(
-                arr.iter()
-                    .any(|v| other.iter().any(|w| with_host(|h| h.eq_values(v, w)))),
-            ))
+            Ok(Value::Bool(arr.iter().any(|v| {
+                other.iter().any(|w| with_host(|h| h.eq_values(v, w)))
+            })))
         }
         "length" | "size" | "count"
             if !(name == "count" && (!args.is_empty() || block.is_some())) =>
@@ -8846,13 +8853,7 @@ fn dispatch_thread(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
                 });
             }
             if with_host(|h| h.find_method_owner("Thread", name)).is_some() {
-                return crate::host::call_instance_method(
-                    recv.clone(),
-                    "Thread",
-                    name,
-                    args,
-                    None,
-                );
+                return crate::host::call_instance_method(recv.clone(), "Thread", name, args, None);
             }
             Err(no_method_error(recv, name))
         }
@@ -9088,9 +9089,7 @@ fn dispatch_file_class(
             let base = args.get(1).and_then(|a| with_host(|h| h.as_str(a)));
             Ok(new_str(path_expand(&str_arg(args, 0), base.as_deref())))
         }
-        "absolute_path?" => {
-            Ok(Value::Bool(str_arg(args, 0).starts_with('/')))
-        }
+        "absolute_path?" => Ok(Value::Bool(str_arg(args, 0).starts_with('/'))),
         _ => return None,
     })
 }
@@ -13204,9 +13203,7 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
                 o
             }))
         }
-        _ => {
-            Err(format!("undefined method '{name}'"))
-        }
+        _ => Err(format!("undefined method '{name}'")),
     }
 }
 
@@ -13941,12 +13938,16 @@ fn dispatch_stdlib_module(cls: &str, name: &str, args: &[Value]) -> Option<Resul
                 ("Zlib" | "Zlib::Inflate", "inflate") => {
                     // Input is compressed binary (a `bin_str` from deflate).
                     let out = zlib_inflate(&latin1_bytes(args.first().unwrap_or(&Value::Undef)));
-                    Some(out.map(|b| with_host(|h| h.new_string(String::from_utf8_lossy(&b).into_owned()))))
+                    Some(out.map(|b| {
+                        with_host(|h| h.new_string(String::from_utf8_lossy(&b).into_owned()))
+                    }))
                 }
                 ("Zlib", "gzip") => Some(gzip_compress(&str_arg(0)).map(bin_str)),
                 ("Zlib", "gunzip") => {
                     let out = gzip_decompress(&latin1_bytes(args.first().unwrap_or(&Value::Undef)));
-                    Some(out.map(|b| with_host(|h| h.new_string(String::from_utf8_lossy(&b).into_owned()))))
+                    Some(out.map(|b| {
+                        with_host(|h| h.new_string(String::from_utf8_lossy(&b).into_owned()))
+                    }))
                 }
                 ("Zlib", "crc32") => {
                     let init = args.get(1).map(as_i).unwrap_or(0) as u32;
@@ -15219,18 +15220,8 @@ pub(crate) fn embedded_stdlib(name: &str) -> Option<&'static str> {
         // reference constants the bundle doesn't define (URI::REGEXP::PATTERN::
         // ESCAPED). Serving the bundle for every sub-path keeps the gem's files
         // from loading.
-        "uri"
-        | "uri/common"
-        | "uri/generic"
-        | "uri/rfc2396_parser"
-        | "uri/rfc3986_parser"
-        | "uri/http"
-        | "uri/https"
-        | "uri/ftp"
-        | "uri/file"
-        | "uri/ws"
-        | "uri/wss"
-        | "uri/ldap"
+        "uri" | "uri/common" | "uri/generic" | "uri/rfc2396_parser" | "uri/rfc3986_parser"
+        | "uri/http" | "uri/https" | "uri/ftp" | "uri/file" | "uri/ws" | "uri/wss" | "uri/ldap"
         | "uri/mailto" => Some(include_str!("../stdlib/uri.rb")),
         "forwardable" => Some(include_str!("../stdlib/forwardable.rb")),
         "delegate" => Some(include_str!("../stdlib/delegate.rb")),
@@ -16341,7 +16332,11 @@ fn scan_int_value(s: &str, base: i64) -> Option<Value> {
     if i < end && (bytes[i] == b'+' || bytes[i] == b'-') {
         i += 1;
     }
-    let mut radix = if (2..=36).contains(&base) { base as u32 } else { 10 };
+    let mut radix = if (2..=36).contains(&base) {
+        base as u32
+    } else {
+        10
+    };
     if i + 1 < end && bytes[i] == b'0' {
         let pb = match bytes[i + 1] {
             b'x' | b'X' => Some(16),
