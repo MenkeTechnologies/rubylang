@@ -57,7 +57,7 @@ path = "src/main.rs"
 name = "gen-docs"
 path = "src/bin/gen_docs.rs"
 
-# Differential parity harness: runs the corpus through rubyrs and the reference
+# Differential parity harness: runs the corpus through rubylang and the reference
 # `ruby`, diffing stdout. Development tool — needs `ruby` on PATH, so CI never
 # runs it; its frozen outputs live in tests/data/parity_expected.txt, which
 # tests/parity.rs replays with no `ruby` installed.
@@ -75,7 +75,7 @@ name = "parity-fuzz"
 path = "src/bin/parity_fuzz.rs"
 
 [dependencies]
-# Ruby executes on fusevm. rubyrs is a pure frontend: it lowers Ruby to fusevm
+# Ruby executes on fusevm. rubylang is a pure frontend: it lowers Ruby to fusevm
 # bytecode (src/compiler.rs) and hosts the Ruby object heap (src/host.rs,
 # reached from fusevm's extension handler). Object/String/Array/Hash cells ride
 # through the VM as `Value::Obj(u32)` handles into that heap.
@@ -94,7 +94,7 @@ flate2 = "1"
 # Ruby Hash preserves insertion order (observable in `each`/`to_a`/inspect).
 indexmap = "2"
 
-# rkyv-backed bytecode cache at ~/.rubyrs/scripts.rkyv (mirrors zshrs/elisprs):
+# rkyv-backed bytecode cache at ~/.rubylang/scripts.rkyv (mirrors zshrs/elisprs):
 # the outer shard is a zero-copy rkyv archive; the inner per-script fusevm::Chunk
 # is bincode (fusevm::Chunk is serde-owned, not rkyv::Archive). Versioned from
 # day one so a cached .rb that worked never breaks (compat floor).

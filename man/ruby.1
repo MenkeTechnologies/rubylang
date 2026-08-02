@@ -1,4 +1,4 @@
-.TH RUBY 1 "2026" "rubyrs 0.1.4" "User Commands"
+.TH RUBY 1 "2026" "rubylang 0.1.4" "User Commands"
 .SH NAME
 ruby \- compiled Ruby runtime on the fusevm bytecode VM
 .SH SYNOPSIS
@@ -6,7 +6,7 @@ ruby \- compiled Ruby runtime on the fusevm bytecode VM
 [\fIOPTIONS\fR]
 [\fIFILE\fR]
 .SH DESCRIPTION
-.B rubyrs
+.B rubylang
 runs Ruby programs by lexing and parsing to an AST, lowering to
 .B fusevm
 bytecode, and executing on a shared bytecode VM with a three-tier Cranelift
@@ -87,4 +87,4 @@ Print a fusevm bytecode disassembly listing and exit.
 0 on success, 1 on a parse or runtime error (reported to stderr as
 .IR "ruby: <reason>" ).
 .SH SEE ALSO
-Project: https://github.com/MenkeTechnologies/rubyrs
+Project: https://github.com/MenkeTechnologies/rubylang
