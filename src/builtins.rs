@@ -1814,16 +1814,25 @@ pub(crate) fn dispatch(
                         None,
                     );
                 }
+                // `Kernel` as a receiver answers for its module functions and
+                // nothing else: MRI makes `puts`/`format`/… public singleton
+                // methods on the module (`Kernel.respond_to?(:puts)` → true) while
+                // an unrelated probe stays false. Those functions are dispatched by
+                // `kernel()` rather than registered as methods, so the name table
+                // that drives that dispatch is the accurate answer here.
+                if cname == "Kernel" {
+                    return Ok(Value::Bool(is_kernel_function(&m)));
+                }
                 // A builtin class (Dir, File, …) has native class methods that are
                 // not enumerable here, so stay permissive; a *user* class has all
                 // its class methods registered, so report an undefined one as absent
                 // (sinatra's `set` needs `respond_to?("opt=")` false until defined).
-                // The root classes/modules are the exception: they carry no hidden
+                // The root classes are the exception: they carry no hidden
                 // gem-specific class methods, and Rails walks `ancestors` calling
                 // `respond_to?(:initializers)` on each — a permissive BasicObject/
                 // Object would wrongly claim the method and then fail on the call.
                 let permissive = with_host(|h| h.is_builtin_class(&cname))
-                    && !matches!(cname.as_str(), "BasicObject" | "Object" | "Kernel");
+                    && !matches!(cname.as_str(), "BasicObject" | "Object");
                 return Ok(Value::Bool(permissive));
             }
             // Built-in receivers are otherwise permissive, but the pattern-match
@@ -15450,11 +15459,14 @@ fn do_require(args: &[Value], mode: ReqMode) -> Result<Value, String> {
     // no external file — the installed `ruby` stays self-contained.
     if mode == ReqMode::Require {
         if let Some(src) = embedded_stdlib(&raw) {
-            let feature = format!("<embedded>/{raw}.rb");
-            if feature_loaded(&feature) {
+            // Deduped on the host, not in `$LOADED_FEATURES`: a bundled library
+            // has no path on disk, and the prelude loads one (`rubygems/version`)
+            // before user code runs — a synthetic entry there would make a script
+            // that counts its own requires see one it never made.
+            if with_host(|h| h.embedded_stdlib_loaded(&raw)) {
                 return Ok(Value::Bool(false));
             }
-            record_feature(&feature);
+            with_host(|h| h.mark_embedded_stdlib_loaded(&raw));
             let prog = crate::compile(src).map_err(|e| raise_exc("SyntaxError", &e))?;
             let main = crate::load_merged(prog);
             crate::host::run_required_main(main)?;

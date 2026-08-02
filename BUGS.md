@@ -189,7 +189,13 @@ Honest limitations of this surface:
   there is no enumerable registry of the builtin method surface — so
   `"s".respond_to?(:no_such)` is `true` where MRI is `false`. Accurate builtin
   `respond_to?` needs a per-type method-name registry (deep substrate, not yet
-  built).
+  built). A *class or module* receiver is the exception and reports accurately:
+  its registered class methods, singleton methods and aliases, the `Class`/
+  `Module` reflection surface, then `respond_to_missing?` on its singleton class.
+  `Object`/`BasicObject` report an unknown name as absent (Rails walks
+  `ancestors` calling `respond_to?(:initializers)` on each), and `Kernel` answers
+  for exactly the module functions it dispatches — `Kernel.respond_to?(:puts)` is
+  `true`, `Kernel.respond_to?(:initializers)` is `false`, as in MRI.
 - **Refinements (`refine` / `using`) are not implemented.** `refine Klass do … end`
   raises `undefined method 'refine'`. Scoped, lexically-activated monkey-patching
   needs a whole activation-scope substrate (per-lexical-scope method-table
@@ -775,7 +781,11 @@ Not modeled / boundaries:
   pure-Ruby libraries embedded in the binary (`embedded_stdlib`, via
   `include_str!`), compiled and run on the host the first time they are required
   — so `require "uri"` actually defines `URI` (etc.) with no external file, and
-  the installed `ruby` stays self-contained. Coverage is the common surface, not
+  the installed `ruby` stays self-contained. They dedup on the require name in
+  host state, not through `$LOADED_FEATURES` (a repeat `require` still returns
+  `false`): a bundled library has no path on disk, and the prelude requires one
+  of them (`rubygems/version`) before user code runs, so a synthetic entry there
+  would show a script a feature it never required. Coverage is the common surface, not
   the full API: `URI` parse/join/`encode_www_form` (HTTP/HTTPS/FTP + Generic, no
   scheme registry); `CSV` parse/generate with RFC-4180 quoting (no converters or
   `:headers` Row objects); `OptionParser` short/long/`--[no-]`/valued flags with

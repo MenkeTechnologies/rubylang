@@ -665,6 +665,11 @@ pub struct RubyHost {
     struct_defs: IndexMap<String, (Vec<String>, bool)>,
     /// Struct-def names that are actually `Data.define` value classes.
     data_classes: std::collections::HashSet<String>,
+    /// `require` names of the stdlib bundled into the binary (`uri`, `csv`,
+    /// `rubygems/version`, …) that have already been compiled and run on this
+    /// host. They have no path on disk, so they dedup here instead of through
+    /// `$LOADED_FEATURES` — that Array holds the paths the *program* required.
+    embedded_stdlib_loaded: std::collections::HashSet<String>,
     struct_counter: u32,
     /// Class variables (`@@x`): class name → variable name → value. Shared across
     /// the class hierarchy (looked up by walking the superclass chain).
@@ -1342,6 +1347,7 @@ impl RubyHost {
             fiddle_mem: Vec::new(),
             struct_defs: IndexMap::new(),
             data_classes: std::collections::HashSet::new(),
+            embedded_stdlib_loaded: std::collections::HashSet::new(),
             struct_counter: 0,
             class_vars: IndexMap::new(),
             class_ivars: IndexMap::new(),
@@ -2995,6 +3001,16 @@ impl RubyHost {
     /// Whether `name` is a `Data.define`d class (vs a plain `Struct`).
     pub fn is_data_class(&self, name: &str) -> bool {
         self.data_classes.contains(name)
+    }
+    /// Whether the bundled stdlib `name` has already been run on this host, so a
+    /// repeat `require` returns false without re-running it.
+    pub fn embedded_stdlib_loaded(&self, name: &str) -> bool {
+        self.embedded_stdlib_loaded.contains(name)
+    }
+    /// Record the bundled stdlib `name` as loaded. Called before its source runs,
+    /// so a circular require inside it sees the library as already loaded.
+    pub fn mark_embedded_stdlib_loaded(&mut self, name: &str) {
+        self.embedded_stdlib_loaded.insert(name.to_string());
     }
     /// The class name a class variable read/write resolves against, given `self`:
     /// an instance's class, or a class-reference's own name.
