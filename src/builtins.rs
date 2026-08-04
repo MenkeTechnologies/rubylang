@@ -12778,7 +12778,7 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
         }
         "puts" => {
             if args.is_empty() {
-                println!();
+                crate::host::write_stdout("\n");
             }
             for a in args {
                 puts_one(a);
@@ -12800,20 +12800,20 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             for (i, a) in args.iter().enumerate() {
                 if i > 0 {
                     if let Some(s) = &sep {
-                        print!("{s}");
+                        crate::host::write_stdout(s);
                     }
                 }
-                print!("{}", display(a));
+                crate::host::write_stdout(&display(a));
             }
             if let Some(t) = &term {
-                print!("{t}");
+                crate::host::write_stdout(t);
             }
             Ok(Value::Undef)
         }
         "p" => {
             for a in args {
                 let s = with_host(|h| h.inspect(a));
-                println!("{s}");
+                crate::host::write_stdout(&format!("{s}\n"));
             }
             Ok(match args.len() {
                 0 => Value::Undef,
@@ -13083,7 +13083,7 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             } else {
                 sprintf(&fmt, &args[1..], None)
             };
-            print!("{out}");
+            crate::host::write_stdout(&out);
             Ok(Value::Undef)
         }
         "gets" => {
@@ -13219,7 +13219,7 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
 fn puts_one(v: &Value) {
     if let Some(arr) = with_host(|h| h.as_array(v)) {
         if arr.is_empty() {
-            println!();
+            crate::host::write_stdout("\n");
         }
         for e in &arr {
             puts_one(e);
@@ -13229,9 +13229,9 @@ fn puts_one(v: &Value) {
         // not already end in one.
         let s = display(v);
         if s.ends_with('\n') {
-            print!("{s}");
+            crate::host::write_stdout(&s);
         } else {
-            println!("{s}");
+            crate::host::write_stdout(&format!("{s}\n"));
         }
     }
 }
@@ -14712,7 +14712,7 @@ fn erb_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Value>,
         // `run`/`run_with_hash` evaluate and print the result (MRI writes to $stdout).
         "run" => {
             let r = crate::host::eval_in_place(&src())?;
-            print!("{}", with_host(|h| h.to_s(&r)));
+            crate::host::write_stdout(&with_host(|h| h.to_s(&r)));
             Ok(Some(Value::Undef))
         }
         _ => Ok(None),

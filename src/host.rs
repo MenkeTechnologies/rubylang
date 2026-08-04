@@ -759,6 +759,12 @@ pub struct RubyHost {
     /// moves, never the bytes it points at), so a `FiddlePtr.addr` computed from
     /// `.as_ptr()` stays valid until `#free`.
     fiddle_mem: Vec<Option<Box<[u8]>>>,
+    /// In-process output sink. When `Some`, everything the program writes to the
+    /// native stdout/stderr streams is appended here instead of reaching the
+    /// process — what an embedder that owns the terminal (a TUI) needs so a
+    /// `puts` cannot corrupt its display. `None` (the default) is the ordinary
+    /// standalone `ruby` behaviour.
+    capture: Option<String>,
 }
 
 /// One live `SQLite3::Database`, indexed by `RObj::Db.id`. Wraps the owned
@@ -1345,6 +1351,7 @@ impl RubyHost {
             db_handles: Vec::new(),
             fiddle_libs: Vec::new(),
             fiddle_mem: Vec::new(),
+            capture: None,
             struct_defs: IndexMap::new(),
             data_classes: std::collections::HashSet::new(),
             embedded_stdlib_loaded: std::collections::HashSet::new(),
@@ -2739,6 +2746,53 @@ impl RubyHost {
     }
     pub fn set_global(&mut self, name: &str, v: Value) {
         self.globals.insert(name.to_string(), v);
+    }
+
+    // ── output capture ───────────────────────────────────────────────────
+    //
+    // Every write a *program* makes to a native stream funnels through
+    // `write_out`: `puts`/`print`/`p`/`printf`, `$stdout.write`, and ERB's
+    // `run`. Diagnostics the runtime itself emits (the REPL banner, a crash
+    // backtrace from `main`) deliberately do not — they belong to the process,
+    // not to the program.
+
+    /// Start capturing program output in-process. Any text already captured is
+    /// discarded, so each run starts clean.
+    pub fn begin_capture(&mut self) {
+        self.capture = Some(String::new());
+    }
+
+    /// Stop capturing and take everything written since [`begin_capture`],
+    /// returning the empty string when capture was not on.
+    ///
+    /// [`begin_capture`]: RubyHost::begin_capture
+    pub fn end_capture(&mut self) -> String {
+        self.capture.take().unwrap_or_default()
+    }
+
+    /// Whether output is being captured.
+    pub fn capturing(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    /// Write program output: into the capture buffer when capturing, else to the
+    /// native stream `stderr` selects. `s` is written verbatim — `puts` has
+    /// already decided about the trailing newline.
+    pub fn write_out(&mut self, s: &str, stderr: bool) {
+        if let Some(buf) = &mut self.capture {
+            buf.push_str(s);
+            return;
+        }
+        use std::io::Write;
+        if stderr {
+            let mut o = std::io::stderr();
+            let _ = o.write_all(s.as_bytes());
+            let _ = o.flush();
+        } else {
+            let mut o = std::io::stdout();
+            let _ = o.write_all(s.as_bytes());
+            let _ = o.flush();
+        }
     }
     pub fn get_const(&self, name: &str) -> Value {
         self.consts.get(name).cloned().unwrap_or(Value::Undef)
@@ -7673,25 +7727,33 @@ pub fn io_closed(v: &Value) -> bool {
     }
 }
 
+/// Write `s` as program output on stdout — the funnel `puts`/`print`/`p` and
+/// the other Kernel writers use, so an embedder's capture catches them all.
+pub fn write_stdout(s: &str) {
+    with_host(|h| h.write_out(s, false));
+}
+
+/// Write `s` as program output on stderr (`warn`, `$stderr.write`).
+pub fn write_stderr(s: &str) {
+    with_host(|h| h.write_out(s, true));
+}
+
 /// `IO#write` for one already-stringified chunk; returns the byte count written.
 pub fn io_write_str(v: &Value, s: &str) -> Result<usize, String> {
     use std::io::Write;
     let id = io_id(v).ok_or("not an IO")?;
+    // The standard streams route through the host's output funnel rather than
+    // the process fds, so a capturing embedder sees them.
+    if with_host(|h| matches!(h.io_handles.get(id as usize), Some(IoCell::Stdout))) {
+        write_stdout(s);
+        return Ok(s.len());
+    }
+    if with_host(|h| matches!(h.io_handles.get(id as usize), Some(IoCell::Stderr))) {
+        write_stderr(s);
+        return Ok(s.len());
+    }
     with_host(|h| match h.io_handles.get_mut(id as usize) {
-        Some(IoCell::Stdout) => {
-            let mut o = std::io::stdout();
-            o.write_all(s.as_bytes())
-                .and_then(|_| o.flush())
-                .map(|_| s.len())
-                .map_err(|e| e.to_string())
-        }
-        Some(IoCell::Stderr) => {
-            let mut o = std::io::stderr();
-            o.write_all(s.as_bytes())
-                .and_then(|_| o.flush())
-                .map(|_| s.len())
-                .map_err(|e| e.to_string())
-        }
+        Some(IoCell::Stdout) | Some(IoCell::Stderr) => unreachable!("handled above"),
         Some(IoCell::Stdin) => Err("not opened for writing".to_string()),
         Some(IoCell::File { file: Some(f), .. }) => f
             .write_all(s.as_bytes())

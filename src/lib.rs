@@ -158,6 +158,56 @@ pub fn eval_str_cfg(src: &str, cfg: &RunConfig) -> Result<Value, String> {
     })
 }
 
+/// Run Ruby source on a fresh host with `globals` bound and the program's
+/// output captured in-process, returning the program's outcome alongside
+/// everything it wrote.
+///
+/// This is the entry point for an embedder rather than for the `ruby` binary,
+/// and it exists because [`eval_str`] cannot serve one: it resets the host
+/// first, which wipes any global installed beforehand, and it lets `puts` reach
+/// the real stdout, which corrupts a host that owns the terminal. Both are
+/// fixed here — the globals are seeded *after* the reset, and every write the
+/// program makes lands in the returned string.
+///
+/// Globals are given as text (bound as local-scope names, so `stdin` reads as
+/// an ordinary variable) and interned as real `String` objects here. They are
+/// deliberately not `Value`: strings live on this host's heap as `RObj::Str`,
+/// so a `Value::Str` a caller builds is not a Ruby string and answers no
+/// methods.
+///
+/// The outcome and the output are returned separately (rather than the output
+/// only on success) because a program that prints and *then* raises produced
+/// both, and an embedder generally wants to show both.
+///
+/// ```no_run
+/// let (result, out) = rubylang::eval_str_captured("puts stdin.upcase", &[("stdin", "hi")]);
+/// assert!(result.is_ok());
+/// assert_eq!(out, "HI\n");
+/// ```
+pub fn eval_str_captured(src: &str, globals: &[(&str, &str)]) -> (Result<Value, String>, String) {
+    host::reset_host();
+    let result = host::with_gvl(|| {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        host::with_host(|h| h.init_load_path(&cwd.to_string_lossy()));
+        host::push_file_dir(cwd);
+        host::push_file_path("-e".to_string());
+        host::with_host(|h| h.set_program_args(&[], "-e"));
+        run_prelude()?;
+        // Seeded after the prelude: it runs ordinary Ruby, and a local set
+        // before it would not survive into the program's scope.
+        host::with_host(|h| {
+            for (name, text) in globals {
+                let value = h.new_string(text.to_string());
+                h.set_local(name, value);
+            }
+            h.begin_capture();
+        });
+        run_compiled(compile(src)?)
+    });
+    let output = host::with_host(|h| h.end_capture());
+    (result, output)
+}
+
 /// Core classes that MRI provides in C but rubylang defines in Ruby, run on the
 /// fresh host before any user code. `ObjectSpace::WeakMap` is a weak-key hash in
 /// MRI; here it is an ordinary hash (no weak semantics), which is enough for the
