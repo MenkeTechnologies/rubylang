@@ -81,6 +81,30 @@ leading positional before `...`); `Integer#step`, `?c` char literals,
 - **Numbered / `it` implicit block params.** `_1`.`_9` and Ruby 3.4's `it`
   are not bound (they read as `nil`); implementing them needs a nested-block-aware
   body walk. Use explicit `{ |x| … }` params.
+- **Loop control flow through `begin`/`rescue`.** A `begin` body compiles to its
+  own chunk, so a `break`/`next` inside one cannot jump to the enclosing native
+  `while`/`until`/`for` label directly; it raises a signal that the loop picks
+  back up immediately after the nested run (`BEGIN_IN_LOOP` plus the
+  `TAKE_LOOP_NEXT`/`PEEK_LOOP_BREAK`/`TAKE_LOOP_BREAK` handoff). `return`,
+  `throw` and `retry` still unwind past the loop untouched, and a `break` from a
+  *block* keeps belonging to the method it was passed to. `while`/`until` also
+  evaluate to their `break` operand (`(while true do break 7 end) == 7`), not
+  always nil.
+- **Block scoping.** A block parameter is block-local and gets a fresh binding
+  per iteration, so `3.times { |i| procs << -> { i } }` closes over `0`,`1`,`2`;
+  a local first assigned inside a block does not leak out (`1.times { x = 1 };
+  defined?(x)` is nil); and explicit block-locals (`{ |i; tmp| … }`) shadow an
+  outer name of the same spelling. `for` is the deliberate exception — it
+  introduces no scope, so its loop variable is an enclosing local that outlives
+  the loop and is shared by every closure the body makes (`[2, 2, 2]`, where the
+  `each` form gives `[0, 1, 2]`).
+- **`redo` is not implemented.** The keyword does not re-run the current block
+  iteration; it needs a Redo signal that every block-driving builtin re-dispatches
+  on, alongside the existing break/next handling.
+- **`for` body locals do not leak.** Ruby's `for` shares the enclosing scope
+  outright, so a local first assigned *in the body* also outlives the loop. The
+  loop variable is handled, but body locals are still block-scoped here —
+  closing that needs a full statement-tree walk to pre-declare them.
 
 ## Metaprogramming / reflection / eval
 
@@ -301,7 +325,21 @@ Honest limitations of this surface:
   infinite generator (`loop { y << ... }`) materializes the block to completion on
   first use, so it works only for *finite* generators — that block's `.next` still
   runs forever (routing it through a `Fiber` is a planned follow-on, now that the
-  Fiber engine exists — see below).
+  Fiber engine exists — see below). The same eagerness moves *when* a raise from
+  inside the block surfaces: MRI reports it on the `next` that would have reached
+  it, while here the whole block runs on the first `next`, so the exception (with
+  its correct class) arrives one `next` early.
+- **Exception hierarchy.** The builtin exception classes carry MRI's real tree,
+  not a flat `X < Exception`: `ArgumentError`/`TypeError`/`RuntimeError`/… derive
+  from `StandardError`, and the ones with an intermediate parent keep it
+  (`NoMethodError < NameError`, `KeyError`/`StopIteration < IndexError`,
+  `FloatDomainError < RangeError`, `FrozenError < RuntimeError`,
+  `LoadError`/`NotImplementedError`/`SyntaxError < ScriptError`). So `#is_a?`,
+  `Class#superclass` and `Module#ancestors` agree with MRI, and a bare `rescue`
+  catches `StandardError` and nothing above it — `SystemExit`, `ScriptError` and
+  friends fall through it as they should. An error class the host has no record
+  of (a Rust-side failure reported by message alone) is still treated as a plain
+  `StandardError` so a bare `rescue` keeps working.
 - **Fiber (stackful coroutines).** `Fiber.new { |first| ... }`, `#resume(*args)`,
   `Fiber.yield(v)`, and `#alive?` are implemented on `corosensei` same-thread
   stackful coroutines: a fiber freezes its entire native stack — including the
@@ -315,6 +353,10 @@ Honest limitations of this surface:
   `Fiber.yield` at the root raises `FiberError`. Each fiber runs its own `VM`
   instance and its own volatile execution context (scope/signal/frames), swapped
   at every resume/suspend boundary, so fibers are isolated and nest correctly.
+  That swap includes the pending-exception slot, so a raise inside the body has
+  its exception object handed back across the boundary on the way out — without
+  that the resumer would see only the message string and rebuild it as a bare
+  `RuntimeError`, losing both the class and any user subclass identity.
 - **Thread (real OS threads under a GVL).** `Thread.new`/`start`/`fork` spawn a
   real OS thread that runs on the one process-global `Mutex<RubyHost>` heap. A
   Global VM Lock serializes execution — only the lock-holder runs Ruby, exactly
@@ -388,7 +430,11 @@ Honest limitations of this surface:
 - **`Array#pack` / `String#unpack` / `#unpack1`** are implemented for the common
   web/crypto directives — `C`/`c` (bytes), `a`/`A` (string, NUL/space pad), `N`/
   `n`/`V`/`v` (big/little-endian 16/32-bit ints), `H`/`h` (hex, high/low nibble
-  first). Because strings are UTF-8 (`String`, not a byte buffer), a binary string
+  first), the fixed-width integers `s`/`S`/`l`/`L`/`q`/`Q`/`i`/`I`/`j`/`J` (with
+  the `<`/`>` byte-order modifiers; an unsigned 64-bit value past `i64::MAX`
+  unpacks to a Bignum), the floats `D`/`d`/`E`/`G` (double) and `F`/`f`/`e`/`g`
+  (single), and the cursor moves `x`/`X`/`@`. Because strings are UTF-8 (`String`,
+  not a byte buffer), a binary string
   is modeled with the Latin-1 convention: a "byte" is a code point in
   `U+0000..=U+00FF` (its low 8 bits). `pack` produces such a string and `unpack`
   reads it back the same way, so any `pack`-produced binary string round-trips

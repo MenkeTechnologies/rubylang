@@ -62,6 +62,10 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::SUPER_FWD_BLK, b_super_fwd_blk);
     vm.register_builtin(ops::MKARGS, b_mkargs);
     vm.register_builtin(ops::MKHASH_MERGE, b_mkhash_merge);
+    vm.register_builtin(ops::TAKE_LOOP_NEXT, b_take_loop_next);
+    vm.register_builtin(ops::PEEK_LOOP_BREAK, b_peek_loop_break);
+    vm.register_builtin(ops::TAKE_LOOP_BREAK, b_take_loop_break);
+    vm.register_builtin(ops::BEGIN_IN_LOOP, b_begin_in_loop);
     vm.register_builtin(ops::CALL_ARR, b_call_arr);
     vm.register_builtin(ops::CALL_METHOD_ARR, b_call_method_arr);
     vm.register_builtin(ops::CALL_ARR_BLK, b_call_arr_blk);
@@ -314,6 +318,49 @@ fn b_begin(vm: &mut VM, _: u8) -> Value {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
+}
+
+/// `begin` sitting directly inside a native loop. A `break`/`next` raised in the
+/// body belongs to that loop, so this must NOT halt the chunk the way `b_begin`
+/// does — the loop's handoff ops follow immediately and turn the signal into the
+/// jump it should have been. Every other signal (`return`, `throw`, `retry`)
+/// still unwinds.
+fn b_begin_in_loop(vm: &mut VM, _: u8) -> Value {
+    let id = match vm.pop() {
+        Value::Int(n) => n as usize,
+        _ => return abort(vm, "bad begin id".into()),
+    };
+    let out = crate::host::run_begin(id);
+    // A pending break/next means the body stopped *because* of the loop control
+    // flow, not because of an error — hand it to the loop instead of unwinding.
+    if crate::host::pending_signal_is_loop_flow() {
+        return out.unwrap_or(Value::Undef);
+    }
+    match out {
+        Ok(v) => propagate(vm, v),
+        Err(e) => abort(vm, e),
+    }
+}
+
+/// Consume a pending `next` signal, reporting whether there was one. The
+/// enclosing native loop emits this right after a nested chunk (a `begin` body)
+/// returns; a `next` raised in there could not jump to the loop head itself,
+/// because that label belongs to this chunk, not the nested one.
+fn b_take_loop_next(_: &mut VM, _: u8) -> Value {
+    Value::Bool(crate::host::take_next().is_some())
+}
+
+/// Whether a `break` signal is pending, leaving it in place. The loop tests this
+/// first and only consumes the signal on the branch that actually jumps, so a
+/// `break` it does not own keeps unwinding.
+fn b_peek_loop_break(_: &mut VM, _: u8) -> Value {
+    crate::host::peek_break()
+}
+
+/// Consume the pending `break` signal and yield its operand — the value the
+/// enclosing `while`/`until` evaluates to.
+fn b_take_loop_break(_: &mut VM, _: u8) -> Value {
+    take_break().unwrap_or(Value::Undef)
 }
 
 /// Pop `n` values, returning them in push order (first pushed at index 0).
@@ -3018,6 +3065,12 @@ fn dispatch_classref(
         return Ok(r);
     }
     match name {
+        // `Proc.new { ... }` is the block itself, exactly like `Kernel#proc`.
+        // Without this it fell through to the generic `new` and produced a plain
+        // object of class Proc, which has no `call`.
+        "new" if cls == "Proc" => {
+            block.ok_or_else(|| String::from("tried to create Proc without a block"))
+        }
         "new" => {
             // `Class.new([Super]) { body }` / `Module.new { body }` — an anonymous
             // class/module. The optional first arg is the superclass; the block is
@@ -4449,7 +4502,21 @@ fn dispatch_bigint(
             let radix = args.first().and_then(int_arg).unwrap_or(10);
             new_str(b.to_str_radix(radix as u32))
         }
-        "to_i" | "to_int" | "floor" | "ceil" | "round" | "truncate" => big(b.clone()),
+        "to_i" | "to_int" => big(b.clone()),
+        // Like a fixnum receiver, a non-negative `ndigits` is a no-op; a
+        // negative one rounds to a power of ten in exact integer arithmetic.
+        "floor" | "ceil" | "round" | "truncate" => {
+            let kind = match name {
+                "floor" => RoundKind::Floor,
+                "ceil" => RoundKind::Ceil,
+                "round" => RoundKind::Round,
+                _ => RoundKind::Truncate,
+            };
+            match args.first().and_then(int_arg) {
+                Some(d) if d < 0 => bigint_to_value(int_round_negative(b, clamp_ndigits(d), kind)),
+                _ => big(b.clone()),
+            }
+        }
         "to_f" => Value::Float(b.to_f64().unwrap_or(f64::INFINITY)),
         "abs" | "magnitude" => big(b.abs()),
         "-@" => big(-b.clone()),
@@ -4878,10 +4945,10 @@ fn dispatch_number(
         "integer?" => Ok(Value::Bool(matches!(recv, Value::Int(_)))),
         "succ" | "next" => Ok(Value::Int(as_i(recv) + 1)),
         "pred" => Ok(Value::Int(as_i(recv) - 1)),
-        "floor" => round_like(recv, args.first().map(as_i), f64::floor),
-        "ceil" => round_like(recv, args.first().map(as_i), f64::ceil),
-        "round" => round_like(recv, args.first().map(as_i), f64::round),
-        "truncate" => round_like(recv, args.first().map(as_i), f64::trunc),
+        "floor" => round_like(recv, args.first().map(as_i), RoundKind::Floor),
+        "ceil" => round_like(recv, args.first().map(as_i), RoundKind::Ceil),
+        "round" => round_like(recv, args.first().map(as_i), RoundKind::Round),
+        "truncate" => round_like(recv, args.first().map(as_i), RoundKind::Truncate),
         "nan?" if matches!(recv, Value::Float(_)) => {
             Ok(Value::Bool(matches!(recv, Value::Float(f) if f.is_nan())))
         }
@@ -4985,7 +5052,16 @@ fn dispatch_number(
         }
         // Bytes in the machine word (a fixnum is 8 bytes on a 64-bit build).
         "size" => Ok(Value::Int(8)),
-        "fdiv" => Ok(Value::Float(as_f(recv) / as_f(&args[0]))),
+        // `Integer#fdiv(Integer)` is exact-integer division rendered as a double
+        // (MRI `rb_int_fdiv_double`), not `to_f / to_f` — the gcd cancellation
+        // changes the result once either side exceeds 2**53. A Float argument
+        // takes the plain IEEE division MRI's `double_div_double` does.
+        "fdiv" => Ok(Value::Float(
+            match with_host(|h| (h.as_bigint(recv), h.as_bigint(&args[0]))) {
+                (Some(x), Some(y)) => int_fdiv_double(&x, &y),
+                _ => as_f(recv) / as_f(&args[0]),
+            },
+        )),
         "clamp" => {
             // Ruby returns the receiver when in range, otherwise the bound
             // itself (preserving its type, so `(-2.7).clamp(-1.0, 1.0)` is a Float).
@@ -5090,51 +5166,392 @@ fn float_to_int_value(f: f64) -> Value {
     }
 }
 
-fn round_like(recv: &Value, ndigits: Option<i64>, op: fn(f64) -> f64) -> Result<Value, String> {
-    match recv {
-        Value::Float(f) => {
-            // A non-finite Float raises FloatDomainError when the result would be
-            // an Integer (round with no / negative ndigits, floor/ceil/truncate);
-            // round(positive ndigits) returns a Float, so Infinity/NaN pass through.
-            if !f.is_finite() {
-                if matches!(ndigits, Some(d) if d > 0) {
-                    return Ok(Value::Float(*f));
-                }
-                let name = if f.is_nan() {
-                    "NaN"
-                } else if *f > 0.0 {
-                    "Infinity"
-                } else {
-                    "-Infinity"
-                };
-                return Err(raise_exc("FloatDomainError", name));
+/// Which of the four `Numeric` rounding directions a `round_like` call wants.
+///
+/// MRI keeps these as four separate C entry points (`flo_round`, `flo_floor`,
+/// `flo_ceil`, `flo_truncate`) that share the overflow/underflow guards but
+/// differ in the scaled-value correction, so a plain `fn(f64) -> f64` cannot
+/// express them — hence the enum.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoundKind {
+    Floor,
+    Ceil,
+    Round,
+    Truncate,
+}
+
+/// The `binexp` output of C `frexp`: the exponent for which
+/// `x == m * 2**binexp` with `0.5 <= |m| < 1`. `x` must be finite and non-zero.
+///
+/// Read straight off the IEEE-754 bits so powers of two land exactly (a
+/// `log2().floor()` approximation is off by one for them). Subnormals carry a
+/// zero exponent field, so they are scaled up by `2**54` first and the shift
+/// subtracted back out.
+fn frexp_binexp(x: f64) -> i32 {
+    let raw = ((x.to_bits() >> 52) & 0x7ff) as i32;
+    if raw != 0 {
+        return raw - 1022;
+    }
+    let scaled = x * (1u64 << 54) as f64;
+    ((((scaled.to_bits() >> 52) & 0x7ff) as i32) - 54) - 1022
+}
+
+/// MRI `float_round_overflow` (numeric.c). At this many digits the scaled value
+/// is already integral, so rounding cannot change the number and the receiver is
+/// returned untouched.
+fn float_round_overflow(ndigits: i32, binexp: i32) -> bool {
+    /// `DBL_DIG + 2` — the digits it can take to round-trip a double.
+    const FLOAT_DIG: i32 = 15 + 2;
+    ndigits
+        >= FLOAT_DIG
+            - if binexp > 0 {
+                binexp / 4
+            } else {
+                binexp / 3 - 1
             }
-            Ok(match ndigits {
-                Some(d) if d > 0 => {
-                    // Natural IEEE rounding preserves the sign of a value that
-                    // rounds to zero (`-0.01.round(1)` -> -0.0), matching MRI for
-                    // normal magnitudes. (MRI returns +0.0 only in the deep
-                    // underflow case where the value is far below the rounding
-                    // unit — an implementation-defined dtoa quirk left as-is.)
-                    let m = 10f64.powi(d as i32);
-                    Value::Float(op(f * m) / m)
-                }
-                Some(d) if d < 0 => {
-                    let m = 10f64.powi((-d) as i32);
-                    float_to_int_value(op(f / m) * m)
-                }
-                _ => float_to_int_value(op(*f)),
-            })
+}
+
+/// MRI `float_round_underflow` (numeric.c). The magnitude is so far below the
+/// rounding unit that the result is zero — and MRI returns a *positive* zero
+/// here (`DBL2NUM(0)`), which is why `(-1.5e-10).round(4)` is `0.0`, not `-0.0`.
+fn float_round_underflow(ndigits: i32, binexp: i32) -> bool {
+    ndigits
+        < -if binexp > 0 {
+            binexp / 3 + 1
+        } else {
+            binexp / 4
         }
-        Value::Int(n) => Ok(match ndigits {
-            Some(d) if d < 0 => {
-                let m = 10f64.powi((-d) as i32);
-                Value::Int((op(*n as f64 / m) * m) as i64)
+}
+
+/// MRI `round_half_up` (numeric.c): round half away from zero, then repair the
+/// rounding error introduced by the `x * s` product itself. Without the repair
+/// `1.005.round(2)` is `1.0` because `1.005 * 100` lands just under `100.5`.
+fn round_half_up(x: f64, s: f64) -> f64 {
+    let mut f = (x * s).round();
+    if s == 1.0 {
+        return f;
+    }
+    if x > 0.0 {
+        if (f + 0.5) / s <= x {
+            f += 1.0;
+        }
+    } else if (f - 0.5) / s >= x {
+        f -= 1.0;
+    }
+    f
+}
+
+/// MRI `rb_flo_{round,ceil,floor}_by_rational` (rational.c): for `ndigits`
+/// beyond `DBL_DIG` the `pow(10, ndigits)` scale factor is itself inexact, so
+/// MRI redoes the whole operation in exact rational arithmetic — the f64 is
+/// converted to the exact rational it denotes, scaled by `10**ndigits`, rounded,
+/// unscaled, and converted back.
+fn flo_round_by_rational(number: f64, ndigits: i32, kind: RoundKind) -> f64 {
+    let scale = num_rational::BigRational::from(num_bigint::BigInt::from(10).pow(ndigits as u32));
+    let Some(exact) = num_rational::BigRational::from_float(number) else {
+        return number;
+    };
+    let scaled = exact * &scale;
+    let rounded = match kind {
+        RoundKind::Round => scaled.round(),
+        RoundKind::Ceil => scaled.ceil(),
+        RoundKind::Floor => scaled.floor(),
+        RoundKind::Truncate => scaled.trunc(),
+    };
+    rational_to_f64(&(rounded / scale))
+}
+
+/// MRI `int_round_zero_p` (numeric.c): `10**-ndigits / 2` already exceeds the
+/// receiver, so every rounding direction that goes through it collapses to 0.
+/// `bytes` is the receiver's machine width, mirroring MRI's `sizeof(long)` for a
+/// fixnum and `rb_big_size` (32-bit BDIGITs) for a bignum.
+fn int_round_zero_p(bytes: i64, ndigits: i32) -> bool {
+    -0.415241 * f64::from(ndigits) - 0.125 > bytes as f64
+}
+
+/// The machine width MRI would report for this integer, feeding
+/// `int_round_zero_p`.
+fn int_round_bytes(n: &num_bigint::BigInt) -> i64 {
+    match n.to_u64_digits().0 {
+        // A fixnum is one `long`, whatever its magnitude.
+        _ if n.bits() < 62 => std::mem::size_of::<i64>() as i64,
+        // A bignum is `BIGNUM_LEN * SIZEOF_BDIGIT`, and BDIGIT is a 32-bit
+        // `unsigned int` on every LP64 build.
+        _ => n.bits().div_ceil(32) as i64 * 4,
+    }
+}
+
+/// MRI `rb_int_round` / `rb_int_floor` / `rb_int_ceil` / `rb_int_truncate`
+/// (numeric.c) for `ndigits < 0`, done in exact integer arithmetic so that
+/// `123456789012345678.floor(-3)` keeps every digit an f64 scale factor loses.
+fn int_round_negative(n: &num_bigint::BigInt, ndigits: i32, kind: RoundKind) -> num_bigint::BigInt {
+    use num_integer::Integer as _;
+    let zero = num_bigint::BigInt::from(0);
+    // `floor`/`ceil` skip the shortcut in MRI; only `round`/`truncate` take it.
+    if matches!(kind, RoundKind::Round | RoundKind::Truncate)
+        && int_round_zero_p(int_round_bytes(n), ndigits)
+    {
+        return zero;
+    }
+    let f = num_bigint::BigInt::from(10).pow(ndigits.unsigned_abs());
+    // MRI splits every one of these into a `long` fast path (taken when both the
+    // receiver and `10**-ndigits` are fixnums) and a generic bignum path. The
+    // two paths are *not* equivalent for `truncate`, so the split is observable
+    // and has to be reproduced.
+    let both_fixnum = n.bits() <= 62 && f.bits() <= 62;
+    match kind {
+        // `n - (n mod f)`, with `mod` floored, plus one more `f` when the
+        // remainder is past (or exactly at, going away from zero) the halfway
+        // point.
+        RoundKind::Round => {
+            let h = &f / 2;
+            let r = n.mod_floor(&f);
+            let base = n - &r;
+            if r > h || (r == h && n > &zero) {
+                base + f
+            } else {
+                base
             }
+        }
+        RoundKind::Floor => n - n.mod_floor(&f),
+        RoundKind::Ceil => {
+            let r = n.mod_floor(&f);
+            if r.is_zero_shim() {
+                n.clone()
+            } else {
+                n + (f - r)
+            }
+        }
+        RoundKind::Truncate if both_fixnum => {
+            let neg = *n < zero;
+            let x = if neg { -n } else { n.clone() };
+            let x = &x / &f * &f;
+            if neg {
+                -x
+            } else {
+                x
+            }
+        }
+        // MRI's bignum branch is `num + (f - num % f)` for a negative receiver
+        // with no guard for a zero remainder, so it steps a whole `f` toward
+        // zero on an exact multiple: `(-10**20).truncate(-1)` is
+        // `-99999999999999999990`, and `(-10**20).truncate(-20)` is `0`.
+        // Reproduced as-is — it is what a Ruby program observes.
+        RoundKind::Truncate => {
+            let m = n.mod_floor(&f);
+            if *n < zero {
+                n + (f - m)
+            } else {
+                n - m
+            }
+        }
+    }
+}
+
+/// MRI `rb_int_fdiv_double` (numeric.c): the quotient of two exact integers as a
+/// double.
+///
+/// MRI does **not** compute the correctly-rounded quotient. It cancels the gcd,
+/// converts each side to a double independently, and divides — so each
+/// conversion rounds before the division does. That double rounding is
+/// observable: `49989999999999995.fdiv(10**15)` is `49.99`, even though
+/// `49.989999999999995` is the nearer double. Ported faithfully, because
+/// `Rational#to_f` and `Float#round(15..)` both funnel through it.
+///
+/// The exception is MRI's `big_fdiv_int` path, taken when a naive conversion
+/// would overflow or lose the denominator; that one scales the operands first,
+/// which is equivalent to the exact quotient, so the exact rational is used.
+fn int_fdiv_double(x: &num_bigint::BigInt, y: &num_bigint::BigInt) -> f64 {
+    use num_integer::Integer as _;
+    use num_traits::{One as _, ToPrimitive as _};
+    // `|n| < 2**62` — MRI's fixnum range on an LP64 build.
+    let fixnum = |n: &num_bigint::BigInt| n.bits() <= 62;
+    // MRI `accurate_in_double`: `|n| < 2**53`, i.e. every integer of that size
+    // survives the `double` conversion untouched.
+    let accurate = |n: &num_bigint::BigInt| n.bits() <= 53;
+    let to_f = |n: &num_bigint::BigInt| n.to_f64().unwrap_or(f64::NAN);
+
+    if y.is_zero_shim() {
+        return to_f(x) / 0.0;
+    }
+    let (mut x, mut y) = (x.clone(), y.clone());
+    if !(accurate(&x) && accurate(&y)) {
+        let g = x.gcd(&y);
+        if !g.is_zero_shim() && !g.is_one() {
+            x /= &g;
+            y /= &g;
+        }
+    }
+    let dx = to_f(&x);
+    let naive = if fixnum(&x) {
+        accurate(&y)
+    } else {
+        fixnum(&y) && dx.is_finite()
+    };
+    if naive {
+        return dx / to_f(&y);
+    }
+    num_rational::BigRational::new(x, y)
+        .to_f64()
+        .unwrap_or(f64::NAN)
+}
+
+/// `Rational#to_f` — MRI `nurat_to_double`, which is `rb_int_fdiv_double` over
+/// the (already reduced) numerator and denominator.
+fn rational_to_f64(r: &num_rational::BigRational) -> f64 {
+    int_fdiv_double(r.numer(), r.denom())
+}
+
+/// `BigInt::is_zero` without pulling `num_traits::Zero` into every call site.
+trait IsZeroShim {
+    fn is_zero_shim(&self) -> bool;
+}
+
+impl IsZeroShim for num_bigint::BigInt {
+    fn is_zero_shim(&self) -> bool {
+        use num_traits::Zero as _;
+        self.is_zero()
+    }
+}
+
+/// Narrow an exact integer result back to a Ruby `Integer`, staying a BigInt
+/// only when it must.
+fn bigint_to_value(b: num_bigint::BigInt) -> Value {
+    use num_traits::ToPrimitive as _;
+    match b.to_i64() {
+        Some(n) => Value::Int(n),
+        None => with_host(|h| h.new_bigint(b)),
+    }
+}
+
+fn round_like(recv: &Value, ndigits: Option<i64>, kind: RoundKind) -> Result<Value, String> {
+    match recv {
+        Value::Float(f) => float_round_like(*f, ndigits, kind),
+        // `Integer#round/floor/ceil/truncate` return the receiver unchanged for
+        // a non-negative `ndigits`; only a negative count rounds to a power of
+        // ten, and MRI does that in exact integer arithmetic.
+        Value::Int(n) => Ok(match ndigits {
+            Some(d) if d < 0 => bigint_to_value(int_round_negative(
+                &num_bigint::BigInt::from(*n),
+                clamp_ndigits(d),
+                kind,
+            )),
             _ => Value::Int(*n),
         }),
         _ => Ok(recv.clone()),
     }
+}
+
+/// `ndigits` saturated into `i32`. MRI takes an `int` here, and both guards
+/// (`float_round_overflow` / `int_round_zero_p`) already collapse the extremes,
+/// so saturating cannot change an answer.
+fn clamp_ndigits(d: i64) -> i32 {
+    d.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+/// `Float#round/floor/ceil/truncate`, ported from MRI's `flo_round`,
+/// `rb_float_floor`, `rb_float_ceil` and `flo_truncate` (numeric.c).
+fn float_round_like(number: f64, ndigits: Option<i64>, kind: RoundKind) -> Result<Value, String> {
+    // MRI `flo_truncate` is literally `signbit(x) ? ceil : floor`, so the rest
+    // of the function only ever sees the three real directions.
+    let kind = match kind {
+        RoundKind::Truncate => {
+            if number.is_sign_negative() {
+                RoundKind::Ceil
+            } else {
+                RoundKind::Floor
+            }
+        }
+        k => k,
+    };
+    // A non-finite Float raises FloatDomainError when the result would be
+    // an Integer (round with no / negative ndigits, floor/ceil/truncate);
+    // round(positive ndigits) returns a Float, so Infinity/NaN pass through.
+    if !number.is_finite() {
+        if matches!(ndigits, Some(d) if d > 0) {
+            return Ok(Value::Float(number));
+        }
+        let name = if number.is_nan() {
+            "NaN"
+        } else if number > 0.0 {
+            "Infinity"
+        } else {
+            "-Infinity"
+        };
+        return Err(raise_exc("FloatDomainError", name));
+    }
+    let nd = clamp_ndigits(ndigits.unwrap_or(0));
+    // Zero keeps its sign as a Float and flattens to Integer 0 otherwise.
+    if number == 0.0 {
+        return Ok(if nd > 0 {
+            Value::Float(number)
+        } else {
+            Value::Int(0)
+        });
+    }
+    if nd > 0 {
+        let binexp = frexp_binexp(number);
+        if float_round_overflow(nd, binexp) {
+            return Ok(Value::Float(number));
+        }
+        // `round` underflows from either side; `ceil` only from below and
+        // `floor` only from above, since the other side is pinned to a nonzero
+        // value. In every case MRI hands back a *positive* zero.
+        let underflows = match kind {
+            RoundKind::Round => true,
+            RoundKind::Ceil => number < 0.0,
+            RoundKind::Floor => number > 0.0,
+            RoundKind::Truncate => unreachable!("normalized above"),
+        };
+        if underflows && float_round_underflow(nd, binexp) {
+            return Ok(Value::Float(0.0));
+        }
+        // MRI `ACCURATE_POW10(ndigits)` is `ndigits < DBL_DIG`; past that the
+        // scale factor itself is inexact and MRI switches to rationals.
+        if nd >= 15 {
+            return Ok(Value::Float(flo_round_by_rational(number, nd, kind)));
+        }
+        let f = 10f64.powi(nd);
+        return Ok(Value::Float(match kind {
+            RoundKind::Round => round_half_up(number, f) / f,
+            RoundKind::Ceil => (number * f).ceil() / f,
+            RoundKind::Floor => {
+                // MRI nudges up one unit and backs off only if that overshot,
+                // which repairs the `number * f` product's rounding error.
+                let mul = (number * f).floor();
+                let res = (mul + 1.0) / f;
+                if res > number {
+                    mul / f
+                } else {
+                    res
+                }
+            }
+            RoundKind::Truncate => unreachable!("normalized above"),
+        }));
+    }
+    // `ndigits <= 0` yields an Integer: convert first, then round the integer
+    // exactly. `round` truncates toward zero on the way in (MRI `flo_to_i`),
+    // `floor`/`ceil` take their own direction.
+    let (whole, nd0_done) = match kind {
+        RoundKind::Round if nd == 0 => (round_half_up(number, 1.0), true),
+        RoundKind::Round => (number.trunc(), false),
+        RoundKind::Floor => (number.floor(), false),
+        RoundKind::Ceil => (number.ceil(), false),
+        RoundKind::Truncate => unreachable!("normalized above"),
+    };
+    if nd0_done || nd == 0 {
+        return Ok(float_to_int_value(whole));
+    }
+    let Some(exact) = f64_to_bigint(whole) else {
+        return Ok(float_to_int_value(whole));
+    };
+    Ok(bigint_to_value(int_round_negative(&exact, nd, kind)))
+}
+
+/// The exact `BigInt` an integral f64 denotes, or `None` if it is not finite.
+fn f64_to_bigint(f: f64) -> Option<num_bigint::BigInt> {
+    use num_traits::FromPrimitive as _;
+    num_bigint::BigInt::from_f64(f)
 }
 
 fn iter_int_range(
@@ -8342,7 +8759,7 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
     match name {
         "numerator" => Ok(with_host(|h| h.new_bigint(r.numer().clone()))),
         "denominator" => Ok(with_host(|h| h.new_bigint(r.denom().clone()))),
-        "to_f" => Ok(Value::Float(r.to_f64().unwrap_or(f64::NAN))),
+        "to_f" => Ok(Value::Float(rational_to_f64(&r))),
         "to_i" | "to_int" | "truncate" => Ok(with_host(|h| h.new_bigint(r.to_integer()))),
         // `#floor`/`#ceil`/`#round` with no digits argument round to the nearest
         // Integer (toward -inf / +inf / nearest). `num_rational::Ratio` provides
@@ -8360,9 +8777,7 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
         "/" | "quo" => match with_host(|h| h.as_rational(&args[0])) {
             Some(d) if !d.is_zero() => Ok(rat(r / d)),
             Some(_) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
-            None => Ok(Value::Float(
-                r.to_f64().unwrap_or(f64::NAN) / as_f(&args[0]),
-            )),
+            None => Ok(Value::Float(rational_to_f64(&r) / as_f(&args[0]))),
         },
         "**" | "pow" => {
             if let Some(exp) = int_arg(&args[0]) {
@@ -8373,9 +8788,7 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
                 };
                 Ok(rat(p))
             } else {
-                Ok(Value::Float(
-                    r.to_f64().unwrap_or(f64::NAN).powf(as_f(&args[0])),
-                ))
+                Ok(Value::Float(rational_to_f64(&r).powf(as_f(&args[0]))))
             }
         }
         "<=>" => match with_host(|h| h.as_rational(&args[0])) {
@@ -15541,6 +15954,15 @@ fn bytes_to_binstr(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| b as char).collect()
 }
 
+/// The low 64 bits of an Integer, two's complement for a negative — what MRI's
+/// `pack` keeps when the value is wider than the directive.
+fn bigint_low_u64(b: &num_bigint::BigInt) -> u64 {
+    use num_integer::Integer as _;
+    use num_traits::ToPrimitive as _;
+    let modulus = num_bigint::BigInt::from(u64::MAX) + 1;
+    b.mod_floor(&modulus).to_u64().unwrap_or(0)
+}
+
 /// Decode a binary string to its byte sequence (each codepoint's low 8 bits).
 fn binstr_to_bytes(s: &str) -> Vec<u8> {
     s.chars().map(|c| (c as u32 & 0xff) as u8).collect()
@@ -15649,7 +16071,14 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
                 let little = matches!(d.kind, 'V' | 'v');
                 let n = d.count.unwrap_or(items.len().saturating_sub(idx));
                 for _ in 0..n {
-                    let v = items.get(idx).map(as_i).unwrap_or(0) as u64;
+                    // An Integer wider than the directive keeps its low bytes
+                    // (MRI truncates rather than raising), and a promoted BigInt
+                    // has to go through `as_bigint` — `as_i` bottoms out at 0
+                    // for anything past the i64 range.
+                    let v = match with_host(|h| items.get(idx).and_then(|it| h.as_bigint(it))) {
+                        Some(b) => bigint_low_u64(&b),
+                        None => items.get(idx).map(as_i).unwrap_or(0) as u64,
+                    };
                     idx += 1;
                     let full = v.to_be_bytes();
                     let mut w: Vec<u8> = full[8 - width..].to_vec();
@@ -15662,15 +16091,24 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
             // Native-endian integers (little-endian on x86-64/aarch64): s/S 16-bit,
             // l/L 32-bit, q/Q 64-bit, i/I/j/J native word (modeled as 64-bit).
             's' | 'S' | 'l' | 'L' | 'q' | 'Q' | 'i' | 'I' | 'j' | 'J' => {
+                // `i`/`I` are a native `int` (4 bytes), not a native `long`;
+                // `j`/`J` are pointer-width (8).
                 let width = match d.kind {
                     's' | 'S' => 2usize,
-                    'l' | 'L' => 4,
+                    'l' | 'L' | 'i' | 'I' => 4,
                     _ => 8,
                 };
                 let n = d.count.unwrap_or(items.len().saturating_sub(idx));
                 let big = d.endian == Some(false);
                 for _ in 0..n {
-                    let v = items.get(idx).map(as_i).unwrap_or(0) as u64;
+                    // An Integer wider than the directive keeps its low bytes
+                    // (MRI truncates rather than raising), and a promoted BigInt
+                    // has to go through `as_bigint` — `as_i` bottoms out at 0
+                    // for anything past the i64 range.
+                    let v = match with_host(|h| items.get(idx).and_then(|it| h.as_bigint(it))) {
+                        Some(b) => bigint_low_u64(&b),
+                        None => items.get(idx).map(as_i).unwrap_or(0) as u64,
+                    };
                     idx += 1;
                     if big {
                         out.extend_from_slice(&v.to_be_bytes()[8 - width..]);
@@ -15833,6 +16271,93 @@ fn unpack_bytes(bytes: &[u8], fmt: &str) -> Result<Vec<Value>, String> {
                     }
                 }
             }
+            // Fixed-width integers, mirroring the same directives in `pack`:
+            // lowercase is signed, uppercase unsigned; `<`/`>` pick the byte
+            // order and native (little on every supported target) is the default.
+            's' | 'S' | 'l' | 'L' | 'q' | 'Q' | 'i' | 'I' | 'j' | 'J' => {
+                let width = match d.kind {
+                    's' | 'S' => 2usize,
+                    'l' | 'L' | 'i' | 'I' => 4,
+                    _ => 8,
+                };
+                let signed = d.kind.is_lowercase();
+                let big = d.endian == Some(false);
+                let n = d.count.unwrap_or(usize::MAX);
+                let mut produced = 0;
+                while produced < n && pos + width <= bytes.len() {
+                    let chunk = &bytes[pos..pos + width];
+                    let mut buf = [0u8; 8];
+                    let raw = if big {
+                        buf[8 - width..].copy_from_slice(chunk);
+                        u64::from_be_bytes(buf)
+                    } else {
+                        buf[..width].copy_from_slice(chunk);
+                        u64::from_le_bytes(buf)
+                    };
+                    // Sign-extend from the directive's width before handing the
+                    // value back as a Ruby Integer. An unsigned 64-bit value
+                    // past `i64::MAX` promotes to a bignum rather than wrapping
+                    // negative.
+                    out.push(if signed {
+                        Value::Int(if width < 8 {
+                            ((raw << (64 - width * 8)) as i64) >> (64 - width * 8)
+                        } else {
+                            raw as i64
+                        })
+                    } else if raw > i64::MAX as u64 {
+                        with_host(|h| h.new_bigint(num_bigint::BigInt::from(raw)))
+                    } else {
+                        Value::Int(raw as i64)
+                    });
+                    pos += width;
+                    produced += 1;
+                }
+                if d.count.is_some() {
+                    for _ in produced..n {
+                        out.push(Value::Undef);
+                    }
+                }
+            }
+            // Floats: `D`/`d`/`E`/`G` double, `F`/`f`/`e`/`g` single. `E`/`e` are
+            // little-endian, `G`/`g` big-endian, the rest native.
+            'D' | 'd' | 'E' | 'F' | 'f' | 'e' | 'G' | 'g' => {
+                let double = matches!(d.kind, 'D' | 'd' | 'E' | 'G');
+                let big = matches!(d.kind, 'G' | 'g');
+                let width = if double { 8 } else { 4 };
+                let n = d.count.unwrap_or(usize::MAX);
+                let mut produced = 0;
+                while produced < n && pos + width <= bytes.len() {
+                    let chunk = &bytes[pos..pos + width];
+                    let f = if double {
+                        let b: [u8; 8] = chunk.try_into().unwrap_or([0; 8]);
+                        if big {
+                            f64::from_be_bytes(b)
+                        } else {
+                            f64::from_le_bytes(b)
+                        }
+                    } else {
+                        let b: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
+                        f64::from(if big {
+                            f32::from_be_bytes(b)
+                        } else {
+                            f32::from_le_bytes(b)
+                        })
+                    };
+                    out.push(Value::Float(f));
+                    pos += width;
+                    produced += 1;
+                }
+                if d.count.is_some() {
+                    for _ in produced..n {
+                        out.push(Value::Undef);
+                    }
+                }
+            }
+            // Cursor moves, which produce no values: `x` skips forward, `X` backs
+            // up, `@` seeks to an absolute offset.
+            'x' => pos = (pos + d.count.unwrap_or(1)).min(bytes.len()),
+            'X' => pos = pos.saturating_sub(d.count.unwrap_or(1)),
+            '@' => pos = d.count.unwrap_or(0).min(bytes.len()),
             'H' | 'h' => {
                 let rest = &bytes[pos.min(bytes.len())..];
                 let avail = rest.len() * 2;
@@ -16395,18 +16920,78 @@ fn has_radix_prefix(s: &str) -> bool {
 }
 
 /// Ruby `String#to_f`: the leading float prefix, or 0.0.
-fn parse_leading_float(s: &str) -> f64 {
-    let t = s.trim();
-    let mut buf = String::new();
-    let mut seen_dot = false;
-    for (i, c) in t.chars().enumerate() {
-        if c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+')) {
-            buf.push(c);
-        } else if c == '.' && !seen_dot {
-            seen_dot = true;
-            buf.push(c);
+/// Consume a run of digits at `i`, appending them to `out` and dropping any
+/// underscore that sits between two digits. Returns whether a digit was taken.
+///
+/// MRI accepts `_` only when both neighbours are digits; anywhere else it ends
+/// the number, so `"1_000.5".to_f` is `1000.5` but `"1__0".to_f` is `1.0`.
+fn take_digit_run(b: &[u8], i: &mut usize, out: &mut String) -> bool {
+    let mut any = false;
+    while *i < b.len() {
+        if b[*i].is_ascii_digit() {
+            out.push(b[*i] as char);
+            *i += 1;
+            any = true;
+        } else if b[*i] == b'_' && any && *i + 1 < b.len() && b[*i + 1].is_ascii_digit() {
+            *i += 1;
         } else {
             break;
+        }
+    }
+    any
+}
+
+/// `String#to_f` — MRI `rb_str_to_dbl(str, FALSE)`: `strtod` over the longest
+/// numeric prefix, with underscores between digits removed and no error for
+/// trailing junk. Anything that does not begin a number is `0.0`.
+///
+/// The prefix is rebuilt digit by digit rather than handed to Rust's parser
+/// whole, because that parser also accepts `inf`/`NaN`, which MRI's does not.
+fn parse_leading_float(s: &str) -> f64 {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    // With `badcheck` off MRI refuses a hex float outright rather than reading
+    // the leading `0`.
+    if i + 1 < b.len() && b[i] == b'0' && (b[i + 1] | 0x20) == b'x' {
+        return 0.0;
+    }
+    let mut buf = String::new();
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        buf.push(b[i] as char);
+        i += 1;
+    }
+    let int_digits = take_digit_run(b, &mut i, &mut buf);
+    // A `.` only joins the number when a digit follows it (`"1.".to_f` is 1.0).
+    let mut frac_digits = false;
+    if i < b.len() && b[i] == b'.' {
+        let mut j = i + 1;
+        let mut frac = String::new();
+        frac_digits = take_digit_run(b, &mut j, &mut frac);
+        if frac_digits {
+            buf.push('.');
+            buf.push_str(&frac);
+            i = j;
+        }
+    }
+    if !int_digits && !frac_digits {
+        return 0.0;
+    }
+    // Likewise an exponent is only taken when it is complete: `"1e".to_f` is 1.0.
+    if i < b.len() && (b[i] | 0x20) == b'e' {
+        let mut j = i + 1;
+        let mut exp = String::new();
+        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+            exp.push(b[j] as char);
+            j += 1;
+        }
+        let mut mag = String::new();
+        if take_digit_run(b, &mut j, &mut mag) {
+            buf.push('e');
+            buf.push_str(&exp);
+            buf.push_str(&mag);
         }
     }
     buf.parse().unwrap_or(0.0)

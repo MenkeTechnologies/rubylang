@@ -2135,3 +2135,212 @@ p("a=b" =~ /=/)
 n = 10
 n /= 2
 p n
+#==#
+# ── Float#round(ndigits) underflows to a POSITIVE zero (MRI float_round_underflow) ──
+p (-1.5 / 1e10).round(4)
+p (-0.0001).round(2)
+p (-0.00001).ceil(2)
+p (-0.00001).truncate(2)
+p (-0.0).round(2)
+#==#
+# ── Float#round repairs the `x * 10**n` product's rounding error (round_half_up) ──
+p 1.005.round(2)
+p 0.145.round(2)
+p 2.675.round(2)
+p (-2.675).round(2)
+#==#
+# ── ndigits past DBL_DIG redoes the rounding in exact rationals ──
+p 49.989999999999995.round(15)
+p (-1.0e-14).ceil(15)
+p (-1.0e-14).truncate(17)
+p (-1.5e-16).round(16)
+#==#
+# ── Integer/Float rounding to a power of ten stays in exact integer math ──
+p 123456789012345678.0.floor(-3)
+p (2**70).round(-3)
+p 9999999999999999999999.round(-3)
+p (-12345).round(-2)
+p (-12345).floor(-2)
+p (-12345).ceil(-2)
+p 12345.round(-20)
+#==#
+# ── Integer#fdiv / Rational#to_f cancel the gcd, then convert each side ──
+p 49989999999999995.fdiv(10**15)
+p Rational(49989999999999995, 10**15).to_f
+p 10000000000000001.fdiv(3)
+p Rational(1, 3).to_f
+#==#
+# ── Float#to_s keeps fixed notation while the point falls inside the digits ──
+p 3333333333333333.5
+p 123456789012345.6
+p 1e15
+p 1e16
+p 1234567890123456.0
+p 0.0001
+p 9.999e-5
+p(-0.0)
+p 1.0e-320
+#==#
+# ── String#to_f honours exponents and digit-separating underscores ──
+p "1e15".to_f
+p "1_000.5".to_f
+p "1.0e-320".to_f
+p "1e-400".to_f
+p "1e400".to_f
+p "1e".to_f
+p ".5".to_f
+p "0x10".to_f
+p "1__0".to_f
+p "  3.5  ".to_f
+#==#
+# ── unpack covers the fixed-width integer and float directives pack emits ──
+p [1.5, -2.25].pack("D2").unpack("D2")
+p [1.5, -2.25].pack("g2").unpack("g2")
+p [-3, 300].pack("i2").unpack("i2")
+p [2**64 - 3].pack("Q").unpack1("Q")
+p [-1].pack("s").unpack1("s")
+p "abcdef".unpack("a2 X1 a2")
+p "abcdef".unpack("@3a2")
+#==#
+# ── `while`/`until` evaluate to their `break` operand, not always nil ──
+p(while true do break 7 end)
+p(until false do break 8 end)
+p(while false do break 9 end)
+v = while true
+  begin
+    break 11
+  rescue
+    nil
+  end
+end
+p v
+#==#
+# ── break/next raised from a `begin` body still target the enclosing loop ──
+i = 0
+until i >= 3
+  i += 1
+  begin
+    next
+  rescue
+    nil
+  end
+end
+p i
+log = []
+n = 0
+while true
+  n += 1
+  begin
+    break if n == 4
+  ensure
+    log << n
+  end
+end
+p [n, log]
+#==#
+# ── a `break` from a block keeps belonging to the method, not the outer loop ──
+i = 0
+seen = []
+while i < 3
+  i += 1
+  [10, 20].each do |x|
+    begin
+      break if x == 20
+    rescue
+      nil
+    end
+    seen << [i, x]
+  end
+end
+p [i, seen]
+#==#
+# ── return / raise still unwind straight through a loop's begin ──
+def loop_ret
+  k = 0
+  while true
+    k += 1
+    begin
+      return k if k == 3
+    ensure
+      nil
+    end
+  end
+end
+p loop_ret
+def loop_raise
+  while true
+    begin
+      raise ArgumentError, "stop"
+    rescue ArgumentError => e
+      return e.message
+    end
+  end
+end
+p loop_raise
+#==#
+# ── the builtin exception tree has its real intermediate layers ──
+p [ArgumentError.superclass, NoMethodError.superclass, KeyError.superclass]
+p [FloatDomainError.superclass, FrozenError.superclass, LoadError.superclass]
+p [StandardError.superclass, SystemExit.superclass, NotImplementedError.superclass]
+class MyErr < ArgumentError; end
+begin
+  raise MyErr, "boom"
+rescue => e
+  p [e.class, e.is_a?(ArgumentError), e.is_a?(StandardError), e.is_a?(Exception)]
+end
+begin; raise KeyError, "k"; rescue IndexError; puts "KeyError < IndexError"; end
+begin; raise FloatDomainError, "f"; rescue RangeError; puts "FloatDomainError < RangeError"; end
+#==#
+# ── a bare `rescue` catches StandardError only, so ScriptError falls through ──
+begin
+  begin
+    raise NotImplementedError, "ni"
+  rescue => e
+    puts "wrongly caught #{e.class}"
+  end
+rescue NotImplementedError => e
+  puts "fell through: #{e.class}"
+end
+#==#
+# ── an exception keeps its class across a Fiber boundary ──
+f = Fiber.new { raise TypeError, "tboom" }
+begin
+  f.resume
+rescue => e
+  p [e.class, e.message]
+end
+g = Fiber.new { Fiber.yield 1; raise KeyError, "kb" }
+p g.resume
+begin
+  g.resume
+rescue KeyError => e
+  p [e.class, e.message]
+end
+#==#
+# ── block scoping: a block param is per-iteration, `for` shares one binding ──
+procs = []
+3.times { |i| procs << -> { i } }
+p procs.map(&:call)
+cs = []
+for k in 0..2
+  cs << -> { k }
+end
+p [cs.map(&:call), k]
+1.times { x = 1 }
+p defined?(x)
+z = 5
+[1].each { z = 9 }
+p z
+#==#
+# ── explicit block-locals shadow instead of assigning the outer name ──
+tmp = "outer"
+[1, 2].each { |i; tmp| tmp = i * 100 }
+p tmp
+a = 1
+[9].each { |a| }
+p a
+#==#
+# ── Proc.new takes the block, like Kernel#proc ──
+sq = Proc.new { |n| n * n }
+p [sq.call(5), sq.class, sq.lambda?]
+p [1, 2, 3].map { |n| Proc.new { n * 2 } }.map(&:call)

@@ -1835,8 +1835,11 @@ impl Compiler {
         self.compile_seq(b, body)?;
         b.emit(Op::Pop, 0); // discard the body value each iteration
         b.emit(Op::Jump(start), 0);
+        b.patch_jump(exit, b.current_pos());
+        // Running out of iterations makes the loop nil; a `break` lands *past*
+        // this, carrying its own operand as the loop's value.
+        b.emit(Op::LoadUndef, 0);
         let end = b.current_pos();
-        b.patch_jump(exit, end);
         let ctx = self.loops.pop().unwrap();
         for j in ctx.breaks {
             b.patch_jump(j, end);
@@ -1844,8 +1847,6 @@ impl Compiler {
         for j in ctx.nexts {
             b.patch_jump(j, ctx.start);
         }
-        // `while` evaluates to nil.
-        b.emit(Op::LoadUndef, 0);
         Ok(())
     }
 
@@ -1870,6 +1871,8 @@ impl Compiler {
         let cond_pos = b.current_pos();
         self.compile_cond(b, cond)?;
         b.emit(Op::JumpIfTrue(body_start), 0);
+        // Same shape as `while`: nil on a normal exit, the operand on a `break`.
+        b.emit(Op::LoadUndef, 0);
         let end = b.current_pos();
         let ctx = self.loops.pop().unwrap();
         for j in ctx.breaks {
@@ -1878,8 +1881,6 @@ impl Compiler {
         for j in ctx.nexts {
             b.patch_jump(j, cond_pos);
         }
-        // A post-test loop evaluates to nil, like `while`.
-        b.emit(Op::LoadUndef, 0);
         Ok(())
     }
 
@@ -1890,12 +1891,36 @@ impl Compiler {
         iter: &Expr,
         body: &[Stmt],
     ) -> Result<(), String> {
-        // `for v in iter … end` ≡ `iter.each { |v| … }` (block shares the frame,
-        // so `v` and any assignments leak, matching Ruby's `for`).
+        // `for v in iter … end` runs the body in the ENCLOSING scope — unlike
+        // `iter.each { |v| … }`, Ruby's `for` introduces no scope at all, so `v`
+        // outlives the loop and every closure made in the body shares the one
+        // binding (`for i in 0..2 { procs << -> { i } }` yields `[2, 2, 2]`,
+        // where the `each` form yields `[0, 1, 2]`).
+        //
+        // Desugaring to `each` with `v` as the *block parameter* would get both
+        // of those wrong, since a block parameter is block-local. Bind a hidden
+        // parameter instead and copy it into the enclosing local.
+        self.tmp += 1;
+        let hidden = format!("__for{}__", self.tmp);
+        // Declare the loop variable in the enclosing scope so it exists even if
+        // the body never runs — without clobbering a value it already has
+        // (`x = 5; for x in []; end; p x` is still 5).
+        self.kstr(b, var);
+        b.emit(Op::CallBuiltin(ops::DEFINED, 1), 0);
+        let skip = b.emit(Op::JumpIfTrue(0), 0);
+        self.compile_assign(b, &Expr::Var(VarKind::Local, var.to_string()), &Expr::Nil)?;
+        b.emit(Op::Pop, 0);
+        b.patch_jump(skip, b.current_pos());
+
+        let mut inner = vec![Stmt::from(Expr::Assign(
+            Box::new(Expr::Var(VarKind::Local, var.to_string())),
+            Box::new(Expr::Var(VarKind::Local, hidden.clone())),
+        ))];
+        inner.extend(body.iter().cloned());
         let block = Block {
-            params: vec![var.to_string()],
+            params: vec![hidden],
             splat: None,
-            body: body.to_vec(),
+            body: inner,
         };
         let call = Expr::Call {
             recv: Some(Box::new(iter.clone())),
@@ -2564,8 +2589,54 @@ impl Compiler {
             ensure: ensure_id,
         });
         b.emit(Op::LoadInt(begin_id as i64), 0);
-        b.emit(Op::CallBuiltin(ops::BEGIN, 1), 0);
+        // Directly inside a native loop, use the variant that lets a `break`/
+        // `next` signal survive to the handoff ops below instead of unwinding.
+        let op = if self.loops.is_empty() {
+            ops::BEGIN
+        } else {
+            ops::BEGIN_IN_LOOP
+        };
+        b.emit(Op::CallBuiltin(op, 1), 0);
+        self.emit_loop_signal_handoff(b);
         Ok(())
+    }
+
+    /// Re-dispatch a `break`/`next` that a nested chunk could only signal.
+    ///
+    /// A `begin` body is compiled into its own chunk, so a `break` inside it
+    /// cannot jump to the enclosing native `while`/`until`/`for` exit — that
+    /// label lives in *this* chunk. It raises a signal instead, and the nested
+    /// run unwinds to here with the signal still pending. This turns it back
+    /// into the jump the loop was expecting.
+    ///
+    /// Emitted only when a native loop is actually open: inside a block body the
+    /// loop stack is empty, and a `break` there belongs to the method being
+    /// called, so it must keep unwinding untouched.
+    fn emit_loop_signal_handoff(&mut self, b: &mut ChunkBuilder) {
+        if self.loops.is_empty() {
+            return;
+        }
+        // Stack on entry is `[value]`, and every path leaves it that way except
+        // the two that jump out (which drop it first, as a `break`/`next`
+        // compiled in this chunk would).
+        b.emit(Op::CallBuiltin(ops::TAKE_LOOP_NEXT, 0), 0);
+        let no_next = b.emit(Op::JumpIfFalse(0), 0);
+        b.emit(Op::Pop, 0);
+        let next_jump = b.emit(Op::Jump(0), 0);
+        b.patch_jump(no_next, b.current_pos());
+
+        // Peek first, consume only on the branch that jumps: a `break` this loop
+        // does not own has to stay pending.
+        b.emit(Op::CallBuiltin(ops::PEEK_LOOP_BREAK, 0), 0);
+        let no_break = b.emit(Op::JumpIfFalse(0), 0);
+        b.emit(Op::Pop, 0);
+        b.emit(Op::CallBuiltin(ops::TAKE_LOOP_BREAK, 0), 0);
+        let break_jump = b.emit(Op::Jump(0), 0);
+        b.patch_jump(no_break, b.current_pos());
+
+        let ctx = self.loops.last_mut().unwrap();
+        ctx.nexts.push(next_jump);
+        ctx.breaks.push(break_jump);
     }
 
     fn compile_flow(
@@ -2585,7 +2656,12 @@ impl Compiler {
             }
         }
         if in_loop && matches!(kind, FlowKind::Break | FlowKind::Next) {
-            b.emit(Op::Pop, 0); // loop break/next carry no value in native form
+            // `break VALUE` makes that value the loop's own value, so it stays on
+            // the stack and lands at the loop's exit label. `next` discards it —
+            // a native loop's per-iteration value is thrown away regardless.
+            if matches!(kind, FlowKind::Next) {
+                b.emit(Op::Pop, 0);
+            }
             let j = b.emit(Op::Jump(0), 0);
             let ctx = self.loops.last_mut().unwrap();
             match kind {

@@ -1203,6 +1203,22 @@ impl Parser {
                     )?;
                 }
             }
+            // Explicit block-locals: `|i; tmp, other|`. The names after the `;`
+            // are fresh locals of the block that must not touch same-named locals
+            // outside it. A block parameter already has exactly that scope, and
+            // one that is never passed an argument starts out nil — so declaring
+            // them as trailing positional params gives the right shadowing with
+            // no new machinery.
+            if matches!(self.peek(), Tok::Semicolon) {
+                self.advance();
+                while !self.is_op("|") {
+                    let name = self.ident_name()?;
+                    params.push(name);
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+            }
             self.expect_op("|")?;
         }
         // Block keyword params (`|a:, b: default, **rest|`) — the ProcDef carries

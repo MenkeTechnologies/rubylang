@@ -150,6 +150,18 @@ pub mod ops {
     pub const SUPER_FWD_BLK: u16 = 48; // [proc] -> super forwarding args, with a new block
     pub const MKSTRF: u16 = 49; // [parts...] argc=n -> frozen heap String (frozen_string_literal)
     pub const MKHASH_MERGE: u16 = 50; // [hashes...] argc=n -> one merged Hash (later wins)
+                                      // A `break`/`next` inside a construct that compiles to its own chunk (a
+                                      // `begin`/`rescue`) can only leave a *signal* behind — it cannot jump to a
+                                      // native loop's exit, because that label lives in a different chunk. These
+                                      // three let the enclosing native loop pick the signal back up right after
+                                      // the nested chunk returns, so the jump happens in the chunk that owns it.
+    pub const TAKE_LOOP_NEXT: u16 = 51; // [] -> Bool; consume a pending `next`
+    pub const PEEK_LOOP_BREAK: u16 = 52; // [] -> Bool; is a `break` pending?
+    pub const TAKE_LOOP_BREAK: u16 = 53; // [] -> the pending `break` value
+                                         // `BEGIN` for a `begin` that sits directly in a native loop: identical, except
+                                         // a `break`/`next` signal does NOT halt the chunk, so the handoff ops the
+                                         // compiler emits right after it get to run and turn the signal into a jump.
+    pub const BEGIN_IN_LOOP: u16 = 54; // [begin_id] -> run begin/rescue/ensure
 }
 
 /// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried
@@ -3786,8 +3798,15 @@ impl RubyHost {
         // — covers both a plain user object and a native-backed builtin subclass
         // (`class Params < Hash`), whose `class_of` is the override, so
         // `params.is_a?(Hash)` and `is_a?(Enumerable)` hold.
-        if self.classes.contains_key(&actual) {
-            return self.class_is_ancestor(&actual, class);
+        if self.classes.contains_key(&actual) && self.class_is_ancestor(&actual, class) {
+            return true;
+        }
+        // Builtin exceptions (and user subclasses of them) only place correctly
+        // through the full ancestry: `class_is_ancestor` stops at the first name
+        // with no class-table entry, which is exactly where the builtin part of
+        // the tree begins (`MyErr < ArgumentError < StandardError`).
+        if is_builtin_exception_name(&actual) || self.classes.contains_key(&actual) {
+            return self.class_ancestry(&actual).iter().any(|a| a == class);
         }
         false
     }
@@ -3884,14 +3903,18 @@ impl RubyHost {
                     out.extend(["Object", "Kernel", "BasicObject"].map(String::from));
                     dedup_keep_first(out)
                 } else if is_builtin_exception_name(name) {
-                    // Exception hierarchy: <name> → Exception → Object → …
-                    if name == "Exception" {
-                        own(&[])
-                    } else {
-                        let mut v = vec![name.to_string(), "Exception".to_string()];
-                        v.extend(["Object", "Kernel", "BasicObject"].map(String::from));
-                        v
+                    // Walk the real MRI exception tree, so `rescue StandardError`
+                    // and `#is_a?` agree with it: most errors sit under
+                    // StandardError, and several have their own intermediate
+                    // parent (`NoMethodError < NameError < StandardError`).
+                    let mut v = vec![name.to_string()];
+                    let mut cur = name;
+                    while let Some(parent) = builtin_exception_parent(cur) {
+                        v.push(parent.to_string());
+                        cur = parent;
                     }
+                    v.extend(["Object", "Kernel", "BasicObject"].map(String::from));
+                    v
                 } else {
                     own(&[])
                 }
@@ -3965,6 +3988,14 @@ impl RubyHost {
     }
     /// Whether `name` is a builtin class/type name (for constant resolution).
     pub fn is_builtin_class(&self, name: &str) -> bool {
+        // Every builtin exception is a class constant too, including the few not
+        // spelled `*Error` (`SystemExit`, `SignalException`, `Interrupt`). They
+        // are all top-level, so a qualified name is never one of them — without
+        // that guard a namespaced probe like `Foo::NegativeError` would resolve
+        // to a phantom class just for ending in "Error".
+        if !name.contains("::") && is_builtin_exception_name(name) {
+            return true;
+        }
         matches!(
             name,
             "Integer"
@@ -4824,22 +4855,16 @@ impl RubyHost {
     /// `rescued` (walks the exception's superclass chain; unknown classes match
     /// generously so a bare `StandardError` rescue still fires).
     pub fn exc_matches(&self, exc_class: &str, rescued: &str) -> bool {
-        if exc_class == rescued || rescued == "Exception" || rescued == "StandardError" {
+        if exc_class == rescued || rescued == "Exception" {
             return true;
         }
-        // Walk the user superclass chain if the exception is a user class.
-        let mut cur = Some(exc_class.to_string());
-        while let Some(name) = cur {
-            if name == rescued {
-                return true;
-            }
-            cur = self
-                .classes
-                .get(&name)
-                .and_then(|d| d.superclass.clone())
-                .map(|s| self.resolve_class_alias(&s, &name));
+        // A name we have no record of cannot be placed in the tree — many
+        // builtins report a failure by message alone. Treat it as a plain
+        // StandardError so a bare `rescue` still fires.
+        if !self.classes.contains_key(exc_class) && !is_builtin_exception_name(exc_class) {
+            return rescued == "StandardError";
         }
-        false
+        self.class_ancestry(exc_class).iter().any(|a| a == rescued)
     }
     pub fn begin_def(&self, id: usize) -> Option<BeginDef> {
         self.begins.get(id).cloned()
@@ -5771,6 +5796,27 @@ pub fn inspect_string(s: &str) -> String {
     out
 }
 
+/// The shortest round-tripping decimal digit string for `|f|`, plus the position
+/// of the decimal point relative to it — the `digits` / `decpt` pair MRI gets
+/// from `ruby_dtoa(value, 0, 0, ...)`.
+///
+/// Rust's `{:e}` already emits the shortest representation that round-trips, so
+/// the digits are read off it and the exponent shifted by one (`{:e}` puts the
+/// point after the first digit, `decpt` puts it before them all).
+fn dtoa_shortest(f: f64) -> (String, i32) {
+    let s = format!("{:e}", f.abs());
+    let (mant, exp) = s.split_once('e').unwrap_or((s.as_str(), "0"));
+    let decpt = exp.parse::<i32>().unwrap_or(0) + 1;
+    (mant.chars().filter(|c| *c != '.').collect(), decpt)
+}
+
+/// `Float#to_s`, ported from MRI `flo_to_s` (numeric.c).
+///
+/// The choice between fixed and exponential notation is driven by the *shortest
+/// representation*, not by magnitude: a value keeps fixed notation whenever the
+/// decimal point falls inside the digit string (`decpt < digs`), however large
+/// it is. That is why `1e15` prints as `1.0e+15` but `3333333333333333.5`, which
+/// is larger, prints in full.
 fn fmt_float(f: f64) -> String {
     if !f.is_finite() {
         return if f.is_nan() {
@@ -5781,34 +5827,49 @@ fn fmt_float(f: f64) -> String {
             "-Infinity".to_string()
         };
     }
-    let a = f.abs();
-    // Ruby prints in scientific notation outside [1e-4, 1e15): a magnitude >= 1e15
-    // has a decimal exponent past Float::DIG (15), and < 1e-4 is below -4.
-    if a != 0.0 && !(1e-4..1e15).contains(&a) {
-        return sci_notation(f);
-    }
-    if f == f.trunc() {
-        format!("{f:.1}")
+    /// `DBL_DIG` — past this many leading places MRI gives up on fixed notation.
+    const DBL_DIG: i32 = 15;
+    let (digits, decpt) = dtoa_shortest(f);
+    let digs = digits.len() as i32;
+    let mut out = if f.is_sign_negative() {
+        "-".to_string()
     } else {
-        format!("{f}")
+        String::new()
+    };
+    if decpt > 0 {
+        if decpt < digs {
+            // The point lands between digits: split the string there.
+            let (int, frac) = digits.split_at(decpt as usize);
+            out.push_str(int);
+            out.push('.');
+            out.push_str(frac);
+            return out;
+        }
+        if decpt <= DBL_DIG {
+            // Every digit is integral; pad out to the point and add a bare `.0`.
+            out.push_str(&digits);
+            out.extend(std::iter::repeat('0').take((decpt - digs) as usize));
+            out.push_str(".0");
+            return out;
+        }
+    } else if decpt > -4 {
+        // A small magnitude still prints in full: `0.` then the leading zeros.
+        out.push_str("0.");
+        out.extend(std::iter::repeat('0').take((-decpt) as usize));
+        out.push_str(&digits);
+        return out;
     }
-}
-
-/// Ruby-style scientific notation: `1.8446744073709552e+19`, `1.0e-05` — a
-/// mantissa that always shows a decimal point and a signed, ≥2-digit exponent.
-fn sci_notation(f: f64) -> String {
-    let s = format!("{f:e}"); // e.g. "1.8446744073709552e19" / "1e-5"
-    let (mant, exp) = s.split_once('e').unwrap_or((&s, "0"));
-    let mant = if mant.contains('.') {
-        mant.to_string()
+    // Exponential form: one digit, a point, the rest (or a filler `0`), then a
+    // signed exponent padded to at least two digits.
+    out.push_str(&digits[..1]);
+    out.push('.');
+    if digs > 1 {
+        out.push_str(&digits[1..]);
     } else {
-        format!("{mant}.0")
-    };
-    let (sign, digits) = match exp.strip_prefix('-') {
-        Some(d) => ("-", d),
-        None => ("+", exp),
-    };
-    format!("{mant}e{sign}{digits:0>2}")
+        out.push('0');
+    }
+    out.push_str(&format!("e{:+03}", decpt - 1));
+    out
 }
 
 fn as_int(v: &Value) -> Option<i64> {
@@ -5900,7 +5961,39 @@ fn gemspec_require_paths(spec: &std::path::Path) -> Option<Vec<String>> {
 
 /// Whether `name` is a builtin exception class name (for ancestry).
 fn is_builtin_exception_name(name: &str) -> bool {
-    name.ends_with("Error") || name == "Exception" || name == "StopIteration"
+    // Most are `*Error`; the rest are the handful MRI named otherwise.
+    name.ends_with("Error")
+        || matches!(
+            name,
+            "Exception" | "StopIteration" | "SystemExit" | "SignalException" | "Interrupt"
+        )
+}
+
+/// The direct superclass of a builtin exception class, mirroring MRI's tree
+/// (`error.c`). `Exception` itself has no exception parent (it derives from
+/// `Object`), and any `*Error` not listed sits directly under `StandardError` —
+/// the same default MRI uses for library-defined errors, and what makes a bare
+/// `rescue` catch them.
+fn builtin_exception_parent(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "Exception" => return None,
+        // Direct children of Exception — deliberately NOT rescued by a bare
+        // `rescue`, which is the whole point of keeping them off StandardError.
+        "NoMemoryError" | "ScriptError" | "SecurityError" | "SignalException" | "StandardError"
+        | "SystemExit" | "SystemStackError" => "Exception",
+        "LoadError" | "NotImplementedError" | "SyntaxError" => "ScriptError",
+        "Interrupt" => "SignalException",
+        // Intermediate parents inside StandardError.
+        "UncaughtThrowError" => "ArgumentError",
+        "EOFError" => "IOError",
+        "KeyError" | "StopIteration" => "IndexError",
+        "ClosedQueueError" => "StopIteration",
+        "NoMethodError" => "NameError",
+        "FloatDomainError" => "RangeError",
+        "FrozenError" => "RuntimeError",
+        "NoMatchingPatternKeyError" => "NoMatchingPatternError",
+        _ => "StandardError",
+    })
 }
 
 fn cmp_ord(op: NumOp, o: std::cmp::Ordering) -> bool {
@@ -6808,8 +6901,12 @@ pub fn run_begin(begin_id: usize) -> Result<Value, String> {
         let mut handled = false;
         let mut retrying = false;
         for rd in &bd.rescues {
-            // A bare `rescue` (no classes, no splat) catches StandardError.
-            let is_bare = rd.classes.is_empty() && rd.splat.is_none();
+            // A bare `rescue` (no classes, no splat) catches StandardError and
+            // nothing above it — `SystemExit`, `LoadError`, `NotImplementedError`
+            // and friends deliberately fall through it, as in MRI.
+            let is_bare = rd.classes.is_empty()
+                && rd.splat.is_none()
+                && with_host(|h| h.exc_matches(&exc_class, "StandardError"));
             let static_match = rd
                 .classes
                 .iter()
@@ -7049,19 +7146,30 @@ pub fn fiber_resume(fiber: &Value, v: Value) -> Result<Value, String> {
 
     CUR_FIBER.with(|c| c.set(prev));
     // Pull the fiber's context back out, restore the caller's.
-    let fiber_ctx = with_host(|h| h.install_fiber_ctx(caller_ctx));
+    let mut fiber_ctx = with_host(|h| h.install_fiber_ctx(caller_ctx));
+
+    let out = match out {
+        corosensei::CoroutineResult::Yield(y) => Ok(y),
+        corosensei::CoroutineResult::Return(r) => {
+            with_fibers(|fibers| fibers[id as usize].done = true);
+            if r.is_err() {
+                // The raise happened on the fiber's side of the swap, so the
+                // exception OBJECT sits in the fiber's context while only the
+                // message string rides out in the `Err`. Hand the object back to
+                // the caller, or `rescue` would rebuild it from that string and
+                // every `raise TypeError` would arrive as a bare RuntimeError.
+                if let Some(exc) = fiber_ctx.pending_exc.take() {
+                    with_host(|h| h.set_pending_exc(exc));
+                }
+            }
+            r // block's value, or a propagated raise
+        }
+    };
     with_fibers(|fibers| {
         fibers[id as usize].ctx = fiber_ctx;
         fibers[id as usize].coro = Some(coro);
     });
-
-    match out {
-        corosensei::CoroutineResult::Yield(y) => Ok(y),
-        corosensei::CoroutineResult::Return(r) => {
-            with_fibers(|fibers| fibers[id as usize].done = true);
-            r // block's value, or a propagated raise
-        }
-    }
+    out
 }
 
 /// `fiber.alive?` — false once the block has returned.
@@ -8429,6 +8537,27 @@ pub fn take_break() -> Option<Value> {
         }
         _ => None,
     })
+}
+/// Consume a pending `next` signal, returning its value. Any other signal is
+/// left in place so it keeps unwinding.
+pub fn take_next() -> Option<Value> {
+    with_host(|h| match &h.signal {
+        Some(Signal::Next(_)) => match h.signal.take() {
+            Some(Signal::Next(v)) => Some(v),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+/// Whether a `break` signal is pending, without consuming it.
+/// Whether the pending signal is a `break` or `next` — the two a native loop
+/// owns and will re-dispatch itself, rather than letting it unwind the chunk.
+pub fn pending_signal_is_loop_flow() -> bool {
+    with_host(|h| matches!(h.signal, Some(Signal::Break(_)) | Some(Signal::Next(_))))
+}
+/// Whether a `break` signal is pending, without consuming it.
+pub fn peek_break() -> Value {
+    with_host(|h| Value::Bool(matches!(h.signal, Some(Signal::Break(_)))))
 }
 pub fn has_pending_signal() -> bool {
     with_host(|h| h.signal.is_some())
