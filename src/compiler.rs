@@ -42,11 +42,17 @@ pub struct Program {
     pub procs: Vec<ProcDef>,
 }
 
-/// Break/next jump fixups for a native `while` loop.
+/// Break/next/redo jump fixups for a native `while` loop.
 struct LoopCtx {
     start: usize,
+    /// First op of the loop *body* — where `redo` jumps back to. For `while`/
+    /// `until` this is past the condition test (a `redo` must not re-test it);
+    /// for the post-test `begin … end while` form it is the same as `start`.
+    /// Filled in once the condition has been emitted.
+    body_start: usize,
     breaks: Vec<usize>,
     nexts: Vec<usize>,
+    redos: Vec<usize>,
 }
 
 #[derive(Default)]
@@ -56,6 +62,15 @@ pub struct Compiler {
     begins: Vec<BeginDef>,
     procs: Vec<ProcDef>,
     loops: Vec<LoopCtx>,
+    /// Whether a `redo` compiled into the current chunk has something that will
+    /// re-run it. True inside a block/lambda body (`call_proc` re-runs it) and
+    /// inside a `begin` nested in a native loop (the loop's `TAKE_LOOP_REDO`
+    /// handoff re-runs it). `self.loops` covers the direct in-loop case on its
+    /// own, but it is emptied when compiling a nested chunk, so this flag carries
+    /// the fact across that boundary. Anywhere else MRI raises
+    /// `Invalid redo (SyntaxError)`, and so does this compiler. Reset (and
+    /// restored) across a method body, which is a new `redo` context.
+    redo_ok: bool,
     /// Monotonic counter for unique temporaries (`case/in` subject slots).
     tmp: usize,
     /// When true (`--dap`), emit a per-statement `Op::Extended(DBG_LINE)` marker
@@ -196,6 +211,7 @@ fn slot_scan_expr(
         | Expr::SelfExpr
         | Expr::Regex(_, _)
         | Expr::Retry
+        | Expr::Redo
         | Expr::Var(_, _) => {}
         Expr::Str(parts) => {
             for p in parts {
@@ -392,6 +408,211 @@ fn scope_plain_assigns(body: &[Stmt]) -> Vec<String> {
     out
 }
 
+/// Every local a `for` body assigns, in first-seen order.
+///
+/// Ruby's `for` introduces no scope, so a local first assigned in the body
+/// outlives the loop exactly like the loop variable does
+/// (`for i in 1..3; sq = i * i; end` leaves both `i` and `sq` behind, and
+/// `defined?(sq)` is `"local-variable"` even when the loop body never ran).
+/// The body is lowered to an `each` block, whose locals *are* block-local, so
+/// `compile_for` pre-declares every name this returns in the enclosing scope —
+/// the block's assignment then writes through to that binding instead of making
+/// a fresh one per iteration (which is also what makes a closure created in the
+/// body share the final value, as MRI does).
+///
+/// The walk follows control flow — `if`/`while`/`case`/`case-in`/`begin` and a
+/// nested `for`, all of which are the same scope in MRI — and stops at the
+/// things that genuinely open a new one: a block or lambda body, a `def`, and a
+/// `class`/`module` body.
+fn for_body_locals(body: &[Stmt]) -> Vec<String> {
+    let mut out = Vec::new();
+    for s in body {
+        for_locals_expr(&s.expr, &mut out);
+    }
+    out
+}
+
+fn push_local(name: &str, out: &mut Vec<String>) {
+    if !out.iter().any(|x| x == name) {
+        out.push(name.to_string());
+    }
+}
+
+/// Record the locals an assignment target binds (`a`, `*rest`, or a nested
+/// destructuring target list).
+fn for_locals_target(t: &Expr, out: &mut Vec<String>) {
+    match t {
+        Expr::Var(VarKind::Local, n) => push_local(n, out),
+        Expr::Splat(inner) => for_locals_target(inner, out),
+        Expr::Array(items) => items.iter().for_each(|i| for_locals_target(i, out)),
+        _ => {}
+    }
+}
+
+fn for_locals_pattern(p: &Pattern, out: &mut Vec<String>) {
+    match p {
+        Pattern::Bind(n) => push_local(n, out),
+        Pattern::Splat(Some(n)) => push_local(n, out),
+        Pattern::As(inner, n) => {
+            for_locals_pattern(inner, out);
+            push_local(n, out);
+        }
+        Pattern::Array(ps) | Pattern::Or(ps) => ps.iter().for_each(|p| for_locals_pattern(p, out)),
+        Pattern::Hash(fields, _) => {
+            for (key, sub) in fields {
+                match sub {
+                    // `{key:}` shorthand binds `key` itself.
+                    None => push_local(key, out),
+                    Some(p) => for_locals_pattern(p, out),
+                }
+            }
+        }
+        Pattern::Const(_, Some(inner)) => for_locals_pattern(inner, out),
+        _ => {}
+    }
+}
+
+fn for_locals_body(body: &[Stmt], out: &mut Vec<String>) {
+    for s in body {
+        for_locals_expr(&s.expr, out);
+    }
+}
+
+fn for_locals_expr(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Assign(t, v) => {
+            for_locals_target(t, out);
+            for_locals_expr(v, out);
+        }
+        Expr::MultiAssign { targets, values } => {
+            targets.iter().for_each(|t| for_locals_target(t, out));
+            values.iter().for_each(|v| for_locals_expr(v, out));
+        }
+        Expr::If {
+            cond,
+            then,
+            elifs,
+            els,
+        } => {
+            for_locals_expr(cond, out);
+            for_locals_body(then, out);
+            for (c, b) in elifs {
+                for_locals_expr(c, out);
+                for_locals_body(b, out);
+            }
+            if let Some(b) = els {
+                for_locals_body(b, out);
+            }
+        }
+        Expr::While { cond, body } | Expr::DoWhile { cond, body } => {
+            for_locals_expr(cond, out);
+            for_locals_body(body, out);
+        }
+        // A nested `for` leaks its own loop variable and body locals too.
+        Expr::For { var, iter, body } => {
+            push_local(var, out);
+            for_locals_expr(iter, out);
+            for_locals_body(body, out);
+        }
+        Expr::Case {
+            subject,
+            whens,
+            els,
+        } => {
+            for_locals_expr(subject, out);
+            for (tests, b) in whens {
+                tests.iter().for_each(|t| for_locals_expr(t, out));
+                for_locals_body(b, out);
+            }
+            if let Some(b) = els {
+                for_locals_body(b, out);
+            }
+        }
+        Expr::CaseIn {
+            subject,
+            clauses,
+            els,
+        } => {
+            for_locals_expr(subject, out);
+            for c in clauses {
+                for_locals_pattern(&c.pattern, out);
+                if let Some(g) = &c.guard {
+                    for_locals_expr(g, out);
+                }
+                for_locals_body(&c.body, out);
+            }
+            if let Some(b) = els {
+                for_locals_body(b, out);
+            }
+        }
+        Expr::Begin {
+            body,
+            rescues,
+            ensure,
+        } => {
+            for_locals_body(body, out);
+            for r in rescues {
+                // `rescue => e` binds `e` in the enclosing scope.
+                if let Some(n) = &r.binding {
+                    push_local(n, out);
+                }
+                for_locals_body(&r.body, out);
+            }
+            if let Some(b) = ensure {
+                for_locals_body(b, out);
+            }
+        }
+        // A block/lambda body is its own scope in MRI too — do not descend into
+        // it, but the receiver and arguments of the call are still this scope.
+        Expr::Call { recv, args, .. } => {
+            if let Some(r) = recv {
+                for_locals_expr(r, out);
+            }
+            args.iter().for_each(|a| for_locals_expr(a, out));
+        }
+        Expr::Binary(_, l, r) => {
+            for_locals_expr(l, out);
+            for_locals_expr(r, out);
+        }
+        Expr::Unary(_, x) | Expr::Splat(x) | Expr::BlockPass(x) | Expr::Defined(x) => {
+            for_locals_expr(x, out)
+        }
+        Expr::Index(r, idx) => {
+            for_locals_expr(r, out);
+            idx.iter().for_each(|i| for_locals_expr(i, out));
+        }
+        Expr::Array(xs) | Expr::Yield(xs) => xs.iter().for_each(|x| for_locals_expr(x, out)),
+        Expr::Hash(pairs) => {
+            for (k, v) in pairs {
+                for_locals_expr(k, out);
+                for_locals_expr(v, out);
+            }
+        }
+        Expr::Range { lo, hi, .. } => {
+            if let Some(x) = lo {
+                for_locals_expr(x, out);
+            }
+            if let Some(x) = hi {
+                for_locals_expr(x, out);
+            }
+        }
+        Expr::Str(parts) => {
+            for p in parts {
+                if let StrPart::Interp(x) = p {
+                    for_locals_expr(x, out);
+                }
+            }
+        }
+        Expr::Return(o) | Expr::Break(o) | Expr::Next(o) => {
+            if let Some(x) = o {
+                for_locals_expr(x, out);
+            }
+        }
+        Expr::Super { args: Some(a), .. } => a.iter().for_each(|x| for_locals_expr(x, out)),
+        _ => {}
+    }
+}
+
 fn collect_plain_assigns(e: &Expr, out: &mut Vec<String>) {
     match e {
         Expr::Assign(t, v) => {
@@ -411,6 +632,7 @@ fn collect_plain_assigns(e: &Expr, out: &mut Vec<String>) {
         | Expr::SelfExpr
         | Expr::Regex(_, _)
         | Expr::Retry
+        | Expr::Redo
         | Expr::Var(_, _) => {}
         Expr::Str(parts) => {
             for p in parts {
@@ -772,6 +994,7 @@ impl Compiler {
         body: &[Stmt],
     ) -> Result<MethodDef, String> {
         let saved = std::mem::take(&mut self.loops);
+        let saved_redo = std::mem::take(&mut self.redo_ok);
         let saved_line = self.cur_line;
         // A fresh local scope: parameters are its initial locals.
         let param_locals: std::collections::HashSet<String> =
@@ -827,6 +1050,7 @@ impl Compiler {
         self.scope_locals.pop();
         self.cur_method.pop();
         self.loops = saved;
+        self.redo_ok = saved_redo;
         self.cur_line = saved_line;
         // Positional params (name-bound by index) are separate from keyword
         // params (bound from the trailing keyword hash).
@@ -846,12 +1070,31 @@ impl Compiler {
             .iter()
             .filter(|p| !p.keyword && !p.kwsplat && !p.block)
             .position(|p| p.splat);
+        // Arity, for the pre-body `ArgumentError`. A `*splat` is neither
+        // required nor optional (it absorbs any surplus), so it counts as
+        // neither; every other positional param is one or the other.
+        let req = params
+            .iter()
+            .filter(|p| !p.keyword && !p.kwsplat && !p.block && !p.splat && p.default.is_none())
+            .count() as u16;
+        let opt = params
+            .iter()
+            .filter(|p| !p.keyword && !p.kwsplat && !p.block && !p.splat && p.default.is_some())
+            .count() as u16;
+        let kwreq: Vec<String> = params
+            .iter()
+            .filter(|p| p.keyword && p.default.is_none())
+            .map(|p| p.name.clone())
+            .collect();
         Ok(MethodDef {
             params: pnames,
             splat,
             kwparams,
             kwsplat,
             blockparam,
+            req,
+            opt,
+            kwreq,
             chunk: b.build(),
             slot_params: n_slot_params,
         })
@@ -1213,6 +1456,27 @@ impl Compiler {
                 // dummy value the builtin pops, then raise the retry signal.
                 b.emit(Op::LoadUndef, 0);
                 b.emit(Op::CallBuiltin(ops::SIG_RETRY, 1), 0);
+            }
+            Expr::Redo => {
+                // Inside a native `while`/`until`, `redo` is a backward jump to
+                // the body start (skipping the condition test). Anywhere else —
+                // notably a block body, which compiles to its own chunk with an
+                // empty loop stack — it is a signal `call_proc` re-runs on.
+                if self.loops.is_empty() {
+                    // Outside both a loop and a block there is nothing to re-run.
+                    // MRI rejects this at parse time; reject it here rather than
+                    // leaving a signal nothing consumes (which would silently
+                    // truncate the program).
+                    if !self.redo_ok {
+                        return Err("Invalid redo (SyntaxError)".into());
+                    }
+                    b.emit(Op::LoadUndef, 0); // dummy operand the builtin pops
+                    b.emit(Op::CallBuiltin(ops::SIG_REDO, 1), 0);
+                } else {
+                    let j = b.emit(Op::Jump(0), 0);
+                    self.loops.last_mut().unwrap().redos.push(j);
+                    b.emit(Op::LoadUndef, 0); // leave a value (dead if jump taken)
+                }
             }
             Expr::Yield(args) => {
                 for a in args {
@@ -1827,11 +2091,15 @@ impl Compiler {
         let start = b.current_pos();
         self.loops.push(LoopCtx {
             start,
+            body_start: start,
             breaks: vec![],
             nexts: vec![],
+            redos: vec![],
         });
         self.compile_cond(b, cond)?;
         let exit = b.emit(Op::JumpIfFalse(0), 0);
+        // `redo` re-runs the body without re-testing the condition.
+        self.loops.last_mut().unwrap().body_start = b.current_pos();
         self.compile_seq(b, body)?;
         b.emit(Op::Pop, 0); // discard the body value each iteration
         b.emit(Op::Jump(start), 0);
@@ -1846,6 +2114,9 @@ impl Compiler {
         }
         for j in ctx.nexts {
             b.patch_jump(j, ctx.start);
+        }
+        for j in ctx.redos {
+            b.patch_jump(j, ctx.body_start);
         }
         Ok(())
     }
@@ -1863,8 +2134,10 @@ impl Compiler {
         let body_start = b.current_pos();
         self.loops.push(LoopCtx {
             start: body_start,
+            body_start,
             breaks: vec![],
             nexts: vec![],
+            redos: vec![],
         });
         self.compile_seq(b, body)?;
         b.emit(Op::Pop, 0); // discard the body value each iteration
@@ -1880,6 +2153,9 @@ impl Compiler {
         }
         for j in ctx.nexts {
             b.patch_jump(j, cond_pos);
+        }
+        for j in ctx.redos {
+            b.patch_jump(j, ctx.body_start);
         }
         Ok(())
     }
@@ -1902,15 +2178,26 @@ impl Compiler {
         // parameter instead and copy it into the enclosing local.
         self.tmp += 1;
         let hidden = format!("__for{}__", self.tmp);
-        // Declare the loop variable in the enclosing scope so it exists even if
-        // the body never runs — without clobbering a value it already has
-        // (`x = 5; for x in []; end; p x` is still 5).
-        self.kstr(b, var);
-        b.emit(Op::CallBuiltin(ops::DEFINED, 1), 0);
-        let skip = b.emit(Op::JumpIfTrue(0), 0);
-        self.compile_assign(b, &Expr::Var(VarKind::Local, var.to_string()), &Expr::Nil)?;
-        b.emit(Op::Pop, 0);
-        b.patch_jump(skip, b.current_pos());
+        // Declare the loop variable — and every local the body assigns — in the
+        // enclosing scope, so each exists even if the body never runs, without
+        // clobbering a value it already has (`x = 5; for x in []; end; p x` is
+        // still 5). Pre-declaring the body locals is what makes them outlive the
+        // loop: the lowered `each` block then writes through to these bindings
+        // instead of creating block-local ones.
+        let mut declare = vec![var.to_string()];
+        for n in for_body_locals(body) {
+            if n != var && !n.starts_with("__") {
+                declare.push(n);
+            }
+        }
+        for name in &declare {
+            self.kstr(b, name);
+            b.emit(Op::CallBuiltin(ops::DEFINED, 1), 0);
+            let skip = b.emit(Op::JumpIfTrue(0), 0);
+            self.compile_assign(b, &Expr::Var(VarKind::Local, name.clone()), &Expr::Nil)?;
+            b.emit(Op::Pop, 0);
+            b.patch_jump(skip, b.current_pos());
+        }
 
         let mut inner = vec![Stmt::from(Expr::Assign(
             Box::new(Expr::Var(VarKind::Local, var.to_string())),
@@ -2168,7 +2455,13 @@ impl Compiler {
     }
 
     fn compile_proc(&mut self, block: &Block) -> Result<usize, String> {
-        self.compile_proc_body(&block.body, &block.params, block.splat)
+        // A block/lambda body is a legal home for `redo` (a `begin` body compiled
+        // through `compile_proc_body` is not — it only inherits the depth of
+        // whatever encloses it), so track the nesting here.
+        let saved_redo = std::mem::replace(&mut self.redo_ok, true);
+        let r = self.compile_proc_body(&block.body, &block.params, block.splat);
+        self.redo_ok = saved_redo;
+        r
     }
 
     /// Emit code leaving a single array on the stack that is `items` flattened
@@ -2524,6 +2817,9 @@ impl Compiler {
             kwparams: vec![],
             kwsplat: None,
             blockparam: None,
+            req: 0,
+            opt: 0,
+            kwreq: vec![],
             chunk: b.build(),
             slot_params: 0,
         }
@@ -2544,6 +2840,9 @@ impl Compiler {
             kwparams: vec![],
             kwsplat: None,
             blockparam: None,
+            req: 1,
+            opt: 0,
+            kwreq: vec![],
             chunk: b.build(),
             slot_params: 0,
         }
@@ -2556,6 +2855,14 @@ impl Compiler {
         rescues: &[Rescue],
         ensure: &Option<Vec<Stmt>>,
     ) -> Result<(), String> {
+        // Directly inside a native loop, a `redo` in any of these nested chunks is
+        // valid: `BEGIN_IN_LOOP` lets the signal survive and the handoff below
+        // turns it into a jump to the loop body. `self.loops` is emptied while
+        // those chunks compile, so record the fact in the flag instead.
+        let saved_redo = self.redo_ok;
+        if !self.loops.is_empty() {
+            self.redo_ok = true;
+        }
         let body_id = self.compile_proc_body(body, &[], None)?;
         let mut rdefs = Vec::new();
         for r in rescues {
@@ -2582,6 +2889,7 @@ impl Compiler {
             Some(e) => Some(self.compile_proc_body(e, &[], None)?),
             None => None,
         };
+        self.redo_ok = saved_redo;
         let begin_id = self.begins.len();
         self.begins.push(BeginDef {
             body: body_id,
@@ -2634,9 +2942,17 @@ impl Compiler {
         let break_jump = b.emit(Op::Jump(0), 0);
         b.patch_jump(no_break, b.current_pos());
 
+        // A `redo` raised inside the nested chunk re-runs this loop's body.
+        b.emit(Op::CallBuiltin(ops::TAKE_LOOP_REDO, 0), 0);
+        let no_redo = b.emit(Op::JumpIfFalse(0), 0);
+        b.emit(Op::Pop, 0);
+        let redo_jump = b.emit(Op::Jump(0), 0);
+        b.patch_jump(no_redo, b.current_pos());
+
         let ctx = self.loops.last_mut().unwrap();
         ctx.nexts.push(next_jump);
         ctx.breaks.push(break_jump);
+        ctx.redos.push(redo_jump);
     }
 
     fn compile_flow(

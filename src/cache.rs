@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 /// Bump on any incompatible change to `CProg` / the lowering.
-const SCHEMA: u64 = 3;
+const SCHEMA: u64 = 4;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
@@ -44,6 +44,9 @@ type CMethod = (
     Vec<String>,
     Option<String>,
     Option<String>,
+    u16,
+    u16,
+    Vec<String>,
     Chunk,
     u16,
 );
@@ -208,12 +211,15 @@ fn m_to(name: &str, m: &MethodDef) -> CMethod {
         m.kwparams.clone(),
         m.kwsplat.clone(),
         m.blockparam.clone(),
+        m.req,
+        m.opt,
+        m.kwreq.clone(),
         m.chunk.clone(),
         m.slot_params,
     )
 }
 fn m_from(
-    (name, params, splat, kwparams, kwsplat, blockparam, chunk, slot_params): CMethod,
+    (name, params, splat, kwparams, kwsplat, blockparam, req, opt, kwreq, chunk, slot_params): CMethod,
 ) -> (String, MethodDef) {
     (
         name,
@@ -223,6 +229,9 @@ fn m_from(
             kwparams,
             kwsplat,
             blockparam,
+            req,
+            opt,
+            kwreq,
             chunk,
             slot_params,
         },

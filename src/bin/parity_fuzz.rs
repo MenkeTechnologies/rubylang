@@ -621,6 +621,12 @@ enum Mode {
     Rational,
     Patternmatch,
     Kernelconv,
+    Loopflow,
+    Hashenum,
+    Enumext,
+    Kwargs,
+    Metaprog,
+    Mixins,
 }
 
 const ALL_MODES: &[Mode] = &[
@@ -649,6 +655,12 @@ const ALL_MODES: &[Mode] = &[
     Mode::Rational,
     Mode::Patternmatch,
     Mode::Kernelconv,
+    Mode::Loopflow,
+    Mode::Hashenum,
+    Mode::Enumext,
+    Mode::Kwargs,
+    Mode::Metaprog,
+    Mode::Mixins,
 ];
 
 fn gen_intmeth(seed: u64) -> Vec<String> {
@@ -760,6 +772,228 @@ fn gen_struct(seed: u64) -> Vec<String> {
     })
 }
 
+/// Loop control flow: `break`/`next`/`redo`/`retry` in every construct that owns
+/// them, plus `for`'s no-scope rule (the loop variable AND any local the body
+/// assigns outlive the loop, and every closure the body makes shares the one
+/// binding). Every `redo`/`retry` is guarded by a counter so the program always
+/// terminates — a hang is a divergence the harness reports as a timeout, not a
+/// gap, so a non-terminating generator would silently teach nothing.
+fn gen_loopflow(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let n = r.range(2, 5);
+    let k = r.range(1, 3);
+    one(match r.below(18) {
+        0 => format!("c = 0; {n}.times {{ |i| c += 1; redo if c == {k} }}; p c"),
+        1 => format!(
+            "c = 0; r = []; [1, 2, 3].each {{ |x| c += 1; redo if c == {k}; r << [x, c] }}; p [r, c]"
+        ),
+        2 => format!(
+            "i = 0; c = 0\nwhile i < {n}\n  c += 1\n  if c == {k}\n    i += 1\n    redo\n  end\n  i += 1\nend\np [i, c]"
+        ),
+        3 => format!("c = 0\nfor x in 1..{n}\n  c += 1\n  redo if c == {k}\nend\np [c, x]"),
+        4 => format!(
+            "c = 0\nuntil c >= {n}\n  c += 1\n  redo if c == {k}\nend\np c"
+        ),
+        5 => format!(
+            "c = 0\ni = 0\nwhile i < {n}\n  begin\n    c += 1\n    redo if c == {k}\n  end\n  i += 1\nend\np [i, c]"
+        ),
+        6 => format!("r = []; [1, 2, 3].each {{ |x| next if x == {k}; r << x }}; p r"),
+        7 => format!("p (while true do break {n} end)"),
+        8 => format!("i = 0; while i < {n}; i += 1; break if i == {k}; end; p i"),
+        9 => format!("for i in 1..{n}\n  sq = i * i\nend\np [i, sq, defined?(sq)]"),
+        10 => format!("for i in []\n  z = {n}\nend\np [i, z, defined?(z)]"),
+        11 => format!(
+            "ps = []\nfor i in 0...{n}\n  t = i * 2\n  ps << -> {{ [i, t] }}\nend\np ps.map(&:call)"
+        ),
+        12 => format!(
+            "for k, v in {{a: 1, b: {n}}}\n  s = \"#{{k}}=#{{v}}\"\nend\np [k, v, s]"
+        ),
+        13 => format!(
+            "a = 0\nbegin\n  a += 1\n  raise \"x\" if a < {k}\nrescue\n  retry if a < {k}\nend\np a"
+        ),
+        14 => format!(
+            "for i in 1..{n}\n  if i == {k}\n    m = i\n  end\nend\np [m, defined?(m)]"
+        ),
+        15 => format!(
+            "out = []\nfor i in 1..{n}\n  for j in 1..2\n    out << i * j\n  end\nend\np [out, i, j]"
+        ),
+        16 => format!("c = 0; [1, 2].map {{ |x| c += 1; redo if c == {k}; x * 10 }}.then {{ |a| p [a, c] }}"),
+        _ => format!(
+            "r = []\n{n}.times do |i|\n  r << i\n  break if i == {k}\nend\np r"
+        ),
+    })
+}
+
+/// Hash through Enumerable. MRI derives these from `Hash#each`, which yields the
+/// whole `[k, v]` pair as ONE value — so a one-parameter block sees the pair,
+/// not the key. That distinction is invisible to a `{ |k, v| }` block (it
+/// auto-splats), which is why it survived the original corpus.
+fn gen_hashenum(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let h = hash_lit(r);
+    one(match r.below(20) {
+        0 => format!("r = []; {h}.each {{ |x| r << x }}; p r"),
+        1 => format!("r = []; {h}.each_pair {{ |x| r << x }}; p r"),
+        2 => format!("p {h}.map {{ |x| x }}"),
+        3 => format!("p {h}.collect {{ |x| x }}"),
+        4 => format!("p {h}.find {{ |x| x.is_a?(Array) }}"),
+        5 => format!("p {h}.detect {{ |x| x[1] > 0 }}"),
+        6 => format!("p {h}.count {{ |x| x.is_a?(Array) }}"),
+        7 => format!("p {h}.count"),
+        8 => format!("p {h}.sum(0) {{ |x| x[1] }}"),
+        9 => format!("p {h}.flat_map {{ |x| x }}"),
+        10 => format!("p {h}.filter_map {{ |x| x[0] }}"),
+        11 => format!("p [{h}.any? {{ |x| x.is_a?(Array) }}, {h}.all? {{ |x| x.size == 2 }}, {h}.none? {{ |x| x.nil? }}]"),
+        12 => format!("p {h}.take_while {{ |x| x.is_a?(Array) }}"),
+        13 => format!("p {h}.drop_while {{ |x| x.is_a?(Array) }}"),
+        14 => format!("p {h}.find_index {{ |x| x[1] > 0 }}"),
+        15 => format!("p {h}.min_by {{ |x| x[1] }}"),
+        16 => format!("p {h}.sort_by {{ |x| x[0] }}"),
+        17 => format!("p {h}.to_h {{ |k, v| [k.to_s, v] }}"),
+        18 => format!("p {h}.each_with_object([]) {{ |x, a| a << x }}"),
+        _ => format!("p [{h}.first, {h}.reverse_each.to_a, {h}.tally.size]"),
+    })
+}
+
+/// `Enumerator.new { |y| ... }` external iteration. MRI runs the block on a
+/// Fiber, so `next` advances exactly one `y <<` — a side effect or a raise after
+/// the second yield must surface on the *third* `next`, and an endless generator
+/// must answer `next` rather than hang. Endless generators are always consumed
+/// by a bounded `next`/`first`/`take`, never by `to_a`.
+fn gen_enumext(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let n = r.range(1, 4);
+    let m = r.range(2, 5);
+    one(match r.below(14) {
+        0 => "e = Enumerator.new {{ |y| y << 1; y << 2; y << 3 }}; p [e.next, e.next, e.next]".to_string(),
+        1 => "e = Enumerator.new {{ |y| y << 1; y << 2 }}; p [e.next, e.peek, e.next]".to_string(),
+        2 => "log = []\ne = Enumerator.new {{ |y| log << :a; y << 1; log << :b; y << 2; log << :c }}\np log\np e.next\np log\np e.next\np log"
+            .to_string(),
+        3 => "e = Enumerator.new {{ |y| y << 1; raise \"boom\" }}\np e.next\nbegin\n  e.next\nrescue => ex\n  p [ex.class, ex.message]\nend"
+            .to_string(),
+        4 => "e = Enumerator.new {{ |y| y << 1; raise ArgumentError, \"bad\" }}\np e.next\nbegin\n  e.next\nrescue ArgumentError => ex\n  p [ex.class, ex.is_a?(StandardError)]\nend"
+            .to_string(),
+        5 => "e = Enumerator.new {{ |y| i = 0; loop {{ y << i; i += 1 }} }}\np [e.next, e.next, e.next]"
+            .to_string(),
+        6 => format!(
+            "e = Enumerator.new {{ |y| i = 0; loop {{ y << i; i += 1 }} }}\np e.first({m})\np e.take({n})"
+        ),
+        7 => format!(
+            "e = Enumerator.new {{ |y| i = 0; loop {{ y << i * 2; i += 1 }} }}\np e.lazy.map {{ |x| x + 1 }}.first({m})"
+        ),
+        8 => format!(
+            "e = Enumerator.new {{ |y| {n}.times {{ |i| y << i }} }}\nr = []\nloop {{ r << e.next }}\np r"
+        ),
+        9 => "e = Enumerator.new {{ |y| y << 1; y << 2 }}\np e.next\ne.rewind\np e.next\np e.to_a"
+            .to_string(),
+        10 => "e = Enumerator.new {{ |y| y << 1 }}\np e.next\nbegin\n  e.next\nrescue StopIteration => ex\n  p ex.class\nend"
+            .to_string(),
+        11 => format!(
+            "a = Enumerator.new {{ |y| {m}.times {{ |i| y << \"a#{{i}}\" }} }}\nb = Enumerator.new {{ |y| {m}.times {{ |i| y << \"b#{{i}}\" }} }}\np [a.next, b.next, a.next, b.next]"
+        ),
+        12 => format!("e = Enumerator.new {{ |y| y.yield({n}, {m}); y << 9 }}; p [e.next, e.next]"),
+        _ => "e = [1, 2, 3].each; p [e.next, e.peek, e.next, e.next]".to_string(),
+    })
+}
+
+/// Keyword arguments: required / defaulted / `**rest`, the positional+keyword
+/// split, and the double-splat call form.
+fn gen_kwargs(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (a, b) = (ii(r), ii(r));
+    one(match r.below(12) {
+        0 => format!("def f(x:, y: {b}) = [x, y]\np f(x: {a})"),
+        1 => format!("def f(x:, y:) = [x, y]\np f(y: {b}, x: {a})"),
+        2 => format!("def f(a, x: {b}) = [a, x]\np f({a})"),
+        3 => format!("def f(**o) = o\np f(a: {a}, b: {b})"),
+        4 => format!("def f(x:, **o) = [x, o]\np f(x: {a}, z: {b})"),
+        5 => format!("def f(x:, y: {b}) = [x, y]\nh = {{x: {a}, y: {b}}}\np f(**h)"),
+        6 => format!("def f(a, b = {b}, *r, k:, **o) = [a, b, r, k, o]\np f({a}, k: {b})"),
+        7 => "def f(x:) = x\nbegin\n  f\nrescue ArgumentError => e\n  p e.class\nend".to_string(),
+        8 => format!("def f(x:) = x\nbegin\n  f(x: {a}, y: {b})\nrescue ArgumentError => e\n  p e.class\nend"),
+        9 => format!("f = ->(x:, y: {b}) {{ [x, y] }}\np f.call(x: {a})"),
+        10 => format!("def f(*a, **o) = [a, o]\np f({a}, {b}, k: {a})"),
+        _ => format!("def f(x: {a}) = x\np [f, f(x: {b})]"),
+    })
+}
+
+/// Metaprogramming hooks: `method_missing`/`respond_to_missing?`,
+/// `define_method`, `Module#prepend` + `super`, singleton methods, and
+/// `send`/`public_send`.
+fn gen_metaprog(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (a, b) = (ii(r), ii(r));
+    let w = ww(r);
+    one(match r.below(14) {
+        0 => format!(
+            "class C\n  def method_missing(n, *a) = [n, a]\n  def respond_to_missing?(n, p = false) = true\nend\np C.new.{w}({a})"
+        ),
+        1 => format!(
+            "class C\n  def method_missing(n, *a) = n.to_s\nend\np [C.new.respond_to?(:{w}), C.new.{w}]"
+        ),
+        2 => format!(
+            "class C\n  define_method(:m) {{ |x| x + {a} }}\nend\np C.new.m({b})"
+        ),
+        3 => format!(
+            "class C\n  [:a, :b].each {{ |n| define_method(n) {{ n.to_s * {} }} }}\nend\np [C.new.a, C.new.b]",
+            r.range(1, 3)
+        ),
+        4 => "module M\n  def m = \"M\" + super\nend\nclass C\n  prepend M\n  def m = \"C\"\nend\np C.new.m"
+            .to_string(),
+        5 => "module M\n  def m = \"M\"\nend\nclass C\n  include M\n  def m = \"C\" + super\nend\np C.new.m"
+            .to_string(),
+        6 => format!("class C; def m = {a}; end\np [C.new.send(:m), C.new.public_send(:m)]"),
+        7 => format!(
+            "o = Object.new\ndef o.m = {a}\np [o.m, o.singleton_methods.sort]"
+        ),
+        8 => format!(
+            "class C\n  def m = {a}\nend\nC.class_eval {{ def n = {b} }}\np [C.new.m, C.new.n]"
+        ),
+        9 => format!(
+            "class C; end\nC.define_method(:m) {{ {a} }}\np C.new.m"
+        ),
+        10 => format!(
+            "class C\n  def initialize; @x = {a}; end\nend\np C.new.instance_variable_get(:@x)"
+        ),
+        11 => format!(
+            "class C; def m = {a}; end\np [C.instance_methods(false).sort, C.new.respond_to?(:m)]"
+        ),
+        12 => format!(
+            "module M\n  def self.included(b) = b.const_set(:TAG, {a})\nend\nclass C\n  include M\nend\np C::TAG"
+        ),
+        _ => format!(
+            "class C\n  def method_missing(n, *a)\n    n.to_s.start_with?(\"get_\") ? {a} : super\n  end\nend\nbegin\n  C.new.nope\nrescue NoMethodError => e\n  p e.class\nend\np C.new.get_x"
+        ),
+    })
+}
+
+/// `Comparable` / `Enumerable` mixed into a user class: every derived method has
+/// to come from the single `<=>` / `each` the class defines.
+fn gen_mixins(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (a, b) = (r.range(0, 9), r.range(0, 9));
+    let cmp = "class N\n  include Comparable\n  attr_reader :v\n  def initialize(v) = @v = v\n  def <=>(o) = v <=> o.v\n  def to_s = \"N(#{v})\"\nend";
+    let enu = "class Bag\n  include Enumerable\n  def initialize(*xs) = @xs = xs\n  def each(&b) = @xs.each(&b)\nend";
+    one(match r.below(14) {
+        0 => format!("{cmp}\np(N.new({a}) < N.new({b}))"),
+        1 => format!("{cmp}\np(N.new({a}) >= N.new({b}))"),
+        2 => format!("{cmp}\np N.new({a}).between?(N.new(0), N.new(9))"),
+        3 => format!("{cmp}\np N.new({a}).clamp(N.new(2), N.new(6)).to_s"),
+        4 => format!("{cmp}\np [N.new({a}), N.new({b})].max.to_s"),
+        5 => format!("{cmp}\np [N.new({a}), N.new({b})].sort.map(&:to_s)"),
+        6 => format!("{enu}\np Bag.new({a}, {b}, 3).map {{ |x| x * 2 }}"),
+        7 => format!("{enu}\np Bag.new({a}, {b}, 3).select(&:even?)"),
+        8 => format!("{enu}\np Bag.new({a}, {b}, 3).sort"),
+        9 => format!("{enu}\np Bag.new({a}, {b}, 3).include?({a})"),
+        10 => format!("{enu}\np Bag.new({a}, {b}, 3).each_with_index.to_a"),
+        11 => format!(
+            "{enu}\np [Bag.new({a}, {b}).min, Bag.new({a}, {b}).max, Bag.new({a}, {b}).sum]"
+        ),
+        12 => format!("{enu}\np Bag.new({a}, {b}, 3).partition(&:odd?)"),
+        _ => format!("{enu}\np Bag.new({a}, {b}, 3).each_slice(2).to_a"),
+    })
+}
+
 fn gen_rational(seed: u64) -> Vec<String> {
     let r = &mut Rng::seed(seed);
     let (a, b) = (r.range(1, 12), r.range(1, 12));
@@ -850,6 +1084,12 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Rational => gen_rational(seed),
         Mode::Patternmatch => gen_patternmatch(seed),
         Mode::Kernelconv => gen_kernelconv(seed),
+        Mode::Loopflow => gen_loopflow(seed),
+        Mode::Hashenum => gen_hashenum(seed),
+        Mode::Enumext => gen_enumext(seed),
+        Mode::Kwargs => gen_kwargs(seed),
+        Mode::Metaprog => gen_metaprog(seed),
+        Mode::Mixins => gen_mixins(seed),
     }
 }
 
@@ -880,6 +1120,12 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Rational => "rational",
         Mode::Patternmatch => "patternmatch",
         Mode::Kernelconv => "kernelconv",
+        Mode::Loopflow => "loopflow",
+        Mode::Hashenum => "hashenum",
+        Mode::Enumext => "enumext",
+        Mode::Kwargs => "kwargs",
+        Mode::Metaprog => "metaprog",
+        Mode::Mixins => "mixins",
     }
 }
 

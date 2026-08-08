@@ -1404,3 +1404,130 @@ nil
 #==#
 [25, Proc, false]
 [2, 4, 6]
+#==#
+[1, 1]
+[2, 5]
+[3, 6]
+6
+[[10, 20], 3]
+3
+#==#
+[[10, 1], [10, 2], [10, 3]]
+#==#
+[3, 3]
+[2, 3]
+#==#
+6
+[2, 3]
+[[1, 2], [2, 3]]
+#==#
+[1, 2, 3]
+#==#
+[3, 9, "local-variable"]
+[nil, nil, "local-variable"]
+#==#
+[[2, 4], [2, 4], [2, 4]]
+[2, 4]
+#==#
+[9, "local-variable", nil, 2, 1]
+[2, 2, 4]
+#==#
+[:b, 2, "b=2"]
+[3, 4, 7]
+[1, 2, nil]
+#==#
+[[:a, 1], [:b, 2]]
+[[:a, 1], [:b, 2]]
+[[:a, 1], [:b, 2]]
+[[:a, 1], [:b, 2]]
+true
+#==#
+[:a, 1]
+[:b, 2]
+2
+3
+[:a, 1, :b, 2]
+[:a, :b]
+[true, true, true]
+[[:a, 1], [:b, 2]]
+[]
+1
+#==#
+{b: 2}
+{a: 1}
+{a: 10, b: 20}
+{"a" => 1, "b" => 2}
+[[:a, :b], [1, 2]]
+{"a" => 2, "b" => 4}
+{a: 1, b: 2}
+#==#
+[[:a, 1], [:a, 1], [:b, 2], [[:a, 1], [:b, 2]]]
+[[:a, 1]]
+[[:b, 2]]
+[[:b, 2], [:a, 1]]
+[[[:a, 1], 9], [[:b, 2], 8]]
+{[:a, 1] => 1, [:b, 2] => 1}
+[[:a, 1], [:b, 2]]
+Hash
+#==#
+[[:a, 1], [:b, 2]]
+[[:a, 1], [:b, 2]]
+[1, 2]
+#==#
+[]
+1
+[:a]
+2
+[:a, :b]
+[:stop, StopIteration]
+[:a, :b, :c]
+#==#
+1
+2
+[RuntimeError, "boom"]
+1
+[ArgumentError, "bad", true]
+#==#
+0
+1
+[0, 1, 2]
+[0, 1, 2, 3]
+[0, 2, 4]
+2
+#==#
+1
+1
+2
+2
+:stopped
+1
+[1, 2]
+#==#
+["a0", "b0", "a1", "b1", "a2", "b2"]
+:a_done
+[1, 2]
+[[1, 2], 3]
+#==#
+"wrong number of arguments (given 1, expected 2)"
+"wrong number of arguments (given 3, expected 2)"
+"wrong number of arguments (given 0, expected 1..2)"
+[5, 1]
+"wrong number of arguments (given 0, expected 1+)"
+[1, [2, 3]]
+"wrong number of arguments (given 1, expected 2+)"
+#==#
+"unknown keyword: :z"
+"unknown keywords: :z, :w"
+"missing keyword: :x"
+"missing keywords: :x, :y"
+"wrong number of arguments (given 0, expected 1; required keyword: x)"
+"wrong number of arguments (given 2, expected 1; required keyword: x)"
+{a: 1, b: 2}
+[1, 1]
+[1, 2]
+#==#
+[:m, :n]
+[[:k], 3]
+[:cm]
+[]
+[]

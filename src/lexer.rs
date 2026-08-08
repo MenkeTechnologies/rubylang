@@ -74,7 +74,7 @@ impl fmt::Display for Tok {
 const KEYWORDS: &[&str] = &[
     "def", "end", "if", "elsif", "else", "unless", "while", "until", "for", "in", "do", "return",
     "break", "next", "yield", "then", "case", "when", "nil", "true", "false", "and", "or", "not",
-    "class", "module", "begin", "rescue", "ensure", "self", "super", "retry", "alias",
+    "class", "module", "begin", "rescue", "ensure", "self", "super", "retry", "redo", "alias",
 ];
 
 /// Tokenize `src`. Returns an error string on an unterminated string or an

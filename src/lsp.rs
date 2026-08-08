@@ -167,6 +167,12 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "a=0; begin; a+=1; raise if a<2; rescue; retry if a<2; end; a   # => 2",
     ),
     (
+        "redo",
+        "Keyword",
+        "re-run the current block iteration or loop body, without advancing",
+        "c=0; [1,2].each { |n| c+=1; redo if c==1 }; c   # => 3",
+    ),
+    (
         "begin",
         "Keyword",
         "open an exception-handling block (rescue/ensure/else)",

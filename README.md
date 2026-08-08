@@ -75,8 +75,9 @@ JIT. rubylang carries no VM or JIT of its own. Highlights:
 - **Editor-ready** — an LSP server, a DAP debugger (source-line breakpoints
   inside methods, stepping, stack + locals), and an `irb`-style REPL on a
   persistent host, all over stdio.
-- **Differential parity** — a 35-snippet corpus diffed live against the
-  reference `ruby`, frozen and replayed in CI with no `ruby` installed.
+- **Differential parity** — a snippet corpus diffed live against the
+  reference `ruby`, frozen and replayed in CI with no `ruby` installed, plus a
+  grammar-driven differential fuzzer.
 
 ---
 
@@ -304,7 +305,9 @@ Nothing is faked as working: an unimplemented method raises `undefined method`.
 Alongside the fixed corpus, a **differential parity fuzzer** — `cargo run --bin
 parity-fuzz` — generates thousands of seed-deterministic Ruby snippets across
 grammar-driven modes (arithmetic, float shortest-repr, slicing, enumerables,
-format specs, `case`/`when`, …) and diffs stdout + exit code of the reference
+format specs, `case`/`when`, loop control flow including `redo`, Hash-through-
+Enumerable, `Enumerator` external iteration, keyword arguments, metaprogramming
+hooks, `Comparable`/`Enumerable` mixins, …) and diffs stdout + exit code of the reference
 `ruby` against rubylang. Every divergence is delta-debugged to a minimal
 reproducer and replays exactly with `parity-fuzz --seed N --once`. It runs
 subprocesses only (never links the library) and needs a reference `ruby`, so CI

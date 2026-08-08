@@ -1810,6 +1810,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Retry)
             }
+            "redo" => {
+                self.advance();
+                Ok(Expr::Redo)
+            }
             "yield" => {
                 self.advance();
                 let (args, _) = if self.is_op("(") {
@@ -1959,12 +1963,37 @@ impl Parser {
 
     fn for_expr(&mut self) -> Result<Expr, String> {
         self.advance();
-        let var = self.ident_name()?;
+        let mut names = vec![self.ident_name()?];
+        while self.eat_op(",") {
+            names.push(self.ident_name()?);
+        }
         self.expect_kw("in")?;
         let iter = self.cond_expr()?;
         self.eat_kw("do");
-        let body = self.body_until(&["end"])?;
+        let mut body = self.body_until(&["end"])?;
         self.expect_kw("end")?;
+        // `for k, v in pairs` iterates one element at a time and destructures it
+        // into the listed names, which — like a single loop variable — live in
+        // the enclosing scope. Bind the element to a hidden name and prepend the
+        // parallel assignment; `for`'s body-local pre-declaration then covers
+        // `k`/`v` the same way it covers any other body local.
+        let var = if names.len() == 1 {
+            names.pop().unwrap()
+        } else {
+            self.tmp += 1;
+            let hidden = format!("__forelem{}__", self.tmp);
+            body.insert(
+                0,
+                Stmt::from(Expr::MultiAssign {
+                    targets: names
+                        .into_iter()
+                        .map(|n| Expr::Var(VarKind::Local, n))
+                        .collect(),
+                    values: vec![Expr::Var(VarKind::Local, hidden.clone())],
+                }),
+            );
+            hidden
+        };
         Ok(Expr::For {
             var,
             iter: Box::new(iter),

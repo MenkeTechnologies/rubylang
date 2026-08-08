@@ -95,16 +95,37 @@ leading positional before `...`); `Integer#step`, `?c` char literals,
   a local first assigned inside a block does not leak out (`1.times { x = 1 };
   defined?(x)` is nil); and explicit block-locals (`{ |i; tmp| … }`) shadow an
   outer name of the same spelling. `for` is the deliberate exception — it
-  introduces no scope, so its loop variable is an enclosing local that outlives
-  the loop and is shared by every closure the body makes (`[2, 2, 2]`, where the
-  `each` form gives `[0, 1, 2]`).
-- **`redo` is not implemented.** The keyword does not re-run the current block
-  iteration; it needs a Redo signal that every block-driving builtin re-dispatches
-  on, alongside the existing break/next handling.
-- **`for` body locals do not leak.** Ruby's `for` shares the enclosing scope
-  outright, so a local first assigned *in the body* also outlives the loop. The
-  loop variable is handled, but body locals are still block-scoped here —
-  closing that needs a full statement-tree walk to pre-declare them.
+  introduces no scope, so its loop variable AND every local its body assigns are
+  enclosing locals that outlive the loop and are shared by every closure the body
+  makes (`[2, 2, 2]`, where the `each` form gives `[0, 1, 2]`). The body walk
+  that pre-declares those locals follows control flow (`if`/`while`/`case`/
+  `case-in` clause bindings/`begin` + its `rescue => e` binding/a nested `for`)
+  and stops at a real new scope (a block or lambda body, a `def`, a `class`/
+  `module` body), so `for i in 1..3; sq = i * i; end` leaves `sq` behind while
+  `[1].each { q = 1 }` does not leave `q`. `for k, v in pairs` destructures each
+  element into enclosing locals the same way.
+- **Method arity is enforced.** A call with the wrong number of positional
+  arguments, an unknown keyword, or a missing required keyword raises
+  `ArgumentError` before the body runs, with MRI's exact message —
+  `wrong number of arguments (given 1, expected 2)`, `expected 1..2` for a
+  signature with optional params, `expected 1+` for one with a splat, plus the
+  `; required keyword: x` suffix MRI appends when the signature has required
+  keywords, and `unknown keyword(s): :z` / `missing keyword(s): :x`. (Previously
+  a short call silently left the parameter unbound, so the body ran with a stray
+  nil.) Not yet enforced: **lambda** arity — `->(x, y) { }.call(1)` binds `y` to
+  nil instead of raising, because a block template carries no required/optional
+  split yet. A `proc` is correct by construction (MRI does not check procs).
+
+- **`redo`.** Implemented. Inside a native `while`/`until` (and the post-test
+  `begin … end while` form) it compiles to a backward jump to the body start, so
+  the loop condition is not re-tested. Anywhere else — a block body, or a `begin`
+  nested in either — it raises a Redo signal: `call_proc` re-runs the block body
+  on it (with the same scope, so the params keep their values and a local the
+  body already assigned survives the re-run, as in MRI), and a loop picks it back
+  up through the `TAKE_LOOP_REDO` handoff alongside break/next. `redo` outside
+  both a loop and a block is rejected at compile time with
+  `Invalid redo (SyntaxError)`, matching MRI's parse-time rejection rather than
+  leaving a signal nothing consumes.
 
 ## Metaprogramming / reflection / eval
 
@@ -130,6 +151,10 @@ Implemented and verified against the reference `ruby`:
   `included`/`extended`/`prepended(base)` fire when the corresponding mixin
   relationship is established. Each fires only if the module/class defines the
   hook as a class method.
+- **`singleton_methods`.** Lists the names defined on the object alone
+  (`def obj.m`, `class << obj`, `define_singleton_method`); on a class or module
+  it lists that class's own class methods, since a class's singleton methods ARE
+  its class methods. Returned sorted.
 - **Constant reflection.** `const_get` / `const_set` / `const_defined?` /
   `constants` on any class or module ref, including builtin class names
   (`Object.const_get(:String)`). `const_get`/`const_set`/`const_defined?`
@@ -321,14 +346,28 @@ Honest limitations of this surface:
   block-less endless `cycle` (no count) returns an infinite Enumerator backed by a
   native cycling generator, so `first(n)`/`take(n)`/`.lazy` draw as many repeats as
   needed and `next`/`peek` round-robin the elements forever (materializing one
-  cycle, then wrapping). Limits: external iteration (`next`/`peek`) on any *other*
-  infinite generator (`loop { y << ... }`) materializes the block to completion on
-  first use, so it works only for *finite* generators — that block's `.next` still
-  runs forever (routing it through a `Fiber` is a planned follow-on, now that the
-  Fiber engine exists — see below). The same eagerness moves *when* a raise from
-  inside the block surfaces: MRI reports it on the `next` that would have reached
-  it, while here the whole block runs on the first `next`, so the exception (with
-  its correct class) arrives one `next` early.
+  cycle, then wrapping). External iteration (`next`/`peek`) on any other generator
+  runs the block on a `Fiber`, as MRI's `enumerator.c` does: the block advances
+  exactly one `y << v` per `next`, so an endless `loop { y << ... }` generator
+  answers `next` instead of running forever, a side effect between two yields
+  happens only once the consumer reaches it, and a raise surfaces on the `next`
+  that would have reached it (not on the first). `peek` parks the pulled value
+  without advancing; `rewind` drops the fiber so the next `next` re-runs the block
+  from the top.
+- **Hash through Enumerable.** MRI derives Hash's Enumerable surface from
+  `Hash#each`, and `each` yields the whole `[k, v]` pair as ONE value
+  (`hash.c` `each_pair_i`) — so a one-parameter block sees the pair, not the key.
+  `each`/`each_pair` yield that way here, and every derived method
+  (`find`/`detect`, `count`, `sum`, `flat_map`, `filter_map`, `any?`/`all?`/
+  `none?`, `min`/`max`/`sort`, `take_while`/`drop_while`, `find_index`,
+  `collect`, `tally`, `zip`, `first`, `reverse_each`, `each_entry`, `cycle`,
+  `grep`, …) is delegated to the array of pairs, which is the same model. A
+  `{ |k, v| }` block still binds both, because a multi-parameter block auto-splats
+  the pair. Hash's OWN methods — `select`/`reject`, `delete_if`/`keep_if`,
+  `each_key`/`each_value`, `transform_keys`/`transform_values`, and `to_h` with a
+  block — yield key and value separately, as in MRI. `Struct#each_pair` and
+  `ENV.each` follow `Hash#each`. Residual gap: a block-less `chunk_while` returns
+  the grouped array rather than an `Enumerator`.
 - **Exception hierarchy.** The builtin exception classes carry MRI's real tree,
   not a flat `X < Exception`: `ArgumentError`/`TypeError`/`RuntimeError`/… derive
   from `StandardError`, and the ones with an intermediate parent keep it

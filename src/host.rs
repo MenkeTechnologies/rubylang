@@ -162,6 +162,8 @@ pub mod ops {
                                          // a `break`/`next` signal does NOT halt the chunk, so the handoff ops the
                                          // compiler emits right after it get to run and turn the signal into a jump.
     pub const BEGIN_IN_LOOP: u16 = 54; // [begin_id] -> run begin/rescue/ensure
+    pub const SIG_REDO: u16 = 55; // [v] -> re-run the current block iteration
+    pub const TAKE_LOOP_REDO: u16 = 56; // [] -> Bool; consume a pending `redo`
 }
 
 /// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried
@@ -188,6 +190,18 @@ pub enum LazyOp {
 }
 
 /// A heap object — the Ruby reference types.
+/// A `Generator`'s external-iteration state — MRI's `enumerator.c` fiber model.
+///
+/// The generator block runs inside `fiber`, suspending at every `y << v`, so
+/// `Enumerator#next` advances it by exactly one element. `peeked` holds a value
+/// that `peek` pulled off the fiber but `next` has not consumed yet (`peek` must
+/// not advance). Created on the first `next`/`peek`, dropped by `rewind`.
+#[derive(Debug, Clone)]
+pub struct GenExt {
+    pub fiber: Value,
+    pub peeked: Option<Value>,
+}
+
 #[derive(Debug, Clone)]
 pub enum RObj {
     Str(String),
@@ -322,15 +336,18 @@ pub enum RObj {
         method: String,
     },
     /// A block-based generator (`Enumerator.new { |y| ... }`): the user block
-    /// that drives it by sending `<<`/`yield` to a yielder. Driven on demand by
-    /// `to_a`/`first`/`take`/`lazy`; each drive re-runs the block from the start
-    /// (blocks are pure/re-runnable). `materialized` caches external-iteration
-    /// state — `None` until the first `next`/`peek`, which runs the block to
-    /// completion (so `.next` on an *infinite* generator runs forever: there are
-    /// no fibers/coroutines here, so external iteration cannot pause a block).
+    /// that drives it by sending `<<`/`yield` to a yielder. Bulk operations
+    /// (`to_a`/`first`/`take`/`lazy`) re-run the block from the start each time
+    /// (blocks are pure/re-runnable).
+    ///
+    /// External iteration (`next`/`peek`) instead runs the block on a `Fiber`,
+    /// as MRI's `enumerator.c` does, so it advances exactly one `y << v` per
+    /// `next` — see [`GenExt`]. `materialized` is the older buffer+cursor path,
+    /// still used for an endless `cycle` generator, whose fiber would never end.
     Generator {
         block: Value,
         materialized: Option<(Vec<Value>, usize)>,
+        ext: Option<GenExt>,
     },
     /// The native `Enumerator::Yielder` passed to a generator block as `|y|`.
     /// `<<`/`yield` push into the collector `enum_sinks[sink]`; once the buffer
@@ -340,6 +357,12 @@ pub enum RObj {
         sink: usize,
         limit: usize,
     },
+    /// The `Enumerator::Yielder` handed to a generator block that is running on
+    /// an external-iteration `Fiber`: `<<`/`yield` suspend the fiber with the
+    /// value instead of buffering it, so the block advances one element per
+    /// `Enumerator#next`. No state of its own — `Fiber.yield` finds the running
+    /// fiber through `CUR_FIBER`.
+    FiberYielder,
     /// A `Fiber` (`Fiber.new { ... }`). Holds only an index into
     /// `RubyHost.fibers`; the corosensei `Coroutine` (neither Clone nor Debug)
     /// cannot live inline in this `#[derive(Clone)]` enum, so it sits in the
@@ -562,6 +585,14 @@ pub struct MethodDef {
     pub kwsplat: Option<String>,
     /// `&blk` block-capture parameter name, if any.
     pub blockparam: Option<String>,
+    /// Arity, for the `ArgumentError` MRI raises before the body ever runs.
+    /// `req` counts positional params with no default (on both sides of a splat);
+    /// `opt` counts the ones with a default; `kwreq` names the keyword params
+    /// with no default, in declaration order. A method built by the compiler for
+    /// an `attr_*` accessor fills these in the same way a `def` does.
+    pub req: u16,
+    pub opt: u16,
+    pub kwreq: Vec<String>,
     pub chunk: Chunk,
     /// Number of leading positional params bound directly into the body's fusevm
     /// frame slots `0..slot_params` (native-lowerable) instead of the host env.
@@ -603,6 +634,12 @@ enum Signal {
     Return(Value, Option<u64>),
     /// `retry` inside a `rescue` clause — restarts the enclosing `begin` body.
     Retry,
+    /// `redo` — re-runs the current block iteration (or native loop body) from
+    /// the top. Unlike `next`, the iterator does not advance and the loop
+    /// condition is not re-tested; unlike `retry`, block-locals keep their
+    /// values across the re-run (MRI: `[10].each { y = (y||0)+1; redo if … }`
+    /// counts 1, 2, 3).
+    Redo,
     /// `throw(tag, value)` — unwinds to the matching `catch(tag)`. The first
     /// field is the tag (matched by object identity, like Ruby), the second the
     /// thrown value (`nil` for a bare `throw tag`).
@@ -1760,7 +1797,45 @@ impl RubyHost {
         self.alloc(RObj::Generator {
             block,
             materialized: None,
+            ext: None,
         })
+    }
+    /// The `Enumerator::Yielder` for a generator running on an external-iteration
+    /// fiber (its `<<` suspends the fiber instead of buffering).
+    pub fn new_fiber_yielder(&mut self) -> Value {
+        self.alloc(RObj::FiberYielder)
+    }
+    /// Whether `v` is that fiber-backed yielder, so `<<` should suspend.
+    pub fn is_fiber_yielder(&self, v: &Value) -> bool {
+        matches!(self.obj(v), Some(RObj::FiberYielder))
+    }
+    /// The external-iteration fiber of a `Generator`, if one has been started.
+    pub fn generator_ext_fiber(&self, v: &Value) -> Option<Value> {
+        match self.obj(v) {
+            Some(RObj::Generator { ext: Some(e), .. }) => Some(e.fiber.clone()),
+            _ => None,
+        }
+    }
+    /// Start external iteration on `fiber` (the first `next`/`peek`).
+    pub fn generator_ext_start(&mut self, v: &Value, fiber: Value) {
+        if let Some(RObj::Generator { ext, .. }) = self.obj_mut(v) {
+            *ext = Some(GenExt {
+                fiber,
+                peeked: None,
+            });
+        }
+    }
+    /// The value a previous `peek` pulled but no `next` has consumed yet.
+    pub fn generator_peeked(&self, v: &Value) -> Option<Value> {
+        match self.obj(v) {
+            Some(RObj::Generator { ext: Some(e), .. }) => e.peeked.clone(),
+            _ => None,
+        }
+    }
+    pub fn generator_set_peeked(&mut self, v: &Value, val: Option<Value>) {
+        if let Some(RObj::Generator { ext: Some(e), .. }) = self.obj_mut(v) {
+            e.peeked = val;
+        }
     }
     /// A block-less endless `cycle` Enumerator: a `Generator` whose body is a
     /// native `CycleProc` repeating `buf` forever (bounded by the consumer via
@@ -1859,11 +1934,15 @@ impl RubyHost {
     /// Reset a materialized generator's external-iteration cursor.
     pub fn generator_rewind(&mut self, v: &Value) {
         if let Some(RObj::Generator {
-            materialized: Some((_, cursor)),
-            ..
+            materialized, ext, ..
         }) = self.obj_mut(v)
         {
-            *cursor = 0;
+            if let Some((_, cursor)) = materialized {
+                *cursor = 0;
+            }
+            // Drop the external-iteration fiber: the next `next`/`peek` starts a
+            // fresh one, re-running the block from the top (MRI `rewind`).
+            *ext = None;
         }
     }
     /// The buffered values of an `Enumerator`, if `v` is one.
@@ -3154,6 +3233,32 @@ impl RubyHost {
                 .cloned(),
             _ => None,
         }
+    }
+    /// Every singleton method name of `v`, sorted — `Object#singleton_methods`.
+    /// A plain object contributes its `def obj.m` / `class << obj` methods plus
+    /// any `define_singleton_method` block; a class or module contributes its
+    /// class methods (`def self.m`), which ARE its singleton methods in MRI.
+    pub fn singleton_method_names(&self, v: &Value) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        if let Value::Obj(id) = v {
+            if let Some(m) = self.singleton_methods.get(id) {
+                names.extend(m.keys().cloned());
+            }
+            if let Some(m) = self.singleton_define_methods.get(id) {
+                names.extend(m.keys().cloned());
+            }
+        }
+        if let Some(cls) = self.classref_name(v) {
+            if let Some(def) = self.classes.get(&cls) {
+                names.extend(def.class_methods.keys().cloned());
+            }
+            if let Some(m) = self.class_define_methods.get(&cls) {
+                names.extend(m.keys().cloned());
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
     }
     /// Register a `define_singleton_method` (a block Proc) on a specific object.
     pub fn add_singleton_define_method(&mut self, id: u32, name: &str, proc: Value) {
@@ -4921,7 +5026,9 @@ impl RubyHost {
                 Some(RObj::Generator { .. }) => {
                     "#<Enumerator: #<Enumerator::Generator>:each>".to_string()
                 }
-                Some(RObj::Yielder { .. }) => "#<Enumerator::Yielder>".to_string(),
+                Some(RObj::Yielder { .. }) | Some(RObj::FiberYielder) => {
+                    "#<Enumerator::Yielder>".to_string()
+                }
                 Some(RObj::Fiber { .. }) => "#<Fiber (created)>".to_string(),
                 Some(RObj::Thread { id }) => {
                     let alive = self
@@ -5166,7 +5273,7 @@ impl RubyHost {
                 Some(RObj::Lazy { .. }) => "Enumerator::Lazy",
                 Some(RObj::Enumerator { .. }) => "Enumerator",
                 Some(RObj::Generator { .. }) => "Enumerator",
-                Some(RObj::Yielder { .. }) => "Enumerator::Yielder",
+                Some(RObj::Yielder { .. }) | Some(RObj::FiberYielder) => "Enumerator::Yielder",
                 Some(RObj::Fiber { .. }) => "Fiber",
                 Some(RObj::Thread { .. }) => "Thread",
                 Some(RObj::IoHandle { id }) => self
@@ -6259,6 +6366,116 @@ fn drive_around(idx: usize) -> Result<Value, String> {
     }
 }
 
+/// `:a, :b` — the MRI rendering of a keyword-name list in an `ArgumentError`.
+fn kw_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|n| format!(":{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The `ArgumentError` MRI raises before a method body runs, or `Ok(())`.
+///
+/// Three checks, in MRI's order: positional count, then unknown keywords, then
+/// missing keywords. Messages match `vm_args.c` exactly — `expected N`,
+/// `expected N..M` (with optional params), `expected N+` (with a splat), plus the
+/// `; required keyword: x` suffix a signature with required keywords carries.
+///
+/// This is what makes a wrong call a *raise* rather than a silent nil binding —
+/// `def f(x, y); end; f(1)` used to run the body with `y` unbound.
+fn check_arity(def: &MethodDef, args: &[Value]) -> Result<(), String> {
+    let wants_kw = !def.kwparams.is_empty() || def.kwsplat.is_some();
+    // With keyword params, a trailing Hash argument is the keyword hash and does
+    // not count as positional (`bind_params` splits it the same way).
+    let (positional, kwhash) = if wants_kw {
+        match args.last() {
+            Some(v) if with_host(|h| h.as_hash(v)).is_some() => {
+                (args.len() - 1, with_host(|h| h.as_hash(v)))
+            }
+            _ => (args.len(), None),
+        }
+    } else {
+        (args.len(), None)
+    };
+
+    let (req, opt) = (def.req as usize, def.opt as usize);
+    let ok = if def.splat.is_some() {
+        positional >= req
+    } else {
+        positional >= req && positional <= req + opt
+    };
+    if !ok {
+        let expected = if def.splat.is_some() {
+            format!("{req}+")
+        } else if opt > 0 {
+            format!("{req}..{}", req + opt)
+        } else {
+            req.to_string()
+        };
+        // MRI appends the required keywords whenever the signature has any, even
+        // when the call did supply them.
+        let suffix = match def.kwreq.len() {
+            0 => String::new(),
+            1 => format!("; required keyword: {}", def.kwreq[0]),
+            _ => format!("; required keywords: {}", def.kwreq.join(", ")),
+        };
+        return Err(crate::builtins::raise_exc(
+            "ArgumentError",
+            &format!("wrong number of arguments (given {positional}, expected {expected}{suffix})"),
+        ));
+    }
+
+    if !wants_kw {
+        return Ok(());
+    }
+    // A `**opts` collector absorbs every unlisted keyword, so only a signature
+    // without one can have an unknown keyword.
+    if def.kwsplat.is_none() {
+        let unknown: Vec<String> = kwhash
+            .iter()
+            .flat_map(|m| m.keys())
+            .filter_map(|k| match k {
+                RKey::Sym(s) if !def.kwparams.iter().any(|p| p == s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        if !unknown.is_empty() {
+            let label = if unknown.len() == 1 {
+                "unknown keyword"
+            } else {
+                "unknown keywords"
+            };
+            return Err(crate::builtins::raise_exc(
+                "ArgumentError",
+                &format!("{label}: {}", kw_list(&unknown)),
+            ));
+        }
+    }
+    let missing: Vec<String> = def
+        .kwreq
+        .iter()
+        .filter(|k| {
+            !kwhash
+                .as_ref()
+                .is_some_and(|m| m.contains_key(&RKey::Sym((*k).clone())))
+        })
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        let label = if missing.len() == 1 {
+            "missing keyword"
+        } else {
+            "missing keywords"
+        };
+        return Err(crate::builtins::raise_exc(
+            "ArgumentError",
+            &format!("{label}: {}", kw_list(&missing)),
+        ));
+    }
+    Ok(())
+}
+
 /// Run a resolved method: push a fresh frame bound to `self_obj`, bind args, and
 /// run the body with locals targeting that new top frame.
 #[allow(clippy::too_many_arguments)]
@@ -6334,6 +6551,7 @@ fn run_method(
         (Some(n), Some(c)) if n.starts_with("__class_body__") => Some(c.clone()),
         _ => None,
     };
+    check_arity(def, args)?;
     let frame_id = next_frame_id();
     let saved_active = with_host(|h| {
         let mut binding = h.bind_params(
@@ -8450,7 +8668,15 @@ pub fn call_proc_self_ctx(
         block_scope.def_class = Some(owner);
     }
     let prev_active = with_host(|h| h.active_scope.replace(block_scope));
-    let r = run_chunk_on(def.chunk.clone());
+    // `redo` re-runs the body from the top with the SAME scope — the params keep
+    // their bound values and any local the body already assigned survives (MRI
+    // does not re-bind either), so the child env is deliberately not rebuilt.
+    let r = loop {
+        let r = run_chunk_on(def.chunk.clone());
+        if r.is_err() || !take_redo_signal() {
+            break r;
+        }
+    };
     with_host(|h| {
         h.active_scope = prev_active;
     });
@@ -8495,6 +8721,9 @@ pub fn raise_signal_return(v: Value) {
 pub fn raise_signal_retry() {
     with_host(|h| h.signal = Some(Signal::Retry));
 }
+pub fn raise_signal_redo() {
+    with_host(|h| h.signal = Some(Signal::Redo));
+}
 /// Raise a `throw(tag, value)` control signal, unwinding to the matching
 /// `catch(tag)` above (see `take_throw`).
 pub fn raise_signal_throw(tag: Value, value: Value) {
@@ -8526,6 +8755,18 @@ pub fn take_retry_signal() -> bool {
         }
     })
 }
+/// Consume a pending `redo` signal, returning whether one was set. Used both by
+/// `call_proc` (to re-run a block body) and by the native-loop handoff op.
+pub fn take_redo_signal() -> bool {
+    with_host(|h| {
+        if matches!(h.signal, Some(Signal::Redo)) {
+            h.signal = None;
+            true
+        } else {
+            false
+        }
+    })
+}
 pub fn take_break() -> Option<Value> {
     with_host(|h| match &h.signal {
         Some(Signal::Break(_)) => {
@@ -8549,11 +8790,16 @@ pub fn take_next() -> Option<Value> {
         _ => None,
     })
 }
-/// Whether a `break` signal is pending, without consuming it.
-/// Whether the pending signal is a `break` or `next` — the two a native loop
-/// owns and will re-dispatch itself, rather than letting it unwind the chunk.
+/// Whether the pending signal is a `break`, `next` or `redo` — the three a
+/// native loop owns and will re-dispatch itself, rather than letting it unwind
+/// the chunk.
 pub fn pending_signal_is_loop_flow() -> bool {
-    with_host(|h| matches!(h.signal, Some(Signal::Break(_)) | Some(Signal::Next(_))))
+    with_host(|h| {
+        matches!(
+            h.signal,
+            Some(Signal::Break(_)) | Some(Signal::Next(_)) | Some(Signal::Redo)
+        )
+    })
 }
 /// Whether a `break` signal is pending, without consuming it.
 pub fn peek_break() -> Value {

@@ -193,6 +193,9 @@ pub enum Expr {
     Next(Option<Box<Expr>>),
     /// `retry` — restart the enclosing `begin` body from a `rescue` clause.
     Retry,
+    /// `redo` — re-run the current block iteration (or native loop body) from the
+    /// top, without advancing the iterator or re-testing the loop condition.
+    Redo,
     /// `yield args` — invoke the block passed to the enclosing method.
     Yield(Vec<Expr>),
     /// `defined?(expr)` — a description string of the operand (or nil), without

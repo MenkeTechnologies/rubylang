@@ -2344,3 +2344,387 @@ p a
 sq = Proc.new { |n| n * n }
 p [sq.call(5), sq.class, sq.lambda?]
 p [1, 2, 3].map { |n| Proc.new { n * 2 } }.map(&:call)
+#==#
+# ── redo re-runs the current block iteration without advancing the iterator ──
+n = 0
+[1, 2, 3].each do |x|
+  n += 1
+  redo if x == 2 && n < 5
+  p [x, n]
+end
+p n
+c = 0
+a = [1, 2].map do |x|
+  c += 1
+  redo if c == 1
+  x * 10
+end
+p [a, c]
+c2 = 0
+2.times { |x| c2 += 1; redo if c2 == 1 }
+p c2
+#==#
+# ── redo keeps the block's locals: they are not rebound on the re-run ──
+r = []
+c = 0
+[10].each do |x|
+  y = (y || 0) + 1
+  r << [x, y]
+  c += 1
+  redo if c < 3
+end
+p r
+#==#
+# ── redo in a while re-runs the body without re-testing the condition ──
+i = 0
+c = 0
+while i < 3
+  c += 1
+  if c == 2
+    i += 1
+    redo
+  end
+  i += 1
+end
+p [i, c]
+j = 0
+d = 0
+until j >= 2
+  d += 1
+  redo if d == 1
+  j += 1
+end
+p [j, d]
+#==#
+# ── redo in a for, and through a begin nested in a loop or a block ──
+c = 0
+for x in 1..3
+  c += 1
+  redo if x == 2 && c < 5
+end
+p c
+i = 0
+n = 0
+while i < 2
+  begin
+    n += 1
+    redo if n == 1
+  end
+  i += 1
+end
+p [i, n]
+m = 0
+out = []
+[1, 2].each do |v|
+  begin
+    m += 1
+    redo if m == 1
+  end
+  out << [v, m]
+end
+p out
+#==#
+# ── redo runs a block's ensure once per attempt ──
+log = []
+c = 0
+[1].each do |x|
+  begin
+    c += 1
+    redo if c < 3
+  ensure
+    log << c
+  end
+end
+p log
+#==#
+# ── `for` introduces no scope: body locals outlive the loop too ──
+for i in 1..3
+  sq = i * i
+end
+p [i, sq, defined?(sq)]
+for j in []
+  z = 1
+end
+p [j, z, defined?(z)]
+#==#
+# ── every closure a `for` body makes shares the one binding ──
+ps = []
+for i in 0..2
+  t = i * 2
+  ps << -> { [i, t] }
+end
+p ps.map(&:call)
+p [i, t]
+#==#
+# ── for body locals leak out of nested control flow and nested loops ──
+for i in 1..2
+  if i == 2
+    m = 9
+  end
+  while false
+    w = 1
+  end
+  begin
+    g = i
+  end
+  case i
+  when 1 then c1 = 1
+  end
+end
+p [m, defined?(w), w, g, c1]
+for a in 1..2
+  for b in 1..2
+    k = a * b
+  end
+end
+p [a, b, k]
+#==#
+# ── `for k, v in pairs` destructures into enclosing locals ──
+for k, v in {a: 1, b: 2}
+  s = "#{k}=#{v}"
+end
+p [k, v, s]
+for x, y in [[1, 2], [3, 4]]
+  t = x + y
+end
+p [x, y, t]
+for p1, p2, p3 in [[1, 2]]
+  q = 1
+end
+p [p1, p2, p3]
+#==#
+# ── Hash#each yields the whole [k, v] pair as ONE value (MRI each_pair_i) ──
+h = {a: 1, b: 2}
+got = []
+h.each { |x| got << x }
+p got
+got2 = []
+h.each_pair { |x| got2 << x }
+p got2
+p h.map { |x| x }
+p h.collect { |x| x }
+p h.each { |k, v| }.equal?(h)
+#==#
+# ── so does every Enumerable method Hash derives from `each` ──
+h = {a: 1, b: 2}
+p h.find { |x| x.is_a?(Array) }
+p h.detect { |x| x[1] == 2 }
+p h.count { |x| x.is_a?(Array) }
+p h.sum(0) { |x| x[1] }
+p h.flat_map { |x| x }
+p h.filter_map { |x| x[0] }
+p [h.any? { |x| x.is_a?(Array) }, h.all? { |x| x.size == 2 }, h.none? { |x| x.nil? }]
+p h.take_while { |x| x.is_a?(Array) }
+p h.drop_while { |x| x.is_a?(Array) }
+p h.find_index { |x| x[1] == 2 }
+#==#
+# ── Hash's own methods still yield key and value separately ──
+h = {a: 1, b: 2}
+p h.select { |k, v| v > 1 }
+p h.reject { |k, v| v > 1 }
+p h.transform_values { |v| v * 10 }
+p h.transform_keys { |k| k.to_s }
+ks = []
+h.each_key { |k| ks << k }
+vs = []
+h.each_value { |v| vs << v }
+p [ks, vs]
+p h.to_h { |k, v| [k.to_s, v * 2] }
+p h.to_h
+#==#
+# ── Hash reaches the rest of Enumerable through its pair sequence ──
+h = {a: 1, b: 2}
+p [h.first, h.min, h.max, h.sort]
+p h.take(1)
+p h.drop(1)
+p h.reverse_each.to_a
+p h.zip([9, 8])
+p h.tally
+p h.uniq
+p h.each_entry { |x| }.class
+#==#
+# ── Struct#each_pair yields one [member, value] pair, like Hash#each ──
+SP = Struct.new(:a, :b)
+s = SP.new(1, 2)
+one = []
+s.each_pair { |x| one << x }
+p one
+two = []
+s.each_pair { |k, v| two << [k, v] }
+p two
+vals = []
+s.each { |v| vals << v }
+p vals
+#==#
+# ── Enumerator.new runs its block on a fiber: one `y <<` per `next` ──
+log = []
+e = Enumerator.new do |y|
+  log << :a
+  y << 1
+  log << :b
+  y << 2
+  log << :c
+end
+p log
+p e.next
+p log
+p e.next
+p log
+begin
+  e.next
+rescue StopIteration => x
+  p [:stop, x.class]
+end
+p log
+#==#
+# ── a raise inside a generator surfaces at the `next` that reaches it ──
+e = Enumerator.new do |y|
+  y << 1
+  y << 2
+  raise "boom"
+end
+p e.next
+p e.next
+begin
+  e.next
+rescue => ex
+  p [ex.class, ex.message]
+end
+g = Enumerator.new { |y| y << 1; raise ArgumentError, "bad" }
+p g.next
+begin
+  g.next
+rescue ArgumentError => ex
+  p [ex.class, ex.message, ex.is_a?(StandardError)]
+end
+#==#
+# ── an endless generator answers `next` instead of running forever ──
+e = Enumerator.new do |y|
+  i = 0
+  loop { y << i; i += 1 }
+end
+p e.next
+p e.next
+p e.take(3)
+p e.first(4)
+p e.lazy.map { |x| x * 2 }.first(3)
+p e.next
+#==#
+# ── peek does not advance; rewind restarts the block ──
+e = Enumerator.new { |y| y << 1; y << 2 }
+p e.peek
+p e.next
+p e.peek
+p e.next
+begin
+  e.peek
+rescue StopIteration
+  p :stopped
+end
+e.rewind
+p e.next
+p e.to_a
+#==#
+# ── independent generators keep independent positions ──
+a = Enumerator.new { |y| 3.times { |i| y << "a#{i}" } }
+b = Enumerator.new { |y| 3.times { |i| y << "b#{i}" } }
+p [a.next, b.next, a.next, b.next, a.next, b.next]
+begin
+  a.next
+rescue StopIteration
+  p :a_done
+end
+r = []
+c = Enumerator.new { |y| y << 1; y << 2 }
+loop { r << c.next }
+p r
+d = Enumerator.new { |y| y.yield(1, 2); y << 3 }
+p [d.next, d.next]
+#==#
+# ── a wrong positional count raises ArgumentError before the body runs ──
+def two(x, y) = [x, y]
+begin
+  two(1)
+rescue ArgumentError => e
+  p e.message
+end
+begin
+  two(1, 2, 3)
+rescue ArgumentError => e
+  p e.message
+end
+def opt(x, y = 1) = [x, y]
+begin
+  opt
+rescue ArgumentError => e
+  p e.message
+end
+p opt(5)
+def sp(x, *r) = [x, r]
+begin
+  sp
+rescue ArgumentError => e
+  p e.message
+end
+p sp(1, 2, 3)
+def mid(x, y = 1, z = 2, *r, w) = [x, y, z, r, w]
+begin
+  mid(1)
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+# ── unknown and missing keywords raise, and name every offender ──
+def kw(x:, y: 1) = [x, y]
+begin
+  kw(x: 1, z: 2)
+rescue ArgumentError => e
+  p e.message
+end
+begin
+  kw(x: 1, z: 2, w: 3)
+rescue ArgumentError => e
+  p e.message
+end
+begin
+  kw
+rescue ArgumentError => e
+  p e.message
+end
+def kw2(x:, y:) = [x, y]
+begin
+  kw2
+rescue ArgumentError => e
+  p e.message
+end
+def poskw(a, x:) = [a, x]
+begin
+  poskw(x: 1)
+rescue ArgumentError => e
+  p e.message
+end
+begin
+  poskw(1, 2, x: 1)
+rescue ArgumentError => e
+  p e.message
+end
+def anykw(**o) = o
+p anykw(a: 1, b: 2)
+p kw(x: 1)
+p poskw(1, x: 2)
+#==#
+# ── singleton_methods lists what is defined on the object alone ──
+o = Object.new
+def o.m = 1
+def o.n = 2
+p o.singleton_methods.sort
+o2 = Object.new
+o2.define_singleton_method(:k) { 3 }
+p [o2.singleton_methods.sort, o2.k]
+class SingHost
+  def self.cm = 1
+  def im = 2
+end
+p SingHost.singleton_methods.sort
+p SingHost.new.singleton_methods
+p 1.singleton_methods

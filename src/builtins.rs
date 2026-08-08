@@ -10,8 +10,8 @@
 use crate::host::ops;
 use crate::host::{
     call_instance_method, call_method, call_proc, current_block, has_pending_signal,
-    raise_signal_break, raise_signal_next, raise_signal_retry, raise_signal_return,
-    raise_signal_throw, take_break, take_throw, with_host, RKey, RubyHost,
+    raise_signal_break, raise_signal_next, raise_signal_redo, raise_signal_retry,
+    raise_signal_return, raise_signal_throw, take_break, take_throw, with_host, RKey, RubyHost,
 };
 use fusevm::{Value, VM};
 use indexmap::IndexMap;
@@ -53,6 +53,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::SIG_NEXT, b_sig_next);
     vm.register_builtin(ops::SIG_RETURN, b_sig_return);
     vm.register_builtin(ops::SIG_RETRY, b_sig_retry);
+    vm.register_builtin(ops::SIG_REDO, b_sig_redo);
+    vm.register_builtin(ops::TAKE_LOOP_REDO, b_take_loop_redo);
     vm.register_builtin(ops::NO_MATCH, b_no_match);
     vm.register_builtin(ops::GETSELF, b_getself);
     vm.register_builtin(ops::BEGIN, b_begin);
@@ -348,6 +350,12 @@ fn b_begin_in_loop(vm: &mut VM, _: u8) -> Value {
 /// because that label belongs to this chunk, not the nested one.
 fn b_take_loop_next(_: &mut VM, _: u8) -> Value {
     Value::Bool(crate::host::take_next().is_some())
+}
+
+/// Consume a pending `redo` signal raised inside a `begin` nested in a native
+/// loop, so the loop can turn it back into a jump to its body start.
+fn b_take_loop_redo(_: &mut VM, _: u8) -> Value {
+    Value::Bool(crate::host::take_redo_signal())
 }
 
 /// Whether a `break` signal is pending, leaving it in place. The loop tests this
@@ -1047,6 +1055,15 @@ fn b_sig_retry(vm: &mut VM, _: u8) -> Value {
     vm.ip = vm.chunk.ops.len();
     Value::Undef
 }
+/// `redo` from inside a chunk that is not a native loop body (a block body, or a
+/// `begin` nested in a loop): halt the chunk with a Redo signal. `call_proc`
+/// re-runs the block on it; a native loop picks it back up via `TAKE_LOOP_REDO`.
+fn b_sig_redo(vm: &mut VM, _: u8) -> Value {
+    vm.pop(); // `redo` carries no value
+    raise_signal_redo();
+    vm.ip = vm.chunk.ops.len();
+    Value::Undef
+}
 
 // ===========================================================================
 // Dispatch
@@ -1385,6 +1402,7 @@ fn is_universal_object_method(name: &str) -> bool {
             | "dup"
             | "clone"
             | "methods"
+            | "singleton_methods"
             | "enum_for"
             | "to_enum"
             | "instance_eval"
@@ -1774,6 +1792,20 @@ pub(crate) fn dispatch(
                 }));
             }
             return Ok(new_arr(vec![]));
+        }
+        // `Object#singleton_methods` — the names defined on this object alone
+        // (`def obj.m`, `class << obj`, `define_singleton_method`); on a class or
+        // module, its class methods. Sorted, as MRI's are not, so callers sort;
+        // sorting here is a superset-safe determinism the corpus relies on.
+        "singleton_methods" if args.is_empty() || matches!(args.first(), Some(Value::Bool(_))) => {
+            return Ok(with_host(|h| {
+                let syms: Vec<Value> = h
+                    .singleton_method_names(recv)
+                    .iter()
+                    .map(|n| h.new_symbol(n))
+                    .collect();
+                h.new_array(syms)
+            }));
         }
         "send" | "__send__" | "public_send" => {
             let m = name_of(&args[0]);
@@ -3890,8 +3922,13 @@ fn struct_method(
         "each_pair" if block.is_some() => {
             let bl = block.clone().unwrap();
             for (m, v) in members.iter().zip(values()) {
-                let sym = with_host(|h| h.new_symbol(m));
-                call_proc(&bl, &[sym, v])?;
+                // One `[member, value]` pair per yield, like `Hash#each`; a
+                // `{ |k, v| }` block auto-splats it.
+                let pair = with_host(|h| {
+                    let sym = h.new_symbol(m);
+                    h.new_array(vec![sym, v])
+                });
+                call_proc(&bl, &[pair])?;
             }
             recv.clone()
         }
@@ -9204,6 +9241,13 @@ fn dispatch_yielder(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
                 [single] => single.clone(),
                 many => new_arr(many.to_vec()),
             };
+            // On the external-iteration path the block runs inside a Fiber:
+            // suspend it with this value so `Enumerator#next` gets exactly one
+            // element and the block stops right here until the next `next`.
+            if with_host(|h| h.is_fiber_yielder(recv)) {
+                crate::host::fiber_yield(v)?;
+                return Ok(recv.clone());
+            }
             if with_host(|h| h.yielder_push(recv, v)) {
                 raise_signal_break(Value::Undef);
             }
@@ -10537,7 +10581,9 @@ fn dispatch_env(name: &str, args: &[Value], block: Option<Value>) -> Result<Valu
         "each" | "each_pair" => {
             if let Some(bl) = &block {
                 for (k, v) in std::env::vars().collect::<Vec<_>>() {
-                    call_proc(bl, &[new_str(k), new_str(v)])?;
+                    // Like `Hash#each`, one `[name, value]` pair per yield.
+                    let pair = new_arr(vec![new_str(k), new_str(v)]);
+                    call_proc(bl, &[pair])?;
                 }
             }
             Ok(with_host(|h| h.class_ref("ENV")))
@@ -10943,8 +10989,51 @@ fn normalize_abs(path: &str) -> String {
     }
 }
 
+/// One step of `Enumerator#next` / `#peek` over a block-based generator.
+///
+/// MRI's `enumerator.c` runs the generator block on a Fiber for external
+/// iteration, and so does this: the block advances only as far as its next
+/// `y << v`, which is observable — an exception raised after the second yield
+/// surfaces on the *third* `next`, not the first, and an endless
+/// `loop { y << i }` generator answers `next` instead of hanging.
+///
+/// `peek` pulls the same way but parks the value in `GenExt::peeked` so it does
+/// not advance; the following `next`/`peek` consumes that instead of resuming.
+fn generator_external_next(recv: &Value, gblock: &Value, advance: bool) -> Result<Value, String> {
+    if let Some(v) = with_host(|h| h.generator_peeked(recv)) {
+        if advance {
+            with_host(|h| h.generator_set_peeked(recv, None));
+        }
+        return Ok(v);
+    }
+    // The first resume carries the `Enumerator::Yielder` that becomes the
+    // block's `|y|` parameter; later ones carry nothing.
+    let (fiber, arg) = match with_host(|h| h.generator_ext_fiber(recv)) {
+        Some(f) => (f, Value::Undef),
+        None => {
+            let f = crate::host::new_fiber(gblock.clone());
+            with_host(|h| h.generator_ext_start(recv, f.clone()));
+            (f, with_host(|h| h.new_fiber_yielder()))
+        }
+    };
+    let stop = || raise_exc("StopIteration", "iteration reached an end");
+    if !crate::host::fiber_alive(&fiber) {
+        return Err(stop());
+    }
+    let v = crate::host::fiber_resume(&fiber, arg)?;
+    // The block returned instead of yielding: the sequence is over, and its
+    // return value is not an element.
+    if !crate::host::fiber_alive(&fiber) {
+        return Err(stop());
+    }
+    if !advance {
+        with_host(|h| h.generator_set_peeked(recv, Some(v.clone())));
+    }
+    Ok(v)
+}
+
 /// A block-based generator (`Enumerator.new { |y| ... }`). Terminal operations
-/// re-drive the block; `next`/`peek` materialize it to completion once.
+/// re-drive the block; `next`/`peek` step it on a fiber.
 fn dispatch_generator(
     recv: &Value,
     gblock: &Value,
@@ -10975,23 +11064,22 @@ fn dispatch_generator(
         }
         // `.lazy` keeps the generator as the pipeline source (see `lazy_pull`).
         "lazy" => Ok(with_host(|h| h.new_lazy(recv.clone(), vec![]))),
-        // External iteration: materialize to completion on first use, then
-        // cursor. An infinite generator here runs forever — there are no fibers.
+        // External iteration.
         "next" | "peek" if args.is_empty() && block.is_none() => {
-            let need = with_host(|h| h.generator_unmaterialized(recv));
-            if need {
-                // A `cycle` generator is infinite: materialize just one cycle
-                // (its element count) and let `generator_next` wrap over it. Any
-                // other generator drives to completion (an infinite one hangs
-                // here, exactly as in MRI without fibers).
-                let limit = with_host(|h| h.cycle_proc_len(gblock)).unwrap_or(usize::MAX);
-                let buf = drive_generator(gblock, limit)?;
-                with_host(|h| h.set_generator_materialized(recv, buf));
+            // A `cycle` generator repeats forever by construction, so a fiber
+            // would never reach StopIteration: materialize exactly one cycle and
+            // let `generator_next` wrap the cursor over it.
+            if let Some(limit) = with_host(|h| h.cycle_proc_len(gblock)) {
+                if with_host(|h| h.generator_unmaterialized(recv)) {
+                    let buf = drive_generator(gblock, limit)?;
+                    with_host(|h| h.set_generator_materialized(recv, buf));
+                }
+                return match with_host(|h| h.generator_next(recv, name == "next")) {
+                    Some(v) => Ok(v),
+                    None => Err(raise_exc("StopIteration", "iteration reached an end")),
+                };
             }
-            match with_host(|h| h.generator_next(recv, name == "next")) {
-                Some(v) => Ok(v),
-                None => Err(raise_exc("StopIteration", "iteration reached an end")),
-            }
+            generator_external_next(recv, gblock, name == "next")
         }
         "rewind" if args.is_empty() => {
             with_host(|h| h.generator_rewind(recv));
@@ -11605,21 +11693,6 @@ fn dispatch_hash(
     let map = with_host(|h| h.as_hash(recv).unwrap_or_default());
     match name {
         "size" | "length" => Ok(Value::Int(map.len() as i64)),
-        "count" => {
-            if let Some(b) = &block {
-                let mut n = 0i64;
-                for (k, v) in &map {
-                    let kv = with_host(|h| h.key_value(k));
-                    let r = call_proc(b, &[kv, v.clone()])?;
-                    if with_host(|h| h.truthy(&r)) {
-                        n += 1;
-                    }
-                }
-                Ok(Value::Int(n))
-            } else {
-                Ok(Value::Int(map.len() as i64))
-            }
-        }
         "empty?" => Ok(Value::Bool(map.is_empty())),
         // Pattern-match protocol: return self (the requested-keys arg is only a
         // hint; the pattern re-checks each key). Matches MRI's `Hash#deconstruct_keys`.
@@ -11779,8 +11852,15 @@ fn dispatch_hash(
         "each" | "each_pair" => {
             if let Some(b) = &block {
                 for (k, v) in &map {
-                    let kv = with_host(|h| h.key_value(k));
-                    call_proc(b, &[kv, v.clone()])?;
+                    // MRI `hash.c` `each_pair_i` yields the assoc array as a
+                    // SINGLE value, so a `{ |x| }` block sees `[k, v]`. A
+                    // `{ |k, v| }` block still binds both: a multi-parameter
+                    // block auto-splats the one array argument.
+                    let pair = with_host(|h| {
+                        let kv = h.key_value(k);
+                        h.new_array(vec![kv, v.clone()])
+                    });
+                    call_proc(b, &[pair])?;
                     if has_pending_signal() {
                         take_break();
                         break;
@@ -11899,19 +11979,6 @@ fn dispatch_hash(
             }
             Ok(with_host(|h| h.new_hash(out)))
         }
-        "filter_map" => {
-            let mut out = Vec::new();
-            if let Some(b) = &block {
-                for (k, v) in &map {
-                    let kv = with_host(|h| h.key_value(k));
-                    let r = call_proc(b, &[kv, v.clone()])?;
-                    if with_host(|h| h.truthy(&r)) {
-                        out.push(r);
-                    }
-                }
-            }
-            Ok(new_arr(out))
-        }
         "each_with_object" => {
             let memo = args[0].clone();
             if let Some(b) = &block {
@@ -11926,52 +11993,22 @@ fn dispatch_hash(
             }
             Ok(memo)
         }
-        "sum" => {
-            let mut acc = args.first().cloned().unwrap_or(Value::Int(0));
-            if let Some(b) = &block {
-                for (k, v) in &map {
-                    let kv = with_host(|h| h.key_value(k));
-                    let r = call_proc(b, &[kv, v.clone()])?;
-                    acc = add_values(&acc, &r);
-                }
-            }
-            Ok(acc)
-        }
-        "any?" | "all?" | "none?" => {
-            if let Some(b) = &block {
-                for (k, v) in &map {
-                    let kv = with_host(|h| h.key_value(k));
-                    let r = call_proc(b, &[kv, v.clone()])?;
-                    let t = with_host(|h| h.truthy(&r));
-                    match name {
-                        "any?" if t => return Ok(Value::Bool(true)),
-                        "all?" if !t => return Ok(Value::Bool(false)),
-                        "none?" if t => return Ok(Value::Bool(false)),
-                        _ => {}
-                    }
-                }
-            }
-            // Reached when no block was given, or the block ran to completion
-            // without an early return. With a block that never matched: `any?` is
-            // false, `all?`/`none?` are true. With NO block, a `[k, v]` pair is
-            // always truthy, so `any?` is `!empty?`, `none?` is `empty?`, `all?`
-            // true — sinatra guards `@params.merge(captures) if params.any?`.
-            let result = if block.is_none() {
-                match name {
-                    "any?" => !map.is_empty(),
-                    "none?" => map.is_empty(),
-                    _ => true,
-                }
-            } else {
-                name != "any?"
-            };
-            Ok(Value::Bool(result))
-        }
-        // Enumerable methods that iterate the hash as `[k, v]` pairs: delegate
-        // to the array of pairs (blocks receive the pair, auto-splat to `|k, v|`
-        // or destructure to `|(k, v)|`).
+        // Enumerable methods, which MRI derives from `Hash#each` — and `each`
+        // yields the whole `[k, v]` pair as ONE value (hash.c `each_pair_i`), not
+        // key and value separately. So every one of these sees a pair-element
+        // sequence: a `{ |x| }` block gets `[k, v]`, and `{ |k, v| }` still works
+        // because a multi-parameter block auto-splats the pair.
+        //
+        // Delegating to the array of pairs is exactly that model. Hash's OWN
+        // methods (`select`, `reject`, `delete_if`, `each_key`, `transform_*`, …)
+        // are matched by earlier arms and do yield two values, as in MRI.
         "min_by" | "max_by" | "sort_by" | "reduce" | "inject" | "group_by" | "partition"
-        | "find_all" | "chunk_while" | "each_slice" | "each_cons" | "minmax_by" => {
+        | "find_all" | "chunk_while" | "chunk" | "slice_when" | "each_slice" | "each_cons"
+        | "minmax_by" | "minmax" | "count" | "sum" | "any?" | "all?" | "none?" | "one?"
+        | "filter_map" | "flat_map" | "collect_concat" | "find" | "detect" | "find_index"
+        | "take_while" | "drop_while" | "take" | "drop" | "collect" | "min" | "max" | "sort"
+        | "tally" | "zip" | "reverse_each" | "each_entry" | "cycle" | "first" | "uniq" | "grep"
+        | "grep_v" | "entries" => {
             let rows: Vec<Value> = with_host(|h| {
                 map.iter()
                     .map(|(k, v)| {
@@ -11981,7 +12018,17 @@ fn dispatch_hash(
                     .collect()
             });
             let tmp = with_host(|h| h.new_array(rows));
-            remap_array_delegate(dispatch_array(&tmp, name, args, block), recv, name)
+            // `each_*` iterators return the RECEIVER when a block is given, so
+            // the pair array they were delegated through must not leak out
+            // (`h.each_entry { }` is the Hash, not `[[k, v]]`). Block-less, the
+            // same names produce a sequence, which the array result stands in for.
+            let returns_recv = block.is_some()
+                && matches!(
+                    name,
+                    "each_entry" | "reverse_each" | "each_slice" | "each_cons"
+                );
+            let out = remap_array_delegate(dispatch_array(&tmp, name, args, block), recv, name)?;
+            Ok(if returns_recv { recv.clone() } else { out })
         }
         "invert" => {
             let mut out = IndexMap::new();
@@ -12004,6 +12051,28 @@ fn dispatch_hash(
         "default_proc=" => {
             with_host(|h| h.set_hash_default_proc(recv, args[0].clone()));
             Ok(args[0].clone())
+        }
+        // `Hash#to_h` is the identity, except with a block: the block is called
+        // with `key, value` (two values, unlike `each`) and must return the
+        // `[new_key, new_value]` pair that replaces the entry.
+        "to_h" if block.is_some() => {
+            let b = block.as_ref().unwrap();
+            let mut out = IndexMap::new();
+            for (k, v) in &map {
+                let kv = with_host(|h| h.key_value(k));
+                let r = call_proc(b, &[kv, v.clone()])?;
+                let pair = with_host(|h| h.as_array(&r))
+                    .ok_or_else(|| "wrong element type (expected array)".to_string())?;
+                if pair.len() != 2 {
+                    return Err(format!(
+                        "element has wrong array length (expected 2, was {})",
+                        pair.len()
+                    ));
+                }
+                let nk = with_host(|h| h.value_to_key(&pair[0]));
+                out.insert(nk, pair[1].clone());
+            }
+            Ok(with_host(|h| h.new_hash(out)))
         }
         "to_h" => Ok(recv.clone()),
         // `Hash#to_hash` — the implicit-conversion form, returns the hash itself.
@@ -12044,21 +12113,6 @@ fn dispatch_hash(
             }
             Ok(with_host(|h| h.new_hash(out)))
         }
-        "flat_map" | "collect_concat" => {
-            let mut out = Vec::new();
-            if let Some(b) = &block {
-                for (k, v) in &map {
-                    let kv = with_host(|h| h.key_value(k));
-                    let r = call_proc(b, &[kv, v.clone()])?;
-                    if let Some(xs) = with_host(|h| h.as_array(&r)) {
-                        out.extend(xs);
-                    } else {
-                        out.push(r);
-                    }
-                }
-            }
-            Ok(new_arr(out))
-        }
         "each_with_index" => {
             let pairs: Vec<Value> = with_host(|h| {
                 map.iter()
@@ -12088,18 +12142,6 @@ fn dispatch_hash(
                         .collect(),
                 ))
             }
-        }
-        "find" | "detect" => {
-            if let Some(b) = &block {
-                for (k, v) in &map {
-                    let kv = with_host(|h| h.key_value(k));
-                    let r = call_proc(b, &[kv.clone(), v.clone()])?;
-                    if with_host(|h| h.truthy(&r)) {
-                        return Ok(with_host(|h| h.new_array(vec![kv, v.clone()])));
-                    }
-                }
-            }
-            Ok(Value::Undef)
         }
         "dig" => Ok(dig(recv, args)),
         _ => Err(no_method_error(recv, name)),
@@ -14530,8 +14572,13 @@ fn openstruct_method(
         "each_pair" | "each" => {
             if let Some(bl) = block {
                 for (k, v) in pairs() {
-                    let key = with_host(|h| h.new_symbol(&k));
-                    call_proc(&bl, &[key, v])?;
+                    // `Struct#each_pair` yields one `[member, value]` pair, like
+                    // `Hash#each` (a `{ |k, v| }` block auto-splats it).
+                    let pair = with_host(|h| {
+                        let key = h.new_symbol(&k);
+                        h.new_array(vec![key, v])
+                    });
+                    call_proc(&bl, &[pair])?;
                 }
             }
             Ok(Some(recv.clone()))
