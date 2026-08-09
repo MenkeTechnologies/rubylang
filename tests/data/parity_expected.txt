@@ -1747,3 +1747,13 @@ FrozenError
 [[10, 20], [[10, 0]], [[20, 1]], [[10, 0], [20, 1]]]
 #==#
 [[[10, 0], [20, 1]], "#<Enumerator: [10, 20]:each_with_index>"]
+#==#
+["break from proc-closure", "break from proc-closure", 7]
+#==#
+["#<Enumerator::Lazy: [1, 2]>", "#<Enumerator::Lazy: #<Enumerator::Lazy: [1, 2]>:map>", "#<Enumerator::Lazy: #<Enumerator::Lazy: #<Enumerator::Lazy: [1, 2]>:map>:select>"]
+#==#
+["#<Enumerator::Lazy: #<Enumerator::Lazy: [1, 2]>:take(2)>", "#<Enumerator::Lazy: #<Enumerator::Lazy: [1, 2]>:drop(1)>", "#<Enumerator::Lazy: #<Enumerator::Lazy: [1, 2]>:zip([3, 4])>", "#<Enumerator::Lazy: {a: 1}>"]
+#==#
+["#<Enumerator: 1..3:each_with_index>", "#<Enumerator: 1..3:each_slice(2)>", "#<Enumerator: #<Enumerator: [1, 2]:each>:map>", "#<Enumerator: [1, 2]:reverse_each>"]
+#==#
+[1..3, [1, 2, 3], [2, 4]]

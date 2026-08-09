@@ -1850,7 +1850,9 @@ pub(crate) fn dispatch(
                 }
                 src
             };
-            return Ok(with_host(|h| h.new_lazy(source, vec![])));
+            // `inspect` shows the object `.lazy` was called on, which is not the
+            // materialized source when the receiver had to be converted.
+            return Ok(with_host(|h| h.new_lazy_of(source, vec![], recv.clone())));
         }
         // `Object#methods` — the receiver's instance methods (own + user-defined
         // ancestors) as symbols. Bounded to user-defined method surface; builtin
@@ -7876,7 +7878,9 @@ fn dispatch_array(
             } else {
                 // Block-less: an Enumerator yielding the elements in reverse.
                 let rev: Vec<Value> = arr.iter().rev().cloned().collect();
-                Ok(with_host(|h| h.new_enumerator(rev, "reverse_each")))
+                Ok(with_host(|h| {
+                    h.new_enumerator_of(rev, "reverse_each", recv.clone())
+                }))
             }
         }
         "each_with_index" => {
@@ -7905,7 +7909,7 @@ fn dispatch_array(
         // returning the mutated receiver.
         "map!" | "collect!" => {
             if block.is_none() {
-                return Ok(with_host(|h| h.new_enumerator(arr, "map")));
+                return Ok(with_host(|h| h.new_enumerator_of(arr, "map", recv.clone())));
             }
             let mut out = Vec::with_capacity(arr.len());
             if let Some(b) = &block {
@@ -7924,7 +7928,7 @@ fn dispatch_array(
             if block.is_none() {
                 // Block-less `map`/`collect` yields the original elements as an
                 // Enumerator (re-attaching a block later maps them).
-                return Ok(with_host(|h| h.new_enumerator(arr, name)));
+                return Ok(with_host(|h| h.new_enumerator_of(arr, name, recv.clone())));
             }
             let mut out = Vec::with_capacity(arr.len());
             if let Some(b) = &block {
@@ -7972,7 +7976,7 @@ fn dispatch_array(
             if block.is_none() {
                 // Block-less: an Enumerator over the elements, tagged with the
                 // filtering method so `select.with_index { … }` filters.
-                return Ok(with_host(|h| h.new_enumerator(arr, name)));
+                return Ok(with_host(|h| h.new_enumerator_of(arr, name, recv.clone())));
             }
             let keep_when = name != "reject";
             let mut out = Vec::new();
@@ -7995,7 +7999,7 @@ fn dispatch_array(
         // array. (`reject!`/`delete_if` are handled below.)
         "select!" | "filter!" | "keep_if" => {
             let Some(b) = &block else {
-                return Ok(with_host(|h| h.new_enumerator(arr, name)));
+                return Ok(with_host(|h| h.new_enumerator_of(arr, name, recv.clone())));
             };
             let mut kept = Vec::with_capacity(arr.len());
             for x in &arr {
@@ -9030,8 +9034,21 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
 /// fall through to the Array implementation over the element list.
 /// Call `p` with `elem` and return whether the result is truthy.
 fn proc_truthy(p: &Value, elem: &Value) -> Result<bool, String> {
-    let r = call_proc(p, std::slice::from_ref(elem))?;
+    let r = call_lazy_call(p, std::slice::from_ref(elem))?;
     Ok(with_host(|h| h.truthy(&r)))
+}
+
+/// Call a block that a lazy pipeline STORED and is only now running. A `break`
+/// in it has no call left to break out of — the `.map`/`.select` it was written
+/// on returned the moment it was written — so MRI raises `LocalJumpError: break
+/// from proc-closure` instead of unwinding. Without this the break signal
+/// escapes and silently swallows the whole statement.
+fn call_lazy_call(p: &Value, args: &[Value]) -> Result<Value, String> {
+    let r = call_proc(p, args)?;
+    if crate::host::take_break().is_some() {
+        return Err(raise_exc("LocalJumpError", "break from proc-closure"));
+    }
+    Ok(r)
 }
 
 /// Call a lazy pipeline block on `elem`, spreading it when it is the packed form
@@ -9045,8 +9062,8 @@ fn proc_truthy(p: &Value, elem: &Value) -> Result<bool, String> {
 /// Note this is not the eager split: eager `drop_while` sees the PAIR.
 fn call_lazy_block(p: &Value, elem: &Value) -> Result<Value, String> {
     match with_host(|h| h.as_array(elem)).filter(|_| with_host(|h| h.is_multi_yield(elem))) {
-        Some(vals) if vals.len() > 1 => call_proc(p, &vals),
-        _ => call_proc(p, std::slice::from_ref(elem)),
+        Some(vals) if vals.len() > 1 => call_lazy_call(p, &vals),
+        _ => call_lazy_call(p, std::slice::from_ref(elem)),
     }
 }
 
@@ -9070,7 +9087,10 @@ fn dispatch_lazy(
     let extend = |op: LazyOp| -> Value {
         let mut next = ops.clone();
         next.push(op);
-        with_host(|h| h.new_lazy(source.clone(), next))
+        with_host(|h| {
+            let origin = h.lazy_origin(recv).unwrap_or_else(|| source.clone());
+            h.new_lazy_of(source.clone(), next, origin)
+        })
     };
     let blk = || block.clone().ok_or_else(|| "no block given".to_string());
     match name {
@@ -17270,6 +17290,15 @@ fn remap_array_delegate(
     recv: &Value,
     name: &str,
 ) -> Result<Value, String> {
+    // An Enumerator the delegate built recorded the TEMPORARY array as the object
+    // it iterates; the real one is this receiver, which `each` answers and
+    // `inspect` shows (`(1..3).each_with_index` is
+    // `#<Enumerator: 1..3:each_with_index>`, not the materialized array).
+    if let Ok(v) = &r {
+        if with_host(|h| h.enum_source(v)).is_some() {
+            with_host(|h| h.set_enum_source(v, recv.clone()));
+        }
+    }
     r.map_err(|e| {
         if e.starts_with("undefined method") && e.contains("an instance of Array") {
             no_method_error(recv, name)

@@ -1992,6 +1992,48 @@ fn enumerator_source_and_lazy_pipeline() {
     );
 }
 
+/// A `break` in a block a lazy pipeline stored escapes a call that already
+/// returned, so MRI raises instead of unwinding. Before, the signal escaped and
+/// silently swallowed the statement.
+#[test]
+fn break_from_a_stored_lazy_block_raises() {
+    eq(
+        "begin\n  [1, 2].lazy.map { break 7 }.to_a\nrescue LocalJumpError => e\n  e.message\nend",
+        "\"break from proc-closure\"",
+    );
+    eq(
+        "begin\n  [1, 2].lazy.select { break }.first(1)\nrescue LocalJumpError => e\n  e.message\nend",
+        "\"break from proc-closure\"",
+    );
+    // A block written on a real iterating call still breaks out of it.
+    eq("[1, 2].map { break 7 }", "7");
+    eq("[1, 2].lazy.map { |x| x * 2 }.first(1)", "[2]");
+}
+
+/// An Enumerator and a lazy pipeline name the object they were built from.
+#[test]
+fn enumerator_and_lazy_inspect_name_their_receiver() {
+    eq("[1, 2].lazy.inspect", "\"#<Enumerator::Lazy: [1, 2]>\"");
+    eq(
+        "[1, 2].lazy.map { }.select { }.inspect",
+        "\"#<Enumerator::Lazy: #<Enumerator::Lazy: #<Enumerator::Lazy: [1, 2]>:map>:select>\"",
+    );
+    eq(
+        "[1, 2].lazy.take(2).inspect",
+        "\"#<Enumerator::Lazy: #<Enumerator::Lazy: [1, 2]>:take(2)>\"",
+    );
+    eq("{a: 1}.lazy.inspect", "\"#<Enumerator::Lazy: {a: 1}>\"");
+    eq(
+        "(1..3).each_with_index.inspect",
+        "\"#<Enumerator: 1..3:each_with_index>\"",
+    );
+    eq(
+        "[1, 2].each.map.inspect",
+        "\"#<Enumerator: #<Enumerator: [1, 2]:each>:map>\"",
+    );
+    eq("(1..3).each_with_index.each { |x| x }", "1..3");
+}
+
 /// A built-in's `#arity`/`#owner`/`#parameters` come from the table of what MRI
 /// declares (`src/arity_table.rs`), so the assertions here are the encoding
 /// itself: a fixed count when every parameter is required, `-(required + 1)` once

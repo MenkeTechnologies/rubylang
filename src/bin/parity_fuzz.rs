@@ -1310,8 +1310,29 @@ fn gen_multiyield(seed: u64) -> Vec<String> {
         "uniq",
         "find_all",
     ];
-    one(match r.below(10) {
-        0 => format!("p({src}.{} {b})", r.pick(&consumers)),
+    one(match r.below(13) {
+        // A lazy pipeline's own `inspect` — one `#<Enumerator::Lazy: …>` per
+        // stage around the object `.lazy` was called on. Not for a generator
+        // source: MRI shows the Generator's ADDRESS there, which is not
+        // comparable between two interpreters.
+        10 if !src.starts_with("Enumerator.new") => format!(
+            "p({src}.lazy.{}{})",
+            r.pick(&["map { |x| x }", "select { |x| x }", "take_while { |x| x }", "reject { |x| x }"]),
+            r.pick(&["", ".take(2)", ".drop(1)", ".zip([1, 2])", ".map { |x| x }"])
+        ),
+        // `break` inside a block a lazy pipeline STORED: the call it was written
+        // on already returned, so MRI raises `LocalJumpError` when the block
+        // finally runs.
+        11 => format!(
+            "p({src}.lazy.{} {{ break {} }}.to_a)",
+            r.pick(&["map", "select", "reject", "take_while", "drop_while", "filter_map"]),
+            r.range(1, 9)
+        ),
+        12 => format!(
+            "begin\n  {src}.lazy.{} {{ break }}.first(1)\nrescue LocalJumpError => e\n  p e.message\nend",
+            r.pick(&["map", "select", "take_while", "filter_map"])
+        ),
+        0 | 10 => format!("p({src}.{} {b})", r.pick(&consumers)),
         1 => format!("p({src}.to_a)"),
         2 => format!("{src}.each {b}\np :done"),
         // `Enumerator#each` answers the object being iterated — except on a

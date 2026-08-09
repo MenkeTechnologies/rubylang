@@ -110,7 +110,11 @@ leading positional before `...`); `Integer#step`, `?c` char literals,
   each block-taking builtin had to remember to handle `break` and about fifty did
   not — they returned their receiver, or let the signal unwind far enough to
   discard the enclosing statement's output entirely (`p([1, 2, 3].find { break 99 })`
-  printed nothing).
+  printed nothing). A block a LAZY pipeline stored is the case with no owner
+  left: `[1, 2].lazy.map { break 7 }` runs the block only once `to_a`/`first`
+  pulls it, long after the `.map` it was written on returned, so MRI raises
+  `LocalJumpError: break from proc-closure` there instead of unwinding — as
+  rubylang now does, where the signal used to escape and swallow the statement.
 - **Block scoping.** A block parameter is block-local and gets a fresh binding
   per iteration, so `3.times { |i| procs << -> { i } }` closes over `0`,`1`,`2`;
   a local first assigned inside a block does not leak out (`1.times { x = 1 };
@@ -428,11 +432,13 @@ Honest limitations of this surface:
   the object it iterates, which `each` answers and `inspect` shows
   (`[1, 2, 3].each_cons(2).each { }` is `[1, 2, 3]`, and it inspects as
   `#<Enumerator: [1, 2, 3]:each_cons(2)>`) — neither is reconstructible from the
-  buffer, since `each_cons` windows overlap. Still open: an enumerator built from
-  a NON-Array receiver records the materialized array instead
-  (`(1..3).each_with_index` inspects as `#<Enumerator: [1, 2, 3]:…>` where MRI
-  shows `1..3`), and `Enumerator#each` on a GENERATOR answers the enumerator
-  where MRI answers the generator block's own value (usually the `Yielder`).
+  buffer, since `each_cons` windows overlap. A receiver that had to be
+  materialized to reach the Array implementation (a Range, a Hash, a Set, another
+  Enumerator) is re-pointed afterwards, so `(1..3).each_with_index` inspects as
+  `#<Enumerator: 1..3:each_with_index>` and `[1, 2].each.map` nests. Still open:
+  `Hash#each_with_index` answers an Array rather than an Enumerator, and
+  `Enumerator#each` on a GENERATOR answers the enumerator where MRI answers the
+  generator block's own value (usually the `Yielder`).
 - **Multi-value Enumerator yields.** `each_with_index`, `each_with_object` and a
   generator's `y.yield a, b` yield TWO values per iteration, not one packed pair.
   The buffer keeps them packed (that is what `to_a` and `each_entry` see) and the
@@ -453,9 +459,12 @@ Honest limitations of this surface:
   its own split, measured the same way: `map`, `flat_map`, `filter_map`,
   `take_while` and `drop_while` spread, `select` and `reject` pack — note lazy
   `drop_while` differs from eager `drop_while`.
-- **`.lazy` sources.** A Range (possibly endless) and a generator stay the
-  pipeline's source, so they are still pulled on demand; anything else is
-  materialized first. That materialization goes through `to_a`, not an
+- **`.lazy` sources.** A lazy enumerator remembers the object `.lazy` was called
+  on, so it inspects the way MRI's does — one `#<Enumerator::Lazy: …>` wrapper
+  per stage, tagged with the operation and its argument
+  (`#<Enumerator::Lazy: #<Enumerator::Lazy: [1, 2]>:take(2)>`). A Range (possibly
+  endless) and a generator stay the pipeline's source, so they are still pulled
+  on demand; anything else is materialized first. That materialization goes through `to_a`, not an
   "is it an Array" test — a Hash, a Set and an Enumerator are all enumerable but
   none of them IS an array, and reading them as one answered an EMPTY pipeline
   (`{a: 1}.lazy.map { … }.to_a` was `[]`). A user `Enumerable` with an infinite

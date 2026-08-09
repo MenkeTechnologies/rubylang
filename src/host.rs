@@ -256,6 +256,10 @@ pub enum RObj {
     Lazy {
         source: Value,
         ops: Vec<LazyOp>,
+        /// The object `.lazy` was called on, which `inspect` shows. It differs
+        /// from `source` whenever the receiver had to be materialized to feed
+        /// the pipeline (a Hash, a Set, an Enumerator).
+        origin: Value,
     },
     Range {
         lo: i64,
@@ -1849,12 +1853,52 @@ impl RubyHost {
     }
     /// Build a lazy enumerator from a source value and an operation pipeline.
     pub fn new_lazy(&mut self, source: Value, ops: Vec<LazyOp>) -> Value {
-        self.alloc(RObj::Lazy { source, ops })
+        let origin = source.clone();
+        self.alloc(RObj::Lazy {
+            source,
+            ops,
+            origin,
+        })
+    }
+    /// As [`new_lazy`], for a receiver that had to be materialized: `origin` is
+    /// what `.lazy` was called on, `source` what the pipeline pulls from.
+    pub fn new_lazy_of(&mut self, source: Value, ops: Vec<LazyOp>, origin: Value) -> Value {
+        self.alloc(RObj::Lazy {
+            source,
+            ops,
+            origin,
+        })
+    }
+    /// The object a lazy enumerator was built from (`Enumerator::Lazy#inspect`).
+    pub fn lazy_origin(&self, v: &Value) -> Option<Value> {
+        match self.obj(v) {
+            Some(RObj::Lazy { origin, .. }) => Some(origin.clone()),
+            _ => None,
+        }
+    }
+    /// How `inspect` names a pipeline stage. The argument-taking ones show their
+    /// argument (`take(2)`, `zip([3, 4])`), matching MRI.
+    fn lazy_op_tag(&mut self, op: &LazyOp) -> String {
+        match op {
+            LazyOp::Map(_) => "map".to_string(),
+            LazyOp::Select(_) => "select".to_string(),
+            LazyOp::Reject(_) => "reject".to_string(),
+            LazyOp::FilterMap(_) => "filter_map".to_string(),
+            LazyOp::FlatMap(_) => "flat_map".to_string(),
+            LazyOp::TakeWhile(_) => "take_while".to_string(),
+            LazyOp::DropWhile(_) => "drop_while".to_string(),
+            LazyOp::Take(n) => format!("take({n})"),
+            LazyOp::Drop(n) => format!("drop({n})"),
+            LazyOp::Zip(others) => {
+                let args: Vec<String> = others.iter().map(|xs| self.inspect_array(xs)).collect();
+                format!("zip({})", args.join(", "))
+            }
+        }
     }
     /// The `(source, ops)` of a lazy enumerator, if `v` is one.
     pub fn lazy_parts(&self, v: &Value) -> Option<(Value, Vec<LazyOp>)> {
         match self.obj(v) {
-            Some(RObj::Lazy { source, ops }) => Some((source.clone(), ops.clone())),
+            Some(RObj::Lazy { source, ops, .. }) => Some((source.clone(), ops.clone())),
             _ => None,
         }
     }
@@ -5394,7 +5438,16 @@ impl RubyHost {
                     format!("#<Fiddle::Function ptr=0x{addr:x}>")
                 }
                 Some(RObj::FiddlePtr { addr, size, .. }) => fiddle_read_cstr_or_len(addr, size),
-                Some(RObj::Lazy { .. }) => "#<Enumerator::Lazy>".to_string(),
+                // MRI nests one `#<Enumerator::Lazy: …>` per pipeline stage
+                // around the object `.lazy` was called on, tagged with the
+                // operation that added it.
+                Some(RObj::Lazy { ops, origin, .. }) => {
+                    let mut s = format!("#<Enumerator::Lazy: {}>", self.inspect(&origin));
+                    for op in &ops {
+                        s = format!("#<Enumerator::Lazy: {s}:{}>", self.lazy_op_tag(op));
+                    }
+                    s
+                }
                 Some(RObj::Enumerator {
                     buf,
                     method,

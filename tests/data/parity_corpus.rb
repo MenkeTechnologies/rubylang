@@ -3157,3 +3157,28 @@ e = [10, 20].each_with_index
 got = []
 r = e.each_entry { |x| got << x }
 p [got, r.inspect]
+#==#
+# A `break` in a block a lazy pipeline STORED has no call left to break out of —
+# the `.map` it was written on returned the moment it was written.
+r = begin
+  [1, 2].lazy.map { break 7 }.to_a
+rescue LocalJumpError => e
+  e.message
+end
+r2 = begin
+  [1, 2].lazy.select { break }.first(1)
+rescue LocalJumpError => e
+  e.message
+end
+p [r, r2, [1, 2].map { break 7 }]
+#==#
+# A lazy pipeline inspects as one wrapper per stage around the object `.lazy`
+# was called on.
+p [[1, 2].lazy.inspect, [1, 2].lazy.map { }.inspect, [1, 2].lazy.map { }.select { }.inspect]
+#==#
+p [[1, 2].lazy.take(2).inspect, [1, 2].lazy.drop(1).inspect, [1, 2].lazy.zip([3, 4]).inspect, {a: 1}.lazy.inspect]
+#==#
+# An Enumerator names the object it iterates, whatever kind of receiver it was.
+p [(1..3).each_with_index.inspect, (1..3).each_slice(2).inspect, [1, 2].each.map.inspect, [1, 2].reverse_each.inspect]
+#==#
+p [(1..3).each_with_index.each { |x| x }, (1..3).each_with_index.lazy.map { |x| x }.to_a, [1, 2].each.map { |x| x * 2 }]
