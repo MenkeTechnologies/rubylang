@@ -638,6 +638,13 @@ enum Mode {
     Blockflow,
     Methobj,
     Multiyield,
+    Eqlident,
+    /// Round-robin over every mode in `ALL_MODES`. Not itself a member of
+    /// `ALL_MODES` (that would recurse), so adding a mode never changes any
+    /// other mode's own seed→case mapping — but it DOES reshuffle which mode
+    /// a given `all` seed lands on, so an `all` run is only comparable to
+    /// another `all` run at the same `ALL_MODES` length.
+    All,
 }
 
 const ALL_MODES: &[Mode] = &[
@@ -683,6 +690,7 @@ const ALL_MODES: &[Mode] = &[
     Mode::Blockflow,
     Mode::Methobj,
     Mode::Multiyield,
+    Mode::Eqlident,
 ];
 
 fn gen_intmeth(seed: u64) -> Vec<String> {
@@ -1607,6 +1615,66 @@ fn gen_methobj(seed: u64) -> Vec<String> {
     })
 }
 
+/// Ruby has TWO equalities and they disagree: `==` coerces across numeric
+/// classes (`1 == 1.0`) while `eql?`/`hash` — the pair Hash keys, `uniq`, the
+/// Array set operators and `Set` are all defined in terms of — does not
+/// (`1.eql?(1.0)` is false, and the two are distinct Hash keys). Every case
+/// here prints the SAME operation over an `eql?`-equal pair and over a merely
+/// `==`-equal pair, so an implementation that picks either equality for both
+/// is caught: answering with `==` throughout collapses `[1, 1.0]`, answering
+/// with identity throughout splits `[1, 1]`. The rule is recursive — a
+/// container is `eql?` only when its elements are — so the pairs are also
+/// nested one and two levels deep, and used as Hash/Set keys where the
+/// identity is what selects the bucket.
+fn gen_eqlident(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let n = r.range(1, 6);
+    let m = r.range(1, 6);
+    // `same` and `wide` hold equal numeric VALUES; only their classes differ,
+    // so `==` cannot tell them apart and `eql?` must.
+    let same = format!("{n}");
+    let wide = format!("{n}.0");
+    let pre = "require \"set\"";
+    one(match r.below(24) {
+        0 => format!("p [{same}.eql?({same}), {same}.eql?({wide}), {wide}.eql?({wide})]"),
+        1 => format!("p [[{same}].eql?([{same}]), [{same}].eql?([{wide}])]"),
+        2 => format!("p [[[{same}]].eql?([[{same}]]), [[{same}]].eql?([[{wide}]])]"),
+        3 => format!("p [{{ a: {same} }}.eql?({{ a: {same} }}), {{ a: {same} }}.eql?({{ a: {wide} }})]"),
+        4 => format!("p [{same}, {wide}, {same}, {m}].uniq"),
+        5 => format!("p [[{same}], [{wide}], [{same}]].uniq"),
+        6 => format!("p([{same}, {m}] | [{wide}])"),
+        7 => format!("p([{same}, {m}] & [{wide}])"),
+        8 => format!("p([{same}, {wide}] - [{same}])"),
+        9 => format!("p [[{same}], [{m}]].intersect?([[{wide}]])"),
+        10 => format!("h = {{}}\nh[{same}] = :i\nh[{wide}] = :f\np [h.size, h[{same}], h[{wide}]]"),
+        11 => format!(
+            "h = {{}}\nh[[{same}]] = :i\nh[[{wide}]] = :f\np [h.size, h[[{same}]], h[[{wide}]]]"
+        ),
+        12 => format!(
+            "h = {{}}\nh[{{ a: {same} }}] = :i\nh[{{ a: {wide} }}] = :f\np [h.size, h[{{ a: {same} }}]]"
+        ),
+        13 => format!("h = {{}}\nh[{{ a: {same} }}] = :i\np h.keys"),
+        14 => format!("{pre}\ns = Set.new\ns << {{ a: {same} }}\ns << {{ a: {same} }}\np [s.size, s.to_a]"),
+        15 => format!("{pre}\np [(Set[{same}] & Set[{wide}]).to_a, (Set[{same}] - Set[{wide}]).to_a]"),
+        16 => format!(
+            "{pre}\np [Set[{same}].subset?(Set[{wide}]), Set[{same}].subset?(Set[{same}, {m}])]"
+        ),
+        17 => format!(
+            "{pre}\np [Set[{same}].disjoint?(Set[{wide}]), Set[{same}].intersect?(Set[{same}])]"
+        ),
+        18 => format!("{pre}\nh = {{}}\nh[Set[{same}]] = :x\np [h[Set[{same}]], h.keys]"),
+        19 => format!("p [{{ a: {n}, b: {m} }}.hash == {{ b: {m}, a: {n} }}.hash, {{ a: {n} }}.hash == {{ a: {n}.0 }}.hash]"),
+        20 => format!("p [[{same}].hash == [{same}].hash, [{same}].hash == [{wide}].hash]"),
+        21 => format!(
+            "S = Struct.new(:a)\np [S.new({same}).eql?(S.new({same})), S.new({same}).eql?(S.new({wide}))]"
+        ),
+        22 => format!(
+            "D = Data.define(:a)\np [D.new(a: {same}).eql?(D.new(a: {same})), D.new(a: {same}).eql?(D.new(a: {wide}))]"
+        ),
+        _ => format!("p [{same}.eql?({wide}), {same} == {wide}, [{same}] == [{wide}], [{same}].eql?([{wide}])]"),
+    })
+}
+
 fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
     match mode {
         Mode::Arith => gen_arith(seed),
@@ -1651,6 +1719,8 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Blockflow => gen_blockflow(seed),
         Mode::Methobj => gen_methobj(seed),
         Mode::Multiyield => gen_multiyield(seed),
+        Mode::Eqlident => gen_eqlident(seed),
+        Mode::All => gen_case(seed, ALL_MODES[(seed as usize) % ALL_MODES.len()]),
     }
 }
 
@@ -1941,10 +2011,15 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Blockflow => "blockflow",
         Mode::Methobj => "methobj",
         Mode::Multiyield => "multiyield",
+        Mode::Eqlident => "eqlident",
+        Mode::All => "all",
     }
 }
 
 fn mode_from_name(s: &str) -> Option<Mode> {
+    if s == "all" {
+        return Some(Mode::All);
+    }
     ALL_MODES.iter().copied().find(|&m| mode_name(m) == s)
 }
 
@@ -2138,6 +2213,7 @@ fn parse_args() -> Args {
                      --count N        number of cases (default 2000)\n\
                      --seed N         base seed; case i uses seed+i (default 1)\n\
                      --mode M         one of: {}\n\
+                     --mode all       round-robin over every mode above\n\
                      (each also accepted as a `--<mode>` shorthand)\n\
                      --stderr         also require the diagnostics to match\n\
                      --once           run a single case (seed) and print both outputs\n\
