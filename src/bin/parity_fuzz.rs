@@ -495,6 +495,15 @@ fn gen_sorting(seed: u64) -> Vec<String> {
     // up as a bare exit-code difference with the message unchecked.
     let guard =
         |body: &str| format!("begin\n  p {body}\nrescue => e\n  p [e.class, e.message]\nend");
+    // Three or more elements: assert the exception CLASS, not the message. MRI
+    // picks its ordering loop by the receiver's length and element kinds, and
+    // the loops disagree about WHICH pair they reach and which operand they
+    // lead with — `[1, 2, "a", 3].min` names `"a"` and `1`, `.max` names `"a"`
+    // and `2`, `.min(2)` names `"a"` and `2`. Dropping only the order does not
+    // help either, because the order decides which operand is rendered by class
+    // and which by inspect. The message IS pinned, exhaustively and in order,
+    // by the two-element arms, which is where the rule is actually knowable.
+    let guard3 = |body: &str| format!("begin\n  p {body}\nrescue => e\n  p e.class\nend");
     one(match r.below(12) {
         0 => format!("p {a}.sort"),
         1 => format!("p {a}.sort {{ |x, y| y <=> x }}"),
@@ -503,11 +512,11 @@ fn gen_sorting(seed: u64) -> Vec<String> {
         4 => format!("p {a}.min_by {{ |x| x.abs }}"),
         5 => format!("p {a}.max_by {{ |x| x.abs }}"),
         6 => guard(&format!("[{x}, {y}].{m}")),
-        7 => guard(&format!("[{x}, {y}, {z}].{m}")),
+        7 => guard3(&format!("[{x}, {y}, {z}].{m}")),
         8 => guard(&format!("[{x}, {y}].{mb} {{ |e| e }}")),
-        9 => guard(&format!("[{x}, {y}, {z}].{mb} {{ |e| e }}")),
+        9 => guard3(&format!("[{x}, {y}, {z}].{mb} {{ |e| e }}")),
         // `min(n)`/`max(n)` sort internally, a third path again.
-        10 => guard(&format!(
+        10 => guard3(&format!(
             "[{x}, {y}, {z}].{}({})",
             if r.below(2) == 0 { "min" } else { "max" },
             r.range(1, 3)
