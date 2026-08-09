@@ -294,9 +294,32 @@ const FLOATS: &[&str] = &[
 const WORDS: &[&str] = &[
     "foo", "bar", "baz", "hello", "world", "abc", "xyz", "Ruby", "Lang",
 ];
+/// Element literals drawn from DIFFERENT `<=>` domains. Most pairs of these
+/// cannot be ranked at all -- `1 <=> "a"` is nil, and so is every cross-domain
+/// pair -- while a few (`1`/`2.5`/`1r`/`2**70`) rank fine. Ruby's `sort`, `min`,
+/// `max` and their `_by` forms are DEFINED by `<=>`, so an unrankable pair
+/// raises ArgumentError from the caller rather than answering; keeping the
+/// rankable numerics in the pool is what stops "make everything raise" from
+/// looking like a fix. No `Object.new`: its `inspect` carries a heap address,
+/// which would diverge on the cases that succeed.
+const MIXED: &[&str] = &[
+    "1",
+    "\"a\"",
+    "nil",
+    ":s",
+    "2.5",
+    "[9]",
+    "true",
+    "1r",
+    "Float::NAN",
+    "2**70",
+];
 
 fn ii<'a>(r: &mut Rng) -> &'a str {
     r.pick(INTS)
+}
+fn mixed<'a>(r: &mut Rng) -> &'a str {
+    r.pick(MIXED)
 }
 fn ff<'a>(r: &mut Rng) -> &'a str {
     r.pick(FLOATS)
@@ -460,13 +483,41 @@ fn gen_sorting(seed: u64) -> Vec<String> {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    one(match r.below(6) {
+    // A pair, and a triple, from mixed `<=>` domains: most cannot be ranked.
+    let (x, y, z) = (mixed(r), mixed(r), mixed(r));
+    // Every ordering entry point, block-less and block-taking alike. They are
+    // separate code paths in both interpreters, and each raises from its own
+    // loop, so the message names its own pair.
+    let m = r.pick(&["sort", "min", "max", "minmax"]);
+    let mb = r.pick(&["sort_by", "min_by", "max_by", "minmax_by"]);
+    // Print the exception rather than letting it reach stderr: stderr is only
+    // compared under `--stderr`, so a raise-vs-answer gap would otherwise show
+    // up as a bare exit-code difference with the message unchecked.
+    let guard =
+        |body: &str| format!("begin\n  p {body}\nrescue => e\n  p [e.class, e.message]\nend");
+    one(match r.below(12) {
         0 => format!("p {a}.sort"),
         1 => format!("p {a}.sort {{ |x, y| y <=> x }}"),
         2 => format!("p {a}.sort_by {{ |x| -x }}"),
         3 => format!("p {w}.sort_by(&:length)"),
         4 => format!("p {a}.min_by {{ |x| x.abs }}"),
-        _ => format!("p {a}.max_by {{ |x| x.abs }}"),
+        5 => format!("p {a}.max_by {{ |x| x.abs }}"),
+        6 => guard(&format!("[{x}, {y}].{m}")),
+        7 => guard(&format!("[{x}, {y}, {z}].{m}")),
+        8 => guard(&format!("[{x}, {y}].{mb} {{ |e| e }}")),
+        9 => guard(&format!("[{x}, {y}, {z}].{mb} {{ |e| e }}")),
+        // `min(n)`/`max(n)` sort internally, a third path again.
+        10 => guard(&format!(
+            "[{x}, {y}, {z}].{}({})",
+            if r.below(2) == 0 { "min" } else { "max" },
+            r.range(1, 3)
+        )),
+        // The block forms rank by what the BLOCK answers; a nil from the block
+        // is the same unrankable pair, reported with the block's own operands.
+        _ => guard(&format!(
+            "[{x}, {y}].{} {{ |c, d| c <=> d }}",
+            r.pick(&["sort", "min", "max", "minmax"])
+        )),
     })
 }
 
@@ -528,13 +579,37 @@ fn gen_comparison(seed: u64) -> Vec<String> {
     let r = &mut Rng::seed(seed);
     let a = ii(r);
     let b = ii(r);
-    one(match r.below(6) {
+    // `clamp` and `between?` are both derived from `<=>`, and they disagree on
+    // purpose: `clamp` rejects a min above its max up front and treats a nil
+    // bound as "no bound", while `between?` has no min-vs-max check at all and
+    // short-circuits to false below min without ever ranking max. Bounds are
+    // drawn so both orders, nil bounds, and a cross-domain bound all appear.
+    let bound = r.pick(&["1", "3", "nil", "\"s\"", "2.5", "Float::NAN"]);
+    let recv = r.pick(&["5", "0", "2.5", "\"m\"", "Float::NAN"]);
+    let guard =
+        |body: &str| format!("begin\n  p {body}\nrescue => e\n  p [e.class, e.message]\nend");
+    one(match r.below(10) {
         0 => format!("p {a} <=> {b}"),
         1 => format!("p {a}.0 == {a}"),
         2 => format!("p [{a}, {b}] <=> [{b}, {a}]"),
         3 => format!("p [{a}, {b}, {}].min", ii(r)),
         4 => format!("p ({a}..{b}).include?({})", ii(r)),
-        _ => format!("p \"{}\" <=> \"{}\"", ww(r), ww(r)),
+        5 => format!("p \"{}\" <=> \"{}\"", ww(r), ww(r)),
+        6 => guard(&format!(
+            "{recv}.clamp({bound}, {})",
+            r.pick(&["1", "3", "nil"])
+        )),
+        7 => guard(&format!(
+            "{recv}.between?({bound}, {})",
+            r.pick(&["1", "3", "nil"])
+        )),
+        8 => guard(&format!(
+            "{recv}.clamp({}{}{})",
+            r.pick(&["1", "3"]),
+            r.pick(&["..", "..."]),
+            r.pick(&["1", "3"])
+        )),
+        _ => guard(&format!("{recv}.clamp({bound})")),
     })
 }
 
@@ -803,7 +878,12 @@ fn gen_exceptions(seed: u64) -> Vec<String> {
     let r = &mut Rng::seed(seed);
     let w = ww(r);
     let n = ii(r);
-    one(match r.below(9) {
+    // A receiver with no `-@` and no arithmetic at all. MRI names the receiver
+    // in the NoMethodError the same way everywhere -- `an instance of C`, or the
+    // bare literal for nil/true/false -- never by its bare class name. Only
+    // receivers MRI answers with NoMethodError (not TypeError) belong here.
+    let bad_recv = r.pick(&["{}", "(1..2)", ":s", "nil", "true", "proc {}"]);
+    one(match r.below(11) {
         0 => format!("p (begin; raise \"{w}\"; rescue => e; e.message; end)"),
         1 => format!("p (begin; Integer(\"{w}\"); rescue ArgumentError; :caught; end)"),
         2 => format!("p (begin; {n} / 0; rescue ZeroDivisionError => e; e.message; end)"),
@@ -816,6 +896,11 @@ fn gen_exceptions(seed: u64) -> Vec<String> {
         6 => format!("p (begin; {{}}.fetch(:{w}); rescue KeyError; :key; end)"),
         7 => "class E1 < StandardError; end; p (begin; raise E1; rescue E1; :custom; end)"
             .to_string(),
+        8 => format!("p (begin; -{bad_recv}; rescue NoMethodError => e; e.message; end)"),
+        9 => format!(
+            "p (begin; {bad_recv} {} 1; rescue NoMethodError => e; e.message; end)",
+            r.pick(&["+", "-", "*", "/"])
+        ),
         _ => "p (begin; nil.foo; rescue NoMethodError; :nome; end)".to_string(),
     })
 }
@@ -1080,7 +1165,7 @@ fn gen_rational(seed: u64) -> Vec<String> {
     let relop = r.pick(&["<", ">", "<=", ">="]);
     // Left column renders via `inspect` in the message, right column via class.
     let operand = r.pick(&["Float::NAN", "nil", ":sym", "\"s\"", "[1]", "Object.new"]);
-    one(match r.below(17) {
+    one(match r.below(19) {
         0 => format!("p(Rational({a}, {b}) + Rational({c}, {d}))"),
         1 => format!("p(Rational({a}, {b}) - Rational({c}, {d}))"),
         2 => format!("p(Rational({a}, {b}) * Rational({c}, {d}))"),
@@ -1113,6 +1198,24 @@ fn gen_rational(seed: u64) -> Vec<String> {
         // that could disagree.
         15 => format!(
             "begin\n  p(Rational({a}, {b}).send(:{relop}, {operand}))\nrescue => e\n  p [e.class, e.message]\nend"
+        ),
+        // `between?` and `clamp` are Comparable's OTHER two `<=>` consumers, and
+        // Rational reaches them through its own dispatch rather than through the
+        // module. They disagree by design: `clamp` rejects a min above its max
+        // before ranking anything and treats a nil bound as unbounded, while
+        // `between?` has no min-vs-max check and short-circuits to false below
+        // min without ever ranking max.
+        16 => format!(
+            "begin\n  p(Rational({a}, {b}).{}({}, {}))\nrescue => e\n  p [e.class, e.message]\nend",
+            r.pick(&["between?", "clamp"]),
+            r.pick(&["0", "1", "nil", "Rational(1, 2)", "\"s\""]),
+            r.pick(&["0", "1", "nil", "Rational(9, 2)"])
+        ),
+        17 => format!(
+            "begin\n  p(Rational({a}, {b}).clamp({}{}{}))\nrescue => e\n  p [e.class, e.message]\nend",
+            r.pick(&["0", "1"]),
+            r.pick(&["..", "..."]),
+            r.pick(&["0", "3"])
         ),
         // Ordering that SUCCEEDS against every numeric class, pinned next to the
         // failures so a fix cannot satisfy them by making Rational refuse to
