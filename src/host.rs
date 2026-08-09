@@ -187,6 +187,15 @@ pub enum LazyOp {
     /// `zip(a, b, …)` — pairs each element with the same-index element of every
     /// argument array (nil past the end), producing an array per element.
     Zip(Vec<Vec<Value>>),
+    /// `uniq` / `uniq { |x| key }` — passes an element through only the first
+    /// time its key is seen. The optional block supplies the key; without one
+    /// the element is its own key.
+    ///
+    /// Unlike every other stage this one is STATEFUL across elements, so its
+    /// seen-set lives in `LazyState::Uniq` for the duration of one pull rather
+    /// than in the op itself: the op is shared by every pull of the pipeline and
+    /// must not accumulate between them.
+    Uniq(Option<Value>),
 }
 
 /// How a derived generator reshapes the values its source yields. This is what
@@ -1993,6 +2002,9 @@ impl RubyHost {
                 let args: Vec<String> = others.iter().map(|xs| self.inspect_array(xs)).collect();
                 format!("zip({})", args.join(", "))
             }
+            // MRI tags it `uniq` whether or not a key block was given — the
+            // block is not shown, so both forms inspect identically.
+            LazyOp::Uniq(_) => "uniq".to_string(),
         }
     }
     /// The `(source, ops)` of a lazy enumerator, if `v` is one.

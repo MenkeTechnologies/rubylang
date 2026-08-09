@@ -6211,3 +6211,106 @@ fn a_ranking_spaceship_still_drives_the_native_comparable_operators() {
     eq(&format!("{n}N.new(2).clamp(N.new(3), N.new(4)).v"), "3");
     eq(&format!("{n}[N.new(3), N.new(1)].sort.map(&:v)"), "[1, 3]");
 }
+
+#[test]
+fn lazy_uniq_is_a_stateful_stage_that_stays_lazy() {
+    // `uniq` was declared in the arity table and absent from lazy dispatch, so
+    // every one of these raised NoMethodError. It is the one stage that carries
+    // state ACROSS elements, so it does not fit the per-element shape of the
+    // others.
+    eq("[1, 1, 2, 4, 2, 1, 5].lazy.uniq.to_a", "[1, 2, 4, 5]");
+    eq("[1, 2, 3].lazy.uniq.to_a", "[1, 2, 3]");
+    eq("[].lazy.uniq.to_a", "[]");
+    // First-occurrence order is preserved.
+    eq("[3, 1, 3, 2, 1].lazy.uniq.to_a", "[3, 1, 2]");
+    // Over an INFINITE source, bounded by first: only a stage that really is
+    // lazy terminates here at all.
+    eq(
+        "(1..).lazy.map { |x| x % 5 }.uniq.first(5)",
+        "[1, 2, 3, 4, 0]",
+    );
+    eq(
+        "(1..Float::INFINITY).lazy.map { |x| x % 3 }.uniq.first(3)",
+        "[1, 2, 0]",
+    );
+    // Composed with the stages either side.
+    eq(
+        "(1..).lazy.map { |x| x % 5 }.uniq.drop(1).first(2)",
+        "[2, 3]",
+    );
+    eq("[3, 1, 3, 2].lazy.uniq.take(2).to_a", "[3, 1]");
+    eq("[1, 1, 2].lazy.uniq.map { |x| x * 2 }.to_a", "[2, 4]");
+    // Two uniq stages in one pipeline keep separate state.
+    eq(
+        "(1..).lazy.map { |x| x % 6 }.uniq.map { |x| x % 3 }.uniq.first(3)",
+        "[1, 2, 0]",
+    );
+}
+
+#[test]
+fn lazy_uniq_keys_on_the_block_but_yields_the_element() {
+    // The block supplies the KEY; the value that passes through is the original
+    // element, not the key.
+    eq(
+        "[1, 2, 3, 4, 5, 6].lazy.uniq { |x| x % 3 }.to_a",
+        "[1, 2, 3]",
+    );
+    eq("(1..10).lazy.uniq { |x| x % 3 }.first(3)", "[1, 2, 3]");
+    eq(
+        "%w[apple avocado berry].lazy.uniq { |s| s[0] }.to_a",
+        "[\"apple\", \"berry\"]",
+    );
+    // No block: the element is its own key.
+    eq("[\"a\", \"b\", \"a\"].lazy.uniq.to_a", "[\"a\", \"b\"]");
+    eq("[[1], [1], [2]].lazy.uniq.to_a", "[[1], [2]]");
+}
+
+#[test]
+fn lazy_uniq_uses_eql_semantics_not_loose_equality() {
+    // The seen-set keys the way Array#uniq and Hash keys do (hash/eql?), so
+    // `1` and `1.0` are DISTINCT even though `1 == 1.0`. Keying on `==` would
+    // collapse them.
+    eq("[1, 1.0, 1, 2].lazy.uniq.to_a", "[1, 1.0, 2]");
+    eq("[1, 1.0].lazy.uniq.to_a.size", "2");
+    eq("[:a, \"a\"].lazy.uniq.to_a.size", "2");
+    // Matches the eager Array#uniq it mirrors.
+    eq("[1, 1.0, 1, 2].uniq", "[1, 1.0, 2]");
+}
+
+#[test]
+fn lazy_uniq_state_resets_between_pulls_of_the_same_pipeline() {
+    // A stored pipeline is pulled more than once, and a generator source is
+    // re-driven in growing batches WITHIN one pull. Either way the seen-set
+    // belongs to the pull, not to the op: leaking it across would make the
+    // second pull answer empty.
+    eq(
+        "e = [1, 1, 2, 3].lazy.uniq; [e.to_a, e.to_a]",
+        "[[1, 2, 3], [1, 2, 3]]",
+    );
+    eq(
+        "e = [1, 1, 2, 3].lazy.uniq; e.first(2); e.to_a",
+        "[1, 2, 3]",
+    );
+    // Generator source: the re-drive loop replays from the start, so the reset
+    // has to happen there too.
+    let gen = "e = Enumerator.new { |y| i = 0; loop { y << (i % 4); i += 1 } }; ";
+    eq(&format!("{gen}e.lazy.uniq.first(4)"), "[0, 1, 2, 3]");
+    eq(&format!("{gen}e.lazy.uniq.first(2)"), "[0, 1]");
+    eq(
+        &format!("{gen}e.lazy.map {{ |x| x }}.uniq.first(3)"),
+        "[0, 1, 2]",
+    );
+}
+
+#[test]
+fn lazy_uniq_inspects_as_a_named_stage() {
+    // MRI tags the stage `uniq` with no argument, block or not.
+    eq(
+        "[1, 2].lazy.uniq.inspect",
+        "\"#<Enumerator::Lazy: #<Enumerator::Lazy: [1, 2]>:uniq>\"",
+    );
+    eq(
+        "[1, 2].lazy.uniq { |x| x }.inspect",
+        "\"#<Enumerator::Lazy: #<Enumerator::Lazy: [1, 2]>:uniq>\"",
+    );
+}

@@ -9524,6 +9524,9 @@ fn dispatch_lazy(
                 .collect();
             Ok(extend(LazyOp::Zip(others)))
         }
+        // `uniq` takes an OPTIONAL block, so unlike map/select it must not
+        // demand one.
+        "uniq" => Ok(extend(LazyOp::Uniq(block.clone()))),
         "lazy" => Ok(recv.clone()),
         "first" => {
             let out = lazy_pull(
@@ -9555,6 +9558,9 @@ enum LazyState {
     Dropping(bool),
     /// `zip` cursor: the index of the next element to pair.
     Zip(usize),
+    /// `uniq`'s seen keys for this pull, by the same `hash`/`eql?` key Array#uniq
+    /// and Hash keys use, so `1` and `1.0` stay distinct.
+    Uniq(std::collections::HashSet<crate::host::RKey>),
     None,
 }
 
@@ -9642,6 +9648,24 @@ fn lazy_feed(
             let cont = lazy_feed(ops, state, i + 1, elem, out, limit)?;
             Ok(cont && !last)
         }
+        // Keyed by the block's value when there is one, but the element that
+        // passes through is always the ORIGINAL — `uniq { |x| x % 3 }` yields
+        // the elements, not the residues.
+        LazyOp::Uniq(keyer) => {
+            let key = match keyer {
+                Some(p) => call_lazy_block(p, &elem)?,
+                None => elem.clone(),
+            };
+            let k = with_host(|h| h.value_to_key(&key));
+            let LazyState::Uniq(seen) = &mut state[i] else {
+                return Ok(false);
+            };
+            if seen.insert(k) {
+                lazy_feed(ops, state, i + 1, elem, out, limit)
+            } else {
+                Ok(true)
+            }
+        }
         LazyOp::Drop(_) => {
             let LazyState::Drop(rem) = &mut state[i] else {
                 return Ok(true);
@@ -9686,6 +9710,7 @@ fn lazy_pull(
             LazyOp::Drop(n) => LazyState::Drop(*n),
             LazyOp::DropWhile(_) => LazyState::Dropping(true),
             LazyOp::Zip(_) => LazyState::Zip(0),
+            LazyOp::Uniq(_) => LazyState::Uniq(std::collections::HashSet::new()),
             _ => LazyState::None,
         })
         .collect();
@@ -9727,6 +9752,10 @@ fn lazy_pull(
                     LazyOp::Drop(n) => LazyState::Drop(*n),
                     LazyOp::DropWhile(_) => LazyState::Dropping(true),
                     LazyOp::Zip(_) => LazyState::Zip(0),
+                    // Must be cleared like the rest: this loop replays the
+                    // generator from the start, so a seen-set carried over from
+                    // the previous, shorter drive would suppress every element.
+                    LazyOp::Uniq(_) => LazyState::Uniq(std::collections::HashSet::new()),
                     _ => LazyState::None,
                 };
             }
