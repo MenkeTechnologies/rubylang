@@ -32,20 +32,29 @@ CLASSES = %w[
 # Owners injected by default gems rather than by the core interpreter.
 SKIP_OWNER = /\A(DidYouMean|ErrorHighlight)\b/
 
-def esc(s)
-  s.gsub('\\', '\\\\\\\\').gsub('"', '\"')
-end
+# The helpers live in a module rather than at the top level because a top-level
+# `def` is a PRIVATE INSTANCE METHOD OF Object, which the `Object` pass below
+# then dumps as though MRI defined it. That contaminated the table with rows for
+# this script's own helpers (`esc`, `derived_params`, `encode_params`), and a
+# phantom row makes rubylang report the name as defined on every object.
+module Gen
+  module_function
 
-# The parameters list MRI reports for a C function of this arity: `n` required
-# for a fixed `n`, and `-(n+1)` means `n` required followed by a rest. Rows whose
-# real parameters differ (Ruby-defined built-ins with names/defaults/keywords)
-# carry them explicitly instead.
-def derived_params(arity)
-  arity >= 0 ? [[:req]] * arity : [[:req]] * (-arity - 1) + [[:rest]]
-end
+  def esc(s)
+    s.gsub('\\', '\\\\\\\\').gsub('"', '\"')
+  end
 
-def encode_params(ps)
-  ps.map { |kind, name| name ? "#{kind}:#{name}" : kind.to_s }.join(",")
+  # The parameters list MRI reports for a C function of this arity: `n` required
+  # for a fixed `n`, and `-(n+1)` means `n` required followed by a rest. Rows whose
+  # real parameters differ (Ruby-defined built-ins with names/defaults/keywords)
+  # carry them explicitly instead.
+  def derived_params(arity)
+    arity >= 0 ? [[:req]] * arity : [[:req]] * (-arity - 1) + [[:rest]]
+  end
+
+  def encode_params(ps)
+    ps.map { |kind, name| name ? "#{kind}:#{name}" : kind.to_s }.join(",")
+  end
 end
 
 rows = {}
@@ -114,8 +123,8 @@ puts <<~HDR
 HDR
 
 rows.sort_by { |(owner, m), _| [owner, m] }.each do |(owner, m), (arity, ps)|
-  enc = ps == derived_params(arity) ? "" : encode_params(ps)
-  puts %{    ("#{esc(owner)}", "#{esc(m)}", #{arity}, "#{esc(enc)}"),}
+  enc = ps == Gen.derived_params(arity) ? "" : Gen.encode_params(ps)
+  puts %{    ("#{Gen.esc(owner)}", "#{Gen.esc(m)}", #{arity}, "#{Gen.esc(enc)}"),}
 end
 
 puts <<~MID
@@ -127,7 +136,7 @@ puts <<~MID
 MID
 
 ancestry.sort.each do |cn, chain|
-  puts %{    ("#{esc(cn)}", &[#{chain.map { |c| %{"#{esc(c)}"} }.join(", ")}]),}
+  puts %{    ("#{Gen.esc(cn)}", &[#{chain.map { |c| %{"#{Gen.esc(c)}"} }.join(", ")}]),}
 end
 
 puts <<~MID2
@@ -138,7 +147,7 @@ puts <<~MID2
   pub static BUILTIN_MODULES: &[&str] = &[
 MID2
 
-modules.sort.each { |m| puts %{    "#{esc(m)}",} }
+modules.sort.each { |m| puts %{    "#{Gen.esc(m)}",} }
 
 puts <<~'TAIL'
 ];
