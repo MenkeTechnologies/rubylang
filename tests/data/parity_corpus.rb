@@ -3529,3 +3529,32 @@ p caught { Sent.new.m }, Sent.private_instance_methods(false), Sent.new.send(:m)
 p caught { Evaled.new.m }, Evaled.private_instance_methods(false)
 Sent.send(:public, :m)
 p Sent.new.m, Sent.private_instance_methods(false)
+# Comparison ACROSS the numeric classes. Ruby's `Integer == Float` is EXACT —
+# it converts the FLOAT to an integer, never the other way — so `(10**23)`
+# and `1e23` are NOT equal even though `(10**23).to_f == 1e23`. Every arm here
+# demanded both sides convert to its own type and answered false/nil otherwise.
+big = 2**64
+p [big == big.to_f, big.to_f == big, big != big.to_f, (big + 1) == big.to_f]
+p [(10**23) == 1e23, (10**23).to_f == 1e23, 10**20 == 1e20]
+p [big <=> big.to_f, (big + 1) <=> big.to_f, (big - 1) <=> big.to_f]
+p [big <=> Float::INFINITY, big <=> -Float::INFINITY, big <=> Float::NAN]
+p [big == Float::NAN, big == Float::INFINITY, (big <=> "x")]
+p [Rational(1, 2) == 0.5, 0.5 == Rational(1, 2), Rational(1, 3) == 1.0 / 3]
+p [Rational(1, 2) <=> 0.5, Rational(1, 2) <=> Float::NAN, Rational(1, 2) == 1]
+p [big == Rational(big, 1), Rational(big, 1) == big.to_f]
+p [Complex(1, 0) == 1.0, 1.0 == Complex(1, 0), Complex(1, 1) == 1.0]
+p [Complex(1.0, 0) == 1, Complex(1, 0) == "x"]
+p [big.coerce(1.0), big.coerce(1)]
+p [Rational(1, 2).coerce(1.0), Rational(1, 2).coerce(1)]
+# `max`/`min` rounded both sides to a double first, so two integers one apart
+# beyond 2**53 compared EQUAL and the first one won.
+p [[big, big + 1].max, [big, big + 1].min, [big + 1, big].max]
+p [[big, big + 1].minmax, [big, 1e20].max, [big, 1e20].min]
+# Ordering against a Float is exact too — rounding `big` to a double lands it
+# exactly on `big.to_f`, which would make `<=` and `>=` both true.
+p [big <= big.to_f, big >= big.to_f, big < big.to_f, big > big.to_f]
+p [(10**52) <= (10**52).to_f, (10**52) >= (10**52).to_f]
+p [big > 1.0, big < Float::INFINITY, 1.0 < big, Rational(1, 2) < 0.6]
+# `eql?` stays class-strict, and the two remain distinct Hash keys.
+p [big.eql?(big.to_f), big.eql?(big), [big, big.to_f].uniq.size]
+p({big => :i}[big.to_f])

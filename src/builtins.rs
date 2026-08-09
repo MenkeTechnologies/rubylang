@@ -4974,15 +4974,24 @@ fn dispatch_bigint(
             }
             _ => return Err(raise_exc("ZeroDivisionError", "divided by 0")),
         },
+        // Against another Integer this is an exact BigInt compare; against a
+        // Float it stays exact rather than promoting the Integer, so
+        // `(2**64 + 1) <=> 2.0**64` is 1 and not 0. Anything else is nil.
         "<=>" => match with_host(|h| h.as_bigint(&args[0])) {
-            Some(o) => Value::Int(match b.cmp(&o) {
-                std::cmp::Ordering::Less => -1,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Greater => 1,
-            }),
-            None => Value::Undef,
+            Some(o) => Value::Int(ord_to_i(b.cmp(&o))),
+            None => match &args[0] {
+                Value::Float(f) if f.is_nan() => Value::Undef,
+                Value::Float(f) if f.is_infinite() => Value::Int(if *f > 0.0 { -1 } else { 1 }),
+                Value::Float(f) => Value::Int(ord_to_i(cmp_bigint_float(&b, *f))),
+                _ => Value::Undef,
+            },
         },
-        "coerce" => new_arr(vec![args[0].clone(), big(b.clone())]),
+        // `Integer#coerce` promotes SELF to the argument's kind when that is a
+        // Float, and the argument to an Integer otherwise.
+        "coerce" => match &args[0] {
+            Value::Float(_) => new_arr(vec![args[0].clone(), Value::Float(bigint_to_f64(&b))]),
+            _ => new_arr(vec![args[0].clone(), big(b.clone())]),
+        },
         _ => return Ok(None),
     };
     Ok(Some(r))
@@ -5485,14 +5494,15 @@ fn dispatch_number(
             }
             Ok(recv.clone())
         }
+        // `Integer#<=>` is EXACT against a Float, so `3**34 <=> (3**34).to_f` is
+        // 1 — the double rounded down. Casting both to `f64` first collapsed
+        // them onto the same value and answered 0. NaN orders against nothing,
+        // and a non-numeric argument is nil rather than a comparison.
         "<=>" => {
-            let (x, y) = (as_f(recv), as_f(&args[0]));
-            Ok(match x.partial_cmp(&y) {
-                Some(std::cmp::Ordering::Less) => Value::Int(-1),
-                Some(std::cmp::Ordering::Equal) => Value::Int(0),
-                Some(std::cmp::Ordering::Greater) => Value::Int(1),
-                None => Value::Undef,
-            })
+            if !is_numeric_value(&args[0]) || as_f(&args[0]).is_nan() {
+                return Ok(Value::Undef);
+            }
+            Ok(Value::Int(ord_to_i(cmp_numeric(recv, &args[0]))))
         }
         // Bit operations promote to BigInt on overflow (`1 << 64`) and accept
         // already-promoted operands.
@@ -5803,6 +5813,35 @@ fn int_fdiv_double(x: &num_bigint::BigInt, y: &num_bigint::BigInt) -> f64 {
 /// the (already reduced) numerator and denominator.
 fn rational_to_f64(r: &num_rational::BigRational) -> f64 {
     int_fdiv_double(r.numer(), r.denom())
+}
+
+fn bigint_to_f64(b: &num_bigint::BigInt) -> f64 {
+    use num_traits::ToPrimitive as _;
+    b.to_f64().unwrap_or(f64::INFINITY)
+}
+
+fn ord_to_i(o: std::cmp::Ordering) -> i64 {
+    match o {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// Compare an Integer to a FINITE Float exactly, the way MRI's
+/// `rb_integer_float_cmp` does — never by promoting the Integer to a Float,
+/// which would report `2**64 + 1` and `2.0**64` as equal. Compares against the
+/// float's floor, then breaks a tie on whichever side the fraction falls.
+fn cmp_bigint_float(b: &num_bigint::BigInt, f: f64) -> std::cmp::Ordering {
+    use num_traits::FromPrimitive as _;
+    let floor = f.floor();
+    let Some(fi) = num_bigint::BigInt::from_f64(floor) else {
+        return std::cmp::Ordering::Equal;
+    };
+    match b.cmp(&fi) {
+        std::cmp::Ordering::Equal if f > floor => std::cmp::Ordering::Less,
+        other => other,
+    }
 }
 
 /// `BigInt::is_zero` without pulling `num_traits::Zero` into every call site.
@@ -9352,18 +9391,31 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
                 Ok(Value::Float(rational_to_f64(&r).powf(as_f(&args[0]))))
             }
         }
+        // Against another Rational or an Integer this is exact; against a Float
+        // MRI's `nurat_cmp` goes through `to_f`, matching how `Rational#==`
+        // treats one. A NaN orders against nothing.
         "<=>" => match with_host(|h| h.as_rational(&args[0])) {
-            Some(o) => Ok(Value::Int(match r.cmp(&o) {
-                std::cmp::Ordering::Less => -1,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Greater => 1,
-            })),
-            None => Ok(Value::Undef),
+            Some(o) => Ok(Value::Int(ord_to_i(r.cmp(&o)))),
+            None => match &args[0] {
+                Value::Float(f) if !f.is_nan() => Ok(Value::Int(ord_to_i(
+                    rational_to_f64(&r)
+                        .partial_cmp(f)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                ))),
+                _ => Ok(Value::Undef),
+            },
         },
-        "coerce" => Ok(new_arr(vec![
-            with_host(|h| h.new_rational(h.as_rational(&args[0]).unwrap_or_else(|| r.clone()))),
-            recv.clone(),
-        ])),
+        // As with Integer, a Float argument promotes SELF to a Float.
+        "coerce" => match &args[0] {
+            Value::Float(_) => Ok(new_arr(vec![
+                args[0].clone(),
+                Value::Float(rational_to_f64(&r)),
+            ])),
+            _ => Ok(new_arr(vec![
+                with_host(|h| h.new_rational(h.as_rational(&args[0]).unwrap_or_else(|| r.clone()))),
+                recv.clone(),
+            ])),
+        },
         "hash" => Ok(Value::Int(r.to_i64().unwrap_or(0))),
         "integer?" => Ok(Value::Bool(r.is_integer())),
         // The arithmetic/comparison operators reach here when invoked as methods
@@ -18357,10 +18409,45 @@ fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
             let (xs, ys) = with_host(|h| (h.as_str(a), h.as_str(b)));
             match (xs, ys) {
                 (Some(x), Some(y)) => x.cmp(&y),
-                _ => as_f(a).partial_cmp(&as_f(b)).unwrap_or(Ordering::Equal),
+                _ => cmp_numeric(a, b),
             }
         }
-        _ => as_f(a).partial_cmp(&as_f(b)).unwrap_or(Ordering::Equal),
+        _ => cmp_numeric(a, b),
+    }
+}
+
+/// Order two numbers. Integers wider than `i64` and Rationals compare EXACTLY:
+/// rounding them to `f64` first collapses `2**64` and `2**64 + 1` onto the same
+/// double and reports them EQUAL, which made `max`/`min` keep whichever element
+/// happened to come first (`[2**64, 2**64 + 1].max` answered `2**64`). Only a
+/// Float operand, which no rational can represent, falls back to the double.
+fn cmp_numeric(a: &Value, b: &Value) -> std::cmp::Ordering {
+    let (ra, rb) = with_host(|h| (h.as_rational(a), h.as_rational(b)));
+    // A FINITE Float converts to an exact rational too, so a mixed pair stays
+    // exact: `3**34` really is greater than `(3**34).to_f`, which rounded down.
+    let ra = ra.or_else(|| as_exact_rational(a));
+    let rb = rb.or_else(|| as_exact_rational(b));
+    if let (Some(x), Some(y)) = (ra, rb) {
+        return x.cmp(&y);
+    }
+    as_f(a)
+        .partial_cmp(&as_f(b))
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// Whether a value is one of Ruby's numbers — the operand kinds `<=>` will
+/// compare rather than answer nil for.
+fn is_numeric_value(v: &Value) -> bool {
+    matches!(v, Value::Int(_) | Value::Float(_))
+        || with_host(|h| matches!(h.class_of(v).as_str(), "Integer" | "Float" | "Rational"))
+}
+
+/// A finite Float as the exact rational it really is (every finite double is a
+/// dyadic rational). `None` for NaN/infinity and for anything not a Float.
+fn as_exact_rational(v: &Value) -> Option<num_rational::BigRational> {
+    match v {
+        Value::Float(f) if f.is_finite() => num_rational::BigRational::from_float(*f),
+        _ => None,
     }
 }
 

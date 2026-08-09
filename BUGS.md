@@ -531,6 +531,22 @@ Honest limitations of this surface:
   false for a private method unless the second argument is true.
   Still open: `public_send` does not differ from `send`, and visibility on
   *class* methods (`private_class_method`) is still accepted as a no-op.
+- **Divergence — a bare `==`/`<`/`<=`/`>`/`>=` between an `i64`-range Integer
+  and a Float is not exact.** Ruby compares an Integer to a Float exactly, never
+  by rounding the Integer, so `3**34 == (3**34).to_f` is false and
+  `7**53 <= (7**53).to_f` is false. Every path rubylang owns does that:
+  `Integer#<=>`, `eql?`, Hash keys, `uniq`, `include?`/`index`, `max`/`min`/
+  `sort`, and all of `<` `<=` `>` `>=` `==` once either side is a BigInt,
+  Rational or Complex. The one path it does NOT own is the bare operator when
+  BOTH sides are still native — an `i64` Integer and a Float — because fusevm
+  compares those inline: `vm.rs` `cmp_int_fast` matches
+  `(a, b, _) if is_native_num(a) && is_native_num(b)` and answers
+  `float_cmp(a.to_float(), b.to_float())`, with the strict-numeric-mode flag
+  ignored, so the numeric hook is never consulted and rubylang never sees the
+  operands. It only shows above 2^53, where the `f64` cast starts rounding.
+  `(3**34).send(:==, (3**34).to_f)` goes through dispatch and IS exact.
+  Closing this needs a fusevm release that delegates a native Int/Float
+  comparison to the hook; fusevm is pinned at 0.17.0 here.
 - **Composite Hash keys.** Arrays (`{[1, 2] => v}`, nested), Hashes
   (`{{a: 1} => v}`), Sets, Ranges (`{(1..3) => v}`, Integer/String/Float
   endpoints), `BigInt`/`Rational`/`Complex` numbers, and class objects work as

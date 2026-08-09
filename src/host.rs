@@ -6439,6 +6439,20 @@ impl RubyHost {
         let complex_side = matches!(self.obj(a), Some(RObj::Complex { .. }))
             || matches!(self.obj(b), Some(RObj::Complex { .. }));
         if !complex_side && (matches!(a, Value::Float(_)) || matches!(b, Value::Float(_))) {
+            // ORDERING against a Float is exact in Ruby, so it must not go
+            // through the `as_f64` promotion the arithmetic below uses: rounding
+            // `10**52` to a double lands it exactly on `(10**52).to_f` and
+            // reports `10**52 <= (10**52).to_f` as true, where MRI says false.
+            if matches!(op, Lt | Gt | Le | Ge) {
+                if let Some(ord) = self.exact_num_cmp(a, b) {
+                    return Ok(Value::Bool(match op {
+                        Lt => ord.is_lt(),
+                        Gt => ord.is_gt(),
+                        Le => ord.is_le(),
+                        _ => ord.is_ge(),
+                    }));
+                }
+            }
             if let (Some(x), Some(y)) = (self.as_f64(a), self.as_f64(b)) {
                 let out = match op {
                     Add => Some(Value::Float(x + y)),
@@ -6721,31 +6735,102 @@ impl RubyHost {
         }
     }
 
+    /// A Float's EXACT integer value, or `None` when it has none — it is NaN,
+    /// infinite, or carries a fractional part. This is what makes Ruby's
+    /// `Integer == Float` exact rather than a lossy promotion of the Integer:
+    /// `2**64 == 2.0**64` is true because `2.0**64` is exactly `2**64`, while
+    /// `(2**64 + 1) == 2.0**64` is false and `(10**23) == 1e23` is false.
+    fn exact_float_int(v: &Value) -> Option<num_bigint::BigInt> {
+        use num_traits::FromPrimitive as _;
+        let f = match v {
+            Value::Float(f) => *f,
+            _ => return None,
+        };
+        if !f.is_finite() || f.fract() != 0.0 {
+            return None;
+        }
+        num_bigint::BigInt::from_f64(f)
+    }
+
+    /// Order two numbers EXACTLY, or `None` when one of them is not a finite
+    /// number (NaN/infinity, or not a number at all) and so has no exact
+    /// rational value to compare. Every finite double IS a rational, so a mixed
+    /// Integer/Float pair never has to round either side.
+    pub fn exact_num_cmp(&self, a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+        let exact = |v: &Value| match v {
+            Value::Float(f) if f.is_finite() => num_rational::BigRational::from_float(*f),
+            Value::Float(_) => None,
+            _ => self.as_rational(v),
+        };
+        Some(exact(a)?.cmp(&exact(b)?))
+    }
+
     pub fn eq_values(&self, a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => x == y,
             (Value::Float(x), Value::Float(y)) => x == y,
-            (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => *x as f64 == *y,
-            (Value::Bool(x), Value::Bool(y)) => x == y,
-            (Value::Undef, Value::Undef) => true,
-            // Integer equality across the i64/BigInt boundary (a promoted BigInt
-            // is never equal to an i64, since it never holds an in-range value,
-            // but two BigInts or a BigInt vs Int compare by value).
-            _ if matches!(self.obj(a), Some(RObj::BigInt(_)))
-                || matches!(self.obj(b), Some(RObj::BigInt(_))) =>
-            {
-                match (self.as_bigint(a), self.as_bigint(b)) {
-                    (Some(x), Some(y)) => x == y,
-                    _ => false,
+            // `Integer == Float` is EXACT in Ruby, at every Integer width. Below
+            // 2**53 an `as f64` cast is lossless, so that stays the fast path;
+            // above it the cast rounds and would report `3**34` equal to
+            // `(3**34).to_f`, which MRI says is false.
+            (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => {
+                if x.unsigned_abs() <= (1u64 << 53) {
+                    *x as f64 == *y
+                } else {
+                    Self::exact_float_int(&Value::Float(*y))
+                        .is_some_and(|f| f == num_bigint::BigInt::from(*x))
                 }
             }
-            // Rational equality (also equal to an integer of the same value).
+            (Value::Bool(x), Value::Bool(y)) => x == y,
+            (Value::Undef, Value::Undef) => true,
+            // Rational equality (also equal to an integer of the same value —
+            // `as_rational` converts an Integer of either width, which is why
+            // this arm comes BEFORE the BigInt one: `2**64 == Rational(2**64, 1)`
+            // has a BigInt on the left and only the rational path can answer it).
+            // Against a Float, MRI's `Rational#==` really does go through
+            // `to_f`, so `Rational(1, 3) == 1.0/3` is true.
             _ if matches!(self.obj(a), Some(RObj::Rational(_)))
                 || matches!(self.obj(b), Some(RObj::Rational(_))) =>
             {
                 match (self.as_rational(a), self.as_rational(b)) {
                     (Some(x), Some(y)) => x == y,
-                    _ => false,
+                    _ => match (self.as_f64(a), self.as_f64(b)) {
+                        (Some(x), Some(y)) => x == y,
+                        _ => false,
+                    },
+                }
+            }
+            // Integer equality across the i64/BigInt boundary (a promoted BigInt
+            // is never equal to an i64, since it never holds an in-range value,
+            // but two BigInts or a BigInt vs Int compare by value). Against a
+            // Float, MRI compares EXACTLY rather than converting the Integer —
+            // `(10**23) == 1e23` is false where `(10**23).to_f == 1e23` is true
+            // — so the Float is the side that has to convert, and it only can
+            // when it is finite and has no fractional part.
+            _ if matches!(self.obj(a), Some(RObj::BigInt(_)))
+                || matches!(self.obj(b), Some(RObj::BigInt(_))) =>
+            {
+                match (self.as_bigint(a), self.as_bigint(b)) {
+                    (Some(x), Some(y)) => x == y,
+                    (Some(x), None) => Self::exact_float_int(b).is_some_and(|y| x == y),
+                    (None, Some(y)) => Self::exact_float_int(a).is_some_and(|x| x == y),
+                    (None, None) => false,
+                }
+            }
+            // A Complex equals a real number when its imaginary part is zero and
+            // its real part is equal: `Complex(1, 0) == 1.0` is true.
+            _ if matches!(self.obj(a), Some(RObj::Complex { .. }))
+                != matches!(self.obj(b), Some(RObj::Complex { .. })) =>
+            {
+                let (cx, real) = match self.obj(a) {
+                    Some(RObj::Complex { .. }) => (a, b),
+                    _ => (b, a),
+                };
+                match self.complex_parts(cx) {
+                    Some((re, im)) => {
+                        self.eq_values(&im, &Value::Int(0)) && self.eq_values(&re, real)
+                    }
+                    None => false,
                 }
             }
             _ => {
