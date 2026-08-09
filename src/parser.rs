@@ -37,7 +37,7 @@ impl ParamAcc {
             .filter(|(_, d)| d.is_none())
             .map(|(n, _)| n.clone())
             .collect();
-        self.arity.kwsplat = self.kwsplat.is_some();
+        self.arity.kwsplat = self.kwsplat.clone();
         if !self.kwparams.is_empty() || self.kwsplat.is_some() {
             Parser::desugar_block_kwargs(
                 &mut self.params,
@@ -1817,9 +1817,13 @@ impl Parser {
                 // `silence_redefinition_of_method def name; … end` — a pattern
                 // activesupport/Rails use pervasively. (`if`/`unless`/`while`/
                 // `until` are excluded: after a command they read as modifiers.)
+                // `yield` is an expression and is never a modifier or a binary
+                // operator, so `p yield` / `puts yield` is unambiguously a
+                // command call on its value. Without it the argument was dropped
+                // and the call printed nothing at all.
                 matches!(
                     k.as_str(),
-                    "nil" | "true" | "false" | "self" | "not" | "def" | "defined?"
+                    "nil" | "true" | "false" | "self" | "not" | "def" | "defined?" | "yield"
                 )
             }
             // A tight unary sign (`puts -7` — space before `-`, none after) is a

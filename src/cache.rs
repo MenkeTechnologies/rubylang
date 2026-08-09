@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 /// Bump on any incompatible change to `CProg` / the lowering.
-const SCHEMA: u64 = 5;
+const SCHEMA: u64 = 6;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
@@ -76,7 +76,7 @@ type CProc = (
     u16,
     Vec<String>,
     Vec<String>,
-    bool,
+    Option<String>,
     Option<String>,
 );
 
@@ -296,7 +296,7 @@ fn to_cprog(prog: &Program) -> CProg {
                     p.arity.opt,
                     p.arity.kwnames.clone(),
                     p.arity.kwreq.clone(),
-                    p.arity.kwsplat,
+                    p.arity.kwsplat.clone(),
                     p.arity.blockparam.clone(),
                 )
             })

@@ -2651,6 +2651,123 @@ impl RubyHost {
     pub fn is_unbound_method(&self, v: &Value) -> bool {
         matches!(self.obj(v), Some(RObj::Method { unbound: true, .. }))
     }
+    /// The class a `Method`/`UnboundMethod` lookup of `name` resolves against —
+    /// the name MRI reports in `undefined method 'x' for class '…'`. An instance
+    /// receiver answers its own class; a class receiver answers itself for an
+    /// UnboundMethod (`Foo.instance_method` names an INSTANCE method) and its
+    /// singleton otherwise (`Foo.method` names a class method).
+    pub fn method_lookup_class(&self, recv: &Value, unbound: bool) -> String {
+        match self.classref_name(recv) {
+            Some(cls) if unbound => cls,
+            Some(cls) => format!("#<Class:{cls}>"),
+            // `class_of`, not `dispatch_class`: the latter is the native-op
+            // router and answers the RAW type for a builtin subclass, so a
+            // `class Params < Hash` instance would name `Hash` here.
+            None => self.class_of(recv),
+        }
+    }
+    /// Whether the receiver actually HAS a method called `name` — the check
+    /// `Object#method` and `Module#instance_method` gate on before handing back a
+    /// `Method` object, so a name nothing defines raises `NameError` instead of
+    /// yielding a `Method` that fails only when called.
+    ///
+    /// `resolve_method_shape` answers for written `def`s, `define_method` bodies
+    /// and MRI's built-in table. It is not the whole surface: several kinds of
+    /// definition live in tables of their own, and each is checked here so that a
+    /// name dispatch WOULD resolve is never reported undefined —
+    /// per-object singletons, an `alias` whose target is a built-in (which
+    /// `find_method_owner` cannot resolve, as it only walks written defs),
+    /// runtime `attr_*` accessors, and `Struct` members. Callers add
+    /// `respond_to_missing?`, which has to run Ruby code and so cannot be
+    /// answered from the host state alone.
+    pub fn method_defined_on(&self, recv: &Value, name: &str, unbound: bool) -> bool {
+        // A per-object singleton method belongs to the OBJECT, so only a bound
+        // lookup sees it: an UnboundMethod names an instance method of a class.
+        if !unbound
+            && (self.find_singleton_method(recv, name).is_some()
+                || self.find_singleton_define_method(recv, name).is_some())
+        {
+            return true;
+        }
+        match self.resolve_method_shape(recv, name, unbound) {
+            // A bound lookup on a CLASS names a class method, but
+            // `resolve_method_shape` deliberately falls back to the instance side
+            // for one — rubylang stores the same class value for `Foo.method` and
+            // `Foo.instance_method`, so the fallback keeps a mis-tagged lookup
+            // answerable. Existence cannot inherit that leniency or
+            // `String.method(:upcase)` reports defined where MRI raises, so
+            // re-check against the singleton chain alone.
+            Some(_) if !unbound && self.classref_name(recv).is_some() => {
+                let cls = self.classref_name(recv).unwrap_or_default();
+                if self.find_class_method_owner(&cls, name).is_some()
+                    // A class IS an object, so the Object/Kernel instance side of
+                    // its chain still counts — a top-level `def` (private on
+                    // Object) is callable as `Foo.method(:helper)` in MRI.
+                    || self.methods.contains_key(name)
+                    || self.find_method_owner("Object", name).is_some()
+                    || self
+                        .singleton_lookup_chain(&cls)
+                        .iter()
+                        .any(|o| crate::arity_table::lookup(o, name).is_some())
+                {
+                    return true;
+                }
+            }
+            Some(_) => return true,
+            None => {}
+        }
+        // The classes whose own tables still have to be consulted. A class
+        // receiver carries two: its singleton (where `def self.x` and
+        // `singleton_class.attr_accessor` register) for a bound lookup, and the
+        // class itself, whose instance-side tables an UnboundMethod names.
+        // The singleton methods a `Struct.new` / `Data.define` class carries
+        // itself. They are defined on the GENERATED class rather than on
+        // `Struct`/`Data`, so dumping `Struct.methods` never sees them and no
+        // table row describes them.
+        if !unbound {
+            if let Some(cls) = self.classref_name(recv) {
+                let generated: &[&str] = if self.is_data_class(&cls) {
+                    &["[]", "new", "members"]
+                } else {
+                    &["[]", "members", "keyword_init?"]
+                };
+                if self.struct_def(&cls).is_some() && generated.contains(&name) {
+                    return true;
+                }
+            }
+        }
+        let mut chain: Vec<String> = Vec::new();
+        if let Some(cls) = self.classref_name(recv) {
+            // A bound lookup on a class sees only the SINGLETON side (`def self.x`,
+            // `singleton_class.attr_accessor`); the class's instance methods are
+            // not its class methods. An UnboundMethod names exactly the reverse.
+            chain.push(if unbound {
+                cls
+            } else {
+                format!("#<Class:{cls}>")
+            });
+        } else {
+            // `class_of` rather than `object_class`, so a builtin subclass
+            // (`class Params < Hash`) contributes its OWN name and its
+            // `alias_method`/`attr_*` tables are consulted.
+            chain.push(self.class_of(recv));
+        }
+        chain.iter().any(|cls| {
+            // `resolve_method_shape` reaches the written-method table only via
+            // `object_class`, which is None for a native-backed builtin subclass
+            // (`class Aliased < Hash`) — so consult it here under `class_of`.
+            self.find_method_owner(cls, name).is_some()
+                || self.find_define_method(cls, name).is_some()
+                || self.attr_access(cls, name).is_some()
+                || self.find_alias(cls, name).is_some()
+                || self.native_kernel_alias(cls, name).is_some()
+                || self.struct_def(cls).is_some_and(|(members, _)| {
+                    let member = name.strip_suffix('=').unwrap_or(name);
+                    members.iter().any(|m| m == member)
+                        || matches!(name, "deconstruct" | "deconstruct_keys")
+                })
+        })
+    }
     /// Where a `Method`/`UnboundMethod` name resolved, and the module that owns
     /// it. `arity`/`owner`/`parameters` all read the same resolution, so they can
     /// never describe different methods.
@@ -2842,7 +2959,7 @@ impl RubyHost {
                     p.arity.opt as usize,
                     &p.arity.kwnames,
                     &p.arity.kwreq,
-                    p.arity.kwsplat.then_some(""),
+                    p.arity.kwsplat.as_deref(),
                     p.arity.blockparam.as_deref(),
                 )
             }
@@ -4321,7 +4438,14 @@ impl RubyHost {
         // through the full ancestry: `class_is_ancestor` stops at the first name
         // with no class-table entry, which is exactly where the builtin part of
         // the tree begins (`MyErr < ArgumentError < StandardError`).
-        if is_builtin_exception_name(&actual) || self.classes.contains_key(&actual) {
+        if is_builtin_exception_name(&actual)
+            || self.classes.contains_key(&actual)
+            // A `Struct.new` / `Data.define` class need not be in the class table
+            // at all — it registers as a struct definition — so neither gate above
+            // sees it, and `Trio.new(1, 2).is_a?(Struct)` was false while
+            // `Trio.ancestors` already listed `Struct`.
+            || self.struct_defs.contains_key(&actual)
+        {
             return self.class_ancestry(&actual).iter().any(|a| a == class);
         }
         false
@@ -4363,11 +4487,27 @@ impl RubyHost {
         }
         module.to_string()
     }
+    /// The tail every ancestor chain ends in — the common root, preceded by the
+    /// generating class when `name` is a `Struct.new` / `Data.define` class. MRI
+    /// keeps that class in the chain, and it is where the generated surface is
+    /// defined: `Struct` mixes in `Enumerable` (so a struct is `each`-able and
+    /// answers `map`/`select`/…), while `Data` deliberately does not.
+    fn ancestry_tail(&self, name: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.struct_defs.contains_key(name) {
+            out.push(if self.is_data_class(name) { "Data" } else { "Struct" }.to_string());
+            if !self.is_data_class(name) {
+                out.push("Enumerable".to_string());
+            }
+        }
+        out.extend(["Object", "Kernel", "BasicObject"].map(String::from));
+        out
+    }
     pub fn class_ancestry(&self, name: &str) -> Vec<String> {
         let own = |mods: &[&str]| {
             let mut v = vec![name.to_string()];
             v.extend(mods.iter().map(|s| s.to_string()));
-            v.extend(["Object", "Kernel", "BasicObject"].map(String::from));
+            v.extend(self.ancestry_tail(name));
             v
         };
         match name {
@@ -4419,7 +4559,7 @@ impl RubyHost {
                             }
                         }
                     }
-                    out.extend(["Object", "Kernel", "BasicObject"].map(String::from));
+                    out.extend(self.ancestry_tail(name));
                     dedup_keep_first(out)
                 } else if is_builtin_exception_name(name) {
                     // Walk the real MRI exception tree, so `rescue StandardError`
@@ -4528,6 +4668,7 @@ impl RubyHost {
                 | "Range"
                 | "Proc"
                 | "Method"
+                | "UnboundMethod"
                 | "Object"
                 | "BasicObject"
                 | "Module"
@@ -5510,8 +5651,14 @@ impl RubyHost {
                 | Some(RObj::CycleProc(_))
                 | Some(RObj::SeqProc(_))
                 | Some(RObj::DeriveProc { .. }) => "#<Proc>".to_string(),
-                Some(RObj::Method { recv, name, .. }) => {
-                    format!("#<Method: {}#{name}>", self.class_of(&recv))
+                // MRI renders the DEFINING module, not the receiver's class, and
+                // tags an UnboundMethod as one. (MRI also appends the written
+                // parameter list and source location; rubylang retains neither.)
+                Some(RObj::Method {
+                    recv, name, unbound,
+                }) => {
+                    let tag = if unbound { "UnboundMethod" } else { "Method" };
+                    format!("#<{tag}: {}#{name}>", self.method_owner(&recv, &name, unbound))
                 }
                 Some(RObj::Regexp { source, flags, .. }) => {
                     let on: String = "mix".chars().filter(|c| flags.contains(*c)).collect();
@@ -5779,6 +5926,10 @@ impl RubyHost {
                 | Some(RObj::CycleProc(_))
                 | Some(RObj::SeqProc(_))
                 | Some(RObj::DeriveProc { .. }) => "Proc",
+                // An UnboundMethod is its own class in MRI, with its own surface
+                // (`bind`/`bind_call` but no `call`/`receiver`), so it must not
+                // report itself as a `Method`.
+                Some(RObj::Method { unbound: true, .. }) => "UnboundMethod",
                 Some(RObj::Method { .. }) => "Method",
                 Some(RObj::Regexp { .. }) => "Regexp",
                 Some(RObj::MatchData { .. }) => "MatchData",
@@ -7015,7 +7166,7 @@ impl<'a> ArityFacts<'a> {
             has_rest: def.splat.is_some(),
             kwnames: &def.arity.kwnames,
             kwreq: &def.arity.kwreq,
-            has_kwrest: def.arity.kwsplat,
+            has_kwrest: def.arity.kwsplat.is_some(),
         }
     }
     /// MRI's `rb_iseq_min_max_arity`: the mandatory count, and the maximum

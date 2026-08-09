@@ -2582,6 +2582,54 @@ impl Compiler {
                         methods.insert(name.clone(), def);
                     }
                 }
+                // `private def m … end` (and `public`/`protected`/`module_function`
+                // in the same position): the modifier takes the `def`'s name
+                // symbol as its argument, so the method is defined on the class
+                // exactly as a bare `def` is. Without this arm the statement is
+                // not recognised as a definition and defers to the runtime class
+                // body, where the `def` registers in the TOP-LEVEL method table —
+                // making `private def helper` callable as a bare `helper` from
+                // anywhere, and visible to `SomeOtherClass.new.method(:helper)`.
+                // rubylang does not model visibility, so the modifier is inert
+                // apart from `module_function`, which also promotes to a class
+                // method.
+                Expr::Call {
+                    recv: None,
+                    name: m,
+                    args,
+                    ..
+                } if matches!(
+                    m.as_str(),
+                    "private" | "public" | "protected" | "module_function"
+                ) && args.len() == 1
+                    && matches!(
+                        &args[0],
+                        Expr::Def {
+                            singleton_recv: None,
+                            ..
+                        }
+                    ) =>
+                {
+                    let Expr::Def {
+                        name,
+                        params,
+                        body,
+                        singleton,
+                        ..
+                    } = &args[0]
+                    else {
+                        unreachable!("guarded by the match arm above")
+                    };
+                    let def = self.compile_method_named(name, params, body)?;
+                    if *singleton {
+                        class_methods.insert(name.clone(), def);
+                    } else {
+                        if module_function_mode || m == "module_function" {
+                            class_methods.insert(name.clone(), def.clone());
+                        }
+                        methods.insert(name.clone(), def);
+                    }
+                }
                 // Bare `module_function` (parses as a local read) turns on the mode.
                 // Also emit it to the runtime body so the module is flagged for the
                 // class-method fallback (covers `def`s the compiler can't promote

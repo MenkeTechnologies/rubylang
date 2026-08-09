@@ -3182,3 +3182,157 @@ p [[1, 2].lazy.take(2).inspect, [1, 2].lazy.drop(1).inspect, [1, 2].lazy.zip([3,
 p [(1..3).each_with_index.inspect, (1..3).each_slice(2).inspect, [1, 2].each.map.inspect, [1, 2].reverse_each.inspect]
 #==#
 p [(1..3).each_with_index.each { |x| x }, (1..3).each_with_index.lazy.map { |x| x }.to_a, [1, 2].each.map { |x| x * 2 }]
+#==#
+# `method` on a name nothing defines raises NameError rather than handing back a
+# Method object that only fails when called. The message names the class the
+# lookup ran against, and `NameError#name` is the missing name.
+def miss
+  yield
+rescue NameError => e
+  [e.class, e.message, e.name]
+end
+p miss { 1.method(:no_such) }
+p miss { "s".method(:no_such) }
+p miss { Object.new.method(:no_such) }
+p miss { String.method(:no_such) }
+p miss { String.instance_method(:no_such) }
+#==#
+# A class receiver's bound `method` names a CLASS method: the instance-side
+# surface must not answer it, but a top-level `def` (private on Object) does.
+def helper_for_parity_probe; end
+class MethodProbe; def inst; end; def self.klass; end; end
+def miss2
+  yield.class
+rescue NameError
+  :NameError
+end
+p [miss2 { MethodProbe.method(:klass) }, miss2 { MethodProbe.method(:inst) },
+   miss2 { MethodProbe.method(:helper_for_parity_probe) },
+   miss2 { MethodProbe.instance_method(:inst) }, miss2 { String.method(:upcase) },
+   miss2 { String.instance_method(:upcase) }]
+#==#
+# Every way a method can come to exist still answers `method` — a per-object
+# singleton, an alias whose target is a built-in, an attr accessor, a Struct
+# member, and a name only `respond_to_missing?` claims.
+class Aliased < Hash; alias_method :as_hash, :to_h; attr_accessor :tag; end
+Pointy = Struct.new(:x)
+class Ghosted
+  def respond_to_missing?(n, _p = false) = n == :ghost
+  def method_missing(n, *a) = n == :ghost ? :spooked : super
+end
+solo = Object.new
+def solo.only_mine; end
+solo.define_singleton_method(:also_mine) { }
+p [solo.method(:only_mine).class, solo.method(:also_mine).class,
+   Aliased.new.method(:as_hash).class, Aliased.new.method(:tag).class,
+   Aliased.new.method(:tag=).class, Pointy.new(1).method(:x).class,
+   Ghosted.new.method(:ghost).call]
+#==#
+# A `method_missing` WITHOUT `respond_to_missing?` does not make the name exist.
+class OnlyMissing; def method_missing(n, *a) = :anything; end
+begin
+  OnlyMissing.new.method(:whatever)
+rescue NameError => e
+  p e.message
+end
+#==#
+# An UnboundMethod is its own class, not a Method: it has `bind`/`bind_call` and
+# no `receiver`, and it describes the class it was looked up on.
+class Bindable; def takes(a, b = 1) = [a, b]; end
+um = Bindable.instance_method(:takes)
+recv = begin
+  um.receiver
+rescue NoMethodError => e
+  e.message
+end
+p [um.class, um.name, um.arity, um.owner, um.parameters, recv,
+   um.bind(Bindable.new).call(3), um.bind_call(Bindable.new, 4, 5),
+   um.is_a?(UnboundMethod), um.is_a?(Method),
+   Bindable.new.method(:takes).unbind.class]
+#==#
+# A `define_method` body's `**rest` keeps its NAME. The parser desugars the
+# collector into a synthetic capture param, so only the recorded arity can say
+# what it was written as.
+kls = Class.new do
+  define_method(:m) { |a, *b, **rest, &blk| }
+  define_method(:n) { |a, b = 1, *c, d:, e: 2, **opts, &bl| }
+  define_method(:plain) { |x| }
+end
+p kls.instance_method(:m).parameters
+p kls.instance_method(:n).parameters
+p kls.instance_method(:plain).parameters
+p [kls.instance_method(:m).arity, kls.instance_method(:n).arity]
+#==#
+# `Hash#each_with_index` without a block is an Enumerator, exactly as the Array
+# one is — not the bare Array of pairs.
+h = {a: 1, b: 2}
+p h.each_with_index.class
+p h.each_with_index.to_a
+p h.each_with_index.next
+p h.each_with_index.inspect
+p h.each_with_index.map { |kv, i| [kv, i] }
+#==#
+# `Enumerator#each` on a generator answers what the generator BODY evaluated to,
+# not the enumerator. `y << v` answers the yielder, so a body ending in a push
+# reports one.
+p (Enumerator.new { |y| y << 1; y << 2 }.each { |x| x }).class
+p (Enumerator.new { |y| y << 1; 42 }.each { |x| x })
+p (Enumerator.new { |y| y << 1 }.each { |x| x }).equal?(nil)
+p [1, 2].each.each { |x| x }
+p [1, 2, 3].each_slice(2).each { |x| x }
+#==#
+# `private def m` / `protected def m` / `module_function def m` define the method
+# ON THE CLASS. Left to the runtime class body the `def` landed in the top-level
+# method table instead, making it callable as a bare name from anywhere.
+class Visible
+  def open_one = 1
+  private def shut = 2
+  protected def guarded = 3
+  public def opened = 4
+end
+module Functional; module_function def helper = 5; end
+class Bystander; end
+leaked = begin
+  Bystander.new.method(:shut)
+rescue NameError
+  :NameError
+end
+p [Visible.new.send(:shut), Visible.new.send(:guarded), Visible.new.opened,
+   Visible.new.open_one, Functional.helper, leaked,
+   Visible.instance_method(:shut).name]
+#==#
+# A `Struct.new` class keeps `Struct` (and the `Enumerable` it mixes in) in its
+# ancestry; a `Data.define` class keeps `Data` and does NOT get Enumerable.
+Trio = Struct.new(:a, :b)
+Duo = Data.define(:a)
+p Trio.ancestors
+p Duo.ancestors
+p [Trio.new(1, 2).is_a?(Struct), Trio.new(1, 2).is_a?(Enumerable),
+   Duo.new(a: 1).is_a?(Data), Duo.new(a: 1).is_a?(Enumerable)]
+p [Trio.members, Trio.new(1, 2).map { |v| v }, Duo.members]
+#==#
+# `yield` starts a paren-less command argument: `p yield` passes the yielded
+# value. Excluded from the argument-start set, the argument was dropped and the
+# call printed nothing at all.
+def shows = p yield
+def prints = puts yield
+def two = p yield, 1
+def forwards(x) = x
+def hands_on = forwards yield
+shows { 42 }
+prints { "hi" }
+two { 7 }
+p hands_on { 5 }
+#==#
+# The required argument of `each_with_object` is checked rather than indexed, and
+# an argument-less `index`/`rindex` is an Enumerator — both crashed the process.
+def arity_err
+  yield
+rescue ArgumentError => e
+  e.message
+end
+p arity_err { [1, 2].each_with_object }
+p arity_err { {a: 1}.each_with_object }
+p arity_err { [1, 2].include? }
+p [[1, 2, 3].index.class, [1, 2, 3].index.to_a, [1, 2, 3].rindex.class,
+   [1, 2, 3].find_index.to_a, [1, 2, 3].index(2), [1, 2, 3].rindex(2)]

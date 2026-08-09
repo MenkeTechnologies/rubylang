@@ -1757,3 +1757,52 @@ FrozenError
 ["#<Enumerator: 1..3:each_with_index>", "#<Enumerator: 1..3:each_slice(2)>", "#<Enumerator: #<Enumerator: [1, 2]:each>:map>", "#<Enumerator: [1, 2]:reverse_each>"]
 #==#
 [1..3, [1, 2, 3], [2, 4]]
+#==#
+[NameError, "undefined method 'no_such' for class 'Integer'", :no_such]
+[NameError, "undefined method 'no_such' for class 'String'", :no_such]
+[NameError, "undefined method 'no_such' for class 'Object'", :no_such]
+[NameError, "undefined method 'no_such' for class '#<Class:String>'", :no_such]
+[NameError, "undefined method 'no_such' for class 'String'", :no_such]
+#==#
+[Method, :NameError, Method, UnboundMethod, :NameError, UnboundMethod]
+#==#
+[Method, Method, Method, Method, Method, Method, :spooked]
+#==#
+"undefined method 'whatever' for class 'OnlyMissing'"
+#==#
+[UnboundMethod, :takes, -2, Bindable, [[:req, :a], [:opt, :b]], "undefined method 'receiver' for an instance of UnboundMethod", [3, 1], [4, 5], true, false, UnboundMethod]
+#==#
+[[:req, :a], [:rest, :b], [:keyrest, :rest], [:block, :blk]]
+[[:req, :a], [:opt, :b], [:rest, :c], [:keyreq, :d], [:key, :e], [:keyrest, :opts], [:block, :bl]]
+[[:req, :x]]
+[-2, -3]
+#==#
+Enumerator
+[[[:a, 1], 0], [[:b, 2], 1]]
+[[:a, 1], 0]
+"#<Enumerator: {a: 1, b: 2}:each_with_index>"
+[[[:a, 1], 0], [[:b, 2], 1]]
+#==#
+Enumerator::Yielder
+42
+false
+[1, 2]
+[1, 2, 3]
+#==#
+[2, 3, 4, 1, 5, :NameError, :shut]
+#==#
+[Trio, Struct, Enumerable, Object, Kernel, BasicObject]
+[Duo, Data, Object, Kernel, BasicObject]
+[true, true, true, false]
+[[:a, :b], [1, 2], [:a]]
+#==#
+42
+hi
+7
+1
+5
+#==#
+"wrong number of arguments (given 0, expected 1)"
+"wrong number of arguments (given 0, expected 1)"
+"wrong number of arguments (given 0, expected 1)"
+[Enumerator, [1, 2, 3], Enumerator, [1, 2, 3], 1, 1]

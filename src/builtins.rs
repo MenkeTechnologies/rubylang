@@ -1419,6 +1419,43 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
     kernel(name, args, block)
 }
 
+/// Gate `Object#method` / `Module#instance_method` on the name actually being
+/// defined: MRI raises `NameError` for one that is not, rather than handing back
+/// a `Method` object that only fails when called. `unbound` selects the
+/// instance-method lookup a `Module#instance_method` performs.
+///
+/// A class that answers `respond_to_missing?` truthfully owns the name even
+/// though nothing defines it — MRI hands back a `Method` that routes through
+/// `method_missing` — so that hook is consulted before reporting the miss. A
+/// `method_missing` WITHOUT `respond_to_missing?` does not count, matching MRI.
+fn method_object_or_name_error(recv: &Value, m: &str, unbound: bool) -> Result<(), String> {
+    if with_host(|h| h.method_defined_on(recv, m, unbound)) {
+        return Ok(());
+    }
+    if !unbound {
+        if let Some(cls) = with_host(|h| h.object_class(recv)) {
+            if with_host(|h| h.find_method_owner(&cls, "respond_to_missing?")).is_some() {
+                let sym = with_host(|h| h.new_symbol(m));
+                let r = call_instance_method(
+                    recv.clone(),
+                    &cls,
+                    "respond_to_missing?",
+                    &[sym, Value::Bool(true)],
+                    None,
+                )?;
+                if with_host(|h| h.truthy(&r)) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let lookup = with_host(|h| h.method_lookup_class(recv, unbound));
+    Err(raise_exc(
+        "NameError",
+        &format!("undefined method '{m}' for class '{lookup}'"),
+    ))
+}
+
 /// Object methods available on every value (so a bare self-call inside a method
 /// resolves them before falling through to Kernel).
 fn is_universal_object_method(name: &str) -> bool {
@@ -1493,7 +1530,9 @@ pub(crate) fn dispatch_by_type(
         "Range" => dispatch_range(recv, name, args, block),
         "Symbol" => dispatch_symbol(recv, name, args),
         "Proc" => dispatch_proc(recv, name, args, block),
-        "Method" => dispatch_method(recv, name, args, block),
+        // Both share one handler: it reads the `unbound` tag off the value to
+        // pick the bound/unbound behaviour per method.
+        "Method" | "UnboundMethod" => dispatch_method(recv, name, args, block),
         "Regexp" => dispatch_regexp(recv, name, args),
         "MatchData" => dispatch_matchdata(recv, name, args),
         "Set" => dispatch_set(recv, name, args, block),
@@ -1915,6 +1954,7 @@ pub(crate) fn dispatch(
         // `obj.method(:name)` — capture a bound Method object.
         "method" => {
             let m = name_of(&args[0]);
+            method_object_or_name_error(recv, &m, false)?;
             return Ok(with_host(|h| h.new_method(recv.clone(), &m)));
         }
         "respond_to?" => {
@@ -3609,10 +3649,9 @@ fn dispatch_classref(
             let m = name_of(&args[0]);
             // The owning class is the receiver, so `arity`/`parameters` can find
             // the definition; `bind`/`bind_call` replace it with the real object.
-            Ok(with_host(|h| {
-                let owner = h.class_ref(cls);
-                h.new_unbound_method(owner, &m)
-            }))
+            let owner = with_host(|h| h.class_ref(cls));
+            method_object_or_name_error(&owner, &m, true)?;
+            Ok(with_host(|h| h.new_unbound_method(owner.clone(), &m)))
         }
         // Numeric class constants (`Float::INFINITY`, `Float::NAN`, …), reached
         // via `::` (which lowers to a method call on the class reference).
@@ -7548,9 +7587,17 @@ fn dispatch_array(
             Ok(recv.clone())
         }
         "to_a" | "to_ary" | "dup" | "clone" | "deconstruct" => Ok(new_arr(arr)),
-        "include?" => Ok(Value::Bool(
-            arr.iter().any(|x| with_host(|h| h.eq_values(x, &args[0]))),
-        )),
+        "include?" => {
+            let Some(needle) = args.first() else {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    "wrong number of arguments (given 0, expected 1)",
+                ));
+            };
+            Ok(Value::Bool(
+                arr.iter().any(|x| with_host(|h| h.eq_values(x, needle))),
+            ))
+        }
         "index" | "find_index" => {
             let pos = if let Some(bl) = &block {
                 let mut found = None;
@@ -7563,8 +7610,16 @@ fn dispatch_array(
                 }
                 found
             } else {
+                // Neither a needle nor a block: MRI answers an Enumerator over
+                // the elements, which a later block turns back into the search.
+                // Indexing `args[0]` here panicked the whole interpreter.
+                let Some(needle) = args.first() else {
+                    return Ok(with_host(|h| {
+                        h.new_enumerator_of(arr.clone(), name, recv.clone())
+                    }));
+                };
                 arr.iter()
-                    .position(|x| with_host(|h| h.eq_values(x, &args[0])))
+                    .position(|x| with_host(|h| h.eq_values(x, needle)))
             };
             Ok(pos.map(|p| Value::Int(p as i64)).unwrap_or(Value::Undef))
         }
@@ -7580,8 +7635,13 @@ fn dispatch_array(
                 }
                 found
             } else {
+                let Some(needle) = args.first() else {
+                    return Ok(with_host(|h| {
+                        h.new_enumerator_of(arr.clone(), name, recv.clone())
+                    }));
+                };
                 arr.iter()
-                    .rposition(|x| with_host(|h| h.eq_values(x, &args[0])))
+                    .rposition(|x| with_host(|h| h.eq_values(x, needle)))
             };
             Ok(pos.map(|p| Value::Int(p as i64)).unwrap_or(Value::Undef))
         }
@@ -8327,7 +8387,14 @@ fn dispatch_array(
             }))
         }
         "each_with_object" => {
-            let memo = args[0].clone();
+            // The memo is required — MRI raises rather than defaulting it, and
+            // indexing here panicked the whole interpreter on `xs.each_with_object`.
+            let Some(memo) = args.first().cloned() else {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    "wrong number of arguments (given 0, expected 1)",
+                ));
+            };
             let Some(bl) = &block else {
                 // Block-less: an Enumerator of `[elem, memo]` pairs, the shape
                 // MRI hands a later block — `[10, 20].each_with_object([]).to_a`
@@ -9874,13 +9941,20 @@ pub(crate) fn drive_derived(src: &Value, kind: &Derive, yielder: &Value) -> Resu
 }
 
 fn drive_generator(gblock: &Value, limit: usize) -> Result<Vec<Value>, String> {
+    drive_generator_value(gblock, limit).map(|(buf, _)| buf)
+}
+
+/// As [`drive_generator`], also answering the generator block's OWN return
+/// value. `Enumerator#each` reports it rather than the enumerator: MRI runs the
+/// generator body and hands back its result, which is usually the `Yielder`
+/// (`y << v` answers the yielder so `y << 1 << 2` chains).
+fn drive_generator_value(gblock: &Value, limit: usize) -> Result<(Vec<Value>, Value), String> {
     let yielder = with_host(|h| h.new_yielder(limit));
     let r = call_proc(gblock, std::slice::from_ref(&yielder));
     let buf = with_host(|h| h.take_enum_sink());
     // Clear the limiter's break (a generator block never breaks on its own).
     take_break();
-    r?;
-    Ok(buf)
+    Ok((buf, r?))
 }
 
 /// Instance methods on a `Fiber`: `resume(*args)`, `alive?`.
@@ -11662,7 +11736,8 @@ fn dispatch_generator(
         "to_a" | "force" | "entries" => Ok(new_arr(drive_generator(gblock, usize::MAX)?)),
         "each" if block.is_some() => {
             let bl = block.unwrap();
-            for v in drive_generator(gblock, usize::MAX)? {
+            let (values, generated) = drive_generator_value(gblock, usize::MAX)?;
+            for v in values {
                 // A `y.yield a, b` iteration hands the block BOTH values, so a
                 // one-parameter block binds `a` and `{ |*x| }` collects both.
                 match with_host(|h| h.as_array(&v)).filter(|_| with_host(|h| h.is_multi_yield(&v)))
@@ -11671,7 +11746,9 @@ fn dispatch_generator(
                     None => call_proc(&bl, std::slice::from_ref(&v))?,
                 };
             }
-            Ok(recv.clone())
+            // MRI answers what the generator body evaluated to, NOT the
+            // enumerator — `Enumerator.new { |y| y << 1; 42 }.each { }` is `42`.
+            Ok(generated)
         }
         // `.lazy` keeps the generator as the pipeline source (see `lazy_pull`).
         "lazy" => Ok(with_host(|h| h.new_lazy(recv.clone(), vec![]))),
@@ -12613,7 +12690,12 @@ fn dispatch_hash(
             Ok(with_host(|h| h.new_hash(out)))
         }
         "each_with_object" => {
-            let memo = args[0].clone();
+            let Some(memo) = args.first().cloned() else {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    "wrong number of arguments (given 0, expected 1)",
+                ));
+            };
             if let Some(b) = &block {
                 for (k, v) in &map {
                     // Hash#each_with_object yields the [key, value] pair and the memo.
@@ -12776,15 +12858,17 @@ fn dispatch_hash(
                 }
                 Ok(recv.clone())
             } else {
-                // No Enumerator type yet: return `[[k, v], index]` pairs so the
-                // chain `each_with_index.to_a` / `.map { |kv, i| … }` still works.
-                Ok(new_arr(
-                    pairs
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, pair)| new_arr(vec![pair, Value::Int(i as i64)]))
-                        .collect(),
-                ))
+                // Block-less: an Enumerator of `[[k, v], index]` pairs, exactly as
+                // `Array#each_with_index` answers one — so `.next` works and the
+                // value reports as an Enumerator rather than the bare pair Array.
+                let indexed = pairs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, pair)| new_arr(vec![pair, Value::Int(i as i64)]))
+                    .collect();
+                Ok(with_host(|h| {
+                    h.new_enumerator_of(indexed, "each_with_index", recv.clone())
+                }))
             }
         }
         "dig" => Ok(dig(recv, args)),
@@ -13479,6 +13563,12 @@ fn dispatch_method(
             h.new_array(arr)
         })),
         "name" => Ok(with_host(|h| h.new_symbol(&mname))),
+        // An UnboundMethod has no receiver — its stored value is the class the
+        // name was looked up on — so MRI defines `#receiver` on `Method` only.
+        "receiver" if unbound => Err(raise_exc(
+            "NoMethodError",
+            "undefined method 'receiver' for an instance of UnboundMethod",
+        )),
         "receiver" => Ok(mrecv),
         // A `Method` is itself callable via `call_proc`, so `to_proc` is identity.
         "to_proc" => Ok(recv.clone()),

@@ -78,8 +78,12 @@ MRI's numeric class-strictness, so `1.eql?(1.0)` is false).
   (splat as the first target) parse now, alongside the already-supported trailing
   (`a, *b =`) and middle (`a, *b, c =`) splat positions.
 - **Lambda literal as a command argument.** `p ->(x) { x }` (a `->` lambda
-  directly after a spaced command name) parses. Still not parsed: nested
-  destructuring targets in a parallel assignment LHS (`(a, (b, c)), d = …`).
+  directly after a spaced command name) parses. So does `yield` in the same
+  position (`p yield`, `puts yield`, `forwards yield`) — it is an expression and
+  never a modifier or a binary operator, so it is unambiguous there; left out of
+  the argument-start set the argument was silently dropped and the call printed
+  nothing at all. Still not parsed: nested destructuring targets in a parallel
+  assignment LHS (`(a, (b, c)), d = …`).
 - **Numbered / `it` implicit block params.** Implemented. A block that declares
   no `|params|` records the highest `_1`.`_9` it mentions and synthesizes exactly
   that many required params when it closes; a bare `it` (Ruby 3.4) synthesizes
@@ -195,16 +199,39 @@ Implemented and verified against the reference `ruby`:
   `#<Class:Integer>`, `Integer.method(:name).owner` → `Module`). Measured over
   2248 `(receiver, method)` pairs across 21 receivers: 1395 arities, 2248 owners
   and 1543 parameter lists disagreed with ruby 4.0.6 before the table; none do
-  after. Still open:
-  - `obj.method(:no_such_method)` does not raise `NameError` the way MRI does.
-    The builtin surface is not enumerable (the table lists what MRI defines, not
-    what rubylang implements), so absence in the table is not proof the method is
-    missing and cannot be used as the existence test.
-  - A `define_method` body that takes `**rest` reports an unnamed `[:keyrest]`.
-    The parser desugars a block's keyword collector into a synthetic capture
-    parameter, so its written name survives nowhere.
-  - `UnboundMethod` reports its class as `Method` (there is one `Method` object
-    kind, tagged unbound), and `#receiver` answers the class instead of raising.
+  after.
+- **`method` / `instance_method` on an undefined name.** Both raise `NameError`
+  (`undefined method 'x' for class 'C'`) rather than handing back a `Method`
+  object that fails only when called. The table alone cannot decide this — it
+  lists what MRI defines, not what rubylang implements — so the check is the union
+  of every place a definition can live: written `def`s, `define_method` bodies,
+  per-object singletons, `alias`es whose target is a built-in, runtime `attr_*`
+  accessors, `Struct`/`Data` members and their generated class methods, top-level
+  `def`s (private on `Object`, so a class receiver sees them), and the table.
+  A class that answers `respond_to_missing?` owns the name even though nothing
+  defines it; a `method_missing` without one does not, matching MRI. A bound
+  lookup on a class names a CLASS method, so the instance side does not answer it
+  (`String.method(:upcase)` raises, `String.instance_method(:upcase)` does not).
+  Measured over 38,864 `(receiver, name)` pairs across 28 receivers and a further
+  49,490 across 35 user-defined receiver shapes (every definition form above):
+  33,960 names wrongly answered a `Method` before; 24 and 199 remain, and no name
+  MRI answers is refused except the six on `main` (below).
+- **`UnboundMethod`.** Its own class, not `Method`: it answers `bind`/`bind_call`
+  and raises `NoMethodError` for `#receiver`, while `#name`/`#arity`/`#owner`/
+  `#parameters` describe the class it was looked up on. `#inspect` is
+  `#<UnboundMethod: Owner#name>` — MRI also appends the written parameter list and
+  the definition's source location, neither of which rubylang retains (the same
+  reason `Exception#backtrace` is empty).
+  Still open:
+  - `main`'s singleton methods (`include`, `private`, `public`, `define_method`,
+    `using`, `ruby2_keywords`) are not modeled, so `self.method(:include)` at the
+    top level raises. rubylang has no `main` object at all — top-level `self` is a
+    plain `Object` and inspects as `#<Object>`, not `main`.
+  - MRI `undef`s the `Comparable`/`Numeric` methods `Complex` inherits (`<`,
+    `clamp`, `between?`, `round`, …); the generated table records no
+    "undefined here" column, so the ancestor's row is still found — 19 of the 24
+    residual cases above.
+  - `NameError#receiver` is nil for these; MRI answers the class.
 - **`define_method`.** `define_method(:m) { … }` in a class body and the explicit
   receiver form `Klass.define_method(:m) { … }` both register an instance method
   whose body is the block. When invoked, the block rebinds `self` to the calling
@@ -366,6 +393,21 @@ Honest limitations of this surface:
 
 ## Runtime / methods
 
+- **Argument-count checking on built-ins is not systematic.** Most built-in
+  dispatch arms read their required argument as `args[0]`, so calling one with no
+  arguments panics the interpreter (`index out of bounds`) instead of raising
+  `ArgumentError`. A sweep that calls every name in `src/arity_table.rs` with no
+  arguments and no block, restarting after each crash, found 171 such panics in
+  the first 4,384 of 17,676 `(receiver, name)` cases — `1.+()`, `1.==()`,
+  `"s".center`, `[1, 2].fetch`, `1.method`, `1.respond_to?` among them. The arms on
+  the block-less Enumerable path are guarded (`each_with_object` raises MRI's
+  `wrong number of arguments (given 0, expected 1)`, argument-less
+  `index`/`find_index`/`rindex` answer an Enumerator, `include?` raises); the rest
+  is open, and wants one systematic arity-guard pass rather than piecemeal fixes.
+- **Blocks and procs.** `Proc#parameters` is not implemented (`->(a, **rest) { }
+  .parameters` raises `undefined method`), though the written shape it needs is
+  now recorded. An anonymous keyword collector in a block parameter list
+  (`{ |**| }`) does not parse; the named form (`{ |**rest| }`) does.
 - **Regexp.** Supported: `/pat/flags` literals, `=~`/`!~`, `String#match`
   (returns `MatchData` with `[n]`/`pre_match`/`post_match`/`to_a`/`captures`),
   `match?`, `scan`, `split(re)`, `sub`/`gsub` with a Regexp (backrefs `\1`..`\9`
@@ -405,6 +447,12 @@ Honest limitations of this surface:
   protected) is not modeled, so `public_instance_methods` equals
   `instance_methods` and `public_method_defined?` equals `method_defined?`. The
   synthetic `__class_body__` (and any `__`-prefixed internal name) is excluded.
+  The modifier-with-a-`def` forms (`private def m …`, and `public`/`protected`/
+  `module_function` likewise) still DEFINE on the class: the class-body compiler
+  recognises them as definitions, where deferring them to the runtime class body
+  registered the `def` in the top-level method table instead — making a
+  `private def helper` reachable as a bare `helper` from anywhere.
+  `module_function def m` also promotes to a module method.
 - **Composite Hash keys.** Arrays (`{[1, 2] => v}`, nested), Ranges
   (`{(1..3) => v}`, Integer/String/Float endpoints), and class objects work as
   Hash keys and Set members — keyed structurally by value, so equal keys hash
@@ -412,6 +460,15 @@ Honest limitations of this surface:
   keys by VALUE too — its class plus its members — so two `P.new(1, 2)` are the
   same Hash key and report the same `#hash`, as in MRI. (Only a plain user object
   with a custom `hash`/`eql?` still keys by heap identity.)
+- **`Struct`/`Data` class ancestry.** A `Struct.new` class keeps `Struct` — and
+  the `Enumerable` it mixes in — in its chain, and a `Data.define` class keeps
+  `Data` and deliberately does NOT get `Enumerable`, matching MRI. `#is_a?` reads
+  the same chain, so `Trio.new(1, 2).is_a?(Struct)` and `is_a?(Enumerable)` hold
+  where a struct class is not in the class table at all. The class methods the
+  generated class carries itself (`[]`, `members`, `keyword_init?`; `[]`, `new`,
+  `members` for `Data`) are defined on it rather than on `Struct`/`Data`, so
+  dumping `Struct.methods` never sees them and `src/arity_table.rs` has no row —
+  they are named explicitly in the method-existence check.
 - **`Data.define` is strict about its members.** Every member is mandatory and no
   extra one is accepted, in either construction form: `P.new(1)` raises
   `ArgumentError: missing keyword: :y`, `P.new(1, 2, 3)` raises `wrong number of
@@ -456,10 +513,10 @@ Honest limitations of this surface:
   buffer, since `each_cons` windows overlap. A receiver that had to be
   materialized to reach the Array implementation (a Range, a Hash, a Set, another
   Enumerator) is re-pointed afterwards, so `(1..3).each_with_index` inspects as
-  `#<Enumerator: 1..3:each_with_index>` and `[1, 2].each.map` nests. Still open:
-  `Hash#each_with_index` answers an Array rather than an Enumerator, and
-  `Enumerator#each` on a GENERATOR answers the enumerator where MRI answers the
-  generator block's own value (usually the `Yielder`).
+  `#<Enumerator: 1..3:each_with_index>` and `[1, 2].each.map` nests.
+  `Hash#each_with_index` answers one as well, and `Enumerator#each` on a GENERATOR
+  answers what the generator body evaluated to, as MRI does — usually the
+  `Yielder`, since `y << v` answers the yielder so `y << 1 << 2` chains.
 - **Multi-value Enumerator yields.** `each_with_index`, `each_with_object` and a
   generator's `y.yield a, b` yield TWO values per iteration, not one packed pair.
   The buffer keeps them packed (that is what `to_a` and `each_entry` see) and the

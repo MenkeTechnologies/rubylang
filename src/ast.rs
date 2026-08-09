@@ -69,8 +69,11 @@ pub struct BlockArity {
     pub kwnames: Vec<String>,
     /// The keyword params with no default — the ones whose absence raises.
     pub kwreq: Vec<String>,
-    /// A `**rest` keyword collector is present.
-    pub kwsplat: bool,
+    /// The `**rest` keyword collector's name, if one is present. The desugaring
+    /// replaces it with a synthetic capture param, so this is the only record of
+    /// what it was written as — and `Method#parameters` has to report
+    /// `[:keyrest, :rest]`, not a nameless `[:keyrest]`.
+    pub kwsplat: Option<String>,
     /// `&blk` capture parameter name, if any.
     pub blockparam: Option<String>,
 }
