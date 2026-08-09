@@ -639,6 +639,7 @@ enum Mode {
     Methobj,
     Multiyield,
     Eqlident,
+    Numwide,
     /// Round-robin over every mode in `ALL_MODES`. Not itself a member of
     /// `ALL_MODES` (that would recurse), so adding a mode never changes any
     /// other mode's own seed→case mapping — but it DOES reshuffle which mode
@@ -691,6 +692,7 @@ const ALL_MODES: &[Mode] = &[
     Mode::Methobj,
     Mode::Multiyield,
     Mode::Eqlident,
+    Mode::Numwide,
 ];
 
 fn gen_intmeth(seed: u64) -> Vec<String> {
@@ -1675,6 +1677,42 @@ fn gen_eqlident(seed: u64) -> Vec<String> {
     })
 }
 
+/// Comparison ACROSS the numeric classes, which `bignum` never reached — its
+/// four arms only ever build one big integer and print it, so no case ever put
+/// a BigInt, a Rational or a Complex on one side of a comparison and a Float on
+/// the other. Ruby's rule is not "convert both to Float": `Integer == Float` is
+/// EXACT, so `(10**23) == 1e23` is false while `(10**23).to_f == 1e23` is true,
+/// and `Rational == Float` really is `to_f`-lossy, so `Rational(1, 3) == 1.0/3`
+/// is true. Every case prints an equality beside the ordering of the same pair,
+/// so an implementation that answers one with the other is caught.
+fn gen_numwide(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let e = r.range(20, 90);
+    let base = r.pick(&["2", "3", "7", "10"]);
+    let big = format!("{base}**{e}");
+    let (n, d) = (r.range(1, 9), r.range(2, 9));
+    one(match r.below(18) {
+        0 => format!("p [{big} == ({big}).to_f, ({big}).to_f == {big}]"),
+        1 => format!("p [{big} == ({big}).to_f + 1, {big} + 1 == ({big}).to_f]"),
+        2 => format!("p [{big} != ({big}).to_f, {big} != ({big}).to_f * 2]"),
+        3 => format!("p [{big} <=> ({big}).to_f, {big} <=> ({big}).to_f * 2]"),
+        4 => format!("p [({big}).to_f <=> {big}, {big} <=> {big}]"),
+        5 => format!("p [{big} < ({big}).to_f * 2, {big} > ({big}).to_f / 2]"),
+        6 => format!("p [{big} <= ({big}).to_f, {big} >= ({big}).to_f]"),
+        7 => format!("p [{big} == Float::INFINITY, {big} < Float::INFINITY]"),
+        8 => format!("p [{big} == Float::NAN, {big} <=> Float::NAN]"),
+        9 => format!("p [Rational({n}, {d}) == {n}.0 / {d}, Rational({n}, {d}) == 0.0]"),
+        10 => format!("p [{n}.0 / {d} == Rational({n}, {d}), Rational({n}, {d}) <=> {n}.0 / {d}]"),
+        11 => format!("p [Rational({n}, 1) == {n}, Rational({n}, 1) == {n}.0]"),
+        12 => format!("p [Complex({n}, 0) == {n}.0, Complex({n}, 1) == {n}.0]"),
+        13 => format!("p [{n}.0 == Complex({n}, 0), Complex({n}.0, 0) == {n}]"),
+        14 => format!("p [{big} == Rational({big}, 1), Rational({big}, 1) == ({big}).to_f]"),
+        15 => format!("p [({big}).eql?(({big}).to_f), ({big}).eql?({big})]"),
+        16 => format!("p [[{big}, ({big}).to_f].uniq.size, [{big}, {big}].uniq.size]"),
+        _ => format!("p [({big}).coerce(1.0), ({big}).coerce(1)]"),
+    })
+}
+
 fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
     match mode {
         Mode::Arith => gen_arith(seed),
@@ -1720,6 +1758,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Methobj => gen_methobj(seed),
         Mode::Multiyield => gen_multiyield(seed),
         Mode::Eqlident => gen_eqlident(seed),
+        Mode::Numwide => gen_numwide(seed),
         Mode::All => gen_case(seed, ALL_MODES[(seed as usize) % ALL_MODES.len()]),
     }
 }
@@ -2012,6 +2051,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Methobj => "methobj",
         Mode::Multiyield => "multiyield",
         Mode::Eqlident => "eqlident",
+        Mode::Numwide => "numwide",
         Mode::All => "all",
     }
 }
