@@ -1904,6 +1904,82 @@ fn method_objects_batch() {
     );
 }
 
+/// A built-in's `#arity`/`#owner`/`#parameters` come from the table of what MRI
+/// declares (`src/arity_table.rs`), so the assertions here are the encoding
+/// itself: a fixed count when every parameter is required, `-(required + 1)` once
+/// anything is optional or variadic, and the DEFINING module as the owner.
+#[test]
+fn builtin_method_shapes_match_mri() {
+    // Fixed arity, then optional, then variadic-after-one-required.
+    eq("3.method(:*).arity", "1");
+    eq("3.method(:divmod).arity", "1");
+    eq("3.method(:times).arity", "0");
+    eq("3.method(:round).arity", "-1");
+    eq("[1, 2].method(:pack).arity", "-2");
+    // The owner is the module that defines it, which is rarely the receiver's
+    // own class.
+    eq("3.method(:between?).owner.to_s", "\"Comparable\"");
+    eq("3.method(:puts).owner.to_s", "\"Kernel\"");
+    eq("3.method(:*).owner.to_s", "\"Integer\"");
+    eq("[1, 2].method(:each_slice).owner.to_s", "\"Enumerable\"");
+    eq("[1, 2].method(:map).owner.to_s", "\"Array\"");
+    eq("{a: 1}.method(:map).owner.to_s", "\"Enumerable\"");
+    // A class receiver resolves the singleton chain, then `Class`/`Module`.
+    eq("Integer.method(:sqrt).arity", "1");
+    eq("Integer.method(:sqrt).owner.to_s", "\"#<Class:Integer>\"");
+    eq("Integer.method(:name).owner.to_s", "\"Module\"");
+    // `Array` defines its own `new`; `Hash` inherits `Class#new`.
+    eq("Array.method(:new).owner.to_s", "\"#<Class:Array>\"");
+    eq("Hash.method(:new).owner.to_s", "\"Class\"");
+    // An UnboundMethod looks its name up as an INSTANCE method instead.
+    eq("Integer.instance_method(:to_s).owner.to_s", "\"Integer\"");
+    eq("3.method(:to_s).unbind.owner.to_s", "\"Integer\"");
+    eq("Integer.method(:to_s).owner.to_s", "\"Module\"");
+    // Native code has no written parameter names: MRI reports one-element entries.
+    eq("3.method(:+).parameters", "[[:req]]");
+    eq("3.method(:round).parameters", "[[:rest]]");
+    eq(
+        "[1, 2].method(:pack).parameters",
+        "[[:req, :fmt], [:key, :buffer]]",
+    );
+    // A subclass of a built-in inherits the built-in's owners.
+    eq(
+        "class ESub < Array; end; ESub.new.method(:each).owner.to_s",
+        "\"Array\"",
+    );
+    eq(
+        "class ESub2 < Array; end; ESub2.new.method(:each_slice).owner.to_s",
+        "\"Enumerable\"",
+    );
+    // `curry` reads the same arity.
+    eq("3.method(:+).curry[4]", "7");
+}
+
+/// A written method describes itself: required-vs-optional positionals, required
+/// keywords, and the module it was defined in.
+#[test]
+fn written_method_shapes_match_mri() {
+    eq(
+        "class EW\n  def m(a, b = 1, *c, d:, e: 2, **f, &g); end\nend\nEW.new.method(:m).parameters",
+        "[[:req, :a], [:opt, :b], [:rest, :c], [:keyreq, :d], [:key, :e], [:keyrest, :f], [:block, :g]]",
+    );
+    eq(
+        "class EW2\n  def m(a, *b, c); end\nend\nEW2.new.method(:m).parameters",
+        "[[:req, :a], [:rest, :b], [:req, :c]]",
+    );
+    eq("module EM\n  def mm(a); end\nend\nclass EC\n  include EM\nend\nEC.new.method(:mm).owner.to_s",
+        "\"EM\"");
+    // A `define_method` body reports the block's shape, checked strictly.
+    eq(
+        "class ED\n  define_method(:d) { |x, y = 1| }\nend\n[ED.new.method(:d).arity, ED.new.method(:d).parameters]",
+        "[-2, [[:req, :x], [:opt, :y]]]",
+    );
+    // `||` in parameter position is an EMPTY parameter list, not the operator.
+    eq("proc { || 1 }.call", "1");
+    eq("proc { || }.arity", "0");
+    eq("[1, 2].map { || 5 }", "[5, 5]");
+}
+
 #[test]
 fn block_and_lambda_splat_params() {
     // Symbol#to_proc forwards surplus args, so it works as a reduce operator.

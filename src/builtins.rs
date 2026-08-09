@@ -3564,7 +3564,7 @@ fn dispatch_classref(
             // the definition; `bind`/`bind_call` replace it with the real object.
             Ok(with_host(|h| {
                 let owner = h.class_ref(cls);
-                h.new_method(owner, &m)
+                h.new_unbound_method(owner, &m)
             }))
         }
         // Numeric class constants (`Float::INFINITY`, `Float::NAN`, …), reached
@@ -13038,23 +13038,50 @@ fn dispatch_method(
         Some(m) => m,
         None => return Err(no_method_error(recv, name)),
     };
+    // An UnboundMethod stores the class it was looked up ON; a bound Method with a
+    // class receiver is a class-method call. `arity`/`owner`/`parameters` resolve
+    // to different methods for the two, so the tag has to travel with them.
+    let unbound = with_host(|h| h.is_unbound_method(recv));
     match name {
         "call" | "()" | "[]" | "yield" | "===" => call_bound(&mrecv, &mname, args, block),
         // UnboundMethod (or Method) rebinding: `bind(obj)` yields a Method bound
         // to `obj`; `bind_call(obj, *args)` binds and invokes in one step.
         "bind" => Ok(with_host(|h| h.new_method(args[0].clone(), &mname))),
         "bind_call" => call_bound(&args[0], &mname, &args[1..], block),
-        // `Method#unbind` — drop the receiver, yielding an UnboundMethod.
-        "unbind" => Ok(with_host(|h| h.new_method(Value::Undef, &mname))),
-        "arity" => Ok(Value::Int(with_host(|h| h.method_arity(&mrecv, &mname)))),
+        // `Method#unbind` — drop the receiver, yielding an UnboundMethod. The
+        // DEFINING class takes its place (which is what `Module#instance_method`
+        // stores too), so the unbound method still describes itself; `bind` and
+        // `bind_call` overwrite it with the real object.
+        "unbind" => Ok(with_host(|h| {
+            let owner = h.method_owner(&mrecv, &mname, unbound);
+            let owner = h.class_ref(&owner);
+            h.new_unbound_method(owner, &mname)
+        })),
+        "arity" => Ok(Value::Int(with_host(|h| {
+            h.method_arity(&mrecv, &mname, unbound)
+        }))),
+        // `Method#owner` — the class or module that DEFINES the method, which for
+        // a built-in is rarely the receiver's own class (`3.method(:between?)` is
+        // owned by `Comparable`, `3.method(:puts)` by `Kernel`).
+        "owner" => Ok(with_host(|h| {
+            let owner = h.method_owner(&mrecv, &mname, unbound);
+            h.class_ref(&owner)
+        })),
         "parameters" => Ok(with_host(|h| {
-            let pairs = h.method_parameters(&mrecv, &mname);
+            let pairs = h.method_parameters(&mrecv, &mname, unbound);
             let arr: Vec<Value> = pairs
                 .iter()
                 .map(|(kind, pname)| {
                     let k = h.new_symbol(kind);
-                    let n = h.new_symbol(pname);
-                    h.new_array(vec![k, n])
+                    // A built-in's parameters have no written names, and MRI
+                    // reports those as one-element entries.
+                    match pname {
+                        Some(n) => {
+                            let n = h.new_symbol(n);
+                            h.new_array(vec![k, n])
+                        }
+                        None => h.new_array(vec![k]),
+                    }
                 })
                 .collect();
             h.new_array(arr)
@@ -13069,7 +13096,7 @@ fn dispatch_method(
         "curry" => {
             let arity = match args.first() {
                 Some(n) => as_i(n),
-                None => with_host(|h| h.method_arity(&mrecv, &mname)),
+                None => with_host(|h| h.method_arity(&mrecv, &mname, unbound)),
             };
             Ok(with_host(|h| {
                 h.new_method_curry(recv.clone(), arity.max(0) as usize)

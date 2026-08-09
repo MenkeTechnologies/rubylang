@@ -321,6 +321,11 @@ pub enum RObj {
     Method {
         recv: Value,
         name: String,
+        /// An UnboundMethod (`Module#instance_method`, `Method#unbind`), whose
+        /// `recv` is the class the method was looked up on rather than an
+        /// object. Both forms store a class, so only this flag says whether a
+        /// class receiver means "its class method" or "its instance method".
+        unbound: bool,
     },
     /// A user-defined object: its class name and its instance variables.
     Object {
@@ -639,6 +644,23 @@ pub struct MethodDef {
     /// the dispatcher seeds those slots with the call's positional args before
     /// running the chunk. 0 = every param is host-bound as usual.
     pub slot_params: u16,
+}
+
+/// What a `Method`/`UnboundMethod` name resolved to, and the module that owns
+/// it — the one answer `#arity`, `#owner` and `#parameters` all read.
+pub enum MethodShape {
+    /// A written `def` (or `attr_*`), and the class/module it was defined in.
+    /// Boxed: a `MethodDef` carries a whole compiled chunk, and the other two
+    /// variants are a handful of words.
+    Def { def: Box<MethodDef>, owner: String },
+    /// A `define_method` body (a proc template), and its owner.
+    Block { template: usize, owner: String },
+    /// A built-in, described by its row in the generated MRI shape table.
+    Builtin {
+        owner: &'static str,
+        arity: i16,
+        params: &'static str,
+    },
 }
 
 /// A compiled block template.
@@ -2362,7 +2384,11 @@ impl RubyHost {
             // arguments (MRI reports `-2`); a bound `Method` used as a proc
             // reports the method's arity.
             Some(RObj::SymProc(_)) => Some(-2),
-            Some(RObj::Method { recv, name }) => Some(self.method_arity(recv, name)),
+            Some(RObj::Method {
+                recv,
+                name,
+                unbound,
+            }) => Some(self.method_arity(recv, name, *unbound)),
             _ => None,
         }
     }
@@ -2508,89 +2534,244 @@ impl RubyHost {
         self.alloc(RObj::Method {
             recv,
             name: name.to_string(),
+            unbound: false,
+        })
+    }
+    /// Allocate an `UnboundMethod` (`Module#instance_method`, `Method#unbind`):
+    /// `owner` is the class the method is looked up on, not a receiver.
+    pub fn new_unbound_method(&mut self, owner: Value, name: &str) -> Value {
+        self.alloc(RObj::Method {
+            recv: owner,
+            name: name.to_string(),
+            unbound: true,
         })
     }
     /// The (receiver, method-name) of a bound `Method` value (`None` otherwise).
     pub fn as_method(&self, v: &Value) -> Option<(Value, String)> {
         match self.obj(v) {
-            Some(RObj::Method { recv, name }) => Some((recv.clone(), name.clone())),
+            Some(RObj::Method { recv, name, .. }) => Some((recv.clone(), name.clone())),
             _ => None,
         }
     }
-    /// `Method#arity`. For a user-defined method the arity is the count of required
-    /// positional parameters, negated (`-(n+1)`) when a `*rest` splat is present.
-    /// For a built-in method the exact arity is unknown here, so it reports `-1`
-    /// (variadic), matching Ruby's convention for optional/variadic methods.
-    /// `Method#parameters` descriptors: `(kind, name)` pairs. Optional-vs-required
-    /// and keyreq-vs-key aren't tracked (no default info on `MethodDef`), so
-    /// positional params report `req` and keyword params `key`; the splat/kwsplat/
-    /// block kinds (which delegation forwarding actually keys on) are exact.
-    pub fn method_parameters(&self, recv: &Value, name: &str) -> Vec<(&'static str, String)> {
-        let def = if let Some(cls) = self.object_class(recv) {
-            self.find_method_owner(&cls, name).map(|(d, _)| d)
+    /// Whether a `Method` value is an UnboundMethod — its stored receiver names
+    /// the class to look the method up on as an INSTANCE method.
+    pub fn is_unbound_method(&self, v: &Value) -> bool {
+        matches!(self.obj(v), Some(RObj::Method { unbound: true, .. }))
+    }
+    /// Where a `Method`/`UnboundMethod` name resolved, and the module that owns
+    /// it. `arity`/`owner`/`parameters` all read the same resolution, so they can
+    /// never describe different methods.
+    pub fn resolve_method_shape(
+        &self,
+        recv: &Value,
+        name: &str,
+        unbound: bool,
+    ) -> Option<MethodShape> {
+        if let Some(cls) = self.object_class(recv) {
+            if let Some((def, owner)) = self.find_method_owner(&cls, name) {
+                return Some(MethodShape::Def {
+                    def: Box::new(def),
+                    owner,
+                });
+            }
         } else if let Some(cls) = self.classref_name(recv) {
-            // A class receiver is either `Foo.method(:bar)` (a class method) or
-            // `Foo.instance_method(:bar)` (an instance method), which reach here
-            // identically -- try the class method first, then the instance one.
-            self.find_class_method(&cls, name)
-                .or_else(|| self.find_method_owner(&cls, name).map(|(d, _)| d))
-        } else {
-            self.methods.get(name).cloned()
-        };
-        let mut out = Vec::new();
-        if let Some(d) = def {
-            for (i, p) in d.params.iter().enumerate() {
-                let pname = p.trim_start_matches('*').to_string();
-                out.push((if Some(i) == d.splat { "rest" } else { "req" }, pname));
+            // An UnboundMethod's class receiver names an INSTANCE method; a bound
+            // one is a class method first, with the instance method as a fallback
+            // (a plain `Foo.method(:bar)` and `Foo.instance_method(:bar)` store the
+            // class identically).
+            if unbound {
+                if let Some((def, owner)) = self.find_method_owner(&cls, name) {
+                    return Some(MethodShape::Def {
+                        def: Box::new(def),
+                        owner,
+                    });
+                }
+            } else if let Some((def, owner)) = self.find_class_method_owner(&cls, name) {
+                // A `def self.m` is owned by the defining class's SINGLETON class;
+                // one reached through `extend M` is owned by `M` itself.
+                let owner = if self
+                    .classes
+                    .get(&owner)
+                    .is_some_and(|d| d.class_methods.contains_key(name))
+                {
+                    format!("#<Class:{owner}>")
+                } else {
+                    owner
+                };
+                return Some(MethodShape::Def {
+                    def: Box::new(def),
+                    owner,
+                });
             }
-            for k in &d.kwparams {
-                out.push(("key", k.clone()));
-            }
-            if let Some(ks) = &d.kwsplat {
-                out.push(("keyrest", ks.trim_start_matches('*').to_string()));
-            }
-            if let Some(bp) = &d.blockparam {
-                out.push(("block", bp.trim_start_matches('&').to_string()));
+            if let Some((def, owner)) = self.find_method_owner(&cls, name) {
+                return Some(MethodShape::Def {
+                    def: Box::new(def),
+                    owner,
+                });
             }
         }
+        // A top-level `def` lives in the flat method table, not on `Object`, so
+        // fall back to it before reporting "builtin". MRI owns those by `Object`.
+        if let Some(def) = self.methods.get(name) {
+            return Some(MethodShape::Def {
+                def: Box::new(def.clone()),
+                owner: "Object".to_string(),
+            });
+        }
+        // A `define_method` body describes the method it defined: its block is
+        // arity-checked with method (strict) semantics.
+        if let Some(cls) = self.object_class(recv).or_else(|| self.classref_name(recv)) {
+            if let Some(owner) = self.class_ancestry(&cls).into_iter().find(|c| {
+                self.define_methods
+                    .get(c)
+                    .is_some_and(|m| m.contains_key(name))
+            }) {
+                let p = self.define_methods[&owner][name].clone();
+                if let Some(RObj::Proc {
+                    template,
+                    kind: ProcKind::Normal,
+                    ..
+                }) = self.obj(&p)
+                {
+                    return Some(MethodShape::Block {
+                        template: *template,
+                        owner,
+                    });
+                }
+            }
+        }
+        self.builtin_shape(recv, name, unbound)
+    }
+    /// The built-in row describing `name` for `recv`: the first module in the
+    /// receiver's ancestor chain that the reference interpreter defines it on.
+    fn builtin_shape(&self, recv: &Value, name: &str, unbound: bool) -> Option<MethodShape> {
+        let chain = match self.classref_name(recv) {
+            // An UnboundMethod on a class looks its name up as an INSTANCE method.
+            Some(cls) if unbound => self.expanded_ancestry(&cls),
+            // A bound class receiver is a class-method call (`Integer.sqrt`) first;
+            // the instance chain behind it keeps a mis-tagged lookup answerable.
+            Some(cls) => {
+                let mut c = self.singleton_lookup_chain(&cls);
+                c.extend(self.expanded_ancestry(&cls));
+                c
+            }
+            None => self.expanded_ancestry(&self.dispatch_class(recv)),
+        };
+        chain.iter().find_map(|owner| {
+            crate::arity_table::lookup(owner, name).map(|(owner, arity, params)| {
+                MethodShape::Builtin {
+                    owner,
+                    arity,
+                    params,
+                }
+            })
+        })
+    }
+    /// The ancestor chain to resolve a built-in method against: the runtime's own
+    /// ancestry (which knows the user's classes, includes and prepends), with
+    /// every built-in class in it expanded to the chain the reference interpreter
+    /// reports — `class Foo < Array` must reach `Enumerable`, and `File` `IO`.
+    pub fn expanded_ancestry(&self, class: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for a in self.class_ancestry(class) {
+            match crate::arity_table::ancestry(&a) {
+                Some(chain) => out.extend(chain.iter().map(|s| s.to_string())),
+                None => out.push(a),
+            }
+        }
+        dedup_keep_first(out)
+    }
+    /// The chain a method call on a CLASS resolves against: each class ancestor's
+    /// singleton class (`#<Class:Integer>`, `#<Class:Numeric>`, …), then `Class`
+    /// (a module has none), `Module`, and the common root — MRI's
+    /// `Integer.singleton_class.ancestors`.
+    fn singleton_lookup_chain(&self, class: &str) -> Vec<String> {
+        let mut out = vec![format!("#<Class:{class}>")];
+        // A module's singleton class inherits from `Module` directly — it has no
+        // superclass singletons ahead of it, and no `Class`.
+        if !crate::arity_table::is_module(class) {
+            out.extend(
+                self.expanded_ancestry(class)
+                    .into_iter()
+                    .skip(1)
+                    .filter(|a| !crate::arity_table::is_module(a))
+                    .map(|a| format!("#<Class:{a}>")),
+            );
+            out.push("Class".to_string());
+        }
+        out.extend(["Module", "Object", "Kernel", "BasicObject"].map(String::from));
         out
     }
-    pub fn method_arity(&self, recv: &Value, name: &str) -> i64 {
-        let def = if let Some(cls) = self.object_class(recv) {
-            self.find_method_owner(&cls, name).map(|(d, _)| d)
-        } else if let Some(cls) = self.classref_name(recv) {
-            // A class receiver reaches here both from `Foo.method(:bar)` (a class
-            // method) and from `Foo.instance_method(:bar)` (an instance method):
-            // try the class method first, then fall back to the instance one.
-            self.find_class_method(&cls, name)
-                .or_else(|| self.find_method_owner(&cls, name).map(|(d, _)| d))
-        } else {
-            self.methods.get(name).cloned()
-        };
-        // A top-level `def` lives in the flat method table, not on `Object`, so
-        // fall back to it before reporting "builtin".
-        let def = def.or_else(|| self.methods.get(name).cloned());
-        if let Some(d) = def {
-            return ArityFacts::of_method(&d).arity_value(true);
+    /// `Method#owner` — the class or module that DEFINES the method, which is
+    /// rarely the receiver's own class (`3.method(:between?).owner` is
+    /// `Comparable`). Falls back to the receiver's class for a method no table
+    /// row and no definition describes.
+    pub fn method_owner(&self, recv: &Value, name: &str, unbound: bool) -> String {
+        match self.resolve_method_shape(recv, name, unbound) {
+            Some(MethodShape::Def { owner, .. }) | Some(MethodShape::Block { owner, .. }) => owner,
+            Some(MethodShape::Builtin { owner, .. }) => owner.to_string(),
+            None => self
+                .classref_name(recv)
+                .map(|c| format!("#<Class:{c}>"))
+                .unwrap_or_else(|| self.dispatch_class(recv)),
         }
-        // A `define_method` body reports the arity of its block, with method
-        // (strict) semantics — that is what the defined method enforces.
-        let dm = self
-            .object_class(recv)
-            .or_else(|| self.classref_name(recv))
-            .and_then(|cls| self.find_define_method(&cls, name));
-        if let Some(p) = dm {
-            if let Some(RObj::Proc {
-                template,
-                kind: ProcKind::Normal,
-                ..
-            }) = self.obj(&p)
-            {
-                return ArityFacts::of_proc(&self.procs[*template]).arity_value(true);
+    }
+    /// `Method#parameters` descriptors: `(kind, name)` pairs, with the name absent
+    /// for a built-in (native code has no written parameter names, and MRI reports
+    /// those as one-element `[:req]` / `[:rest]` entries).
+    pub fn method_parameters(
+        &self,
+        recv: &Value,
+        name: &str,
+        unbound: bool,
+    ) -> Vec<(&'static str, Option<String>)> {
+        match self.resolve_method_shape(recv, name, unbound) {
+            Some(MethodShape::Def { def, .. }) => written_params(
+                &def.params,
+                def.splat,
+                def.opt as usize,
+                &def.kwparams,
+                &def.kwreq,
+                def.kwsplat.as_deref(),
+                def.blockparam.as_deref(),
+            ),
+            Some(MethodShape::Block { template, .. }) => {
+                let p = &self.procs[template];
+                // The parser desugars a block's keyword params into one synthetic
+                // trailing capture param, which is not a parameter of the method.
+                let positional = match p.params.last().map(String::as_str) {
+                    Some("__blockkw") => &p.params[..p.params.len() - 1],
+                    _ => &p.params[..],
+                };
+                written_params(
+                    positional,
+                    p.splat,
+                    p.arity.opt as usize,
+                    &p.arity.kwnames,
+                    &p.arity.kwreq,
+                    p.arity.kwsplat.then_some(""),
+                    p.arity.blockparam.as_deref(),
+                )
             }
+            Some(MethodShape::Builtin { arity, params, .. }) => {
+                crate::arity_table::params_for(arity, params)
+            }
+            None => Vec::new(),
         }
-        // Built-in method: real arity is not tracked; report variadic.
-        -1
+    }
+    /// `Method#arity`. A written method reports the count of its required
+    /// parameters, negated (`-(n+1)`) when the call shape is not a single fixed
+    /// count; a built-in reports the arity the reference interpreter declares for
+    /// it. `-1` is the last resort for a method nothing describes.
+    pub fn method_arity(&self, recv: &Value, name: &str, unbound: bool) -> i64 {
+        match self.resolve_method_shape(recv, name, unbound) {
+            Some(MethodShape::Def { def, .. }) => ArityFacts::of_method(&def).arity_value(true),
+            Some(MethodShape::Block { template, .. }) => {
+                ArityFacts::of_proc(&self.procs[template]).arity_value(true)
+            }
+            Some(MethodShape::Builtin { arity, .. }) => arity as i64,
+            None => -1,
+        }
     }
 
     // ---- public accessors used by builtins (fine-grained borrows) ---------
@@ -5214,7 +5395,7 @@ impl RubyHost {
                 | Some(RObj::CycleProc(_))
                 | Some(RObj::SeqProc(_))
                 | Some(RObj::DeriveProc { .. }) => "#<Proc>".to_string(),
-                Some(RObj::Method { recv, name }) => {
+                Some(RObj::Method { recv, name, .. }) => {
                     format!("#<Method: {}#{name}>", self.class_of(&recv))
                 }
                 Some(RObj::Regexp { source, flags, .. }) => {
@@ -6197,6 +6378,48 @@ fn as_int(v: &Value) -> Option<i64> {
         Value::Float(f) => Some(*f as i64),
         _ => None,
     }
+}
+
+/// `Method#parameters` for a WRITTEN parameter list. Ruby fixes the order —
+/// required positionals, optional positionals, `*rest`, post-splat required
+/// positionals — so the `opt` count identifies which of the pre-splat names carry
+/// defaults, and everything after the splat is required again. `kwsplat` is the
+/// `**rest` name, or `Some("")` when the collector is present but its name was
+/// desugared away (a block's, which the parser rewrites into a capture param).
+fn written_params(
+    params: &[String],
+    splat: Option<usize>,
+    opt: usize,
+    kwnames: &[String],
+    kwreq: &[String],
+    kwsplat: Option<&str>,
+    blockparam: Option<&str>,
+) -> Vec<(&'static str, Option<String>)> {
+    let mut out: Vec<(&'static str, Option<String>)> = Vec::new();
+    let pre = splat.unwrap_or(params.len());
+    for (i, p) in params.iter().enumerate() {
+        let name = p.trim_start_matches('*').to_string();
+        let kind = if Some(i) == splat {
+            "rest"
+        } else if i < pre.saturating_sub(opt) || i > pre {
+            "req"
+        } else {
+            "opt"
+        };
+        out.push((kind, Some(name)));
+    }
+    for k in kwnames {
+        let kind = if kwreq.contains(k) { "keyreq" } else { "key" };
+        out.push((kind, Some(k.clone())));
+    }
+    if let Some(ks) = kwsplat {
+        let name = ks.trim_start_matches('*');
+        out.push(("keyrest", (!name.is_empty()).then(|| name.to_string())));
+    }
+    if let Some(bp) = blockparam {
+        out.push(("block", Some(bp.trim_start_matches('&').to_string())));
+    }
+    out
 }
 
 /// Remove duplicate entries from an ancestry list, keeping the first occurrence
@@ -8834,7 +9057,7 @@ pub fn call_proc_self_ctx(
         // A bound `Method` used as a block/proc (`map(&obj.method(:m))`): re-dispatch
         // the stored method on its captured receiver, with the Kernel fallback so a
         // bound Kernel method (`method(:puts)`) works off the `main` object too.
-        Some(RObj::Method { recv, name }) => {
+        Some(RObj::Method { recv, name, .. }) => {
             return crate::builtins::call_bound(&recv, &name, args, None);
         }
         // The native `cycle` generator body: driven with a yielder (`args[0]`),

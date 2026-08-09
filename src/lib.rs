@@ -7,6 +7,7 @@
 //! JIT here — execution and codegen live in fusevm.
 
 pub mod aot;
+pub mod arity_table;
 pub mod ast;
 pub mod banner;
 pub mod builtins;

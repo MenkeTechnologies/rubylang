@@ -636,6 +636,7 @@ enum Mode {
     Complexnum,
     Objintro,
     Blockflow,
+    Methobj,
 }
 
 const ALL_MODES: &[Mode] = &[
@@ -679,6 +680,7 @@ const ALL_MODES: &[Mode] = &[
     Mode::Complexnum,
     Mode::Objintro,
     Mode::Blockflow,
+    Mode::Methobj,
 ];
 
 fn gen_intmeth(seed: u64) -> Vec<String> {
@@ -1074,18 +1076,68 @@ fn gen_blockflow(seed: u64) -> Vec<String> {
     // Block-taking methods whose value is observable. Each entry is
     // (receiver, method-call-prefix, block params).
     let arr_meths = [
-        "each", "map", "select", "filter", "reject", "find", "detect", "find_index",
-        "sort_by", "min_by", "max_by", "group_by", "partition", "take_while",
-        "drop_while", "sum", "count", "flat_map", "each_with_index", "each_entry",
-        "find_all", "filter_map", "reverse_each", "each_index", "any?", "all?",
-        "none?", "one?", "delete_if", "keep_if",
+        "each",
+        "map",
+        "select",
+        "filter",
+        "reject",
+        "find",
+        "detect",
+        "find_index",
+        "sort_by",
+        "min_by",
+        "max_by",
+        "group_by",
+        "partition",
+        "take_while",
+        "drop_while",
+        "sum",
+        "count",
+        "flat_map",
+        "each_with_index",
+        "each_entry",
+        "find_all",
+        "filter_map",
+        "reverse_each",
+        "each_index",
+        "any?",
+        "all?",
+        "none?",
+        "one?",
+        "delete_if",
+        "keep_if",
     ];
     let hash_meths = [
-        "each", "each_pair", "map", "select", "filter", "reject", "find", "detect",
-        "each_with_index", "each_key", "each_value", "sort_by", "min_by", "max_by",
-        "group_by", "partition", "sum", "count", "any?", "all?", "none?", "one?",
-        "delete_if", "keep_if", "transform_values", "transform_keys", "filter_map",
-        "flat_map", "each_entry", "find_all",
+        "each",
+        "each_pair",
+        "map",
+        "select",
+        "filter",
+        "reject",
+        "find",
+        "detect",
+        "each_with_index",
+        "each_key",
+        "each_value",
+        "sort_by",
+        "min_by",
+        "max_by",
+        "group_by",
+        "partition",
+        "sum",
+        "count",
+        "any?",
+        "all?",
+        "none?",
+        "one?",
+        "delete_if",
+        "keep_if",
+        "transform_values",
+        "transform_keys",
+        "filter_map",
+        "flat_map",
+        "each_entry",
+        "find_all",
     ];
     one(match r.below(24) {
         // The core shape: the break value IS the call's value.
@@ -1180,6 +1232,240 @@ fn gen_kernelconv(seed: u64) -> Vec<String> {
     })
 }
 
+/// `Method`/`UnboundMethod` reflection: `#arity`, `#owner`, `#parameters`,
+/// `#name`, `#curry` over BUILT-IN methods as well as written ones.
+///
+/// A built-in has no written parameter list, so every one of those answers comes
+/// out of a table of what MRI declares — which is exactly the kind of surface a
+/// generator that only ever probes written `def`s reports zero divergences on.
+/// The receiver list therefore spans the core classes, and the method list per
+/// receiver spans fixed-arity, optional-argument and variadic built-ins, plus the
+/// ones a MODULE defines (`Comparable#between?`, `Enumerable#each_slice`,
+/// `Kernel#frozen?`) where the owner is not the receiver's own class.
+///
+/// Not emitted: `parameters` of a `define_method` body that takes `**rest` — the
+/// parser desugars the collector into a synthetic capture param, so its name is
+/// not recorded anywhere and rubylang reports an unnamed `[:keyrest]`.
+fn gen_methobj(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    // (receiver literal, methods to probe on it). Mixed on purpose: fixed arity,
+    // `-1` variadic, `-2` "one required then variadic", and module-owned ones.
+    let recvs: &[(&str, &[&str])] = &[
+        (
+            "3",
+            &[
+                "+",
+                "*",
+                "divmod",
+                "gcd",
+                "times",
+                "to_s",
+                "round",
+                "between?",
+                "clamp",
+                "digits",
+                "fdiv",
+                "pow",
+                "abs",
+                "upto",
+                "coerce",
+                "puts",
+                "frozen?",
+                "instance_of?",
+            ],
+        ),
+        (
+            "1.5",
+            &[
+                "+", "round", "floor", "divmod", "between?", "step", "to_i", "nan?", "coerce",
+            ],
+        ),
+        (
+            "\"ab\"",
+            &[
+                "upcase",
+                "sub",
+                "gsub",
+                "split",
+                "each_char",
+                "center",
+                "index",
+                "between?",
+                "start_with?",
+                "delete",
+                "count",
+                "tr",
+                "slice",
+                "unpack",
+                "%",
+            ],
+        ),
+        (
+            ":sym",
+            &["to_proc", "to_s", "succ", "between?", "start_with?", "[]"],
+        ),
+        (
+            "[1, 2]",
+            &[
+                "push",
+                "map",
+                "first",
+                "include?",
+                "each_slice",
+                "inject",
+                "flatten",
+                "join",
+                "rotate",
+                "sample",
+                "sum",
+                "zip",
+                "each_cons",
+                "min_by",
+                "take_while",
+                "dig",
+            ],
+        ),
+        (
+            "{a: 1}",
+            &[
+                "each",
+                "fetch",
+                "map",
+                "merge",
+                "store",
+                "dig",
+                "any?",
+                "each_with_object",
+                "min_by",
+                "group_by",
+                "count",
+                "to_a",
+            ],
+        ),
+        (
+            "(1..3)",
+            &["step", "each", "cover?", "sum", "each_slice", "min", "to_a"],
+        ),
+        (
+            "nil",
+            &[
+                "to_a",
+                "to_s",
+                "inspect",
+                "&",
+                "frozen?",
+                "instance_variable_get",
+            ],
+        ),
+        (
+            "Object.new",
+            &[
+                "frozen?",
+                "instance_variable_get",
+                "respond_to?",
+                "tap",
+                "then",
+                "send",
+            ],
+        ),
+    ];
+    // Class receivers: the owner is a singleton class (`#<Class:Integer>`) or,
+    // for the inherited ones, `Class` / `Module` / `Kernel`.
+    let classes: &[(&str, &[&str])] = &[
+        (
+            "Integer",
+            &[
+                "sqrt",
+                "try_convert",
+                "name",
+                "instance_method",
+                "ancestors",
+            ],
+        ),
+        (
+            "String",
+            &["new", "try_convert", "name", "instance_methods"],
+        ),
+        ("Array", &["new", "[]", "try_convert", "superclass"]),
+        ("Hash", &["new", "[]", "name", "include?"]),
+        ("Math", &["sqrt", "hypot", "log", "atan2", "cbrt"]),
+        ("Struct", &["new", "name"]),
+    ];
+    // Written parameter shapes — the `def` side of the same three answers.
+    let defs = [
+        ("def m(a); end", "m"),
+        ("def m(a, b); end", "m"),
+        ("def m(a, b = 1); end", "m"),
+        ("def m(a, *b); end", "m"),
+        ("def m(*a); end", "m"),
+        ("def m(a, *b, c); end", "m"),
+        ("def m(a, b: 1); end", "m"),
+        ("def m(a, b:); end", "m"),
+        ("def m(a, **b); end", "m"),
+        ("def m(a, &b); end", "m"),
+        ("def m(a, b = 1, *c, d:, e: 2, **f, &g); end", "m"),
+        ("def m; end", "m"),
+    ];
+    let (rc, ms) = r.pick(recvs);
+    let m = r.pick(ms);
+    let (cls, cms) = r.pick(classes);
+    let cm = r.pick(cms);
+    let (d, dn) = r.pick(&defs);
+    one(match r.below(20) {
+        0 => format!("p({rc}.method(:{m}).arity)"),
+        1 => format!("p({rc}.method(:{m}).owner.to_s)"),
+        2 => format!("p({rc}.method(:{m}).parameters)"),
+        3 => format!("p([{rc}.method(:{m}).arity, {rc}.method(:{m}).owner.to_s])"),
+        4 => format!("p({rc}.method(:{m}).name)"),
+        5 => format!("p {cls}.method(:{cm}).arity"),
+        6 => format!("p {cls}.method(:{cm}).owner.to_s"),
+        7 => format!("p {cls}.method(:{cm}).parameters"),
+        8 => format!("class C\n  {d}\nend\np C.new.method(:{dn}).arity"),
+        9 => format!("class C\n  {d}\nend\np C.new.method(:{dn}).parameters"),
+        10 => format!("class C\n  {d}\nend\np C.new.method(:{dn}).owner.to_s"),
+        11 => format!("class C\n  {d}\nend\np C.instance_method(:{dn}).owner.to_s"),
+        12 => format!("class C\n  {d}\nend\np C.instance_method(:{dn}).arity"),
+        13 => format!("class C\n  {d}\nend\np C.new.method(:{dn}).unbind.owner.to_s"),
+        // A module-owned method: the owner is the module, never the class.
+        14 => format!(
+            "module M\n  {d}\nend\nclass C\n  {}\nend\np [C.new.method(:{dn}).owner.to_s, C.new.method(:{dn}).arity]",
+            if r.below(2) == 0 { "include M" } else { "prepend M" }
+        ),
+        15 => format!(
+            "class C\n  include Comparable\n  def <=>(o) = 0\nend\np [C.new.method(:{}).owner.to_s, C.new.method(:{}).arity]",
+            r.pick(&["between?", "clamp", "<", ">="]),
+            r.pick(&["between?", "clamp", "<", ">="])
+        ),
+        16 => format!(
+            "class C\n  include Enumerable\n  def each; yield 1; end\nend\np [C.new.method(:{}).owner.to_s, C.new.method(:{}).arity]",
+            r.pick(&["map", "each_slice", "sort_by", "include?", "first"]),
+            r.pick(&["map", "each_slice", "sort_by", "include?", "first"])
+        ),
+        // `define_method` bodies report the block's shape, strictly.
+        17 => format!(
+            "class C\n  define_method(:d) {{ |{}| }}\nend\np [C.new.method(:d).arity, C.new.method(:d).parameters]",
+            r.pick(&["x", "x, y", "x, y = 1", "x, *y", "", "x, k: 1"])
+        ),
+        // `curry` reads the same arity a built-in reports.
+        18 => format!("p 3.method(:{}).curry[{}]", r.pick(&["+", "*", "-", "gcd"]), r.range(1, 9)),
+        // A user subclass of a built-in inherits the built-in's owner. The method
+        // names are per-parent: a name the parent does not have is a `NameError`
+        // in MRI, which spends the case without comparing anything.
+        _ => {
+            let (parent, pms): &(&str, &[&str]) = r.pick(&[
+                ("Array", &["each", "size", "first", "frozen?", "instance_of?", "to_s"] as &[&str]),
+                ("Hash", &["each", "size", "frozen?", "instance_of?", "to_s", "fetch"]),
+                ("String", &["size", "upcase", "frozen?", "instance_of?", "to_s", "sub"]),
+            ]);
+            format!(
+                "class C < {parent}\nend\np [C.new.method(:{}).owner.to_s, C.new.method(:{}).arity]",
+                r.pick(pms),
+                r.pick(pms)
+            )
+        }
+    })
+}
+
 fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
     match mode {
         Mode::Arith => gen_arith(seed),
@@ -1222,6 +1508,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Complexnum => gen_complexnum(seed),
         Mode::Objintro => gen_objintro(seed),
         Mode::Blockflow => gen_blockflow(seed),
+        Mode::Methobj => gen_methobj(seed),
     }
 }
 
@@ -1510,6 +1797,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Complexnum => "complexnum",
         Mode::Objintro => "objintro",
         Mode::Blockflow => "blockflow",
+        Mode::Methobj => "methobj",
     }
 }
 

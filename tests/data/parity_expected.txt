@@ -1703,3 +1703,25 @@ FrozenError
 [nil, [2], [1, 2]]
 #==#
 [[10, 20], [[10, 0], [20, 1]], [[10, 0], [20, 1]]]
+#==#
+[1, 1, 0, -1, -1]
+#==#
+[Comparable, Kernel, Enumerable, Array, Enumerable]
+#==#
+[[[:req]], [[:rest]], [[:req]]]
+#==#
+[1, "#<Class:Integer>", 2, "#<Class:Math>", "Module"]
+#==#
+[Integer, Integer, Module, 0]
+#==#
+[-3, [[:req, :a], [:opt, :b], [:rest, :c], [:keyreq, :d], [:key, :e], [:keyrest, :f], [:block, :g]], ArOwner, ArMod]
+#==#
+[Array, 0, Kernel, Enumerable]
+#==#
+[-2, [[:req, :x], [:opt, :y]], ArDm, 0]
+#==#
+[1, 0, [5, 5]]
+#==#
+[7, 3, 1]
+#==#
+[Comparable, 2, Enumerable, -1]

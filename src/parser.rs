@@ -1248,6 +1248,13 @@ impl Parser {
     /// patterns become a sequence of flat assignments.
     fn block_params(&mut self) -> Result<BlockParams, String> {
         let mut acc = ParamAcc::default();
+        // `{ || … }` — an EMPTY parameter list, which the lexer hands over as the
+        // single `||` operator token. Written out, `proc { || }` is legal Ruby;
+        // without this the `||` is parsed as the start of the block BODY and the
+        // block fails to parse at all.
+        if self.eat_op("||") {
+            return Ok(acc.finish());
+        }
         if self.eat_op("|") {
             if !self.is_op("|") {
                 self.block_param(&mut acc)?;

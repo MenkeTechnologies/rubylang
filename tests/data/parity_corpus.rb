@@ -3053,3 +3053,60 @@ p [[1, 2].reject! { false }, [1, 2].reject! { |x| x == 1 }, [1, 2].delete_if { f
 #==#
 # each_with_index yields TWO values: a one-parameter block binds only the first.
 p [[10, 20].each_with_index.map { |x| x }, [10, 20].each_with_index.map { |x, i| [x, i] }, [10, 20].each_with_index.to_a]
+#==#
+# A built-in's arity is what MRI DECLARES for it: the count when every parameter
+# is required, and -(required+1) once anything is optional or variadic.
+p [3.method(:*).arity, 3.method(:divmod).arity, 3.method(:times).arity, 3.method(:round).arity, [1, 2].method(:push).arity]
+#==#
+# `#owner` names the module that DEFINES the method, not the receiver's class.
+p [3.method(:between?).owner, 3.method(:puts).owner, [1, 2].method(:each_slice).owner, [1, 2].method(:map).owner, {a: 1}.method(:map).owner]
+#==#
+# A built-in's parameters have no written names, so MRI reports one-element entries.
+p [3.method(:+).parameters, 3.method(:round).parameters, [1, 2].method(:each_slice).parameters]
+#==#
+# A class receiver resolves class methods; the owner is the singleton class.
+p [Integer.method(:sqrt).arity, Integer.method(:sqrt).owner.to_s, Math.method(:hypot).arity, Math.method(:hypot).owner.to_s, Integer.method(:name).owner.to_s]
+#==#
+# An UnboundMethod looks its name up as an INSTANCE method of the class it holds.
+p [3.method(:to_s).unbind.owner, Integer.instance_method(:to_s).owner, Integer.method(:to_s).owner, Array.instance_method(:each).arity]
+#==#
+# A written method reports its own shape, with the module it was defined in.
+class ArOwner
+  def m(a, b = 1, *c, d:, e: 2, **f, &g); end
+end
+module ArMod
+  def mm(a); end
+end
+class ArInc
+  include ArMod
+end
+p [ArOwner.new.method(:m).arity, ArOwner.new.method(:m).parameters, ArOwner.new.method(:m).owner, ArInc.new.method(:mm).owner]
+#==#
+# A subclass of a built-in inherits the built-in's owners.
+class ArSub < Array
+end
+p [ArSub.new.method(:each).owner, ArSub.new.method(:size).arity, ArSub.new.method(:frozen?).owner, ArSub.new.method(:each_slice).owner]
+#==#
+# A `define_method` body reports the block's shape, checked strictly.
+class ArDm
+  define_method(:d) { |x, y = 1| }
+  define_method(:e) { || }
+end
+p [ArDm.new.method(:d).arity, ArDm.new.method(:d).parameters, ArDm.new.method(:d).owner, ArDm.new.method(:e).arity]
+#==#
+# `|| ` is an EMPTY block parameter list, not the or-operator.
+p [proc { || 1 }.call, proc { || }.arity, [1, 2].map { || 5 }]
+#==#
+# `curry` gathers exactly as many arguments as the method's arity.
+p [3.method(:+).curry[4], 3.method(:gcd).curry[6], 3.method(:+).to_proc.arity]
+#==#
+# An included module's methods are owned by the module, whichever way it came in.
+class ArCmp
+  include Comparable
+  def <=>(o) = 0
+end
+class ArEnum
+  include Enumerable
+  def each; yield 1; end
+end
+p [ArCmp.new.method(:between?).owner, ArCmp.new.method(:between?).arity, ArEnum.new.method(:sort_by).owner, ArEnum.new.method(:first).arity]
