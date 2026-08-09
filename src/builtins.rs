@@ -14027,19 +14027,10 @@ fn dispatch_regexp(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
             Ok(scan_regex(&re, &s))
         }
         // `options` — the Ruby flag bitmask: IGNORECASE=1, EXTENDED=2, MULTILINE=4.
+        // Shares its encoder with Regexp equality, which compares this bitmask.
         "options" => {
             let flags = with_host(|h| h.regex_flags(recv)).unwrap_or_default();
-            let mut opts = 0i64;
-            if flags.contains('i') {
-                opts |= 1;
-            }
-            if flags.contains('x') {
-                opts |= 2;
-            }
-            if flags.contains('m') {
-                opts |= 4;
-            }
-            Ok(Value::Int(opts))
+            Ok(Value::Int(crate::host::regex_option_bits(&flags) as i64))
         }
         "casefold?" => {
             let flags = with_host(|h| h.regex_flags(recv)).unwrap_or_default();

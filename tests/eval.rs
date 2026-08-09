@@ -5899,3 +5899,72 @@ fn class_sits_under_module_in_the_ancestry() {
     );
     eq("Module.superclass.name", "\"Object\"");
 }
+
+#[test]
+fn regexp_is_a_value_not_an_identity() {
+    // MRI compares a Regexp by source + options (+ encoding), so two separately
+    // written literals are the SAME value. Every case below answered the other
+    // way while Regexp fell through to the object-identity arm of `eq_values`.
+    eq("/a/ == /a/", "true");
+    eq("/a/ == /b/", "false");
+    eq("/a/ == /a/i", "false");
+    eq("/a/i == /a/i", "true");
+    // Options are a normalized bitmask, so flag ORDER does not matter. A
+    // comparison written on the stored flag text ("im" vs "mi") gets this wrong
+    // while still passing every single-flag case above.
+    eq("/a/im == /a/mi", "true");
+    eq("/a/imx == /a/xmi", "true");
+    // `x` is a distinct option, not decoration.
+    eq("/a/x == /a/", "false");
+    // A Regexp built at runtime equals the literal with the same source.
+    eq("Regexp.new('a') == /a/", "true");
+    // Interpolation builds a fresh object with the same source.
+    eq(r##"/#{"a"}/ == /a/"##, "true");
+    // Never equal across types.
+    eq("/a/ == 'a'", "false");
+    eq("/a/ == nil", "false");
+    // `eql?` follows `==` for a Regexp (no numeric-style class strictness).
+    eq("/a/.eql?(/a/)", "true");
+    eq("/a/.eql?(/a/i)", "false");
+}
+
+#[test]
+fn regexp_hash_and_eql_agree_so_it_works_as_a_key() {
+    // `hash` must agree with `==` or a Regexp cannot be a Hash key, and `uniq`,
+    // `-`, `include?` and Set membership (all defined via hash/eql?) all break.
+    eq("/a/.hash == /a/.hash", "true");
+    eq("/a/im.hash == /a/mi.hash", "true");
+    eq("/a/.hash == /a/i.hash", "false");
+    eq("/a/.hash == /b/.hash", "false");
+
+    eq("{/a/ => 1}[/a/]", "1");
+    eq("{/a/ => 1}[/a/i]", "nil");
+    eq("[/a/, /b/, /a/].uniq.size", "2");
+    eq("[/a/, /a/i, /a/].uniq.size", "2");
+    eq("([/a/, /b/] - [/a/]).size", "1");
+    eq("[/a/].include?(/a/)", "true");
+    eq("[/a/].include?(/a/m)", "false");
+    eq("require 'set'; Set[/a/, /a/].size", "1");
+
+    // A Regexp taken back OUT of a Hash key must still be a Regexp that
+    // inspects as it went in -- the key round-trip used to yield the debug text
+    // of the heap handle ("Obj(78)").
+    eq("{/a/mi => 1}.keys.first.inspect", "\"/a/mi\"");
+    eq("{/a/ => 1}.inspect", "\"{/a/ => 1}\"");
+}
+
+#[test]
+fn regexp_options_is_the_bitmask_equality_uses() {
+    // IGNORECASE 1, EXTENDED 2, MULTILINE 4 -- shared with the equality path, so
+    // these pin the encoder both of them read.
+    eq("/a/.options", "0");
+    eq("/a/i.options", "1");
+    eq("/a/x.options", "2");
+    eq("/a/m.options", "4");
+    eq("/a/imx.options", "7");
+    eq("/a/mi.options", "5");
+    // Flag text is rendered in Ruby's canonical `mix` order regardless of how
+    // it was written.
+    eq("/a/im.inspect", "\"/a/mi\"");
+    eq("/a/xmi.inspect", "\"/a/mix\"");
+}

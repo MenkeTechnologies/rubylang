@@ -650,6 +650,27 @@ pub struct RescueDef {
     pub body: usize,
 }
 
+/// Ruby's `Regexp#options` bitmask for a regexp's flag text: `IGNORECASE` 1,
+/// `EXTENDED` 2, `MULTILINE` 4.
+///
+/// This is what decides whether two Regexps are the same value, so it must be
+/// computed from the bits and never from the flag TEXT: a literal records the
+/// letters in the order they were written, so `/a/im` and `/a/mi` carry
+/// different text and identical options, and Ruby calls them equal.
+pub fn regex_option_bits(flags: &str) -> u8 {
+    let mut bits = 0u8;
+    if flags.contains('i') {
+        bits |= 1;
+    }
+    if flags.contains('x') {
+        bits |= 2;
+    }
+    if flags.contains('m') {
+        bits |= 4;
+    }
+    bits
+}
+
 /// A hashable Ruby value used as a Hash key. `Ord` is derived purely to give
 /// the order-independent containers (`Hash`, `Set`) a canonical element order
 /// to sort into; it is not a Ruby-visible ordering.
@@ -687,6 +708,9 @@ pub enum RKey {
     Range(i64, i64, bool),
     StrRange(String, String, bool),
     FloatRange(u64, u64, bool),
+    /// A Regexp, keyed by `(source, options)` — the same pair `==` compares —
+    /// so `/a/` and `/a/` are one Hash key and collapse under `uniq`.
+    Regexp(String, u8),
     /// An identity key: the heap-object index of a `Value::Obj`, used when a Hash
     /// is in `compare_by_identity` mode so distinct-but-equal objects (two `[1]`
     /// arrays, two `"ab"` strings) hash as separate keys.
@@ -2404,6 +2428,9 @@ impl RubyHost {
     /// Compile a regex literal (Ruby `flags` → inline flags: `i`
     /// case-insensitive, `m` dot-matches-newline, `x` extended). Returns an error
     /// string if the pattern is not valid for the fancy-regex engine.
+    ///
+    /// The `flags` text is stored as written, so use [`regex_option_bits`] —
+    /// never the string itself — to compare two Regexps' options.
     ///
     /// fancy-regex is a backtracking engine, so Ruby/Onigmo features the `regex`
     /// crate rejects — backreferences (`\1`, `\k<name>`) and look-around
@@ -6098,6 +6125,15 @@ impl RubyHost {
                 let parts: Vec<String> = ks.clone().iter().map(|k| self.key_inspect(k)).collect();
                 format!("[{}]", parts.join(", "))
             }
+            // `mix` order, matching `Regexp#inspect`.
+            RKey::Regexp(source, bits) => {
+                let flags: String = [(4, 'm'), (1, 'i'), (2, 'x')]
+                    .iter()
+                    .filter(|(b, _)| bits & b != 0)
+                    .map(|(_, c)| *c)
+                    .collect();
+                format!("/{source}/{flags}")
+            }
             RKey::Range(lo, hi, excl) => format!("{lo}{}{hi}", if *excl { "..." } else { ".." }),
             RKey::StrRange(lo, hi, excl) => {
                 format!("{lo:?}{}{hi:?}", if *excl { "..." } else { ".." })
@@ -6258,6 +6294,11 @@ impl RubyHost {
                     parts.extend(ivars.values().map(|m| self.to_key(m)));
                     RKey::Array(parts)
                 }
+                // Keyed by the same `(source, options)` pair `eq_values`
+                // compares, so `hash`/`eql?` stay consistent with `==`.
+                Some(RObj::Regexp { source, flags, .. }) => {
+                    RKey::Regexp(source.clone(), regex_option_bits(flags))
+                }
                 _ => RKey::Str(format!("{v:?}")),
             },
             _ => RKey::Nil,
@@ -6298,6 +6339,19 @@ impl RubyHost {
             RKey::StrRange(lo, hi, excl) => self.new_str_range(lo.clone(), hi.clone(), *excl),
             RKey::FloatRange(lo, hi, excl) => {
                 self.new_float_range(f64::from_bits(*lo), f64::from_bits(*hi), *excl)
+            }
+            // Rebuilt with the flag letters in Ruby's canonical `mix` order, the
+            // same order `to_s`/`inspect` render, so a Regexp taken back out of a
+            // Hash key inspects exactly as the one put in.
+            RKey::Regexp(source, bits) => {
+                let flags: String = [(4, 'm'), (1, 'i'), (2, 'x')]
+                    .iter()
+                    .filter(|(b, _)| bits & b != 0)
+                    .map(|(_, c)| *c)
+                    .collect();
+                // The source compiled once already; if the engine somehow
+                // rejects it now there is no Regexp to answer with.
+                self.new_regex(source, &flags).unwrap_or(Value::Undef)
             }
             RKey::Identity(i) => Value::Obj(*i),
         }
@@ -6860,6 +6914,24 @@ impl RubyHost {
                     (Some(RObj::Set(x)), Some(RObj::Set(y))) => {
                         x.len() == y.len() && x.keys().all(|k| y.contains_key(k))
                     }
+                    // Two Regexps are equal when their source and their options
+                    // agree — `/a/ == /a/` is true even though each literal
+                    // allocates its own object. Options compare as the NORMALIZED
+                    // bitmask, not as the flag text, so `/a/im == /a/mi`. (MRI
+                    // also compares the encoding; there is no per-Regexp encoding
+                    // to compare here, so source and options decide it.)
+                    (
+                        Some(RObj::Regexp {
+                            source: xs,
+                            flags: xf,
+                            ..
+                        }),
+                        Some(RObj::Regexp {
+                            source: ys,
+                            flags: yf,
+                            ..
+                        }),
+                    ) => xs == ys && regex_option_bits(xf) == regex_option_bits(yf),
                     // Two Encoding objects are equal when they name the same
                     // encoding — MRI's encodings are shared singletons, so `==`
                     // compares by identity; we carry a fresh object per call and
