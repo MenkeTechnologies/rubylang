@@ -6008,7 +6008,11 @@ impl RubyHost {
             Value::Int(n) => RKey::Int(*n),
             // `0.0.eql?(-0.0)` is true in Ruby and the two are the SAME Hash key,
             // but their bit patterns differ — normalize the sign of zero away.
-            Value::Float(f) => RKey::FloatBits(if *f == 0.0 { 0f64.to_bits() } else { f.to_bits() }),
+            Value::Float(f) => RKey::FloatBits(if *f == 0.0 {
+                0f64.to_bits()
+            } else {
+                f.to_bits()
+            }),
             Value::Bool(b) => RKey::Bool(*b),
             Value::Undef => RKey::Nil,
             Value::Str(s) => RKey::Str(s.to_string()),
@@ -6311,12 +6315,14 @@ impl RubyHost {
                 }
             }
             // `Array - Array`: difference, preserving order and duplicates in the
-            // left operand that are absent from the right.
+            // left operand that are absent from the right. This is the NATIVE
+            // arrival of `-`; `Array#difference` reaches the same operation
+            // through method dispatch, and both must use `eql?` membership.
             (Some(RObj::Array(xs)), Sub) => {
                 if let Some(RObj::Array(ys)) = self.obj(b).cloned() {
                     let kept: Vec<Value> = xs
                         .iter()
-                        .filter(|v| !ys.iter().any(|w| self.eq_values(v, w)))
+                        .filter(|v| !ys.iter().any(|w| self.eql_values(v, w)))
                         .cloned()
                         .collect();
                     return Ok(self.new_array(kept));
@@ -6454,7 +6460,7 @@ impl RubyHost {
                     .as_set(b)
                     .or_else(|| self.as_array(b))
                     .unwrap_or_default();
-                let in_ys = |v: &Value, this: &Self| ys.iter().any(|w| this.eq_values(v, w));
+                let in_ys = |v: &Value, this: &Self| ys.iter().any(|w| this.eql_values(v, w));
                 let result: Vec<Value> = match op {
                     Add => xs.iter().chain(ys.iter()).cloned().collect(),
                     _ => xs.iter().filter(|v| !in_ys(v, self)).cloned().collect(),
@@ -6470,6 +6476,57 @@ impl RubyHost {
     }
 
     /// Structural equality (`==`).
+    /// Ruby's OTHER equality. `==` coerces across the numeric classes
+    /// (`1 == 1.0`, `1 == 1r`) while `eql?` — the half of the `hash`/`eql?` pair
+    /// that Hash keys, `uniq`, the Array set operators and `Set` are all defined
+    /// in terms of — does not. The rule is RECURSIVE: a container is `eql?` to
+    /// another only when their corresponding elements are, so `[1].eql?([1.0])`
+    /// is false even though `[1] == [1.0]`, and likewise one and two levels
+    /// deeper. Anything that is neither a number nor a container falls through
+    /// to `==`, which is what Ruby's default `eql?` amounts to for it.
+    pub fn eql_values(&self, a: &Value, b: &Value) -> bool {
+        let numeric = |c: &str| matches!(c, "Integer" | "Float" | "Rational" | "Complex");
+        let (ca, cb) = (self.class_of(a), self.class_of(b));
+        if ca != cb && numeric(&ca) && numeric(&cb) {
+            return false;
+        }
+        match (self.obj(a), self.obj(b)) {
+            (Some(RObj::Array(x)), Some(RObj::Array(y))) => {
+                x.len() == y.len() && x.iter().zip(y).all(|(p, q)| self.eql_values(p, q))
+            }
+            // A Hash's KEYS are already `eql?`-strict — they are `RKey`s, where an
+            // Integer and a Float never share a variant — so only the values need
+            // the recursion.
+            (Some(RObj::Hash { map: x, .. }), Some(RObj::Hash { map: y, .. })) => {
+                x.len() == y.len()
+                    && x.iter()
+                        .all(|(k, v)| y.get(k).is_some_and(|w| self.eql_values(v, w)))
+            }
+            (Some(RObj::Complex { re: xr, im: xi }), Some(RObj::Complex { re: yr, im: yi })) => {
+                self.eql_values(xr, yr) && self.eql_values(xi, yi)
+            }
+            // A Struct/Data instance is `eql?` when it is the same class and
+            // every member is `eql?` — `S.new(1)` and `S.new(1.0)` are not.
+            (
+                Some(RObj::Object {
+                    class: sa,
+                    ivars: ia,
+                }),
+                Some(RObj::Object {
+                    class: sb,
+                    ivars: ib,
+                }),
+            ) if self.struct_defs.contains_key(sa) => {
+                sa == sb
+                    && ia.len() == ib.len()
+                    && ia
+                        .iter()
+                        .all(|(k, v)| ib.get(k).is_some_and(|w| self.eql_values(v, w)))
+            }
+            _ => self.eq_values(a, b),
+        }
+    }
+
     pub fn eq_values(&self, a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => x == y,

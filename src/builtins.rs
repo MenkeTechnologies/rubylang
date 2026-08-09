@@ -1751,18 +1751,14 @@ pub(crate) fn dispatch(
         }
         "==" => return Ok(Value::Bool(with_host(|h| h.eq_values(recv, &args[0])))),
         "!=" => return Ok(Value::Bool(!with_host(|h| h.eq_values(recv, &args[0])))),
-        // `eql?` is `==` plus MRI's numeric strictness: `Numeric#eql?` demands
-        // the same class, so `1.eql?(1.0)` is false where `1 == 1.0` is true.
-        // Everything else (String, Array, Hash, Set, Range, plain objects) uses
-        // the same equality `==` does — a class wanting different `eql?`
-        // semantics defines its own, which the lookup above finds first.
+        // `eql?` is `==` plus MRI's numeric strictness, applied at EVERY depth:
+        // `Numeric#eql?` demands the same class, so `1.eql?(1.0)` is false where
+        // `1 == 1.0` is true, and a container inherits that from its elements —
+        // `[1].eql?([1.0])` and `{a: 1}.eql?({a: 1.0})` are false too. A class
+        // wanting different `eql?` semantics defines its own, which the lookup
+        // above finds first.
         "eql?" if args.len() == 1 => {
-            let numeric = |c: &str| matches!(c, "Integer" | "Float" | "Rational" | "Complex");
-            let (a_cls, b_cls) = with_host(|h| (h.class_of(recv), h.class_of(&args[0])));
-            if a_cls != b_cls && numeric(&a_cls) && numeric(&b_cls) {
-                return Ok(Value::Bool(false));
-            }
-            return Ok(Value::Bool(with_host(|h| h.eq_values(recv, &args[0]))));
+            return Ok(Value::Bool(with_host(|h| h.eql_values(recv, &args[0]))));
         }
         "===" => {
             // Case-equality: a Proc/lambda is CALLED (so `case x when ->(v){…}`
@@ -4235,12 +4231,22 @@ fn struct_method(
             }
             recv.clone()
         }
+        // Same class and member-wise equality — under `==` for `==`, and under
+        // the strict `eql?` for `eql?`, so `S.new(1).eql?(S.new(1.0))` is false
+        // while `S.new(1) == S.new(1.0)` is true, as in MRI.
         "==" | "eql?" => {
+            let strict = name == "eql?";
             let same = with_host(|h| h.object_class(&args[0])).as_deref() == Some(cls)
-                && members
-                    .iter()
-                    .zip(values())
-                    .all(|(m, v)| with_host(|h| h.eq_values(&h.ivar_of(&args[0], m), &v)));
+                && members.iter().zip(values()).all(|(m, v)| {
+                    with_host(|h| {
+                        let other = h.ivar_of(&args[0], m);
+                        if strict {
+                            h.eql_values(&other, &v)
+                        } else {
+                            h.eq_values(&other, &v)
+                        }
+                    })
+                });
             Value::Bool(same)
         }
         "to_s" | "inspect" => {
@@ -7547,10 +7553,19 @@ fn str_succ(s: &str) -> String {
 // ---- Array ----------------------------------------------------------------
 
 /// Remove duplicates by `==`, keeping the first occurrence (for `Array#&`/`|`).
+/// Membership for the SET-LIKE operations — `uniq`, `|`, `&`, `-`,
+/// `intersect?` and every `Set` predicate. Ruby defines all of them in terms of
+/// `hash`/`eql?`, never `==`, so `[1, 1.0].uniq` keeps both and `[1] & [1.0]`
+/// is empty. The scanning lookups (`include?`, `index`, `count(obj)`,
+/// `delete`, `assoc`) are the ones Ruby defines with `==`; they keep using it.
+fn set_member(xs: &[Value], v: &Value) -> bool {
+    xs.iter().any(|w| with_host(|h| h.eql_values(v, w)))
+}
+
 fn dedup_keep(items: Vec<Value>) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for x in items {
-        if !out.iter().any(|y| with_host(|h| h.eq_values(&x, y))) {
+        if !set_member(&out, &x) {
             out.push(x);
         }
     }
@@ -7603,7 +7618,7 @@ fn dispatch_array(
         // `-` difference. `-` also arrives via the native path (num_op).
         "&" | "intersection" | "|" | "union" | "-" | "difference" if !args.is_empty() => {
             let other = with_host(|h| h.as_array(&args[0]).unwrap_or_default());
-            let has = |xs: &[Value], v: &Value| xs.iter().any(|w| with_host(|h| h.eq_values(v, w)));
+            let has = set_member;
             let out = match name {
                 "&" | "intersection" => {
                     dedup_keep(arr.iter().filter(|v| has(&other, v)).cloned().collect())
@@ -7616,9 +7631,7 @@ fn dispatch_array(
         // `Array#intersect?(other)` — true if any element is shared (Ruby 3.1+).
         "intersect?" if !args.is_empty() => {
             let other = with_host(|h| h.as_array(&args[0]).unwrap_or_default());
-            Ok(Value::Bool(arr.iter().any(|v| {
-                other.iter().any(|w| with_host(|h| h.eq_values(v, w)))
-            })))
+            Ok(Value::Bool(arr.iter().any(|v| set_member(&other, v))))
         }
         "length" | "size" | "count"
             if !(name == "count" && (!args.is_empty() || block.is_some())) =>
@@ -7996,7 +8009,7 @@ fn dispatch_array(
                     Some(b) => call_proc(b, std::slice::from_ref(&x))?,
                     None => x.clone(),
                 };
-                if !keys.iter().any(|k| with_host(|h| h.eq_values(&key, k))) {
+                if !set_member(&keys, &key) {
                     keys.push(key);
                     out.push(x);
                 }
@@ -8013,7 +8026,7 @@ fn dispatch_array(
                     Some(b) => call_proc(b, std::slice::from_ref(x))?,
                     None => x.clone(),
                 };
-                if !keys.iter().any(|k| with_host(|h| h.eq_values(&key, k))) {
+                if !set_member(&keys, &key) {
                     keys.push(key);
                     out.push(x.clone());
                 }
@@ -8749,16 +8762,24 @@ fn dispatch_array(
             with_host(|h| h.set_array(recv, a));
             Ok(recv.clone())
         }
-        // `Array#delete(obj)` — remove every element equal to `obj`; return the
-        // object if any were removed, else the block's value (if given) or nil.
+        // `Array#delete(obj)` — remove every element `==` to `obj`; return the
+        // LAST removed ELEMENT (MRI returns what was in the array, not the
+        // argument, and `==` can match across classes, so `[1.0].delete(1)`
+        // answers `1.0`), else the block's value (if given) or nil.
         "delete" => {
             let mut a = arr;
-            let before = a.len();
-            a.retain(|x| !with_host(|h| h.eq_values(x, &args[0])));
-            let removed = a.len() < before;
+            let mut last: Option<Value> = None;
+            a.retain(|x| {
+                if with_host(|h| h.eq_values(x, &args[0])) {
+                    last = Some(x.clone());
+                    false
+                } else {
+                    true
+                }
+            });
             with_host(|h| h.set_array(recv, a));
-            if removed {
-                Ok(args[0].clone())
+            if let Some(v) = last {
+                Ok(v)
             } else if let Some(bl) = &block {
                 call_proc(bl, std::slice::from_ref(&args[0]))
             } else {
@@ -12411,7 +12432,7 @@ fn dispatch_set(
             let o = other();
             let keep: Vec<Value> = items
                 .iter()
-                .filter(|v| o.iter().any(|w| with_host(|h| h.eq_values(v, w))))
+                .filter(|v| set_member(&o, v))
                 .cloned()
                 .collect();
             Ok(with_host(|h| h.new_set(keep)))
@@ -12420,7 +12441,7 @@ fn dispatch_set(
             let o = other();
             let keep: Vec<Value> = items
                 .iter()
-                .filter(|v| !o.iter().any(|w| with_host(|h| h.eq_values(v, w))))
+                .filter(|v| !set_member(&o, v))
                 .cloned()
                 .collect();
             Ok(with_host(|h| h.new_set(keep)))
@@ -12430,53 +12451,37 @@ fn dispatch_set(
             let o = other();
             let mut out: Vec<Value> = items
                 .iter()
-                .filter(|v| !o.iter().any(|w| with_host(|h| h.eq_values(v, w))))
+                .filter(|v| !set_member(&o, v))
                 .cloned()
                 .collect();
-            out.extend(
-                o.iter()
-                    .filter(|w| !items.iter().any(|v| with_host(|h| h.eq_values(v, w))))
-                    .cloned(),
-            );
+            out.extend(o.iter().filter(|w| !set_member(&items, w)).cloned());
             Ok(with_host(|h| h.new_set(out)))
         }
         "subset?" | "<=" => {
             let o = other();
-            Ok(Value::Bool(items.iter().all(|v| {
-                o.iter().any(|w| with_host(|h| h.eq_values(v, w)))
-            })))
+            Ok(Value::Bool(items.iter().all(|v| set_member(&o, v))))
         }
         "superset?" | ">=" => {
             let o = other();
-            Ok(Value::Bool(o.iter().all(|w| {
-                items.iter().any(|v| with_host(|h| h.eq_values(v, w)))
-            })))
+            Ok(Value::Bool(o.iter().all(|w| set_member(&items, w))))
         }
         "proper_subset?" | "<" => {
             let o = other();
-            let subset = items
-                .iter()
-                .all(|v| o.iter().any(|w| with_host(|h| h.eq_values(v, w))));
+            let subset = items.iter().all(|v| set_member(&o, v));
             Ok(Value::Bool(subset && items.len() < o.len()))
         }
         "proper_superset?" | ">" => {
             let o = other();
-            let superset = o
-                .iter()
-                .all(|w| items.iter().any(|v| with_host(|h| h.eq_values(v, w))));
+            let superset = o.iter().all(|w| set_member(&items, w));
             Ok(Value::Bool(superset && items.len() > o.len()))
         }
         "disjoint?" => {
             let o = other();
-            Ok(Value::Bool(!items.iter().any(|v| {
-                o.iter().any(|w| with_host(|h| h.eq_values(v, w)))
-            })))
+            Ok(Value::Bool(!items.iter().any(|v| set_member(&o, v))))
         }
         "intersect?" => {
             let o = other();
-            Ok(Value::Bool(items.iter().any(|v| {
-                o.iter().any(|w| with_host(|h| h.eq_values(v, w)))
-            })))
+            Ok(Value::Bool(items.iter().any(|v| set_member(&o, v))))
         }
         "each" if block.is_some() => {
             let bl = block.unwrap();
@@ -16581,6 +16586,14 @@ pub fn numeric_hook(op: fusevm::NumOp, a: &Value, b: &Value) -> Result<Value, St
                 _ => false,
             }));
         }
+    }
+    // `Set#< <= > >=` are the proper-subset/subset/proper-superset/superset
+    // predicates, not numeric ordering. `dispatch_set` already implements all
+    // four, but they arrive here as native comparison ops and so never reached
+    // it — `Set[1] <= Set[1, 2]` answered `undefined method '<=' for Set` while
+    // the spelled-out `Set[1].subset?(Set[1, 2])` worked.
+    if matches!(op, Lt | Gt | Le | Ge) && with_host(|h| h.as_set(a).is_some()) {
+        return dispatch(a, num_op_method(op), std::slice::from_ref(b), None);
     }
     with_host(|h| h.num_op(op, a, b))
 }

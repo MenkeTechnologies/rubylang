@@ -3361,3 +3361,31 @@ s << {a: 1}
 s << {a: 1}
 p s.size
 p({[1, {b: 2}] => :nested}[[1, {b: 2}]])
+#==#
+# Ruby has two equalities and they disagree: `==` coerces across the numeric
+# classes, `eql?` does not — and `eql?` is the one `uniq`, the Array set
+# operators and every `Set` predicate are defined in terms of. The rule is
+# recursive, so a container is `eql?` only when its elements are. Each line
+# pairs the strict answer with the loose one so neither equality can serve both.
+require "set"
+p [1.eql?(1), 1.eql?(1.0), 1.eql?(1r), 1 == 1.0]
+p [[1].eql?([1]), [1].eql?([1.0]), [1] == [1.0]]
+p [[[1]].eql?([[1.0]]), [1, [2, [3]]].eql?([1, [2, [3.0]]])]
+p [{a: 1}.eql?({a: 1}), {a: 1}.eql?({a: 1.0}), {a: 1} == {a: 1.0}]
+p [{1 => :x}.eql?({1.0 => :x}), Complex(1, 2).eql?(Complex(1.0, 2))]
+p [[1, 1.0, 1].uniq, [1, 2, 1.0].uniq { |x| x }]
+p [[1] | [1.0], [1, 2] & [1.0], [1, 1.0] - [1], [1].difference([1.0])]
+p [[1].intersect?([1.0]), [1].intersect?([1])]
+p [(Set[1] & Set[1.0]).to_a, (Set[1] - Set[1.0]).to_a, (Set[1] ^ Set[1.0]).to_a]
+p [Set[1].subset?(Set[1.0]), Set[1].superset?(Set[1.0]), Set[1] <= Set[1, 2]]
+p [Set[1].disjoint?(Set[1.0]), Set[1].intersect?(Set[1.0])]
+p [Set[1, 2].proper_subset?(Set[1.0, 2, 3]), Set[1, 2] < Set[1, 2, 3]]
+p [[1] - [1.0], (Set[1] - Set[1.0]).to_a]
+Pair = Struct.new(:a)
+Rec = Data.define(:a)
+p [Pair.new(1).eql?(Pair.new(1)), Pair.new(1).eql?(Pair.new(1.0)),
+   Pair.new(1) == Pair.new(1.0)]
+p [Rec.new(a: 1).eql?(Rec.new(a: 1)), Rec.new(a: 1).eql?(Rec.new(a: 1.0))]
+# The `==`-defined scanning lookups must NOT pick up the strictness.
+p [[1].include?(1.0), [1].index(1.0), [1, 1.0].count(1), [1].delete(1.0)]
+p [{a: 1}.value?(1.0), [[1, :x]].assoc(1.0), [[:x, 1]].rassoc(1.0)]

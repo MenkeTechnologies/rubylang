@@ -39,7 +39,11 @@ leading positional before `...`); `Integer#step`, `?c` char literals,
 `Array#dig`/`first(n)`/`last(n)`/`min(n)`/`max(n)`/`each_cons`/`sum { }`/
 `sample`/`shuffle`/`shuffle!`/`repeated_combination`/`repeated_permutation`,
 `Hash#dig`/`assoc`/`rassoc`, `String#upto`; `eql?` on every value (`==` plus
-MRI's numeric class-strictness, so `1.eql?(1.0)` is false).
+MRI's numeric class-strictness at every depth, so `1.eql?(1.0)` and
+`[1].eql?([1.0])` are both false), and the set-like operations that Ruby defines
+in terms of `hash`/`eql?` rather than `==` — `uniq`, `|`, `&`, `-`,
+`intersect?` and every `Set` predicate — agreeing with it, so `[1, 1.0].uniq`
+keeps both.
 
 ## Language
 
@@ -495,10 +499,13 @@ Honest limitations of this surface:
   registered the `def` in the top-level method table instead — making a
   `private def helper` reachable as a bare `helper` from anywhere.
   `module_function def m` also promotes to a module method.
-- **Composite Hash keys.** Arrays (`{[1, 2] => v}`, nested), Ranges
-  (`{(1..3) => v}`, Integer/String/Float endpoints), and class objects work as
+- **Composite Hash keys.** Arrays (`{[1, 2] => v}`, nested), Hashes
+  (`{{a: 1} => v}`), Sets, Ranges (`{(1..3) => v}`, Integer/String/Float
+  endpoints), `BigInt`/`Rational`/`Complex` numbers, and class objects work as
   Hash keys and Set members — keyed structurally by value, so equal keys hash
-  together and round-trip through `.keys`/`.inspect`. A `Struct`/`Data` instance
+  together and round-trip through `.keys`/`.inspect`. Hash and Set keys are
+  order-independent, matching MRI (`{a: 1, b: 2}.hash == {b: 2, a: 1}.hash`),
+  and `0.0`/`-0.0` are one key. A `Struct`/`Data` instance
   keys by VALUE too — its class plus its members — so two `P.new(1, 2)` are the
   same Hash key and report the same `#hash`, as in MRI. (Only a plain user object
   with a custom `hash`/`eql?` still keys by heap identity.)
