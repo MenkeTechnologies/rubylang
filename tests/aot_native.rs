@@ -71,12 +71,14 @@ fn run_ruby(args: &[&str], path: &Path) -> (String, String, i32, bool) {
     )
 }
 
-/// MRI stdout + exit code, if `/opt/homebrew/bin/ruby` is present (third witness).
+/// MRI stdout + exit code, when a verified MRI is installed (third witness).
+///
+/// Resolved by `rubylang::oracle` rather than by hard-coding
+/// `/opt/homebrew/bin/ruby`, which is a symlink to rubylang's own binary
+/// wherever rubylang is installed — the witness was rubylang.
 fn mri(path: &Path) -> Option<(String, i32)> {
-    let out = Command::new("/opt/homebrew/bin/ruby")
-        .arg(path)
-        .output()
-        .ok()?;
+    let ruby = rubylang::oracle::find().ok()?;
+    let out = ruby.command().arg(path).output().ok()?;
     Some((
         String::from_utf8_lossy(&out.stdout).to_string(),
         out.status.code().unwrap_or(-1),

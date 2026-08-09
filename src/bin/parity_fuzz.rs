@@ -5,6 +5,10 @@
 //! exit code diverge. Each case is produced from a per-index seed so any
 //! divergence replays exactly: `parity-fuzz --seed <N> --once`.
 //!
+//! The ORACLE is resolved by `rubylang::oracle`, never by a PATH lookup for
+//! `ruby`: rubylang installs its own binary under that name, so bare `ruby`
+//! fuzzes rubylang against itself and reports perfect parity forever.
+//!
 //! Ported from the zshrs harness (`zshrs/bins/parity-fuzz.rs`): same RunOut /
 //! render / differs / run_with_timeout infra, same seed→deterministic Mode
 //! dispatch, same parallel workers, delta-debug `minimize`, `--verify`
@@ -100,47 +104,21 @@ fn ours_bin() -> PathBuf {
 /// The ORACLE: the reference MRI `ruby`. Every divergence is "rubylang disagrees
 /// with THIS ruby", so which ruby it is, is part of the result.
 ///
-/// `RUBYLANG_FUZZ_RUBY` names it explicitly; if set but unusable this is a HARD
-/// ERROR (falling back to a different ruby would silently answer a different
-/// question). Otherwise the first existing system path wins. Candidates are
-/// absolute system paths, never `target/`, so the oracle can never resolve to
-/// our own binary.
-fn oracle_path() -> &'static str {
-    static ORACLE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    ORACLE.get_or_init(|| {
-        if let Ok(p) = std::env::var("RUBYLANG_FUZZ_RUBY") {
-            if !Path::new(&p).exists() {
-                eprintln!("parity-fuzz: RUBYLANG_FUZZ_RUBY={p}: no such file");
-                std::process::exit(2);
-            }
-            return p;
-        }
-        for p in [
-            "/opt/homebrew/bin/ruby",
-            "/usr/local/bin/ruby",
-            "/usr/bin/ruby",
-        ] {
-            if Path::new(p).exists() {
-                return p.to_string();
-            }
-        }
-        "ruby".to_string()
-    })
+/// Resolution and verification live in [`rubylang::oracle`]. The candidate that
+/// existence alone would have picked here — `/opt/homebrew/bin/ruby` — is a
+/// symlink into rubylang's own Cellar on any machine where rubylang is
+/// installed, so "first absolute system path that exists" selected rubylang and
+/// fuzzed it against itself: zero divergences, forever, on a broken build.
+/// `oracle::find` makes a candidate prove it is MRI before accepting it.
+fn oracle() -> &'static rubylang::oracle::Oracle {
+    static ORACLE: std::sync::OnceLock<rubylang::oracle::Oracle> = std::sync::OnceLock::new();
+    ORACLE.get_or_init(|| rubylang::oracle::require_oracle("parity-fuzz"))
 }
 
 /// `<path> (<ruby --version>)`, for the run header and the report file so a
 /// divergence record is attributable to the exact oracle that produced it.
 fn oracle_id() -> String {
-    let path = oracle_path();
-    let ver = Command::new(path)
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-    format!("{path} ({ver})")
+    oracle().id()
 }
 
 /// Raw bytes, never `String`: Ruby can emit output that is not valid UTF-8
@@ -267,7 +245,7 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> RunOut {
 }
 
 fn run_oracle(script: &str, timeout: Duration) -> RunOut {
-    let mut cmd = Command::new(oracle_path());
+    let mut cmd = Command::new(&oracle().path);
     cmd.args(["-e", script]);
     run_with_timeout(cmd, timeout)
 }

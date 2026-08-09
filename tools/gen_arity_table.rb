@@ -7,7 +7,12 @@
 # is dumped straight out of the reference interpreter rather than hand-written,
 # so it says exactly what MRI says.
 #
-#   ruby tools/gen_arity_table.rb > src/arity_table.rs && cargo fmt
+#   /opt/homebrew/opt/ruby/bin/ruby tools/gen_arity_table.rb > src/arity_table.rs \
+#     && cargo fmt
+#
+# MUST be a real MRI, given by absolute path. Bare `ruby` is rubylang itself
+# wherever rubylang is installed, and regenerating this table from rubylang
+# would freeze rubylang's own answers as the reference it is measured against.
 #
 # Rows come from the instance-method surface (including inherited, so the owner
 # columns fill in Kernel/Comparable/Enumerable/...) plus the singleton surface of
@@ -32,6 +37,23 @@
 # This script must load NO stdlib. A `require` adds methods the core interpreter
 # does not define (`Kernel#j` from json, `Dir.mktmpdir` from tmpdir), and those
 # would land in the table as though MRI defined them.
+
+# Refuse to run under anything but MRI. rubylang installs its own binary as
+# `ruby`, so a bare `ruby tools/gen_arity_table.rb` regenerates the reference
+# table FROM rubylang — every row becomes whatever rubylang already answers, the
+# arity/owner/parameters guards then agree with themselves, and the divergences
+# this table exists to catch become unrepresentable. There is no safe fallback,
+# so this aborts rather than warns.
+unless defined?(RUBY_ENGINE) && RUBY_ENGINE == "ruby"
+  engine = defined?(RUBY_ENGINE) ? RUBY_ENGINE.inspect : "undefined"
+  abort <<~ERR
+    gen_arity_table: refusing to run — RUBY_ENGINE is #{engine}, not "ruby".
+      interpreter: #{RbConfig.ruby rescue $PROGRAM_NAME}
+    This table is the REFERENCE that rubylang is measured against; it must come
+    from MRI. Re-run naming a real MRI by absolute path, e.g.
+      /opt/homebrew/opt/ruby/bin/ruby tools/gen_arity_table.rb > src/arity_table.rs
+  ERR
+end
 
 CLASSES = %w[
   BasicObject Object Kernel Comparable Enumerable
@@ -440,11 +462,16 @@ puts <<~HDR
   //! is what the reference `ruby` reports for that method.
   //!
   //! GENERATED — do not edit by hand. Regenerate against the reference
-  //! interpreter with:
+  //! interpreter, named by ABSOLUTE PATH, with:
   //!
   //! ```text
-  //! ruby tools/gen_arity_table.rb > src/arity_table.rs && cargo fmt
+  //! /opt/homebrew/opt/ruby/bin/ruby tools/gen_arity_table.rb > src/arity_table.rs
+  //! cargo fmt
   //! ```
+  //!
+  //! Bare `ruby` is rubylang itself wherever rubylang is installed; the
+  //! generator aborts rather than dump rubylang's own answers here as the
+  //! reference it is measured against.
 
   /// `(owner, method, arity, params)`, sorted by `(owner, method)` for binary
   /// search. An empty `params` means the list is the one implied by the arity

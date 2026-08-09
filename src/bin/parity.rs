@@ -2,21 +2,28 @@
 //!
 //! Development tool, not part of the runtime. It runs every snippet in
 //! `tests/data/parity_corpus.rb` (separated by a `#==#` line) through both the
-//! system `ruby` (the oracle) and rubylang in-process, and compares stdout.
+//! reference MRI `ruby` (the oracle) and rubylang in-process, and compares
+//! stdout.
 //!
 //! * default: print a parity report (parity / gap / panic counts, and each
-//!   gap's expected-vs-got). Needs `ruby` on PATH.
+//!   gap's expected-vs-got).
 //! * `--freeze`: capture the oracle output for every snippet into
 //!   `tests/data/parity_expected.txt`, which the CI-safe `tests/parity.rs`
-//!   replays with no `ruby` installed.
+//!   replays with no reference interpreter installed.
 //!
 //! Errors compare loosely: if the oracle exits non-zero and rubylang also errors,
 //! that snippet is parity (both reject it); the corpus is otherwise all valid
 //! programs whose stdout must match byte-for-byte.
+//!
+//! The oracle is resolved by [`rubylang::oracle`], which verifies the candidate
+//! really is MRI. It is NEVER bare `ruby`: rubylang installs its own binary
+//! under that name, so a PATH lookup freezes rubylang's own output into
+//! `tests/data/` as though it were the reference. Every snippet would then
+//! agree and the harness would report perfect parity while measuring nothing.
 
+use rubylang::oracle::Oracle;
 use std::io::{Read, Write};
 use std::os::unix::io::FromRawFd;
-use std::process::Command;
 
 const SEP: &str = "#==#";
 const CORPUS: &str = "tests/data/parity_corpus.rb";
@@ -26,8 +33,12 @@ const EXAMPLES_DIR: &str = "examples";
 const EXAMPLES_OUT: &str = "tests/data/examples";
 
 fn main() {
+    // Resolved (and proven to be MRI) before anything is compared or frozen.
+    let oracle_ruby = rubylang::oracle::require_oracle("parity");
+    eprintln!("parity: oracle = {}", oracle_ruby.id());
+
     if std::env::args().any(|a| a == "--freeze-examples") {
-        freeze_examples();
+        freeze_examples(&oracle_ruby);
         return;
     }
     let freeze = std::env::args().any(|a| a == "--freeze");
@@ -44,7 +55,7 @@ fn main() {
                 out.push_str(SEP);
                 out.push('\n');
             }
-            out.push_str(&oracle(s));
+            out.push_str(&oracle(&oracle_ruby, s));
         }
         std::fs::write(EXPECTED, out).expect("write expected");
         println!("froze {} oracle outputs -> {EXPECTED}", snippets.len());
@@ -53,7 +64,7 @@ fn main() {
 
     let (mut parity, mut gaps, mut panics) = (0, Vec::new(), Vec::new());
     for (i, s) in snippets.iter().enumerate() {
-        let want = oracle(s);
+        let want = oracle(&oracle_ruby, s);
         match rubyrs_run(s) {
             Ok(got) if got == want => parity += 1,
             Ok(got) => gaps.push((i, s.clone(), want, got)),
@@ -82,9 +93,18 @@ fn main() {
 
 /// Freeze the reference `ruby` stdout for every `examples/*.rb` into
 /// `tests/data/examples/<name>.out`, which the CI-safe `tests/examples.rs`
-/// replays. A script that the oracle rejects (non-zero exit) is a bug in the
-/// example itself, so we refuse to freeze it.
-fn freeze_examples() {
+/// replays.
+///
+/// An example the oracle CANNOT run is left alone rather than overwritten.
+/// Some examples exercise libraries rubylang embeds and a stock MRI does not
+/// have installed (`sqlite3`, the bundled Rack / ActiveRecord-lite), so MRI
+/// exits with a `LoadError`. Writing rubylang's own stdout for those would
+/// produce a file indistinguishable from a reference baseline while asserting
+/// nothing, which is the exact failure this harness exists to detect.
+///
+/// Provenance is recorded next to the outputs so a reader can tell the two
+/// kinds apart without rerunning anything.
+fn freeze_examples(ruby: &Oracle) {
     std::fs::create_dir_all(EXAMPLES_OUT).expect("create examples out dir");
     let mut names: Vec<String> = std::fs::read_dir(EXAMPLES_DIR)
         .expect("read examples dir")
@@ -92,20 +112,45 @@ fn freeze_examples() {
         .filter(|n| n.ends_with(".rb"))
         .collect();
     names.sort();
+
+    let mut provenance = format!(
+        "# Provenance of every tests/data/examples/<name>.out.\n\
+         # Written by `cargo run --bin parity -- --freeze-examples`.\n\
+         # oracle: {}\n\n",
+        ruby.id()
+    );
+    let (mut froze, mut skipped) = (0usize, Vec::new());
     for name in &names {
         let path = format!("{EXAMPLES_DIR}/{name}");
-        let out = Command::new("ruby").arg(&path).output().expect("run ruby");
-        if !out.status.success() {
-            eprintln!(
-                "parity: reference ruby rejected {path}:\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            std::process::exit(1);
-        }
         let stem = name.strip_suffix(".rb").unwrap();
-        std::fs::write(format!("{EXAMPLES_OUT}/{stem}.out"), &out.stdout).expect("write out");
+        let out = ruby.command().arg(&path).output().expect("run oracle");
+        if out.status.success() {
+            std::fs::write(format!("{EXAMPLES_OUT}/{stem}.out"), &out.stdout).expect("write out");
+            provenance.push_str(&format!("{stem}\treference\n"));
+            froze += 1;
+        } else {
+            let why = String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .next()
+                .unwrap_or("(no stderr)")
+                .trim()
+                .to_string();
+            provenance.push_str(&format!("{stem}\tNOT-REFERENCE\toracle rejected: {why}\n"));
+            skipped.push(format!("  {stem}: {why}"));
+        }
     }
-    println!("froze {} example outputs -> {EXAMPLES_OUT}/", names.len());
+    std::fs::write(format!("{EXAMPLES_OUT}/PROVENANCE.tsv"), &provenance)
+        .expect("write provenance");
+
+    println!("froze {froze} reference example outputs -> {EXAMPLES_OUT}/");
+    if !skipped.is_empty() {
+        println!(
+            "\n{} example(s) the oracle cannot run — their existing .out files are \
+             NOT reference output and were left untouched:\n{}",
+            skipped.len(),
+            skipped.join("\n")
+        );
+    }
 }
 
 fn split_snippets(corpus: &str) -> Vec<String> {
@@ -122,11 +167,18 @@ fn first_line(s: &str) -> &str {
 
 /// Run a snippet through the reference `ruby`; on a non-zero exit, return a
 /// normalized error marker so both sides can agree "this is rejected".
-fn oracle(snippet: &str) -> String {
-    match Command::new("ruby").arg("-e").arg(snippet).output() {
+///
+/// A spawn failure is fatal rather than a recorded `<oracle-unavailable>`
+/// string: freezing that marker would bake "we could not ask" into the file
+/// `tests/parity.rs` treats as the reference answer.
+fn oracle(ruby: &Oracle, snippet: &str) -> String {
+    match ruby.command().arg("-e").arg(snippet).output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
         Ok(_) => "<error>".to_string(),
-        Err(e) => format!("<oracle-unavailable: {e}>"),
+        Err(e) => {
+            eprintln!("parity: oracle {} failed to run: {e}", ruby.path.display());
+            std::process::exit(2);
+        }
     }
 }
 

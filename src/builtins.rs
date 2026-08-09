@@ -1263,10 +1263,10 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
             return Ok(Value::Undef);
         }
         // Visibility directives in a class/module body. `private :m` and friends
-        // set the entry's visibility; the constant-level and class-method-level
-        // spellings are still accepted as no-ops (gems use them constantly:
-        // `private_constant :X`, `deprecate_constant`). Ruby returns the single
-        // name argument, or nil.
+        // set the instance entry's visibility, `private_class_method :m` the
+        // class entry's; the constant-level spellings are still accepted as
+        // no-ops (gems use them constantly: `private_constant :X`,
+        // `deprecate_constant`). Ruby returns the single name argument, or nil.
         if matches!(
             name,
             "private"
@@ -1293,6 +1293,12 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
                 for a in args {
                     let m = name_of(a);
                     with_host(|h| h.set_method_visibility(&cls, &m, vis));
+                }
+            }
+            if let Some(vis) = class_visibility_directive(name) {
+                for a in args {
+                    let m = name_of(a);
+                    with_host(|h| h.set_class_method_visibility(&cls, &m, vis));
                 }
             }
             return Ok(match args {
@@ -1921,13 +1927,18 @@ pub(crate) fn dispatch(
         | "private_class_method"
         | "public_class_method"
         | "private_constant?" => {
-            if let (Some(cls), Some(vis)) = (
-                with_host(|h| h.classref_name(recv)),
-                visibility_directive(name),
-            ) {
-                for a in args {
-                    let m = name_of(a);
-                    with_host(|h| h.set_method_visibility(&cls, &m, vis));
+            if let Some(cls) = with_host(|h| h.classref_name(recv)) {
+                if let Some(vis) = visibility_directive(name) {
+                    for a in args {
+                        let m = name_of(a);
+                        with_host(|h| h.set_method_visibility(&cls, &m, vis));
+                    }
+                }
+                if let Some(vis) = class_visibility_directive(name) {
+                    for a in args {
+                        let m = name_of(a);
+                        with_host(|h| h.set_class_method_visibility(&cls, &m, vis));
+                    }
                 }
             }
             return Ok(match args {
@@ -2078,8 +2089,17 @@ pub(crate) fn dispatch(
                 h.new_array(syms)
             }));
         }
-        "send" | "__send__" | "public_send" => {
+        // `send`/`__send__` reach every method regardless of visibility — that is
+        // the whole point of them. `public_send` is the one that does not, and it
+        // is stricter than an ordinary `recv.m` call: an ordinary call permits a
+        // private method when the receiver IS `self`, `public_send` never does.
+        "send" | "__send__" => {
             let m = name_of(&args[0]);
+            return dispatch(recv, &m, &args[1..], block);
+        }
+        "public_send" => {
+            let m = name_of(&args[0]);
+            check_public_visibility(recv, &m)?;
             return dispatch(recv, &m, &args[1..], block);
         }
         // `obj.method(:name)` — capture a bound Method object.
@@ -2159,7 +2179,16 @@ pub(crate) fn dispatch(
             // `respond_to_missing?` on the singleton class is the final say.
             if let Some(cname) = with_host(|h| h.classref_name(recv)) {
                 if with_host(|h| h.class_responds_to(&cname, &m)) {
-                    return Ok(Value::Bool(true));
+                    // A `private_class_method` does not respond unless the
+                    // second argument asks for the private surface, exactly as
+                    // for a private instance method.
+                    let include_private = args
+                        .get(1)
+                        .map(|a| with_host(|h| h.truthy(a)))
+                        .unwrap_or(false);
+                    let private = with_host(|h| h.class_method_visibility(&cname, &m))
+                        == crate::host::Visibility::Private;
+                    return Ok(Value::Bool(include_private || !private));
                 }
                 let sclass = format!("#<Class:{cname}>");
                 if with_host(|h| h.find_method_owner(&sclass, "respond_to_missing?")).is_some() {
@@ -17894,6 +17923,17 @@ fn visibility_directive(name: &str) -> Option<crate::host::Visibility> {
     }
 }
 
+/// The CLASS-method spellings, which write a different map. There is no
+/// `protected_class_method` in Ruby — a singleton method has no sibling
+/// receiver for `protected` to make sense of — so the pair is exhaustive.
+fn class_visibility_directive(name: &str) -> Option<crate::host::Visibility> {
+    match name {
+        "private_class_method" => Some(crate::host::Visibility::Private),
+        "public_class_method" => Some(crate::host::Visibility::Public),
+        _ => None,
+    }
+}
+
 /// How MRI names a receiver in a `NoMethodError`: `nil` / `true` / `false`,
 /// `class C` or `module M` for a class/module reference, `an instance of C`
 /// otherwise.
@@ -17923,6 +17963,13 @@ fn receiver_phrase(recv: &Value) -> String {
 /// `send`/`__send__` and implicit-self calls do not route through here, so both
 /// keep bypassing visibility exactly as in MRI.
 fn check_visibility(recv: &Value, name: &str) -> Result<(), String> {
+    // A class/module reference is checked against the CLASS-method map
+    // (`private_class_method :m`), not the instance map: `private :run` and
+    // `private_class_method :run` are independent, and consulting the instance
+    // map for `C.run` would let one hide the other.
+    if let Some(cls) = with_host(|h| h.classref_name(recv)) {
+        return check_class_method_visibility(&cls, recv, name);
+    }
     let Some(cls) = with_host(|h| h.object_class(recv)) else {
         return Ok(());
     };
@@ -17948,6 +17995,84 @@ fn check_visibility(recv: &Value, name: &str) -> Result<(), String> {
         crate::host::Visibility::Public => true,
     };
     if allowed {
+        return Ok(());
+    }
+    Err(raise_exc(
+        "NoMethodError",
+        &format!(
+            "{} method '{name}' called for {}",
+            vis.word(),
+            receiver_phrase(recv)
+        ),
+    ))
+}
+
+/// Gate an explicit-receiver call whose receiver is a class/module reference —
+/// `C.m` — on what `private_class_method` recorded.
+///
+/// The one exemption is the same as for instance methods: the call is allowed
+/// when the receiver IS the current `self`, so `self.h` inside a `def self.…`
+/// of the same class works while `K.h` written in that same body does not.
+/// Comparing class NAMES is an identity test here because a class reference is
+/// keyed by its name in the host's class table.
+///
+/// ```text
+/// class K
+///   def self.h = 1
+///   private_class_method :h
+///   def self.a = h        # ok — implicit self, never reaches this check
+///   def self.b = self.h   # ok — receiver is self
+///   def self.c = K.h      # NoMethodError: private method 'h' called for class K
+/// end
+/// ```
+fn check_class_method_visibility(cls: &str, recv: &Value, name: &str) -> Result<(), String> {
+    let vis = with_host(|h| h.class_method_visibility(cls, name));
+    if vis == crate::host::Visibility::Public {
+        return Ok(());
+    }
+    let this_is_recv = with_host(|h| h.classref_name(&h.current_self())).as_deref() == Some(cls);
+    if this_is_recv {
+        return Ok(());
+    }
+    Err(raise_exc(
+        "NoMethodError",
+        &format!(
+            "{} method '{name}' called for {}",
+            vis.word(),
+            receiver_phrase(recv)
+        ),
+    ))
+}
+
+/// The visibility test for `public_send`, which is STRICTER than the one an
+/// ordinary `recv.m` call gets.
+///
+/// [`check_visibility`] lets a private method through when the receiver is the
+/// current `self`, because `self.priv` has been legal since Ruby 2.7.
+/// `public_send` grants no such exemption — it is the method you reach for
+/// precisely to refuse anything non-public — so calling it on your own receiver
+/// still raises:
+///
+/// ```text
+/// class A
+///   def priv = 1
+///   private :priv
+///   def go = public_send(:priv)   # NoMethodError, even though self is the recv
+/// end
+/// ```
+///
+/// A name that is not defined at all is left alone: `public_send(:nope)` must
+/// report `undefined method`, which the dispatch itself raises.
+fn check_public_visibility(recv: &Value, name: &str) -> Result<(), String> {
+    let vis = if let Some(cls) = with_host(|h| h.classref_name(recv)) {
+        with_host(|h| h.class_method_visibility(&cls, name))
+    } else {
+        let Some(cls) = with_host(|h| h.object_class(recv)) else {
+            return Ok(());
+        };
+        with_host(|h| h.method_visibility(&cls, name))
+    };
+    if vis == crate::host::Visibility::Public {
         return Ok(());
     }
     Err(raise_exc(

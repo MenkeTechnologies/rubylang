@@ -1,0 +1,22 @@
+# Provenance of every tests/data/examples/<name>.out.
+# Written by `cargo run --bin parity -- --freeze-examples`.
+# oracle: /opt/homebrew/Cellar/ruby/4.0.6/bin/ruby (ruby 4.0.6 (2026-07-14 revision 03b6d3f889) +PRISM [arm64-darwin25])
+
+app_kit_app	reference
+blocks	reference
+classes	reference
+enumerable	reference
+fizzbuzz	reference
+heredocs	reference
+orm_app	NOT-REFERENCE	oracle rejected: examples/orm_app.rb:11:in 'Kernel#require': cannot load such file -- sqlite3 (LoadError)
+orm_blog	NOT-REFERENCE	oracle rejected: examples/orm_blog.rb:14:in 'Kernel#require': cannot load such file -- sqlite3 (LoadError)
+pattern_matching	reference
+rack_app	reference
+regex	reference
+sqlite_persistence	NOT-REFERENCE	oracle rejected: examples/sqlite_persistence.rb:7:in 'Kernel#require': cannot load such file -- sqlite3 (LoadError)
+test_collections	reference
+test_control	reference
+test_numbers	reference
+test_oop	reference
+test_strings	reference
+wordcount	reference

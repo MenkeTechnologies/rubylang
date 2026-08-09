@@ -594,6 +594,17 @@ pub struct ClassDef {
     /// visibility (it belongs to the class the method is defined in, not to the
     /// method body, so an inherited method can be made private in a subclass).
     pub visibility: IndexMap<String, Visibility>,
+    /// Per-CLASS-method visibility — what `private_class_method :m` records.
+    ///
+    /// A separate map from [`ClassDef::visibility`] because the two namespaces
+    /// are separate in MRI too: the instance entry lives on the class, the class
+    /// entry lives on its singleton class, and `private :m` / `private_class_method :m`
+    /// on the same name are independent facts. Storing both in one map would let
+    /// `private :run` silently hide `self.run`.
+    ///
+    /// Public is the default and is not stored, so an absent name is public and
+    /// the map stays empty for a class that never restricts a class method.
+    pub class_visibility: IndexMap<String, Visibility>,
     /// True when this was opened with `module`, not `class` (or created by
     /// `Module.new`). A module is an instance of `Module`, not of `Class`, so
     /// `M.class` is `Module`, `M.is_a?(Class)` is false, and `M` has no
@@ -1513,6 +1524,9 @@ fn merge_class(classes: &mut IndexMap<String, ClassDef>, name: String, def: Clas
     existing.is_module |= def.is_module;
     for (k, v) in def.visibility {
         existing.visibility.insert(k, v);
+    }
+    for (k, v) in def.class_visibility {
+        existing.class_visibility.insert(k, v);
     }
     for (k, v) in def.methods {
         existing.methods.insert(k, v);
@@ -2784,6 +2798,14 @@ impl RubyHost {
     pub fn method_lookup_class(&self, recv: &Value, unbound: bool) -> String {
         match self.classref_name(recv) {
             Some(cls) if unbound => cls,
+            // A MODULE's singleton class is created lazily: until something
+            // needs it, `M` is just an instance of `Module` and that is the
+            // class MRI names. A CLASS is different — its singleton class
+            // always exists, because `new`/`allocate` live there — so only the
+            // module case is conditional. See [`Self::has_singleton_class`].
+            Some(cls) if self.is_module_name(&cls) && !self.has_singleton_class(recv, &cls) => {
+                "Module".to_string()
+            }
             Some(cls) => format!("#<Class:{cls}>"),
             // `class_of`, not `dispatch_class`: the latter is the native-op
             // router and answers the RAW type for a builtin subclass, so a
@@ -2791,6 +2813,58 @@ impl RubyHost {
             None => self.class_of(recv),
         }
     }
+    /// Whether a module's singleton class has been MATERIALISED.
+    ///
+    /// MRI does not create `#<Class:M>` when `module M; end` is evaluated; the
+    /// module object is simply an instance of `Module`. The singleton class is
+    /// created the first time something has to live in it, and until then MRI
+    /// names `Module` as the lookup class:
+    ///
+    /// ```text
+    /// module Plain; end
+    /// Plain.method(:nope)   # NameError: … for class 'Module'
+    ///
+    /// module Owner; def self.x = 1; end
+    /// Owner.method(:nope)   # NameError: … for class '#<Class:Owner>'
+    /// ```
+    ///
+    /// Anything that puts an entry in the singleton class materialises it: a
+    /// `def self.…`, an `extend` (the extended module joins the singleton
+    /// ancestry), a `define_singleton_method`, or a singleton `def M.x`. A
+    /// class is never lazy this way — `#<Class:C>` holds `new` and `allocate`
+    /// from the start — so callers gate this on the receiver being a module.
+    pub fn has_singleton_class(&self, recv: &Value, cls: &str) -> bool {
+        if let Some(def) = self.classes.get(cls) {
+            if !def.class_methods.is_empty() || !def.extends.is_empty() {
+                return true;
+            }
+        }
+        if self
+            .class_define_methods
+            .get(cls)
+            .is_some_and(|m| !m.is_empty())
+        {
+            return true;
+        }
+        // A per-object singleton (`def M.x`, `M.define_singleton_method`) is
+        // keyed by the module object's own id, not by its name.
+        if let Value::Obj(id) = recv {
+            if self
+                .singleton_methods
+                .get(id)
+                .is_some_and(|m| !m.is_empty())
+                || self
+                    .singleton_define_methods
+                    .get(id)
+                    .is_some_and(|m| !m.is_empty())
+            {
+                return true;
+            }
+        }
+        // An explicit `class << M` body opens the singleton class by name.
+        self.classes.contains_key(&format!("#<Class:{cls}>"))
+    }
+
     /// Whether the receiver actually HAS a method called `name` — the check
     /// `Object#method` and `Module#instance_method` gate on before handing back a
     /// `Method` object, so a name nothing defines raises `NameError` instead of
@@ -5227,6 +5301,43 @@ impl RubyHost {
         } else {
             def.visibility.insert(method.to_string(), vis);
         }
+    }
+
+    /// Record `vis` for `class`'s CLASS method `method` —
+    /// `private_class_method :m` / `public_class_method :m`.
+    pub fn set_class_method_visibility(&mut self, class: &str, method: &str, vis: Visibility) {
+        let def = self.classes.entry(class.to_string()).or_default();
+        if vis == Visibility::Public {
+            def.class_visibility.shift_remove(method);
+        } else {
+            def.class_visibility.insert(method.to_string(), vis);
+        }
+    }
+
+    /// The visibility of `class`'s class method `method`.
+    ///
+    /// Walks the superclass chain because a class method is inherited and so is
+    /// the restriction on it: `private_class_method :new` on a base class hides
+    /// `new` on every subclass. `extend`ed and `include`d modules are not walked
+    /// — `private_class_method` records against the class it is called on, and a
+    /// module's own instance-method visibility is a different map.
+    pub fn class_method_visibility(&self, class: &str, method: &str) -> Visibility {
+        let mut cur = Some(class.to_string());
+        while let Some(name) = cur {
+            let Some(def) = self.classes.get(&name) else {
+                break;
+            };
+            if let Some(v) = def.class_visibility.get(method) {
+                return *v;
+            }
+            // A subclass that redefines the class method defines it public, and
+            // that shadows a private entry further up the chain.
+            if def.class_methods.contains_key(method) {
+                return Visibility::Public;
+            }
+            cur = def.superclass.clone();
+        }
+        Visibility::Public
     }
     /// Whether `method` is defined on `class` or any ancestor (own methods,
     /// included modules, superclasses, and `define_method`-created methods),

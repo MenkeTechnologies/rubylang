@@ -6491,3 +6491,175 @@ fn ranking_that_succeeds_still_succeeds() {
     eq("[1r, 1].max(1)", "[(1/1)]");
     eq("[1, 1r, 2.5].max(3)", "[2.5, (1/1), 1]");
 }
+
+/// `public_send` is not a synonym for `send`. `send`/`__send__` reach every
+/// method by design; `public_send` refuses anything non-public, and it is
+/// stricter than an ordinary `recv.m` call — the self-receiver exemption that
+/// makes `self.priv` legal since Ruby 2.7 does not apply to it.
+///
+/// Every expected string is byte-matched against ruby 4.0.6.
+#[test]
+fn public_send_enforces_visibility_where_send_does_not() {
+    // `send` still bypasses: that is the whole contract of `send`.
+    eq(
+        "class PsA; def p1; 1; end; private :p1; def go; send(:p1); end; end; PsA.new.go",
+        "1",
+    );
+    eq(
+        "class PsB; def x; 7; end; end; PsB.new.public_send(:x)",
+        "7",
+    );
+
+    eq(
+        "class PsC; def p1; 1; end; private :p1; end; \
+         begin; PsC.new.public_send(:p1); rescue NoMethodError => e; e.message; end",
+        "\"private method 'p1' called for an instance of PsC\"",
+    );
+    eq(
+        "class PsD; def r1; 1; end; protected :r1; end; \
+         begin; PsD.new.public_send(:r1); rescue NoMethodError => e; e.message; end",
+        "\"protected method 'r1' called for an instance of PsD\"",
+    );
+    // The exemption an ordinary call gets is NOT granted here: the receiver is
+    // the current self and it still raises.
+    eq(
+        "class PsE; def p1; 1; end; private :p1; def go; public_send(:p1); end; end; \
+         begin; PsE.new.go; rescue NoMethodError => e; e.message; end",
+        "\"private method 'p1' called for an instance of PsE\"",
+    );
+    // A name nothing defines keeps reporting `undefined method`, not `private`.
+    eq(
+        "begin; Object.new.public_send(:nope); rescue NoMethodError => e; e.message; end",
+        "\"undefined method 'nope' for an instance of Object\"",
+    );
+}
+
+/// `private_class_method` / `public_class_method` write a real store, and the
+/// class-method namespace is independent of the instance one.
+///
+/// Every expected string is byte-matched against ruby 4.0.6.
+#[test]
+fn private_class_method_restricts_the_class_method_namespace() {
+    eq(
+        "class CmA; def self.h; 1; end; private_class_method :h; end; \
+         begin; CmA.h; rescue NoMethodError => e; e.message; end",
+        "\"private method 'h' called for class CmA\"",
+    );
+    // Reachable from inside the class's own class methods, bare or via `self`.
+    eq(
+        "class CmB; def self.h; 5; end; private_class_method :h; def self.go; h; end; end; CmB.go",
+        "5",
+    );
+    eq(
+        "class CmC; def self.h; 5; end; private_class_method :h; \
+         def self.go; self.h; end; end; CmC.go",
+        "5",
+    );
+    // The `def self.…` expression form gems use.
+    eq(
+        "class CmD; private_class_method def self.b; \"b\"; end; end; \
+         begin; CmD.b; rescue NoMethodError => e; e.message; end",
+        "\"private method 'b' called for class CmD\"",
+    );
+    // `public_class_method` lifts it again.
+    eq(
+        "class CmE; def self.h; 1; end; private_class_method :h; end; \
+         CmE.public_class_method(:h); CmE.h",
+        "1",
+    );
+    // Inherited: the restriction follows the subclass, and the message names the
+    // RECEIVER class, not the owner.
+    eq(
+        "class CmF; def self.mk; 1; end; private_class_method :mk; end; class CmG < CmF; end; \
+         begin; CmG.mk; rescue NoMethodError => e; e.message; end",
+        "\"private method 'mk' called for class CmG\"",
+    );
+    // A subclass that redefines the class method defines it public again.
+    eq(
+        "class CmH; def self.mk; 1; end; private_class_method :mk; end; \
+         class CmI < CmH; def self.mk; 2; end; end; CmI.mk",
+        "2",
+    );
+    // `new` is an ordinary class method and can be hidden — the documented way
+    // to force a factory.
+    eq(
+        "class CmJ; private_class_method :new; end; \
+         begin; CmJ.new; rescue NoMethodError => e; e.message; end",
+        "\"private method 'new' called for class CmJ\"",
+    );
+    // The two namespaces are separate: hiding the class method leaves the
+    // same-named instance method public.
+    eq(
+        "class CmK; def h; 1; end; def self.h; 2; end; private_class_method :h; end; \
+         [CmK.new.h, (begin; CmK.h; rescue NoMethodError; :raised; end)].inspect",
+        "\"[1, :raised]\"",
+    );
+    // Reflection follows: `respond_to?` hides it unless asked for the private
+    // surface, and `public_send` refuses it.
+    eq(
+        "class CmL; def self.h; 1; end; private_class_method :h; end; \
+         [CmL.respond_to?(:h), CmL.respond_to?(:h, true)].inspect",
+        "\"[false, true]\"",
+    );
+    eq(
+        "class CmM; def self.h; 1; end; private_class_method :h; end; \
+         begin; CmM.public_send(:h); rescue NoMethodError => e; e.message; end",
+        "\"private method 'h' called for class CmM\"",
+    );
+}
+
+/// A module's singleton class is created LAZILY. Until something has to live in
+/// it, `module M; end` leaves `M` an ordinary instance of `Module`, and that is
+/// the class MRI names in a failed method lookup. A class is never lazy this
+/// way — `#<Class:C>` holds `new`/`allocate` from the start.
+///
+/// Every expected string is byte-matched against ruby 4.0.6.
+#[test]
+fn a_module_singleton_class_is_materialized_on_demand() {
+    eq(
+        "module LzA; end; begin; LzA.method(:nope); rescue NameError => e; e.message; end",
+        "\"undefined method 'nope' for class 'Module'\"",
+    );
+    // A class always has one.
+    eq(
+        "class LzB; end; begin; LzB.method(:nope); rescue NameError => e; e.message; end",
+        "\"undefined method 'nope' for class '#<Class:LzB>'\"",
+    );
+    // Each way of putting an entry in the singleton class materializes it.
+    eq(
+        "module LzC; def self.x; 1; end; end; \
+         begin; LzC.method(:nope); rescue NameError => e; e.message; end",
+        "\"undefined method 'nope' for class '#<Class:LzC>'\"",
+    );
+    eq(
+        "module LzD; end; def LzD.q; 1; end; \
+         begin; LzD.method(:nope); rescue NameError => e; e.message; end",
+        "\"undefined method 'nope' for class '#<Class:LzD>'\"",
+    );
+    eq(
+        "module LzE; end; LzE.extend(Comparable); \
+         begin; LzE.method(:nope); rescue NameError => e; e.message; end",
+        "\"undefined method 'nope' for class '#<Class:LzE>'\"",
+    );
+    eq(
+        "module LzF; end; LzF.define_singleton_method(:y) { 1 }; \
+         begin; LzF.method(:nope); rescue NameError => e; e.message; end",
+        "\"undefined method 'nope' for class '#<Class:LzF>'\"",
+    );
+    eq(
+        "module LzG; end; class << LzG; def z; 1; end; end; \
+         begin; LzG.method(:nope); rescue NameError => e; e.message; end",
+        "\"undefined method 'nope' for class '#<Class:LzG>'\"",
+    );
+    eq(
+        "module LzH; module_function; def mf; 1; end; end; \
+         begin; LzH.method(:nope); rescue NameError => e; e.message; end",
+        "\"undefined method 'nope' for class '#<Class:LzH>'\"",
+    );
+    // `instance_method` is an UNBOUND lookup, which names the module itself and
+    // never the singleton class — lazy or not.
+    eq(
+        "module LzI; end; begin; LzI.instance_method(:nope); rescue NameError => e; e.message; end",
+        "\"undefined method 'nope' for module 'LzI'\"",
+    );
+}

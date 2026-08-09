@@ -7,6 +7,38 @@ by `tests/parity.rs`). This file tracks what is deliberately not done yet, so th
 gaps are honest rather than surprising. Nothing is faked as working — an
 unimplemented method raises `undefined method`.
 
+## The oracle is never bare `ruby`
+
+rubylang installs its own binary under the name `ruby`. Wherever it is
+installed, every `ruby` on `PATH` — including `/opt/homebrew/bin/ruby`, a
+symlink into `…/Cellar/rubylang/<ver>/bin/ruby` — IS rubylang. A differential
+harness that spawns bare `ruby` therefore compares rubylang to itself: every
+snippet agrees, the fuzzer reports zero divergences on a broken build, and
+`--freeze` writes rubylang's own stdout into `tests/data/` as the reference
+answer. Nothing fails, so nothing reveals it.
+
+`src/oracle.rs` is the single resolver every harness uses. It never falls back
+to a `PATH` lookup, and a candidate must pass three independent proofs before it
+is accepted: it must not canonicalize into a `rubylang` install or a `target/`
+build dir; its `--version` must have MRI's `ruby X.Y.Z (… revision …)
+[platform]` shape (rubylang prints `ruby 0.1.3`); and `RUBY_ENGINE` must be
+`"ruby"` (rubylang's is deliberately `"rubylang"`, so this stays true however
+close the mimicry gets). An unresolvable oracle is a hard error, not a skip.
+`RUBYLANG_ORACLE_RUBY` names one explicitly and is never silently replaced.
+
+Two consequences worth knowing:
+
+- `tools/gen_arity_table.rb` aborts unless `RUBY_ENGINE == "ruby"`. Regenerating
+  the reference table from rubylang would freeze rubylang's own answers as the
+  reference it is measured against.
+- `--freeze-examples` LEAVES ALONE any example the oracle cannot run, and
+  records what each frozen output actually is in
+  `tests/data/examples/PROVENANCE.tsv`. Three examples (`orm_app`, `orm_blog`,
+  `sqlite_persistence`) require libraries rubylang embeds and a stock MRI does
+  not have installed, so MRI exits with a `LoadError`; their `.out` files are
+  rubylang self-baselines and are labelled `NOT-REFERENCE`. The other fifteen
+  were re-verified byte-for-byte against ruby 4.0.6.
+
 ## Working (for reference)
 
 Classes with `initialize`/`attr_*`/instance methods, single inheritance, `super`
@@ -534,9 +566,14 @@ Honest limitations of this surface:
   error wording is MRI's `for module M` rather than `for class M`. Built-in
   modules (`Comparable`, `Enumerable`, `Kernel`, `Math`, …) come from the
   generated table's module list and answer the same way.
-  Still open: MRI creates a module's singleton class lazily, so
-  `M.method(:undefined)` on a module with no `def self.` reports the lookup
-  class as `Module`; rubylang always names `#<Class:M>`.
+  A module's singleton class is created LAZILY, as in MRI: `module M; end`
+  leaves `M` an ordinary instance of `Module`, so `M.method(:undefined)` reports
+  the lookup class as `Module`, not `#<Class:M>`. It materialises on the first
+  thing that has to live in it — a `def self.m`, a `def M.m`, an `extend`, a
+  `define_singleton_method`, a `class << M` body, or `module_function` — after
+  which the same miss names `#<Class:M>`. A CLASS is never lazy this way
+  (`#<Class:C>` holds `new`/`allocate` from the start), and the unbound
+  `M.instance_method(:undefined)` names `module 'M'` either way.
 - **Class/module reflection.** `Module#instance_methods([inherited])`, its three
   visibility-specific siblings, the `#*method_defined?` predicates, and the
   instance-side `Object#methods` return method names as symbols (see "Method
@@ -576,8 +613,40 @@ Honest limitations of this surface:
   `method_defined?` excludes private while `public_`/`private_`/
   `protected_method_defined?` test for exactly one, and `respond_to?` answers
   false for a private method unless the second argument is true.
-  Still open: `public_send` does not differ from `send`, and visibility on
-  *class* methods (`private_class_method`) is still accepted as a no-op.
+  `public_send` is NOT a synonym for `send`: it refuses a private or protected
+  method, and it is stricter than an ordinary `obj.m` call — the self-receiver
+  exemption does not apply, so `public_send(:priv)` on your own receiver raises
+  too. A name nothing defines still reports `undefined method`, not `private`.
+  **Class-method visibility.** `private_class_method` / `public_class_method`
+  write a real store: `ClassDef` carries a `class_visibility` map separate from
+  the instance one, because the two namespaces are independent in MRI (the
+  instance entry lives on the class, the class entry on its singleton class), so
+  `private :run` cannot hide `self.run`. Both the class-body and
+  explicit-receiver spellings write it, including the `private_class_method def
+  self.m …` expression form. Lookup walks the superclass chain — a private
+  `new` on a base class stays private on every subclass, and the error names the
+  RECEIVER class (`private method 'mk' called for class Sub`) — while a subclass
+  that redefines the class method makes it public again. `respond_to?` hides it
+  unless the second argument asks for the private surface, and `public_send`
+  refuses it. The compiler never fills the map (`private_class_method` is an
+  ordinary runtime call), so the rkyv cache shape is unchanged and a cache
+  written before the field existed still loads.
+  Still open, one shared limitation for both instance and class methods: MRI's
+  self-receiver exemption is SYNTACTIC — only the literal keyword `self` counts
+  — while rubylang tests object identity. So `z = self; z.priv` and
+  `def self.go; C.priv_cm; end` are accepted where MRI raises. Distinguishing
+  them needs the compiler to mark a literal-`self` receiver on the call op.
+  Still open: the private surface of the BUILT-IN Kernel methods is not modelled
+  (`Kernel#puts`/`print`/`require`/`raise`/… are private instance methods in
+  MRI), so `5.public_send(:puts, "x")` reports `undefined method 'puts'` where
+  MRI reports `private method 'puts'`. Only user-defined classes and modules
+  record visibility; closing this needs a generated visibility column in
+  `src/arity_table.rs`.
+  Still open: the singleton-class reflection surface is empty —
+  `C.singleton_class.instance_methods(false)` and its `private_` sibling both
+  answer `[]` where MRI lists the class methods, and `C.methods` omits class
+  methods entirely (even public ones). Enforcement above does not depend on it;
+  it needs `#<Class:C>` to be populated from the owning class's `class_methods`.
 - **Divergence — a bare `==`/`<`/`<=`/`>`/`>=` between an `i64`-range Integer
   and a Float is not exact.** Ruby compares an Integer to a Float exactly, never
   by rounding the Integer, so `3**34 == (3**34).to_f` is false and

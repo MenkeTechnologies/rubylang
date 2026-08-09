@@ -8,11 +8,16 @@
 //! is what the reference `ruby` reports for that method.
 //!
 //! GENERATED — do not edit by hand. Regenerate against the reference
-//! interpreter with:
+//! interpreter, named by ABSOLUTE PATH, with:
 //!
 //! ```text
-//! ruby tools/gen_arity_table.rb > src/arity_table.rs && cargo fmt
+//! /opt/homebrew/opt/ruby/bin/ruby tools/gen_arity_table.rb > src/arity_table.rs
+//! cargo fmt
 //! ```
+//!
+//! Bare `ruby` is rubylang itself wherever rubylang is installed; the
+//! generator aborts rather than dump rubylang's own answers here as the
+//! reference it is measured against.
 
 /// `(owner, method, arity, params)`, sorted by `(owner, method)` for binary
 /// search. An empty `params` means the list is the one implied by the arity

@@ -60,13 +60,16 @@ fn run_home(home: &Path, args: &[&str], path: &Path) -> (String, String, bool) {
     )
 }
 
-/// The reference MRI output, if `/opt/homebrew/bin/ruby` is present. Used as a
-/// third witness; the rubylang-vs-rubylang equality is asserted unconditionally.
+/// The reference MRI output, when a verified MRI is installed. Used as a third
+/// witness; the rubylang-vs-rubylang equality is asserted unconditionally.
+///
+/// The interpreter is resolved by `rubylang::oracle`, which proves the
+/// candidate is MRI. Naming `/opt/homebrew/bin/ruby` directly — as this did —
+/// pointed the "third witness" at rubylang's own installed binary, so the
+/// witness agreed with the thing it was witnessing.
 fn mri(path: &Path) -> Option<String> {
-    let out = Command::new("/opt/homebrew/bin/ruby")
-        .arg(path)
-        .output()
-        .ok()?;
+    let ruby = rubylang::oracle::find().ok()?;
+    let out = ruby.command().arg(path).output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).to_string())

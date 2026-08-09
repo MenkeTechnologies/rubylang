@@ -350,6 +350,12 @@ fn from_cprog(cp: CProg) -> Program {
                             extends,
                             class_methods,
                             visibility,
+                            // Not part of the cached shape: the compiler never
+                            // fills it (see `compiler.rs`), so there is nothing
+                            // to persist and the rkyv schema is unchanged — a
+                            // cache written before this field existed still
+                            // loads.
+                            class_visibility: Default::default(),
                             is_module,
                         },
                     )

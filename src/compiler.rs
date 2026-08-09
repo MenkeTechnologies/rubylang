@@ -2921,6 +2921,11 @@ impl Compiler {
                 extends,
                 class_methods,
                 visibility,
+                // `private_class_method` is resolved at run time (it is an
+                // ordinary call in the class body, and it also takes the result
+                // of a `def self.…` expression), so the compiler never has one
+                // to record here.
+                class_visibility: Default::default(),
                 is_module,
             },
         ));
