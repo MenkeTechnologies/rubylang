@@ -91,6 +91,12 @@ pub struct Parser {
     /// stack is the block currently being parsed; a bare `_2` sets it to ≥2. When
     /// the block closes, a non-zero max synthesizes params `_1.._max`.
     nparam_stack: Vec<u32>,
+    /// Parallel to `nparam_stack`: was the implicit `it` parameter (Ruby 3.4+)
+    /// referenced in the block currently being parsed? A block that used it
+    /// gains one required parameter under the reserved name `__it__`; a bare
+    /// `it` then resolves to it, unless a real local named `it` is in scope
+    /// (MRI precedence — see `RubyHost::get_local`).
+    it_stack: Vec<bool>,
 }
 
 /// Parse a full program. Inline `rust { ... }` FFI blocks are desugared to
@@ -106,6 +112,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
         no_pattern: false,
         no_rescue_mod: false,
         nparam_stack: Vec::new(),
+        it_stack: Vec::new(),
     };
     p.program()
 }
@@ -1144,6 +1151,7 @@ impl Parser {
             let track = params.is_empty() && splat.is_none();
             if track {
                 self.nparam_stack.push(0);
+                self.it_stack.push(false);
             }
             // The block body is a fresh statement context: a nested `do` block is
             // allowed even when this block is itself a no-do command argument
@@ -1156,11 +1164,19 @@ impl Parser {
             self.expect_kw("end")?;
             if track {
                 let max = self.nparam_stack.pop().unwrap_or(0);
+                let used_it = self.it_stack.pop().unwrap_or(false);
                 for n in 1..=max {
                     params.push(format!("_{n}"));
                 }
                 // Numbered params (`_1`, `_2`) are ordinary required params.
                 arity.req = max as u16;
+                // `it` (Ruby 3.4+) is the block's single implicit parameter. It
+                // never combines with `_1..._9` (MRI rejects that outright), so
+                // this only applies when no numbered param was seen.
+                if used_it && max == 0 {
+                    params.push("__it__".to_string());
+                    arity.req = 1;
+                }
             }
             let body = self.prepend_preludes(preludes, rest);
             return Ok(Some(Block {
@@ -1176,6 +1192,7 @@ impl Parser {
             let track = params.is_empty() && splat.is_none();
             if track {
                 self.nparam_stack.push(0);
+                self.it_stack.push(false);
             }
             // Fresh statement context inside the block (see the `do` branch).
             let saved_no_do = std::mem::replace(&mut self.no_do_block, false);
@@ -1191,10 +1208,15 @@ impl Parser {
             self.expect_op("}")?;
             if track {
                 let max = self.nparam_stack.pop().unwrap_or(0);
+                let used_it = self.it_stack.pop().unwrap_or(false);
                 for n in 1..=max {
                     params.push(format!("_{n}"));
                 }
                 arity.req = max as u16;
+                if used_it && max == 0 {
+                    params.push("__it__".to_string());
+                    arity.req = 1;
+                }
             }
             let body = self.prepend_preludes(preludes, body);
             return Ok(Some(Block {
@@ -1744,6 +1766,14 @@ impl Parser {
         // A bare `_1`..`_9` in a block with no explicit params is an implicit
         // numbered parameter — record the highest one seen so the block
         // synthesizes params `_1.._max` when it closes.
+        // A bare `it` in a block with no explicit params is the implicit single
+        // parameter (Ruby 3.4+). Recorded here; the block synthesizes `__it__`
+        // when it closes.
+        if name == "it" {
+            if let Some(top) = self.it_stack.last_mut() {
+                *top = true;
+            }
+        }
         if let Some(top) = self.nparam_stack.last_mut() {
             if let Some(rest) = name.strip_prefix('_') {
                 if rest.len() == 1 {

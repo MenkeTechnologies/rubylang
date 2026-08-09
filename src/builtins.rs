@@ -239,11 +239,12 @@ fn block_operand(v: Value) -> Option<Value> {
 
 fn b_call_arr_blk(vm: &mut VM, _: u8) -> Value {
     let block = block_operand(vm.pop());
+    let owns = crate::host::take_block_literal();
     let arr = vm.pop();
     let name = name_of(&vm.pop());
     let args = with_host(|h| h.as_array(&arr).unwrap_or_default());
     match dispatch_call(&name, &args, block) {
-        Ok(v) => propagate(vm, v),
+        Ok(v) => finish_block_call(vm, owns, v),
         Err(e) => abort(vm, e),
     }
 }
@@ -252,12 +253,13 @@ fn b_call_arr_blk(vm: &mut VM, _: u8) -> Value {
 /// `[recv, name, args, proc]`.
 fn b_call_method_arr_blk(vm: &mut VM, _: u8) -> Value {
     let block = block_operand(vm.pop());
+    let owns = crate::host::take_block_literal();
     let arr = vm.pop();
     let name = name_of(&vm.pop());
     let recv = vm.pop();
     let args = with_host(|h| h.as_array(&arr).unwrap_or_default());
     match dispatch(&recv, &name, &args, block) {
-        Ok(v) => propagate(vm, v),
+        Ok(v) => finish_block_call(vm, owns, v),
         Err(e) => abort(vm, e),
     }
 }
@@ -296,9 +298,10 @@ fn b_super_fwd(vm: &mut VM, _: u8) -> Value {
 /// `super(args) { blk }` — the proc rides on top of the args; argc = n_args + 1.
 fn b_super_blk(vm: &mut VM, argc: u8) -> Value {
     let block = block_operand(vm.pop());
+    let owns = crate::host::take_block_literal();
     let args = pop_n(vm, argc.saturating_sub(1) as usize);
     match crate::host::call_super_blk(Some(args), block) {
-        Ok(v) => propagate(vm, v),
+        Ok(v) => finish_block_call(vm, owns, v),
         Err(e) => abort(vm, e),
     }
 }
@@ -306,8 +309,9 @@ fn b_super_blk(vm: &mut VM, argc: u8) -> Value {
 /// `super { blk }` — forward args, pass a new block (the proc on top of stack).
 fn b_super_fwd_blk(vm: &mut VM, _: u8) -> Value {
     let block = block_operand(vm.pop());
+    let owns = crate::host::take_block_literal();
     match crate::host::call_super_blk(None, block) {
-        Ok(v) => propagate(vm, v),
+        Ok(v) => finish_block_call(vm, owns, v),
         Err(e) => abort(vm, e),
     }
 }
@@ -576,6 +580,30 @@ fn propagate(vm: &mut VM, v: Value) -> Value {
         vm.ip = vm.chunk.ops.len();
     }
     v
+}
+
+/// Finish a call that was written with a block operand.
+///
+/// When the block was a LITERAL at this call site (`owns_break`), MRI ends this
+/// invocation on a `break` and makes the break value the invocation's value —
+/// verified against ruby 4.0.6:
+///   `def m(&b); r = [1,2].each(&b); p :after; r; end; p(m { break 7 })`
+/// prints `7` and never prints `:after`, so the forwarding `each(&b)` is not the
+/// target; the `m { ... }` site is. Hence a forwarded `&expr` block never sets
+/// the marker and cannot steal an outer block's break.
+///
+/// This is the single place the signal has to end. Builtins that iterate a block
+/// consume it themselves in about forty hand-written spots; every other
+/// block-taking method left it pending, and `propagate` then halted the whole
+/// chunk — which is why `p([1,2,3].find { break 99 })` printed nothing at all
+/// instead of `99`.
+fn finish_block_call(vm: &mut VM, owns_break: bool, v: Value) -> Value {
+    if owns_break {
+        if let Some(bv) = take_break() {
+            return bv;
+        }
+    }
+    propagate(vm, v)
 }
 fn b_setlocal(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
@@ -856,9 +884,10 @@ fn b_call(vm: &mut VM, argc: u8) -> Value {
 fn b_call_blk(vm: &mut VM, argc: u8) -> Value {
     let mut vals = pop_n(vm, argc as usize);
     let block = block_operand(vals.pop().unwrap_or(Value::Undef));
+    let owns = crate::host::take_block_literal();
     let name = name_of(&vals.remove(0));
     match dispatch_call(&name, &vals, block) {
-        Ok(v) => propagate(vm, v),
+        Ok(v) => finish_block_call(vm, owns, v),
         Err(e) => abort(vm, e),
     }
 }
@@ -874,10 +903,11 @@ fn b_call_method(vm: &mut VM, argc: u8) -> Value {
 fn b_call_method_blk(vm: &mut VM, argc: u8) -> Value {
     let mut vals = pop_n(vm, argc as usize);
     let block = block_operand(vals.pop().unwrap_or(Value::Undef));
+    let owns = crate::host::take_block_literal();
     let recv = vals.remove(0);
     let name = name_of(&vals.remove(0));
     match dispatch(&recv, &name, &vals, block) {
-        Ok(v) => propagate(vm, v),
+        Ok(v) => finish_block_call(vm, owns, v),
         Err(e) => abort(vm, e),
     }
 }
@@ -972,6 +1002,9 @@ fn b_mkproc(vm: &mut VM, _: u8) -> Value {
         Value::Int(n) => n as usize,
         _ => return abort(vm, "bad proc id".into()),
     };
+    // This Proc is a block literal written at the call op that follows, so that
+    // call owns any `break` the block raises (see `finish_block_call`).
+    crate::host::mark_block_literal();
     with_host(|h| h.new_proc(id))
 }
 fn b_mklambda(vm: &mut VM, _: u8) -> Value {
@@ -4719,9 +4752,6 @@ fn dispatch_number(
                 while i < n {
                     call_proc(b, &[Value::Int(i)])?;
                     if has_pending_signal() {
-                        if let Some(bv) = take_break() {
-                            return Ok(bv);
-                        }
                         break;
                     }
                     i += 1;
@@ -4892,9 +4922,6 @@ fn dispatch_number(
                         while (by > 0 && i <= limit) || (by < 0 && i >= limit) {
                             call_proc(bl, &[Value::Int(i)])?;
                             if has_pending_signal() {
-                                if let Some(bv) = take_break() {
-                                    return Ok(bv);
-                                }
                                 break;
                             }
                             i += by;
@@ -4942,9 +4969,6 @@ fn dispatch_number(
                         while i < n {
                             call_proc(bl, &[Value::Float(clamp(i))])?;
                             if has_pending_signal() {
-                                if let Some(bv) = take_break() {
-                                    return Ok(bv);
-                                }
                                 break;
                             }
                             i += 1.0;
@@ -5688,9 +5712,6 @@ fn iter_int_range(
         while (step > 0 && i <= bound) || (step < 0 && i >= bound) {
             call_proc(b, &[Value::Int(i)])?;
             if has_pending_signal() {
-                if let Some(bv) = take_break() {
-                    return Ok(bv);
-                }
                 break;
             }
             i += step;
@@ -5940,7 +5961,6 @@ fn dispatch_string(
                 for g in UnicodeSegmentation::graphemes(s.as_str(), true) {
                     call_proc(b, &[new_str(g.to_string())])?;
                     if has_pending_signal() {
-                        take_break();
                         break;
                     }
                 }
@@ -6024,7 +6044,6 @@ fn dispatch_string(
                 for b in s.bytes() {
                     call_proc(bl, &[Value::Int(b as i64)])?;
                     if has_pending_signal() {
-                        take_break();
                         break;
                     }
                 }
@@ -6128,7 +6147,6 @@ fn dispatch_string(
                     for line in split_lines(&s) {
                         call_proc(bl, &[new_str(line)])?;
                         if has_pending_signal() {
-                            take_break();
                             break;
                         }
                     }
@@ -6397,7 +6415,6 @@ fn dispatch_string(
                 for c in s.chars() {
                     call_proc(b, &[new_str(c.to_string())])?;
                     if has_pending_signal() {
-                        take_break();
                         break;
                     }
                 }
@@ -7430,7 +7447,6 @@ fn dispatch_array(
                 for w in &windows {
                     call_proc(bl, std::slice::from_ref(w))?;
                     if has_pending_signal() {
-                        take_break();
                         break;
                     }
                 }
@@ -7564,9 +7580,6 @@ fn dispatch_array(
                 for i in 0..arr.len() {
                     call_proc(b, &[Value::Int(i as i64)])?;
                     if has_pending_signal() {
-                        if let Some(bv) = take_break() {
-                            return Ok(bv);
-                        }
                         break;
                     }
                 }
@@ -7805,9 +7818,6 @@ fn dispatch_array(
                 for x in &arr {
                     call_proc(b, std::slice::from_ref(x))?;
                     if has_pending_signal() {
-                        if let Some(bv) = take_break() {
-                            return Ok(bv);
-                        }
                         break;
                     }
                 }
@@ -7835,9 +7845,6 @@ fn dispatch_array(
                 for x in arr.iter().rev() {
                     call_proc(b, std::slice::from_ref(x))?;
                     if has_pending_signal() {
-                        if let Some(bv) = take_break() {
-                            return Ok(bv);
-                        }
                         break;
                     }
                 }
@@ -7853,7 +7860,6 @@ fn dispatch_array(
                 for (i, x) in arr.iter().enumerate() {
                     call_proc(b, &[x.clone(), Value::Int(i as i64)])?;
                     if has_pending_signal() {
-                        take_break();
                         break;
                     }
                 }
@@ -7880,7 +7886,6 @@ fn dispatch_array(
                 for x in &arr {
                     let r = call_proc(b, std::slice::from_ref(x))?;
                     if has_pending_signal() {
-                        take_break();
                         break;
                     }
                     out.push(r);
@@ -7949,9 +7954,6 @@ fn dispatch_array(
                 for x in &arr {
                     let r = call_proc(b, std::slice::from_ref(x))?;
                     if has_pending_signal() {
-                        if let Some(bv) = take_break() {
-                            return Ok(bv);
-                        }
                         break;
                     }
                     let t = with_host(|h| h.truthy(&r));
@@ -7991,9 +7993,6 @@ fn dispatch_array(
                 for x in &arr {
                     let r = call_proc(b, std::slice::from_ref(x))?;
                     if has_pending_signal() {
-                        if let Some(bv) = take_break() {
-                            return Ok(bv);
-                        }
                         break;
                     }
                     if with_host(|h| h.truthy(&r)) {
@@ -8271,7 +8270,6 @@ fn dispatch_array(
                 for row in &rows {
                     call_proc(bl, std::slice::from_ref(row))?;
                     if has_pending_signal() {
-                        take_break();
                         break;
                     }
                 }
@@ -8309,7 +8307,6 @@ fn dispatch_array(
                 for c in &out {
                     call_proc(bl, std::slice::from_ref(c))?;
                     if has_pending_signal() {
-                        take_break();
                         break;
                     }
                 }
@@ -8328,7 +8325,6 @@ fn dispatch_array(
                 for p in &out {
                     call_proc(bl, std::slice::from_ref(p))?;
                     if has_pending_signal() {
-                        take_break();
                         break;
                     }
                 }
@@ -8497,8 +8493,13 @@ fn dispatch_array(
             with_host(|h| h.set_array(recv, a));
             Ok(removed)
         }
+        // In-place drop filters. `reject!` reports "nothing changed" by returning
+        // nil (MRI: `[1,2].reject! { false }` → nil, `[1,2].reject! { |x| x==1 }`
+        // → `[2]`); `delete_if` always returns the array. This mirrors the
+        // `select!`/`keep_if` pair above.
         "delete_if" | "reject!" => {
             let mut a = arr;
+            let before = a.len();
             if let Some(bl) = &block {
                 let mut kept = Vec::with_capacity(a.len());
                 for x in a.drain(..) {
@@ -8509,8 +8510,13 @@ fn dispatch_array(
                 }
                 a = kept;
             }
+            let changed = a.len() != before;
             with_host(|h| h.set_array(recv, a));
-            Ok(recv.clone())
+            if name.ends_with('!') && !changed {
+                Ok(Value::Undef)
+            } else {
+                Ok(recv.clone())
+            }
         }
         "take_while" => {
             let mut out = Vec::new();
@@ -8561,7 +8567,6 @@ fn dispatch_array(
                 for s in &slices {
                     call_proc(bl, std::slice::from_ref(s))?;
                     if has_pending_signal() {
-                        take_break();
                         break;
                     }
                 }
@@ -9344,7 +9349,10 @@ fn dispatch_enumerator(
         // Every non-iteration message is delegated to the buffered values as an
         // Array, preserving the full Enumerable surface (`map`, `to_a`,
         // `select`, …) that block-less calls exposed before Enumerator existed.
-        _ => remap_array_delegate(dispatch_array(&new_arr(buf), name, args, block), recv, name),
+        _ => {
+            let buf = project_multi_yield(recv, name, &buf, block.as_ref());
+            remap_array_delegate(dispatch_array(&new_arr(buf), name, args, block), recv, name)
+        }
     }
 }
 
@@ -9375,6 +9383,74 @@ fn dispatch_yielder(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
         }
         _ => Err(no_method_error(recv, name)),
     }
+}
+
+/// Enumerators whose source yields TWO values per iteration, not one packed
+/// pair. `each_with_index` yields `(element, index)` and `each_with_object`
+/// yields `(element, memo)`, so a one-parameter block sees only the element,
+/// exactly as `yield_pair` models for Hash entries. Every other enumerator
+/// (`each_slice`, `each_cons`, `Hash#each`) really does yield ONE value that
+/// happens to be an array, and must not be projected.
+const MULTI_YIELD_SOURCES: &[&str] = &[
+    "each_with_index",
+    "with_index",
+    "each_with_object",
+    "with_object",
+];
+
+/// The consumers whose result is built from what the BLOCK returns, so handing
+/// the block one value instead of the packed pair is the whole difference.
+///
+/// MRI splits here and the split is not cosmetic — `collect_i` yields the raw
+/// values (a one-parameter block binds the first) while `select_i` packs them
+/// first (a one-parameter block binds the pair). Verified against ruby 4.0.6
+/// with a discriminating block on `[10, 20].each_with_index`:
+///   `.map    { |x| x == 10 }` → `[true, false]`   (block saw 10)
+///   `.select { |x| x == 10 }` → `[]`              (block saw `[10, 0]`)
+/// Consumers that *collect source elements* (`select`, `reject`, `take_while`,
+/// `sort_by`, `group_by`, `partition`, `find`) are deliberately absent: even
+/// where their block sees the first value, their result is made of the packed
+/// pairs, so projecting the buffer would corrupt it.
+const BLOCK_RESULT_CONSUMERS: &[&str] = &[
+    "map",
+    "collect",
+    "flat_map",
+    "collect_concat",
+    "filter_map",
+    "each",
+];
+
+/// Project a multi-yield enumerator's buffered `[a, b]` entries down to `a` when
+/// the block can only bind one of them.
+///
+/// The buffer stores each iteration's yielded values packed as a pair, which is
+/// right for `to_a` and for a two-parameter block, but a one-parameter block in
+/// MRI binds just the first value: `[1, 2].each_with_index.map { |x| x }` is
+/// `[1, 2]`, not `[[1, 0], [2, 1]]`. Arity drives the choice, matching
+/// `yield_pair`, so `{ |x, i| }`, `{ _1 + _2 }` and `{ |*a| }` still see both.
+fn project_multi_yield(
+    recv: &Value,
+    name: &str,
+    buf: &[Value],
+    block: Option<&Value>,
+) -> Vec<Value> {
+    let Some(b) = block else {
+        return buf.to_vec();
+    };
+    if !BLOCK_RESULT_CONSUMERS.contains(&name) {
+        return buf.to_vec();
+    }
+    let multi = with_host(|h| h.enum_method(recv))
+        .is_some_and(|m| MULTI_YIELD_SOURCES.contains(&m.as_str()));
+    if !multi || with_host(|h| h.proc_arity(b)).is_none_or(|a| a > 1 || a < 0) {
+        return buf.to_vec();
+    }
+    buf.iter()
+        .map(|v| match with_host(|h| h.as_array(v)) {
+            Some(pair) if !pair.is_empty() => pair[0].clone(),
+            _ => v.clone(),
+        })
+        .collect()
 }
 
 /// Hand a Hash entry to a block as either two separate values or the packed
@@ -11880,9 +11956,6 @@ fn dispatch_set(
             for v in &items {
                 call_proc(&bl, std::slice::from_ref(v))?;
                 if has_pending_signal() {
-                    if let Some(bv) = take_break() {
-                        return Ok(bv);
-                    }
                     break;
                 }
             }
@@ -12077,7 +12150,6 @@ fn dispatch_hash(
                     });
                     call_proc(b, &[pair])?;
                     if has_pending_signal() {
-                        take_break();
                         break;
                     }
                 }
@@ -12089,7 +12161,6 @@ fn dispatch_hash(
                 for v in map.values() {
                     call_proc(b, std::slice::from_ref(v))?;
                     if has_pending_signal() {
-                        take_break();
                         break;
                     }
                 }
@@ -12102,7 +12173,6 @@ fn dispatch_hash(
                     let kv = with_host(|h| h.key_value(k));
                     call_proc(b, &[kv])?;
                     if has_pending_signal() {
-                        take_break();
                         break;
                     }
                 }
@@ -12350,7 +12420,6 @@ fn dispatch_hash(
                 for (i, pair) in pairs.iter().enumerate() {
                     call_proc(b, &[pair.clone(), Value::Int(i as i64)])?;
                     if has_pending_signal() {
-                        take_break();
                         break;
                     }
                 }
@@ -12422,9 +12491,6 @@ fn dispatch_range(
                 loop {
                     call_proc(b, &[Value::Int(i)])?;
                     if has_pending_signal() {
-                        if let Some(bv) = take_break() {
-                            return Ok(bv);
-                        }
                         break;
                     }
                     i += by;
@@ -12506,9 +12572,6 @@ fn dispatch_range(
                         for v in vals {
                             call_proc(&b, &[v])?;
                             if has_pending_signal() {
-                                if let Some(bv) = take_break() {
-                                    return Ok(bv);
-                                }
                                 break;
                             }
                         }
@@ -12526,9 +12589,6 @@ fn dispatch_range(
                 for v in vals {
                     call_proc(b, &[v])?;
                     if has_pending_signal() {
-                        if let Some(bv) = take_break() {
-                            return Ok(bv);
-                        }
                         break;
                     }
                 }
@@ -12542,9 +12602,6 @@ fn dispatch_range(
                 for i in lo..end {
                     call_proc(b, &[Value::Int(i)])?;
                     if has_pending_signal() {
-                        if let Some(bv) = take_break() {
-                            return Ok(bv);
-                        }
                         break;
                     }
                 }
@@ -12660,9 +12717,6 @@ fn dispatch_float_range(
                     for v in vals {
                         call_proc(&b, &[v])?;
                         if has_pending_signal() {
-                            if let Some(bv) = take_break() {
-                                return Ok(bv);
-                            }
                             break;
                         }
                     }
@@ -12818,9 +12872,6 @@ fn dispatch_str_range(
                 for e in elems() {
                     call_proc(b, &[e])?;
                     if has_pending_signal() {
-                        if let Some(bv) = take_break() {
-                            return Ok(bv);
-                        }
                         break;
                     }
                 }

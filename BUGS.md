@@ -78,9 +78,14 @@ leading positional before `...`); `Integer#step`, `?c` char literals,
 - **Lambda literal as a command argument.** `p ->(x) { x }` (a `->` lambda
   directly after a spaced command name) parses. Still not parsed: nested
   destructuring targets in a parallel assignment LHS (`(a, (b, c)), d = …`).
-- **Numbered / `it` implicit block params.** `_1`.`_9` and Ruby 3.4's `it`
-  are not bound (they read as `nil`); implementing them needs a nested-block-aware
-  body walk. Use explicit `{ |x| … }` params.
+- **Numbered / `it` implicit block params.** Implemented. A block that declares
+  no `|params|` records the highest `_1`.`_9` it mentions and synthesizes exactly
+  that many required params when it closes; a bare `it` (Ruby 3.4) synthesizes
+  one, bound under the reserved name `__it__`. `it` resolves to that parameter
+  only after the ordinary local chain misses, which is MRI's precedence — so
+  `[1, 2].map { it }` is `[1, 2]` while `it = 5; [1, 2].map { it }` is `[5, 5]`,
+  and a *method* named `it` never wins over the implicit parameter. Not rejected
+  yet: MRI's SyntaxErrors for mixing `it` with ordinary params or with `_1`.
 - **Loop control flow through `begin`/`rescue`.** A `begin` body compiles to its
   own chunk, so a `break`/`next` inside one cannot jump to the enclosing native
   `while`/`until`/`for` label directly; it raises a signal that the loop picks
@@ -90,6 +95,22 @@ leading positional before `...`); `Integer#step`, `?c` char literals,
   *block* keeps belonging to the method it was passed to. `while`/`until` also
   evaluate to their `break` operand (`(while true do break 7 end) == 7`), not
   always nil.
+- **`break` out of a block — who owns it.** MRI targets a `break` at the
+  invocation the block LITERAL was written on: that invocation ends immediately
+  and the break value becomes its value. There is exactly one place that ends the
+  signal. `MKPROC` (emitted only for a block literal, always as the last operand
+  before its call op) marks the call as the owner, and the block-carrying call
+  handlers consume a pending `Break` there. A forwarded `&expr` block never sets
+  the marker, so an inner forwarding call cannot steal an outer block's break —
+  `def m(&b); r = [1, 2].each(&b); p :after; r; end; m { break 7 }` answers `7`
+  and never prints `:after`, as in MRI. The signal also survives a user-defined
+  method boundary (`def y; yield; :after; end; y { break 3 }` is `3`), so it can
+  reach that owner. Consequently the iterating builtins do NOT consume `break`
+  themselves; they only stop iterating and leave the signal pending. Before this,
+  each block-taking builtin had to remember to handle `break` and about fifty did
+  not — they returned their receiver, or let the signal unwind far enough to
+  discard the enclosing statement's output entirely (`p([1, 2, 3].find { break 99 })`
+  printed nothing).
 - **Block scoping.** A block parameter is block-local and gets a fresh binding
   per iteration, so `3.times { |i| procs << -> { i } }` closes over `0`,`1`,`2`;
   a local first assigned inside a block does not leak out (`1.times { x = 1 };
@@ -148,7 +169,20 @@ Implemented and verified against the reference `ruby`:
   works the same way. Singleton methods take priority over the class's own
   instance methods in dispatch (matching `Module#ancestors` order). A bare
   self-call inside a singleton method (or inside a block whose `self` is a
-  receiver carrying singletons) resolves those singletons.
+  receiver carrying singletons) resolves those singletons. `Object#singleton_class`
+  itself is NOT implemented — the singleton is a per-object method table, not a
+  reified anonymous `Class`, so `obj.singleton_class` raises `undefined method`
+  and `obj.singleton_class.instance_methods(false)` has no equivalent. Use
+  `obj.singleton_methods`, which is implemented.
+- **`Method#arity` / `#owner` on builtins.** A `Method` for a *user-defined*
+  method reports the arity MRI does (`def h(a, b = 1)` → `-2`). A builtin has no
+  declared shape to read — the dispatch functions match on an `args` slice — so
+  `method_arity` falls back to `-1` for every one of them: `3.method(:*).arity`
+  is `-1` where MRI says `1`. Measured against ruby 4.0.6 over 97 builtin methods
+  across Integer/Float/String/Array/Hash/Symbol, 55 disagree. Closing this needs a
+  declarative arity table for the builtin surface, not a change to the lookup.
+  `Method#owner` is unimplemented for the same reason (no defining module is
+  recorded for a builtin).
 - **`define_method`.** `define_method(:m) { … }` in a class body and the explicit
   receiver form `Klass.define_method(:m) { … }` both register an instance method
   whose body is the block. When invoked, the block rebinds `self` to the calling
@@ -375,6 +409,19 @@ Honest limitations of this surface:
   block — MRI turns it into a Proc up front, so a block-less call raises
   `ArgumentError: tried to create Proc object without a block` rather than
   answering an Enumerator.
+- **Multi-value Enumerator yields — partial.** `each_with_index` and
+  `each_with_object` yield TWO values per iteration, not one packed pair, so a
+  one-parameter block binds only the first. That is honored for the consumers
+  whose result is built from the block's own results (`map`, `collect`,
+  `flat_map`, `collect_concat`, `filter_map`, `each`): `[1, 2].each_with_index
+  .map { |x| x }` is `[1, 2]`. It is NOT yet honored for consumers that decide
+  with the block but collect the *source* elements — `take_while`, `count`,
+  `find_index`, `any?`/`none?`/`one?` still hand the block the packed pair, so
+  `[10, 20].each_with_index.count { |x| x == 10 }` answers `0` where MRI answers
+  `1`. Closing those needs the buffer and the block argument to be reshaped
+  independently (MRI splits them as `rb_enum_values_pack` vs `rb_yield_values2`);
+  the buffer-level projection used today cannot express it. `Hash#each_with_index`
+  and the `each_with_object(memo)` enumerator are also still unprojected.
 - **Block-based generators.** `Enumerator.new { |y| ... }` drives the block with
   a native `Enumerator::Yielder`; `y << v` and its alias `y.yield(v)` push
   yielded values. `to_a`/`first(n)`/`take(n)`/`each`/`lazy` re-run the block on
@@ -627,7 +674,9 @@ Honest limitations of this surface:
   supports `step`, `min`/`max`/`begin`/`end`, and the containment predicates.
   `==` compares endpoints and exclusivity; `===` is proper case-equality (Range
   covers, `Class` matches instances, `Regexp` matches a string) rather than
-  `==`, so `case`/`when` over ranges and classes works.
+  `==`, so `case`/`when` over ranges and classes works. `step` is implemented for
+  numeric endpoints only: `('a'..'e').step(2)` raises `undefined method 'step'`
+  where MRI answers an Enumerator over `["a", "c", "e"]`.
 - **Pattern matching (`case/in`).** Array/hash/find-by-key patterns, class
   patterns (`Integer`, `Point[...]`), variable/`_` binding, `=> name` (chained
   and binding a whole `|` alternation), `^pin`, `|` alternatives (a bare `|` in a

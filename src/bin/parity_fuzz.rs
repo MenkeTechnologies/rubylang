@@ -635,6 +635,7 @@ enum Mode {
     Strenc,
     Complexnum,
     Objintro,
+    Blockflow,
 }
 
 const ALL_MODES: &[Mode] = &[
@@ -677,6 +678,7 @@ const ALL_MODES: &[Mode] = &[
     Mode::Strenc,
     Mode::Complexnum,
     Mode::Objintro,
+    Mode::Blockflow,
 ];
 
 fn gen_intmeth(seed: u64) -> Vec<String> {
@@ -1051,6 +1053,111 @@ fn gen_patternmatch(seed: u64) -> Vec<String> {
     })
 }
 
+/// Non-local control flow **as the value of a block-taking call**.
+///
+/// `loopflow` already emits `break`/`next`/`redo`, but always as a statement
+/// inside a loop whose result is thrown away (`arr.each { break }; p r`). The
+/// value the block-taking call itself evaluates to was never probed, and that
+/// is exactly where MRI's rule lives: a `break` ends the invocation the block
+/// LITERAL was written on and becomes its value. Every case here therefore puts
+/// the call in value position — `p(recv.meth { break v })` — and varies the
+/// method, so a method that silently returns its receiver (or swallows the
+/// statement's output entirely) cannot hide.
+///
+/// Also covers the shapes a per-method generator cannot reach: `break` crossing
+/// a user-defined `yield`, blocks nested two deep, `break`/`next`/`return`
+/// interacting with `begin/rescue/ensure`, and proc-vs-lambda `return`.
+fn gen_blockflow(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let v = ii(r);
+    let w = ww(r);
+    // Block-taking methods whose value is observable. Each entry is
+    // (receiver, method-call-prefix, block params).
+    let arr_meths = [
+        "each", "map", "select", "filter", "reject", "find", "detect", "find_index",
+        "sort_by", "min_by", "max_by", "group_by", "partition", "take_while",
+        "drop_while", "sum", "count", "flat_map", "each_with_index", "each_entry",
+        "find_all", "filter_map", "reverse_each", "each_index", "any?", "all?",
+        "none?", "one?", "delete_if", "keep_if",
+    ];
+    let hash_meths = [
+        "each", "each_pair", "map", "select", "filter", "reject", "find", "detect",
+        "each_with_index", "each_key", "each_value", "sort_by", "min_by", "max_by",
+        "group_by", "partition", "sum", "count", "any?", "all?", "none?", "one?",
+        "delete_if", "keep_if", "transform_values", "transform_keys", "filter_map",
+        "flat_map", "each_entry", "find_all",
+    ];
+    one(match r.below(24) {
+        // The core shape: the break value IS the call's value.
+        0 => format!("p([1, 2, 3].{} {{ |x| break {v} }})", r.pick(&arr_meths)),
+        1 => format!(
+            "p({{a: 1, b: 2}}.{} {{ |k, vv| break {v} }})",
+            r.pick(&hash_meths)
+        ),
+        // Conditional break — the loop runs partway, then yields the value.
+        2 => format!(
+            "p([1, 2, 3, 4].{} {{ |x| break x * 10 if x == {}; x }})",
+            r.pick(&arr_meths),
+            r.range(1, 4)
+        ),
+        // Arity-taking iterators that return the receiver without a break.
+        3 => format!("p([1, 2, 3, 4].each_slice({}) {{ |s| break {v} }})", r.range(1, 3)),
+        4 => format!("p([1, 2, 3, 4].each_cons({}) {{ |s| break {v} }})", r.range(1, 3)),
+        5 => format!("p([1, 2, 3].each_with_object([]) {{ |x, acc| break {v} }})"),
+        6 => format!("p(\"{w}\".each_char {{ |c| break {v} }})"),
+        7 => format!("p(\"a\\nb\\nc\".each_line {{ |l| break {v} }})"),
+        8 => format!("p((1..{}).each_with_index {{ |x, i| break {v} }})", r.range(2, 5)),
+        9 => format!("p({}.times {{ |i| break {v} }})", r.range(1, 4)),
+        10 => format!("p(1.upto({}) {{ |i| break {v} }})", r.range(2, 5)),
+        // Break crossing a user-defined `yield`: the method ends and the value
+        // belongs to the literal's call site.
+        11 => format!(
+            "def y\n  yield 1\n  :after\nend\np(y {{ |x| break {v} }})"
+        ),
+        12 => format!(
+            "def y2\n  r = yield 1\n  [:got, r]\nend\np(y2 {{ |x| next {v} }})"
+        ),
+        // Nested two deep: only the inner call is the inner break's target.
+        13 => format!(
+            "p([1, 2].map {{ |a| [3, 4].each {{ |b| break {v} }} }})"
+        ),
+        14 => format!(
+            "p([1, 2].each {{ |a| [3, 4].each {{ |b| break {v} }}; }})"
+        ),
+        // `return` from a block is non-local: it ends the defining method.
+        15 => format!(
+            "def m\n  [1, 2, 3].each {{ |x| return x + {} if x == 2 }}\n  :fell\nend\np m",
+            r.range(0, 9)
+        ),
+        16 => format!(
+            "def m2\n  [1, 2].each {{ |a| [3, 4].each {{ |b| return [a, b] if b == 4 }} }}\n  :none\nend\np m2"
+        ),
+        // proc vs lambda `return` differ; verify rather than assume.
+        17 => format!(
+            "def pr\n  q = Proc.new {{ return {v} }}\n  q.call\n  :after\nend\np pr"
+        ),
+        18 => format!(
+            "def la\n  q = lambda {{ return {v} }}\n  q.call\n  :after\nend\np la"
+        ),
+        19 => format!("l = lambda {{ break {v} }}\np l.call"),
+        // ensure must still run, and must not eat the value.
+        20 => format!(
+            "def e\n  o = []\n  [1, 2, 3].each {{ |i| begin; o << i; break if i == 2; ensure; o << :E; end }}\n  o\nend\np e"
+        ),
+        21 => format!(
+            "def e2\n  begin\n    [1, 2].each {{ |i| return {v} if i == 2 }}\n  ensure\n    nil\n  end\n  :no\nend\np e2"
+        ),
+        22 => format!(
+            "def e3\n  r = begin\n    {v}\n  rescue\n    -1\n  ensure\n    -2\n  end\n  r\nend\np e3"
+        ),
+        // `for` does NOT create a scope; a block does.
+        _ => format!(
+            "for i in 1..{}\n  sq = i\nend\np [i, sq, defined?(sq)]\n[9].each {{ |jj| kk = jj }}\np [defined?(jj), defined?(kk)]",
+            r.range(2, 4)
+        ),
+    })
+}
+
 fn gen_kernelconv(seed: u64) -> Vec<String> {
     let r = &mut Rng::seed(seed);
     let n = ii(r);
@@ -1114,6 +1221,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Strenc => gen_strenc(seed),
         Mode::Complexnum => gen_complexnum(seed),
         Mode::Objintro => gen_objintro(seed),
+        Mode::Blockflow => gen_blockflow(seed),
     }
 }
 
@@ -1401,6 +1509,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Strenc => "strenc",
         Mode::Complexnum => "complexnum",
         Mode::Objintro => "objintro",
+        Mode::Blockflow => "blockflow",
     }
 }
 

@@ -3018,3 +3018,38 @@ p [Complex(1, 2).zero?, Complex(0, 0).zero?, Complex(1, 2).nonzero?]
 #==#
 # --- String codepoints ---
 p ["日本語".codepoints, "héllo".codepoints.size, "héllo".each_codepoint.to_a.size]
+#==#
+# --- break out of a block is the value of the call the LITERAL was written on ---
+p [[1, 2, 3].find { break 99 }, [1, 2, 3].sort_by { break 7 }, [1, 2, 3].sum { break 5 }]
+#==#
+p [[1, 2, 3].each_with_index { |x, i| break [x, i] if i == 1 }, [1, 2, 3, 4].each_slice(2) { break :s }]
+#==#
+p [{a: 1, b: 2}.each { break :h }, {a: 1, b: 2}.each_key { break :k }, {a: 1}.transform_values { break :t }]
+#==#
+p ["abc".each_char { break :c }, "a\nb".each_line { break :l }, (1..5).each_with_index { break :r }]
+#==#
+p [[1, 2, 3].each_with_object([]) { |x, a| break :o }, [1, 2, 3].take_while { break :w }, [1, 2].zip([3, 4]) { break :z }]
+#==#
+# `break` crossing a user-defined `yield` ends the method and is its call's value.
+def brk_yielder; yield 1; :after; end
+p [(brk_yielder { break :broke }), (brk_yielder { :body })]
+#==#
+# A forwarded `&blk` is NOT the break target — the literal's call site is.
+def brk_fwd(&b); r = [1, 2].each(&b); $stdout.print "reached "; r; end
+p(brk_fwd { break 7 })
+#==#
+# Nested two deep: the inner call owns the inner break.
+def brk_nest; [1, 2].each { |a| [3, 4].each { |b| break 8 } }; end
+p [brk_nest, [1, 2].map { |a| [3, 4].each { break 9 } }]
+#==#
+# `it` is the implicit single block parameter; a real local named `it` wins.
+p [[1, 2].map { it * 3 }, [[1, 2]].map { it }, {a: 1}.map { it }]
+#==#
+it = 5
+p [[1, 2].map { it }, [1, 2].map { _1 * 2 }, [1, 2].each_with_index.map { _1 + _2 }]
+#==#
+# `reject!` answers nil when it removed nothing; `delete_if` always answers self.
+p [[1, 2].reject! { false }, [1, 2].reject! { |x| x == 1 }, [1, 2].delete_if { false }]
+#==#
+# each_with_index yields TWO values: a one-parameter block binds only the first.
+p [[10, 20].each_with_index.map { |x| x }, [10, 20].each_with_index.map { |x, i| [x, i] }, [10, 20].each_with_index.to_a]

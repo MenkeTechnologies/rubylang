@@ -2915,9 +2915,18 @@ impl RubyHost {
             let parent = env.lock().unwrap().parent.clone();
             match parent {
                 Some(p) => env = p,
-                None => return Value::Undef,
+                None => break,
             }
         }
+        // The implicit block parameter `it` (Ruby 3.4+) is bound under the
+        // reserved name `__it__` (see the parser). Looking it up only after the
+        // ordinary chain misses gives MRI's precedence: a real local named `it`
+        // wins, so `it = 5; [1, 2].map { it }` is `[5, 5]` while
+        // `[1, 2].map { it }` is `[1, 2]`.
+        if name == "it" {
+            return self.get_local("__it__");
+        }
+        Value::Undef
     }
     /// Assign a local: update it where it already exists in the chain (so a block
     /// mutates an enclosing variable), else create it in the innermost scope.
@@ -2949,9 +2958,16 @@ impl RubyHost {
             let parent = env.lock().unwrap().parent.clone();
             match parent {
                 Some(p) => env = p,
-                None => return false,
+                None => break,
             }
         }
+        // Same fallback as `get_local`: `it` also names the implicit block
+        // parameter bound as `__it__`. Both lookups must agree, or a bare `it`
+        // would be reported undefined and re-dispatched as a method call.
+        if name == "it" {
+            return self.local_defined("__it__");
+        }
+        false
     }
     pub fn get_global(&self, name: &str) -> Value {
         self.globals.get(name).cloned().unwrap_or(Value::Undef)
@@ -6913,6 +6929,16 @@ fn run_method(
             with_host(|h| h.signal = Some(other));
             r
         }
+        // A `break` from a block this method `yield`ed ends the method here, but
+        // the value belongs to the call site the block literal was written on —
+        // re-arm it so that site's `finish_block_call` produces it. Verified
+        // against ruby 4.0.6: `def y; yield; p :afty; :fell; end; p(y { break 3 })`
+        // prints `3` and never prints `:afty`. Dropping it (the old `_` arm) made
+        // the whole call evaluate to nil.
+        Some(other @ Signal::Break(_)) => {
+            with_host(|h| h.signal = Some(other));
+            r
+        }
         _ => r,
     };
     // AOP `after`/`around` weave: only on a normal (Ok) return, after the frame is
@@ -9128,6 +9154,31 @@ pub fn take_redo_signal() -> bool {
         }
     })
 }
+thread_local! {
+    /// Set by `MKPROC`, cleared by the very next block-carrying call op: "the
+    /// block operand about to be consumed is a LITERAL written at that call
+    /// site", which is exactly the frame MRI targets a `break` at.
+    ///
+    /// The compiler emits `MKPROC` as the last operand before its call op (both
+    /// in `compile_call` and for `super { ... }`), and only for a block literal
+    /// — a forwarded `&expr` compiles the expression instead — so this flag is
+    /// always read by the owning call and never by a forwarding one.
+    static BLOCK_LITERAL_CALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `MKPROC` ran: the next block-carrying call op owns any `break` its block
+/// raises.
+pub fn mark_block_literal() {
+    BLOCK_LITERAL_CALL.with(|c| c.set(true));
+}
+
+/// Read and clear the block-literal marker. Called at the *entry* of a
+/// block-carrying call handler, before dispatch, since running the block can
+/// set the flag again for calls nested inside it.
+pub fn take_block_literal() -> bool {
+    BLOCK_LITERAL_CALL.with(|c| c.replace(false))
+}
+
 pub fn take_break() -> Option<Value> {
     with_host(|h| match &h.signal {
         Some(Signal::Break(_)) => {
