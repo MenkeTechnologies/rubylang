@@ -223,6 +223,10 @@ Implemented and verified against the reference `ruby`:
   the definition's source location, neither of which rubylang retains (the same
   reason `Exception#backtrace` is empty).
   Still open:
+  - `Object#public_method` and `Object#singleton_method` are not implemented at
+    all, so they raise `undefined method` rather than the `NameError` (or the
+    `Method`) MRI answers. `method` and `Module#instance_method` /
+    `#public_instance_method` are the implemented spellings.
   - `main`'s singleton methods (`include`, `private`, `public`, `define_method`,
     `using`, `ruby2_keywords`) are not modeled, so `self.method(:include)` at the
     top level raises. rubylang has no `main` object at all — top-level `self` is a
