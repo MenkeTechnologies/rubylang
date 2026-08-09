@@ -3110,3 +3110,50 @@ class ArEnum
   def each; yield 1; end
 end
 p [ArCmp.new.method(:between?).owner, ArCmp.new.method(:between?).arity, ArEnum.new.method(:sort_by).owner, ArEnum.new.method(:first).arity]
+#==#
+# A source that yields TWO values per iteration reshapes the block argument and
+# the collected element INDEPENDENTLY: the block binds the first value, the
+# element kept is still the packed pair.
+e = [10, 20].each_with_index
+p [e.take_while { |x| x == 10 }, e.count { |x| x.is_a?(Array) }, e.find_index { |x| x.is_a?(Array) }]
+#==#
+e = [10, 20].each_with_index
+p [e.any? { |x| x.is_a?(Array) }, e.all? { |x| x.is_a?(Array) }, e.none? { |x| x.is_a?(Array) }, e.one? { |x| x == 10 }]
+#==#
+# The consumers whose block sees the PACKED pair — the other half of the split.
+e = [10, 20].each_with_index
+p [e.select { |x| x.is_a?(Array) }, e.drop_while { |x| x == 10 }, e.find { |x| x == 20 }, e.sort_by { |x| -x[0] }]
+#==#
+# Ruby's own binding rules do the reshaping, so a splat collects both values.
+e = [10, 20].each_with_index
+p [e.map { |*a| a }, e.map { |x| x }, e.map { |x, i| [i, x] }, e.take_while { |*a| a[0] == 10 }]
+#==#
+# `y.yield a, b` yields two values; `y << [a, b]` yields one that is an array.
+two = Enumerator.new { |y| y.yield 1, 2; y.yield 3, 4 }
+one = Enumerator.new { |y| y << [1, 2]; y << [3, 4] }
+p [two.take_while { |a| a < 3 }, two.map { |a| a }, one.take_while { |a| a[0] < 3 }, one.map { |a| a }]
+#==#
+# Block-less `each_with_object` is an Enumerator of `[elem, memo]` pairs.
+p [[10, 20].each_with_object([]).to_a, [10, 20].each_with_object([]).map { |x| x }]
+#==#
+# An Enumerator answers the object it iterates, which its buffer cannot
+# reconstruct — `each_cons` windows overlap.
+p [[1, 2, 3, 4].each_slice(2).each { |x| x }, [1, 2, 3].each_cons(2).each { |x| x }, [10, 20].each_with_index.each { |x| x }]
+#==#
+p [[1, 2, 3, 4].each_slice(2).inspect, [1, 2, 3].each_cons(2).inspect, [10, 20].each_with_index.inspect, [10, 20].each_with_object([]).inspect]
+#==#
+# `.lazy` over a source that is not an Array: a Hash, an Enumerator and a
+# multi-yield Enumerator all have to feed the pipeline.
+h = {a: 1, b: 2}
+p [h.lazy.map { |k, v| [k, v] }.to_a, h.lazy.select { |k, v| v < 2 }.to_a, h.lazy.take_while { |pair| pair[1] < 2 }.to_a]
+#==#
+# The LAZY split is not the eager one: lazy `drop_while` sees the first value,
+# eager `drop_while` sees the pair.
+e = [10, 20].each_with_index
+p [e.lazy.map { |x| x }.to_a, e.lazy.take_while { |x| x == 10 }.to_a, e.lazy.drop_while { |x| x == 10 }.to_a, e.lazy.select { |x| x.is_a?(Array) }.to_a]
+#==#
+# `each_entry` is the one that always packs, and answers the enumerator.
+e = [10, 20].each_with_index
+got = []
+r = e.each_entry { |x| got << x }
+p [got, r.inspect]

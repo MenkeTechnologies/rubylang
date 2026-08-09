@@ -370,6 +370,11 @@ pub enum RObj {
         /// `map` collects block results, `select`/`reject` filter, `each`
         /// returns the receiver.
         method: String,
+        /// The object this Enumerator iterates, when it is known. `each` answers
+        /// it (`[1, 2, 3, 4].each_slice(2).each { }` is `[1, 2, 3, 4]`, not the
+        /// slices) and `inspect` shows it, both of which the buffer alone cannot
+        /// reconstruct — `each_cons` windows overlap.
+        source: Option<Value>,
     },
     /// A block-based generator (`Enumerator.new { |y| ... }`): the user block
     /// that drives it by sending `<<`/`yield` to a yielder. Bulk operations
@@ -769,6 +774,12 @@ pub struct RubyHost {
     /// value here, and `take_enum_sink` reclaims the buffer. A stack (not a single
     /// buffer) so a nested enumerable call inside `each` can't clobber the outer one.
     enum_sinks: Vec<Vec<Value>>,
+    /// Arrays that are the PACKED form of a multi-value `y.yield a, b`, by object
+    /// id. The pack is an ordinary Array everywhere else; this only records that
+    /// the iteration yielded two values, which decides how a block binds them
+    /// (see `multi_yield_consume`). Object ids are never reused, so an id here
+    /// always names the same pack.
+    multi_yield_packs: HashSet<u32>,
     /// A LIFO stack of pending around-advice weaves (see `AroundCall`). A native
     /// `ProcKind::Around(idx)` block references `around_stack[idx]`; entries are
     /// valid only for the duration of the top-level around weave that pushed them.
@@ -1457,6 +1468,7 @@ impl RubyHost {
             active_scope: None,
             frozen: HashSet::new(),
             enum_sinks: Vec::new(),
+            multi_yield_packs: HashSet::new(),
             around_stack: Vec::new(),
             threads: Vec::new(),
             queues: Vec::new(),
@@ -1855,7 +1867,32 @@ impl RubyHost {
             buf,
             cursor: 0,
             method: method.to_string(),
+            source: None,
         })
+    }
+    /// As [`new_enumerator`], recording the object being iterated.
+    pub fn new_enumerator_of(&mut self, buf: Vec<Value>, method: &str, source: Value) -> Value {
+        self.alloc(RObj::Enumerator {
+            buf,
+            cursor: 0,
+            method: method.to_string(),
+            source: Some(source),
+        })
+    }
+    /// Re-point an Enumerator at the object it really iterates. A non-Array
+    /// enumerable is materialized to an Array before the Array dispatcher builds
+    /// the Enumerator, so the source it recorded is that temporary.
+    pub fn set_enum_source(&mut self, v: &Value, src: Value) {
+        if let Some(RObj::Enumerator { source, .. }) = self.obj_mut(v) {
+            *source = Some(src);
+        }
+    }
+    /// The object an Enumerator iterates, when it recorded one.
+    pub fn enum_source(&self, v: &Value) -> Option<Value> {
+        match self.obj(v) {
+            Some(RObj::Enumerator { source, .. }) => source.clone(),
+            _ => None,
+        }
     }
     /// Build a block-based generator (`Enumerator.new { |y| ... }`).
     pub fn new_generator(&mut self, block: Value) -> Value {
@@ -2453,6 +2490,18 @@ impl RubyHost {
     }
     pub fn new_symbol(&mut self, name: &str) -> Value {
         self.intern(name)
+    }
+    /// Record that `v` is the packed form of a multi-value yield (`y.yield a, b`).
+    /// It stays an ordinary Array; only the fact that the iteration produced TWO
+    /// values is remembered, which is what decides how a block binds them.
+    pub fn mark_multi_yield(&mut self, v: &Value) {
+        if let Value::Obj(id) = v {
+            self.multi_yield_packs.insert(*id);
+        }
+    }
+    /// Whether `v` is such a pack.
+    pub fn is_multi_yield(&self, v: &Value) -> bool {
+        matches!(v, Value::Obj(id) if self.multi_yield_packs.contains(id))
     }
     /// Open a fresh element buffer and return a native collector `Proc` bound to
     /// it. Passing this block to a user `Enumerable`'s `each` appends every
@@ -5346,11 +5395,21 @@ impl RubyHost {
                 }
                 Some(RObj::FiddlePtr { addr, size, .. }) => fiddle_read_cstr_or_len(addr, size),
                 Some(RObj::Lazy { .. }) => "#<Enumerator::Lazy>".to_string(),
-                Some(RObj::Enumerator { buf, method, .. }) => {
-                    // MRI shows `#<Enumerator: <receiver>:<method>>`; we keep the
-                    // materialized values in place of the receiver (they match for
-                    // the common Array case) and append the producing method.
-                    format!("#<Enumerator: {}:{method}>", self.inspect_array(&buf))
+                Some(RObj::Enumerator {
+                    buf,
+                    method,
+                    source,
+                    ..
+                }) => {
+                    // MRI shows `#<Enumerator: <receiver>:<method>>`. The receiver
+                    // is the recorded source when there is one; otherwise the
+                    // materialized values stand in for it (they match for the
+                    // common Array case).
+                    let recv = match source {
+                        Some(s) => self.inspect(&s),
+                        None => self.inspect_array(&buf),
+                    };
+                    format!("#<Enumerator: {recv}:{method}>")
                 }
                 Some(RObj::Generator { .. }) => {
                     "#<Enumerator: #<Enumerator::Generator>:each>".to_string()

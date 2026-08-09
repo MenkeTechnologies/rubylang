@@ -309,7 +309,8 @@ format specs, `case`/`when`, loop control flow including `redo`, Hash-through-
 Enumerable, `Enumerator` external iteration and laziness, keyword arguments,
 lambda-vs-proc arity, metaprogramming hooks, `Comparable`/`Enumerable` mixins,
 `Set`, `Data`, `freeze`, object introspection, `Method` reflection
-(`#arity`/`#owner`/`#parameters`), string encodings, `Complex`, …)
+(`#arity`/`#owner`/`#parameters`), multi-value Enumerator yields, string
+encodings, `Complex`, …)
 and diffs stdout + exit code of the reference
 `ruby` against rubylang. Every divergence is delta-debugged to a minimal
 reproducer and replays exactly with `parity-fuzz --seed N --once`. It runs

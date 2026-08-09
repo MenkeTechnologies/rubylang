@@ -424,20 +424,42 @@ Honest limitations of this surface:
   `chunk`/`chunk_while`/`slice_when` with one. `chunk_while`/`slice_when` need a
   block — MRI turns it into a Proc up front, so a block-less call raises
   `ArgumentError: tried to create Proc object without a block` rather than
-  answering an Enumerator.
-- **Multi-value Enumerator yields — partial.** `each_with_index` and
-  `each_with_object` yield TWO values per iteration, not one packed pair, so a
-  one-parameter block binds only the first. That is honored for the consumers
-  whose result is built from the block's own results (`map`, `collect`,
-  `flat_map`, `collect_concat`, `filter_map`, `each`): `[1, 2].each_with_index
-  .map { |x| x }` is `[1, 2]`. It is NOT yet honored for consumers that decide
-  with the block but collect the *source* elements — `take_while`, `count`,
-  `find_index`, `any?`/`none?`/`one?` still hand the block the packed pair, so
-  `[10, 20].each_with_index.count { |x| x == 10 }` answers `0` where MRI answers
-  `1`. Closing those needs the buffer and the block argument to be reshaped
-  independently (MRI splits them as `rb_enum_values_pack` vs `rb_yield_values2`);
-  the buffer-level projection used today cannot express it. `Hash#each_with_index`
-  and the `each_with_object(memo)` enumerator are also still unprojected.
+  answering an Enumerator. An Enumerator built by the Array dispatcher records
+  the object it iterates, which `each` answers and `inspect` shows
+  (`[1, 2, 3].each_cons(2).each { }` is `[1, 2, 3]`, and it inspects as
+  `#<Enumerator: [1, 2, 3]:each_cons(2)>`) — neither is reconstructible from the
+  buffer, since `each_cons` windows overlap. Still open: an enumerator built from
+  a NON-Array receiver records the materialized array instead
+  (`(1..3).each_with_index` inspects as `#<Enumerator: [1, 2, 3]:…>` where MRI
+  shows `1..3`), and `Enumerator#each` on a GENERATOR answers the enumerator
+  where MRI answers the generator block's own value (usually the `Yielder`).
+- **Multi-value Enumerator yields.** `each_with_index`, `each_with_object` and a
+  generator's `y.yield a, b` yield TWO values per iteration, not one packed pair.
+  The buffer keeps them packed (that is what `to_a` and `each_entry` see) and the
+  block is called with them SPREAD, so Ruby's own binding rules reshape them: a
+  one-parameter block binds the first, `{ |x, i| }` binds both, `{ |*a| }`
+  collects `[x, i]`, and a strict `->(x){}` raises `ArgumentError` exactly as MRI
+  does. The two reshapes are therefore independent, which is what MRI's
+  `rb_yield_values2`-vs-`rb_enum_values_pack` split needs and what a single
+  projection of the buffer could not express: `[10, 20].each_with_index
+  .take_while { |x| x == 10 }` hands the block `10` and keeps `[[10, 0]]`.
+  Which consumers get the spread is measured, not derived — `map`, `collect`,
+  `flat_map`, `collect_concat`, `filter_map`, `each`, `take_while`, `count`,
+  `find_index`, `any?`, `all?`, `none?` and `one?` do; `select`, `reject`,
+  `sort_by`, `group_by`, `partition`, `drop_while`, `find`, `min_by`/`max_by`,
+  `sum`, `uniq` and `inject` see the packed pair, as does `each_entry` always. A
+  generator's packs are marked when `y.yield a, b` builds them, so `y << [a, b]`
+  (one value that happens to be an array) is left alone. The LAZY pipeline has
+  its own split, measured the same way: `map`, `flat_map`, `filter_map`,
+  `take_while` and `drop_while` spread, `select` and `reject` pack — note lazy
+  `drop_while` differs from eager `drop_while`.
+- **`.lazy` sources.** A Range (possibly endless) and a generator stay the
+  pipeline's source, so they are still pulled on demand; anything else is
+  materialized first. That materialization goes through `to_a`, not an
+  "is it an Array" test — a Hash, a Set and an Enumerator are all enumerable but
+  none of them IS an array, and reading them as one answered an EMPTY pipeline
+  (`{a: 1}.lazy.map { … }.to_a` was `[]`). A user `Enumerable` with an infinite
+  `each` therefore hangs where MRI stays lazy.
 - **Block-based generators.** `Enumerator.new { |y| ... }` drives the block with
   a native `Enumerator::Yielder`; `y << v` and its alias `y.yield(v)` push
   yielded values. `to_a`/`first(n)`/`take(n)`/`each`/`lazy` re-run the block on

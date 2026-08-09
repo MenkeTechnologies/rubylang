@@ -1834,7 +1834,21 @@ pub(crate) fn dispatch(
             }) {
                 recv.clone()
             } else {
-                new_arr(with_host(|h| h.as_array(recv)).unwrap_or_default())
+                // Anything else materializes. It has to go through `to_a`, not
+                // `as_array`: a Hash, a Set and an Enumerator are all enumerable
+                // but none of them IS an array, and reading them as one answered
+                // an empty pipeline — `{a: 1}.lazy.map { … }.to_a` was `[]`.
+                let src = dispatch(recv, "to_a", &[], None)?;
+                // A source that yields TWO values per iteration keeps that fact:
+                // its packed pairs are marked, so the pipeline can still hand a
+                // block both (`each_with_index.lazy.map { |x| x }` is the
+                // elements, not the pairs).
+                if with_host(|h| h.enum_method(recv)).is_some_and(|m| is_multi_yield_source(&m)) {
+                    for v in with_host(|h| h.as_array(&src)).unwrap_or_default() {
+                        with_host(|h| h.mark_multi_yield(&v));
+                    }
+                }
+                src
             };
             return Ok(with_host(|h| h.new_lazy(source, vec![])));
         }
@@ -4486,7 +4500,14 @@ fn enumerable_method(
     }
     let elems = enum_to_vec(recv)?;
     let arr = with_host(|h| h.new_array(elems));
-    Ok(Some(dispatch_array(&arr, name, args, block)?))
+    let out = dispatch_array(&arr, name, args, block)?;
+    // The Array dispatcher recorded the TEMPORARY array as the Enumerator's
+    // source; the real one is this receiver (`(1..3).each_with_index` inspects as
+    // `#<Enumerator: 1..3:each_with_index>`, not as the materialized array).
+    if with_host(|h| h.enum_source(&out)).is_some() {
+        with_host(|h| h.set_enum_source(&out, recv.clone()));
+    }
+    Ok(Some(out))
 }
 
 fn as_i(v: &Value) -> i64 {
@@ -7453,7 +7474,10 @@ fn dispatch_array(
                 Ok(recv.clone())
             } else {
                 // Block-less: an Enumerator over the windows (MRI `each_cons`).
-                Ok(with_host(|h| h.new_enumerator(windows, "each")))
+                let tag = format!("each_cons({n})");
+                Ok(with_host(|h| {
+                    h.new_enumerator_of(windows, &tag, recv.clone())
+                }))
             }
         }
         "dig" => Ok(dig(recv, args)),
@@ -7825,7 +7849,7 @@ fn dispatch_array(
             } else {
                 // Block-less: an Enumerator yielding each element, so external
                 // iteration (`next`/`peek`) and chained Enumerable calls work.
-                Ok(with_host(|h| h.new_enumerator(arr, name)))
+                Ok(with_host(|h| h.new_enumerator_of(arr, name, recv.clone())))
             }
         }
         // `chain(*enums)` returns an Enumerator over the receiver followed by each
@@ -7872,7 +7896,9 @@ fn dispatch_array(
                     .enumerate()
                     .map(|(i, x)| new_arr(vec![x.clone(), Value::Int(i as i64)]))
                     .collect();
-                Ok(with_host(|h| h.new_enumerator(pairs, "each_with_index")))
+                Ok(with_host(|h| {
+                    h.new_enumerator_of(pairs, "each_with_index", recv.clone())
+                }))
             }
         }
         // `map!`/`collect!` — replace each element with the block's result in place,
@@ -8242,10 +8268,21 @@ fn dispatch_array(
         }
         "each_with_object" => {
             let memo = args[0].clone();
-            if let Some(bl) = &block {
-                for x in &arr {
-                    call_proc(bl, &[x.clone(), memo.clone()])?;
-                }
+            let Some(bl) = &block else {
+                // Block-less: an Enumerator of `[elem, memo]` pairs, the shape
+                // MRI hands a later block — `[10, 20].each_with_object([]).to_a`
+                // is `[[10, []], [20, []]]`, not the memo.
+                let pairs = arr
+                    .iter()
+                    .map(|x| new_arr(vec![x.clone(), memo.clone()]))
+                    .collect();
+                let tag = with_host(|h| format!("each_with_object({})", h.inspect(&memo)));
+                return Ok(with_host(|h| {
+                    h.new_enumerator_of(pairs, &tag, recv.clone())
+                }));
+            };
+            for x in &arr {
+                call_proc(bl, &[x.clone(), memo.clone()])?;
             }
             Ok(memo)
         }
@@ -8574,7 +8611,10 @@ fn dispatch_array(
                 Ok(recv.clone())
             } else {
                 // Block-less: an Enumerator over the slices (MRI `each_slice`).
-                Ok(with_host(|h| h.new_enumerator(slices, "each")))
+                let tag = format!("each_slice({n})");
+                Ok(with_host(|h| {
+                    h.new_enumerator_of(slices, &tag, recv.clone())
+                }))
             }
         }
         // Split into runs at each adjacent pair the block "breaks" on:
@@ -8994,6 +9034,28 @@ fn proc_truthy(p: &Value, elem: &Value) -> Result<bool, String> {
     Ok(with_host(|h| h.truthy(&r)))
 }
 
+/// Call a lazy pipeline block on `elem`, spreading it when it is the packed form
+/// of a multi-value yield. MRI splits the LAZY operations differently from the
+/// eager ones: `map`, `flat_map`, `filter_map`, `take_while` and `drop_while`
+/// yield the raw values (so a one-parameter block binds the first), while `select`
+/// and `reject` pack them first. Verified against ruby 4.0.6 on
+/// `[10, 20].each_with_index.lazy`:
+///   `.take_while { |x| x == 10 }.to_a`         → `[[10, 0]]` (saw 10)
+///   `.select     { |x| x.is_a?(Array) }.to_a` → both  (saw the pair)
+/// Note this is not the eager split: eager `drop_while` sees the PAIR.
+fn call_lazy_block(p: &Value, elem: &Value) -> Result<Value, String> {
+    match with_host(|h| h.as_array(elem)).filter(|_| with_host(|h| h.is_multi_yield(elem))) {
+        Some(vals) if vals.len() > 1 => call_proc(p, &vals),
+        _ => call_proc(p, std::slice::from_ref(elem)),
+    }
+}
+
+/// [`call_lazy_block`], as a predicate.
+fn lazy_block_truthy(p: &Value, elem: &Value) -> Result<bool, String> {
+    let r = call_lazy_block(p, elem)?;
+    Ok(with_host(|h| h.truthy(&r)))
+}
+
 /// `Enumerator::Lazy` methods. Intermediate operations (`map`, `select`, …)
 /// append to the deferred pipeline and return a new lazy enumerator; terminal
 /// operations (`first`, `force`, `to_a`) pull elements on demand.
@@ -9083,7 +9145,7 @@ fn lazy_feed(
     }
     match &ops[i] {
         LazyOp::Map(p) => {
-            let v = call_proc(p, std::slice::from_ref(&elem))?;
+            let v = call_lazy_block(p, &elem)?;
             lazy_feed(ops, state, i + 1, v, out, limit)
         }
         LazyOp::Select(p) => {
@@ -9101,7 +9163,7 @@ fn lazy_feed(
             }
         }
         LazyOp::FilterMap(p) => {
-            let v = call_proc(p, std::slice::from_ref(&elem))?;
+            let v = call_lazy_block(p, &elem)?;
             if with_host(|h| h.truthy(&v)) {
                 lazy_feed(ops, state, i + 1, v, out, limit)
             } else {
@@ -9109,7 +9171,7 @@ fn lazy_feed(
             }
         }
         LazyOp::FlatMap(p) => {
-            let v = call_proc(p, std::slice::from_ref(&elem))?;
+            let v = call_lazy_block(p, &elem)?;
             let items = with_host(|h| h.as_array(&v)).unwrap_or_else(|| vec![v]);
             for sub in items {
                 if !lazy_feed(ops, state, i + 1, sub, out, limit)? {
@@ -9119,7 +9181,7 @@ fn lazy_feed(
             Ok(true)
         }
         LazyOp::TakeWhile(p) => {
-            if proc_truthy(p, &elem)? {
+            if lazy_block_truthy(p, &elem)? {
                 lazy_feed(ops, state, i + 1, elem, out, limit)
             } else {
                 Ok(false)
@@ -9127,7 +9189,7 @@ fn lazy_feed(
         }
         LazyOp::DropWhile(p) => {
             let dropping = matches!(state[i], LazyState::Dropping(true));
-            if dropping && proc_truthy(p, &elem)? {
+            if dropping && lazy_block_truthy(p, &elem)? {
                 Ok(true)
             } else {
                 state[i] = LazyState::Dropping(false);
@@ -9317,8 +9379,17 @@ fn dispatch_enumerator(
                         }
                     }
                     // `each` / `each_with_index` / unknown: side effects only,
-                    // return the enumerated elements (MRI returns the receiver).
-                    _ => collected.push(x.clone()),
+                    // return the enumerated elements. Over a multi-yield source
+                    // those are the elements walked, not the pairs yielded —
+                    // `[10, 20].each_with_index.with_index { }` is `[10, 20]`.
+                    _ => collected.push(
+                        match with_host(|h| h.as_array(x))
+                            .filter(|_| is_multi_yield_source(&method))
+                        {
+                            Some(vals) if vals.len() > 1 => vals[0].clone(),
+                            _ => x.clone(),
+                        },
+                    ),
                 }
             }
             Ok(new_arr(collected))
@@ -9346,13 +9417,60 @@ fn dispatch_enumerator(
                 .collect();
             Ok(with_host(|h| h.new_enumerator(pairs, "each")))
         }
+        // `each` runs the block over the buffered values and answers the OBJECT
+        // being iterated — `[1, 2, 3, 4].each_slice(2).each { }` is `[1, 2, 3, 4]`,
+        // which the buffer cannot reconstruct (`each_cons` windows overlap). A
+        // multi-yield iteration hands the block both values; `each_entry` exists
+        // precisely to hand it the packed one, and answers the enumerator itself.
+        "each" | "each_entry" if args.is_empty() && block.is_some() => {
+            let b = block.unwrap();
+            let spread = name == "each"
+                && with_host(|h| h.enum_method(recv)).is_some_and(|m| is_multi_yield_source(&m));
+            for x in &buf {
+                match with_host(|h| h.as_array(x)).filter(|vals| spread && vals.len() > 1) {
+                    Some(vals) => call_proc(&b, &vals)?,
+                    None => call_proc(&b, std::slice::from_ref(x))?,
+                };
+                if has_pending_signal() {
+                    break;
+                }
+            }
+            if name == "each_entry" {
+                return Ok(recv.clone());
+            }
+            // Re-running `each_with_object` answers the MEMO, not the receiver,
+            // and every buffered pair carries it. With nothing buffered there is
+            // no memo to read — and an empty source means the recorded receiver
+            // is empty too, which is what MRI's memo prints as.
+            if with_host(|h| h.enum_method(recv)).is_some_and(|m| m.starts_with("each_with_object"))
+            {
+                if let Some(memo) = buf
+                    .first()
+                    .and_then(|p| with_host(|h| h.as_array(p)))
+                    .and_then(|vals| vals.get(1).cloned())
+                {
+                    return Ok(memo);
+                }
+            }
+            Ok(with_host(|h| h.enum_source(recv)).unwrap_or_else(|| new_arr(buf)))
+        }
+        // Consumers that DECIDE with the block but answer with the SOURCE
+        // elements, over a source that yields two values per iteration. The two
+        // reshapes are independent, so neither the buffer nor the block argument
+        // alone can carry it: the block binds the first value while the element
+        // kept (or counted) is still the packed pair.
+        _ if args.is_empty()
+            && block.is_some()
+            && (BLOCK_RESULT_CONSUMERS.contains(&name)
+                || SPLIT_YIELD_CONSUMERS.contains(&name))
+            && with_host(|h| h.enum_method(recv)).is_some_and(|m| is_multi_yield_source(&m)) =>
+        {
+            multi_yield_consume(name, &buf, &block.unwrap(), true)
+        }
         // Every non-iteration message is delegated to the buffered values as an
         // Array, preserving the full Enumerable surface (`map`, `to_a`,
         // `select`, …) that block-less calls exposed before Enumerator existed.
-        _ => {
-            let buf = project_multi_yield(recv, name, &buf, block.as_ref());
-            remap_array_delegate(dispatch_array(&new_arr(buf), name, args, block), recv, name)
-        }
+        _ => remap_array_delegate(dispatch_array(&new_arr(buf), name, args, block), recv, name),
     }
 }
 
@@ -9365,7 +9483,15 @@ fn dispatch_yielder(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
         "<<" | "yield" => {
             let v = match args {
                 [single] => single.clone(),
-                many => new_arr(many.to_vec()),
+                // `y.yield a, b` yields TWO values. The buffer holds them packed
+                // (that is the element `to_a` sees), and the pack is marked so a
+                // consumer can still hand the block both — MRI's
+                // `rb_enum_values_pack` vs `rb_yield_values2` split.
+                many => {
+                    let packed = new_arr(many.to_vec());
+                    with_host(|h| h.mark_multi_yield(&packed));
+                    packed
+                }
             };
             // On the external-iteration path the block runs inside a Fiber:
             // suspend it with this value so `Enumerator#next` gets exactly one
@@ -9398,59 +9524,138 @@ const MULTI_YIELD_SOURCES: &[&str] = &[
     "with_object",
 ];
 
-/// The consumers whose result is built from what the BLOCK returns, so handing
-/// the block one value instead of the packed pair is the whole difference.
-///
-/// MRI splits here and the split is not cosmetic — `collect_i` yields the raw
-/// values (a one-parameter block binds the first) while `select_i` packs them
-/// first (a one-parameter block binds the pair). Verified against ruby 4.0.6
-/// with a discriminating block on `[10, 20].each_with_index`:
+/// Whether an Enumerator built by `method` yields TWO values per iteration. The
+/// tag can carry the arguments it was built with (`each_with_object([])`), which
+/// `inspect` shows, so only the name in front of them selects.
+fn is_multi_yield_source(method: &str) -> bool {
+    let name = method.split_once('(').map_or(method, |(n, _)| n);
+    MULTI_YIELD_SOURCES.contains(&name)
+}
+
+/// The consumers whose result is built from what the BLOCK returns. Handing the
+/// block the two yielded values instead of the packed pair is the whole
+/// difference: `collect_i` yields the raw values, `select_i` packs them first.
+/// Verified against ruby 4.0.6 on `[10, 20].each_with_index`:
 ///   `.map    { |x| x == 10 }` → `[true, false]`   (block saw 10)
 ///   `.select { |x| x == 10 }` → `[]`              (block saw `[10, 0]`)
-/// Consumers that *collect source elements* (`select`, `reject`, `take_while`,
-/// `sort_by`, `group_by`, `partition`, `find`) are deliberately absent: even
-/// where their block sees the first value, their result is made of the packed
-/// pairs, so projecting the buffer would corrupt it.
-const BLOCK_RESULT_CONSUMERS: &[&str] = &[
-    "map",
-    "collect",
-    "flat_map",
-    "collect_concat",
-    "filter_map",
-    "each",
+const BLOCK_RESULT_CONSUMERS: &[&str] =
+    &["map", "collect", "flat_map", "collect_concat", "filter_map"];
+
+/// The consumers whose BLOCK sees the yielded values while their ANSWER is built
+/// from the packed source elements. MRI reshapes the two independently
+/// (`take_while_i` yields the raw values, then keeps the packed entry), so no
+/// single reshape of the buffer can express them: projecting the buffer corrupts
+/// the answer, leaving it packed mis-binds the block.
+///
+/// Verified against ruby 4.0.6 on `[10, 20].each_with_index` with a
+/// discriminating one-parameter block:
+///   `.take_while { |x| x == 10 }`        → `[[10, 0]]` (saw 10, kept the pair)
+///   `.count      { |x| x.is_a?(Array) }` → `0`
+///   `.find_index { |x| x.is_a?(Array) }` → `nil`
+///   `.all?       { |x| x.is_a?(Array) }` → `false`
+/// `select`, `reject`, `sort_by`, `group_by`, `partition`, `drop_while`, `find`,
+/// `min_by`/`max_by`, `sum`, `uniq` and `inject` are deliberately absent —
+/// measured the same way, their block DOES see the packed pair.
+const SPLIT_YIELD_CONSUMERS: &[&str] = &[
+    "take_while",
+    "count",
+    "find_index",
+    "any?",
+    "all?",
+    "none?",
+    "one?",
 ];
 
-/// Project a multi-yield enumerator's buffered `[a, b]` entries down to `a` when
-/// the block can only bind one of them.
+/// Run a [`BLOCK_RESULT_CONSUMERS`] or [`SPLIT_YIELD_CONSUMERS`] consumer over a
+/// source that yields TWO values per iteration (`each_with_index`,
+/// `each_with_object`), whose buffer holds them packed as a pair.
 ///
-/// The buffer stores each iteration's yielded values packed as a pair, which is
-/// right for `to_a` and for a two-parameter block, but a one-parameter block in
-/// MRI binds just the first value: `[1, 2].each_with_index.map { |x| x }` is
-/// `[1, 2]`, not `[[1, 0], [2, 1]]`. Arity drives the choice, matching
-/// `yield_pair`, so `{ |x, i| }`, `{ _1 + _2 }` and `{ |*a| }` still see both.
-fn project_multi_yield(
-    recv: &Value,
+/// The block is called with the two values SPREAD, so Ruby's own binding rules
+/// do the reshaping: `{ |x| }` binds the first, `{ |x, i| }` binds both, `{ |*a| }`
+/// collects `[x, i]`, and a strict `->(x){}` raises `ArgumentError` exactly as MRI
+/// does. The answer is built from the packed element, independently. Each
+/// consumer stops where MRI stops — the block can have side effects.
+fn multi_yield_consume(
     name: &str,
     buf: &[Value],
-    block: Option<&Value>,
-) -> Vec<Value> {
-    let Some(b) = block else {
-        return buf.to_vec();
+    block: &Value,
+    pair_source: bool,
+) -> Result<Value, String> {
+    // The values this iteration yielded. Every element of a pair source is a
+    // pack by construction; a generator's buffer can mix packs and plain arrays,
+    // so there the mark decides (`y.yield 1, 2` vs `y << [1, 2]`).
+    let yielded = |v: &Value| {
+        let packed = pair_source || with_host(|h| h.is_multi_yield(v));
+        match with_host(|h| h.as_array(v)).filter(|_| packed) {
+            Some(vals) if vals.len() > 1 => vals,
+            _ => vec![v.clone()],
+        }
     };
-    if !BLOCK_RESULT_CONSUMERS.contains(&name) {
-        return buf.to_vec();
+    let mut collected: Vec<Value> = Vec::new();
+    let mut hits: i64 = 0;
+    for (i, x) in buf.iter().enumerate() {
+        let r = call_proc(block, &yielded(x))?;
+        let t = with_host(|h| h.truthy(&r));
+        match name {
+            "map" | "collect" => collected.push(r),
+            "flat_map" | "collect_concat" => match with_host(|h| h.as_array(&r)) {
+                Some(xs) => collected.extend(xs),
+                None => collected.push(r),
+            },
+            "filter_map" => {
+                if t {
+                    collected.push(r);
+                }
+            }
+            "each" => {}
+            "take_while" => {
+                if !t {
+                    break;
+                }
+                collected.push(x.clone());
+            }
+            "find_index" => {
+                if t {
+                    return Ok(Value::Int(i as i64));
+                }
+            }
+            "any?" => {
+                if t {
+                    return Ok(Value::Bool(true));
+                }
+            }
+            "all?" => {
+                if !t {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            "none?" => {
+                if t {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            // `one?` has to keep going to see a SECOND match, but no further.
+            "one?" | "count" => {
+                hits += t as i64;
+                if name == "one?" && hits > 1 {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            _ => {}
+        }
     }
-    let multi = with_host(|h| h.enum_method(recv))
-        .is_some_and(|m| MULTI_YIELD_SOURCES.contains(&m.as_str()));
-    if !multi || with_host(|h| h.proc_arity(b)).is_none_or(|a| a > 1 || a < 0) {
-        return buf.to_vec();
-    }
-    buf.iter()
-        .map(|v| match with_host(|h| h.as_array(v)) {
-            Some(pair) if !pair.is_empty() => pair[0].clone(),
-            _ => v.clone(),
-        })
-        .collect()
+    Ok(match name {
+        // `each` answers the object the enumerator iterates — for a multi-yield
+        // source that is the elements it walked, not the pairs it yielded:
+        // `[10, 20].each_with_index.each { }` is `[10, 20]` in MRI.
+        "each" => new_arr(buf.iter().map(|x| yielded(x)[0].clone()).collect()),
+        "count" => Value::Int(hits),
+        "find_index" => Value::Undef,
+        "any?" => Value::Bool(false),
+        "all?" | "none?" => Value::Bool(true),
+        "one?" => Value::Bool(hits == 1),
+        _ => new_arr(collected),
+    })
 }
 
 /// Hand a Hash entry to a block as either two separate values or the packed
@@ -11340,7 +11545,13 @@ fn dispatch_generator(
         "each" if block.is_some() => {
             let bl = block.unwrap();
             for v in drive_generator(gblock, usize::MAX)? {
-                call_proc(&bl, std::slice::from_ref(&v))?;
+                // A `y.yield a, b` iteration hands the block BOTH values, so a
+                // one-parameter block binds `a` and `{ |*x| }` collects both.
+                match with_host(|h| h.as_array(&v)).filter(|_| with_host(|h| h.is_multi_yield(&v)))
+                {
+                    Some(vals) => call_proc(&bl, &vals)?,
+                    None => call_proc(&bl, std::slice::from_ref(&v))?,
+                };
             }
             Ok(recv.clone())
         }
@@ -11383,6 +11594,16 @@ fn dispatch_generator(
         // generators; an infinite one hangs here exactly as it does in MRI.
         _ => {
             let buf = drive_generator(gblock, usize::MAX)?;
+            // A generator that yielded MULTI values per iteration (`y.yield a, b`)
+            // hands the block both, while its answer is built from the packs.
+            if let Some(b) = block.as_ref().filter(|_| {
+                args.is_empty()
+                    && (BLOCK_RESULT_CONSUMERS.contains(&name)
+                        || SPLIT_YIELD_CONSUMERS.contains(&name))
+                    && buf.iter().any(|v| with_host(|h| h.is_multi_yield(v)))
+            }) {
+                return multi_yield_consume(name, &buf, b, false);
+            }
             dispatch_array(&new_arr(buf), name, args, block)
         }
     }

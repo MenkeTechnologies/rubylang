@@ -1904,6 +1904,94 @@ fn method_objects_batch() {
     );
 }
 
+/// A source that yields TWO values per iteration reshapes the block argument and
+/// the collected element independently. These assert both halves of MRI's split
+/// at once, so a change that "fixes" one by projecting the buffer fails here.
+#[test]
+fn multi_yield_reshapes_block_and_element_independently() {
+    let e = "e = [10, 20].each_with_index\n";
+    // Block sees the first value; the answer keeps the packed pair.
+    eq(&format!("{e}e.take_while {{ |x| x == 10 }}"), "[[10, 0]]");
+    eq(&format!("{e}e.count {{ |x| x.is_a?(Array) }}"), "0");
+    eq(&format!("{e}e.find_index {{ |x| x.is_a?(Array) }}"), "nil");
+    eq(&format!("{e}e.all? {{ |x| x.is_a?(Array) }}"), "false");
+    eq(&format!("{e}e.any? {{ |x| x.is_a?(Array) }}"), "false");
+    eq(&format!("{e}e.none? {{ |x| x.is_a?(Array) }}"), "true");
+    // The other half of the split: these DO see the packed pair.
+    eq(
+        &format!("{e}e.select {{ |x| x.is_a?(Array) }}"),
+        "[[10, 0], [20, 1]]",
+    );
+    eq(
+        &format!("{e}e.drop_while {{ |x| x == 10 }}"),
+        "[[10, 0], [20, 1]]",
+    );
+    eq(&format!("{e}e.find {{ |x| x == 20 }}"), "nil");
+    // Ruby's binding rules do the reshaping, so a splat collects both values.
+    eq(&format!("{e}e.map {{ |*a| a }}"), "[[10, 0], [20, 1]]");
+    eq(&format!("{e}e.map {{ |x| x }}"), "[10, 20]");
+    eq(
+        &format!("{e}e.take_while {{ |*a| a[0] == 10 }}"),
+        "[[10, 0]]",
+    );
+    // `y.yield a, b` yields two values; `y << [a, b]` yields one that is an array.
+    eq(
+        "Enumerator.new { |y| y.yield 1, 2; y.yield 3, 4 }.take_while { |a| a < 3 }",
+        "[[1, 2]]",
+    );
+    eq(
+        "Enumerator.new { |y| y << [1, 2]; y << [3, 4] }.map { |a| a }",
+        "[[1, 2], [3, 4]]",
+    );
+    // `each_entry` is the one that always packs.
+    eq(
+        &format!("{e}got = []\ne.each_entry {{ |x| got << x }}\ngot"),
+        "[[10, 0], [20, 1]]",
+    );
+}
+
+/// An Enumerator answers the object it iterates, which its buffer cannot
+/// reconstruct — `each_cons` windows overlap, and `each_with_object` answers the
+/// memo. `.lazy` over one has its own split, measured separately from the eager
+/// one (lazy `drop_while` sees the first value, eager `drop_while` the pair).
+#[test]
+fn enumerator_source_and_lazy_pipeline() {
+    eq("[1, 2, 3, 4].each_slice(2).each { |x| x }", "[1, 2, 3, 4]");
+    eq("[1, 2, 3].each_cons(2).each { |x| x }", "[1, 2, 3]");
+    eq("[10, 20].each_with_index.each { |x| x }", "[10, 20]");
+    eq("[10, 20].each_with_object([]).each { |x| x }", "[]");
+    eq(
+        "[1, 2, 3, 4].each_slice(2).inspect",
+        "\"#<Enumerator: [1, 2, 3, 4]:each_slice(2)>\"",
+    );
+    // Block-less `each_with_object` is an Enumerator of `[elem, memo]` pairs.
+    eq("[10, 20].each_with_object([]).to_a", "[[10, []], [20, []]]");
+    // A lazy pipeline over a source that is not an Array must not be empty.
+    eq("{a: 1, b: 2}.lazy.map { |k, v| k }.to_a", "[:a, :b]");
+    eq(
+        "{a: 1, b: 2}.lazy.select { |k, v| v < 2 }.to_a",
+        "[[:a, 1]]",
+    );
+    eq(
+        "Enumerator.new { |y| y << 1; y << 2 }.lazy.map { |x| x * 2 }.to_a",
+        "[2, 4]",
+    );
+    let e = "e = [10, 20].each_with_index\n";
+    eq(&format!("{e}e.lazy.map {{ |x| x }}.to_a"), "[10, 20]");
+    eq(
+        &format!("{e}e.lazy.take_while {{ |x| x == 10 }}.to_a"),
+        "[[10, 0]]",
+    );
+    eq(
+        &format!("{e}e.lazy.drop_while {{ |x| x == 10 }}.to_a"),
+        "[[20, 1]]",
+    );
+    eq(
+        &format!("{e}e.lazy.select {{ |x| x.is_a?(Array) }}.to_a"),
+        "[[10, 0], [20, 1]]",
+    );
+}
+
 /// A built-in's `#arity`/`#owner`/`#parameters` come from the table of what MRI
 /// declares (`src/arity_table.rs`), so the assertions here are the encoding
 /// itself: a fixed count when every parameter is required, `-(required + 1)` once

@@ -637,6 +637,7 @@ enum Mode {
     Objintro,
     Blockflow,
     Methobj,
+    Multiyield,
 }
 
 const ALL_MODES: &[Mode] = &[
@@ -681,6 +682,7 @@ const ALL_MODES: &[Mode] = &[
     Mode::Objintro,
     Mode::Blockflow,
     Mode::Methobj,
+    Mode::Multiyield,
 ];
 
 fn gen_intmeth(seed: u64) -> Vec<String> {
@@ -1232,6 +1234,124 @@ fn gen_kernelconv(seed: u64) -> Vec<String> {
     })
 }
 
+/// Sources that yield TWO values per iteration (`each_with_index`,
+/// `each_with_object`, `y.yield a, b`) driven through every kind of consumer,
+/// plus `.lazy` over a non-Array source.
+///
+/// The reshaping is per consumer and not derivable: `take_while`'s block sees the
+/// first value while the element it keeps is the packed pair, `select`'s block
+/// sees the pair, and `map`'s sees the first. A generator that varies only the
+/// consumer, or only the block shape, cannot tell those apart — this one varies
+/// both, and the block shapes include the ones with different binding rules
+/// (`{ |x| }`, `{ |x, i| }`, `{ |*a| }`).
+fn gen_multiyield(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    // Sources whose every iteration yields two values.
+    let pair_srcs = [
+        "[10, 20, 30].each_with_index",
+        "[10, 20].each_with_object([])",
+        "%w[a b c].each_with_index",
+        "(1..3).each_with_index",
+        "Enumerator.new { |y| y.yield 1, 2; y.yield 3, 4 }",
+        "Enumerator.new { |y| y.yield 5, 6 }",
+    ];
+    // Sources whose iteration yields ONE value that happens to be an array — the
+    // control group: their block must NOT see it unpacked.
+    let pack_srcs = [
+        "{a: 1, b: 2}",
+        "[[1, 2], [3, 4]]",
+        "[1, 2, 3, 4].each_slice(2)",
+        "[1, 2, 3].each_cons(2)",
+        "Enumerator.new { |y| y << [1, 2]; y << [3, 4] }",
+    ];
+    // Block bodies that DISCRIMINATE: their answer differs depending on whether
+    // the block was handed the first value or the packed pair.
+    let probes = [
+        "{ |x| x.is_a?(Array) }",
+        "{ |x| x.to_s.size > 1 }",
+        "{ |x, i| x.is_a?(Array) }",
+        "{ |*a| a.size > 1 }",
+        "{ |x, i| i.nil? }",
+    ];
+    let src = if r.below(3) == 0 {
+        r.pick(&pack_srcs)
+    } else {
+        r.pick(&pair_srcs)
+    };
+    let b = r.pick(&probes);
+    // Consumers split three ways in MRI: block sees the first value and the
+    // answer is the block's, block sees the first value but the answer is the
+    // source element, block sees the packed pair.
+    // `each_entry` is absent on purpose: its value is the Enumerator itself, and
+    // a generator-backed one inspects with its address, which is not comparable.
+    let consumers = [
+        "map",
+        "collect",
+        "flat_map",
+        "filter_map",
+        "take_while",
+        "count",
+        "find_index",
+        "any?",
+        "all?",
+        "none?",
+        "one?",
+        "select",
+        "filter",
+        "reject",
+        "sort_by",
+        "group_by",
+        "partition",
+        "drop_while",
+        "find",
+        "detect",
+        "min_by",
+        "max_by",
+        "uniq",
+        "find_all",
+    ];
+    one(match r.below(10) {
+        0 => format!("p({src}.{} {b})", r.pick(&consumers)),
+        1 => format!("p({src}.to_a)"),
+        2 => format!("{src}.each {b}\np :done"),
+        // `Enumerator#each` answers the object being iterated — except on a
+        // generator, where MRI answers the generator block's own value (a
+        // Yielder, which has no `to_a`, so the reference run only errors). See
+        // BUGS.md; the case is not spent on a snippet MRI itself rejects.
+        3 if !src.starts_with("Enumerator.new") => {
+            format!("p({src}.each {} .to_a)", "{ |x| x }")
+        }
+        3 => format!("p({src}.to_a.size)"),
+        4 => format!("p({src}.map {b})"),
+        5 => format!("p({src}.take_while {b})"),
+        6 => format!(
+            "p({src}.lazy.{} {b}.first(2))",
+            r.pick(&[
+                "map",
+                "select",
+                "take_while",
+                "reject",
+                "filter_map",
+                "drop_while"
+            ])
+        ),
+        7 => format!("p({src}.lazy.map {} .to_a)", "{ |x| x }"),
+        8 => format!("p({src}.each_with_object([]) {} )", "{ |x, acc| acc << x }"),
+        _ => format!(
+            "p({src}.{} {b})",
+            r.pick(&[
+                "count",
+                "find_index",
+                "any?",
+                "all?",
+                "none?",
+                "one?",
+                "take_while"
+            ])
+        ),
+    })
+}
+
 /// `Method`/`UnboundMethod` reflection: `#arity`, `#owner`, `#parameters`,
 /// `#name`, `#curry` over BUILT-IN methods as well as written ones.
 ///
@@ -1509,6 +1629,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Objintro => gen_objintro(seed),
         Mode::Blockflow => gen_blockflow(seed),
         Mode::Methobj => gen_methobj(seed),
+        Mode::Multiyield => gen_multiyield(seed),
     }
 }
 
@@ -1798,6 +1919,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Objintro => "objintro",
         Mode::Blockflow => "blockflow",
         Mode::Methobj => "methobj",
+        Mode::Multiyield => "multiyield",
     }
 }
 
