@@ -1107,13 +1107,18 @@ fn gen_rational(seed: u64) -> Vec<String> {
         // are derived from, pinned separately so a fix can't satisfy the
         // operators by making `<=>` raise too.
         14 => format!("p(Rational({a}, {b}) <=> Float::NAN)"),
-        // Reached through Comparable's other two derived methods, and through
-        // the sort that uses `<=>` directly.
+        // The same operator reached as a METHOD rather than as a native op.
+        // `reduce(:<)` and `send` go through Rational dispatch while `r < x`
+        // goes through the numeric hook, and the two used to be separate paths
+        // that could disagree.
         15 => format!(
-            "begin\n  p(Rational({a}, {b}).clamp(Rational({c}, {d}), Float::NAN))\nrescue ArgumentError => e\n  p e.message\nend"
+            "begin\n  p(Rational({a}, {b}).send(:{relop}, {operand}))\nrescue => e\n  p [e.class, e.message]\nend"
         ),
+        // Ordering that SUCCEEDS against every numeric class, pinned next to the
+        // failures so a fix cannot satisfy them by making Rational refuse to
+        // compare with anything.
         _ => format!(
-            "begin\n  p([Rational({a}, {b}), Float::NAN].sort)\nrescue ArgumentError => e\n  p e.message\nend"
+            "p [Rational({a}, {b}) {relop} Rational({c}, {d}), Rational({a}, {b}) {relop} {c}, Rational({a}, {b}) {relop} {c}.0, Rational({a}, {b}) {relop} (10 ** 20)]"
         ),
     })
 }

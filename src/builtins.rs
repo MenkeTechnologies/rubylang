@@ -4603,16 +4603,11 @@ fn comparable_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<
             v => Ok(Some(as_i(&v))),
         }
     };
-    let cmp_err = |other: &Value| -> String {
-        raise_exc(
-            "ArgumentError",
-            &format!(
-                "comparison of {} with {} failed",
-                with_host(|h| h.class_of(recv)),
-                with_host(|h| h.class_of(other)),
-            ),
-        )
-    };
+    // Shares MRI's `rb_cmperr` rendering with the numeric ordering paths. It
+    // used to name the operand by its CLASS unconditionally, which is right for
+    // a String or an Array and wrong for a Float or a special constant: MRI
+    // prints those by `inspect`, so a NaN operand reads `NaN`, not `Float`.
+    let cmp_err = |other: &Value| -> String { with_host(|h| h.cmp_failed(recv, other)) };
     match name {
         "<" | "<=" | ">" | ">=" => {
             let o = &args[0];
@@ -4627,12 +4622,22 @@ fn comparable_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<
             };
             Ok(Some(Value::Bool(b)))
         }
+        // MRI compares against `min` first and returns false immediately when the
+        // receiver is below it, so a `max` that cannot be compared is never
+        // reached in that case. Each comparison also reports ITS OWN operand:
+        // blaming `lo` for a `hi` that failed names the wrong value.
         "between?" => {
             let (lo, hi) = (&args[0], &args[1]);
-            let (Some(a), Some(b)) = (spaceship(lo)?, spaceship(hi)?) else {
+            let Some(a) = spaceship(lo)? else {
                 return Err(cmp_err(lo));
             };
-            Ok(Some(Value::Bool(a >= 0 && b <= 0)))
+            if a < 0 {
+                return Ok(Some(Value::Bool(false)));
+            }
+            let Some(b) = spaceship(hi)? else {
+                return Err(cmp_err(hi));
+            };
+            Ok(Some(Value::Bool(b <= 0)))
         }
         "clamp" => {
             let (lo, hi) = (&args[0], &args[1]);
@@ -16697,6 +16702,20 @@ pub fn numeric_hook(op: fusevm::NumOp, a: &Value, b: &Value) -> Result<Value, St
             && with_host(|h| h.find_method_owner(&cls, "<=>")).is_some()
         {
             let cmp = call_instance_method(a.clone(), &cls, "<=>", std::slice::from_ref(b), None)?;
+            // A nil `<=>` means the pair cannot be ranked. Comparable splits on
+            // it: the four ORDERING operators raise ArgumentError, while `==`
+            // answers false (and `!=` true) without raising. Both used to read
+            // the nil through `as_i` as 0, so `<` answered false and `==`
+            // answered TRUE -- reporting two values that cannot be compared as
+            // equal. The method forms (`x.send(:<, y)`) already raised, so the
+            // native operator disagreed with its own method.
+            if matches!(cmp, Value::Undef) {
+                return match op {
+                    Eq => Ok(Value::Bool(false)),
+                    Ne => Ok(Value::Bool(true)),
+                    _ => Err(with_host(|h| h.cmp_failed(a, b))),
+                };
+            }
             let c = as_i(&cmp);
             return Ok(Value::Bool(match op {
                 Lt => c < 0,

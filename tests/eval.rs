@@ -6018,3 +6018,196 @@ fn set_ordering_predicates_still_answer_booleans() {
     eqs("Set[1, 2] == Set[2, 1]", "true");
     eqs("Set[1] == Set[2]", "false");
 }
+
+#[test]
+fn rational_ordering_raises_when_the_operands_cannot_be_ranked() {
+    // Rational takes `< <= > >=` from Comparable, so they are DERIVED from
+    // `<=>`. When `<=>` answers nil the operator raises ArgumentError; it does
+    // not answer false. These all returned false, because the Float branch of
+    // the numeric hook compared `to_f` values and NaN loses every IEEE test.
+    let msg = |src: &str| {
+        format!("begin; {src}; rescue ArgumentError => e; e.message; else; :no_raise; end")
+    };
+    for op in ["<", ">", "<=", ">="] {
+        eq(
+            &msg(&format!("Rational(1, 2) {op} Float::NAN")),
+            "\"comparison of Rational with NaN failed\"",
+        );
+    }
+    // Reached as a method rather than as a native operator -- a separate path.
+    eq(
+        &msg("Rational(1, 2).send(:<, Float::NAN)"),
+        "\"comparison of Rational with NaN failed\"",
+    );
+    // An operand with no rational value at all raised NoMethodError before.
+    eq(
+        &msg("Rational(1, 2) < 'x'"),
+        "\"comparison of Rational with String failed\"",
+    );
+    // `<=>` itself answers nil rather than raising -- the value the operators
+    // are derived from.
+    eq("Rational(1, 2) <=> Float::NAN", "nil");
+}
+
+#[test]
+fn only_the_rational_receiver_raises_float_stays_ieee() {
+    // The asymmetry is the whole point, and it is what makes "raise whenever an
+    // operand is NaN" the wrong fix: `Float#<` is its own method and never
+    // consults `<=>`, so a NaN on the LEFT is plain IEEE and answers false.
+    eq("Float::NAN < Rational(1, 2)", "false");
+    eq("Float::NAN > Rational(1, 2)", "false");
+    eq("Float::NAN <= Rational(1, 2)", "false");
+    eq("Float::NAN >= Rational(1, 2)", "false");
+    // Integer and Float receivers are IEEE against a NaN too, and must not have
+    // been dragged into raising.
+    eq("1 < Float::NAN", "false");
+    eq("1.0 < Float::NAN", "false");
+    eq("Float::NAN < 1", "false");
+}
+
+#[test]
+fn rational_ordering_that_succeeds_still_succeeds() {
+    // Pinned so a fix cannot satisfy the raising cases by making Rational
+    // refuse to compare with anything. Every numeric class, both directions.
+    eq("Rational(1, 2) < Rational(2, 3)", "true");
+    eq("Rational(1, 2) < 1", "true");
+    eq("Rational(1, 2) < 0.75", "true");
+    eq("Rational(1, 2) > 0.25", "true");
+    eq("Rational(1, 2) <= Rational(1, 2)", "true");
+    eq("Rational(1, 2) >= Rational(1, 2)", "true");
+    eq("Rational(3, 2) > 1", "true");
+    eq("Rational(1, 2) < (10 ** 20)", "true");
+    eq("1 < Rational(3, 2)", "true");
+    eq("0.25 < Rational(1, 2)", "true");
+    eq("Rational(1, 2) == 0.5", "true");
+}
+
+#[test]
+fn comparison_failure_names_the_operand_the_way_mri_does() {
+    // MRI's rb_cmperr prints the operand by `inspect` when it is a Float or a
+    // special constant and by its CLASS otherwise. Naming everything by class
+    // reports a NaN as "Float", which is the wrong value entirely.
+    let msg = |src: &str| {
+        format!("begin; {src}; rescue ArgumentError => e; e.message; else; :no_raise; end")
+    };
+    // Rendered by inspect.
+    eq(
+        &msg("Rational(1, 2) < Float::NAN"),
+        "\"comparison of Rational with NaN failed\"",
+    );
+    eq(
+        &msg("Rational(1, 2) < nil"),
+        "\"comparison of Rational with nil failed\"",
+    );
+    eq(
+        &msg("Rational(1, 2) < :sym"),
+        "\"comparison of Rational with :sym failed\"",
+    );
+    // Rendered by class.
+    eq(
+        &msg("Rational(1, 2) < 'x'"),
+        "\"comparison of Rational with String failed\"",
+    );
+    eq(
+        &msg("Rational(1, 2) < [1]"),
+        "\"comparison of Rational with Array failed\"",
+    );
+    eq(
+        &msg("Rational(1, 2) < Object.new"),
+        "\"comparison of Rational with Object failed\"",
+    );
+    // The same renderer serves a user Comparable class, which used to name the
+    // operand by class unconditionally.
+    eq(
+        &msg("class K; include Comparable; def <=>(o); nil; end; end; K.new < Float::NAN"),
+        "\"comparison of K with NaN failed\"",
+    );
+}
+
+#[test]
+fn comparable_between_reports_the_operand_that_failed() {
+    // `between?` compares against min FIRST and returns false immediately when
+    // the receiver is below it, so an uncomparable max is never reached in that
+    // case. When it is reached, the message names max -- blaming min for a max
+    // that failed names the wrong value.
+    let src = "class J; include Comparable; attr_reader :v; def initialize(v); @v = v; end; \
+               def <=>(o); o.is_a?(J) ? v <=> o.v : nil; end; end; ";
+    let msg = |body: &str| {
+        format!("{src}begin; {body}; rescue ArgumentError => e; e.message; else; :no_raise; end")
+    };
+    eq(
+        &format!("{src}J.new(2).between?(J.new(1), J.new(3))"),
+        "true",
+    );
+    eq(
+        &format!("{src}J.new(4).between?(J.new(1), J.new(3))"),
+        "false",
+    );
+    // Below min: short-circuits to false without ever ranking the bad max.
+    eq(&format!("{src}J.new(0).between?(J.new(1), 'bad')"), "false");
+    // Above min: the bad max IS reached, and it is what the message names.
+    eq(
+        &msg("J.new(2).between?(J.new(1), 'bad')"),
+        "\"comparison of J with String failed\"",
+    );
+    // A bad min is named too.
+    eq(
+        &msg("J.new(2).between?('bad', J.new(3))"),
+        "\"comparison of J with String failed\"",
+    );
+}
+
+#[test]
+fn a_nil_spaceship_splits_ordering_from_equality_on_the_native_path() {
+    // A native `x < y` on a user Comparable class went through the numeric hook,
+    // which read the `<=>` result with as_i -- turning nil into 0. So `<`
+    // answered false and, worse, `==` answered TRUE: two values that cannot be
+    // compared reported themselves equal. The method forms already raised, so
+    // the operator disagreed with its own method.
+    let k = "class K; include Comparable; def <=>(o); nil; end; end; ";
+    let msg = |body: &str| {
+        format!("{k}begin; {body}; rescue ArgumentError => e; e.message; else; :no_raise; end")
+    };
+    // The four ordering operators raise, natively and as methods alike.
+    for op in ["<", ">", "<=", ">="] {
+        eq(
+            &msg(&format!("K.new {op} 1")),
+            "\"comparison of K with 1 failed\"",
+        );
+        eq(
+            &msg(&format!("K.new.send(:{op}, 1)")),
+            "\"comparison of K with 1 failed\"",
+        );
+    }
+    // `==` and `!=` answer instead of raising -- Comparable#== rescues the
+    // incomparable case, so an unrankable pair is simply not equal.
+    eq(&format!("{k}K.new == 1"), "false");
+    eq(&format!("{k}K.new != 1"), "true");
+    // The operand rendering is the shared rb_cmperr one here too.
+    eq(
+        &msg("K.new < Float::NAN"),
+        "\"comparison of K with NaN failed\"",
+    );
+    eq(
+        &msg("K.new < 'x'"),
+        "\"comparison of K with String failed\"",
+    );
+}
+
+#[test]
+fn a_ranking_spaceship_still_drives_the_native_comparable_operators() {
+    // Pinned so the nil handling above cannot be satisfied by making every
+    // user Comparable comparison raise.
+    let n = "class N; include Comparable; attr_reader :v; def initialize(v); @v = v; end; \
+             def <=>(o); v <=> o.v; end; end; ";
+    eq(&format!("{n}N.new(1) < N.new(2)"), "true");
+    eq(&format!("{n}N.new(2) < N.new(1)"), "false");
+    eq(&format!("{n}N.new(2) > N.new(1)"), "true");
+    eq(&format!("{n}N.new(1) <= N.new(1)"), "true");
+    eq(&format!("{n}N.new(1) >= N.new(1)"), "true");
+    eq(&format!("{n}N.new(1) == N.new(1)"), "true");
+    eq(&format!("{n}N.new(1) != N.new(2)"), "true");
+    eq(&format!("{n}N.new(2).between?(N.new(1), N.new(3))"), "true");
+    eq(&format!("{n}N.new(2).clamp(N.new(3), N.new(4)).v"), "3");
+    eq(&format!("{n}[N.new(3), N.new(1)].sort.map(&:v)"), "[1, 3]");
+}

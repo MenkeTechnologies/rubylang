@@ -6357,6 +6357,31 @@ impl RubyHost {
         }
     }
 
+    /// MRI's `rb_cmperr`: the `ArgumentError` a `Comparable` operator raises
+    /// when `<=>` answers nil.
+    ///
+    /// The operand is NAMED by `inspect` when it is a Float or a special
+    /// constant — so a NaN reads `NaN` and `nil`/`:sym` read as themselves —
+    /// and by its CLASS otherwise (`String`, `Array`, `Object`). MRI switches on
+    /// `SPECIAL_CONST_P(y) || RB_FLOAT_TYPE_P(y)`; the equivalent here is a
+    /// non-heap `Value` plus Symbol, which is a heap object here but a special
+    /// constant there.
+    pub fn cmp_failed(&mut self, recv: &Value, other: &Value) -> String {
+        let by_inspect = match other {
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Undef => true,
+            _ => matches!(self.obj(other), Some(RObj::Symbol(_))),
+        };
+        let rhs = if by_inspect {
+            self.inspect(other)
+        } else {
+            self.class_of(other)
+        };
+        crate::builtins::raise_exc(
+            "ArgumentError",
+            &format!("comparison of {} with {rhs} failed", self.class_of(recv)),
+        )
+    }
+
     // ---- numeric hook (Ruby semantics for non-native operands) ------------
 
     /// Called by fusevm when a native numeric op has a non-`Int`/`Float`
@@ -6431,6 +6456,25 @@ impl RubyHost {
                 Le => return Ok(Value::Bool(x <= y)),
                 Ge => return Ok(Value::Bool(x >= y)),
                 _ => {}
+            }
+        }
+        // Rational takes `< <= > >=` from Comparable, so they are DERIVED from
+        // `Rational#<=>`: when that answers nil the operator raises rather than
+        // answering false. The two cases where it answers nil are a NaN operand
+        // and an operand with no rational value at all.
+        //
+        // Only when the RECEIVER is the Rational. `Float::NAN < Rational(1, 2)`
+        // is `Float#<`, which is plain IEEE and answers false without ever
+        // consulting `<=>`, so the check cannot be written as "either side is a
+        // NaN" -- it is asymmetric, exactly as MRI is.
+        if matches!(op, Lt | Gt | Le | Ge) && matches!(self.obj(a), Some(RObj::Rational(_))) {
+            let comparable = match b {
+                Value::Float(f) => !f.is_nan(),
+                Value::Int(_) => true,
+                _ => self.as_rational(b).is_some(),
+            };
+            if !comparable {
+                return Err(self.cmp_failed(a, b));
             }
         }
         // Rational arithmetic (an integer operand is promoted to a rational). A
