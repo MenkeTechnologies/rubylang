@@ -5968,3 +5968,53 @@ fn regexp_options_is_the_bitmask_equality_uses() {
     eq("/a/im.inspect", "\"/a/mi\"");
     eq("/a/xmi.inspect", "\"/a/mix\"");
 }
+
+#[test]
+fn set_spaceship_is_the_subset_relation_not_an_ordering() {
+    let pre = "require 'set'; ";
+    let eqs = |src: &str, want: &str| eq(&format!("{pre}{src}"), want);
+    // Equal sets compare 0 regardless of insertion order.
+    eqs("Set[1, 2] <=> Set[2, 1]", "0");
+    eqs("Set[] <=> Set[]", "0");
+    // Proper subset / proper superset.
+    eqs("Set[1, 2] <=> Set[1, 2, 3]", "-1");
+    eqs("Set[1, 2, 3] <=> Set[1, 2]", "1");
+    eqs("Set[] <=> Set[1]", "-1");
+    eqs("Set[1] <=> Set[]", "1");
+    // Neither contains the other: nil, NOT an ordered answer. This is the case
+    // an element-wise fallback gets wrong, since it always answers -1/0/1.
+    eqs("Set[1] <=> Set[2]", "nil");
+    eqs("Set[1, 2] <=> Set[2, 3]", "nil");
+    eqs("Set[1, 2, 3] <=> Set[1, 4]", "nil");
+    // A non-Set operand is nil. An Array used to pass through to Array#<=> and
+    // answer 0 here.
+    eqs("Set[1, 2] <=> [1, 2]", "nil");
+    eqs("Set[1, 2] <=> nil", "nil");
+    eqs("Set[1] <=> 1", "nil");
+    eqs("Set[1] <=> 'a'", "nil");
+}
+
+#[test]
+fn set_ordering_predicates_still_answer_booleans() {
+    // `<=>` shares its subset/superset computation with these four, and they
+    // arrive as NATIVE comparison ops rerouted into Set dispatch rather than
+    // through the method path, so they are pinned separately: dropping any one
+    // of them raises NoMethodError rather than answering wrong.
+    let pre = "require 'set'; ";
+    let eqs = |src: &str, want: &str| eq(&format!("{pre}{src}"), want);
+    eqs("Set[1] < Set[1, 2]", "true");
+    eqs("Set[1, 2] < Set[1, 2]", "false");
+    eqs("Set[1, 2] > Set[1]", "true");
+    eqs("Set[1, 2] > Set[1, 2]", "false");
+    eqs("Set[1] <= Set[1]", "true");
+    eqs("Set[1, 2] <= Set[1]", "false");
+    eqs("Set[1, 2] >= Set[1, 2]", "true");
+    eqs("Set[1] >= Set[1, 2]", "false");
+    eqs("Set[1].subset?(Set[1, 2])", "true");
+    eqs("Set[1, 2].superset?(Set[1])", "true");
+    eqs("Set[1].proper_subset?(Set[1, 2])", "true");
+    eqs("Set[1, 2].proper_superset?(Set[1])", "true");
+    // `==` stays value equality, independent of `<=>`.
+    eqs("Set[1, 2] == Set[2, 1]", "true");
+    eqs("Set[1] == Set[2]", "false");
+}

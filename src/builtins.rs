@@ -12582,6 +12582,30 @@ fn dispatch_set(
             let superset = o.iter().all(|w| set_member(&items, w));
             Ok(Value::Bool(superset && items.len() > o.len()))
         }
+        // `Set#<=>` is a SUBSET-RELATION comparison, not an ordering: 0 when the
+        // sets are equal, -1/1 for a proper subset/superset, and nil when
+        // neither contains the other.
+        //
+        // Unlike the algebra methods above, which take an Array operand through
+        // `other()`, `<=>` answers nil for anything that is not a Set. Both
+        // halves used to be wrong in different ways: a Set operand reached
+        // `Array#<=>` through the delegate below, whose own guard rejects a Set
+        // and returned nil for every pair including equal ones, while an ARRAY
+        // operand passed that guard and got an ordered element-wise answer
+        // (`Set[1, 2] <=> [1, 2]` was 0).
+        "<=>" if !args.is_empty() => {
+            let Some(o) = with_host(|h| h.as_set(&args[0])) else {
+                return Ok(Value::Undef);
+            };
+            let subset = items.iter().all(|v| set_member(&o, v));
+            let superset = o.iter().all(|w| set_member(&items, w));
+            Ok(match (subset, superset) {
+                (true, true) => Value::Int(0),
+                (true, false) => Value::Int(-1),
+                (false, true) => Value::Int(1),
+                (false, false) => Value::Undef,
+            })
+        }
         "disjoint?" => {
             let o = other();
             Ok(Value::Bool(!items.iter().any(|v| set_member(&o, v))))
