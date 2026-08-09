@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 /// Bump on any incompatible change to `CProg` / the lowering.
-const SCHEMA: u64 = 4;
+const SCHEMA: u64 = 5;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
@@ -65,8 +65,20 @@ type CClass = (
 type CRescue = (Vec<String>, Option<usize>, Option<String>, usize);
 /// (body proc id, rescues, ensure proc id) — a serde-flat begin block.
 type CBegin = (usize, Vec<CRescue>, Option<usize>);
-/// (params, splat index, chunk) — a serde-flat proc template.
-type CProc = (Vec<String>, Option<usize>, Chunk);
+/// (params, splat index, chunk, req, opt, keyword names, required keywords,
+/// `**rest` present, `&blk` name) — a serde-flat proc template. The trailing
+/// fields are the written parameter shape a lambda is arity-checked against.
+type CProc = (
+    Vec<String>,
+    Option<usize>,
+    Chunk,
+    u16,
+    u16,
+    Vec<String>,
+    Vec<String>,
+    bool,
+    Option<String>,
+);
 
 /// The inner, serde/bincode form of a compiled program. Tuples keep the shape
 /// flat so `fusevm::Chunk`'s serde impl is the only nontrivial dependency.
@@ -275,7 +287,19 @@ fn to_cprog(prog: &Program) -> CProg {
         procs: prog
             .procs
             .iter()
-            .map(|p| (p.params.clone(), p.splat, p.chunk.clone()))
+            .map(|p| {
+                (
+                    p.params.clone(),
+                    p.splat,
+                    p.chunk.clone(),
+                    p.arity.req,
+                    p.arity.opt,
+                    p.arity.kwnames.clone(),
+                    p.arity.kwreq.clone(),
+                    p.arity.kwsplat,
+                    p.arity.blockparam.clone(),
+                )
+            })
             .collect(),
     }
 }
@@ -328,11 +352,21 @@ fn from_cprog(cp: CProg) -> Program {
         procs: cp
             .procs
             .into_iter()
-            .map(|(params, splat, chunk)| ProcDef {
-                params,
-                splat,
-                chunk,
-            })
+            .map(
+                |(params, splat, chunk, req, opt, kwnames, kwreq, kwsplat, blockparam)| ProcDef {
+                    params,
+                    splat,
+                    chunk,
+                    arity: crate::ast::BlockArity {
+                        req,
+                        opt,
+                        kwnames,
+                        kwreq,
+                        kwsplat,
+                        blockparam,
+                    },
+                },
+            )
             .collect(),
     }
 }

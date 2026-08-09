@@ -306,8 +306,10 @@ Alongside the fixed corpus, a **differential parity fuzzer** — `cargo run --bi
 parity-fuzz` — generates thousands of seed-deterministic Ruby snippets across
 grammar-driven modes (arithmetic, float shortest-repr, slicing, enumerables,
 format specs, `case`/`when`, loop control flow including `redo`, Hash-through-
-Enumerable, `Enumerator` external iteration, keyword arguments, metaprogramming
-hooks, `Comparable`/`Enumerable` mixins, …) and diffs stdout + exit code of the reference
+Enumerable, `Enumerator` external iteration and laziness, keyword arguments,
+lambda-vs-proc arity, metaprogramming hooks, `Comparable`/`Enumerable` mixins,
+`Set`, `Data`, `freeze`, object introspection, string encodings, `Complex`, …)
+and diffs stdout + exit code of the reference
 `ruby` against rubylang. Every divergence is delta-debugged to a minimal
 reproducer and replays exactly with `parity-fuzz --seed N --once`. It runs
 subprocesses only (never links the library) and needs a reference `ruby`, so CI

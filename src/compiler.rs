@@ -883,6 +883,7 @@ fn dummy_proc() -> ProcDef {
         params: vec![],
         splat: None,
         chunk: ChunkBuilder::new().build(),
+        arity: crate::ast::BlockArity::default(),
     }
 }
 
@@ -1433,6 +1434,7 @@ impl Compiler {
                             params: Vec::new(),
                             splat: None,
                             body: nondefs,
+                            arity: None,
                         }),
                     };
                     self.compile_expr(b, &call)?;
@@ -2208,6 +2210,7 @@ impl Compiler {
             params: vec![hidden],
             splat: None,
             body: inner,
+            arity: None,
         };
         let call = Expr::Call {
             recv: Some(Box::new(iter.clone())),
@@ -2315,6 +2318,7 @@ impl Compiler {
                                 block: None,
                             }
                             .into()],
+                            arity: None,
                         }),
                     };
                     self.compile_expr(b, &any)?;
@@ -2459,7 +2463,12 @@ impl Compiler {
         // through `compile_proc_body` is not — it only inherits the depth of
         // whatever encloses it), so track the nesting here.
         let saved_redo = std::mem::replace(&mut self.redo_ok, true);
-        let r = self.compile_proc_body(&block.body, &block.params, block.splat);
+        let r = self.compile_proc_body_arity(
+            &block.body,
+            &block.params,
+            block.splat,
+            block.arity.clone(),
+        );
         self.redo_ok = saved_redo;
         r
     }
@@ -2488,12 +2497,30 @@ impl Compiler {
         params: &[String],
         splat: Option<usize>,
     ) -> Result<usize, String> {
+        self.compile_proc_body_arity(body, params, splat, None)
+    }
+
+    /// As [`compile_proc_body`], with the written parameter shape a lambda is
+    /// arity-checked against. `None` (a synthesized block) means every param is
+    /// a plain required positional.
+    fn compile_proc_body_arity(
+        &mut self,
+        body: &[Stmt],
+        params: &[String],
+        splat: Option<usize>,
+        arity: Option<crate::ast::BlockArity>,
+    ) -> Result<usize, String> {
+        let arity = arity.unwrap_or_else(|| crate::ast::BlockArity {
+            req: params.len().saturating_sub(splat.is_some() as usize) as u16,
+            ..Default::default()
+        });
         let chunk = self.compile_body_chunk(body)?;
         let id = self.procs.len();
         self.procs.push(ProcDef {
             params: params.to_vec(),
             splat,
             chunk,
+            arity,
         });
         Ok(id)
     }
@@ -2726,6 +2753,7 @@ impl Compiler {
                                     params: Vec::new(),
                                     splat: None,
                                     body: sc_nondefs,
+                                    arity: None,
                                 }),
                             }
                             .into(),
@@ -3355,6 +3383,7 @@ fn lower_find_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
             params: vec![s_name],
             splat: None,
             body: vec![scan.into()],
+            arity: None,
         }),
     };
     let found = Expr::Begin {

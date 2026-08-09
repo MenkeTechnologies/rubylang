@@ -53,6 +53,28 @@ pub enum VarKind {
     Const,    // Foo
 }
 
+/// The shape of a block/lambda parameter list as written, kept alongside the
+/// flattened `params` because the parser desugars defaults and keyword params
+/// into body preludes (and appends a synthetic keyword-capture param), erasing
+/// the counts a lambda's `ArgumentError` and `Proc#arity` are computed from.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BlockArity {
+    /// Positional params with no default, on both sides of a `*rest` (a
+    /// post-splat param is required too). Excludes the splat, the `&blk`
+    /// capture, and any `|x; local|` block-locals.
+    pub req: u16,
+    /// Positional params with a default (`|x = 1|`).
+    pub opt: u16,
+    /// Every declared keyword param name, in order (`a:` and `b: 1` alike).
+    pub kwnames: Vec<String>,
+    /// The keyword params with no default — the ones whose absence raises.
+    pub kwreq: Vec<String>,
+    /// A `**rest` keyword collector is present.
+    pub kwsplat: bool,
+    /// `&blk` capture parameter name, if any.
+    pub blockparam: Option<String>,
+}
+
 /// A block literal attached to a method call (`do |x| … end` or `{ |x| … }`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
@@ -61,6 +83,9 @@ pub struct Block {
     /// surplus positional args into an array).
     pub splat: Option<usize>,
     pub body: Vec<Stmt>,
+    /// The written parameter shape. `None` for a compiler/parser-synthesized
+    /// block, whose params are all plain and required.
+    pub arity: Option<BlockArity>,
 }
 
 /// A Ruby expression.

@@ -11,10 +11,50 @@
 use crate::ast::*;
 use crate::lexer::{lex, Tok, Token};
 
+/// A block/lambda parameter list under construction. `params`/`splat` are the
+/// flat form the runtime binds by position; `preludes` are the assignments
+/// prepended to the body that re-create defaults, keyword extraction and `(a,
+/// b)` destructuring; `arity` records the shape as written, which the flat form
+/// no longer shows (see [`BlockArity`]).
+#[derive(Default)]
+struct ParamAcc {
+    params: Vec<String>,
+    splat: Option<usize>,
+    preludes: Vec<Expr>,
+    kwparams: Vec<(String, Option<Expr>)>,
+    kwsplat: Option<String>,
+    arity: BlockArity,
+}
+
+impl ParamAcc {
+    /// Finish the list: desugar any keyword params into a synthetic trailing
+    /// capture param plus preludes, and freeze the written arity.
+    fn finish(mut self) -> (Vec<String>, Option<usize>, Vec<Expr>, BlockArity) {
+        self.arity.kwnames = self.kwparams.iter().map(|(n, _)| n.clone()).collect();
+        self.arity.kwreq = self
+            .kwparams
+            .iter()
+            .filter(|(_, d)| d.is_none())
+            .map(|(n, _)| n.clone())
+            .collect();
+        self.arity.kwsplat = self.kwsplat.is_some();
+        if !self.kwparams.is_empty() || self.kwsplat.is_some() {
+            Parser::desugar_block_kwargs(
+                &mut self.params,
+                &mut self.preludes,
+                self.kwparams,
+                self.kwsplat,
+            );
+        }
+        (self.params, self.splat, self.preludes, self.arity)
+    }
+}
+
 /// A parsed block/lambda parameter list: the flat parameter names, the splat
-/// index (if any), and the destructuring "prelude" assignments to prepend to
-/// the block body (unpacking each `(a, b)` group from its temp parameter).
-type BlockParams = (Vec<String>, Option<usize>, Vec<Expr>);
+/// index (if any), the destructuring "prelude" assignments to prepend to
+/// the block body (unpacking each `(a, b)` group from its temp parameter), and
+/// the written parameter shape.
+type BlockParams = (Vec<String>, Option<usize>, Vec<Expr>, BlockArity);
 
 /// Synthetic local names the `...` forwarding sugar binds on both sides: a
 /// `def m(...)` captures the caller's args into these, and a nested `m(...)`
@@ -962,6 +1002,7 @@ impl Parser {
                 body: vec![
                     Expr::BlockPass(Box::new(Expr::Var(VarKind::Local, FWD_BLK.into()))).into(),
                 ],
+                arity: None,
             });
             return Ok(());
         }
@@ -1013,6 +1054,7 @@ impl Parser {
                     body: vec![
                         Expr::BlockPass(Box::new(Expr::Var(VarKind::Local, "&".into()))).into(),
                     ],
+                    arity: None,
                 });
                 return Ok(());
             }
@@ -1044,6 +1086,7 @@ impl Parser {
                     params: vec!["__symargs__".into()],
                     splat: Some(0),
                     body: vec![call.into()],
+                    arity: None,
                 });
                 return Ok(());
             }
@@ -1055,6 +1098,7 @@ impl Parser {
                 params: vec![],
                 splat: None,
                 body: vec![Expr::BlockPass(Box::new(e)).into()],
+                arity: None,
             });
             return Ok(());
         }
@@ -1096,7 +1140,7 @@ impl Parser {
         // Inside a loop/case condition a `do` binds to the enclosing keyword, not
         // to a call in the condition — leave it for the loop parser to consume.
         if !self.no_do_block && self.eat_kw("do") {
-            let (mut params, splat, preludes) = self.block_params()?;
+            let (mut params, splat, preludes, mut arity) = self.block_params()?;
             let track = params.is_empty() && splat.is_none();
             if track {
                 self.nparam_stack.push(0);
@@ -1115,17 +1159,20 @@ impl Parser {
                 for n in 1..=max {
                     params.push(format!("_{n}"));
                 }
+                // Numbered params (`_1`, `_2`) are ordinary required params.
+                arity.req = max as u16;
             }
             let body = self.prepend_preludes(preludes, rest);
             return Ok(Some(Block {
                 params,
                 splat,
                 body,
+                arity: Some(arity),
             }));
         }
         if self.is_op("{") {
             self.advance();
-            let (mut params, splat, preludes) = self.block_params()?;
+            let (mut params, splat, preludes, mut arity) = self.block_params()?;
             let track = params.is_empty() && splat.is_none();
             if track {
                 self.nparam_stack.push(0);
@@ -1147,12 +1194,14 @@ impl Parser {
                 for n in 1..=max {
                     params.push(format!("_{n}"));
                 }
+                arity.req = max as u16;
             }
             let body = self.prepend_preludes(preludes, body);
             return Ok(Some(Block {
                 params,
                 splat,
                 body,
+                arity: Some(arity),
             }));
         }
         Ok(None)
@@ -1176,31 +1225,15 @@ impl Parser {
     /// block body via ordinary parallel assignment (`a, b = __tmp`), so nested
     /// patterns become a sequence of flat assignments.
     fn block_params(&mut self) -> Result<BlockParams, String> {
-        let mut params = Vec::new();
-        let mut splat = None;
-        let mut preludes = Vec::new();
-        let mut kwparams: Vec<(String, Option<Expr>)> = Vec::new();
-        let mut kwsplat: Option<String> = None;
+        let mut acc = ParamAcc::default();
         if self.eat_op("|") {
             if !self.is_op("|") {
-                self.block_param(
-                    &mut params,
-                    &mut splat,
-                    &mut preludes,
-                    &mut kwparams,
-                    &mut kwsplat,
-                )?;
+                self.block_param(&mut acc)?;
                 while self.eat_op(",") {
                     if self.is_op("|") {
                         break; // trailing comma
                     }
-                    self.block_param(
-                        &mut params,
-                        &mut splat,
-                        &mut preludes,
-                        &mut kwparams,
-                        &mut kwsplat,
-                    )?;
+                    self.block_param(&mut acc)?;
                 }
             }
             // Explicit block-locals: `|i; tmp, other|`. The names after the `;`
@@ -1211,23 +1244,29 @@ impl Parser {
             // no new machinery.
             if matches!(self.peek(), Tok::Semicolon) {
                 self.advance();
-                while !self.is_op("|") {
-                    let name = self.ident_name()?;
-                    params.push(name);
-                    if !self.eat_op(",") {
-                        break;
-                    }
-                }
+                self.block_locals(&mut acc, "|")?;
             }
             self.expect_op("|")?;
         }
         // Block keyword params (`|a:, b: default, **rest|`) — the ProcDef carries
         // only positional names, so desugar: capture the trailing keyword Hash into
         // a synthetic positional param and extract each keyword in a prelude.
-        if !kwparams.is_empty() || kwsplat.is_some() {
-            Self::desugar_block_kwargs(&mut params, &mut preludes, kwparams, kwsplat);
+        Ok(acc.finish())
+    }
+
+    /// The `; a, b` tail of a parameter list: explicit block-locals. They bind
+    /// like never-passed trailing positional params (nil, block-scoped), so they
+    /// join `params` but count toward neither `req` nor `opt`. `close` is the
+    /// token that ends the list (`|` for a block, `)` for a lambda).
+    fn block_locals(&mut self, acc: &mut ParamAcc, close: &str) -> Result<(), String> {
+        while !self.is_op(close) {
+            let name = self.ident_name()?;
+            acc.params.push(name);
+            if !self.eat_op(",") {
+                break;
+            }
         }
-        Ok((params, splat, preludes))
+        Ok(())
     }
 
     /// The default expression of a keyword block param (`name: <default>`), or
@@ -1307,6 +1346,7 @@ impl Parser {
                         block: None,
                     }
                     .into()],
+                    arity: None,
                 }),
             };
             let value = Expr::If {
@@ -1326,51 +1366,45 @@ impl Parser {
     /// positional args), or a `(a, b)` destructuring group. Records the splat
     /// index when it sees `*`; a destructuring group pushes a fresh temp name as
     /// the parameter and appends its unpacking assignment(s) to `preludes`.
-    fn block_param(
-        &mut self,
-        params: &mut Vec<String>,
-        splat: &mut Option<usize>,
-        preludes: &mut Vec<Expr>,
-        kwparams: &mut Vec<(String, Option<Expr>)>,
-        kwsplat: &mut Option<String>,
-    ) -> Result<(), String> {
+    fn block_param(&mut self, acc: &mut ParamAcc) -> Result<(), String> {
         if self.is_op("(") {
             let (temp, assigns) = self.destructure_param()?;
-            params.push(temp);
-            preludes.extend(assigns);
+            acc.params.push(temp);
+            acc.preludes.extend(assigns);
+            acc.arity.req += 1;
             return Ok(());
         }
-        if self.eat_op("*") {
-            *splat = Some(params.len());
+        let is_splat = if self.eat_op("*") {
+            acc.splat = Some(acc.params.len());
             // Anonymous splat `->(*) { }` / `{ |*| }` — no binding name.
             if self.is_op(")")
                 || self.is_op("|")
                 || self.is_op(",")
                 || matches!(self.peek(), Tok::Newline | Tok::Semicolon)
             {
-                params.push("*".to_string());
+                acc.params.push("*".to_string());
                 return Ok(());
             }
-        }
+            true
+        } else {
+            false
+        };
         // `&block` — a block's own block-param captures the block passed to the
         // block, NOT a positional argument. Binding it as a positional param (after
         // a `*splat`) would make it consume the last positional arg — so
         // `{ |*args, &blk| }` called with one Array arg would splat that array and
         // hand its last element to `blk`, corrupting `*args`. This is exactly how
         // stdlib `DelegateClass`'s `define_method(:x=) { |*a, &b| … }` forwarder
-        // collapsed an assigned array to its first element. Bind it as a nil local
-        // via a prelude instead, keeping it out of positional binding.
+        // collapsed an assigned array to its first element. It is recorded as the
+        // block capture instead, bound by the caller (nil when no block is passed),
+        // keeping it out of positional binding.
         if self.eat_op("&") {
-            let name = self.ident_name()?;
-            preludes.push(Expr::Assign(
-                Box::new(Expr::Var(VarKind::Local, name)),
-                Box::new(Expr::Nil),
-            ));
+            acc.arity.blockparam = Some(self.ident_name()?);
             return Ok(());
         }
         // `**rest` — a keyword-splat collector (desugared from the trailing hash).
         if self.eat_op("**") {
-            *kwsplat = Some(self.ident_name().unwrap_or_else(|_| "__kwrest".to_string()));
+            acc.kwsplat = Some(self.ident_name().unwrap_or_else(|_| "__kwrest".to_string()));
             return Ok(());
         }
         // A keyword param label may be a reserved word (`|in: 1|`).
@@ -1381,7 +1415,7 @@ impl Parser {
             };
             self.advance(); // the `:`
             let default = self.block_kw_default()?;
-            kwparams.push((kname, default));
+            acc.kwparams.push((kname, default));
             return Ok(());
         }
         let name = self.ident_name()?;
@@ -1389,7 +1423,7 @@ impl Parser {
         if self.is_op(":") {
             self.advance(); // the `:`
             let default = self.block_kw_default()?;
-            kwparams.push((name, default));
+            acc.kwparams.push((name, default));
             return Ok(());
         }
         // `name = default` — a block-param default. A block binds a missing
@@ -1411,12 +1445,17 @@ impl Parser {
                 elifs: Vec::new(),
                 els: Some(vec![Expr::Var(VarKind::Local, name.clone()).into()]),
             };
-            preludes.push(Expr::Assign(
+            acc.preludes.push(Expr::Assign(
                 Box::new(Expr::Var(VarKind::Local, name.clone())),
                 Box::new(guard),
             ));
+            acc.arity.opt += 1;
+        } else if !is_splat {
+            // A named `*rest` is neither required nor optional — it absorbs the
+            // surplus — so only a plain positional name counts as required.
+            acc.arity.req += 1;
         }
-        params.push(name);
+        acc.params.push(name);
         Ok(())
     }
 
@@ -2387,6 +2426,7 @@ impl Parser {
                         params: Vec::new(),
                         splat: None,
                         body,
+                        arity: None,
                     };
                     let call = match e {
                         Expr::Call {
@@ -2846,31 +2886,20 @@ impl Parser {
     /// `->(params) { body }` / `-> { body }` / `->(x) do … end` — a lambda.
     fn lambda_lit(&mut self) -> Result<Expr, String> {
         self.expect_op("->")?;
-        let mut params = Vec::new();
-        let mut splat = None;
-        let mut preludes = Vec::new();
-        let mut kwparams: Vec<(String, Option<Expr>)> = Vec::new();
-        let mut kwsplat: Option<String> = None;
+        let mut acc = ParamAcc::default();
         let mut had_parens = false;
         if self.eat_op("(") {
             had_parens = true;
             if !self.is_op(")") {
-                self.block_param(
-                    &mut params,
-                    &mut splat,
-                    &mut preludes,
-                    &mut kwparams,
-                    &mut kwsplat,
-                )?;
+                self.block_param(&mut acc)?;
                 while self.eat_op(",") {
-                    self.block_param(
-                        &mut params,
-                        &mut splat,
-                        &mut preludes,
-                        &mut kwparams,
-                        &mut kwsplat,
-                    )?;
+                    self.block_param(&mut acc)?;
                 }
+            }
+            // `->(x; tmp) { … }` — explicit block-locals, as in `{ |x; tmp| }`.
+            if matches!(self.peek(), Tok::Semicolon) {
+                self.advance();
+                self.block_locals(&mut acc, ")")?;
             }
             self.expect_op(")")?;
         } else {
@@ -2878,21 +2907,13 @@ impl Parser {
             // parentheses, terminated by the `{`/`do` body.
             while matches!(self.peek(), Tok::Ident(_)) || self.is_op("*") || self.is_op("&") {
                 had_parens = true;
-                self.block_param(
-                    &mut params,
-                    &mut splat,
-                    &mut preludes,
-                    &mut kwparams,
-                    &mut kwsplat,
-                )?;
+                self.block_param(&mut acc)?;
                 if !self.eat_op(",") {
                     break;
                 }
             }
         }
-        if !kwparams.is_empty() || kwsplat.is_some() {
-            Self::desugar_block_kwargs(&mut params, &mut preludes, kwparams, kwsplat);
-        }
+        let (params, splat, preludes, arity) = acc.finish();
         // The body is a `{ … }` or `do … end` block. A lambda's `do…end` is
         // unambiguously its own body, so re-enable `do` here even inside a
         // no-paren command arg (`set :x, ->() do … end`), where surrounding arg
@@ -2911,6 +2932,7 @@ impl Parser {
                 params,
                 splat,
                 body,
+                arity: Some(arity),
             }))
         } else {
             Ok(Expr::Lambda(block))

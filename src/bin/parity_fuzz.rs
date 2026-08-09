@@ -627,6 +627,14 @@ enum Mode {
     Kwargs,
     Metaprog,
     Mixins,
+    Lambda,
+    Enumlazy,
+    Setops,
+    Frozen,
+    Datacls,
+    Strenc,
+    Complexnum,
+    Objintro,
 }
 
 const ALL_MODES: &[Mode] = &[
@@ -661,6 +669,14 @@ const ALL_MODES: &[Mode] = &[
     Mode::Kwargs,
     Mode::Metaprog,
     Mode::Mixins,
+    Mode::Lambda,
+    Mode::Enumlazy,
+    Mode::Setops,
+    Mode::Frozen,
+    Mode::Datacls,
+    Mode::Strenc,
+    Mode::Complexnum,
+    Mode::Objintro,
 ];
 
 fn gen_intmeth(seed: u64) -> Vec<String> {
@@ -1090,7 +1106,258 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Kwargs => gen_kwargs(seed),
         Mode::Metaprog => gen_metaprog(seed),
         Mode::Mixins => gen_mixins(seed),
+        Mode::Lambda => gen_lambda(seed),
+        Mode::Enumlazy => gen_enumlazy(seed),
+        Mode::Setops => gen_setops(seed),
+        Mode::Frozen => gen_frozen(seed),
+        Mode::Datacls => gen_datacls(seed),
+        Mode::Strenc => gen_strenc(seed),
+        Mode::Complexnum => gen_complexnum(seed),
+        Mode::Objintro => gen_objintro(seed),
     }
+}
+
+/// Lambda-vs-proc semantics: strict arity (a lambda raises where a block binds
+/// nil), no auto-splat, keyword/splat/block parameters, `arity`, `curry`,
+/// composition, `define_method` bodies, and `Method` objects. The arity check
+/// runs before the body, so the probe distinguishes "raised" from "ran".
+fn gen_lambda(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (a, b) = (r.range(0, 9), r.range(0, 9));
+    let guard =
+        |body: &str| format!("begin\n  p({body})\nrescue ArgumentError => e\n  p e.message\nend");
+    one(match r.below(24) {
+        0 => guard(&format!("->(x, y) {{ [x, y] }}.call({a})")),
+        1 => guard(&format!("->(x, y) {{ [x, y] }}.call({a}, {b}, 1)")),
+        2 => guard(&format!("->(x, y = {b}) {{ [x, y] }}.call({a})")),
+        3 => guard(&format!("->(x, *r) {{ [x, r] }}.call({a}, {b})")),
+        4 => guard("->(x, *r) { [x, r] }.call"),
+        5 => guard(&format!("->(k:) {{ k }}.call(k: {a})")),
+        6 => guard("->(k:) { k }.call"),
+        7 => guard(&format!("->(k:) {{ k }}.call(k: {a}, j: {b})")),
+        8 => guard(&format!("->(x, k: {b}) {{ [x, k] }}.call({a})")),
+        9 => guard(&format!("->(x, **o) {{ [x, o] }}.call({a}, z: {b})")),
+        10 => guard(&format!("proc {{ |x, y| [x, y] }}.call({a})")),
+        11 => guard(&format!("proc {{ |x, y| [x, y] }}.call({a}, {b}, 1)")),
+        12 => guard(&format!("lambda {{ |x, y| [x, y] }}.call({a})")),
+        13 => guard(&format!("[[{a}, {b}]].map(&->(x, y) {{ x + y }})")),
+        14 => guard(&format!("[[{a}, {b}]].map {{ |x, y| x + y }}")),
+        15 => "p [->(){}.arity, ->(x){}.arity, ->(x, y = 1){}.arity, ->(*a){}.arity, ->(k:){}.arity, ->(k: 1){}.arity]".to_string(),
+        16 => "p [proc{}.arity, proc{|x|}.arity, proc{|x, y = 1|}.arity, proc{|*a|}.arity, proc{|k: 1|}.arity]".to_string(),
+        17 => format!("p ->(x, y) {{ x + y }}.curry[{a}][{b}]"),
+        18 => guard(&format!("->(x, y) {{ x + y }}.curry.call({a}, {b}, 1)")),
+        19 => format!("f = ->(x) {{ x + {a} }} >> ->(y) {{ y * 2 }}\np [f.call({b}), f.lambda?]"),
+        20 => format!(
+            "class C\n  define_method(:m) {{ |x, y| [x, y] }}\nend\nbegin\n  p C.new.m({a})\nrescue ArgumentError => e\n  p e.message\nend"
+        ),
+        21 => format!(
+            "def m(x, y) = [x, y]\nbegin\n  p method(:m).call({a})\nrescue ArgumentError => e\n  p e.message\nend\np [method(:m).arity, method(:m).to_proc.lambda?]"
+        ),
+        22 => format!("p ->(&b) {{ b.call({a}) }}.call {{ |v| v * 2 }}"),
+        _ => format!(
+            "p [(->(x) {{ x > {a} }} === {b}), (case {b} when ->(x) {{ x > {a} }} then :hi else :lo end)]"
+        ),
+    })
+}
+
+/// Enumerator shape and laziness: which methods answer an Enumerator, the
+/// grouping methods (`chunk`/`chunk_while`/`slice_when`/`each_slice`/
+/// `each_cons`), and — the part that used to hang — block-less enumerator
+/// methods over an INFINITE source, bounded by `first`/`take`/`next`.
+fn gen_enumlazy(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let n = r.range(1, 3);
+    let k = r.range(2, 4);
+    let arr = "[1, 2, 4, 5, 7]";
+    let gen = "e = Enumerator.new { |y| i = 0; loop { y << i; i += 1 } }";
+    one(match r.below(22) {
+        0 => format!("p {arr}.each_slice({k}).class"),
+        1 => format!("p {arr}.each_cons({k}).class"),
+        2 => format!("p {arr}.chunk_while {{ |a, b| b == a + 1 }}.class"),
+        3 => format!("p {arr}.slice_when {{ |a, b| b > a + 1 }}.class"),
+        4 => format!("p {arr}.chunk {{ |x| x.even? }}.class"),
+        5 => format!("p {arr}.each_slice({k}).to_a"),
+        6 => format!("p {arr}.each_cons({k}).to_a"),
+        7 => format!("p {arr}.chunk_while {{ |a, b| b == a + 1 }}.to_a"),
+        8 => format!("p {arr}.slice_when {{ |a, b| b > a + 1 }}.to_a"),
+        9 => format!("p {arr}.chunk {{ |x| x.even? }}.to_a"),
+        10 => {
+            format!("begin\n  p {arr}.chunk_while\nrescue ArgumentError => e\n  p e.message\nend")
+        }
+        11 => format!("begin\n  p {arr}.slice_when\nrescue ArgumentError => e\n  p e.message\nend"),
+        12 => format!("{gen}\np e.first({k})"),
+        13 => format!("{gen}\np e.take({k})"),
+        14 => format!("{gen}\np e.each_slice({n}).first({k})"),
+        15 => format!("{gen}\np e.each_cons({n}).first({k})"),
+        16 => format!("{gen}\np e.each_with_index.first({k})"),
+        17 => format!("{gen}\np e.map.first({k})"),
+        18 => format!("{gen}\np e.each_with_object([]).first({n})"),
+        19 => format!("p (1..).each_slice({n}).first({k})"),
+        20 => format!("p (1..).each_with_index.first({k})"),
+        _ => format!("p (1..Float::INFINITY).each_cons({n}).first({k})"),
+    })
+}
+
+/// `Set`: construction, the algebra operators, mutation, and the predicates.
+fn gen_setops(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (a, b) = (r.range(1, 5), r.range(1, 5));
+    let pre = "require \"set\"";
+    one(match r.below(16) {
+        0 => format!("{pre}\np Set.new([{a}, {b}, {a}]).to_a.sort"),
+        1 => format!("{pre}\np (Set[{a}, {b}] | Set[3, 4]).to_a.sort"),
+        2 => format!("{pre}\np (Set[{a}, {b}, 3] & Set[3, 4]).to_a.sort"),
+        3 => format!("{pre}\np (Set[{a}, {b}, 3] - Set[3]).to_a.sort"),
+        4 => format!("{pre}\np (Set[{a}, {b}] ^ Set[{b}, 9]).to_a.sort"),
+        5 => format!("{pre}\np Set[{a}, {b}].include?({a})"),
+        6 => {
+            format!("{pre}\np [Set[{a}].subset?(Set[{a}, {b}]), Set[{a}, {b}].superset?(Set[{a}])]")
+        }
+        7 => {
+            format!("{pre}\ns = Set.new\ns << {a}\ns.add({b})\ns.add({a})\np [s.size, s.to_a.sort]")
+        }
+        8 => format!("{pre}\ns = Set[{a}, {b}, 3]\ns.delete({a})\np s.to_a.sort"),
+        9 => format!("{pre}\np Set[{a}, {b}].map {{ |x| x * 2 }}.sort"),
+        10 => format!("{pre}\np Set[{a}, {b}].select(&:even?).to_a.sort"),
+        11 => format!("{pre}\np [Set[{a}].empty?, Set.new.empty?]"),
+        12 => format!("{pre}\np (Set[{a}, {b}] == Set[{b}, {a}])"),
+        13 => format!("{pre}\np Set[{a}, {b}].disjoint?(Set[7, 8])"),
+        14 => format!("{pre}\np Set[{a}, {b}].to_a.sum"),
+        _ => format!("{pre}\np Set.new([{a}, {b}]).each_with_object([]) {{ |x, m| m << x }}.sort"),
+    })
+}
+
+/// `freeze`/`frozen?` and the `FrozenError` a mutation of a frozen object
+/// raises, plus how `dup`/`clone` carry (or drop) the frozen flag.
+fn gen_frozen(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (a, w) = (r.range(1, 9), ww(r));
+    one(match r.below(16) {
+        0 => format!("p [{a}.frozen?, :{w}.frozen?, nil.frozen?, true.frozen?]"),
+        1 => format!("p \"{w}\".freeze.frozen?"),
+        2 => format!("p [{a}, {a}].freeze.frozen?"),
+        3 => format!("p({{ a: {a} }}.freeze.frozen?)"),
+        4 => format!("begin\n  [{a}] .freeze << 1\nrescue => e\n  p e.class\nend"),
+        5 => format!("begin\n  \"{w}\".freeze << \"x\"\nrescue => e\n  p e.class\nend"),
+        6 => format!("begin\n  h = {{ a: {a} }}.freeze\n  h[:b] = 1\nrescue => e\n  p e.class\nend"),
+        7 => format!("s = \"{w}\".freeze\np [s.dup.frozen?, s.clone.frozen?]"),
+        8 => format!("s = \"{w}\".freeze\np s.clone(freeze: false).frozen?"),
+        9 => format!("a = [{a}].freeze\np [a.dup.frozen?, a.frozen?]"),
+        10 => format!("class C; end\nc = C.new.freeze\nbegin\n  c.instance_variable_set(:@x, {a})\nrescue => e\n  p e.class\nend"),
+        11 => format!("p \"{w}\".frozen?"),
+        12 => format!("p [{a}.freeze.equal?({a}), :{w}.freeze.equal?(:{w})]"),
+        13 => format!("a = [{a}, {a} + 1].freeze\np a.map {{ |x| x * 2 }}"),
+        14 => format!("p [(1..{a}).frozen?, ({a}..).frozen?]"),
+        _ => format!("s = \"{w}\"\ns.freeze\np [s.frozen?, s.upcase.frozen?]"),
+    })
+}
+
+/// `Data.define` value objects (Ruby 3.2+): construction both ways, `with`,
+/// equality, deconstruction and the errors a bad call raises.
+fn gen_datacls(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (a, b) = (r.range(0, 9), r.range(0, 9));
+    let d = "P = Data.define(:x, :y)";
+    one(match r.below(14) {
+        0 => format!("{d}\np P.new(x: {a}, y: {b}).to_h"),
+        1 => format!("{d}\np P.new({a}, {b}).to_h"),
+        2 => format!("{d}\np [P.new({a}, {b}).x, P.new({a}, {b}).y]"),
+        3 => format!("{d}\np P.new({a}, {b}) == P.new({a}, {b})"),
+        4 => format!("{d}\np P.new({a}, {b}).with(y: {b} + 1).to_h"),
+        5 => format!("{d}\np P.members"),
+        6 => format!("{d}\nbegin\n  P.new({a})\nrescue ArgumentError => e\n  p e.class\nend"),
+        7 => {
+            format!("{d}\nbegin\n  P.new({a}, {b}, 1)\nrescue ArgumentError => e\n  p e.class\nend")
+        }
+        8 => format!("{d}\np(case P.new({a}, {b})\n  in {{ x:, y: }} then [x, y]\n  end)"),
+        9 => format!("{d}\np P.new({a}, {b}).frozen?"),
+        10 => format!("{d}\np P.new({a}, {b}).deconstruct_keys([:x])"),
+        11 => format!("{d}\np P.new({a}, {b}).inspect.include?(\"x=\")"),
+        12 => format!("{d}\np [P.new({a}, {b}).hash == P.new({a}, {b}).hash]"),
+        _ => format!(
+            "{d}\nbegin\n  P.new(x: {a}, z: {b})\nrescue ArgumentError => e\n  p e.class\nend"
+        ),
+    })
+}
+
+/// String bytes/chars/encoding: the places a multibyte string makes character
+/// count, byte count and index disagree.
+fn gen_strenc(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let s = r.pick(&["héllo", "naïve", "日本語", "aéb", "straße", "abc"]);
+    let n = r.range(0, 3);
+    one(match r.below(16) {
+        0 => format!("p \"{s}\".length"),
+        1 => format!("p \"{s}\".bytesize"),
+        2 => format!("p \"{s}\".bytes.size"),
+        3 => format!("p \"{s}\".chars"),
+        4 => format!("p \"{s}\".encoding.to_s"),
+        5 => format!("p \"{s}\".valid_encoding?"),
+        6 => format!("p \"{s}\"[{n}]"),
+        7 => format!("p \"{s}\".reverse"),
+        8 => format!("p \"{s}\".upcase"),
+        9 => format!("p \"{s}\".each_char.to_a.size"),
+        10 => format!("p \"{s}\".each_byte.to_a.size"),
+        11 => format!("p \"{s}\".b.encoding.to_s"),
+        12 => format!("p \"{s}\".codepoints.size"),
+        13 => format!("p \"{s}\".sub(/./, \"X\")"),
+        14 => format!("p \"{s}\".scan(/./).size"),
+        _ => format!("p \"{s}\".slice({n}, 2)"),
+    })
+}
+
+/// `Complex` arithmetic and conversion, where the real/imaginary parts keep
+/// their own numeric types.
+fn gen_complexnum(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (a, b, c, d) = (r.range(-4, 5), r.range(-4, 5), r.range(1, 5), r.range(1, 5));
+    one(match r.below(14) {
+        0 => format!("p Complex({a}, {b}) + Complex({c}, {d})"),
+        1 => format!("p Complex({a}, {b}) - Complex({c}, {d})"),
+        2 => format!("p Complex({a}, {b}) * Complex({c}, {d})"),
+        3 => format!("p Complex({a}, {b}) / Complex({c}, {d})"),
+        4 => format!("p [Complex({a}, {b}).real, Complex({a}, {b}).imaginary]"),
+        5 => format!("p Complex({a}, {b}).conjugate"),
+        6 => format!("p Complex({a}, {b}).abs2"),
+        7 => format!("p Complex({a}, {b}) == Complex({a}, {b})"),
+        8 => format!("p Complex({a}, {b}).to_s"),
+        9 => format!("p ({a} + {b}i)"),
+        10 => format!("p Complex({a}, 0).to_i"),
+        11 => format!("p Complex({a}, {b}).rectangular"),
+        12 => format!("p [Complex({a}, {b}).zero?, Complex(0, 0).zero?]"),
+        _ => format!("p Complex({a}, {b}) * {c}"),
+    })
+}
+
+/// Object introspection that needs no `ObjectSpace`: class/ancestry queries,
+/// instance variables, method lists, and the `tap`/`then` value pipeline.
+fn gen_objintro(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (a, w) = (r.range(1, 9), ww(r));
+    let cls =
+        format!("class C\n  def initialize; @x = {a}; @y = \"{w}\"; end\n  def m(z) = z\nend");
+    one(match r.below(18) {
+        0 => format!("{cls}\np C.new.instance_variables.sort"),
+        1 => format!("{cls}\np C.new.instance_variable_get(:@x)"),
+        2 => format!("{cls}\np C.new.instance_variable_defined?(:@z)"),
+        3 => format!("{cls}\np C.instance_methods(false).sort"),
+        4 => format!("{cls}\np C.new.respond_to?(:m)"),
+        5 => format!("{cls}\np [C.new.is_a?(C), C.new.is_a?(Object), C.new.kind_of?(Comparable)]"),
+        6 => format!("{cls}\np C.ancestors.first(2).map(&:to_s)"),
+        7 => format!("{cls}\np C.new.class.name"),
+        8 => format!("p [{a}.class, \"{w}\".class, :{w}.class, nil.class, (1..2).class]"),
+        9 => format!("p {a}.then {{ |x| x * 2 }}"),
+        10 => format!("p [{a}].tap {{ |x| x << {a} }}"),
+        11 => format!("{cls}\np C.new.methods.include?(:m)"),
+        12 => format!("{cls}\np [C.new.respond_to?(:m), C.new.respond_to?(:nope)]"),
+        13 => format!("{cls}\np C.superclass.to_s"),
+        14 => "p Integer.ancestors.include?(Comparable)".to_string(),
+        15 => format!(
+            "{cls}\nc = C.new\nc.instance_variable_set(:@z, {a})\np c.instance_variable_get(:@z)"
+        ),
+        16 => format!("p [{a}.singleton_class.to_s.start_with?(\"#<Class\"), Integer.name]"),
+        _ => format!("{cls}\np C.new.public_methods(false).sort"),
+    })
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1126,6 +1393,14 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Kwargs => "kwargs",
         Mode::Metaprog => "metaprog",
         Mode::Mixins => "mixins",
+        Mode::Lambda => "lambda",
+        Mode::Enumlazy => "enumlazy",
+        Mode::Setops => "setops",
+        Mode::Frozen => "frozen",
+        Mode::Datacls => "datacls",
+        Mode::Strenc => "strenc",
+        Mode::Complexnum => "complexnum",
+        Mode::Objintro => "objintro",
     }
 }
 

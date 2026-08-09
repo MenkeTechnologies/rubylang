@@ -189,6 +189,26 @@ pub enum LazyOp {
     Zip(Vec<Vec<Value>>),
 }
 
+/// How a derived generator reshapes the values its source yields. This is what
+/// keeps a block-less enumerator method on an INFINITE source lazy: instead of
+/// materializing the source and delegating to Array, the result is another
+/// generator that applies `Derive` to the source's values on demand.
+#[derive(Debug, Clone)]
+pub enum Derive {
+    /// Pass values through (block-less `each`/`map`/`select`/… all re-yield the
+    /// element sequence unchanged).
+    Each,
+    /// `each_slice(n)` — consecutive groups of `n` (a short final group only
+    /// once the source runs out).
+    Slice(usize),
+    /// `each_cons(n)` — every sliding window of `n`.
+    Cons(usize),
+    /// `each_with_index`/`with_index(offset)` — `[value, index]` pairs.
+    WithIndex(i64),
+    /// `each_with_object(obj)` — `[value, obj]` pairs.
+    WithObject(Value),
+}
+
 /// A heap object — the Ruby reference types.
 /// A `Generator`'s external-iteration state — MRI's `enumerator.c` fiber model.
 ///
@@ -284,6 +304,17 @@ pub enum RObj {
     /// with a yielder, it repeats the captured elements forever. The yielder's
     /// limit bounds it for `first(n)`/`take(n)` exactly like a `loop {}` generator.
     CycleProc(Vec<Value>),
+    /// A native generator body yielding `lo, lo+1, lo+2, …` forever: the driving
+    /// block of the Enumerator an endless Range (`(1..)`) answers a block-less
+    /// enumerator method with. Bounded by the consumer, like `CycleProc`.
+    SeqProc(i64),
+    /// A native generator body that reshapes another generator's values. `src` is
+    /// that source generator's own driving block (re-run from the start on each
+    /// batch, as generator blocks are pure); `kind` is the transform.
+    DeriveProc {
+        src: Box<Value>,
+        kind: Derive,
+    },
     /// A bound `Method` object (`obj.method(:name)`): the captured receiver plus
     /// the method name. `#call(*args)` routes back through dispatch on the stored
     /// receiver; `#to_proc` yields a callable that closes over both.
@@ -495,6 +526,13 @@ pub enum ProcKind {
     /// A partially-applied proc: it needs `arity` total args and has already
     /// gathered `collected`; when full it runs the base `template`/`scope`.
     Curried { arity: usize, collected: Vec<Value> },
+    /// `Method#curry` — the same gathering, but the full call invokes the bound
+    /// `target` Method rather than a proc template.
+    MethodCurried {
+        target: Box<Value>,
+        arity: usize,
+        collected: Vec<Value>,
+    },
     /// Function composition: call `first`, feed its result to `second`.
     /// `f >> g` builds `{ first: f, second: g }`; `f << g` builds `{ first: g,
     /// second: f }`.
@@ -610,6 +648,11 @@ pub struct ProcDef {
     /// Index of a `*rest` splat parameter, if any.
     pub splat: Option<usize>,
     pub chunk: Chunk,
+    /// The parameter shape as written. A plain block ignores it (blocks bind
+    /// leniently), but a lambda — `->`, `lambda { }`, `Method#to_proc`, a
+    /// `define_method` body — is arity-checked against it exactly like a `def`,
+    /// and `Proc#arity` is computed from it for both.
+    pub arity: crate::ast::BlockArity,
 }
 
 /// One method activation (or the top level): its captured scope plus the args it
@@ -1844,6 +1887,24 @@ impl RubyHost {
         let block = self.alloc(RObj::CycleProc(buf));
         self.new_generator(block)
     }
+    /// The Enumerator a block-less enumerator method on a generator answers
+    /// with: the source's own driving block, reshaped by `kind`. Nothing is
+    /// pulled here, so an infinite source stays infinite.
+    pub fn new_derived_enumerator(&mut self, src_block: Value, kind: Derive) -> Value {
+        let block = match kind {
+            Derive::Each => src_block,
+            kind => self.alloc(RObj::DeriveProc {
+                src: Box::new(src_block),
+                kind,
+            }),
+        };
+        self.new_generator(block)
+    }
+    /// The same, for an endless Range: its element sequence is `lo, lo+1, …`.
+    pub fn new_endless_range_enumerator(&mut self, lo: i64, kind: Derive) -> Value {
+        let seq = self.alloc(RObj::SeqProc(lo));
+        self.new_derived_enumerator(seq, kind)
+    }
     /// The driving block of a `Generator`, if `v` is one.
     pub fn generator_block(&self, v: &Value) -> Option<Value> {
         match self.obj(v) {
@@ -2094,6 +2155,21 @@ impl RubyHost {
         let sign = if im_s.starts_with('-') { "-" } else { "+" };
         format!("{re_s}{sign}{}i", im_s.trim_start_matches('-'))
     }
+    /// Any real number (Integer, Float, BigInt, Rational) as `f64`, or `None`
+    /// for a non-numeric value.
+    pub fn as_f64(&self, v: &Value) -> Option<f64> {
+        use num_traits::ToPrimitive as _;
+        match v {
+            Value::Int(n) => Some(*n as f64),
+            Value::Float(f) => Some(*f),
+            Value::Obj(_) => match self.obj(v) {
+                Some(RObj::BigInt(b)) => b.to_f64(),
+                Some(RObj::Rational(r)) => r.to_f64(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     /// View an integer or rational as a `BigRational`.
     pub fn as_rational(&self, v: &Value) -> Option<num_rational::BigRational> {
         match self.obj(v) {
@@ -2263,25 +2339,30 @@ impl RubyHost {
             *is_lambda = true;
         }
     }
-    /// Ruby `Proc#arity`. A curried proc reports `-1`; a normal proc reports its
-    /// declared parameter count (all params here are required, so arity is exact).
+    /// Ruby `Proc#arity`. A curried proc reports `-1`; a normal proc reports the
+    /// count MRI's `rb_proc_arity` derives from its written parameter shape,
+    /// which is stricter for a lambda than for a plain block.
     pub fn proc_arity(&self, v: &Value) -> Option<i64> {
         match self.obj(v) {
-            Some(RObj::Proc { kind, template, .. }) => match kind {
-                ProcKind::Curried { .. } | ProcKind::Composed { .. } => Some(-1),
+            Some(RObj::Proc {
+                kind,
+                template,
+                is_lambda,
+                ..
+            }) => match kind {
+                ProcKind::Curried { .. }
+                | ProcKind::MethodCurried { .. }
+                | ProcKind::Composed { .. } => Some(-1),
                 ProcKind::Collect(_) | ProcKind::Around(_) => Some(1),
                 ProcKind::Normal => {
-                    let def = &self.procs[*template];
-                    if def.splat.is_some() {
-                        // A block/lambda with a splat has arity -(required + 1),
-                        // the required count being all positional params bar the
-                        // splat itself.
-                        Some(-(def.params.len().saturating_sub(1) as i64 + 1))
-                    } else {
-                        Some(def.params.len() as i64)
-                    }
+                    Some(ArityFacts::of_proc(&self.procs[*template]).arity_value(*is_lambda))
                 }
             },
+            // A `Symbol#to_proc` proc takes the receiver plus the method's own
+            // arguments (MRI reports `-2`); a bound `Method` used as a proc
+            // reports the method's arity.
+            Some(RObj::SymProc(_)) => Some(-2),
+            Some(RObj::Method { recv, name }) => Some(self.method_arity(recv, name)),
             _ => None,
         }
     }
@@ -2297,9 +2378,10 @@ impl RubyHost {
             }) => {
                 let arity = match kind {
                     ProcKind::Curried { arity, .. } => arity,
-                    ProcKind::Composed { .. } | ProcKind::Collect(_) | ProcKind::Around(_) => {
-                        return Some(v.clone())
-                    }
+                    ProcKind::MethodCurried { .. }
+                    | ProcKind::Composed { .. }
+                    | ProcKind::Collect(_)
+                    | ProcKind::Around(_) => return Some(v.clone()),
                     ProcKind::Normal => self.procs[template].params.len(),
                 };
                 Some(self.alloc(RObj::Proc {
@@ -2314,6 +2396,21 @@ impl RubyHost {
             }
             _ => None,
         }
+    }
+    /// Build the curried view of a bound `Method`: gathers `arity` args across
+    /// successive calls, then invokes the method.
+    pub fn new_method_curry(&mut self, target: Value, arity: usize) -> Value {
+        let scope = self.cur_scope().clone();
+        self.alloc(RObj::Proc {
+            template: 0,
+            scope,
+            is_lambda: true,
+            kind: ProcKind::MethodCurried {
+                target: Box::new(target),
+                arity,
+                collected: Vec::new(),
+            },
+        })
     }
     /// Build a composed proc `first` then `second` (both are `Proc` values).
     pub fn new_composed(&mut self, first: Value, second: Value, is_lambda: bool) -> Value {
@@ -2432,7 +2529,11 @@ impl RubyHost {
         let def = if let Some(cls) = self.object_class(recv) {
             self.find_method_owner(&cls, name).map(|(d, _)| d)
         } else if let Some(cls) = self.classref_name(recv) {
+            // A class receiver is either `Foo.method(:bar)` (a class method) or
+            // `Foo.instance_method(:bar)` (an instance method), which reach here
+            // identically -- try the class method first, then the instance one.
             self.find_class_method(&cls, name)
+                .or_else(|| self.find_method_owner(&cls, name).map(|(d, _)| d))
         } else {
             self.methods.get(name).cloned()
         };
@@ -2458,22 +2559,38 @@ impl RubyHost {
         let def = if let Some(cls) = self.object_class(recv) {
             self.find_method_owner(&cls, name).map(|(d, _)| d)
         } else if let Some(cls) = self.classref_name(recv) {
+            // A class receiver reaches here both from `Foo.method(:bar)` (a class
+            // method) and from `Foo.instance_method(:bar)` (an instance method):
+            // try the class method first, then fall back to the instance one.
             self.find_class_method(&cls, name)
+                .or_else(|| self.find_method_owner(&cls, name).map(|(d, _)| d))
         } else {
             self.methods.get(name).cloned()
         };
-        match def {
-            Some(d) => {
-                if d.splat.is_some() {
-                    // Required positional params = all positional minus the splat.
-                    -((d.params.len().saturating_sub(1)) as i64 + 1)
-                } else {
-                    d.params.len() as i64
-                }
-            }
-            // Built-in method: real arity is not tracked; report variadic.
-            None => -1,
+        // A top-level `def` lives in the flat method table, not on `Object`, so
+        // fall back to it before reporting "builtin".
+        let def = def.or_else(|| self.methods.get(name).cloned());
+        if let Some(d) = def {
+            return ArityFacts::of_method(&d).arity_value(true);
         }
+        // A `define_method` body reports the arity of its block, with method
+        // (strict) semantics — that is what the defined method enforces.
+        let dm = self
+            .object_class(recv)
+            .or_else(|| self.classref_name(recv))
+            .and_then(|cls| self.find_define_method(&cls, name));
+        if let Some(p) = dm {
+            if let Some(RObj::Proc {
+                template,
+                kind: ProcKind::Normal,
+                ..
+            }) = self.obj(&p)
+            {
+                return ArityFacts::of_proc(&self.procs[*template]).arity_value(true);
+            }
+        }
+        // Built-in method: real arity is not tracked; report variadic.
+        -1
     }
 
     // ---- public accessors used by builtins (fine-grained borrows) ---------
@@ -2529,7 +2646,11 @@ impl RubyHost {
     pub fn is_proc(&self, v: &Value) -> bool {
         matches!(
             self.obj(v),
-            Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) | Some(RObj::CycleProc(_))
+            Some(RObj::Proc { .. })
+                | Some(RObj::SymProc(_))
+                | Some(RObj::CycleProc(_))
+                | Some(RObj::SeqProc(_))
+                | Some(RObj::DeriveProc { .. })
         )
     }
     pub fn has_method(&self, name: &str) -> bool {
@@ -4373,6 +4494,17 @@ impl RubyHost {
     /// `define_method`-created methods are included; synthetic/internal names
     /// (`__class_body__` and anything starting with `__`) are excluded. Names are
     /// deduplicated, keeping the first (nearest) occurrence.
+    /// Ruby makes a handful of hook methods private by definition, so they never
+    /// appear in `instance_methods`/`public_methods` however they were declared.
+    const PRIVATE_HOOKS: &[&str] = &[
+        "initialize",
+        "initialize_copy",
+        "initialize_clone",
+        "initialize_dup",
+        "respond_to_missing?",
+        "method_missing",
+    ];
+
     pub fn instance_method_names(&self, class: &str, inherited: bool) -> Vec<String> {
         let chain: Vec<String> = if inherited {
             self.class_ancestry(class)
@@ -4383,14 +4515,14 @@ impl RubyHost {
         for n in &chain {
             if let Some(def) = self.classes.get(n) {
                 for k in def.methods.keys() {
-                    if !k.starts_with("__") {
+                    if !k.starts_with("__") && !Self::PRIVATE_HOOKS.contains(&k.as_str()) {
                         out.push(k.clone());
                     }
                 }
             }
             if let Some(dm) = self.define_methods.get(n) {
                 for k in dm.keys() {
-                    if !k.starts_with("__") {
+                    if !k.starts_with("__") && !Self::PRIVATE_HOOKS.contains(&k.as_str()) {
                         out.push(k.clone());
                     }
                 }
@@ -5061,9 +5193,11 @@ impl RubyHost {
                 }
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash { map, .. }) => self.inspect_hash(&map),
-                Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) | Some(RObj::CycleProc(_)) => {
-                    "#<Proc>".to_string()
-                }
+                Some(RObj::Proc { .. })
+                | Some(RObj::SymProc(_))
+                | Some(RObj::CycleProc(_))
+                | Some(RObj::SeqProc(_))
+                | Some(RObj::DeriveProc { .. }) => "#<Proc>".to_string(),
                 Some(RObj::Method { recv, name }) => {
                     format!("#<Method: {}#{name}>", self.class_of(&recv))
                 }
@@ -5137,7 +5271,29 @@ impl RubyHost {
                 Some(RObj::Symbol(s)) => format!(":{s}"),
                 Some(RObj::BigInt(b)) => b.to_string(),
                 Some(RObj::Rational(r)) => format!("({}/{})", r.numer(), r.denom()),
-                Some(RObj::Complex { re, im }) => format!("({})", self.complex_to_s(&re, &im)),
+                // MRI's `Complex#inspect` inspects each part, so a Rational part
+                // is parenthesized (`(11/25)`), and an imaginary part that does
+                // not end in a digit takes an explicit `*i`.
+                Some(RObj::Complex { re, im }) => {
+                    let re_s = self.inspect(&re);
+                    // The sign comes from the VALUE, not its rendering: a
+                    // negative Rational inspects as `(-1/8)`, whose leading
+                    // character is a paren.
+                    let negative = self.as_f64(&im).is_some_and(|f| f < 0.0);
+                    let mag_v = if negative {
+                        self.num_op(NumOp::Sub, &Value::Int(0), &im)
+                            .unwrap_or_else(|_| im.clone())
+                    } else {
+                        im.clone()
+                    };
+                    let (sign, mag) = (if negative { "-" } else { "+" }, self.inspect(&mag_v));
+                    let unit = if mag.ends_with(|c: char| c.is_ascii_digit()) {
+                        "i"
+                    } else {
+                        "*i"
+                    };
+                    format!("({re_s}{sign}{mag}{unit})")
+                }
                 Some(RObj::Set(map)) => {
                     let inner: Vec<String> = map.values().map(|v| self.inspect(v)).collect();
                     format!("Set[{}]", inner.join(", "))
@@ -5296,9 +5452,11 @@ impl RubyHost {
                 Some(RObj::FloatRange { .. }) => "Range",
                 Some(RObj::StrRange { .. }) => "Range",
                 Some(RObj::ObjRange { .. }) => "Range",
-                Some(RObj::Proc { .. }) | Some(RObj::SymProc(_)) | Some(RObj::CycleProc(_)) => {
-                    "Proc"
-                }
+                Some(RObj::Proc { .. })
+                | Some(RObj::SymProc(_))
+                | Some(RObj::CycleProc(_))
+                | Some(RObj::SeqProc(_))
+                | Some(RObj::DeriveProc { .. }) => "Proc",
                 Some(RObj::Method { .. }) => "Method",
                 Some(RObj::Regexp { .. }) => "Regexp",
                 Some(RObj::MatchData { .. }) => "MatchData",
@@ -5340,6 +5498,14 @@ impl RubyHost {
                 }
                 Some(RObj::FloatRange { lo, hi, exclusive }) => {
                     RKey::FloatRange(lo.to_bits(), hi.to_bits(), *exclusive)
+                }
+                // A Struct/Data instance compares and hashes BY VALUE in Ruby —
+                // two `P.new(1, 2)` are the same hash key and report the same
+                // `hash` — so key it on its class plus its members.
+                Some(RObj::Object { class, ivars }) if self.struct_defs.contains_key(class) => {
+                    let mut parts = vec![RKey::Class(class.clone())];
+                    parts.extend(ivars.values().map(|m| self.to_key(m)));
+                    RKey::Array(parts)
                 }
                 _ => RKey::Str(format!("{v:?}")),
             },
@@ -5393,6 +5559,12 @@ impl RubyHost {
             }
             if let Some(x) = self.as_bigint(a) {
                 return Ok(self.new_bigint(-x));
+            }
+            // `-2i` / `-Complex(1, 2)` — negate both parts.
+            if let Some((re, im)) = self.complex_parts(a) {
+                let nr = self.num_op(Sub, &Value::Int(0), &re)?;
+                let ni = self.num_op(Sub, &Value::Int(0), &im)?;
+                return Ok(self.new_complex(nr, ni));
             }
             // `String#-@` returns a frozen copy of the string (Ruby's frozen-
             // string operator); a mutable string is duped and frozen, an already
@@ -5491,12 +5663,36 @@ impl RubyHost {
                 }
             }
         }
+        // Float arithmetic. The VM computes Float ops inline and never routes
+        // them here, so this path exists for the recursive COMPONENT operations
+        // a Complex/Rational with a Float part makes (`Complex(1.5, 2.5) * 2`
+        // multiplies `1.5` by `2` through `num_op`).
+        let complex_side = matches!(self.obj(a), Some(RObj::Complex { .. }))
+            || matches!(self.obj(b), Some(RObj::Complex { .. }));
+        if !complex_side && (matches!(a, Value::Float(_)) || matches!(b, Value::Float(_))) {
+            if let (Some(x), Some(y)) = (self.as_f64(a), self.as_f64(b)) {
+                let out = match op {
+                    Add => Some(Value::Float(x + y)),
+                    Sub => Some(Value::Float(x - y)),
+                    Mul => Some(Value::Float(x * y)),
+                    Div => Some(Value::Float(x / y)),
+                    Mod => Some(Value::Float(x - y * (x / y).floor())),
+                    Pow => Some(Value::Float(x.powf(y))),
+                    Lt => Some(Value::Bool(x < y)),
+                    Gt => Some(Value::Bool(x > y)),
+                    Le => Some(Value::Bool(x <= y)),
+                    Ge => Some(Value::Bool(x >= y)),
+                    _ => None,
+                };
+                if let Some(v) = out {
+                    return Ok(v);
+                }
+            }
+        }
         // Complex arithmetic: `(a+bi) op (c+di)`, promoting a real operand to
         // `(real, 0)`. Component operations recurse through `num_op` so the parts
         // keep their own numeric types.
-        if matches!(self.obj(a), Some(RObj::Complex { .. }))
-            || matches!(self.obj(b), Some(RObj::Complex { .. }))
-        {
+        if complex_side {
             let (ar, ai) = self
                 .complex_parts(a)
                 .unwrap_or_else(|| (a.clone(), Value::Int(0)));
@@ -6385,7 +6581,86 @@ fn kw_list(names: &[String]) -> String {
 /// This is what makes a wrong call a *raise* rather than a silent nil binding —
 /// `def f(x, y); end; f(1)` used to run the body with `y` unbound.
 fn check_arity(def: &MethodDef, args: &[Value]) -> Result<(), String> {
-    let wants_kw = !def.kwparams.is_empty() || def.kwsplat.is_some();
+    check_call_arity(&ArityFacts::of_method(def), args)
+}
+
+/// The parameter-count facts a call is checked against. `def`, `->`, `lambda`,
+/// `define_method` and `Method#to_proc` all share this one description so they
+/// raise the identical `ArgumentError` and report the identical `arity`.
+pub struct ArityFacts<'a> {
+    /// Positional params with no default, on both sides of a `*rest`.
+    req: u16,
+    /// Positional params with a default.
+    opt: u16,
+    has_rest: bool,
+    /// Every declared keyword name (required and optional).
+    kwnames: &'a [String],
+    /// The keyword params with no default.
+    kwreq: &'a [String],
+    has_kwrest: bool,
+}
+
+impl<'a> ArityFacts<'a> {
+    pub fn of_method(def: &'a MethodDef) -> Self {
+        ArityFacts {
+            req: def.req,
+            opt: def.opt,
+            has_rest: def.splat.is_some(),
+            kwnames: &def.kwparams,
+            kwreq: &def.kwreq,
+            has_kwrest: def.kwsplat.is_some(),
+        }
+    }
+    pub fn of_proc(def: &'a ProcDef) -> Self {
+        ArityFacts {
+            req: def.arity.req,
+            opt: def.arity.opt,
+            has_rest: def.splat.is_some(),
+            kwnames: &def.arity.kwnames,
+            kwreq: &def.arity.kwreq,
+            has_kwrest: def.arity.kwsplat,
+        }
+    }
+    /// MRI's `rb_iseq_min_max_arity`: the mandatory count, and the maximum
+    /// acceptable positional count (`None` = unlimited, i.e. a `*rest`). A
+    /// keyword hash counts as one toward the maximum, and required keywords
+    /// contribute exactly one to the minimum however many there are.
+    fn min_max(&self) -> (i64, Option<i64>) {
+        let min = self.req as i64 + !self.kwreq.is_empty() as i64;
+        let max = if self.has_rest {
+            None
+        } else {
+            Some(
+                self.req as i64
+                    + self.opt as i64
+                    + (!self.kwnames.is_empty() || self.has_kwrest) as i64,
+            )
+        };
+        (min, max)
+    }
+    /// `Proc#arity` / `Method#arity`. A lambda (and a method) reports a negative
+    /// `-min-1` whenever its call shape is not a single fixed count; a plain
+    /// proc goes negative only for a `*rest`, since it binds everything else
+    /// leniently (MRI `rb_proc_arity`).
+    pub fn arity_value(&self, strict: bool) -> i64 {
+        let (min, max) = self.min_max();
+        let fixed = if strict {
+            max == Some(min)
+        } else {
+            max.is_some()
+        };
+        if fixed {
+            min
+        } else {
+            -min - 1
+        }
+    }
+}
+
+/// Three checks, in MRI's order: positional count, then unknown keywords, then
+/// missing keywords.
+fn check_call_arity(def: &ArityFacts, args: &[Value]) -> Result<(), String> {
+    let wants_kw = !def.kwnames.is_empty() || def.has_kwrest;
     // With keyword params, a trailing Hash argument is the keyword hash and does
     // not count as positional (`bind_params` splits it the same way).
     let (positional, kwhash) = if wants_kw {
@@ -6400,13 +6675,13 @@ fn check_arity(def: &MethodDef, args: &[Value]) -> Result<(), String> {
     };
 
     let (req, opt) = (def.req as usize, def.opt as usize);
-    let ok = if def.splat.is_some() {
+    let ok = if def.has_rest {
         positional >= req
     } else {
         positional >= req && positional <= req + opt
     };
     if !ok {
-        let expected = if def.splat.is_some() {
+        let expected = if def.has_rest {
             format!("{req}+")
         } else if opt > 0 {
             format!("{req}..{}", req + opt)
@@ -6431,12 +6706,12 @@ fn check_arity(def: &MethodDef, args: &[Value]) -> Result<(), String> {
     }
     // A `**opts` collector absorbs every unlisted keyword, so only a signature
     // without one can have an unknown keyword.
-    if def.kwsplat.is_none() {
+    if !def.has_kwrest {
         let unknown: Vec<String> = kwhash
             .iter()
             .flat_map(|m| m.keys())
             .filter_map(|k| match k {
-                RKey::Sym(s) if !def.kwparams.iter().any(|p| p == s) => Some(s.clone()),
+                RKey::Sym(s) if !def.kwnames.iter().any(|p| p == s) => Some(s.clone()),
                 _ => None,
             })
             .collect();
@@ -6474,6 +6749,18 @@ fn check_arity(def: &MethodDef, args: &[Value]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Invoke a top-level `def` (one in the flat method table, not on any class) on
+/// `self_obj` — what a bound `Method` for a top-level method calls.
+pub fn run_top_method(
+    def: &MethodDef,
+    self_obj: Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    run_method(def, self_obj, args, block, Some(name.to_string()), None)
 }
 
 /// Run a resolved method: push a fresh frame bound to `self_obj`, bind args, and
@@ -8486,7 +8773,17 @@ pub fn call_proc_self(
     args: &[Value],
     self_override: Option<&Value>,
 ) -> Result<Value, String> {
-    call_proc_self_ctx(proc_val, args, self_override, None)
+    call_proc_self_ctx(proc_val, args, self_override, None, None)
+}
+
+/// Call a proc with a block of its own, bound to its `&blk` parameter — what
+/// `Proc#call`/`#()`/`#[]`/`#yield` do when handed a block (`->(&b){ b.call }`).
+pub fn call_proc_block(
+    proc_val: &Value,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    call_proc_self_ctx(proc_val, args, None, None, block)
 }
 
 /// Like [`call_proc_self`], but `method_ctx = Some((name, owner))` marks the proc
@@ -8499,6 +8796,7 @@ pub fn call_proc_self_ctx(
     args: &[Value],
     self_override: Option<&Value>,
     method_ctx: Option<(String, String)>,
+    passed_block: Option<Value>,
 ) -> Result<Value, String> {
     let (template, scope, kind, is_lambda) = match with_host(|h| h.obj(proc_val).cloned()) {
         Some(RObj::Proc {
@@ -8533,6 +8831,29 @@ pub fn call_proc_self_ctx(
                 }
             }
         }
+        // The endless-Range generator body: count up forever until the yielder's
+        // limit breaks out.
+        Some(RObj::SeqProc(lo)) => {
+            let Some(yielder) = args.first().cloned() else {
+                return Err("no yielder is available".to_string());
+            };
+            let mut i = lo;
+            loop {
+                crate::builtins::dispatch(&yielder, "<<", &[Value::Int(i)], None)?;
+                if has_pending_signal() {
+                    return Ok(Value::Undef);
+                }
+                i += 1;
+            }
+        }
+        // A derived generator body: pull the source in batches and forward the
+        // reshaped values, so the transform never materializes an infinite source.
+        Some(RObj::DeriveProc { src, kind }) => {
+            let Some(yielder) = args.first().cloned() else {
+                return Err("no yielder is available".to_string());
+            };
+            return crate::builtins::drive_derived(&src, &kind, &yielder);
+        }
         // A `Symbol#to_proc` proc used as a block value: send the symbol's method
         // to the first argument.
         Some(RObj::SymProc(s)) => {
@@ -8555,11 +8876,13 @@ pub fn call_proc_self_ctx(
             all.extend_from_slice(args);
             if all.len() >= arity {
                 // Enough args gathered: run the base template with all of them.
+                // The base keeps the original's lambda-ness, so currying a lambda
+                // and then over-applying it (`f.curry.call(1, 2, 3)`) still raises.
                 let base = with_host(|h| {
                     h.alloc(RObj::Proc {
                         template,
                         scope: scope.clone(),
-                        is_lambda: false,
+                        is_lambda,
                         kind: ProcKind::Normal,
                     })
                 });
@@ -8572,6 +8895,29 @@ pub fn call_proc_self_ctx(
                     scope: scope.clone(),
                     is_lambda: false,
                     kind: ProcKind::Curried {
+                        arity,
+                        collected: all,
+                    },
+                })
+            }));
+        }
+        ProcKind::MethodCurried {
+            target,
+            arity,
+            collected,
+        } => {
+            let mut all = collected.clone();
+            all.extend_from_slice(args);
+            if all.len() >= arity {
+                return call_proc(&target, &all);
+            }
+            return Ok(with_host(|h| {
+                h.alloc(RObj::Proc {
+                    template,
+                    scope: scope.clone(),
+                    is_lambda: true,
+                    kind: ProcKind::MethodCurried {
+                        target: target.clone(),
                         arity,
                         collected: all,
                     },
@@ -8600,10 +8946,19 @@ pub fn call_proc_self_ctx(
 
     let def = with_host(|h| h.procs[template].clone());
 
+    // A lambda — and a `define_method` body, which MRI also gives method
+    // semantics — is arity-checked before its body runs, exactly like a `def`.
+    // A plain block is lenient: it binds missing params to nil and drops extras.
+    let strict = is_lambda || method_ctx.is_some();
+    if strict {
+        check_call_arity(&ArityFacts::of_proc(&def), args)?;
+    }
+
     // Auto-splat: a block with more than one parameter slot destructures a single
     // array argument — `pairs.each { |k, v| … }`, and also `{ |first, *rest| … }`.
-    // A lone `*rest` (one slot) does not auto-splat.
-    let bound: Vec<Value> = if def.params.len() > 1 && args.len() == 1 {
+    // A lone `*rest` (one slot) does not auto-splat. A lambda never auto-splats:
+    // `[[1,2]].map(&->(x, y){ … })` raises in MRI rather than unpacking the pair.
+    let bound: Vec<Value> = if !strict && def.params.len() > 1 && args.len() == 1 {
         match with_host(|h| h.as_array(&args[0])) {
             Some(items) => items,
             None => args.to_vec(),
@@ -8650,6 +9005,12 @@ pub fn call_proc_self_ctx(
                 child.lock().unwrap().vars.insert(p.clone(), v);
             }
         }
+    }
+    // `&blk` captures the block this proc was called with (nil if none). It is
+    // deliberately not a positional param — see the parser's `block_param`.
+    if let Some(bp) = &def.arity.blockparam {
+        let v = passed_block.clone().unwrap_or(Value::Undef);
+        child.lock().unwrap().vars.insert(bp.clone(), v);
     }
     // The block's "home": the method activation it was defined in. A non-local
     // `return` from this block unwinds to that frame.

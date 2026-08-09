@@ -2728,3 +2728,293 @@ end
 p SingHost.singleton_methods.sort
 p SingHost.new.singleton_methods
 p 1.singleton_methods
+#==#
+# --- lambda arity: strict, unlike a block ---
+begin
+  ->(x, y) { [x, y] }.call(1)
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+begin
+  ->(x, y) { [x, y] }.call(1, 2, 3)
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+begin
+  ->(x, y = 5) { [x, y] }.call
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+p ->(x, y = 5) { [x, y] }.call(1)
+#==#
+begin
+  ->(x, *r) { [x, r] }.call
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+p ->(x, *r) { [x, r] }.call(1, 2, 3)
+#==#
+begin
+  ->(k:) { k }.call
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+begin
+  ->(k:) { k }.call(k: 1, j: 2)
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+p ->(k:, j: 7) { [k, j] }.call(k: 1)
+#==#
+p ->(x, **o) { [x, o] }.call(1, z: 3)
+#==#
+begin
+  lambda { |x, y| [x, y] }.call(1)
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+# A plain proc stays lenient on both sides.
+p [proc { |x, y| [x, y] }.call(1), proc { |x, y| [x, y] }.call(1, 2, 3)]
+#==#
+# A lambda does NOT auto-splat a single array argument; a block does.
+begin
+  [[1, 2]].map(&->(x, y) { x + y })
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+p [[1, 2]].map { |x, y| x + y }
+#==#
+p [->() {}.arity, ->(x) {}.arity, ->(x, y) {}.arity, ->(x, y = 1) {}.arity]
+#==#
+p [->(*a) {}.arity, ->(x, *a) {}.arity, ->(*a, z) {}.arity]
+#==#
+p [->(k:) {}.arity, ->(k:, j:) {}.arity, ->(x, k:) {}.arity, ->(k: 1) {}.arity, ->(x, k: 1) {}.arity]
+#==#
+p [->(**o) {}.arity, ->(x, **o) {}.arity, ->(&b) {}.arity, ->(x, &b) {}.arity]
+#==#
+p [proc {}.arity, proc { |x| }.arity, proc { |x, y = 1| }.arity, proc { |*a| }.arity, proc { |k: 1| }.arity]
+#==#
+p [->(x, y) {}.lambda?, proc { |x, y| }.lambda?, lambda { |x, y| }.lambda?]
+#==#
+p ->(x, y) { x + y }.curry[2][3]
+#==#
+begin
+  ->(x, y) { x + y }.curry.call(1, 2, 3)
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+f = ->(x) { x * 2 } >> ->(y) { y + 1 }
+p [f.call(3), f.lambda?]
+#==#
+# A lambda's `&blk` captures the block `call` was given.
+p ->(&b) { b.call(4) }.call { |v| v * 2 }
+#==#
+# `->(x; t)` block-locals: `t` is a fresh nil local, not a parameter.
+p ->(x; t) { [x, t] }.call(1)
+#==#
+p ->(x; t) { }.arity
+#==#
+# `Proc#===` calls the proc, so a lambda works as a `case` guard.
+p [(->(x) { x > 2 } === 3), (case 5 when ->(x) { x > 2 } then :big else :small end)]
+#==#
+# `define_method` bodies get method (strict) arity, from a block or a lambda.
+class DMArity
+  define_method(:g) { |x, y| [x, y] }
+end
+begin
+  DMArity.new.g(1)
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+class DMArity2
+  define_method(:g, ->(x, y) { [x, y] })
+end
+begin
+  DMArity2.new.g(1)
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+class DMArity3
+  define_method(:g) { |x, y| [x, y] }
+end
+p [DMArity3.new.g(1, 2), DMArity3.new.method(:g).arity, DMArity3.instance_method(:g).arity]
+#==#
+# A `Method` is a lambda: strict arity, `to_proc`, `curry`, and real `arity`.
+def marity(x, y) = [x, y]
+begin
+  method(:marity).call(1)
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+def marity2(x, y) = [x, y]
+p [method(:marity2).arity, method(:marity2).to_proc.lambda?, method(:marity2).to_proc.call(1, 2)]
+#==#
+def marity3(x, y) = [x, y]
+p method(:marity3).curry[1][2]
+#==#
+def m_shapes0; end
+def m_shapes1(x); end
+def m_shapes2(x, y = 1); end
+def m_shapes3(*a); end
+def m_shapes4(x, *a); end
+p [method(:m_shapes0).arity, method(:m_shapes1).arity, method(:m_shapes2).arity, method(:m_shapes3).arity, method(:m_shapes4).arity]
+#==#
+def m_kwshapes1(k:); end
+def m_kwshapes2(x, k:); end
+def m_kwshapes3(k: 1); end
+def m_kwshapes4(**o); end
+def m_kwshapes5(&b); end
+p [method(:m_kwshapes1).arity, method(:m_kwshapes2).arity, method(:m_kwshapes3).arity, method(:m_kwshapes4).arity, method(:m_kwshapes5).arity]
+#==#
+class UMArity
+  def self.s(x) = x
+  def g(a, b) = [a, b]
+end
+p [UMArity.method(:s).arity, UMArity.instance_method(:g).arity, UMArity.instance_method(:g).bind_call(UMArity.new, 1, 2)]
+#==#
+# A Hash hands `map`/`find` two values to a fixed-arity-above-one block, and the
+# packed pair to anything else — MRI's `rb_block_pair_yield_optimizable`.
+p [{ a: 1 }.map(&->(k, v) { [k, v] }), { a: 1 }.map(&->(kv) { kv }), { a: 1 }.map(&:first)]
+#==#
+p [{ a: 1, b: 2 }.find(&->(k, v) { v == 2 }), { a: 1, b: 2 }.map { |k, v| [k, v] }]
+#==#
+# --- Enumerator shape: the grouping methods answer an Enumerator ---
+p [[1, 2, 3].each_slice(2).class, [1, 2, 3].each_cons(2).class]
+#==#
+p [[1, 2, 4, 5].chunk_while { |a, b| b == a + 1 }.class, [1, 2, 4, 5].slice_when { |a, b| b > a + 1 }.class, [1, 1, 2].chunk { |x| x }.class]
+#==#
+p [[1, 2, 4, 5].chunk_while { |a, b| b == a + 1 }.to_a, [1, 2, 4, 5].slice_when { |a, b| b > a + 1 }.to_a]
+#==#
+p [1, 1, 2, 3, 3].chunk { |x| x.odd? }.to_a
+#==#
+p({ a: 1, b: 2 }.chunk_while { |x, y| true }.to_a)
+#==#
+begin
+  [1, 2, 3].chunk_while
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+begin
+  [1, 2, 3].slice_when
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+p [[1, 2, 3].each_slice(2).next, [1, 2, 3].each_cons(2).next, [1, 2, 3].each_slice(2).size]
+#==#
+p [1, 2, 4].chunk_while { |a, b| b == a + 1 }.map(&:size)
+#==#
+# --- laziness: a block-less enumerator method over an INFINITE source ---
+e = Enumerator.new { |y| i = 0; loop { y << i; i += 1 } }
+p [e.first(3), e.take(2)]
+#==#
+e = Enumerator.new { |y| i = 0; loop { y << i; i += 1 } }
+p e.each_slice(2).first(2)
+#==#
+e = Enumerator.new { |y| i = 0; loop { y << i; i += 1 } }
+p e.each_cons(2).first(2)
+#==#
+e = Enumerator.new { |y| i = 0; loop { y << i; i += 1 } }
+p [e.each_with_index.first(2), e.with_index.first(2)]
+#==#
+e = Enumerator.new { |y| i = 0; loop { y << i; i += 1 } }
+p [e.map.first(2), e.select.first(2), e.each_entry.first(2)]
+#==#
+e = Enumerator.new { |y| i = 0; loop { y << i; i += 1 } }
+p e.each_with_object([]).first(2)
+#==#
+c = [1, 2].cycle
+p [c.map.first(3), c.each_slice(3).first(2), c.each_with_index.first(3)]
+#==#
+p [(1..).each_slice(2).first(2), (1..).each_cons(2).first(2)]
+#==#
+p [(1..).map.first(2), (1..).select.first(2), (1..).each_entry.first(2), (1..).to_enum.first(2)]
+#==#
+p [(1..).each_with_index.first(2), (1..).each_with_object([]).first(2)]
+#==#
+p [(1..Float::INFINITY).each_slice(2).first(2), (1..Float::INFINITY).each_slice(2).class]
+#==#
+# A finite generator still ends where it ends.
+g = Enumerator.new { |y| y << 1; y << 2; y << 3 }
+p [g.each_slice(2).to_a, g.each_cons(2).to_a, g.each_with_index.to_a]
+#==#
+# --- Data.define is strict about its members ---
+DPoint = Data.define(:x, :y)
+begin
+  DPoint.new(1)
+rescue ArgumentError => e
+  p e.class
+end
+#==#
+DPoint2 = Data.define(:x, :y)
+begin
+  DPoint2.new(1, 2, 3)
+rescue ArgumentError => e
+  p e.class
+end
+#==#
+DPoint3 = Data.define(:x, :y)
+begin
+  DPoint3.new(x: 1, z: 2)
+rescue ArgumentError => e
+  p e.class
+end
+#==#
+DPoint4 = Data.define(:x, :y)
+p [DPoint4.new(1, 2).to_h, DPoint4.new(x: 3, y: 4).to_h, DPoint4.new(1, 2).with(y: 9).to_h]
+#==#
+DPoint5 = Data.define(:x, :y)
+p [DPoint5.new(1, 2) == DPoint5.new(1, 2), DPoint5.new(1, 2).hash == DPoint5.new(1, 2).hash]
+#==#
+# A Struct is a value key too.
+SPair = Struct.new(:a, :b)
+h = { SPair.new(1, 2) => :hit }
+p [h[SPair.new(1, 2)], SPair.new(1, 2).hash == SPair.new(1, 2).hash]
+#==#
+# --- freeze / clone ---
+s = "abc".freeze
+p [s.frozen?, s.dup.frozen?, s.clone.frozen?, s.clone(freeze: false).frozen?]
+#==#
+a = [1, 2].freeze
+begin
+  a << 3
+rescue => e
+  p e.class
+end
+#==#
+# --- introspection: the private-by-definition hooks stay out ---
+class IntroHost
+  def initialize; @x = 1; end
+  def m(z) = z
+end
+p [IntroHost.instance_methods(false).sort, IntroHost.new.public_methods(false).sort]
+#==#
+class IntroHost2
+  def initialize; @x = 1; @y = "s"; end
+end
+p [IntroHost2.new.instance_variables.sort, IntroHost2.new.instance_variable_get(:@x)]
+#==#
+# --- Complex: exact division, negation, and MRI's inspect shape ---
+p [Complex(1, 2) / Complex(3, 4), Complex(4, 2) / 2, Complex(1, 2) / Complex(1, 0)]
+#==#
+p [Complex(1.5, 2.5) * Complex(2, 0), Complex(1.5, 2.5) / Complex(2, 0), Complex(1.5, 2.5) + Complex(2, 0)]
+#==#
+p [-Complex(1, 2), (3 + -2i), Complex(-3, -4) / Complex(4, 4)]
+#==#
+p [Complex(1, 2).zero?, Complex(0, 0).zero?, Complex(1, 2).nonzero?]
+#==#
+# --- String codepoints ---
+p ["日本語".codepoints, "héllo".codepoints.size, "héllo".each_codepoint.to_a.size]

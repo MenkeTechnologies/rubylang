@@ -11,7 +11,8 @@ use crate::host::ops;
 use crate::host::{
     call_instance_method, call_method, call_proc, current_block, has_pending_signal,
     raise_signal_break, raise_signal_next, raise_signal_redo, raise_signal_retry,
-    raise_signal_return, raise_signal_throw, take_break, take_throw, with_host, RKey, RubyHost,
+    raise_signal_return, raise_signal_throw, take_break, take_throw, with_host, Derive, RKey,
+    RubyHost,
 };
 use fusevm::{Value, VM};
 use indexmap::IndexMap;
@@ -1449,7 +1450,7 @@ pub(crate) fn dispatch_by_type(
         "Hash" => dispatch_hash(recv, name, args, block),
         "Range" => dispatch_range(recv, name, args, block),
         "Symbol" => dispatch_symbol(recv, name, args),
-        "Proc" => dispatch_proc(recv, name, args),
+        "Proc" => dispatch_proc(recv, name, args, block),
         "Method" => dispatch_method(recv, name, args, block),
         "Regexp" => dispatch_regexp(recv, name, args),
         "MatchData" => dispatch_matchdata(recv, name, args),
@@ -1511,6 +1512,7 @@ pub(crate) fn dispatch(
                     args,
                     Some(recv),
                     Some((name.to_string(), cls.clone())),
+                    block,
                 );
             }
         }
@@ -1568,8 +1570,12 @@ pub(crate) fn dispatch(
         "==" => return Ok(Value::Bool(with_host(|h| h.eq_values(recv, &args[0])))),
         "!=" => return Ok(Value::Bool(!with_host(|h| h.eq_values(recv, &args[0])))),
         "===" => {
-            // Case-equality: a Class matches instances, a Regexp matches a
-            // string, a Range covers, else `==`.
+            // Case-equality: a Proc/lambda is CALLED (so `case x when ->(v){…}`
+            // works), a Class matches instances, a Regexp matches a string, a
+            // Range covers, else `==`.
+            if with_host(|h| h.class_of(recv)) == "Proc" {
+                return crate::host::call_proc_block(recv, args, block);
+            }
             if let Some(cls) = with_host(|h| h.classref_name(recv)) {
                 return Ok(Value::Bool(with_host(|h| h.is_a(&args[0], &cls))));
             }
@@ -1666,9 +1672,19 @@ pub(crate) fn dispatch(
             }));
         }
         "clone" => {
+            // `clone` carries the frozen flag over (unlike `dup`), unless
+            // `freeze:` overrides it: `false` thaws, `true` freezes regardless.
+            let freeze_opt = args
+                .first()
+                .and_then(|a| with_host(|h| h.as_hash(a)))
+                .and_then(|k| k.get(&RKey::Sym("freeze".into())).cloned());
+            let freeze = match &freeze_opt {
+                Some(v) => with_host(|h| h.truthy(v)),
+                None => with_host(|h| h.is_frozen(recv)),
+            };
             return Ok(with_host(|h| {
                 let copy = h.dup_value(recv);
-                if h.is_frozen(recv) {
+                if freeze {
                     h.freeze_value(&copy);
                 }
                 copy
@@ -1756,6 +1772,20 @@ pub(crate) fn dispatch(
             } else {
                 vec![]
             };
+            // An endless Range or an infinite generator cannot be collected —
+            // hand back the lazy Enumerator its own `each` produces instead.
+            if method == "each" && rest.is_empty() {
+                if let Some((lo, hi, _)) = with_host(|h| h.as_range(recv)) {
+                    if hi == crate::host::RANGE_ENDLESS {
+                        return Ok(with_host(|h| {
+                            h.new_endless_range_enumerator(lo, Derive::Each)
+                        }));
+                    }
+                }
+                if let Some(gb) = with_host(|h| h.generator_block(recv)) {
+                    return Ok(with_host(|h| h.new_derived_enumerator(gb, Derive::Each)));
+                }
+            }
             let sink = with_host(|h| h.new_enum_sink());
             dispatch(recv, &method, &rest, Some(sink))?;
             let collected = with_host(|h| h.take_enum_sink());
@@ -2543,8 +2573,34 @@ fn dispatch_classref(
                 _ => None,
             };
             match kw {
-                // Keyword form: `D.new(x: 1, y: 2)`. Missing members read as nil.
+                // Keyword form: `D.new(x: 1, y: 2)`. Every member is mandatory
+                // and no extra key is accepted — a Data class is strict where a
+                // Struct is lenient.
                 Some(k) => {
+                    let missing: Vec<String> = members
+                        .iter()
+                        .filter(|m| !k.contains_key(&RKey::Sym((*m).clone())))
+                        .cloned()
+                        .collect();
+                    let unknown: Vec<String> = k
+                        .keys()
+                        .filter_map(|key| match key {
+                            RKey::Sym(s) if !members.contains(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !unknown.is_empty() {
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            &format!("unknown keyword: :{}", unknown.join(", :")),
+                        ));
+                    }
+                    if !missing.is_empty() {
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            &format!("missing keyword: :{}", missing.join(", :")),
+                        ));
+                    }
                     for m in &members {
                         let v = k
                             .get(&RKey::Sym(m.clone()))
@@ -2553,8 +2609,30 @@ fn dispatch_classref(
                         with_host(|h| h.set_ivar_of(&obj, m, v));
                     }
                 }
-                // Positional form: `D.new(1, 2)`.
+                // Positional form: `D.new(1, 2)` — exactly one value per member.
                 None => {
+                    if args.len() != members.len() {
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            &if args.len() > members.len() {
+                                format!(
+                                    "wrong number of arguments (given {}, expected 0..{})",
+                                    args.len(),
+                                    members.len()
+                                )
+                            } else {
+                                format!(
+                                    "missing keyword{}: :{}",
+                                    if members.len() - args.len() == 1 {
+                                        ""
+                                    } else {
+                                        "s"
+                                    },
+                                    members[args.len()..].join(", :")
+                                )
+                            },
+                        ));
+                    }
                     for (i, m) in members.iter().enumerate() {
                         let v = args.get(i).cloned().unwrap_or(Value::Undef);
                         with_host(|h| h.set_ivar_of(&obj, m, v));
@@ -3449,7 +3527,12 @@ fn dispatch_classref(
         // receiver-less Method (`recv` = nil) that `bind`/`bind_call` re-target.
         "instance_method" | "public_instance_method" => {
             let m = name_of(&args[0]);
-            Ok(with_host(|h| h.new_method(Value::Undef, &m)))
+            // The owning class is the receiver, so `arity`/`parameters` can find
+            // the definition; `bind`/`bind_call` replace it with the real object.
+            Ok(with_host(|h| {
+                let owner = h.class_ref(cls);
+                h.new_method(owner, &m)
+            }))
         }
         // Numeric class constants (`Float::INFINITY`, `Float::NAN`, …), reached
         // via `::` (which lowers to a method call on the class reference).
@@ -4041,6 +4124,7 @@ fn dispatch_object(
                 args,
                 Some(recv),
                 Some((name.to_string(), cls.to_string())),
+                block,
             );
         }
     }
@@ -4054,6 +4138,7 @@ fn dispatch_object(
             args,
             Some(recv),
             Some((name.to_string(), cls.to_string())),
+            block,
         );
     }
     // An `alias_method`/`alias` name forwards to its target method.
@@ -5904,6 +5989,20 @@ fn dispatch_string(
             Ok(Value::Bool(normalized == s))
         }
         "bytes" => Ok(new_arr(s.bytes().map(|b| Value::Int(b as i64)).collect())),
+        // Unicode codepoints (one per character), unlike `bytes`.
+        "codepoints" => Ok(new_arr(s.chars().map(|c| Value::Int(c as i64)).collect())),
+        "each_codepoint" => {
+            let cps: Vec<Value> = s.chars().map(|c| Value::Int(c as i64)).collect();
+            match &block {
+                Some(b) => {
+                    for c in &cps {
+                        call_proc(b, std::slice::from_ref(c))?;
+                    }
+                    Ok(recv.clone())
+                }
+                None => Ok(with_host(|h| h.new_enumerator(cps, "each"))),
+            }
+        }
         // `String#unpack(fmt)` / `#unpack1(fmt)` — the inverse of `Array#pack`.
         // The string is read as a byte sequence via the Latin-1 convention (each
         // codepoint's low byte), so a `pack`-produced binary string round-trips.
@@ -7337,9 +7436,8 @@ fn dispatch_array(
                 }
                 Ok(recv.clone())
             } else {
-                // No enumerator type yet: return the windows array (usable with
-                // `.to_a`/`.map`/`.each`, unlike MRI's lazy Enumerator).
-                Ok(new_arr(windows))
+                // Block-less: an Enumerator over the windows (MRI `each_cons`).
+                Ok(with_host(|h| h.new_enumerator(windows, "each")))
             }
         }
         "dig" => Ok(dig(recv, args)),
@@ -8470,55 +8568,38 @@ fn dispatch_array(
                 // MRI returns the receiver when a block is given.
                 Ok(recv.clone())
             } else {
-                // No lazy Enumerator yet: return the slices array (usable with
-                // `.to_a`/`.map`/`.each`).
-                Ok(new_arr(slices))
+                // Block-less: an Enumerator over the slices (MRI `each_slice`).
+                Ok(with_host(|h| h.new_enumerator(slices, "each")))
             }
         }
-        "chunk_while" => {
-            // Split into runs; a new run starts whenever the block returns
-            // falsey for an adjacent pair (elem[i-1], elem[i]).
+        // Split into runs at each adjacent pair the block "breaks" on:
+        // `chunk_while` breaks where the block is falsey, `slice_when` where it
+        // is truthy. Both need a block — MRI turns the block into a Proc up
+        // front, so a block-less call raises rather than returning an Enumerator
+        // — and both answer an Enumerator over the runs.
+        "chunk_while" | "slice_when" => {
+            let Some(bl) = &block else {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    "tried to create Proc object without a block",
+                ));
+            };
+            let breaks_on = name == "slice_when";
             let mut chunks: Vec<Value> = Vec::new();
-            if let Some(bl) = &block {
-                let mut cur: Vec<Value> = Vec::new();
-                for x in &arr {
-                    if let Some(prev) = cur.last() {
-                        let r = call_proc(bl, &[prev.clone(), x.clone()])?;
-                        if !with_host(|h| h.truthy(&r)) {
-                            chunks.push(new_arr(std::mem::take(&mut cur)));
-                        }
+            let mut cur: Vec<Value> = Vec::new();
+            for x in &arr {
+                if let Some(prev) = cur.last() {
+                    let r = call_proc(bl, &[prev.clone(), x.clone()])?;
+                    if with_host(|h| h.truthy(&r)) == breaks_on {
+                        chunks.push(new_arr(std::mem::take(&mut cur)));
                     }
-                    cur.push(x.clone());
                 }
-                if !cur.is_empty() {
-                    chunks.push(new_arr(cur));
-                }
+                cur.push(x.clone());
             }
-            // No lazy Enumerator yet: return the chunk array (usable with `.to_a`).
-            Ok(new_arr(chunks))
-        }
-        "slice_when" => {
-            // Split into runs; a new run starts whenever the block returns
-            // truthy for an adjacent pair (elem[i-1], elem[i]). Inverse of
-            // chunk_while.
-            let mut chunks: Vec<Value> = Vec::new();
-            if let Some(bl) = &block {
-                let mut cur: Vec<Value> = Vec::new();
-                for x in &arr {
-                    if let Some(prev) = cur.last() {
-                        let r = call_proc(bl, &[prev.clone(), x.clone()])?;
-                        if with_host(|h| h.truthy(&r)) {
-                            chunks.push(new_arr(std::mem::take(&mut cur)));
-                        }
-                    }
-                    cur.push(x.clone());
-                }
-                if !cur.is_empty() {
-                    chunks.push(new_arr(cur));
-                }
+            if !cur.is_empty() {
+                chunks.push(new_arr(cur));
             }
-            // No lazy Enumerator yet: return the chunk array (usable with `.to_a`).
-            Ok(new_arr(chunks))
+            Ok(with_host(|h| h.new_enumerator(chunks, "each")))
         }
         "to_h" => {
             let mut m = IndexMap::new();
@@ -8592,8 +8673,9 @@ fn dispatch_array(
             }
         }
         "chunk" => {
-            // MRI returns an Enumerator; with no Enumerator type we return the
-            // `[key, [elems…]]` pairs array (so `.to_a`/`.each`/`.map` still work).
+            // Consecutive runs of equal block key, as `[key, [elems…]]` pairs
+            // inside an Enumerator (MRI `chunk`). Block-less, the run sequence is
+            // empty until a block is supplied, matching an unused Enumerator.
             let mut out: Vec<Value> = Vec::new();
             if let Some(bl) = &block {
                 let mut cur_key: Option<Value> = None;
@@ -8615,7 +8697,7 @@ fn dispatch_array(
                     out.push(new_arr(vec![pk, new_arr(group)]));
                 }
             }
-            Ok(new_arr(out))
+            Ok(with_host(|h| h.new_enumerator(out, "each")))
         }
         _ => Err(no_method_error(recv, name)),
     }
@@ -8759,6 +8841,42 @@ fn dispatch_complex(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
         }
         "+@" => Ok(recv.clone()),
         "==" => Ok(Value::Bool(with_host(|h| h.eq_values(recv, &args[0])))),
+        "zero?" => Ok(Value::Bool(as_f(&re) == 0.0 && as_f(&im) == 0.0)),
+        "nonzero?" => Ok(if as_f(&re) == 0.0 && as_f(&im) == 0.0 {
+            Value::Undef
+        } else {
+            recv.clone()
+        }),
+        // `(a+bi) / (c+di) == ((ac+bd) + (bc-ad)i) / (c²+d²)`. Integer parts stay
+        // exact by dividing through Rational, as MRI does.
+        "/" | "quo" => {
+            let (cr, ci) = match with_host(|h| h.complex_parts(&args[0])) {
+                Some(p) => p,
+                // A real divisor scales both parts.
+                None => (args[0].clone(), Value::Int(0)),
+            };
+            let mul = |a: &Value, b: &Value| with_host(|h| h.num_op(fusevm::NumOp::Mul, a, b));
+            let add = |a: &Value, b: &Value| with_host(|h| h.num_op(fusevm::NumOp::Add, a, b));
+            let sub = |a: &Value, b: &Value| with_host(|h| h.num_op(fusevm::NumOp::Sub, a, b));
+            let denom = add(&mul(&cr, &cr)?, &mul(&ci, &ci)?)?;
+            if as_f(&denom) == 0.0 {
+                return Err(raise_exc("ZeroDivisionError", "divided by 0"));
+            }
+            let nr = add(&mul(&re, &cr)?, &mul(&im, &ci)?)?;
+            let ni = sub(&mul(&im, &cr)?, &mul(&re, &ci)?)?;
+            // Two exact integers divide like `Integer#quo`: an Integer when the
+            // division is exact, otherwise a reduced Rational (MRI keeps
+            // `(11/25)` exact). Anything with a Float in it divides as a Float.
+            let part = |n: &Value| match (int_arg(n), int_arg(&denom)) {
+                (Some(a), Some(b)) if b != 0 && a % b == 0 => Value::Int(a / b),
+                (Some(a), Some(b)) => with_host(|h| {
+                    h.new_rational(num_rational::BigRational::new(a.into(), b.into()))
+                }),
+                _ => Value::Float(as_f(n) / as_f(&denom)),
+            };
+            let (qr, qi) = (part(&nr), part(&ni));
+            Ok(with_host(|h| h.new_complex(qr, qi)))
+        }
         "+" | "-" | "*" => {
             let op = match name {
                 "+" => fusevm::NumOp::Add,
@@ -9259,10 +9377,98 @@ fn dispatch_yielder(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
     }
 }
 
+/// Hand a Hash entry to a block as either two separate values or the packed
+/// `[k, v]` pair, chosen from the block's own arity — MRI's
+/// `rb_block_pair_yield_optimizable` (`hash.c` picks `each_pair_i_fast` vs
+/// `each_pair_i` the same way). Only a *fixed* arity above one takes two values,
+/// so `{ |k, v| }` and `->(k, v){}` bind key and value while `->(kv){}`,
+/// `->(*a){}` and `&:first` receive the pair intact.
+fn yield_pair(block: &Value, k: Value, v: Value) -> Result<Value, String> {
+    if with_host(|h| h.proc_arity(block)).is_some_and(|a| a > 1) {
+        call_proc(block, &[k, v])
+    } else {
+        call_proc(block, &[new_arr(vec![k, v])])
+    }
+}
+
 /// Run a generator block, collecting yielded values, stopping once `limit`
 /// values are produced. `usize::MAX` runs the block to completion (finite
 /// generators / `to_a`). The yielder's limiter raises a break signal to unwind
 /// infinite `loop {}`/`while` generators; that break is expected and cleared.
+/// The transform a block-less enumerator-returning method asks a generator for,
+/// or `None` when the method genuinely has to see every element (`sort`, `sum`,
+/// `to_a`, …) and so must materialize.
+///
+/// Block-less `map`/`select`/`reject`/… all re-yield the element sequence
+/// unchanged in MRI — the block is what would transform it, and there is none —
+/// so they all map to `Derive::Each`.
+fn derive_kind(name: &str, args: &[Value]) -> Option<Derive> {
+    Some(match name {
+        "each" | "each_entry" | "to_enum" | "enum_for" | "map" | "collect" | "select"
+        | "filter" | "find_all" | "reject" | "filter_map" | "flat_map" | "collect_concat"
+        | "take_while" | "drop_while" | "sort_by" | "min_by" | "max_by" | "group_by"
+        | "partition" | "find" | "detect" | "find_index" | "each_index" => Derive::Each,
+        "each_slice" => Derive::Slice(as_i(args.first()?).max(1) as usize),
+        "each_cons" => Derive::Cons(as_i(args.first()?).max(1) as usize),
+        "each_with_index" => Derive::WithIndex(0),
+        "with_index" => Derive::WithIndex(args.first().map(as_i).unwrap_or(0)),
+        "each_with_object" | "with_object" => Derive::WithObject(args.first()?.clone()),
+        _ => return None,
+    })
+}
+
+/// Reshape the source values a derived generator has pulled so far. The result
+/// is always a prefix-stable function of `raws`, so a later, longer batch only
+/// ever appends — which is what lets `drive_derived` resume by skipping what it
+/// already sent. `exhausted` says whether `raws` is the complete source, which
+/// only a short final `each_slice` group depends on.
+fn reshape(kind: &Derive, raws: &[Value], exhausted: bool) -> Vec<Value> {
+    match kind {
+        Derive::Each => raws.to_vec(),
+        Derive::WithIndex(start) => raws
+            .iter()
+            .enumerate()
+            .map(|(i, v)| new_arr(vec![v.clone(), Value::Int(start + i as i64)]))
+            .collect(),
+        Derive::WithObject(obj) => raws
+            .iter()
+            .map(|v| new_arr(vec![v.clone(), obj.clone()]))
+            .collect(),
+        Derive::Slice(n) => raws
+            .chunks(*n)
+            .filter(|c| exhausted || c.len() == *n)
+            .map(|c| new_arr(c.to_vec()))
+            .collect(),
+        Derive::Cons(n) => raws.windows(*n).map(|w| new_arr(w.to_vec())).collect(),
+    }
+}
+
+/// Drive a derived generator: pull the source in growing batches, reshape each
+/// prefix, and forward whatever has not been sent yet to `yielder`. Re-driving
+/// re-runs the (pure) source block from the start — the same batching
+/// `lazy_pull` uses for a generator source. An infinite source is bounded by the
+/// consumer: the yielder raises a break once its own limit is reached.
+pub(crate) fn drive_derived(src: &Value, kind: &Derive, yielder: &Value) -> Result<Value, String> {
+    let mut bound = 64usize;
+    let mut sent = 0usize;
+    loop {
+        let raws = drive_generator(src, bound)?;
+        let exhausted = raws.len() < bound;
+        let outs = reshape(kind, &raws, exhausted);
+        for v in outs.iter().skip(sent) {
+            dispatch(yielder, "<<", std::slice::from_ref(v), None)?;
+            sent += 1;
+            if has_pending_signal() {
+                return Ok(Value::Undef);
+            }
+        }
+        if exhausted {
+            return Ok(Value::Undef);
+        }
+        bound = bound.saturating_mul(2);
+    }
+}
+
 fn drive_generator(gblock: &Value, limit: usize) -> Result<Vec<Value>, String> {
     let yielder = with_host(|h| h.new_yielder(limit));
     let r = call_proc(gblock, std::slice::from_ref(&yielder));
@@ -11087,9 +11293,18 @@ fn dispatch_generator(
         }
         // MRI returns nil for a generator's size (unknown without running it).
         "size" => Ok(Value::Undef),
-        // Everything else (`map`, `select`, `reduce`, …): materialize fully and
-        // delegate to Array. Faithful for finite generators; an infinite one
-        // hangs here exactly as it does in MRI.
+        // A block-less enumerator-returning method answers with ANOTHER
+        // generator wrapping this one, so an infinite source is never pulled:
+        // `gen.each_slice(2).first(2)` draws four elements, not all of them.
+        _ if block.is_none() && derive_kind(name, args).is_some() => {
+            let kind = derive_kind(name, args).unwrap();
+            Ok(with_host(|h| {
+                h.new_derived_enumerator(gblock.clone(), kind)
+            }))
+        }
+        // Everything else (`sort`, `sum`, `to_a`, a call WITH a block, …) needs
+        // every element: materialize and delegate to Array. Faithful for finite
+        // generators; an infinite one hangs here exactly as it does in MRI.
         _ => {
             let buf = drive_generator(gblock, usize::MAX)?;
             dispatch_array(&new_arr(buf), name, args, block)
@@ -11894,19 +12109,28 @@ fn dispatch_hash(
             }
             Ok(recv.clone())
         }
-        "map" => {
+        "map" | "collect" => {
             let mut out = Vec::new();
             if let Some(b) = &block {
                 for (k, v) in &map {
                     let kv = with_host(|h| h.key_value(k));
-                    // Yield the `[k, v]` pair as a single argument: a 2-param
-                    // block auto-splats it, and a 1-param destructuring block
-                    // (`|(k, v)|`) receives the whole pair to unpack.
-                    let pair = new_arr(vec![kv, v.clone()]);
-                    out.push(call_proc(b, &[pair])?);
+                    out.push(yield_pair(b, kv, v.clone())?);
                 }
             }
             Ok(new_arr(out))
+        }
+        // `find`/`detect` return the whole `[k, v]` pair of the first entry the
+        // block accepts (nil if none).
+        "find" | "detect" if block.is_some() => {
+            let b = block.unwrap();
+            for (k, v) in &map {
+                let kv = with_host(|h| h.key_value(k));
+                let r = yield_pair(&b, kv.clone(), v.clone())?;
+                if with_host(|h| h.truthy(&r)) {
+                    return Ok(new_arr(vec![kv, v.clone()]));
+                }
+            }
+            Ok(Value::Undef)
         }
         "select" | "filter" | "reject" => {
             let keep = name != "reject";
@@ -12005,10 +12229,10 @@ fn dispatch_hash(
         "min_by" | "max_by" | "sort_by" | "reduce" | "inject" | "group_by" | "partition"
         | "find_all" | "chunk_while" | "chunk" | "slice_when" | "each_slice" | "each_cons"
         | "minmax_by" | "minmax" | "count" | "sum" | "any?" | "all?" | "none?" | "one?"
-        | "filter_map" | "flat_map" | "collect_concat" | "find" | "detect" | "find_index"
-        | "take_while" | "drop_while" | "take" | "drop" | "collect" | "min" | "max" | "sort"
-        | "tally" | "zip" | "reverse_each" | "each_entry" | "cycle" | "first" | "uniq" | "grep"
-        | "grep_v" | "entries" => {
+        | "filter_map" | "flat_map" | "collect_concat" | "find_index" | "take_while"
+        | "drop_while" | "take" | "drop" | "min" | "max" | "sort" | "tally" | "zip"
+        | "reverse_each" | "each_entry" | "cycle" | "first" | "uniq" | "grep" | "grep_v"
+        | "entries" => {
             let rows: Vec<Value> = with_host(|h| {
                 map.iter()
                     .map(|(k, v)| {
@@ -12206,6 +12430,13 @@ fn dispatch_range(
                     i += by;
                 }
                 return Ok(recv.clone());
+            }
+            // A block-less enumerator method answers with a lazy Enumerator over
+            // `lo, lo+1, …` — `(1..).each_slice(2).first(2)` must not try to
+            // materialize the range.
+            _ if block.is_none() && derive_kind(name, args).is_some() => {
+                let kind = derive_kind(name, args).unwrap();
+                return Ok(with_host(|h| h.new_endless_range_enumerator(lo, kind)));
             }
             _ => {
                 return Err(raise_exc(
@@ -12672,7 +12903,12 @@ fn dispatch_symbol(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
     }
 }
 
-fn dispatch_proc(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+fn dispatch_proc(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
     // A `Symbol#to_proc` proc: calling it sends the symbol's method to arg[0].
     if let Some(sym) = with_host(|h| h.as_sym_proc(recv)) {
         return match name {
@@ -12688,11 +12924,13 @@ fn dispatch_proc(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
         };
     }
     match name {
-        "call" | "()" | "[]" | "yield" => call_proc(recv, args),
+        "call" | "()" | "[]" | "yield" => crate::host::call_proc_block(recv, args, block),
         "arity" => Ok(Value::Int(with_host(|h| h.proc_arity(recv)).unwrap_or(0))),
         "lambda?" => Ok(Value::Bool(with_host(|h| h.proc_is_lambda(recv)))),
         // `to_proc` on a Proc is the identity.
         "to_proc" => Ok(recv.clone()),
+        // `Proc#===` invokes the proc, so a lambda works as a `case/when` guard.
+        "===" => crate::host::call_proc_block(recv, args, block),
         "curry" => with_host(|h| h.proc_curry(recv))
             .ok_or_else(|| "undefined method 'curry' for Proc".to_string()),
         // Composition: `(f >> g).call(x) == g.call(f.call(x))`.
@@ -12726,7 +12964,15 @@ pub(crate) fn call_bound(
     block: Option<Value>,
 ) -> Result<Value, String> {
     match dispatch(recv, name, args, block.clone()) {
-        Err(e) if e.starts_with("undefined method") => kernel(name, args, block).map_err(|_| e),
+        Err(e) if e.starts_with("undefined method") => {
+            // A top-level `def` is not an instance method of Object — it lives in
+            // the flat method table — so `method(:m).call` has to look there
+            // before falling back to the Kernel private methods.
+            if let Some(def) = with_host(|h| h.method_def(name)) {
+                return crate::host::run_top_method(&def, recv.clone(), name, args, block);
+            }
+            kernel(name, args, block).map_err(|_| e)
+        }
         other => other,
     }
 }
@@ -12766,6 +13012,18 @@ fn dispatch_method(
         "receiver" => Ok(mrecv),
         // A `Method` is itself callable via `call_proc`, so `to_proc` is identity.
         "to_proc" => Ok(recv.clone()),
+        // `Method#to_proc` yields a lambda in MRI, so the derived proc is strict.
+        "lambda?" => Ok(Value::Bool(true)),
+        // `curry` gathers the method's own arity before invoking it.
+        "curry" => {
+            let arity = match args.first() {
+                Some(n) => as_i(n),
+                None => with_host(|h| h.method_arity(&mrecv, &mname)),
+            };
+            Ok(with_host(|h| {
+                h.new_method_curry(recv.clone(), arity.max(0) as usize)
+            }))
+        }
         _ => Err(no_method_error(recv, name)),
     }
 }

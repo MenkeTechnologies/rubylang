@@ -1531,3 +1531,151 @@ Hash
 [:cm]
 []
 []
+#==#
+"wrong number of arguments (given 1, expected 2)"
+#==#
+"wrong number of arguments (given 3, expected 2)"
+#==#
+"wrong number of arguments (given 0, expected 1..2)"
+#==#
+[1, 5]
+#==#
+"wrong number of arguments (given 0, expected 1+)"
+#==#
+[1, [2, 3]]
+#==#
+"missing keyword: :k"
+#==#
+"unknown keyword: :j"
+#==#
+[1, 7]
+#==#
+[1, {z: 3}]
+#==#
+"wrong number of arguments (given 1, expected 2)"
+#==#
+[[1, nil], [1, 2]]
+#==#
+"wrong number of arguments (given 1, expected 2)"
+#==#
+[3]
+#==#
+[0, 1, 2, -2]
+#==#
+[-1, -2, -2]
+#==#
+[1, 1, 2, -1, -2]
+#==#
+[-1, -2, 0, 1]
+#==#
+[0, 1, 1, -1, 0]
+#==#
+[true, false, true]
+#==#
+5
+#==#
+"wrong number of arguments (given 3, expected 2)"
+#==#
+[7, true]
+#==#
+8
+#==#
+[1, nil]
+#==#
+1
+#==#
+[true, :big]
+#==#
+"wrong number of arguments (given 1, expected 2)"
+#==#
+"wrong number of arguments (given 1, expected 2)"
+#==#
+[[1, 2], 2, 2]
+#==#
+"wrong number of arguments (given 1, expected 2)"
+#==#
+[2, true, [1, 2]]
+#==#
+[1, 2]
+#==#
+[0, 1, -2, -1, -2]
+#==#
+[1, 2, -1, -1, 0]
+#==#
+[1, 2, [1, 2]]
+#==#
+[[[:a, 1]], [[:a, 1]], [:a]]
+#==#
+[[:b, 2], [[:a, 1], [:b, 2]]]
+#==#
+[Enumerator, Enumerator]
+#==#
+[Enumerator, Enumerator, Enumerator]
+#==#
+[[[1, 2], [4, 5]], [[1, 2], [4, 5]]]
+#==#
+[[true, [1, 1]], [false, [2]], [true, [3, 3]]]
+#==#
+[[[:a, 1], [:b, 2]]]
+#==#
+"tried to create Proc object without a block"
+#==#
+"tried to create Proc object without a block"
+#==#
+[[1, 2], [1, 2], 2]
+#==#
+[2, 1]
+#==#
+[[0, 1, 2], [0, 1]]
+#==#
+[[0, 1], [2, 3]]
+#==#
+[[0, 1], [1, 2]]
+#==#
+[[[0, 0], [1, 1]], [[0, 0], [1, 1]]]
+#==#
+[[0, 1], [0, 1], [0, 1]]
+#==#
+[[0, []], [1, []]]
+#==#
+[[1, 2, 1], [[1, 2, 1], [2, 1, 2]], [[1, 0], [2, 1], [1, 2]]]
+#==#
+[[[1, 2], [3, 4]], [[1, 2], [2, 3]]]
+#==#
+[[1, 2], [1, 2], [1, 2], [1, 2]]
+#==#
+[[[1, 0], [2, 1]], [[1, []], [2, []]]]
+#==#
+[[[1, 2], [3, 4]], Enumerator]
+#==#
+[[[1, 2], [3]], [[1, 2], [2, 3]], [[1, 0], [2, 1], [3, 2]]]
+#==#
+ArgumentError
+#==#
+ArgumentError
+#==#
+ArgumentError
+#==#
+[{x: 1, y: 2}, {x: 3, y: 4}, {x: 1, y: 9}]
+#==#
+[true, true]
+#==#
+[:hit, true]
+#==#
+[true, false, true, false]
+#==#
+FrozenError
+#==#
+[[:m], [:m]]
+#==#
+[[:@x, :@y], 1]
+#==#
+[((11/25)+(2/25)*i), (2+1i), (1+2i)]
+#==#
+[(3.0+5.0i), (0.75+1.25i), (3.5+2.5i)]
+#==#
+[(-1-2i), (3-2i), ((-7/8)-(1/8)*i)]
+#==#
+[false, true, (1+2i)]
+#==#
+[[26085, 26412, 35486], 5, 5]

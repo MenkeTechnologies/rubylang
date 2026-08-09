@@ -112,9 +112,20 @@ leading positional before `...`); `Integer#step`, `?c` char literals,
   `; required keyword: x` suffix MRI appends when the signature has required
   keywords, and `unknown keyword(s): :z` / `missing keyword(s): :x`. (Previously
   a short call silently left the parameter unbound, so the body ran with a stray
-  nil.) Not yet enforced: **lambda** arity — `->(x, y) { }.call(1)` binds `y` to
-  nil instead of raising, because a block template carries no required/optional
-  split yet. A `proc` is correct by construction (MRI does not check procs).
+  nil.)
+- **Lambda arity is enforced too.** A block template now carries the parameter
+  shape as written (`req`/`opt`/keyword names/required keywords/`**rest`/`&blk`),
+  so a lambda — `->`, `lambda { }`, a `define_method` body, `Method#to_proc` —
+  runs the same pre-body check a `def` does and raises the identical
+  `ArgumentError`. A lambda also does NOT auto-splat a single array argument, so
+  `[[1, 2]].map(&->(x, y) { x + y })` raises where the block form binds both. A
+  plain `proc` stays lenient in both respects, which is MRI's rule, and
+  `Proc#lambda?` is the discriminator. `Proc#arity`/`Method#arity` are computed
+  from the same shape via MRI's `rb_iseq_min_max_arity` formula, so an optional
+  positional, a splat, a `**rest` or an optional keyword each make it negative
+  for a lambda (`->(x, y = 1) {}.arity == -2`) while a proc goes negative only
+  for a splat. `->(&b) { }` binds the block passed to `Proc#call`, and
+  `->(x; t) { }` declares block-locals like `{ |x; t| }`.
 
 - **`redo`.** Implemented. Inside a native `while`/`until` (and the post-test
   `begin … end while` form) it compiles to a backward jump to the body start, so
@@ -322,10 +333,34 @@ Honest limitations of this surface:
 - **Composite Hash keys.** Arrays (`{[1, 2] => v}`, nested), Ranges
   (`{(1..3) => v}`, Integer/String/Float endpoints), and class objects work as
   Hash keys and Set members — keyed structurally by value, so equal keys hash
-  together and round-trip through `.keys`/`.inspect`. (Only a user object with a
-  custom `hash`/`eql?` still keys by heap identity.)
+  together and round-trip through `.keys`/`.inspect`. A `Struct`/`Data` instance
+  keys by VALUE too — its class plus its members — so two `P.new(1, 2)` are the
+  same Hash key and report the same `#hash`, as in MRI. (Only a plain user object
+  with a custom `hash`/`eql?` still keys by heap identity.)
+- **`Data.define` is strict about its members.** Every member is mandatory and no
+  extra one is accepted, in either construction form: `P.new(1)` raises
+  `ArgumentError: missing keyword: :y`, `P.new(1, 2, 3)` raises `wrong number of
+  arguments (given 3, expected 0..2)`, and `P.new(x: 1, z: 2)` raises `unknown
+  keyword: :z`. A `Struct` stays lenient (missing members read as nil), which is
+  also MRI's rule.
+- **`Complex` arithmetic.** `+`/`-`/`*` combine componentwise through the numeric
+  tower, and `/`/`quo` divide by the conjugate: two exact integer parts give an
+  Integer when the division is exact and a reduced `Rational` otherwise
+  (`Complex(1, 2) / Complex(3, 4)` is `((11/25)+(2/25)*i)`), while a Float
+  anywhere in the operands divides as a Float. Unary minus negates both parts, so
+  the `-2i` literal form works. `Complex#inspect` follows MRI's shape: each part
+  is inspected (a Rational part is parenthesized), the sign comes from the value
+  rather than its rendering, and the imaginary unit is `*i` whenever the
+  magnitude does not end in a digit.
+- **Private-by-definition hooks.** `initialize`, `initialize_copy`/`_clone`/
+  `_dup`, `method_missing` and `respond_to_missing?` are private in Ruby however
+  they were written, so they are excluded from `instance_methods`,
+  `public_instance_methods`, `methods` and `public_methods`.
+- **`Object#clone(freeze:)`.** `clone` carries the frozen flag over (unlike
+  `dup`); `freeze: false` thaws the copy and `freeze: true` freezes it regardless
+  of the source.
 - **Enumerator.** A block-less `each`/`map`/`select`/`reject`/`each_with_index`
-  (on arrays), `String#each_char`/`each_byte`/`each_line`, and
+  (on arrays), `String#each_char`/`each_byte`/`each_codepoint`/`each_line`, and
   `Integer#times`/`upto`/`downto`/`step`
   returns a concrete `Enumerator` supporting external iteration (`next`, `peek`,
   `rewind`, `size`, raising `StopIteration` at the end), the full Enumerable
@@ -334,7 +369,12 @@ Honest limitations of this surface:
   and `with_object(memo)`. `with_index` honors the source method — `map`/
   `flat_map` collect the block's results, `select`/`reject` filter, `each`
   returns the elements; `with_object` threads the memo and returns it. Finite
-  block-less sources are eagerly materialized.
+  block-less sources are eagerly materialized. The grouping methods answer an
+  Enumerator too: `each_slice(n)`/`each_cons(n)` without a block, and
+  `chunk`/`chunk_while`/`slice_when` with one. `chunk_while`/`slice_when` need a
+  block — MRI turns it into a Proc up front, so a block-less call raises
+  `ArgumentError: tried to create Proc object without a block` rather than
+  answering an Enumerator.
 - **Block-based generators.** `Enumerator.new { |y| ... }` drives the block with
   a native `Enumerator::Yielder`; `y << v` and its alias `y.yield(v)` push
   yielded values. `to_a`/`first(n)`/`take(n)`/`each`/`lazy` re-run the block on
@@ -353,7 +393,16 @@ Honest limitations of this surface:
   happens only once the consumer reaches it, and a raise surfaces on the `next`
   that would have reached it (not on the first). `peek` parks the pulled value
   without advancing; `rewind` drops the fiber so the next `next` re-runs the block
-  from the top.
+  from the top. A block-less enumerator-returning method on an infinite source no
+  longer materializes it: `each`/`map`/`select`/`each_entry`/`to_enum` and
+  friends, plus `each_slice(n)`/`each_cons(n)`/`each_with_index`/`with_index`/
+  `each_with_object(o)`, answer a DERIVED generator that pulls the source in
+  growing batches and reshapes it on demand, so `gen.each_slice(2).first(2)`
+  draws four elements instead of hanging. An endless Range (`(1..)`,
+  `(1..Float::INFINITY)`) gets the same treatment through a native counting
+  generator, where it used to raise `RangeError`. A call WITH a block, or one
+  that genuinely needs every element (`sort`, `sum`, `to_a`), still materializes
+  and so still runs forever on an infinite source — exactly as MRI does.
 - **Hash through Enumerable.** MRI derives Hash's Enumerable surface from
   `Hash#each`, and `each` yields the whole `[k, v]` pair as ONE value
   (`hash.c` `each_pair_i`) — so a one-parameter block sees the pair, not the key.
@@ -366,8 +415,12 @@ Honest limitations of this surface:
   the pair. Hash's OWN methods — `select`/`reject`, `delete_if`/`keep_if`,
   `each_key`/`each_value`, `transform_keys`/`transform_values`, and `to_h` with a
   block — yield key and value separately, as in MRI. `Struct#each_pair` and
-  `ENV.each` follow `Hash#each`. Residual gap: a block-less `chunk_while` returns
-  the grouped array rather than an `Enumerator`.
+  `ENV.each` follow `Hash#each`. `map`/`collect`/`find`/`detect` are the
+  exception MRI carves out (`rb_block_pair_yield_optimizable`): they hand the
+  block two separate values when its arity is a FIXED count above one, and the
+  packed pair otherwise — so `hash.map(&->(k, v) { … })`, `hash.map(&->(kv) { … })`
+  and `hash.map(&:first)` all bind correctly, which a single fixed yield shape
+  cannot do now that lambdas are strict.
 - **Exception hierarchy.** The builtin exception classes carry MRI's real tree,
   not a flat `X < Exception`: `ArgumentError`/`TypeError`/`RuntimeError`/… derive
   from `StandardError`, and the ones with an intermediate parent keep it
