@@ -397,17 +397,55 @@ Honest limitations of this surface:
 
 ## Runtime / methods
 
-- **Argument-count checking on built-ins is not systematic.** Most built-in
-  dispatch arms read their required argument as `args[0]`, so calling one with no
-  arguments panics the interpreter (`index out of bounds`) instead of raising
-  `ArgumentError`. A sweep that calls every name in `src/arity_table.rs` with no
-  arguments and no block, restarting after each crash, found 171 such panics in
-  the first 4,384 of 17,676 `(receiver, name)` cases — `1.+()`, `1.==()`,
-  `"s".center`, `[1, 2].fetch`, `1.method`, `1.respond_to?` among them. The arms on
-  the block-less Enumerable path are guarded (`each_with_object` raises MRI's
-  `wrong number of arguments (given 0, expected 1)`, argument-less
-  `index`/`find_index`/`rindex` answer an Enumerator, `include?` raises); the rest
-  is open, and wants one systematic arity-guard pass rather than piecemeal fixes.
+- **Argument counts on built-ins are checked once, from a measured table.** Every
+  built-in dispatch arm reads its arguments positionally (`args[0]`), so a call
+  with too few of them panicked the interpreter (`index out of bounds`) where MRI
+  raises a rescuable `ArgumentError`. `builtins::check_builtin_arity` now rejects
+  such a call at the single point where dispatch has decided the call belongs to a
+  built-in, so the whole surface is covered at once rather than arm by arm. The
+  accepted range comes from `arity_table::BUILTIN_ARG_SHAPES`: a `(min, max)` per
+  built-in for each call shape (with and without a block), the `expected …` wording
+  MRI prints, and whether the method takes keyword arguments.
+  A sweep of 48,816 cases — 904 method names from the table × 18 receivers × 3
+  argument modes (none / too many / wrong type), restarting the interpreter after
+  each crash — goes from **635 panics to 90**.
+  The 90 that remain are not argument-count misses; every one is a different bug:
+  44 are methods the table deliberately does not measure (`instance_exec` and
+  `define_method` forward their arguments elsewhere; `print`/`printf`/`throw` are
+  unsafe to probe), 41 are calls MRI answers with `NoMethodError` — rubylang
+  dispatches an Array or String arm on a receiver that has no such method
+  (`Set.new([1]).fill`, `[1, 2].each.pack`), so no table row resolves and nothing
+  is checked — and 5 are type errors rather than count errors (`"abc".gsub(obj)`
+  passes the 1..2 count and then panics on a pattern that is neither Regexp nor
+  String; `1.step` is a legal zero-argument Enumerator call MRI accepts and the arm
+  does not implement).
+- **The built-in shape table is measured, not derived.** `Method#arity` cannot
+  express what a C function accepts — `String#center` reports -1 and takes 1..2 —
+  so `tools/gen_arity_table.rb` CALLS each method with a deliberately wrong number
+  of arguments and reads the range out of the `ArgumentError` MRI raises. Three
+  properties of that measurement are worth stating because each one was a wrong
+  answer first:
+  - **MRI's `expected …` clause is a message, not a range.** `(1..3).min(*12)`
+    prints `expected 1` and yet `(1..3).min` is valid, so a table that reads the
+    minimum off the clause rejects a correct call. Both ends are confirmed by
+    probing — downward from the stated minimum until a count is really refused,
+    and one past the stated maximum to check a maximum exists at all — and the
+    clause is carried verbatim only because it is what the raised message has to
+    say.
+  - **A forwarding method has no shape of its own.** `Class#new` hands its
+    arguments to the receiver's `initialize`, so probing it on `String` measures
+    `String#initialize` and yields a row saying `new` takes 0..1 — which then
+    rejects `Range.new(1, 3)` and every other multi-argument constructor. Those
+    methods are excluded by name (`UNMEASURABLE`) rather than measured; an
+    unmeasured row is one nothing checks, which is the right answer for a method
+    whose shape belongs to its target.
+  - **Keyword acceptance is measured too.** `Data#with` declares `[[:rest]]` and
+    accepts nothing but keywords, so a column read off `Method#parameters` rejects
+    `point.with(x: 9)` — rubylang's parser desugars keyword arguments into one
+    trailing Hash positional, which then overflows a maximum of 0. The generator
+    asks MRI directly, with an unknown keyword: a method that takes keywords
+    complains about the keyword, one that does not counts the Hash as one more
+    positional and complains about the count.
 - **Blocks and procs.** `Proc#parameters` is not implemented (`->(a, **rest) { }
   .parameters` raises `undefined method`), though the written shape it needs is
   now recorded. An anonymous keyword collector in a block parameter list

@@ -1558,6 +1558,104 @@ pub(crate) fn dispatch_by_type(
     }
 }
 
+/// Reject a built-in call whose argument count the reference interpreter would
+/// reject, with the message it would raise.
+///
+/// MRI checks a C function's argument count BEFORE the body runs and raises a
+/// catchable `ArgumentError`. Every built-in arm below reads its arguments
+/// positionally (`args[0]`), so without this check the same call panics the whole
+/// interpreter with `index out of bounds` — an uncatchable crash where Ruby has a
+/// rescuable error. Checking once here covers the whole built-in surface; the
+/// alternative, an `if args.is_empty()` in each of ~300 arms, leaves whichever
+/// arms nobody got to still panicking.
+///
+/// The accepted range comes from `arity_table::BUILTIN_ARG_SHAPES`, which is
+/// measured against the reference interpreter rather than derived from
+/// `Method#arity` — arity cannot express `String#center`'s real 1..2.
+///
+/// Two deliberate leniencies, both because rubylang cannot see a distinction MRI
+/// can, and being lenient costs a wrong answer where being strict would cost a
+/// wrongly-raised error:
+///
+/// * When a block is present the widest of the two measured shapes applies. A
+///   block reaches here from an internal sink as readily as from a written
+///   `{ … }` (`dispatch(recv, "each", &[], Some(sink))`), so a shape that is
+///   narrower with a block — `Array#fill` takes 1..3 without one and 0..2 with —
+///   must not be applied to a block rubylang synthesized itself.
+/// * A trailing Hash is not counted against the maximum for a method the
+///   reference interpreter gives keyword parameters. The parser desugars keyword
+///   arguments into exactly one trailing Hash positional (`src/parser.rs`'s
+///   `push_trailing_kwargs`), so `[].pack("C*", buffer: b)` arrives here as two
+///   positional arguments against a measured maximum of one.
+fn check_builtin_arity(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<&Value>,
+) -> Result<(), String> {
+    let Some(owner) = with_host(|h| h.builtin_owner(recv, name)) else {
+        return Ok(());
+    };
+    let has_block = block.is_some();
+    // A zero-argument call some built-ins answer with their own wording rather
+    // than the standard one — `1.send()` raises "no method name given".
+    if args.is_empty() {
+        if let Some((no_block, with_block)) = crate::arity_table::zero_arg_error(owner, name) {
+            let msg = if has_block { with_block } else { no_block };
+            if !msg.is_empty() {
+                return Err(raise_exc("ArgumentError", msg));
+            }
+        }
+    }
+    let Some((min, max, expected, block_min, block_max, block_expected, keywords)) =
+        crate::arity_table::arg_shape(owner, name)
+    else {
+        return Ok(());
+    };
+    // A shape of -1 was never measured, which means nothing is known and nothing
+    // is checked. With a block that applies to either half: the union of a known
+    // range and an unknown one is unknown.
+    let (min, max, expected) = if !has_block {
+        (min, max, expected)
+    } else if min < 0 || block_min < 0 {
+        return Ok(());
+    } else {
+        let widest = if max < 0 || block_max < 0 {
+            -1
+        } else {
+            max.max(block_max)
+        };
+        // Report the clause belonging to whichever half the widened range came
+        // from, so the message stays one MRI actually prints.
+        let expected = if block_min < min || widest > max {
+            block_expected
+        } else {
+            expected
+        };
+        (min.min(block_min), widest, expected)
+    };
+    if min < 0 || expected.is_empty() {
+        return Ok(());
+    }
+    let given = args.len() as i16;
+    let fits = |n: i16| n >= min && (max < 0 || n <= max);
+    if fits(given) {
+        return Ok(());
+    }
+    // The keyword-hash leniency: retry without the trailing Hash.
+    if keywords
+        && given > 0
+        && with_host(|h| h.as_hash(args.last().unwrap()).is_some())
+        && fits(given - 1)
+    {
+        return Ok(());
+    }
+    Err(raise_exc(
+        "ArgumentError",
+        &format!("wrong number of arguments (given {given}, expected {expected})"),
+    ))
+}
+
 pub(crate) fn dispatch(
     recv: &Value,
     name: &str,
@@ -1609,6 +1707,9 @@ pub(crate) fn dispatch(
             return call_instance_method(recv.clone(), &cls, name, args, block);
         }
     }
+    // Past this point no user-written method can claim the call, so it is a
+    // built-in and its argument count is the reference interpreter's to judge.
+    check_builtin_arity(recv, name, args, block.as_ref())?;
     // Universal methods available on every object.
     match name {
         // Argless `to_s` is the universal default; `to_s(base)` etc. fall through
@@ -6414,6 +6515,16 @@ fn dispatch_string(
                 return regex_replace(&re, &s, &args[1..], &block, all);
             }
             let from = arg_str(&args[0]);
+            // With a block the pattern is the ONLY argument, so there is no
+            // `args[1]` to read: the block's value replaces each match. A String
+            // pattern is a literal one, so it is escaped into a Regexp and run
+            // through the same path — which is also what gives the block the `$~`
+            // MRI sets for a String pattern (`"aXb".gsub("X") { $~[0] }`).
+            if block.is_some() {
+                let re = fancy_regex::Regex::new(&regex_escape(&from))
+                    .map_err(|e| raise_exc("RegexpError", &e.to_string()))?;
+                return regex_replace(&re, &s, &[], &block, all);
+            }
             let to = arg_str(&args[1]);
             Ok(new_str(if all {
                 s.replace(&from, &to)

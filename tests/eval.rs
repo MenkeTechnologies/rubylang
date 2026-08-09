@@ -2085,6 +2085,73 @@ fn builtin_method_shapes_match_mri() {
     eq("3.method(:+).curry[4]", "7");
 }
 
+/// A built-in refuses a wrong argument count the way MRI does — a rescuable
+/// `ArgumentError` carrying MRI's exact wording — instead of reading a missing
+/// `args[0]` and panicking the interpreter. Every case below is one MRI answers
+/// identically; each also pins a property of the measured table behind the check
+/// that a plausible-looking implementation gets wrong.
+#[test]
+fn builtin_arg_counts_raise_instead_of_panicking() {
+    // A helper that turns the raised message into the value under test.
+    let m = |call: &str| format!("begin\n  {call}\nrescue ArgumentError => e\n  e.message\nend");
+    let raises = |call: &str, msg: &str| eq(&m(call), &format!("{msg:?}"));
+
+    raises(
+        "1.send(:+)",
+        "wrong number of arguments (given 0, expected 1)",
+    );
+    raises(
+        "[1, 2].fetch",
+        "wrong number of arguments (given 0, expected 1..2)",
+    );
+    raises(
+        "1.respond_to?",
+        "wrong number of arguments (given 0, expected 1..2)",
+    );
+    // `Method#arity` reports -1 here and cannot express the real 1..2, which is
+    // why the range is measured against the reference interpreter instead.
+    raises(
+        "\"abc\".center",
+        "wrong number of arguments (given 0, expected 1..2)",
+    );
+    raises(
+        "\"abc\".split(1, 2, 3)",
+        "wrong number of arguments (given 3, expected 0..2)",
+    );
+
+    // MRI's "expected" clause is its MESSAGE, not its range: `Range#min` prints
+    // "expected 1" and still accepts zero arguments. Reading the minimum off the
+    // clause would reject the first line here.
+    eq("(1..3).min", "1");
+    raises(
+        "(1..3).min(1, 2)",
+        "wrong number of arguments (given 2, expected 1)",
+    );
+
+    // `Class#new` forwards to `initialize`, so its shape belongs to the class
+    // being constructed. A row measured on `String.new` would cap every
+    // constructor in the language at one argument.
+    eq("Range.new(1, 3)", "1..3");
+    eq("Struct.new(:a, :b).new(1, 2).b", "2");
+
+    // `Data#with` declares `[[:rest]]` and takes nothing but keywords, which the
+    // parser hands over as one trailing Hash. A keyword column read off the
+    // declaration rather than measured would reject this.
+    eq("Data.define(:x).new(x: 1).with(x: 9).x", "9");
+
+    // A block widens `String#sub`: two arguments without one, the pattern alone
+    // with one. Both halves are measured, and the widened form is implemented
+    // rather than merely permitted.
+    raises(
+        "\"aXb\".sub(\"X\")",
+        "wrong number of arguments (given 1, expected 2)",
+    );
+    eq("\"aXb\".sub(\"X\") { \"Y\" }", "\"aYb\"");
+    eq("\"aXbX\".gsub(\"X\") { |c| c.downcase }", "\"axbx\"");
+    // A String pattern is a literal one, and it still sets `$~` for the block.
+    eq("\"a.c\".gsub(\".\") { $~[0] * 2 }", "\"a..c\"");
+}
+
 /// A written method describes itself: required-vs-optional positionals, required
 /// keywords, and the module it was defined in.
 #[test]

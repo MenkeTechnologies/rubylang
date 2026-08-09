@@ -2852,10 +2852,32 @@ impl RubyHost {
         }
         self.builtin_shape(recv, name, unbound)
     }
+    /// The module the reference interpreter defines `name` on for `recv` — the
+    /// first one in the receiver's ancestor chain with a table row. This is the
+    /// key both `src/arity_table.rs` argument-shape tables are looked up by, so a
+    /// call-time arity check resolves the method exactly as reflection does.
+    pub fn builtin_owner(&self, recv: &Value, name: &str) -> Option<&'static str> {
+        self.builtin_chain(recv, false)
+            .iter()
+            .find_map(|owner| crate::arity_table::lookup(owner, name).map(|(owner, _, _)| owner))
+    }
     /// The built-in row describing `name` for `recv`: the first module in the
     /// receiver's ancestor chain that the reference interpreter defines it on.
     fn builtin_shape(&self, recv: &Value, name: &str, unbound: bool) -> Option<MethodShape> {
-        let chain = match self.classref_name(recv) {
+        let chain = self.builtin_chain(recv, unbound);
+        chain.iter().find_map(|owner| {
+            crate::arity_table::lookup(owner, name).map(|(owner, arity, params)| {
+                MethodShape::Builtin {
+                    owner,
+                    arity,
+                    params,
+                }
+            })
+        })
+    }
+    /// The ancestor chain a built-in lookup for `recv` walks.
+    fn builtin_chain(&self, recv: &Value, unbound: bool) -> Vec<String> {
+        match self.classref_name(recv) {
             // An UnboundMethod on a class looks its name up as an INSTANCE method.
             Some(cls) if unbound => self.expanded_ancestry(&cls),
             // A bound class receiver is a class-method call (`Integer.sqrt`) first;
@@ -2866,16 +2888,7 @@ impl RubyHost {
                 c
             }
             None => self.expanded_ancestry(&self.dispatch_class(recv)),
-        };
-        chain.iter().find_map(|owner| {
-            crate::arity_table::lookup(owner, name).map(|(owner, arity, params)| {
-                MethodShape::Builtin {
-                    owner,
-                    arity,
-                    params,
-                }
-            })
-        })
+        }
     }
     /// The ancestor chain to resolve a built-in method against: the runtime's own
     /// ancestry (which knows the user's classes, includes and prepends), with
@@ -4495,7 +4508,14 @@ impl RubyHost {
     fn ancestry_tail(&self, name: &str) -> Vec<String> {
         let mut out = Vec::new();
         if self.struct_defs.contains_key(name) {
-            out.push(if self.is_data_class(name) { "Data" } else { "Struct" }.to_string());
+            out.push(
+                if self.is_data_class(name) {
+                    "Data"
+                } else {
+                    "Struct"
+                }
+                .to_string(),
+            );
             if !self.is_data_class(name) {
                 out.push("Enumerable".to_string());
             }
@@ -5655,10 +5675,15 @@ impl RubyHost {
                 // tags an UnboundMethod as one. (MRI also appends the written
                 // parameter list and source location; rubylang retains neither.)
                 Some(RObj::Method {
-                    recv, name, unbound,
+                    recv,
+                    name,
+                    unbound,
                 }) => {
                     let tag = if unbound { "UnboundMethod" } else { "Method" };
-                    format!("#<{tag}: {}#{name}>", self.method_owner(&recv, &name, unbound))
+                    format!(
+                        "#<{tag}: {}#{name}>",
+                        self.method_owner(&recv, &name, unbound)
+                    )
                 }
                 Some(RObj::Regexp { source, flags, .. }) => {
                     let on: String = "mix".chars().filter(|c| flags.contains(*c)).collect();
