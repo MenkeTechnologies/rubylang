@@ -1806,3 +1806,12 @@ hi
 "wrong number of arguments (given 0, expected 1)"
 "wrong number of arguments (given 0, expected 1)"
 [Enumerator, [1, 2, 3], Enumerator, [1, 2, 3], 1, 1]
+#==#
+[:hash, :set, :big, :rat, :cpx]
+[{a: 1}, Set[1, 2], 18446744073709551616, (1/2), (1+2i)]
+[true, false]
+[true, true]
+[:z, :z, 2]
+2
+1
+:nested

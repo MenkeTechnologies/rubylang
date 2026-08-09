@@ -599,8 +599,10 @@ pub struct RescueDef {
     pub body: usize,
 }
 
-/// A hashable Ruby value used as a Hash key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// A hashable Ruby value used as a Hash key. `Ord` is derived purely to give
+/// the order-independent containers (`Hash`, `Set`) a canonical element order
+/// to sort into; it is not a Ruby-visible ordering.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RKey {
     Int(i64),
     Str(String),
@@ -614,6 +616,21 @@ pub enum RKey {
     /// An Array used as a Hash key (`{[1, 2] => v}`), keyed structurally by its
     /// elements (recursively) so equal arrays hash together and round-trip.
     Array(Vec<RKey>),
+    /// A Hash used as a Hash key (`{{a: 1} => v}`), keyed by its entries. Ruby's
+    /// `Hash#hash` is order-independent (`{a: 1, b: 2}.hash == {b: 2, a: 1}.hash`),
+    /// so the pairs are sorted into a canonical order before keying.
+    Hash(Vec<(RKey, RKey)>),
+    /// A Set used as a Hash key, keyed by its members — likewise sorted, since
+    /// a Set is unordered for equality and hashing.
+    Set(Vec<RKey>),
+    /// An Integer too large for `i64`. A promoted BigInt never holds an
+    /// in-range value, so it can never collide with `Int`.
+    Big(num_bigint::BigInt),
+    /// A Rational, keyed by its lowest-terms value.
+    Rational(num_rational::BigRational),
+    /// A Complex, keyed by both parts (each of which keeps its own numeric
+    /// class, so `Complex(1, 0)` and `Complex(1.0, 0)` are distinct keys).
+    Complex(Box<RKey>, Box<RKey>),
     /// A Range used as a Hash key: `(lo, hi, exclusive)` for an Integer range,
     /// or the String/Float endpoint variants.
     Range(i64, i64, bool),
@@ -5904,6 +5921,16 @@ impl RubyHost {
                 fmt_float(f64::from_bits(*hi))
             ),
             RKey::Identity(i) => self.inspect(&Value::Obj(*i)),
+            // Hash/Set/BigInt/Rational/Complex keys have no shorthand rendering
+            // of their own — rebuild the value and use the one `inspect`.
+            k @ (RKey::Hash(_)
+            | RKey::Set(_)
+            | RKey::Big(_)
+            | RKey::Rational(_)
+            | RKey::Complex(..)) => {
+                let v = self.key_to_value(&k.clone());
+                self.inspect(&v)
+            }
         }
     }
 
@@ -5979,7 +6006,9 @@ impl RubyHost {
     fn to_key(&self, v: &Value) -> RKey {
         match v {
             Value::Int(n) => RKey::Int(*n),
-            Value::Float(f) => RKey::FloatBits(f.to_bits()),
+            // `0.0.eql?(-0.0)` is true in Ruby and the two are the SAME Hash key,
+            // but their bit patterns differ — normalize the sign of zero away.
+            Value::Float(f) => RKey::FloatBits(if *f == 0.0 { 0f64.to_bits() } else { f.to_bits() }),
             Value::Bool(b) => RKey::Bool(*b),
             Value::Undef => RKey::Nil,
             Value::Str(s) => RKey::Str(s.to_string()),
@@ -5989,6 +6018,32 @@ impl RubyHost {
                 Some(RObj::ClassRef(n)) => RKey::Class(n.clone()),
                 Some(RObj::Array(items)) => {
                     RKey::Array(items.iter().map(|e| self.to_key(e)).collect())
+                }
+                // A Hash and a Set are unordered for equality and hashing
+                // (`{a: 1, b: 2}` equals `{b: 2, a: 1}` and hashes the same), so
+                // both sort their entries into a canonical order before keying.
+                Some(RObj::Hash { map, .. }) => {
+                    let mut pairs: Vec<(RKey, RKey)> = map
+                        .iter()
+                        .map(|(k, v)| (k.clone(), self.to_key(v)))
+                        .collect();
+                    pairs.sort();
+                    RKey::Hash(pairs)
+                }
+                Some(RObj::Set(items)) => {
+                    let mut ks: Vec<RKey> = items.keys().cloned().collect();
+                    ks.sort();
+                    RKey::Set(ks)
+                }
+                // The non-`i64` numerics key by VALUE like every other number, so
+                // `h[2**64]` and `h[Rational(1, 2)]` find their entry back. Each
+                // keeps its own class, so `1`, `2**64`, `Rational(1, 1)` and
+                // `Complex(1, 0)` remain four distinct keys as in Ruby.
+                Some(RObj::BigInt(b)) => RKey::Big(b.clone()),
+                Some(RObj::Rational(q)) => RKey::Rational(q.clone()),
+                Some(RObj::Complex { re, im }) => {
+                    let (re, im) = (re.clone(), im.clone());
+                    RKey::Complex(Box::new(self.to_key(&re)), Box::new(self.to_key(&im)))
                 }
                 Some(RObj::Range { lo, hi, exclusive }) => RKey::Range(*lo, *hi, *exclusive),
                 Some(RObj::StrRange { lo, hi, exclusive }) => {
@@ -6022,6 +6077,24 @@ impl RubyHost {
             RKey::Array(ks) => {
                 let items: Vec<Value> = ks.clone().iter().map(|k| self.key_to_value(k)).collect();
                 self.new_array(items)
+            }
+            RKey::Hash(pairs) => {
+                let map: IndexMap<RKey, Value> = pairs
+                    .clone()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.key_to_value(v)))
+                    .collect();
+                self.new_hash(map)
+            }
+            RKey::Set(ks) => {
+                let items: Vec<Value> = ks.clone().iter().map(|k| self.key_to_value(k)).collect();
+                self.new_set(items)
+            }
+            RKey::Big(b) => self.new_bigint(b.clone()),
+            RKey::Rational(q) => self.new_rational(q.clone()),
+            RKey::Complex(re, im) => {
+                let (re, im) = (self.key_to_value(re), self.key_to_value(im));
+                self.new_complex(re, im)
             }
             RKey::Range(lo, hi, excl) => self.new_range(*lo, *hi, *excl),
             RKey::StrRange(lo, hi, excl) => self.new_str_range(lo.clone(), hi.clone(), *excl),

@@ -3336,3 +3336,28 @@ p arity_err { {a: 1}.each_with_object }
 p arity_err { [1, 2].include? }
 p [[1, 2, 3].index.class, [1, 2, 3].index.to_a, [1, 2, 3].rindex.class,
    [1, 2, 3].find_index.to_a, [1, 2, 3].index(2), [1, 2, 3].rindex(2)]
+#==#
+# A Hash key is looked up by `hash`/`eql?`, and five kinds of value had no
+# structural key at all — they fell back to their heap-object index, so every
+# lookup missed and `keys` printed the raw handle (`"Obj(70)"`). A Hash and a
+# Set key by their entries (order-independently, so `{a: 1, b: 2}` and
+# `{b: 2, a: 1}` are one key), and a BigInt/Rational/Complex keys by value while
+# staying a distinct class from an equal Integer. `0.0` and `-0.0` are one key.
+require "set"
+h = {}
+h[{a: 1}] = :hash
+h[Set[1, 2]] = :set
+h[2**64] = :big
+h[Rational(1, 2)] = :rat
+h[Complex(1, 2)] = :cpx
+p [h[{a: 1}], h[Set[2, 1]], h[2**64], h[Rational(1, 2)], h[Complex(1, 2)]]
+p h.keys
+p [{a: 1, b: 2}.hash == {b: 2, a: 1}.hash, {a: 1}.hash == {a: 1.0}.hash]
+p [Set[1, 2].hash == Set[2, 1].hash, (2**64).hash == (2**64).hash]
+p [{0.0 => :z}[-0.0], {-0.0 => :z}[0.0], {1 => :i, 1.0 => :f}.size]
+p [{a: 1}, {a: 1}, {a: 2}].uniq.size
+s = Set.new
+s << {a: 1}
+s << {a: 1}
+p s.size
+p({[1, {b: 2}] => :nested}[[1, {b: 2}]])
