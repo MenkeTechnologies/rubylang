@@ -36,8 +36,10 @@ destructuring (`|(a, b), i|`, nested `|(a, (b, c))|`, `|(a, *rest)|`, and the
 faithful) and Ruby 3 argument forwarding (`def m(...)` / `m(...)`, including a
 leading positional before `...`); `Integer#step`, `?c` char literals,
 `String#center`/`tr`/`lines`/`delete`/`count`/`to_i(base)`/`encoding`, `Integer#to_s(base)`,
-`Array#dig`/`first(n)`/`last(n)`/`min(n)`/`max(n)`/`each_cons`/`sum { }`,
-`Hash#dig`.
+`Array#dig`/`first(n)`/`last(n)`/`min(n)`/`max(n)`/`each_cons`/`sum { }`/
+`sample`/`shuffle`/`shuffle!`/`repeated_combination`/`repeated_permutation`,
+`Hash#dig`/`assoc`/`rassoc`, `String#upto`; `eql?` on every value (`==` plus
+MRI's numeric class-strictness, so `1.eql?(1.0)` is false).
 
 ## Language
 
@@ -318,8 +320,12 @@ Honest limitations of this surface:
 
 ## Lexer
 
-- **Not lexed:** (nothing outstanding here). Heredocs (`<<END`, `<<~SQL`, `<<-EOT`, `<<'RAW'`),
-  `%w[]` / `%i[]` word/symbol arrays (and the `()`/`{}`/`<>` delimiter variants),
+- **Not lexed:** non-ASCII identifiers (`é = 1`, `def ünf`, `:é`). The scanner is
+  byte-based and starts an identifier only on an ASCII letter or `_`, so a
+  UTF-8 name is rejected with `unexpected character`. Everything else below **is**
+  lexed. Heredocs (`<<END`, `<<~SQL`, `<<-EOT`, `<<'RAW'`),
+  `%w[]` / `%i[]` word/symbol arrays (and the `()`/`{}`/`<>` delimiter variants,
+  plus the interpolating `%W[]` / `%I[]` forms),
   double-quoted `#{}` interpolation, `?c` character literals, regex literals
   (`/pat/flags`, with `i`/`m`/`x` flags), radix integer literals
   (`0b1010` binary, `0o17`/`017` octal, `0xff` hex, `0d99` decimal, with `_`
@@ -328,7 +334,17 @@ Honest limitations of this surface:
   `[]`/`<>` nesting) **are** lexed. Double-quoted string escapes cover
   `\a\b\t\n\v\f\r\e\s\0\\\"\#`, `\xHH` (hex byte), and `\uHHHH`/`\u{H…}`
   (Unicode). `String#inspect` renders these Ruby-faithfully — named escapes,
-  `\uXXXX` (uppercase) for other control chars, and `\#` before `{`/`@`/`$`. The
+  `\uXXXX` (uppercase) for other control chars, and `\#` before `{`/`@`/`$`.
+  MRI's sigil-shorthand interpolation is supported everywhere `#{}` is (strings,
+  heredocs, `:"…"` symbols, regex literals, `%W[]`/`%I[]`) — `#@ivar`,
+  `#@@cvar`, `#$gvar`, including the punctuation and numbered globals (`#$!`,
+  `` #$` ``, `#$'`, `#$&`, `#$1`) — and a sigil not followed by a variable name
+  stays a literal `#`, as in MRI (`"#$ x"`, `"#@ x"`, `"#$-0"`).
+  `Symbol#inspect` quotes any
+  name that would not round-trip bare (`:"weird sym"`, `:""`, `:"1a"`), and a
+  Hash symbol key that needs quoting prints as `{"a b": 1}`. Symbol literals
+  cover the sigil forms (`:@x`, `:@@x`, `:$x`) and every operator name
+  (including `` :` ``). The
   bare `%(…)` / `%{…}` / `%[…]` / `%<…>` string form is lexed (double-quoted,
   like `%Q`); it reads as a string at an expression start or after a spaced bare
   method name (`p %(x)`), and as the modulo operator after a value (`10 %(3)`,
@@ -358,8 +374,9 @@ Honest limitations of this surface:
   `$~` (MatchData), `$&` (whole match), `` $` ``/`$'` (pre/post text), `$+`
   (last group), and `$1`..`$9` (numbered groups) — visible after `=~`/`match`
   and inside a `sub`/`gsub` block. (The punctuation globals `` $` `` and `$'`
-  can't yet appear inside a `#{...}` interpolation — the interp scanner reads the
-  quote as a string delimiter; reference them outside interpolation.) Backed by
+  can't yet appear inside a *brace* `#{...}` interpolation — the interp scanner
+  reads the quote as a string delimiter. The sigil shorthand does work:
+  `` "pre=#$` post=#$'" ``.) Backed by
   the Rust `regex` crate, so Ruby's Onigmo-only constructs (backreferences within
   the pattern, lookaround) are unavailable.
 - **`Object#class` returns a Class object** (a class reference): `p obj.class`
@@ -370,7 +387,11 @@ Honest limitations of this surface:
   and the `<`/`<=`/`>`/`>=` class relations return `true`/`false`/`nil` like
   Ruby (`Integer < Numeric` → true, `String < Numeric` → nil). A Class object
   is usable as a Hash key or Set member (keyed by class name), so
-  `group_by(&:class)` and counting-by-class work.
+  `group_by(&:class)` and counting-by-class work. `Class` itself sits under
+  `Module` (`Class.superclass` → `Module`), matching MRI. **A module is not
+  distinguished from a class at runtime**, though: there is no per-name
+  module/class flag, so `M.class` answers `Class` where MRI says `Module`,
+  `M.is_a?(Class)` is `true`, and `M.instance_of?(Module)` is `false`.
 - **Class/module reflection.** `Module#instance_methods([inherited])`,
   `#public_instance_methods`, `#method_defined?`/`#public_method_defined?`, and
   the instance-side `Object#methods` return method names as symbols.
@@ -520,7 +541,12 @@ Honest limitations of this surface:
   from `StandardError`, and the ones with an intermediate parent keep it
   (`NoMethodError < NameError`, `KeyError`/`StopIteration < IndexError`,
   `FloatDomainError < RangeError`, `FrozenError < RuntimeError`,
-  `LoadError`/`NotImplementedError`/`SyntaxError < ScriptError`). So `#is_a?`,
+  `LoadError`/`NotImplementedError`/`SyntaxError < ScriptError`).
+  `Exception#cause` is recorded by `raise`: raising inside a `rescue` links the
+  new exception to the one being handled (`$!`), so `rescue => e; raise Wrapper`
+  keeps the original reachable and `e.cause.cause` walks the chain. A bare
+  re-raise is not its own cause, and an already-set cause is never overwritten.
+  So `#is_a?`,
   `Class#superclass` and `Module#ancestors` agree with MRI, and a bare `rescue`
   catches `StandardError` and nothing above it — `SystemExit`, `ScriptError` and
   friends fall through it as they should. An error class the host has no record
@@ -721,9 +747,14 @@ Honest limitations of this surface:
   supports `step`, `min`/`max`/`begin`/`end`, and the containment predicates.
   `==` compares endpoints and exclusivity; `===` is proper case-equality (Range
   covers, `Class` matches instances, `Regexp` matches a string) rather than
-  `==`, so `case`/`when` over ranges and classes works. `step` is implemented for
-  numeric endpoints only: `('a'..'e').step(2)` raises `undefined method 'step'`
-  where MRI answers an Enumerator over `["a", "c", "e"]`.
+  `==`, so `case`/`when` over ranges and classes works. `step` covers String
+  endpoints as well as numeric ones (`('a'..'e').step(2)` → `["a", "c", "e"]`;
+  a non-positive step yields only the first element, as MRI does for String
+  ranges). A String range whose endpoints are all digits counts *numerically*
+  and zero-pads to the beginning string's width, like MRI's `rb_str_upto_each`:
+  `("9".."11").to_a` is `["9", "10", "11"]` and `("08".."11").to_a` is
+  `["08", "09", "10", "11"]`. `Range.new(lo, hi[, exclusive])` builds the same
+  value the `..`/`...` literal does.
 - **Pattern matching (`case/in`).** Array/hash/find-by-key patterns, class
   patterns (`Integer`, `Point[...]`), variable/`_` binding, `=> name` (chained
   and binding a whole `|` alternation), `^pin`, `|` alternatives (a bare `|` in a
@@ -776,9 +807,7 @@ bytes. rubylang stores a `"\xNN"` source escape as the Unicode code point U+00NN
 a string built from non-ASCII byte escapes differs from MRI. Pure ASCII/UTF-8
 text is byte-exact. (2) The streaming `Digest` instance API
 (`Digest::MD5.new.update(...).hexdigest`) is not implemented — only the
-class-level one-shot `hexdigest`/`digest`/`base64digest`. (3) A setter-symbol
-literal (`:x=`) does not parse (pre-existing lexer gap); use a String
-(`os.respond_to?("a=")`) or a non-setter symbol.
+class-level one-shot `hexdigest`/`digest`/`base64digest`.
 
 ## File / IO / Dir
 
@@ -790,13 +819,15 @@ indexed by an `RObj::IoHandle` — the same non-`Clone`-in-a-`Clone`-enum patter
 
 **Working, output-matched to MRI:** `File.read`/`write` (write returns the byte
 count), `exist?`/`exists?`/`file?`/`directory?`/`size`/`delete`/`unlink`,
-`readlines`/`foreach`, `open(path, mode)` (block form yields the IO and closes
+`readlines`/`foreach` (both honour `chomp: true`), `open(path, mode)`
+(block form yields the IO and closes
 it on exit, returning the block value; block-less returns the open IO); the
 pure path helpers `basename` (incl. `suffix` and `.*` extension strip),
 `dirname`, `extname` (MRI edge cases: leading-dot names, trailing dot →`"."`,
 all-dots →`""`), `join`, `expand_path` (lexical `~`/`.`/`..` resolution against
 an explicit base or the cwd). IO instance: `read`/`write`/`gets`/`puts`/
-`print`/`<<`/`each_line`/`each`/`readlines`/`close`/`closed?`/`flush`/`inspect`
+`print`/`<<`/`each_line`/`each`/`readlines` (the last two take `chomp: true`
+too)/`close`/`closed?`/`flush`/`inspect`
 (`#<File:/path>`, `#<File:/path (closed)>`, `#<IO:<STDOUT>>`). `Dir.pwd`,
 `glob`/`[]` (sorted per MRI ≥3.0; leading-dot files excluded from `*`;
 `{a,b}` brace alternation expanded and concatenated in brace order),

@@ -156,7 +156,9 @@ Implemented and checked against the reference `ruby`:
   (`a, b = 1, 2`, array destructuring, swap), block-parameter destructuring
   (`map { |(a, b), i| … }`, nested and splat groups, `->((a, b)) { }`), default
   arguments.
-- **String interpolation** — double-quoted `#{}` interpolation.
+- **String interpolation** — double-quoted `#{}` interpolation, plus the sigil
+  shorthand (`"count: #@n"`, `"path: #$0"`, `"#@@registry"`) in strings,
+  heredocs, `:"…"` symbols, regex literals and `%W[]` / `%I[]` arrays.
 - **Standard library** — `require`-able builtin libs including `json`, `set`,
   `date`/`time`, `securerandom`, `digest`, `base64`, `ostruct`, `socket`
   (`TCPServer`/`TCPSocket`), `sqlite3`, and `fiddle`, plus bundled pure-Ruby

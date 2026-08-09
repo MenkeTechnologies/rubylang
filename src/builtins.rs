@@ -954,7 +954,16 @@ fn b_mkrange(vm: &mut VM, _: u8) -> Value {
     let excl = vm.pop();
     let hi = vm.pop();
     let lo = vm.pop();
-    let excl = matches!(excl, Value::Bool(true));
+    match make_range(&lo, &hi, matches!(excl, Value::Bool(true))) {
+        Ok(v) => v,
+        Err(e) => abort(vm, e),
+    }
+}
+
+/// Build the Range value for endpoints `lo`/`hi` — the one place that decides
+/// between the integer, float, string and generic-object range representations.
+/// Shared by the `..`/`...` literal op and `Range.new`.
+pub(crate) fn make_range(lo: &Value, hi: &Value, excl: bool) -> Result<Value, String> {
     // `1..Float::INFINITY` is an endless integer range; `-Float::INFINITY..n`
     // is beginless. Map either infinite float bound to the range sentinel.
     let bound = |v: &Value, endless_sentinel: i64| -> Option<i64> {
@@ -965,24 +974,24 @@ fn b_mkrange(vm: &mut VM, _: u8) -> Value {
         }
     };
     if let (Some(a), Some(b)) = (
-        bound(&lo, crate::host::RANGE_BEGINLESS),
-        bound(&hi, crate::host::RANGE_ENDLESS),
+        bound(lo, crate::host::RANGE_BEGINLESS),
+        bound(hi, crate::host::RANGE_ENDLESS),
     ) {
-        return with_host(|h| h.new_range(a, b, excl));
+        return Ok(with_host(|h| h.new_range(a, b, excl)));
     }
-    match (&lo, &hi) {
+    Ok(match (lo, hi) {
         (Value::Int(a), Value::Int(b)) => with_host(|h| h.new_range(*a, *b, excl)),
         // A Float endpoint (on either side) makes a Float range; a mixed
         // Int/Float range coerces the Integer bound to Float, matching Ruby.
         (Value::Float(_) | Value::Int(_), Value::Float(_) | Value::Int(_))
             if matches!(lo, Value::Float(_)) || matches!(hi, Value::Float(_)) =>
         {
-            with_host(|h| h.new_float_range(as_f(&lo), as_f(&hi), excl))
+            with_host(|h| h.new_float_range(as_f(lo), as_f(hi), excl))
         }
         _ => {
             // String endpoints (`'a'..'e'`) produce a String range.
-            let ls = with_host(|h| h.as_str(&lo));
-            let hs = with_host(|h| h.as_str(&hi));
+            let ls = with_host(|h| h.as_str(lo));
+            let hs = with_host(|h| h.as_str(hi));
             match (ls, hs) {
                 (Some(a), Some(b)) => with_host(|h| h.new_str_range(a, b, excl)),
                 // Any other endpoints form a generic object-range over `<=>`-
@@ -990,12 +999,12 @@ fn b_mkrange(vm: &mut VM, _: u8) -> Value {
                 // endpoints are the beginless/endless forms, handled above; a lone
                 // nil here is genuinely bad.
                 _ if matches!(lo, Value::Undef) && matches!(hi, Value::Undef) => {
-                    abort(vm, raise_exc("ArgumentError", "bad value for range"))
+                    return Err(raise_exc("ArgumentError", "bad value for range"))
                 }
                 _ => with_host(|h| h.new_obj_range(lo.clone(), hi.clone(), excl)),
             }
         }
-    }
+    })
 }
 fn b_mkproc(vm: &mut VM, _: u8) -> Value {
     let id = match vm.pop() {
@@ -1602,6 +1611,19 @@ pub(crate) fn dispatch(
         }
         "==" => return Ok(Value::Bool(with_host(|h| h.eq_values(recv, &args[0])))),
         "!=" => return Ok(Value::Bool(!with_host(|h| h.eq_values(recv, &args[0])))),
+        // `eql?` is `==` plus MRI's numeric strictness: `Numeric#eql?` demands
+        // the same class, so `1.eql?(1.0)` is false where `1 == 1.0` is true.
+        // Everything else (String, Array, Hash, Set, Range, plain objects) uses
+        // the same equality `==` does — a class wanting different `eql?`
+        // semantics defines its own, which the lookup above finds first.
+        "eql?" if args.len() == 1 => {
+            let numeric = |c: &str| matches!(c, "Integer" | "Float" | "Rational" | "Complex");
+            let (a_cls, b_cls) = with_host(|h| (h.class_of(recv), h.class_of(&args[0])));
+            if a_cls != b_cls && numeric(&a_cls) && numeric(&b_cls) {
+                return Ok(Value::Bool(false));
+            }
+            return Ok(Value::Bool(with_host(|h| h.eq_values(recv, &args[0]))));
+        }
         "===" => {
             // Case-equality: a Proc/lambda is CALLED (so `case x when ->(v){…}`
             // works), a Class matches instances, a Regexp matches a string, a
@@ -3285,6 +3307,15 @@ fn dispatch_classref(
                 };
                 return Ok(new_arr(items));
             }
+            // `Range.new(lo, hi)` / `Range.new(lo, hi, true)` builds the same
+            // value the `..`/`...` literal does, so every Range method works on
+            // it (the generic-object path would leave it without `each`).
+            if cls == "Range" {
+                let lo = args.first().cloned().unwrap_or(Value::Undef);
+                let hi = args.get(1).cloned().unwrap_or(Value::Undef);
+                let excl = args.get(2).is_some_and(|v| with_host(|h| h.truthy(v)));
+                return make_range(&lo, &hi, excl);
+            }
             // `String.new` / `String.new("x")` — a real mutable string (backed by
             // `RObj::Str`), not an opaque object. Encoding keywords are accepted
             // and ignored (only UTF-8/binary bytes are modeled).
@@ -4315,7 +4346,9 @@ fn dispatch_object(
         "set_backtrace" if is_exception_class(cls) => {
             Ok(args.first().cloned().unwrap_or(Value::Undef))
         }
-        "cause" if is_exception_class(cls) => Ok(Value::Undef),
+        // `Exception#cause` — the exception that was being handled when this one
+        // was raised (recorded by `raise`), or nil.
+        "cause" if is_exception_class(cls) => Ok(with_host(|h| h.ivar_of(recv, "cause"))),
         // `detailed_message(highlight:, …)` (Ruby 3.2+) — the message with the
         // class appended (`msg (ClassName)`), as `Exception#full_message` renders.
         "detailed_message" if is_exception_class(cls) => {
@@ -6545,6 +6578,29 @@ fn dispatch_string(
             Ok(new_str(out))
         }
         "succ" | "next" => Ok(new_str(str_succ(&s))),
+        // `str.upto(max, exclusive = false)` walks the same succession a String
+        // range does — with a block it yields each value and returns self,
+        // block-less it answers with an Enumerator.
+        "upto" => {
+            let hi = arg_str(&args[0]);
+            let excl = matches!(args.get(1), Some(Value::Bool(true)));
+            let vals: Vec<Value> = str_range_vec(&s, &hi, excl)
+                .into_iter()
+                .map(new_str)
+                .collect();
+            match block {
+                Some(b) => {
+                    for v in vals {
+                        call_proc(&b, &[v])?;
+                        if has_pending_signal() {
+                            break;
+                        }
+                    }
+                    Ok(recv.clone())
+                }
+                None => Ok(with_host(|h| h.new_enumerator(vals, "each"))),
+            }
+        }
         "insert" => {
             let mut chars: Vec<char> = s.chars().collect();
             let i = as_i(&args[0]);
@@ -8374,6 +8430,53 @@ fn dispatch_array(
                 Ok(new_arr(out))
             }
         }
+        "repeated_combination" | "repeated_permutation" => {
+            let n = as_i(&args[0]);
+            let rows = if name == "repeated_combination" {
+                repeated_combinations(&arr, n)
+            } else {
+                repeated_permutations(&arr, n)
+            };
+            let out: Vec<Value> = rows.into_iter().map(new_arr).collect();
+            if let Some(bl) = &block {
+                for row in &out {
+                    call_proc(bl, std::slice::from_ref(row))?;
+                    if has_pending_signal() {
+                        break;
+                    }
+                }
+                Ok(recv.clone())
+            } else {
+                // No Enumerator type here: the rows array itself answers
+                // `.to_a`/`.each`/`.map`, matching `combination`/`permutation`.
+                Ok(new_arr(out))
+            }
+        }
+        "shuffle" => Ok(new_arr(shuffled(&arr))),
+        "shuffle!" => {
+            let a = shuffled(&arr);
+            with_host(|h| h.set_array(recv, a));
+            Ok(recv.clone())
+        }
+        // `sample` with no count is one random element (nil when empty);
+        // `sample(n)` is up to `n` *distinct* elements in random order.
+        "sample" => {
+            if args.is_empty() {
+                if arr.is_empty() {
+                    return Ok(Value::Undef);
+                }
+                let i = (rng_next() % arr.len() as u64) as usize;
+                return Ok(arr[i].clone());
+            }
+            let n = as_i(&args[0]);
+            if n < 0 {
+                return Err(raise_exc("ArgumentError", "negative sample number"));
+            }
+            let n = (n as usize).min(arr.len());
+            let mut a = shuffled(&arr);
+            a.truncate(n);
+            Ok(new_arr(a))
+        }
         "assoc" => {
             for x in &arr {
                 if let Some(sub) = with_host(|h| h.as_array(x)) {
@@ -9917,12 +10020,9 @@ fn dispatch_file_class(
         }
         "readlines" => {
             let path = str_arg(args, 0);
+            let chomp = chomp_opt(args);
             match std::fs::read_to_string(&path) {
-                Ok(s) => Ok(new_arr(
-                    s.split_inclusive('\n')
-                        .map(|l| new_str(l.to_string()))
-                        .collect::<Vec<_>>(),
-                )),
+                Ok(s) => Ok(new_arr(file_lines(&s, chomp))),
                 Err(e) => Err(sys_err("No such file or directory @ rb_sysopen", &path, &e)),
             }
         }
@@ -9938,10 +10038,10 @@ fn dispatch_file_class(
                     )))
                 }
             };
+            let lines = file_lines(&s, chomp_opt(args));
             match &block {
                 Some(bl) => {
-                    for line in s.split_inclusive('\n') {
-                        let lv = new_str(line.to_string());
+                    for lv in lines {
                         if let Err(e) = call_proc(bl, std::slice::from_ref(&lv)) {
                             return Some(Err(e));
                         }
@@ -9949,13 +10049,7 @@ fn dispatch_file_class(
                     Ok(Value::Undef)
                 }
                 // Block-less `foreach` yields an Enumerator over the lines.
-                None => Ok(with_host(|h| {
-                    let lines: Vec<Value> = s
-                        .split_inclusive('\n')
-                        .map(|l| h.new_string(l.to_string()))
-                        .collect();
-                    h.new_enumerator(lines, "each")
-                })),
+                None => Ok(with_host(|h| h.new_enumerator(lines, "each"))),
             }
         }
         "open" => return Some(file_open(args, block)),
@@ -10151,11 +10245,15 @@ fn dispatch_io(
             Ok(new_str(s))
         }
         "gets" => crate::host::io_gets(recv).map_err(|e| io_err(&e)),
-        "readlines" => Ok(new_arr(
+        "readlines" => Ok(new_arr(chomp_lines(
             crate::host::io_readlines(recv).map_err(|e| io_err(&e))?,
-        )),
+            chomp_opt(args),
+        ))),
         "each_line" | "each" => {
-            let lines = crate::host::io_readlines(recv).map_err(|e| io_err(&e))?;
+            let lines = chomp_lines(
+                crate::host::io_readlines(recv).map_err(|e| io_err(&e))?,
+                chomp_opt(args),
+            );
             match block {
                 Some(bl) => {
                     for l in &lines {
@@ -12565,6 +12663,18 @@ fn dispatch_hash(
             let out = remap_array_delegate(dispatch_array(&tmp, name, args, block), recv, name)?;
             Ok(if returns_recv { recv.clone() } else { out })
         }
+        // `assoc(key)` / `rassoc(value)` return the matching `[key, value]` pair
+        // (nil when nothing matches) — Hash's analogue of the Array methods.
+        "assoc" | "rassoc" => {
+            for (k, v) in &map {
+                let kv = with_host(|h| h.key_value(k));
+                let probe = if name == "assoc" { &kv } else { v };
+                if with_host(|h| h.eq_values(probe, &args[0])) {
+                    return Ok(with_host(|h| h.new_array(vec![kv, v.clone()])));
+                }
+            }
+            Ok(Value::Undef)
+        }
         "invert" => {
             let mut out = IndexMap::new();
             for (k, v) in &map {
@@ -12859,9 +12969,26 @@ fn dispatch_range(
     }
 }
 
+/// True for a non-empty string of nothing but ASCII digits — the shape MRI's
+/// `rb_str_upto_each` counts numerically instead of walking with `succ`.
+fn all_ascii_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Materialize a String range into its elements via `String#succ` succession,
 /// with Ruby's length guard (stop once the successor grows past the endpoint).
 fn str_range_vec(lo: &str, hi: &str, excl: bool) -> Vec<String> {
+    // Both endpoints all digits: MRI counts numerically and zero-pads to the
+    // *beginning* string's width, so `("9".."11")` is `["9", "10", "11"]` and
+    // `("08".."11")` is `["08", "09", "10", "11"]` — the plain lexicographic
+    // succession would stop immediately on both.
+    if all_ascii_digits(lo) && all_ascii_digits(hi) {
+        if let (Ok(b), Ok(e)) = (lo.parse::<i64>(), hi.parse::<i64>()) {
+            let width = lo.len();
+            let last = if excl { e - 1 } else { e };
+            return (b..=last).map(|n| format!("{n:0width$}")).collect();
+        }
+    }
     let mut out = Vec::new();
     let mut cur = lo.to_string();
     loop {
@@ -13118,6 +13245,30 @@ fn dispatch_str_range(
                 }
             }
             Ok(recv.clone())
+        }
+        // `('a'..'e').step(2)` walks the succession taking every `by`-th value.
+        // A non-positive step yields only the first element (MRI does the same
+        // for String ranges — unlike numeric ranges, it does not raise).
+        "step" | "%" => {
+            let by = args.first().map(as_i).unwrap_or(1);
+            let all = elems();
+            let vals: Vec<Value> = if by < 1 {
+                all.into_iter().take(1).collect()
+            } else {
+                all.into_iter().step_by(by as usize).collect()
+            };
+            match block {
+                Some(b) => {
+                    for v in vals {
+                        call_proc(&b, &[v])?;
+                        if has_pending_signal() {
+                            break;
+                        }
+                    }
+                    Ok(recv.clone())
+                }
+                None => Ok(with_host(|h| h.new_enumerator(vals, "each"))),
+            }
         }
         // Enumerable fallback over the materialized elements.
         _ => {
@@ -13930,6 +14081,18 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
                     }
                 }
             };
+            // MRI records the exception being handled at raise time as the new
+            // exception's `cause`, so `rescue => e; raise Wrapper` keeps the
+            // original reachable. A re-raise of `$!` itself is not its own
+            // cause, and an already-set cause is never overwritten.
+            let handling = with_host(|h| h.get_global("!"));
+            let is_self = matches!((&handling, &exc), (Value::Obj(a), Value::Obj(b)) if a == b);
+            if !matches!(handling, Value::Undef)
+                && !is_self
+                && matches!(with_host(|h| h.ivar_of(&exc, "cause")), Value::Undef)
+            {
+                with_host(|h| h.set_ivar_of(&exc, "cause", handling));
+            }
             // The propagated Err string is the exception's message (its `message`
             // ivar if set, else its class name) — used only if unrescued.
             let message = with_host(|h| match h.ivar_of(&exc, "message") {
@@ -17324,6 +17487,53 @@ fn new_arr(items: Vec<Value>) -> Value {
     with_host(|h| h.new_array(items))
 }
 
+/// `chomp: true` in a trailing options Hash — the keyword `File.readlines`,
+/// `File.foreach` and `IO#readlines`/`#each_line` accept to strip the line
+/// separator from every line they hand back.
+fn chomp_opt(args: &[Value]) -> bool {
+    args.iter()
+        .rev()
+        .find_map(|a| {
+            with_host(|h| h.as_hash(a)).and_then(|m| m.get(&RKey::Sym("chomp".into())).cloned())
+        })
+        .is_some_and(|v| with_host(|h| h.truthy(&v)))
+}
+
+/// Strip the trailing separator from already-split line values when `chomp`.
+fn chomp_lines(lines: Vec<Value>, chomp: bool) -> Vec<Value> {
+    if !chomp {
+        return lines;
+    }
+    lines
+        .iter()
+        .map(|l| {
+            let s = with_host(|h| h.as_str(l).unwrap_or_default());
+            let t = s
+                .strip_suffix('\n')
+                .map(|t| t.strip_suffix('\r').unwrap_or(t))
+                .unwrap_or(&s);
+            new_str(t.to_string())
+        })
+        .collect()
+}
+
+/// Split file contents into Ruby line values (separator kept, as `String#lines`
+/// does), or with the trailing `\n`/`\r\n` removed when `chomp`.
+fn file_lines(s: &str, chomp: bool) -> Vec<Value> {
+    s.split_inclusive('\n')
+        .map(|l| {
+            let l = if chomp {
+                l.strip_suffix('\n')
+                    .map(|t| t.strip_suffix('\r').unwrap_or(t))
+                    .unwrap_or(l)
+            } else {
+                l
+            };
+            new_str(l.to_string())
+        })
+        .collect()
+}
+
 /// All `n`-element combinations of `arr` in MRI order (increasing indices).
 /// `n < 0` yields none; `n == 0` yields a single empty combination; `n > len`
 /// yields none.
@@ -17370,6 +17580,86 @@ fn permutations(arr: &[Value], n: i64) -> Vec<Vec<Value>> {
     let mut cur: Vec<Value> = Vec::with_capacity(n);
     permute_rec(arr, n, &mut used, &mut cur, &mut out);
     out
+}
+
+/// All `n`-element combinations *with repetition* in MRI order (non-decreasing
+/// indices). `n < 0` yields none; `n == 0` yields a single empty combination.
+/// Unlike `combination`, `n > len` is fine as long as `arr` is non-empty.
+fn repeated_combinations(arr: &[Value], n: i64) -> Vec<Vec<Value>> {
+    if n < 0 {
+        return Vec::new();
+    }
+    let n = n as usize;
+    if n == 0 {
+        return vec![Vec::new()];
+    }
+    if arr.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut idx = vec![0usize; n];
+    loop {
+        out.push(idx.iter().map(|&i| arr[i].clone()).collect());
+        // Advance the odometer, keeping the indices non-decreasing.
+        let mut i = n;
+        loop {
+            if i == 0 {
+                return out;
+            }
+            i -= 1;
+            if idx[i] != arr.len() - 1 {
+                break;
+            }
+        }
+        idx[i] += 1;
+        for j in i + 1..n {
+            idx[j] = idx[i];
+        }
+    }
+}
+
+/// All `n`-length tuples drawn from `arr` with repetition (`arr` crossed with
+/// itself `n` times), in MRI's odometer order. `n < 0` yields none; `n == 0`
+/// yields one empty tuple.
+fn repeated_permutations(arr: &[Value], n: i64) -> Vec<Vec<Value>> {
+    if n < 0 {
+        return Vec::new();
+    }
+    let n = n as usize;
+    if n == 0 {
+        return vec![Vec::new()];
+    }
+    if arr.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut idx = vec![0usize; n];
+    loop {
+        out.push(idx.iter().map(|&i| arr[i].clone()).collect());
+        let mut i = n;
+        loop {
+            if i == 0 {
+                return out;
+            }
+            i -= 1;
+            if idx[i] != arr.len() - 1 {
+                break;
+            }
+            idx[i] = 0;
+        }
+        idx[i] += 1;
+    }
+}
+
+/// Fisher–Yates shuffle driven by the shared SplitMix64 PRNG (the one `rand`
+/// and `srand` use), so `srand(n)` makes a shuffle reproducible.
+fn shuffled(arr: &[Value]) -> Vec<Value> {
+    let mut a = arr.to_vec();
+    for i in (1..a.len()).rev() {
+        let j = (rng_next() % (i as u64 + 1)) as usize;
+        a.swap(i, j);
+    }
+    a
 }
 
 fn permute_rec(

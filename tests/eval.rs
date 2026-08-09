@@ -5636,3 +5636,199 @@ fn data_define_value_class() {
         "3",
     );
 }
+
+#[test]
+fn eql_is_equality_with_numeric_class_strictness() {
+    // MRI: Object#eql? answers what `==` does, but Numeric#eql? also demands
+    // the same class — `1 == 1.0` is true while `1.eql?(1.0)` is false.
+    eq("1.eql?(1)", "true");
+    eq("1.eql?(1.0)", "false");
+    eq("1.0.eql?(1)", "false");
+    eq("1 == 1.0", "true");
+    eq("Rational(1, 1).eql?(1)", "false");
+    eq("(2 ** 70).eql?(2 ** 70)", "true");
+    // Non-numeric values keep `==`'s answer.
+    eq("[1, [2]].eql?([1, [2]])", "true");
+    eq("({a: 1}).eql?({a: 1})", "true");
+    eq("(1..2).eql?(1..3)", "false");
+    eq(":a.eql?(:a)", "true");
+    eq("\"a\".eql?(:a)", "false");
+    // A class that overrides only `==` does NOT get value `eql?` (MRI keeps the
+    // Object default), but one that defines `eql?` itself wins.
+    eq(
+        "class Z; def ==(o); true; end; end; Z.new.eql?(Z.new)",
+        "false",
+    );
+    eq(
+        "class Y; def eql?(o); true; end; end; Y.new.eql?(1)",
+        "true",
+    );
+}
+
+#[test]
+fn symbol_inspect_quotes_names_that_would_not_round_trip() {
+    // MRI writes `:name` bare only when the name is an identifier, a sigil'd
+    // variable name, or an operator method name; anything else is quoted.
+    eq(
+        "[:\"weird sym\", :\"\", :\"1a\"].inspect",
+        "\"[:\\\"weird sym\\\", :\\\"\\\", :\\\"1a\\\"]\"",
+    );
+    eq(
+        "[:a, :a?, :b!, :c=, :Const, :_x].inspect",
+        "\"[:a, :a?, :b!, :c=, :Const, :_x]\"",
+    );
+    eq("[:@iv, :@@cv, :$gv].inspect", "\"[:@iv, :@@cv, :$gv]\"");
+    eq(
+        "[:+, :[], :[]=, :<=>, :+@, :`].inspect",
+        "\"[:+, :[], :[]=, :<=>, :+@, :`]\"",
+    );
+    // A Hash symbol key keeps the `key:` shorthand but quotes the name.
+    eq(
+        "{:\"a b\" => 1, :ok => 2}.inspect",
+        "\"{\\\"a b\\\": 1, ok: 2}\"",
+    );
+}
+
+#[test]
+fn sigil_shorthand_interpolation_matches_mri() {
+    // `#@ivar` / `#@@cvar` / `#$gvar` interpolate; a sigil not followed by a
+    // variable name stays a literal `#`.
+    eq("@n = 7; \"count #@n\"", "\"count 7\"");
+    eq("$g = \"G\"; \"gv #$g\"", "\"gv G\"");
+    eq(
+        "class C; @@c = \"CC\"; def m; \"cv #@@c\"; end; end; C.new.m",
+        "\"cv CC\"",
+    );
+    // (`inspect` escapes a `#` that precedes `$`/`@`, as MRI does.)
+    eq("\"lit #$ x\"", "\"lit \\#$ x\"");
+    eq("\"lit #@ x\"", "\"lit \\#@ x\"");
+    eq("\"bare # hash\"", "\"bare # hash\"");
+    // Punctuation and numbered globals work through the shorthand too.
+    eq("\"abcdef\" =~ /cd/; \"#$`|#$'|#$&\"", "\"ab|ef|cd\"");
+    eq("\"abc\" =~ /(b)/; \"#$1\"", "\"b\"");
+    // Every interpolating literal form honours it.
+    eq("@n = 1; :\"s#@n\".inspect", "\":s1\"");
+    eq("@n = 1; /r#@n/.source", "\"r1\"");
+    eq("@n = 1; %W[a#@n b]", "[\"a1\", \"b\"]");
+    eq("@n = 1; %I[a#@n]", "[:a1]");
+    // The lowercase word-array forms stay literal.
+    eq("%w[a#{1}]", "[\"a\\#{1}\"]");
+}
+
+#[test]
+fn string_ranges_count_numerically_when_both_ends_are_digits() {
+    // MRI's rb_str_upto_each: all-digit endpoints iterate as numbers, zero
+    // padded to the *beginning* string's width.
+    eq("(\"9\"..\"11\").to_a", "[\"9\", \"10\", \"11\"]");
+    eq("(\"08\"..\"11\").to_a", "[\"08\", \"09\", \"10\", \"11\"]");
+    eq("(\"099\"..\"101\").to_a", "[\"099\", \"100\", \"101\"]");
+    eq("(\"1\"...\"3\").to_a", "[\"1\", \"2\"]");
+    eq("(\"10\"..\"9\").to_a", "[]");
+    // Non-digit endpoints keep the `succ` succession.
+    eq("(\"a\"..\"e\").step(2).to_a", "[\"a\", \"c\", \"e\"]");
+    eq("(\"a\"..\"e\").step(0).to_a", "[\"a\"]");
+    eq(
+        "\"a8\".upto(\"b1\").to_a",
+        "[\"a8\", \"a9\", \"b0\", \"b1\"]",
+    );
+    eq("\"a\".upto(\"c\", true).to_a", "[\"a\", \"b\"]");
+    eq("\"b\".upto(\"a\").to_a", "[]");
+    eq(
+        "r = []; \"x\".upto(\"z\") { |s| r << s }; r",
+        "[\"x\", \"y\", \"z\"]",
+    );
+}
+
+#[test]
+fn range_new_builds_the_same_value_as_the_literal() {
+    eq("Range.new(1, 3).to_a", "[1, 2, 3]");
+    eq("Range.new(1, 3, true).to_a", "[1, 2]");
+    eq("Range.new(\"a\", \"c\").to_a", "[\"a\", \"b\", \"c\"]");
+    eq("Range.new(1, 3) == (1..3)", "true");
+    eq("Range.new(1.0, 2.0).step(0.5).to_a", "[1.0, 1.5, 2.0]");
+}
+
+#[test]
+fn repeated_combination_and_permutation_follow_mri_order() {
+    eq(
+        "[1, 2, 3].repeated_combination(2).to_a",
+        "[[1, 1], [1, 2], [1, 3], [2, 2], [2, 3], [3, 3]]",
+    );
+    eq(
+        "[1, 2].repeated_permutation(2).to_a",
+        "[[1, 1], [1, 2], [2, 1], [2, 2]]",
+    );
+    // `n == 0` is one empty tuple; a negative `n` yields none; an empty
+    // receiver yields none for `n > 0`.
+    eq("[1, 2].repeated_combination(0).to_a", "[[]]");
+    eq("[1, 2].repeated_permutation(0).to_a", "[[]]");
+    eq("[1, 2].repeated_combination(-1).to_a", "[]");
+    eq("[].repeated_permutation(2).to_a", "[]");
+    // `n` may exceed the receiver's length (unlike `combination`).
+    eq(
+        "[1, 2].repeated_combination(3).to_a",
+        "[[1, 1, 1], [1, 1, 2], [1, 2, 2], [2, 2, 2]]",
+    );
+    // The block form returns the receiver.
+    eq("[1, 2].repeated_permutation(2) { |x| }", "[1, 2]");
+}
+
+#[test]
+fn sample_and_shuffle_stay_within_the_receiver() {
+    eq("[].sample", "nil");
+    eq("[].sample(2)", "[]");
+    eq("[7].sample", "7");
+    eq("[1, 2, 3].sample(0)", "[]");
+    // `sample(n)` draws distinct elements and never more than are available.
+    eq("[1, 2, 3].sample(9).sort", "[1, 2, 3]");
+    eq("[1, 2, 3].shuffle.sort", "[1, 2, 3]");
+    eq("[].shuffle", "[]");
+    eq("a = [1, 2, 3]; a.shuffle!; a.sort", "[1, 2, 3]");
+}
+
+#[test]
+fn hash_assoc_and_rassoc_return_the_matching_pair() {
+    eq("{a: 1, b: 2}.assoc(:a)", "[:a, 1]");
+    eq("{a: 1, b: 2}.rassoc(2)", "[:b, 2]");
+    eq("{a: 1}.assoc(:zz)", "nil");
+    eq("{a: 1}.rassoc(99)", "nil");
+    eq("{\"x\" => 1}.assoc(\"x\")", "[\"x\", 1]");
+}
+
+#[test]
+fn raise_records_the_handled_exception_as_the_cause() {
+    // MRI links a new exception to the one being handled, so a wrapper keeps
+    // the original reachable.
+    eq(
+        "begin; begin; raise \"inner\"; rescue; raise ArgumentError, \"outer\"; end; \
+         rescue => e; e.cause.message; end",
+        "\"inner\"",
+    );
+    eq(
+        "begin; begin; raise \"inner\"; rescue; raise ArgumentError, \"outer\"; end; \
+         rescue => e; e.cause.class.name; end",
+        "\"RuntimeError\"",
+    );
+    // No enclosing rescue means no cause; a bare re-raise is not its own cause.
+    eq("begin; raise \"solo\"; rescue => e; e.cause; end", "nil");
+    eq(
+        "begin; begin; raise \"a\"; rescue; raise; end; rescue => e; e.cause; end",
+        "nil",
+    );
+    // The chain nests.
+    eq(
+        "begin; begin; begin; raise \"L1\"; rescue; raise \"L2\"; end; rescue; raise \"L3\"; end; \
+         rescue => e; e.cause.cause.message; end",
+        "\"L1\"",
+    );
+}
+
+#[test]
+fn class_sits_under_module_in_the_ancestry() {
+    eq("Class.superclass.name", "\"Module\"");
+    eq(
+        "Class.ancestors.inspect",
+        "\"[Class, Module, Object, Kernel, BasicObject]\"",
+    );
+    eq("Module.superclass.name", "\"Object\"");
+}

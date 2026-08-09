@@ -1221,7 +1221,7 @@ impl Compiler {
                 // `/…#{expr}…/` — build the pattern string at runtime by compiling
                 // the interpolation like a double-quoted string, then compile the
                 // Regexp. A static pattern (no `#{`) pushes the source directly.
-                if source.contains("#{") {
+                if source.contains("#{") || crate::parser::has_sigil_interp(source) {
                     let parts = crate::parser::scan_interp(source)?;
                     self.compile_expr(b, &Expr::Str(parts))?;
                 } else {

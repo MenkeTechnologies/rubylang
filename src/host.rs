@@ -4375,6 +4375,9 @@ impl RubyHost {
             "Object" => vec!["Object".into(), "Kernel".into(), "BasicObject".into()],
             // Bare modules are their own only ancestor here.
             "Kernel" | "Comparable" | "Enumerable" => vec![name.into()],
+            // `Class < Module` in MRI, so `Class.superclass` is `Module` and a
+            // Module method is callable on a Class.
+            "Class" => own(&["Module"]),
             "Numeric" => own(&["Comparable"]),
             "Integer" | "Float" | "Rational" => own(&["Numeric", "Comparable"]),
             "Complex" => own(&["Numeric"]),
@@ -5577,7 +5580,13 @@ impl RubyHost {
             Value::Str(s) => inspect_string(s),
             Value::Obj(_) => match self.obj(v).cloned() {
                 Some(RObj::Str(s)) => inspect_string(&s),
-                Some(RObj::Symbol(s)) => format!(":{s}"),
+                Some(RObj::Symbol(s)) => {
+                    if plain_symbol_name(&s) {
+                        format!(":{s}")
+                    } else {
+                        format!(":{}", inspect_string(&s))
+                    }
+                }
                 Some(RObj::BigInt(b)) => b.to_string(),
                 Some(RObj::Rational(r)) => format!("({}/{})", r.numer(), r.denom()),
                 // MRI's `Complex#inspect` inspects each part, so a Rational part
@@ -5688,7 +5697,10 @@ impl RubyHost {
                 // Ruby 3.4+ prints a symbol key as `name: value`; every other
                 // key type keeps the `key => value` form.
                 match k {
-                    RKey::Sym(s) => format!("{s}: {vs}"),
+                    RKey::Sym(s) if plain_symbol_name(s) => format!("{s}: {vs}"),
+                    // A symbol key that needs quoting keeps the `key:` shorthand
+                    // but quotes the name: `{"a b": 1}`, as MRI does.
+                    RKey::Sym(s) => format!("{}: {vs}", inspect_string(s)),
                     _ => format!("{} => {vs}", self.key_inspect(k)),
                 }
             })
@@ -5699,7 +5711,8 @@ impl RubyHost {
         match k {
             RKey::Int(n) => n.to_string(),
             RKey::Str(s) => inspect_string(s),
-            RKey::Sym(s) => format!(":{s}"),
+            RKey::Sym(s) if plain_symbol_name(s) => format!(":{s}"),
+            RKey::Sym(s) => format!(":{}", inspect_string(s)),
             RKey::Bool(b) => b.to_string(),
             RKey::Nil => "nil".to_string(),
             RKey::FloatBits(b) => fmt_float(f64::from_bits(*b)),
@@ -6375,6 +6388,39 @@ impl RubyHost {
 /// control chars and `0x7f`, `\"`/`\\`, and `\#` when a `#` precedes `{`/`@`/`$`
 /// (so the literal reads back unambiguously). Printable and multibyte UTF-8 is
 /// verbatim.
+/// Whether a Symbol's name can follow a bare `:` in `inspect` output. MRI
+/// (`rb_enc_symname_type`, symbol.c) writes every other name quoted —
+/// `:"weird sym"`, `:""`, `:"1a"` — so the form round-trips through `eval`.
+pub fn plain_symbol_name(s: &str) -> bool {
+    // Every operator method name is writable bare.
+    const OPS: &[&str] = &[
+        "+", "-", "*", "/", "%", "**", "==", "!=", "<", "<=", ">", ">=", "<=>", "===", "=~", "!~",
+        "!", "~", "[]", "[]=", "<<", ">>", "&", "|", "^", "+@", "-@", "`",
+    ];
+    if OPS.contains(&s) {
+        return true;
+    }
+    // `@ivar` / `@@cvar` / `$gvar` keep their sigil; only a plain name may also
+    // carry a trailing `?` (predicate), `!` (bang) or `=` (writer).
+    let (sigil, body) = match s.strip_prefix("@@") {
+        Some(rest) => (true, rest),
+        None => match s.strip_prefix('@').or_else(|| s.strip_prefix('$')) {
+            Some(rest) => (true, rest),
+            None => (false, s),
+        },
+    };
+    let core = match body.chars().last() {
+        Some('?' | '!' | '=') if !sigil && body.chars().count() > 1 => &body[..body.len() - 1],
+        _ => body,
+    };
+    let mut cs = core.chars();
+    match cs.next() {
+        Some(c) if c == '_' || c.is_alphabetic() => {}
+        _ => return false,
+    }
+    cs.all(|c| c == '_' || c.is_alphanumeric())
+}
+
 pub fn inspect_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');

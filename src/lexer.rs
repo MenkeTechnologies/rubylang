@@ -766,6 +766,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 && !method_name_pos(&out) =>
             {
                 let symbols = matches!(b[i + 1], b'i' | b'I');
+                // The uppercase forms (`%W`/`%I`) interpolate like a
+                // double-quoted string; the lowercase ones are literal.
+                let interp = matches!(b[i + 1], b'W' | b'I');
                 let open = b[i + 2];
                 let close = match open {
                     b'[' => b']',
@@ -807,10 +810,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                             space: false,
                         });
                     }
-                    let kind = if symbols {
-                        Tok::Symbol((*w).to_string())
-                    } else {
-                        Tok::Str((*w).to_string(), false)
+                    let kind = match (symbols, interp) {
+                        (true, false) => Tok::Symbol((*w).to_string()),
+                        (true, true) => Tok::DSymbol((*w).to_string()),
+                        (false, i) => Tok::Str((*w).to_string(), i),
                     };
                     out.push(Token {
                         kind,
@@ -984,6 +987,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 }
                 i += 1; // closing quote
                 let body = String::from_utf8_lossy(&bytes).into_owned();
+                // `:"a #$g"` interpolates through the sigil shorthand too, with
+                // no `#{` for the loop above to have spotted.
+                let has_interp =
+                    has_interp || (quote == b'"' && crate::parser::has_sigil_interp(&body));
                 let kind = if has_interp {
                     Tok::DSymbol(body)
                 } else if quote == b'"' {
@@ -1012,7 +1019,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 });
             }
             b':' if i + 1 < b.len()
-                && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_' || b[i + 1] == b'@')
+                && (b[i + 1].is_ascii_alphabetic()
+                    || b[i + 1] == b'_'
+                    || b[i + 1] == b'@'
+                    || b[i + 1] == b'$')
                 // A `:` glued to the right of a value (`x:true`, `key:String`) is a
                 // label colon, not a symbol start — the same disambiguation the
                 // operator-symbol case above uses. `foo :bar` (spaced) and
@@ -1022,8 +1032,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             {
                 i += 1;
                 let start = i;
-                // Instance/class-variable symbols keep their sigil: `:@x`, `:@@x`.
+                // Instance/class/global-variable symbols keep their sigil:
+                // `:@x`, `:@@x`, `:$x`.
                 while i < b.len() && b[i] == b'@' {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'$' {
                     i += 1;
                 }
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
@@ -1324,7 +1338,7 @@ fn regex_start(out: &[Token], sp: bool, next: Option<u8>) -> bool {
 // match, so `-@`/`+@`/`!~` must precede `-`/`+`/`!` (`:-@` vs `:-`).
 const OP_SYMBOLS: &[&str] = &[
     "<=>", "===", "[]=", "**", "==", "!=", "!~", "<=", ">=", "<<", ">>", "=~", "[]", "-@", "+@",
-    "+", "-", "*", "/", "%", "<", ">", "&", "|", "^", "~", "!",
+    "+", "-", "*", "/", "%", "<", ">", "&", "|", "^", "~", "!", "`",
 ];
 
 /// The operator symbol beginning `s` (text right after `:`), or `None`.

@@ -3236,6 +3236,24 @@ pub(crate) fn scan_interp(raw: &str) -> Result<Vec<StrPart>, String> {
             i += 2;
             continue;
         }
+        // `#@ivar` / `#@@cvar` / `#$gvar` — MRI's sigil shorthand for the
+        // equivalent `#{…}`. Anything else after the sigil leaves `#` literal.
+        if b[i] == b'#' {
+            if let Some(len) = sigil_interp_len(b, i) {
+                if !lit.is_empty() {
+                    parts.push(StrPart::Lit(std::mem::take(&mut lit)));
+                }
+                let stmts = parse(&raw[i + 1..i + len])?;
+                let e = stmts
+                    .into_iter()
+                    .last()
+                    .map(|s| s.expr)
+                    .unwrap_or(Expr::Str(vec![StrPart::Lit(String::new())]));
+                parts.push(StrPart::Interp(Box::new(e)));
+                i += len;
+                continue;
+            }
+        }
         if b[i] == b'#' && i + 1 < b.len() && b[i + 1] == b'{' {
             if !lit.is_empty() {
                 parts.push(StrPart::Lit(std::mem::take(&mut lit)));
@@ -3277,6 +3295,64 @@ pub(crate) fn scan_interp(raw: &str) -> Result<Vec<StrPart>, String> {
         parts.push(StrPart::Lit(lit));
     }
     Ok(parts)
+}
+
+/// Whether a double-quoted body carries a `#@ivar` / `#@@cvar` / `#$gvar`
+/// shorthand interpolation. The lexer uses this to route a `:"…"` symbol
+/// through the interpolating scan even without a `#{`.
+pub fn has_sigil_interp(raw: &str) -> bool {
+    let b = raw.as_bytes();
+    (0..b.len()).any(|i| b[i] == b'#' && sigil_interp_len(b, i).is_some())
+}
+
+/// The punctuation that can follow `$` in a global name (`$!`, `$~`, `$&`, …) —
+/// MRI's `global_name_punct` table (parse.y).
+const GLOBAL_NAME_PUNCT: &[u8] = b"~*$?!@/\\;,.=:<>\"&`'+0";
+
+/// Length (from the `#`) of a `#@ivar` / `#@@cvar` / `#$gvar` shorthand
+/// interpolation starting at `b[at]`, or `None` when what follows the sigil is
+/// not a variable name — MRI then leaves the `#` as a literal character. Ported
+/// from `parser_peek_variable_name` (parse.y).
+fn sigil_interp_len(b: &[u8], at: usize) -> Option<usize> {
+    let mut j = at + 1;
+    match b.get(j)? {
+        b'$' => {
+            j += 1;
+            match b.get(j)? {
+                // `$-x` — a one-character option global. MRI still requires a
+                // name character after the dash, so `#$-0` stays literal.
+                b'-' => {
+                    let c = *b.get(j + 1)?;
+                    return (c == b'_' || c.is_ascii_alphabetic() || c >= 0x80)
+                        .then_some(j + 2 - at);
+                }
+                c if GLOBAL_NAME_PUNCT.contains(c) => return Some(j + 1 - at),
+                c if c.is_ascii_digit() => {
+                    while j < b.len() && b[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    return Some(j - at);
+                }
+                _ => {}
+            }
+        }
+        b'@' => {
+            j += 1;
+            if b.get(j) == Some(&b'@') {
+                j += 1;
+            }
+        }
+        _ => return None,
+    }
+    // A name body: ASCII letter/underscore, or any non-ASCII byte.
+    match b.get(j) {
+        Some(c) if *c == b'_' || c.is_ascii_alphabetic() || *c >= 0x80 => {}
+        _ => return None,
+    }
+    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] >= 0x80) {
+        j += 1;
+    }
+    Some(j - at)
 }
 
 fn utf8_len(b: u8) -> usize {
