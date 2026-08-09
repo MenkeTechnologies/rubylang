@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 /// Bump on any incompatible change to `CProg` / the lowering.
-const SCHEMA: u64 = 6;
+const SCHEMA: u64 = 7;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
@@ -50,7 +50,9 @@ type CMethod = (
     Chunk,
     u16,
 );
-/// (name, superclass, methods, includes, prepends, extends, class methods).
+/// (name, superclass, methods, includes, prepends, extends, class methods,
+/// is_module). `is_module` records `module M` vs `class M`, which nothing else
+/// in the tuple implies.
 type CClass = (
     String,
     Option<String>,
@@ -59,6 +61,7 @@ type CClass = (
     Vec<String>,
     Vec<String>,
     Vec<CMethod>,
+    bool,
 );
 /// (rescue classes, splat proc id, binding, body proc id) — a serde-flat rescue
 /// clause. `splat` is the proc for a `rescue *expr` dynamic class list.
@@ -269,6 +272,7 @@ fn to_cprog(prog: &Program) -> CProg {
                     c.prepends.clone(),
                     c.extends.clone(),
                     class_methods,
+                    c.is_module,
                 )
             })
             .collect(),
@@ -312,7 +316,16 @@ fn from_cprog(cp: CProg) -> Program {
             .classes
             .into_iter()
             .map(
-                |(n, superclass, methods, includes, prepends, extends, class_methods)| {
+                |(
+                    n,
+                    superclass,
+                    methods,
+                    includes,
+                    prepends,
+                    extends,
+                    class_methods,
+                    is_module,
+                )| {
                     let methods = methods.into_iter().map(m_from).collect();
                     let class_methods = class_methods.into_iter().map(m_from).collect();
                     (
@@ -324,6 +337,7 @@ fn from_cprog(cp: CProg) -> Program {
                             prepends,
                             extends,
                             class_methods,
+                            is_module,
                         },
                     )
                 },

@@ -1833,3 +1833,37 @@ hi
 [true, false]
 [true, 0, 2, 1]
 [true, [1, :x], [:x, 1]]
+#==#
+Module
+Class
+Class
+Module
+Module
+true
+false
+true
+true
+true
+true
+Module
+Class
+Module
+Module
+Module
+Module
+Class
+Class
+Class
+[Only]
+[Mixed, Comparable]
+[Sub, Plain, Object, Kernel, BasicObject]
+Module
+Module
+Class
+#==#
+[NoMethodError, "undefined method 'nope' for module NoSuper"]
+[NoMethodError, "undefined method 'nope' for class HasSuper"]
+[NoMethodError, "undefined method 'superclass' for module NoSuper"]
+Object
+[NameError, "undefined method 'nope' for module 'NoSuper'"]
+[NameError, "undefined method 'nope' for class 'HasSuper'"]

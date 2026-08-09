@@ -205,7 +205,8 @@ Implemented and verified against the reference `ruby`:
   and 1543 parameter lists disagreed with ruby 4.0.6 before the table; none do
   after.
 - **`method` / `instance_method` on an undefined name.** Both raise `NameError`
-  (`undefined method 'x' for class 'C'`) rather than handing back a `Method`
+  (`undefined method 'x' for class 'C'`, `for module 'M'` on a module) rather
+  than handing back a `Method`
   object that fails only when called. The table alone cannot decide this — it
   lists what MRI defines, not what rubylang implements — so the check is the union
   of every place a definition can live: written `def`s, `define_method` bodies,
@@ -476,10 +477,19 @@ Honest limitations of this surface:
   Ruby (`Integer < Numeric` → true, `String < Numeric` → nil). A Class object
   is usable as a Hash key or Set member (keyed by class name), so
   `group_by(&:class)` and counting-by-class work. `Class` itself sits under
-  `Module` (`Class.superclass` → `Module`), matching MRI. **A module is not
-  distinguished from a class at runtime**, though: there is no per-name
-  module/class flag, so `M.class` answers `Class` where MRI says `Module`,
-  `M.is_a?(Class)` is `true`, and `M.instance_of?(Module)` is `false`.
+  `Module` (`Class.superclass` → `Module`), matching MRI. A module IS
+  distinguished from a class at runtime: `ClassDef` carries an `is_module` flag
+  set by the opening keyword (and by `Module.new`), threaded through the
+  bytecode cache, so `M.class` is `Module`, `M.is_a?(Class)` is `false`,
+  `M.instance_of?(Module)` is `true`, `M.ancestors` is the module chain with no
+  `Object`/`Kernel`/`BasicObject` tail (`module B; include A; end` → `[B, A]`),
+  `M.superclass` raises `NoMethodError` instead of answering `Object`, and the
+  error wording is MRI's `for module M` rather than `for class M`. Built-in
+  modules (`Comparable`, `Enumerable`, `Kernel`, `Math`, …) come from the
+  generated table's module list and answer the same way.
+  Still open: MRI creates a module's singleton class lazily, so
+  `M.method(:undefined)` on a module with no `def self.` reports the lookup
+  class as `Module`; rubylang always names `#<Class:M>`.
 - **Class/module reflection.** `Module#instance_methods([inherited])`,
   `#public_instance_methods`, `#method_defined?`/`#public_method_defined?`, and
   the instance-side `Object#methods` return method names as symbols.

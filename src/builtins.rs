@@ -1449,10 +1449,14 @@ fn method_object_or_name_error(recv: &Value, m: &str, unbound: bool) -> Result<(
             }
         }
     }
-    let lookup = with_host(|h| h.method_lookup_class(recv, unbound));
+    let (lookup, word) = with_host(|h| {
+        let lookup = h.method_lookup_class(recv, unbound);
+        let word = h.class_or_module_word(&lookup);
+        (lookup, word)
+    });
     Err(raise_exc(
         "NameError",
-        &format!("undefined method '{m}' for class '{lookup}'"),
+        &format!("undefined method '{m}' for {word} '{lookup}'"),
     ))
 }
 
@@ -3401,7 +3405,7 @@ fn dispatch_classref(
                 } else {
                     None
                 };
-                let name = with_host(|h| h.define_anon_class(superclass.clone()));
+                let name = with_host(|h| h.define_anon_class(superclass.clone(), cls == "Module"));
                 let cref = with_host(|h| h.class_ref(&name));
                 // Fire the superclass's `inherited` hook — MRI runs it when the
                 // class is created (before the body block), just as the compiler
@@ -3599,6 +3603,12 @@ fn dispatch_classref(
             }
             Ok(with_host(|h| h.class_ref(cls)))
         }
+        // `superclass` is a `Class` method, not a `Module` one — a module never
+        // has one, so MRI raises rather than answering nil.
+        "superclass" if with_host(|h| h.is_module_name(cls)) => Err(raise_exc(
+            "NoMethodError",
+            &format!("undefined method 'superclass' for module {cls}"),
+        )),
         "superclass" => Ok(with_host(|h| match h.class_superclass(cls) {
             Some(sc) => h.class_ref(&sc),
             None => Value::Undef,
@@ -4036,7 +4046,10 @@ fn dispatch_classref(
                     }
                     Err(raise_exc(
                         "NoMethodError",
-                        &format!("undefined method '{name}' for class {cls}"),
+                        &format!(
+                            "undefined method '{name}' for {} {cls}",
+                            with_host(|h| h.class_or_module_word(cls))
+                        ),
                     ))
                 }
                 other => other,
@@ -17648,7 +17661,7 @@ fn no_method_error(recv: &Value, name: &str) -> String {
         Value::Bool(true) => "true".to_string(),
         Value::Bool(false) => "false".to_string(),
         _ => match with_host(|h| h.classref_name(recv)) {
-            Some(c) => format!("class {c}"),
+            Some(c) => format!("{} {c}", with_host(|h| h.class_or_module_word(&c))),
             None => format!("an instance of {}", with_host(|h| h.class_of(recv))),
         },
     };

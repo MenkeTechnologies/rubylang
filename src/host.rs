@@ -578,6 +578,12 @@ pub struct ClassDef {
     pub prepends: Vec<String>,
     pub extends: Vec<String>,
     pub class_methods: IndexMap<String, MethodDef>,
+    /// True when this was opened with `module`, not `class` (or created by
+    /// `Module.new`). A module is an instance of `Module`, not of `Class`, so
+    /// `M.class` is `Module`, `M.is_a?(Class)` is false, and `M` has no
+    /// `superclass` — none of which is derivable from the rest of the def, since
+    /// a module and a superclass-less class look identical otherwise.
+    pub is_module: bool,
 }
 
 /// A `begin`/`rescue`/`ensure` block, compiled to proc templates.
@@ -1422,6 +1428,11 @@ fn merge_class(classes: &mut IndexMap<String, ClassDef>, name: String, def: Clas
     if def.superclass.is_some() {
         existing.superclass = def.superclass;
     }
+    // Module-ness is a property of the first opening: a `class Foo` that later
+    // sees a stray `module Foo` is a TypeError in MRI, not a demotion, and the
+    // common case here is a reopening that agrees. Only ever set the flag, so a
+    // `module M` opened before a merge of an unrelated (default) def keeps it.
+    existing.is_module |= def.is_module;
     for (k, v) in def.methods {
         existing.methods.insert(k, v);
     }
@@ -2673,6 +2684,16 @@ impl RubyHost {
     /// receiver answers its own class; a class receiver answers itself for an
     /// UnboundMethod (`Foo.instance_method` names an INSTANCE method) and its
     /// singleton otherwise (`Foo.method` names a class method).
+    /// The word MRI uses for `name` in an error message — `module` for a
+    /// `module M`, `class` for everything else (`undefined method 'x' for
+    /// module M` vs `… for class C`).
+    pub fn class_or_module_word(&self, name: &str) -> &'static str {
+        if self.is_module_name(name) {
+            "module"
+        } else {
+            "class"
+        }
+    }
     pub fn method_lookup_class(&self, recv: &Value, unbound: bool) -> String {
         match self.classref_name(recv) {
             Some(cls) if unbound => cls,
@@ -2929,12 +2950,12 @@ impl RubyHost {
         let mut out = vec![format!("#<Class:{class}>")];
         // A module's singleton class inherits from `Module` directly — it has no
         // superclass singletons ahead of it, and no `Class`.
-        if !crate::arity_table::is_module(class) {
+        if !self.is_module_name(class) {
             out.extend(
                 self.expanded_ancestry(class)
                     .into_iter()
                     .skip(1)
-                    .filter(|a| !crate::arity_table::is_module(a))
+                    .filter(|a| !self.is_module_name(a))
                     .map(|a| format!("#<Class:{a}>")),
             );
             out.push("Class".to_string());
@@ -3163,7 +3184,15 @@ impl RubyHost {
         }
         match self.obj(v) {
             Some(RObj::Object { class, .. }) => class.clone(),
-            Some(RObj::ClassRef(_)) => "Class".to_string(),
+            // A `module M` reference is an instance of `Module`, a `class C` one
+            // an instance of `Class` — `Class < Module`, so only the module side
+            // needs distinguishing.
+            Some(RObj::ClassRef(n)) => if self.is_module_name(n) {
+                "Module"
+            } else {
+                "Class"
+            }
+            .to_string(),
             _ => self.class_name(v).to_string(),
         }
     }
@@ -3664,13 +3693,15 @@ impl RubyHost {
     /// Register an anonymous class/module (`Class.new`/`Module.new`) under a fresh
     /// name and return it. The optional superclass seeds the `ClassDef`; the block
     /// body (if any) is run afterwards as a `class_eval` by the caller.
-    pub fn define_anon_class(&mut self, superclass: Option<String>) -> String {
+    pub fn define_anon_class(&mut self, superclass: Option<String>, is_module: bool) -> String {
         self.struct_counter += 1;
-        let name = format!("#<Class:{}>", self.struct_counter);
+        let kind = if is_module { "Module" } else { "Class" };
+        let name = format!("#<{kind}:{}>", self.struct_counter);
         self.classes.insert(
             name.clone(),
             ClassDef {
                 superclass,
+                is_module,
                 ..ClassDef::default()
             },
         );
@@ -4312,6 +4343,16 @@ impl RubyHost {
     pub fn is_module_function_module(&self, class: &str) -> bool {
         self.module_function_modules.contains(class)
     }
+    /// Whether the constant `name` names a module rather than a class — either a
+    /// built-in one (`Comparable`, `Enumerable`, …) or one the program opened
+    /// with `module`. Drives `Module#class`, `is_a?`/`instance_of?`, and the
+    /// singleton lookup chain, all of which differ between the two.
+    pub fn is_module_name(&self, name: &str) -> bool {
+        // `Module` and `Class` themselves are *classes* (`Module.class` is
+        // `Class` in MRI), so only the table's module list and the program's own
+        // `module` openings count.
+        crate::arity_table::is_module(name) || self.classes.get(name).is_some_and(|d| d.is_module)
+    }
     /// The class name of a user object, if `v` is one.
     pub fn object_class(&self, v: &Value) -> Option<String> {
         match self.obj(v) {
@@ -4561,6 +4602,26 @@ impl RubyHost {
             "String" | "Symbol" | "Time" | "Date" => own(&["Comparable"]),
             "DateTime" => own(&["Date", "Comparable"]),
             "Array" | "Hash" | "Range" | "Set" | "Struct" => own(&["Enumerable"]),
+            // A user-defined `module M`: prepends, itself, then its includes.
+            // A module has no superclass, so the `Object`/`Kernel`/`BasicObject`
+            // tail a class carries must not appear — `module B; include A; end`
+            // gives `[B, A]` in MRI, not `[B, A, Object, Kernel, BasicObject]`.
+            _ if self.classes.get(name).is_some_and(|d| d.is_module) => {
+                let def = &self.classes[name];
+                let mut out: Vec<String> = def
+                    .prepends
+                    .iter()
+                    .rev()
+                    .map(|m| self.resolve_module_name(m, name))
+                    .collect();
+                out.push(name.to_string());
+                for m in def.includes.iter().rev() {
+                    let inc = self.resolve_module_name(m, name);
+                    // A module's own includes contribute their chains too.
+                    out.extend(self.class_ancestry(&inc));
+                }
+                dedup_keep_first(out)
+            }
             _ => {
                 if self.classes.contains_key(name) {
                     // A user-defined class: self, its included modules, then up
@@ -5985,7 +6046,13 @@ impl RubyHost {
                 Some(RObj::Method { .. }) => "Method",
                 Some(RObj::Regexp { .. }) => "Regexp",
                 Some(RObj::MatchData { .. }) => "MatchData",
-                Some(RObj::ClassRef(_)) => "Class",
+                Some(RObj::ClassRef(n)) => {
+                    if self.is_module_name(n) {
+                        "Module"
+                    } else {
+                        "Class"
+                    }
+                }
                 Some(RObj::Object { .. }) => "Object",
                 None => "Object",
             },

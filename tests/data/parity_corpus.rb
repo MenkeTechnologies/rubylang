@@ -3389,3 +3389,44 @@ p [Rec.new(a: 1).eql?(Rec.new(a: 1)), Rec.new(a: 1).eql?(Rec.new(a: 1.0))]
 # The `==`-defined scanning lookups must NOT pick up the strictness.
 p [[1].include?(1.0), [1].index(1.0), [1, 1.0].count(1), [1].delete(1.0)]
 p [{a: 1}.value?(1.0), [[1, :x]].assoc(1.0), [[:x, 1]].rassoc(1.0)]
+#==#
+# A `module` and a superclass-less `class` are indistinguishable in the compiled
+# ClassDef unless the opening keyword is recorded, so every module reported
+# itself as a Class: `M.class` was `Class`, `M.is_a?(Class)` was true, and
+# `M.ancestors` carried a class's `Object`/`Kernel`/`BasicObject` tail.
+module Only; end
+module Mixed; include Comparable; end
+module Reopened; end
+module Reopened; def m; end; end
+class Plain; end
+class Sub < Plain; end
+p Only.class, Plain.class, Sub.class
+p Mixed.class, Reopened.class
+p Only.is_a?(Module), Only.is_a?(Class), Plain.is_a?(Module), Plain.is_a?(Class)
+p Only.instance_of?(Module), Plain.instance_of?(Class)
+p Module.new.class, Class.new.class
+p Comparable.class, Enumerable.class, Kernel.class, Math.class
+p Module.class, Class.class, Object.class
+p Only.ancestors, Mixed.ancestors, Sub.ancestors
+module Outer
+  module Inner; end
+  class Nested; end
+end
+p Outer.class, Outer::Inner.class, Outer::Nested.class
+#==#
+# The receiver word in a NoMethodError/NameError is `module` for a module and
+# `class` for a class; every module said `class`. `Module#superclass` does not
+# exist at all — it answered `Object` instead of raising.
+module NoSuper; end
+class HasSuper; end
+def msg
+  yield
+rescue NoMethodError, NameError => e
+  [e.class, e.message]
+end
+p msg { NoSuper.nope }
+p msg { HasSuper.nope }
+p msg { NoSuper.superclass }
+p msg { HasSuper.superclass }
+p msg { NoSuper.instance_method(:nope) }
+p msg { HasSuper.instance_method(:nope) }

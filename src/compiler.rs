@@ -1386,8 +1386,8 @@ impl Compiler {
                 name,
                 superclass,
                 body,
-            } => self.compile_class(b, name, superclass, body)?,
-            Expr::Module { name, body } => self.compile_class(b, name, &None, body)?,
+            } => self.compile_class(b, name, superclass, body, false)?,
+            Expr::Module { name, body } => self.compile_class(b, name, &None, body, true)?,
             // `class << recv … end` outside a class body. Each inner `def`
             // becomes a singleton method of `recv` (or the current `self` for
             // `class << self`), registered at runtime. Evaluates to nil.
@@ -2535,6 +2535,7 @@ impl Compiler {
         name: &str,
         superclass: &Option<String>,
         body: &[Stmt],
+        is_module: bool,
     ) -> Result<(), String> {
         // The class/module is stored under its fully-qualified name (prefixed by
         // the enclosing namespace). The superclass is resolved against the
@@ -2839,6 +2840,7 @@ impl Compiler {
                 prepends,
                 extends,
                 class_methods,
+                is_module,
             },
         ));
         // A named superclass may be an autoloaded constant (`class Sub < Base`
