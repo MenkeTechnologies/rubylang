@@ -726,6 +726,18 @@ fn gen_intmeth(seed: u64) -> Vec<String> {
     })
 }
 
+/// Regexps as MATCHERS (cases 0-9) and as VALUES (cases 10-18).
+///
+/// The value half is the part a match-only generator cannot reach: Ruby defines
+/// `Regexp#==` by source + options + encoding, so two separately-written
+/// literals with the same source are the SAME value and collapse under `uniq`,
+/// `-`, `include?` and as a Hash key. An implementation that leaves them on
+/// object identity answers every one of those the other way, and no amount of
+/// `=~`/`scan`/`gsub` fuzzing will show it.
+///
+/// The flag pool carries `im` and `mi` on purpose: options are a normalized
+/// BITMASK in Ruby, so those two are equal, which a comparison written on the
+/// raw flag TEXT gets wrong while still passing every single-flag case.
 fn gen_regex(seed: u64) -> Vec<String> {
     let r = &mut Rng::seed(seed);
     let s = format!("{}{}", ww(r), ww(r));
@@ -733,7 +745,12 @@ fn gen_regex(seed: u64) -> Vec<String> {
         "[a-c]+", "o+", "[aeiou]", "\\w+", "l+", "[a-z]{2}", "^.", ".$",
     ];
     let p = r.pick(&pats);
-    one(match r.below(10) {
+    // A second literal, drawn independently, so a pair is same-source about as
+    // often as it is different-source.
+    let q = r.pick(&pats);
+    let flags = ["", "i", "m", "x", "im", "mi", "imx"];
+    let (f, g) = (r.pick(&flags), r.pick(&flags));
+    one(match r.below(19) {
         0 => format!("p(\"{s}\" =~ /{p}/)"),
         1 => format!("p \"{s}\".match?(/{p}/)"),
         2 => format!("p \"{s}\".scan(/{p}/)"),
@@ -743,7 +760,21 @@ fn gen_regex(seed: u64) -> Vec<String> {
         6 => format!("p \"{s}\".match(/{p}/) ? \"m\" : \"no\""),
         7 => format!("p \"{s}\".gsub(/([a-z])\\1/, \"D\")"),
         8 => format!("p \"{s}\".split(/{p}/)"),
-        _ => format!("p \"{s}\".scan(/{p}/).length"),
+        9 => format!("p \"{s}\".scan(/{p}/).length"),
+        // --- Regexp as a value ---
+        10 => format!("p(/{p}/{f} == /{q}/{g})"),
+        11 => format!("p(/{p}/{f}.eql?(/{q}/{g}))"),
+        // The hash VALUE is not comparable between two interpreters; whether two
+        // hashes AGREE is.
+        12 => format!("p(/{p}/{f}.hash == /{q}/{g}.hash)"),
+        13 => format!("p([/{p}/{f}, /{q}/{g}, /{p}/{f}].uniq.size)"),
+        14 => format!("p({{/{p}/{f} => 1}}[/{q}/{g}])"),
+        15 => format!("p([/{p}/{f}].include?(/{q}/{g}))"),
+        16 => format!("p(([/{p}/{f}, /{q}/{g}] - [/{p}/{f}]).size)"),
+        17 => format!("p([/{p}/{f}.options, /{p}/{f}.inspect, /{p}/{f}.source])"),
+        // Single-quoted: a double-quoted "\\w+" would collapse the escape in the
+        // Ruby string literal before `Regexp.new` ever saw it.
+        _ => format!("p(Regexp.new('{p}') == /{p}/)"),
     })
 }
 
@@ -1026,12 +1057,30 @@ fn gen_mixins(seed: u64) -> Vec<String> {
     })
 }
 
+/// Rational arithmetic (cases 0-10) and ORDERING FAILURE (cases 11-16).
+///
+/// Rational gets `< <= > >=` from `Comparable`, so they are defined by `<=>`:
+/// when `<=>` answers nil the operator raises `ArgumentError`, it does not
+/// answer false. Two things make this worth generating rather than asserting:
+///
+/// - It is ASYMMETRIC. `Rational(1,2) < Float::NAN` raises, but
+///   `Float::NAN < Rational(1,2)` is plain IEEE and answers false, because
+///   `Float#<` is its own method and never consults `<=>`. An implementation
+///   that "raises on a NaN operand" passes the first and fails the second, so
+///   both directions are generated (cases 11/12) against the same operator.
+/// - The operand's name in the message is not its class. MRI's `rb_cmperr`
+///   prints `inspect` for a Float or a special constant (`NaN`, `nil`, `:sym`)
+///   and the CLASS for everything else (`String`, `Array`), so case 13 draws
+///   from both kinds.
 fn gen_rational(seed: u64) -> Vec<String> {
     let r = &mut Rng::seed(seed);
     let (a, b) = (r.range(1, 12), r.range(1, 12));
     let (c, d) = (r.range(1, 12), r.range(1, 12));
     let n = ii(r);
-    one(match r.below(11) {
+    let relop = r.pick(&["<", ">", "<=", ">="]);
+    // Left column renders via `inspect` in the message, right column via class.
+    let operand = r.pick(&["Float::NAN", "nil", ":sym", "\"s\"", "[1]", "Object.new"]);
+    one(match r.below(17) {
         0 => format!("p(Rational({a}, {b}) + Rational({c}, {d}))"),
         1 => format!("p(Rational({a}, {b}) - Rational({c}, {d}))"),
         2 => format!("p(Rational({a}, {b}) * Rational({c}, {d}))"),
@@ -1042,7 +1091,30 @@ fn gen_rational(seed: u64) -> Vec<String> {
         7 => format!("p(Rational({a}, {b}) + {n})"),
         8 => format!("p(Rational({a}, {b}).to_f.round(6))"),
         9 => format!("p [Rational({a}, {b}).numerator, Rational({a}, {b}).denominator]"),
-        _ => format!("p({n} / Rational({c}, {d}))"),
+        10 => format!("p({n} / Rational({c}, {d}))"),
+        // Rational on the LEFT: `<=>` is nil, so Comparable raises.
+        11 => format!(
+            "begin\n  p(Rational({a}, {b}) {relop} Float::NAN)\nrescue ArgumentError => e\n  p e.message\nend"
+        ),
+        // Float on the left: `Float#<` is IEEE and must NOT raise.
+        12 => format!(
+            "begin\n  p(Float::NAN {relop} Rational({a}, {b}))\nrescue ArgumentError => e\n  p e.message\nend"
+        ),
+        13 => format!(
+            "begin\n  p(Rational({a}, {b}) {relop} {operand})\nrescue => e\n  p [e.class, e.message]\nend"
+        ),
+        // `<=>` itself answers nil rather than raising — the value the operators
+        // are derived from, pinned separately so a fix can't satisfy the
+        // operators by making `<=>` raise too.
+        14 => format!("p(Rational({a}, {b}) <=> Float::NAN)"),
+        // Reached through Comparable's other two derived methods, and through
+        // the sort that uses `<=>` directly.
+        15 => format!(
+            "begin\n  p(Rational({a}, {b}).clamp(Rational({c}, {d}), Float::NAN))\nrescue ArgumentError => e\n  p e.message\nend"
+        ),
+        _ => format!(
+            "begin\n  p([Rational({a}, {b}), Float::NAN].sort)\nrescue ArgumentError => e\n  p e.message\nend"
+        ),
     })
 }
 
@@ -1808,15 +1880,31 @@ fn gen_lambda(seed: u64) -> Vec<String> {
 
 /// Enumerator shape and laziness: which methods answer an Enumerator, the
 /// grouping methods (`chunk`/`chunk_while`/`slice_when`/`each_slice`/
-/// `each_cons`), and — the part that used to hang — block-less enumerator
-/// methods over an INFINITE source, bounded by `first`/`take`/`next`.
+/// `each_cons`), — the part that used to hang — block-less enumerator
+/// methods over an INFINITE source, bounded by `first`/`take`/`next`, and
+/// `Enumerator::Lazy#uniq` (cases 22-25).
+///
+/// `uniq` is the one lazy stage that has to carry state ACROSS elements, so it
+/// cannot be expressed by the per-element map/filter shape the other stages
+/// share. Over an infinite source (`(1..)` mapped into a small residue set) it
+/// is also the case that proves the stage stays lazy: a `uniq` that materializes
+/// its source first cannot terminate at all, so it fails by hanging rather than
+/// by answering wrong. The block form (`uniq { }`) keys on the block's value but
+/// yields the ORIGINAL element, which a keyless implementation gets wrong.
 fn gen_enumlazy(seed: u64) -> Vec<String> {
     let r = &mut Rng::seed(seed);
     let n = r.range(1, 3);
     let k = r.range(2, 4);
     let arr = "[1, 2, 4, 5, 7]";
     let gen = "e = Enumerator.new { |y| i = 0; loop { y << i; i += 1 } }";
-    one(match r.below(22) {
+    // Modulus of the residue map feeding the infinite-source uniq cases.
+    // `x % m` over `(1..)` yields exactly `m` distinct values, and the case that
+    // also rejects one yields `m - 1`, so the bound below asks for FEWER than
+    // that. Asking for more does not diverge — it does not terminate, in MRI as
+    // much as here, and the run is spent on two timeouts instead of a result.
+    let m = r.range(3, 6);
+    let j = k.min(m - 1);
+    one(match r.below(26) {
         0 => format!("p {arr}.each_slice({k}).class"),
         1 => format!("p {arr}.each_cons({k}).class"),
         2 => format!("p {arr}.chunk_while {{ |a, b| b == a + 1 }}.class"),
@@ -1840,16 +1928,37 @@ fn gen_enumlazy(seed: u64) -> Vec<String> {
         18 => format!("{gen}\np e.each_with_object([]).first({n})"),
         19 => format!("p (1..).each_slice({n}).first({k})"),
         20 => format!("p (1..).each_with_index.first({k})"),
-        _ => format!("p (1..Float::INFINITY).each_cons({n}).first({k})"),
+        21 => format!("p (1..Float::INFINITY).each_cons({n}).first({k})"),
+        // Finite source: `to_a` forces the whole pipeline, so the stage's output
+        // ORDER is pinned too (Ruby keeps first-occurrence order).
+        22 => "p [1, 1, 2, 4, 2, 1, 5].lazy.uniq.to_a".to_string(),
+        // Keyed by the block, yielding the original element.
+        23 => format!("p {arr}.lazy.uniq {{ |x| x % {m} }}.to_a"),
+        // Infinite source, bounded by `first`: only a genuinely lazy `uniq`
+        // terminates.
+        24 => format!("p (1..).lazy.map {{ |x| x % {m} }}.uniq.first({j})"),
+        // Composed with the stages either side of it.
+        _ => format!(
+            "p (1..).lazy.map {{ |x| x % {m} }}.uniq.map {{ |x| x * 2 }}.reject {{ |x| x == 0 }}.first({j})"
+        ),
     })
 }
 
-/// `Set`: construction, the algebra operators, mutation, and the predicates.
+/// `Set`: construction, the algebra operators, mutation, and the predicates —
+/// plus `<=>` (cases 16-20).
+///
+/// `Set#<=>` is a SUBSET-RELATION comparison, not an ordering: `0` when the sets
+/// are equal, `-1`/`1` for a proper subset/superset, and `nil` whenever neither
+/// contains the other or the operand is not a Set. The subset PREDICATES
+/// (`subset?`/`<=`, case 6) can all be right while `<=>` is wrong, because a
+/// Set that falls through to `Array#<=>` still answers `-1`/`0`/`1` — just
+/// element-wise and ordered, and it never answers `nil`. So the incomparable
+/// pair and the non-Set operand are the two cases that actually discriminate.
 fn gen_setops(seed: u64) -> Vec<String> {
     let r = &mut Rng::seed(seed);
     let (a, b) = (r.range(1, 5), r.range(1, 5));
     let pre = "require \"set\"";
-    one(match r.below(16) {
+    one(match r.below(21) {
         0 => format!("{pre}\np Set.new([{a}, {b}, {a}]).to_a.sort"),
         1 => format!("{pre}\np (Set[{a}, {b}] | Set[3, 4]).to_a.sort"),
         2 => format!("{pre}\np (Set[{a}, {b}, 3] & Set[3, 4]).to_a.sort"),
@@ -1869,7 +1978,15 @@ fn gen_setops(seed: u64) -> Vec<String> {
         12 => format!("{pre}\np (Set[{a}, {b}] == Set[{b}, {a}])"),
         13 => format!("{pre}\np Set[{a}, {b}].disjoint?(Set[7, 8])"),
         14 => format!("{pre}\np Set[{a}, {b}].to_a.sum"),
-        _ => format!("{pre}\np Set.new([{a}, {b}]).each_with_object([]) {{ |x, m| m << x }}.sort"),
+        15 => format!("{pre}\np Set.new([{a}, {b}]).each_with_object([]) {{ |x, m| m << x }}.sort"),
+        // Proper subset / proper superset / equal-ignoring-order.
+        16 => format!("{pre}\np (Set[{a}, {b}] <=> Set[{a}, {b}, 9])"),
+        17 => format!("{pre}\np (Set[{a}, {b}, 9] <=> Set[{a}, {b}])"),
+        18 => format!("{pre}\np (Set[{a}, {b}] <=> Set[{b}, {a}])"),
+        // Incomparable unless a == b — the case an ordered fallback gets wrong.
+        19 => format!("{pre}\np [Set[{a}, 7] <=> Set[{b}, 8], Set[] <=> Set[{a}]]"),
+        // A non-Set operand is `nil`, never an Array comparison.
+        _ => format!("{pre}\np [Set[{a}, {b}] <=> [{a}, {b}], Set[{a}] <=> {b}]"),
     })
 }
 
