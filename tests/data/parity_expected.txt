@@ -1867,3 +1867,48 @@ Class
 Object
 [NameError, "undefined method 'nope' for module 'NoSuper'"]
 [NameError, "undefined method 'nope' for class 'HasSuper'"]
+#==#
+true
+"s2"
+"s2"
+"protected method 'value' called for an instance of Vis"
+"private method 'secret' called for an instance of Vis"
+"s2"
+false
+true
+[:bigger?, :implicit, :value, :via_self]
+[:bigger?, :implicit, :via_self]
+[:value]
+[:initialize, :secret]
+false
+true
+true
+true
+2
+"protected method 'value' called for an instance of Vis"
+#==#
+[3, 1]
+"private method 'x' called for an instance of Attrs"
+"private method 'dm' called for an instance of Attrs"
+[:setx, :show]
+[:dm, :x, :x=]
+"private method 'm' called for an instance of Named"
+1
+2
+[:n]
+[:m]
+"private method 'initialize' called for an instance of Hook"
+false
+true
+[]
+[:initialize]
+1
+[:helper]
+#==#
+"private method 'm' called for an instance of Sent"
+[:m]
+1
+"private method 'm' called for an instance of Evaled"
+[:m]
+1
+[]

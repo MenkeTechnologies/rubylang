@@ -578,12 +578,57 @@ pub struct ClassDef {
     pub prepends: Vec<String>,
     pub extends: Vec<String>,
     pub class_methods: IndexMap<String, MethodDef>,
+    /// Per-method visibility for the entries this class owns. Public is the
+    /// default and is NOT stored, so an absent name means public — which keeps
+    /// the map empty for the overwhelmingly common class and makes a reopening
+    /// merge a plain extend. Keyed by method name, exactly like MRI's per-entry
+    /// visibility (it belongs to the class the method is defined in, not to the
+    /// method body, so an inherited method can be made private in a subclass).
+    pub visibility: IndexMap<String, Visibility>,
     /// True when this was opened with `module`, not `class` (or created by
     /// `Module.new`). A module is an instance of `Module`, not of `Class`, so
     /// `M.class` is `Module`, `M.is_a?(Class)` is false, and `M` has no
     /// `superclass` — none of which is derivable from the rest of the def, since
     /// a module and a superclass-less class look identical otherwise.
     pub is_module: bool,
+}
+
+/// MRI method visibility. Only the two non-default values are ever stored; see
+/// [`ClassDef::visibility`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Visibility {
+    #[default]
+    Public,
+    Private,
+    Protected,
+}
+
+impl Visibility {
+    /// The compact form stored in the bytecode cache tuple.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Visibility::Public => 0,
+            Visibility::Private => 1,
+            Visibility::Protected => 2,
+        }
+    }
+    /// Inverse of [`Visibility::as_u8`]; an unknown byte reads as public, so a
+    /// cache entry from a future writer degrades instead of panicking.
+    pub fn from_u8(b: u8) -> Self {
+        match b {
+            1 => Visibility::Private,
+            2 => Visibility::Protected,
+            _ => Visibility::Public,
+        }
+    }
+    /// The word MRI puts in `NoMethodError`: `private method 'm' called for …`.
+    pub fn word(self) -> &'static str {
+        match self {
+            Visibility::Public => "public",
+            Visibility::Private => "private",
+            Visibility::Protected => "protected",
+        }
+    }
 }
 
 /// A `begin`/`rescue`/`ensure` block, compiled to proc templates.
@@ -1433,6 +1478,9 @@ fn merge_class(classes: &mut IndexMap<String, ClassDef>, name: String, def: Clas
     // common case here is a reopening that agrees. Only ever set the flag, so a
     // `module M` opened before a merge of an unrelated (default) def keeps it.
     existing.is_module |= def.is_module;
+    for (k, v) in def.visibility {
+        existing.visibility.insert(k, v);
+    }
     for (k, v) in def.methods {
         existing.methods.insert(k, v);
     }
@@ -5037,7 +5085,28 @@ impl RubyHost {
         "method_missing",
     ];
 
+    /// `Module#instance_methods` — the public AND protected names, which is what
+    /// MRI returns (it excludes only private).
     pub fn instance_method_names(&self, class: &str, inherited: bool) -> Vec<String> {
+        self.instance_method_names_vis(
+            class,
+            inherited,
+            &[Visibility::Public, Visibility::Protected],
+        )
+    }
+
+    /// The instance-method names of `class` whose visibility is one of `want` —
+    /// the shared body behind `instance_methods` / `public_instance_methods` /
+    /// `private_instance_methods` / `protected_instance_methods`.
+    ///
+    /// `PRIVATE_HOOKS` are private by definition in MRI however they were
+    /// declared, so they answer to the private query and to no other.
+    pub fn instance_method_names_vis(
+        &self,
+        class: &str,
+        inherited: bool,
+        want: &[Visibility],
+    ) -> Vec<String> {
         let chain: Vec<String> = if inherited {
             self.class_ancestry(class)
         } else {
@@ -5045,27 +5114,85 @@ impl RubyHost {
         };
         let mut out = Vec::new();
         for n in &chain {
-            if let Some(def) = self.classes.get(n) {
-                for k in def.methods.keys() {
-                    if !k.starts_with("__") && !Self::PRIVATE_HOOKS.contains(&k.as_str()) {
+            let vis_of = |k: &str| {
+                if Self::PRIVATE_HOOKS.contains(&k) {
+                    Visibility::Private
+                } else {
+                    self.own_visibility(n, k)
+                }
+            };
+            let take = |keys: Box<dyn Iterator<Item = &String> + '_>, out: &mut Vec<String>| {
+                for k in keys {
+                    if !k.starts_with("__") && want.contains(&vis_of(k)) {
                         out.push(k.clone());
                     }
                 }
+            };
+            if let Some(def) = self.classes.get(n) {
+                take(Box::new(def.methods.keys()), &mut out);
             }
             if let Some(dm) = self.define_methods.get(n) {
-                for k in dm.keys() {
-                    if !k.starts_with("__") && !Self::PRIVATE_HOOKS.contains(&k.as_str()) {
-                        out.push(k.clone());
-                    }
-                }
+                take(Box::new(dm.keys()), &mut out);
             }
         }
         dedup_keep_first(out)
     }
-    /// `Module#method_defined?` — whether `method` is defined on `class` or any
-    /// ancestor (own methods, included modules, superclasses, and
-    /// `define_method`-created methods). Visibility is not modeled, so this also
-    /// serves `public_method_defined?`.
+
+    /// The visibility `class` records for its OWN entry `method`, without
+    /// consulting ancestors. Public when nothing is recorded.
+    pub fn own_visibility(&self, class: &str, method: &str) -> Visibility {
+        self.classes
+            .get(class)
+            .and_then(|d| d.visibility.get(method))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// The effective visibility of `method` as seen through `class`: the entry
+    /// recorded by the first ancestor that has an opinion, so a subclass can make
+    /// an inherited method private (`private :to_s`) and a public redefinition
+    /// further down wins over a private one further up.
+    pub fn method_visibility(&self, class: &str, method: &str) -> Visibility {
+        if Self::PRIVATE_HOOKS.contains(&method) {
+            return Visibility::Private;
+        }
+        for n in self.class_ancestry(class) {
+            if let Some(def) = self.classes.get(&n) {
+                if let Some(v) = def.visibility.get(method) {
+                    return *v;
+                }
+                // An ancestor that *defines* the method without recording a
+                // visibility defines it public, and that definition shadows any
+                // private entry further up the chain.
+                if def.methods.contains_key(method) {
+                    return Visibility::Public;
+                }
+            }
+            if self
+                .define_methods
+                .get(&n)
+                .is_some_and(|dm| dm.contains_key(method))
+            {
+                return Visibility::Public;
+            }
+        }
+        Visibility::Public
+    }
+
+    /// Record `vis` for `class`'s entry `method` (`private :m`, `public :m`, and
+    /// the class-body modifier the compiler resolves).
+    pub fn set_method_visibility(&mut self, class: &str, method: &str, vis: Visibility) {
+        let def = self.classes.entry(class.to_string()).or_default();
+        if vis == Visibility::Public {
+            def.visibility.shift_remove(method);
+        } else {
+            def.visibility.insert(method.to_string(), vis);
+        }
+    }
+    /// Whether `method` is defined on `class` or any ancestor (own methods,
+    /// included modules, superclasses, and `define_method`-created methods),
+    /// regardless of visibility — the `*_method_defined?` builtins narrow the
+    /// answer with [`RubyHost::method_visibility`] on top.
     pub fn is_method_defined(&self, class: &str, method: &str) -> bool {
         self.find_method_owner(class, method).is_some()
             || self.find_define_method(class, method).is_some()

@@ -490,18 +490,17 @@ Honest limitations of this surface:
   Still open: MRI creates a module's singleton class lazily, so
   `M.method(:undefined)` on a module with no `def self.` reports the lookup
   class as `Module`; rubylang always names `#<Class:M>`.
-- **Class/module reflection.** `Module#instance_methods([inherited])`,
-  `#public_instance_methods`, `#method_defined?`/`#public_method_defined?`, and
-  the instance-side `Object#methods` return method names as symbols.
+- **Class/module reflection.** `Module#instance_methods([inherited])`, its three
+  visibility-specific siblings, the `#*method_defined?` predicates, and the
+  instance-side `Object#methods` return method names as symbols (see "Method
+  visibility" below for which name lands in which set).
   `instance_methods(false)` is the class's own methods (including
   `attr_accessor`/`attr_reader`/`attr_writer` accessors and `define_method`
   methods); `instance_methods` / `instance_methods(true)` add every user-defined
   ancestor (included modules and superclasses) via the ancestor chain. Builtin
   ancestors (`Object`/`Kernel`/`Comparable`/`Enumerable`) are NOT enumerated —
   the inherited set is bounded to the user-defined portion of the chain, so it
-  omits MRI's builtin Kernel methods. Method visibility (public/private/
-  protected) is not modeled, so `public_instance_methods` equals
-  `instance_methods` and `public_method_defined?` equals `method_defined?`. The
+  omits MRI's builtin Kernel methods. The
   synthetic `__class_body__` (and any `__`-prefixed internal name) is excluded.
   The modifier-with-a-`def` forms (`private def m …`, and `public`/`protected`/
   `module_function` likewise) still DEFINE on the class: the class-body compiler
@@ -509,6 +508,29 @@ Honest limitations of this surface:
   registered the `def` in the top-level method table instead — making a
   `private def helper` reachable as a bare `helper` from anywhere.
   `module_function def m` also promotes to a module method.
+- **Method visibility.** Enforced, not just parsed. `ClassDef` carries a
+  per-name `visibility` map (public is the unrecorded default) filled by the
+  class-body compiler from a bare `private`/`protected`/`public` mode, from the
+  `private def m` / `private :a, :b` forms, and from `module_function` (whose
+  instance copy is private); the runtime `private :m` spelling writes the same
+  map, so a directive reached through `class_eval` works too. It rides the
+  bytecode cache.
+  An explicit-receiver call (`obj.m`) is gated: a private method is callable
+  only when the receiver IS the current `self` (Ruby 2.7's `self.priv`), a
+  protected one when `self` is a kind of the class owning the entry. The miss
+  raises MRI's `private method 'm' called for an instance of C`. Implicit-self
+  calls and `send`/`__send__` bypass the check, as in MRI.
+  The modifier applies to `attr_accessor`/`attr_reader`/`attr_writer` accessors
+  and to a `define_method` in the same body, not only to a following `def`.
+  `initialize`, `initialize_copy`/`_clone`/`_dup`, `respond_to_missing?` and
+  `method_missing` are private however they were declared.
+  Reflection follows: `instance_methods` is public + protected,
+  `public_`/`private_`/`protected_instance_methods` select one visibility each,
+  `method_defined?` excludes private while `public_`/`private_`/
+  `protected_method_defined?` test for exactly one, and `respond_to?` answers
+  false for a private method unless the second argument is true.
+  Still open: `public_send` does not differ from `send`, and visibility on
+  *class* methods (`private_class_method`) is still accepted as a no-op.
 - **Composite Hash keys.** Arrays (`{[1, 2] => v}`, nested), Hashes
   (`{{a: 1} => v}`), Sets, Ranges (`{(1..3) => v}`, Integer/String/Float
   endpoints), `BigInt`/`Rational`/`Complex` numbers, and class objects work as

@@ -3430,3 +3430,102 @@ p msg { NoSuper.superclass }
 p msg { HasSuper.superclass }
 p msg { NoSuper.instance_method(:nope) }
 p msg { HasSuper.instance_method(:nope) }
+#==#
+# Visibility was not modeled at all: `private`/`protected` were inert, so an
+# explicit-receiver call reached a private method, `instance_methods` listed it,
+# and `private_instance_methods` listed everything.
+class Vis
+  def initialize(n) = @n = n
+  def bigger?(o) = value > o.value
+  def via_self = self.secret
+  def implicit = secret
+  protected
+  def value = @n
+  private
+  def secret = "s#{@n}"
+end
+def caught
+  yield
+rescue NoMethodError => e
+  e.message
+end
+a = Vis.new(2)
+b = Vis.new(1)
+p a.bigger?(b), a.via_self, a.implicit
+p caught { a.value }, caught { a.secret }
+p a.send(:secret), a.respond_to?(:secret), a.respond_to?(:secret, true)
+p Vis.instance_methods(false).sort
+p Vis.public_instance_methods(false).sort
+p Vis.protected_instance_methods(false).sort
+p Vis.private_instance_methods(false).sort
+p Vis.method_defined?(:secret), Vis.private_method_defined?(:secret)
+p Vis.method_defined?(:value), Vis.protected_method_defined?(:value)
+class Heir < Vis
+  def peek(o) = o.value
+end
+class Alien
+  def snoop(o) = o.value
+end
+p Heir.new(5).peek(a)
+p caught { Alien.new.snoop(a) }
+#==#
+# The visibility modifier applies to `attr_*`, `define_method` and a later
+# `private :name`, not only to a following `def`; `initialize` and the other
+# hook methods are private however they were declared.
+class Attrs
+  private
+  attr_accessor :x
+  define_method(:dm) { 1 }
+  public
+  def show = [x, dm]
+  def setx(v) = self.x = v
+end
+class Named
+  def m = 1
+  def n = 2
+  private :m
+end
+class Hook
+  def initialize = @v = 1
+end
+def caught
+  yield
+rescue NoMethodError => e
+  e.message
+end
+a = Attrs.new
+a.setx(3)
+p a.show, caught { a.x }, caught { a.dm }
+p Attrs.instance_methods(false).sort, Attrs.private_instance_methods(false).sort
+p caught { Named.new.m }, Named.new.send(:m), Named.new.n
+p Named.instance_methods(false).sort, Named.private_instance_methods(false).sort
+h = Hook.new
+p caught { h.initialize }
+p h.respond_to?(:initialize), h.respond_to?(:initialize, true)
+p Hook.instance_methods(false), Hook.private_instance_methods(false)
+module MF
+  def helper = 1
+  module_function :helper
+end
+p MF.helper, MF.private_instance_methods(false)
+#==#
+# A visibility directive sent to the class at run time — `Klass.send(:private,
+# :m)` and `class_eval { private :m }` — writes the same per-entry map the
+# class-body compiler fills, so both are enforced.
+class Sent
+  def m = 1
+end
+Sent.send(:private, :m)
+class Evaled
+  def m = 1
+end
+Evaled.class_eval { private :m }
+def caught
+  yield
+rescue NoMethodError => e
+  e.message
+end
+p caught { Sent.new.m }, Sent.private_instance_methods(false), Sent.new.send(:m)
+p caught { Evaled.new.m }, Evaled.private_instance_methods(false)
+Sent.send(:public, :m)
+p Sent.new.m, Sent.private_instance_methods(false)

@@ -258,6 +258,9 @@ fn b_call_method_arr_blk(vm: &mut VM, _: u8) -> Value {
     let name = name_of(&vm.pop());
     let recv = vm.pop();
     let args = with_host(|h| h.as_array(&arr).unwrap_or_default());
+    if let Err(e) = check_visibility(&recv, &name) {
+        return abort(vm, e);
+    }
     match dispatch(&recv, &name, &args, block) {
         Ok(v) => finish_block_call(vm, owns, v),
         Err(e) => abort(vm, e),
@@ -270,6 +273,9 @@ fn b_call_method_arr(vm: &mut VM, _: u8) -> Value {
     let name = name_of(&vm.pop());
     let recv = vm.pop();
     let args = with_host(|h| h.as_array(&arr).unwrap_or_default());
+    if let Err(e) = check_visibility(&recv, &name) {
+        return abort(vm, e);
+    }
     match dispatch(&recv, &name, &args, None) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
@@ -895,6 +901,9 @@ fn b_call_method(vm: &mut VM, argc: u8) -> Value {
     let mut vals = pop_n(vm, argc as usize);
     let recv = vals.remove(0);
     let name = name_of(&vals.remove(0));
+    if let Err(e) = check_visibility(&recv, &name) {
+        return abort(vm, e);
+    }
     match dispatch(&recv, &name, &vals, None) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
@@ -906,6 +915,9 @@ fn b_call_method_blk(vm: &mut VM, argc: u8) -> Value {
     let owns = crate::host::take_block_literal();
     let recv = vals.remove(0);
     let name = name_of(&vals.remove(0));
+    if let Err(e) = check_visibility(&recv, &name) {
+        return abort(vm, e);
+    }
     match dispatch(&recv, &name, &vals, block) {
         Ok(v) => finish_block_call(vm, owns, v),
         Err(e) => abort(vm, e),
@@ -1250,10 +1262,11 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
             }
             return Ok(Value::Undef);
         }
-        // Visibility directives in a class/module body — rubylang does not enforce
-        // visibility, so accept them as no-ops (gems use them constantly:
-        // `private_constant :X`, `private :m`, `module_function :m`). Ruby returns
-        // the single name argument, or nil.
+        // Visibility directives in a class/module body. `private :m` and friends
+        // set the entry's visibility; the constant-level and class-method-level
+        // spellings are still accepted as no-ops (gems use them constantly:
+        // `private_constant :X`, `deprecate_constant`). Ruby returns the single
+        // name argument, or nil.
         if matches!(
             name,
             "private"
@@ -1274,6 +1287,12 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
             if name == "module_function" && args.is_empty() {
                 if let Some(cls) = with_host(|h| h.classref_name(&h.current_self())) {
                     with_host(|h| h.mark_module_function(&cls));
+                }
+            }
+            if let Some(vis) = visibility_directive(name) {
+                for a in args {
+                    let m = name_of(a);
+                    with_host(|h| h.set_method_visibility(&cls, &m, vis));
                 }
             }
             return Ok(match args {
@@ -1887,10 +1906,12 @@ pub(crate) fn dispatch(
         }
         // Immediates (Integer/Float/true/false/nil) and Symbols are always frozen
         // in Ruby; a mutable reference type reports frozen only after `freeze`.
-        // Method/constant visibility directives. rubylang does not enforce
-        // visibility, so these are accepted as no-ops (used pervasively by gems:
-        // `private_constant :X`, `private :m`, `module_function`). Ruby returns
-        // the single name argument (or nil), which callers occasionally chain.
+        // Method/constant visibility directives sent to a receiver:
+        // `Klass.send(:private, :m)` and `Klass.class_eval { private :m }` both
+        // land here. The method-level spellings set the entry's visibility on the
+        // receiving class; the constant- and class-method-level ones are still
+        // no-ops. Ruby returns the single name argument (or nil), which callers
+        // occasionally chain.
         "private"
         | "public"
         | "protected"
@@ -1900,6 +1921,15 @@ pub(crate) fn dispatch(
         | "private_class_method"
         | "public_class_method"
         | "private_constant?" => {
+            if let (Some(cls), Some(vis)) = (
+                with_host(|h| h.classref_name(recv)),
+                visibility_directive(name),
+            ) {
+                for a in args {
+                    let m = name_of(a);
+                    with_host(|h| h.set_method_visibility(&cls, &m, vis));
+                }
+            }
             return Ok(match args {
                 [one] if name != "module_function" => one.clone(),
                 _ => Value::Undef,
@@ -2075,7 +2105,15 @@ pub(crate) fn dispatch(
                     || with_host(|h| h.find_define_method(&cls, &m)).is_some()
                     || with_host(|h| h.find_alias(&cls, &m)).is_some()
                 {
-                    return Ok(Value::Bool(true));
+                    // A private method does not respond unless the second
+                    // argument asks for the private surface too.
+                    let include_private = args
+                        .get(1)
+                        .map(|a| with_host(|h| h.truthy(a)))
+                        .unwrap_or(false);
+                    let private = with_host(|h| h.method_visibility(&cls, &m))
+                        == crate::host::Visibility::Private;
+                    return Ok(Value::Bool(include_private || !private));
                 }
                 if with_host(|h| h.find_method_owner(&cls, "respond_to_missing?")).is_some() {
                     let include_private = args.get(1).cloned().unwrap_or(Value::Bool(false));
@@ -3669,47 +3707,51 @@ fn dispatch_classref(
         // method names as symbols. `false` gives only the class's own methods;
         // `true`/no arg walks the user-defined ancestor chain. Visibility is not
         // modeled, so `public_instance_methods` is the same set.
-        "instance_methods" | "public_instance_methods" => {
+        // `instance_methods` is public + protected (MRI excludes only private);
+        // the other three select exactly one visibility.
+        "instance_methods"
+        | "public_instance_methods"
+        | "private_instance_methods"
+        | "protected_instance_methods" => {
+            let want: &[crate::host::Visibility] = match name {
+                "instance_methods" => &[
+                    crate::host::Visibility::Public,
+                    crate::host::Visibility::Protected,
+                ],
+                "public_instance_methods" => &[crate::host::Visibility::Public],
+                "private_instance_methods" => &[crate::host::Visibility::Private],
+                _ => &[crate::host::Visibility::Protected],
+            };
             let inherited = args
                 .first()
                 .map(|a| with_host(|h| h.truthy(a)))
                 .unwrap_or(true);
             Ok(with_host(|h| {
-                let names = h.instance_method_names(cls, inherited);
+                let names = h.instance_method_names_vis(cls, inherited, want);
                 let syms: Vec<Value> = names.iter().map(|n| h.new_symbol(n)).collect();
                 h.new_array(syms)
             }))
         }
-        // Visibility is not modeled: rubylang can't tell a `private def` from a
-        // public one, so `private_instance_methods` returns the class's methods
-        // (own with `false`, inherited otherwise). ActionDispatch::Journey's
-        // visitors build their dispatch table from `private_instance_methods
-        // (false)` matching /^visit_/, so an empty set would leave it unable to
-        // dispatch. `protected_instance_methods` stays empty.
-        "private_instance_methods" => {
-            let inherited = args
-                .first()
-                .map(|a| with_host(|h| h.truthy(a)))
-                .unwrap_or(true);
-            Ok(with_host(|h| {
-                let names = h.instance_method_names(cls, inherited);
-                let syms: Vec<Value> = names.iter().map(|n| h.new_symbol(n)).collect();
-                h.new_array(syms)
-            }))
-        }
-        "protected_instance_methods" => Ok(with_host(|h| h.new_array(vec![]))),
-        // `Module#method_defined?(sym)` — true if the method is defined on the
-        // class or any ancestor. Visibility is not modeled, so this also serves
-        // `public_method_defined?`.
-        "method_defined?" | "public_method_defined?" => {
+        // `Module#method_defined?(sym)` — defined on the class or an ancestor AND
+        // not private (MRI's `method_defined?` covers public + protected).
+        "method_defined?"
+        | "public_method_defined?"
+        | "private_method_defined?"
+        | "protected_method_defined?" => {
             let m = name_of(&args[0]);
-            Ok(Value::Bool(with_host(|h| h.is_method_defined(cls, &m))))
+            Ok(Value::Bool(with_host(|h| {
+                if !h.is_method_defined(cls, &m) {
+                    return false;
+                }
+                let vis = h.method_visibility(cls, &m);
+                match name {
+                    "method_defined?" => vis != crate::host::Visibility::Private,
+                    "public_method_defined?" => vis == crate::host::Visibility::Public,
+                    "private_method_defined?" => vis == crate::host::Visibility::Private,
+                    _ => vis == crate::host::Visibility::Protected,
+                }
+            })))
         }
-        // Visibility is not modeled — every defined method reads as public, so
-        // `private_method_defined?`/`protected_method_defined?` are false.
-        // activesupport's `silence_redefinition_of_method` guards on
-        // `method_defined?(m) || private_method_defined?(m)`; the first covers it.
-        "private_method_defined?" | "protected_method_defined?" => Ok(Value::Bool(false)),
         // `Module#class_variable_get/set/defined?` and `class_variables`. The
         // reflective name arrives with its `@@` sigil (`:@@x`); the store keys
         // are bare, so strip it.
@@ -17656,7 +17698,29 @@ const HASH_MUTATORS: &[&str] = &[
 /// `for nil` / `for true` / `for false`, `for class C` when the receiver is a
 /// class/module reference, or `for an instance of C` for every other value.
 fn no_method_error(recv: &Value, name: &str) -> String {
-    let target = match recv {
+    raise_exc(
+        "NoMethodError",
+        &format!("undefined method '{name}' for {}", receiver_phrase(recv)),
+    )
+}
+
+/// The visibility a directive name sets, or `None` when the name is one of the
+/// constant/class-method spellings that does not touch instance visibility.
+/// `module_function :m` makes the instance copy private, as MRI does.
+fn visibility_directive(name: &str) -> Option<crate::host::Visibility> {
+    match name {
+        "private" | "module_function" => Some(crate::host::Visibility::Private),
+        "protected" => Some(crate::host::Visibility::Protected),
+        "public" => Some(crate::host::Visibility::Public),
+        _ => None,
+    }
+}
+
+/// How MRI names a receiver in a `NoMethodError`: `nil` / `true` / `false`,
+/// `class C` or `module M` for a class/module reference, `an instance of C`
+/// otherwise.
+fn receiver_phrase(recv: &Value) -> String {
+    match recv {
         Value::Undef => "nil".to_string(),
         Value::Bool(true) => "true".to_string(),
         Value::Bool(false) => "false".to_string(),
@@ -17664,11 +17728,58 @@ fn no_method_error(recv: &Value, name: &str) -> String {
             Some(c) => format!("{} {c}", with_host(|h| h.class_or_module_word(&c))),
             None => format!("an instance of {}", with_host(|h| h.class_of(recv))),
         },
+    }
+}
+
+/// Gate an EXPLICIT-receiver call (`obj.m`, not a bare `m`) on the method's
+/// visibility. Only user classes record one, so a builtin receiver is never
+/// gated here.
+///
+/// * private — callable only when the receiver IS the current `self`. Ruby 2.7
+///   made `self.priv` legal, so identity is the whole test; any other receiver
+///   raises even if it is an instance of the same class.
+/// * protected — callable when the current `self` is a kind of the class that
+///   owns the entry, which is what lets `==`-style methods reach a sibling's
+///   protected reader.
+///
+/// `send`/`__send__` and implicit-self calls do not route through here, so both
+/// keep bypassing visibility exactly as in MRI.
+fn check_visibility(recv: &Value, name: &str) -> Result<(), String> {
+    let Some(cls) = with_host(|h| h.object_class(recv)) else {
+        return Ok(());
     };
-    raise_exc(
+    let vis = with_host(|h| h.method_visibility(&cls, name));
+    if vis == crate::host::Visibility::Public {
+        return Ok(());
+    }
+    let this = with_host(|h| h.current_self());
+    let same_object = matches!((recv, &this), (Value::Obj(a), Value::Obj(b)) if a == b);
+    let allowed = match vis {
+        crate::host::Visibility::Private => same_object,
+        // The owner is the ancestor whose entry carries the visibility; an
+        // unowned name (only possible if the map outlives its def) falls back to
+        // the receiver's own class.
+        crate::host::Visibility::Protected => {
+            let owner = with_host(|h| {
+                h.find_method_owner(&cls, name)
+                    .map(|(_, o)| o)
+                    .unwrap_or_else(|| cls.clone())
+            });
+            same_object || with_host(|h| h.is_a(&this, &owner))
+        }
+        crate::host::Visibility::Public => true,
+    };
+    if allowed {
+        return Ok(());
+    }
+    Err(raise_exc(
         "NoMethodError",
-        &format!("undefined method '{name}' for {target}"),
-    )
+        &format!(
+            "{} method '{name}' called for {}",
+            vis.word(),
+            receiver_phrase(recv)
+        ),
+    ))
 }
 
 /// Range/Set/Enumerator delegate unknown methods to `Array` (a synthesized

@@ -10,7 +10,7 @@
 //! cleanly instead of loading stale bytecode.
 
 use crate::compiler::Program;
-use crate::host::{BeginDef, ClassDef, MethodDef, ProcDef, RescueDef};
+use crate::host::{BeginDef, ClassDef, MethodDef, ProcDef, RescueDef, Visibility};
 use fusevm::Chunk;
 use rkyv::{Archive, Deserialize as RkyvDe, Serialize as RkyvSer};
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 /// Bump on any incompatible change to `CProg` / the lowering.
-const SCHEMA: u64 = 7;
+const SCHEMA: u64 = 8;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
@@ -51,8 +51,10 @@ type CMethod = (
     u16,
 );
 /// (name, superclass, methods, includes, prepends, extends, class methods,
-/// is_module). `is_module` records `module M` vs `class M`, which nothing else
-/// in the tuple implies.
+/// is_module, non-public method visibilities). `is_module` records `module M`
+/// vs `class M`, which nothing else in the tuple implies; the visibility list
+/// holds only the private/protected entries (`Visibility::as_u8`), public being
+/// the unrecorded default.
 type CClass = (
     String,
     Option<String>,
@@ -62,6 +64,7 @@ type CClass = (
     Vec<String>,
     Vec<CMethod>,
     bool,
+    Vec<(String, u8)>,
 );
 /// (rescue classes, splat proc id, binding, body proc id) — a serde-flat rescue
 /// clause. `splat` is the proc for a `rescue *expr` dynamic class list.
@@ -273,6 +276,10 @@ fn to_cprog(prog: &Program) -> CProg {
                     c.extends.clone(),
                     class_methods,
                     c.is_module,
+                    c.visibility
+                        .iter()
+                        .map(|(n, v)| (n.clone(), v.as_u8()))
+                        .collect(),
                 )
             })
             .collect(),
@@ -325,9 +332,14 @@ fn from_cprog(cp: CProg) -> Program {
                     extends,
                     class_methods,
                     is_module,
+                    visibility,
                 )| {
                     let methods = methods.into_iter().map(m_from).collect();
                     let class_methods = class_methods.into_iter().map(m_from).collect();
+                    let visibility = visibility
+                        .into_iter()
+                        .map(|(name, v)| (name, Visibility::from_u8(v)))
+                        .collect();
                     (
                         n,
                         ClassDef {
@@ -337,6 +349,7 @@ fn from_cprog(cp: CProg) -> Program {
                             prepends,
                             extends,
                             class_methods,
+                            visibility,
                             is_module,
                         },
                     )

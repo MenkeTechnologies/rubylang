@@ -11,7 +11,7 @@
 //! and `""` are true) differs from fusevm's default numeric truthiness.
 
 use crate::ast::*;
-use crate::host::{ops, BeginDef, ClassDef, MethodDef, ProcDef, RescueDef};
+use crate::host::{ops, BeginDef, ClassDef, MethodDef, ProcDef, RescueDef, Visibility};
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::sync::Arc;
 
@@ -2558,6 +2558,18 @@ impl Compiler {
         // following `def` becomes both an instance method and a module (class)
         // method — as `Rack::Utils` exposes its helpers.
         let mut module_function_mode = false;
+        // A bare `private` / `protected` / `public` in the body switches the
+        // visibility every following `def` is registered with, until the next
+        // bare modifier. Only the non-default values are recorded.
+        let mut vis_mode = Visibility::Public;
+        let mut visibility: indexmap::IndexMap<String, Visibility> = indexmap::IndexMap::new();
+        let record_vis = |name: &str, vis: Visibility, map: &mut indexmap::IndexMap<_, _>| {
+            if vis == Visibility::Public {
+                map.shift_remove(name);
+            } else {
+                map.insert(name.to_string(), vis);
+            }
+        };
         for stmt in body {
             match &stmt.expr {
                 // `def Klass.m` / `def obj.m` inside a class body carries an
@@ -2580,6 +2592,7 @@ impl Compiler {
                         if module_function_mode {
                             class_methods.insert(name.clone(), def.clone());
                         }
+                        record_vis(name, vis_mode, &mut visibility);
                         methods.insert(name.clone(), def);
                     }
                 }
@@ -2591,9 +2604,8 @@ impl Compiler {
                 // body, where the `def` registers in the TOP-LEVEL method table —
                 // making `private def helper` callable as a bare `helper` from
                 // anywhere, and visible to `SomeOtherClass.new.method(:helper)`.
-                // rubylang does not model visibility, so the modifier is inert
-                // apart from `module_function`, which also promotes to a class
-                // method.
+                // The modifier also sets the new method's visibility (and
+                // `module_function` additionally promotes it to a class method).
                 Expr::Call {
                     recv: None,
                     name: m,
@@ -2628,7 +2640,54 @@ impl Compiler {
                         if module_function_mode || m == "module_function" {
                             class_methods.insert(name.clone(), def.clone());
                         }
+                        // `module_function def m` makes the *instance* copy
+                        // private, exactly as the bare directive does.
+                        record_vis(
+                            name,
+                            match m.as_str() {
+                                "private" | "module_function" => Visibility::Private,
+                                "protected" => Visibility::Protected,
+                                _ => Visibility::Public,
+                            },
+                            &mut visibility,
+                        );
                         methods.insert(name.clone(), def);
+                    }
+                }
+                // A bare `private` / `protected` / `public` (parses as a local
+                // read) switches the mode for every following `def` in the body.
+                Expr::Var(VarKind::Local, v)
+                    if matches!(v.as_str(), "private" | "protected" | "public") =>
+                {
+                    vis_mode = match v.as_str() {
+                        "private" => Visibility::Private,
+                        "protected" => Visibility::Protected,
+                        _ => Visibility::Public,
+                    };
+                }
+                // `private :a, :b` / `public :a` — set the visibility of methods
+                // already defined in this body. A name defined later in the same
+                // body still resolves, since the map is applied to the whole
+                // ClassDef, not to a definition that must already exist.
+                Expr::Call {
+                    recv: None,
+                    name: m,
+                    args,
+                    ..
+                } if matches!(m.as_str(), "private" | "protected" | "public")
+                    && !args.is_empty()
+                    && args.iter().all(|a| matches!(a, Expr::Symbol(_))) =>
+                {
+                    let vis = match m.as_str() {
+                        "private" => Visibility::Private,
+                        "protected" => Visibility::Protected,
+                        _ => Visibility::Public,
+                    };
+                    for a in args {
+                        let Expr::Symbol(s) = a else {
+                            unreachable!("guarded by the match arm above")
+                        };
+                        record_vis(s, vis, &mut visibility);
                     }
                 }
                 // Bare `module_function` (parses as a local read) turns on the mode.
@@ -2656,6 +2715,9 @@ impl Compiler {
                                 if let Some(def) = methods.get(&field) {
                                     class_methods.insert(field.clone(), def.clone());
                                 }
+                                // The module method is public; the instance copy
+                                // the name still refers to becomes private.
+                                record_vis(&field, Visibility::Private, &mut visibility);
                             }
                         }
                     }
@@ -2670,12 +2732,30 @@ impl Compiler {
                         if let Some(field) = sym_name(a) {
                             if m != "attr_writer" {
                                 methods.insert(field.clone(), self.build_getter(&field));
+                                record_vis(&field, vis_mode, &mut visibility);
                             }
                             if m != "attr_reader" {
-                                methods.insert(format!("{field}="), self.build_setter(&field));
+                                let setter = format!("{field}=");
+                                methods.insert(setter.clone(), self.build_setter(&field));
+                                record_vis(&setter, vis_mode, &mut visibility);
                             }
                         }
                     }
+                }
+                // `define_method(:m) { … }` registers at runtime, but its
+                // visibility is a compile-time property of where it sits in the
+                // body — the ClassDef map is keyed by name, so recording it here
+                // and letting the runtime install the body works out.
+                Expr::Call {
+                    recv: None,
+                    name: m,
+                    args,
+                    ..
+                } if m == "define_method" && vis_mode != Visibility::Public => {
+                    if let Some(field) = args.first().and_then(sym_name) {
+                        record_vis(&field, vis_mode, &mut visibility);
+                    }
+                    init_body.push(stmt.clone());
                 }
                 // `include ModuleName` / `include A::B` — record the mixin,
                 // resolved to the module's qualified registration name.
@@ -2840,6 +2920,7 @@ impl Compiler {
                 prepends,
                 extends,
                 class_methods,
+                visibility,
                 is_module,
             },
         ));
