@@ -45,6 +45,44 @@ in terms of `hash`/`eql?` rather than `==` — `uniq`, `|`, `&`, `-`,
 `intersect?` and every `Set` predicate — agreeing with it, so `[1, 1.0].uniq`
 keeps both.
 
+- **`Set#<=>` is the subset relation, not an ordering.** `0` for equal sets,
+  `-1`/`1` for a proper subset/superset, and `nil` when neither set contains the
+  other. Unlike the algebra methods it does NOT accept an Array operand:
+  anything that is not a Set answers nil. Both halves used to be wrong in
+  opposite directions — a Set operand fell through to `Array#<=>`, whose own
+  guard rejects a Set, so every pair including equal ones answered nil, while an
+  Array operand passed that guard and got an ordered element-wise answer. The
+  subset PREDICATES (`subset?`/`<=`/`superset?`/`>=`/`proper_*`) were correct
+  throughout, which is how it went unnoticed: they can all agree with MRI while
+  `<=>` disagrees. Still absent from Set and reached through the Array delegate,
+  which builds a COPY, so the in-place mutators silently mutate the temporary
+  and leave the Set unchanged: `map!`, `collect!`, `select!`/`filter!`,
+  `reject!`, `delete_if`, `keep_if`, `flatten!`, plus `classify`, `divide`,
+  `subtract`, `replace`, `reset` and `compare_by_identity`.
+- **Ordering operators derive from `<=>`, so an unrankable pair raises.** Ruby
+  gets `< <= > >=` from `Comparable`: when `<=>` answers nil the operator raises
+  `ArgumentError`, it does not answer false. This is ASYMMETRIC and the asymmetry
+  is load-bearing — `Rational(1, 2) < Float::NAN` raises, while
+  `Float::NAN < Rational(1, 2)` is `Float#<`, plain IEEE, and answers false. So
+  the rule is about the RECEIVER, never about "an operand is NaN". The message
+  is MRI's `rb_cmperr`, which names the operand by `inspect` when it is a Float
+  or a special constant (`NaN`, `nil`, `:sym`, a small Integer) and by its CLASS
+  otherwise (`String`, `Array`, `Object`) — so a NaN reads `NaN`, not `Float`.
+  The same rule reaches a user `Comparable` class through the native operator
+  path, where reading a nil `<=>` as 0 previously made `<` answer false and, more
+  dangerously, made `==` answer TRUE for two values that cannot be compared.
+  `==`/`!=` are the exception that does not raise: an unrankable pair is simply
+  not equal.
+- **Divergence — some `NoMethodError` messages name the receiver by class where
+  MRI names an instance.** MRI says `undefined method '<' for an instance of
+  Complex`; the numeric hook's fallthrough says `undefined method '<' for
+  Complex`. `no_method_error`/`receiver_phrase` already produce MRI's wording,
+  so this is confined to the sites that build the sentence by hand instead of
+  calling it: `host.rs` `num_op`'s fallthrough and its `-@` arm, plus the
+  method-lookup and `define_method`-target messages. They should all route
+  through `receiver_phrase`; fixing one of four would only make the wording
+  inconsistent, so they need doing together.
+
 ## Language
 
 - **`extend` / `prepend` / `class << self`.** `extend M` in a class/module body
@@ -465,9 +503,18 @@ Honest limitations of this surface:
   and inside a `sub`/`gsub` block. (The punctuation globals `` $` `` and `$'`
   can't yet appear inside a *brace* `#{...}` interpolation — the interp scanner
   reads the quote as a string delimiter. The sigil shorthand does work:
-  `` "pre=#$` post=#$'" ``.) Backed by
-  the Rust `regex` crate, so Ruby's Onigmo-only constructs (backreferences within
-  the pattern, lookaround) are unavailable.
+  `` "pre=#$` post=#$'" ``.) Backed by `fancy-regex`, a backtracking engine, so
+  the Onigmo constructs the `regex` crate rejects DO work: backreferences within
+  the pattern (`/(ab)\1/`) and lookaround (`/foo(?=bar)/`, `/(?<=foo)bar/`).
+  A Regexp is also a VALUE, not just a matcher: `==`/`eql?`/`hash` compare its
+  source and its normalized option bitmask, so `/a/ == /a/` and
+  `/a/im == /a/mi` are true while `/a/ == /a/i` is false, and a Regexp works as
+  a Hash key and collapses under `uniq`/`-`/`include?`/`Set`. (MRI also compares
+  the encoding; there is no per-Regexp encoding modelled here.) Still missing on
+  Regexp, though the arity table declares them: `encoding`, `fixed_encoding?`,
+  `initialize_copy` and `~`. `Regexp.new(/a/i)` also drops the source regexp's
+  flags, and its integer-options argument only decodes IGNORECASE, never
+  EXTENDED or MULTILINE.
 - **`Object#class` returns a Class object** (a class reference): `p obj.class`
   prints the bare name, `obj.class == SomeClass` and `Integer == Integer`
   compare by class identity, and `obj.class.name` / `.to_s` give the name.
@@ -546,7 +593,14 @@ Honest limitations of this surface:
   operands. It only shows above 2^53, where the `f64` cast starts rounding.
   `(3**34).send(:==, (3**34).to_f)` goes through dispatch and IS exact.
   Closing this needs a fusevm release that delegates a native Int/Float
-  comparison to the hook; fusevm is pinned at 0.17.0 here.
+  comparison to the hook. The upstream fix now EXISTS — `843e45484c` ("strict
+  numeric mode must not answer from a rounded f64") and `56842a3597` (the same
+  for the AOT tier) — but `git describe` puts them at `v0.17.0-14` and
+  `v0.17.0-16`, i.e. AFTER the tag, and rubylang consumes fusevm 0.17.0 from
+  crates.io. So the divergence is still live here and still measurable:
+  `3**34 == (3**34).to_f` answers true against MRI's false, and fuzz mode
+  `numwide` reports it. rubylang itself needs no change when the fix ships —
+  its hook already dispatches generically — only the pin.
 - **Composite Hash keys.** Arrays (`{[1, 2] => v}`, nested), Hashes
   (`{{a: 1} => v}`), Sets, Ranges (`{(1..3) => v}`, Integer/String/Float
   endpoints), `BigInt`/`Rational`/`Complex` numbers, and class objects work as
@@ -644,6 +698,37 @@ Honest limitations of this surface:
   none of them IS an array, and reading them as one answered an EMPTY pipeline
   (`{a: 1}.lazy.map { … }.to_a` was `[]`). A user `Enumerable` with an infinite
   `each` therefore hangs where MRI stays lazy.
+- **Lazy `uniq` is the one stateful stage.** Every other stage decides an
+  element on its own, so its state is a counter at most; `uniq` has to remember
+  the keys it has already emitted. That seen-set belongs to the PULL, not to the
+  stored op — the op is shared by every pull of the same pipeline, so
+  accumulating there makes the second `to_a` of one pipeline answer empty — and
+  it has to be reset again inside the generator re-drive loop, which replays the
+  source from the start in growing batches. Keys go through the same
+  `hash`/`eql?` key `Array#uniq` and Hash keys use, so `1` and `1.0` stay
+  distinct; a block supplies the key while the ORIGINAL element is what passes
+  through. Still missing on `Enumerator::Lazy`, though the arity table declares
+  them: `compact`, `grep`/`grep_v`, `with_index`, `eager`, `chunk`/`chunk_while`,
+  `slice_before`/`slice_after`/`slice_when`, block-less `each`, and `size` (MRI
+  answers nil for a lazy enumerator of unknown length).
+- **Divergence — `sort`/`min`/`max` never raise on an unrankable pair.** Ruby
+  raises `ArgumentError: comparison of X with Y failed` when a comparison inside
+  a sort has no answer; `[1, "a"].sort`, `[1, nil].sort`, `[1.0, Float::NAN].sort`
+  and `[Object.new, Object.new].sort` all answer an arbitrary order here instead.
+  The comparator (`cmp_values`) returns a bare `Ordering` with no error channel
+  and feeds `sort_by`, which cannot fail, so closing this means making the
+  comparator fallible across all twelve of its call sites (`sort`, `sort_by`,
+  `min`/`max`, `min_by`/`max_by`, `Array#<=>`). The ORDERING OPERATORS
+  themselves do raise correctly — this is only the sort/min/max path.
+- **`Comparable`'s derived helpers are not on Rational.** `Rational#between?`
+  and `Rational#clamp` raise `NoMethodError`; MRI derives both from `<=>` like
+  the operators. `clamp` additionally has a contract the shared implementation
+  does not yet keep: MRI ranks `min` against `max` BEFORE it looks at the
+  receiver, so an inverted range raises `ArgumentError: min argument must be
+  less than or equal to max argument` even when the receiver already sits inside
+  it (`5.clamp(3, 1)` answers 1 here), and an unrankable `min`/`max` pair reports
+  the failure against `min` rather than against the receiver. The single-argument
+  Range form (`x.clamp(1..5)`) is separate again.
 - **Block-based generators.** `Enumerator.new { |y| ... }` drives the block with
   a native `Enumerator::Yielder`; `y << v` and its alias `y.yield(v)` push
   yielded values. `to_a`/`first(n)`/`take(n)`/`each`/`lazy` re-run the block on
@@ -772,6 +857,24 @@ Honest limitations of this surface:
   `.utc`/`.getutc` are exact and `.localtime`/`Time.local` behave as UTC.
   Timezone-aware `strftime` is not modeled (`%Z` always prints `UTC`, `%z` always
   `+0000`).
+
+  **Divergence — `Time#to_s`/`#inspect` print UTC where MRI prints local.** With
+  `TZ=America/New_York`, MRI renders `Time.at(0)` as
+  `1969-12-31 19:00:00 -0500` and answers `false` to `utc?`; here it is
+  `1970-01-01 00:00:00 UTC` and `true`. This is NOT an `inspect`-local fix, and
+  that is why it is still open: `RObj::Time` stores a bare `secs: f64` with no
+  offset field, and the whole surface decomposes it through one UTC
+  `time_fields` — the field readers, `strftime`, `<=>`, `+`/`-`, and the
+  `Time.local`/`Time.mktime` constructors (which currently share the `Time.utc`
+  arm and so silently shift the instant by the local offset). Rendering local in
+  `inspect` alone would leave `t.hour` disagreeing with `t.inspect`, which is
+  worse than being consistently UTC. Closing it properly means giving
+  `RObj::Time` an offset, filling it from `localtime_r` (libc is already a
+  dependency, so no tz crate is needed), and threading it through every one of
+  those sites — plus pinning `TZ` in the fuzzer, since otherwise the mode's
+  output depends on the machine's zone. `Time#inspect` is also implemented
+  twice, in `dispatch_time` and in `Host::inspect`, and only the latter fires
+  (the universal `inspect` arm wins first), so both would have to move together.
 - **`Date`** (available without `require "date"`, which is accepted as a no-op).
   `Date.new`/`civil`, `Date.today`, `Date.jd`, and `Date.parse` (ISO
   `YYYY-MM-DD` / `YYYY/MM/DD` only — MRI's lenient free-form parsing is not

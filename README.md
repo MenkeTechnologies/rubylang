@@ -351,7 +351,12 @@ native today.
 The DAP debugger (`ruby --dap`) sets source-line and function breakpoints (break on method entry), steps (next/stepIn/stepOut), evaluates expressions against the paused frame, and inspects the call stack and locals; markers are emitted only in --dap mode, so normal runs are unaffected.
 Regex literals (`/pat/flags`), `=~`/`!~`, `String#{match,scan,match?,sub,gsub}`
 with `Regexp`, `MatchData`, and arbitrary-precision `Integer` (auto-promotion on
-overflow) are supported. `extend` / `prepend` / `class << self`, the full
+overflow) are supported. A `Regexp` is a value as well as a matcher: `==`,
+`eql?` and `hash` compare its source and option bitmask, so `/a/ == /a/` and it
+works as a Hash key. `Set#<=>` answers the subset relation (`nil` when neither
+set contains the other), `Enumerator::Lazy#uniq` streams over an infinite
+source, and the `Comparable` operators raise `ArgumentError` on an unrankable
+pair (`Rational(1, 2) < Float::NAN`) instead of answering false. `extend` / `prepend` / `class << self`, the full
 `case/in` pattern surface (two-sided find patterns, `**nil` exact-key matching,
 alternation binding, the `deconstruct`/`deconstruct_keys` protocol on user
 objects) plus the one-line forms (`expr => pattern` rightward assignment and
