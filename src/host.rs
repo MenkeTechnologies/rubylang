@@ -6973,6 +6973,23 @@ impl RubyHost {
                 ));
             }
         }
+        // An ORDERING operator on a Comparable receiver is not a missing method:
+        // `<` is defined, it asked `<=>`, and `<=>` answered nil. MRI reports
+        // that as `comparison of Integer with String failed`. Only the
+        // arithmetic half of this fallthrough had its own diagnostic, so `1 + "a"`
+        // named both sides while `1 < "a"` claimed Integer has no `<`.
+        if matches!(op, Lt | Gt | Le | Ge) {
+            let cls = self.class_of(a);
+            let comparable = crate::arity_table::ancestry(&cls)
+                .is_some_and(|anc| anc.contains(&"Comparable"))
+                || self
+                    .expanded_ancestry(&cls)
+                    .iter()
+                    .any(|c| c == "Comparable");
+            if comparable {
+                return Err(self.cmp_failed(a, b));
+            }
+        }
         // Same phrasing as method dispatch: an arithmetic operator that the
         // receiver does not have is an ordinary NoMethodError.
         Err(format!(
@@ -7103,6 +7120,28 @@ impl RubyHost {
         Some(exact(a)?.cmp(&exact(b)?))
     }
 
+    /// MRI's `rb_equal`, which is what every collection SEARCH uses — not `==`.
+    ///
+    /// `rb_equal` answers true immediately when the two operands are the same
+    /// VALUE, and only then asks `==`. The two differ on exactly one value: a
+    /// NaN is not `==` itself, but it IS itself, so MRI answers
+    ///
+    ///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [Float::NAN].include?(Float::NAN)'
+    ///   true
+    ///
+    /// while `Float::NAN == Float::NAN` stays false. Identity here is bit
+    /// equality on the `Value`, which is what MRI's flonum comparison amounts to;
+    /// it can only ever turn a false into a true, since anything `==` already
+    /// accepts is unaffected.
+    pub fn rb_equal(&self, a: &Value, b: &Value) -> bool {
+        if let (Value::Float(x), Value::Float(y)) = (a, b) {
+            if x.to_bits() == y.to_bits() {
+                return true;
+            }
+        }
+        self.eq_values(a, b)
+    }
+
     pub fn eq_values(&self, a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => x == y,
@@ -7177,7 +7216,10 @@ impl RubyHost {
                     (Some(RObj::Str(x)), Some(RObj::Str(y))) => x == y,
                     (Some(RObj::Symbol(x)), Some(RObj::Symbol(y))) => x == y,
                     (Some(RObj::Array(x)), Some(RObj::Array(y))) => {
-                        x.len() == y.len() && x.iter().zip(y).all(|(p, q)| self.eq_values(p, q))
+                        // Element-wise through `rb_equal`, not `==`: MRI compares
+                        // array elements with `rb_equal`, so `[NaN] == [NaN]` is
+                        // true even though `NaN == NaN` is false.
+                        x.len() == y.len() && x.iter().zip(y).all(|(p, q)| self.rb_equal(p, q))
                     }
                     // Hash equality is order-independent: same size and every key
                     // in `x` maps to an equal value in `y`.

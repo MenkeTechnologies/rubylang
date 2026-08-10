@@ -5384,8 +5384,11 @@ fn dispatch_bigint(
                 "round" => RoundKind::Round,
                 _ => RoundKind::Truncate,
             };
-            match args.first().and_then(int_arg) {
-                Some(d) if d < 0 => bigint_to_value(int_round_negative(b, clamp_ndigits(d), kind)),
+            let (nd, half) = round_args(args)?;
+            match nd.filter(|_| args.first().and_then(int_arg).is_some()) {
+                Some(d) if d < 0 => {
+                    bigint_to_value(int_round_negative(b, clamp_ndigits(d), kind, half))
+                }
                 _ => big(b.clone()),
             }
         }
@@ -5613,7 +5616,7 @@ fn dispatch_number(
         }
         "/" => match (recv, &args[0]) {
             (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
-            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(floor_div(*a, *b))),
+            (Value::Int(a), Value::Int(b)) => Ok(int_wide(floor_div(*a as i128, *b as i128))),
             // A numeric heap operand: `Integer / Rational` stays exact
             // (`3 / 4r == (3/4)`); `Integer / BigInt` is Integer floor division
             // (`7 / (42**42) == 0`). num_op picks the right one by operand type.
@@ -5624,9 +5627,34 @@ fn dispatch_number(
             }
             _ => Ok(Value::Float(as_f(recv) / coerce_num(recv, &args[0])?)),
         },
+        // `div` is `/` floored to an INTEGER whatever the operand types, so
+        // `7.0.div(2)` is 3 and not 3.5. `remainder` is the OTHER modulo: it
+        // takes the sign of the dividend, which is Rust's `%` and not Ruby's.
+        "div" => match (recv, &args[0]) {
+            (_, Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
+            (Value::Int(a), Value::Int(b)) => Ok(int_wide(floor_div(*a as i128, *b as i128))),
+            _ => {
+                let d = coerce_num(recv, &args[0])?;
+                if d == 0.0 {
+                    return Err(raise_exc("ZeroDivisionError", "divided by 0"));
+                }
+                Ok(float_to_int_value((as_f(recv) / d).floor()))
+            }
+        },
+        "remainder" => match (recv, &args[0]) {
+            (_, Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
+            (Value::Int(a), Value::Int(b)) => Ok(int_wide(*a as i128 % *b as i128)),
+            _ => {
+                let d = coerce_num(recv, &args[0])?;
+                if d == 0.0 {
+                    return Err(raise_exc("ZeroDivisionError", "divided by 0"));
+                }
+                Ok(Value::Float(as_f(recv) % d))
+            }
+        },
         "%" | "modulo" => match (recv, &args[0]) {
             (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
-            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(floor_mod(*a, *b))),
+            (Value::Int(a), Value::Int(b)) => Ok(int_wide(floor_mod(*a as i128, *b as i128))),
             // `Integer % Rational` stays exact (`10 % (1/729r) == (0/1)`), like `/`.
             _ if with_host(|h| h.as_rational(&args[0])).is_some()
                 && matches!(recv, Value::Int(_)) =>
@@ -5635,6 +5663,12 @@ fn dispatch_number(
             }
             _ => {
                 let (x, y) = (as_f(recv), coerce_num(recv, &args[0])?);
+                // `Float#%` by zero RAISES; only `/` and `fdiv` answer Infinity.
+                // Computing it as `x - (x/y).floor()*y` had produced NaN, which
+                // is what IEEE gives and not what Ruby does.
+                if y == 0.0 {
+                    return Err(raise_exc("ZeroDivisionError", "divided by 0"));
+                }
                 Ok(Value::Float(x - (x / y).floor() * y))
             }
         },
@@ -5800,14 +5834,14 @@ fn dispatch_number(
             ])),
         },
         "abs" | "magnitude" => Ok(match recv {
-            Value::Int(n) => Value::Int(n.abs()),
+            Value::Int(n) => int_wide((*n as i128).abs()),
             Value::Float(f) => Value::Float(f.abs()),
             _ => recv.clone(),
         }),
         // `abs2` is the square of the magnitude (self * self), preserving the
         // Integer/Float distinction like Ruby's `Numeric#abs2`.
         "abs2" => Ok(match recv {
-            Value::Int(n) => Value::Int(n * n),
+            Value::Int(n) => int_wide(*n as i128 * *n as i128),
             Value::Float(f) => Value::Float(f * f),
             _ => recv.clone(),
         }),
@@ -5824,12 +5858,24 @@ fn dispatch_number(
         "negative?" => Ok(Value::Bool(as_f(recv) < 0.0)),
         // `Integer#integer?` is true; `Float#integer?` is false.
         "integer?" => Ok(Value::Bool(matches!(recv, Value::Int(_)))),
-        "succ" | "next" => Ok(Value::Int(as_i(recv) + 1)),
-        "pred" => Ok(Value::Int(as_i(recv) - 1)),
-        "floor" => round_like(recv, args.first().map(as_i), RoundKind::Floor),
-        "ceil" => round_like(recv, args.first().map(as_i), RoundKind::Ceil),
-        "round" => round_like(recv, args.first().map(as_i), RoundKind::Round),
-        "truncate" => round_like(recv, args.first().map(as_i), RoundKind::Truncate),
+        "succ" | "next" => Ok(int_wide(as_i(recv) as i128 + 1)),
+        "pred" => Ok(int_wide(as_i(recv) as i128 - 1)),
+        // `half:` is accepted by `round` alone. The other three convert their one
+        // argument, so a keyword Hash reaches them as the `ndigits` POSITIONAL
+        // and fails that conversion — which is what MRI does with it.
+        "floor" | "ceil" | "truncate" => {
+            let nd = args.first().map(to_int).transpose()?;
+            let kind = match name {
+                "floor" => RoundKind::Floor,
+                "ceil" => RoundKind::Ceil,
+                _ => RoundKind::Truncate,
+            };
+            round_like(recv, nd, kind, RoundHalf::Up)
+        }
+        "round" => {
+            let (nd, half) = round_args(args)?;
+            round_like(recv, nd, RoundKind::Round, half)
+        }
         "nan?" if matches!(recv, Value::Float(_)) => {
             Ok(Value::Bool(matches!(recv, Value::Float(f) if f.is_nan())))
         }
@@ -5844,11 +5890,16 @@ fn dispatch_number(
         "divmod" => match (recv, &args[0]) {
             (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
             (Value::Int(a), Value::Int(b)) => Ok(new_arr(vec![
-                Value::Int(floor_div(*a, *b)),
-                Value::Int(floor_mod(*a, *b)),
+                int_wide(floor_div(*a as i128, *b as i128)),
+                int_wide(floor_mod(*a as i128, *b as i128)),
             ])),
             _ => {
                 let (x, y) = (as_f(recv), as_f(&args[0]));
+                // Same as `%`: a zero divisor raises rather than answering the
+                // IEEE `[i64::MAX, NaN]` pair that flooring Infinity produces.
+                if y == 0.0 {
+                    return Err(raise_exc("ZeroDivisionError", "divided by 0"));
+                }
                 let q = (x / y).floor();
                 Ok(new_arr(vec![Value::Int(q as i64), Value::Float(x - q * y)]))
             }
@@ -5875,7 +5926,7 @@ fn dispatch_number(
         "ceildiv" => match (recv, &args[0]) {
             (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
             // Ruby: `n.ceildiv(d)` == `-(-n / d)` using floor division.
-            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(-floor_div(-*a, *b))),
+            (Value::Int(a), Value::Int(b)) => Ok(int_wide(-floor_div(-(*a as i128), *b as i128))),
             _ => Ok(Value::Int(
                 as_f(recv).div_euclid(as_f(&args[0])).ceil() as i64
             )),
@@ -6106,19 +6157,129 @@ fn round_half_up(x: f64, s: f64) -> f64 {
     f
 }
 
+/// Which way an EXACT tie goes. Ruby's default is `:up` — away from zero — and
+/// it is not Rust's `f64::round`, which is also away from zero but has no other
+/// modes, nor IEEE's default, which is `:even`. The mode only ever decides a
+/// value sitting exactly on the halfway point.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoundHalf {
+    Up,
+    Even,
+    Down,
+}
+
+impl RoundHalf {
+    /// `half: :up | :even | :down`, defaulting to `:up` for an absent or nil
+    /// value. Any other symbol is refused the way MRI refuses it.
+    fn from_arg(v: Option<&Value>) -> Result<Self, String> {
+        let Some(v) = v else { return Ok(Self::Up) };
+        if matches!(v, Value::Undef) {
+            return Ok(Self::Up);
+        }
+        let name = with_host(|h| h.as_symbol(v))
+            .or_else(|| with_host(|h| h.as_str(v)))
+            .unwrap_or_default();
+        match name.as_str() {
+            "up" => Ok(Self::Up),
+            "even" => Ok(Self::Even),
+            "down" => Ok(Self::Down),
+            other => Err(raise_exc(
+                "ArgumentError",
+                &format!("invalid rounding mode: {other}"),
+            )),
+        }
+    }
+}
+
+/// `round`'s arguments: an optional `ndigits` positional and an optional `half:`
+/// keyword, which the parser delivers as a trailing Hash.
+fn round_args(args: &[Value]) -> Result<(Option<i64>, RoundHalf), String> {
+    let kw = args
+        .last()
+        .and_then(|a| with_host(|h| h.as_hash(a)).map(|m| (a.clone(), m)));
+    let half = match &kw {
+        Some((_, m)) => RoundHalf::from_arg(m.get(&crate::host::RKey::Sym("half".into())))?,
+        None => RoundHalf::Up,
+    };
+    let positional = match kw {
+        Some(_) => &args[..args.len() - 1],
+        None => args,
+    };
+    Ok((positional.first().map(as_i), half))
+}
+
+/// `BigRational::round` is half-away-from-zero; this is the same for the two
+/// other tie modes. Used only past `DBL_DIG` digits, where the f64 scale factor
+/// is itself inexact and MRI switches to exact arithmetic.
+fn rational_round_half(
+    x: &num_rational::BigRational,
+    half: RoundHalf,
+) -> num_rational::BigRational {
+    use num_integer::Integer as _;
+    use num_traits::Zero as _;
+    if half == RoundHalf::Up {
+        return x.round();
+    }
+    let two = num_rational::BigRational::from(num_bigint::BigInt::from(2));
+    let floor = x.floor();
+    let frac = x - &floor;
+    if frac * &two != num_rational::BigRational::from(num_bigint::BigInt::from(1)) {
+        return x.round();
+    }
+    // Exactly halfway between `floor` and `floor + 1`.
+    let one = num_rational::BigRational::from(num_bigint::BigInt::from(1));
+    match half {
+        RoundHalf::Even => {
+            if floor.to_integer().is_even() {
+                floor
+            } else {
+                floor + one
+            }
+        }
+        // Toward zero: the lower neighbour above zero, the upper one below it.
+        _ if *x > num_rational::BigRational::zero() => floor,
+        _ => floor + one,
+    }
+}
+
+/// `round_half_up` for the two non-default tie modes. `s` scales the value so
+/// the tie lands on `.5`, exactly as MRI's `flo_round` does.
+fn round_half_mode(x: f64, s: f64, half: RoundHalf) -> f64 {
+    match half {
+        RoundHalf::Up => round_half_up(x, s),
+        RoundHalf::Even => {
+            let scaled = x * s;
+            // `.round_ties_even` is stable Rust's banker's rounding; away from a
+            // tie it agrees with `.round()`.
+            scaled.round_ties_even()
+        }
+        RoundHalf::Down => {
+            let scaled = x * s;
+            let f = scaled.round();
+            // `.round()` already went away from zero, so a value exactly on the
+            // halfway point is the only one to pull back.
+            if (f - scaled).abs() == 0.5 {
+                f - f.signum()
+            } else {
+                f
+            }
+        }
+    }
+}
+
 /// MRI `rb_flo_{round,ceil,floor}_by_rational` (rational.c): for `ndigits`
 /// beyond `DBL_DIG` the `pow(10, ndigits)` scale factor is itself inexact, so
 /// MRI redoes the whole operation in exact rational arithmetic — the f64 is
 /// converted to the exact rational it denotes, scaled by `10**ndigits`, rounded,
 /// unscaled, and converted back.
-fn flo_round_by_rational(number: f64, ndigits: i32, kind: RoundKind) -> f64 {
+fn flo_round_by_rational(number: f64, ndigits: i32, kind: RoundKind, half: RoundHalf) -> f64 {
     let scale = num_rational::BigRational::from(num_bigint::BigInt::from(10).pow(ndigits as u32));
     let Some(exact) = num_rational::BigRational::from_float(number) else {
         return number;
     };
     let scaled = exact * &scale;
     let rounded = match kind {
-        RoundKind::Round => scaled.round(),
+        RoundKind::Round => rational_round_half(&scaled, half),
         RoundKind::Ceil => scaled.ceil(),
         RoundKind::Floor => scaled.floor(),
         RoundKind::Truncate => scaled.trunc(),
@@ -6149,7 +6310,12 @@ fn int_round_bytes(n: &num_bigint::BigInt) -> i64 {
 /// MRI `rb_int_round` / `rb_int_floor` / `rb_int_ceil` / `rb_int_truncate`
 /// (numeric.c) for `ndigits < 0`, done in exact integer arithmetic so that
 /// `123456789012345678.floor(-3)` keeps every digit an f64 scale factor loses.
-fn int_round_negative(n: &num_bigint::BigInt, ndigits: i32, kind: RoundKind) -> num_bigint::BigInt {
+fn int_round_negative(
+    n: &num_bigint::BigInt,
+    ndigits: i32,
+    kind: RoundKind,
+    half: RoundHalf,
+) -> num_bigint::BigInt {
     use num_integer::Integer as _;
     let zero = num_bigint::BigInt::from(0);
     // `floor`/`ceil` skip the shortcut in MRI; only `round`/`truncate` take it.
@@ -6172,10 +6338,26 @@ fn int_round_negative(n: &num_bigint::BigInt, ndigits: i32, kind: RoundKind) -> 
             let h = &f / 2;
             let r = n.mod_floor(&f);
             let base = n - &r;
-            if r > h || (r == h && n > &zero) {
-                base + f
-            } else {
-                base
+            if r > h {
+                return base + f;
+            }
+            if r < h {
+                return base;
+            }
+            // Exactly on the halfway point — the only place `half:` is consulted.
+            match half {
+                RoundHalf::Up if n > &zero => base + f,
+                RoundHalf::Up => base,
+                RoundHalf::Down if n > &zero => base,
+                RoundHalf::Down => base + f,
+                // To the even multiple: `base / f` is the lower quotient.
+                RoundHalf::Even => {
+                    if (&base / &f).is_even() {
+                        base
+                    } else {
+                        base + f
+                    }
+                }
             }
         }
         RoundKind::Floor => n - n.mod_floor(&f),
@@ -6318,9 +6500,14 @@ fn bigint_to_value(b: num_bigint::BigInt) -> Value {
     }
 }
 
-fn round_like(recv: &Value, ndigits: Option<i64>, kind: RoundKind) -> Result<Value, String> {
+fn round_like(
+    recv: &Value,
+    ndigits: Option<i64>,
+    kind: RoundKind,
+    half: RoundHalf,
+) -> Result<Value, String> {
     match recv {
-        Value::Float(f) => float_round_like(*f, ndigits, kind),
+        Value::Float(f) => float_round_like(*f, ndigits, kind, half),
         // `Integer#round/floor/ceil/truncate` return the receiver unchanged for
         // a non-negative `ndigits`; only a negative count rounds to a power of
         // ten, and MRI does that in exact integer arithmetic.
@@ -6329,6 +6516,7 @@ fn round_like(recv: &Value, ndigits: Option<i64>, kind: RoundKind) -> Result<Val
                 &num_bigint::BigInt::from(*n),
                 clamp_ndigits(d),
                 kind,
+                half,
             )),
             _ => Value::Int(*n),
         }),
@@ -6345,7 +6533,12 @@ fn clamp_ndigits(d: i64) -> i32 {
 
 /// `Float#round/floor/ceil/truncate`, ported from MRI's `flo_round`,
 /// `rb_float_floor`, `rb_float_ceil` and `flo_truncate` (numeric.c).
-fn float_round_like(number: f64, ndigits: Option<i64>, kind: RoundKind) -> Result<Value, String> {
+fn float_round_like(
+    number: f64,
+    ndigits: Option<i64>,
+    kind: RoundKind,
+    half: RoundHalf,
+) -> Result<Value, String> {
     // MRI `flo_truncate` is literally `signbit(x) ? ceil : floor`, so the rest
     // of the function only ever sees the three real directions.
     let kind = match kind {
@@ -6403,11 +6596,11 @@ fn float_round_like(number: f64, ndigits: Option<i64>, kind: RoundKind) -> Resul
         // MRI `ACCURATE_POW10(ndigits)` is `ndigits < DBL_DIG`; past that the
         // scale factor itself is inexact and MRI switches to rationals.
         if nd >= 15 {
-            return Ok(Value::Float(flo_round_by_rational(number, nd, kind)));
+            return Ok(Value::Float(flo_round_by_rational(number, nd, kind, half)));
         }
         let f = 10f64.powi(nd);
         return Ok(Value::Float(match kind {
-            RoundKind::Round => round_half_up(number, f) / f,
+            RoundKind::Round => round_half_mode(number, f, half) / f,
             RoundKind::Ceil => (number * f).ceil() / f,
             RoundKind::Floor => {
                 // MRI nudges up one unit and backs off only if that overshot,
@@ -6427,7 +6620,7 @@ fn float_round_like(number: f64, ndigits: Option<i64>, kind: RoundKind) -> Resul
     // exactly. `round` truncates toward zero on the way in (MRI `flo_to_i`),
     // `floor`/`ceil` take their own direction.
     let (whole, nd0_done) = match kind {
-        RoundKind::Round if nd == 0 => (round_half_up(number, 1.0), true),
+        RoundKind::Round if nd == 0 => (round_half_mode(number, 1.0, half), true),
         RoundKind::Round => (number.trunc(), false),
         RoundKind::Floor => (number.floor(), false),
         RoundKind::Ceil => (number.ceil(), false),
@@ -6439,7 +6632,7 @@ fn float_round_like(number: f64, ndigits: Option<i64>, kind: RoundKind) -> Resul
     let Some(exact) = f64_to_bigint(whole) else {
         return Ok(float_to_int_value(whole));
     };
-    Ok(bigint_to_value(int_round_negative(&exact, nd, kind)))
+    Ok(bigint_to_value(int_round_negative(&exact, nd, kind, half)))
 }
 
 /// The exact `BigInt` an integral f64 denotes, or `None` if it is not finite.
@@ -6477,8 +6670,25 @@ fn iter_int_range(
     Ok(with_host(|h| h.new_enumerator(vals, "each")))
 }
 
-/// Ruby integer division floors toward negative infinity (`-7 / 2 == -4`).
-fn floor_div(a: i64, b: i64) -> i64 {
+/// An integer result that may not fit in an `i64`.
+///
+/// Ruby has one Integer type and it is unbounded, so every arithmetic result is
+/// representable. Rust's `i64` is not: it PANICS on overflow rather than
+/// producing a wrong number, which turns `(-2**63).abs` — an ordinary
+/// expression MRI answers with 9223372036854775808 — into an uncatchable
+/// interpreter crash. Computing in `i128` and promoting here removes the whole
+/// class at the `i64` boundary.
+fn int_wide(n: i128) -> Value {
+    match i64::try_from(n) {
+        Ok(v) => Value::Int(v),
+        Err(_) => with_host(|h| h.new_bigint(num_bigint::BigInt::from(n))),
+    }
+}
+
+/// Ruby integer division floors toward negative infinity (`-7 / 2 == -4`), where
+/// Rust's `/` truncates toward zero. Taken in `i128` because the `i64` quotient
+/// is not always an `i64`: `i64::MIN / -1` is 2**63.
+fn floor_div(a: i128, b: i128) -> i128 {
     let q = a / b;
     let r = a % b;
     if r != 0 && ((r < 0) != (b < 0)) {
@@ -6488,8 +6698,9 @@ fn floor_div(a: i64, b: i64) -> i64 {
     }
 }
 
-/// Ruby integer modulo takes the sign of the divisor (`-7 % 3 == 2`).
-fn floor_mod(a: i64, b: i64) -> i64 {
+/// Ruby integer modulo takes the sign of the DIVISOR (`-7 % 3 == 2`), where
+/// Rust's `%` takes the sign of the dividend (`-7 % 3 == -1`).
+fn floor_mod(a: i128, b: i128) -> i128 {
     let r = a % b;
     if r != 0 && ((r < 0) != (b < 0)) {
         r + b
@@ -8267,7 +8478,7 @@ fn dispatch_array(
                 ));
             };
             Ok(Value::Bool(
-                arr.iter().any(|x| with_host(|h| h.eq_values(x, needle))),
+                arr.iter().any(|x| with_host(|h| h.rb_equal(x, needle))),
             ))
         }
         "index" | "find_index" => {
@@ -8291,7 +8502,7 @@ fn dispatch_array(
                     }));
                 };
                 arr.iter()
-                    .position(|x| with_host(|h| h.eq_values(x, needle)))
+                    .position(|x| with_host(|h| h.rb_equal(x, needle)))
             };
             Ok(pos.map(|p| Value::Int(p as i64)).unwrap_or(Value::Undef))
         }
@@ -8313,7 +8524,7 @@ fn dispatch_array(
                     }));
                 };
                 arr.iter()
-                    .rposition(|x| with_host(|h| h.eq_values(x, needle)))
+                    .rposition(|x| with_host(|h| h.rb_equal(x, needle)))
             };
             Ok(pos.map(|p| Value::Int(p as i64)).unwrap_or(Value::Undef))
         }
@@ -8936,7 +9147,7 @@ fn dispatch_array(
                 // `count(obj)` counts elements equal to `obj`.
                 let n = arr
                     .iter()
-                    .filter(|x| with_host(|h| h.eq_values(x, target)))
+                    .filter(|x| with_host(|h| h.rb_equal(x, target)))
                     .count();
                 Ok(Value::Int(n as i64))
             } else {
@@ -19477,8 +19688,8 @@ fn reduce_sym(acc: &Value, op: &str, x: &Value) -> Result<Value, String> {
     if let (Value::Int(a), Value::Int(b)) = (acc, x) {
         match op {
             "/" | "%" if *b == 0 => return Err(raise_exc("ZeroDivisionError", "divided by 0")),
-            "/" => return Ok(Value::Int(floor_div(*a, *b))),
-            "%" => return Ok(Value::Int(floor_mod(*a, *b))),
+            "/" => return Ok(int_wide(floor_div(*a as i128, *b as i128))),
+            "%" => return Ok(int_wide(floor_mod(*a as i128, *b as i128))),
             _ => {}
         }
     }

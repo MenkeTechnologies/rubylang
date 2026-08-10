@@ -7355,3 +7355,229 @@ fn inspect_escapes_the_unprintables_and_the_diagnostics_use_it() {
         r#""invalid value for Integer(): \"\\u008512\"""#,
     );
 }
+
+/// The `i64` boundary. Ruby's Integer is unbounded, so every one of these is an
+/// ordinary expression MRI answers with a bignum:
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p((-2**63).abs); p((-2**63) / -1)'
+///   9223372036854775808
+///   9223372036854775808
+/// In Rust each was `i64` arithmetic, which does not answer at all — it PANICS,
+/// killing the interpreter where MRI returns a number. Five distinct operations
+/// crashed on the same value.
+#[test]
+fn integer_arithmetic_promotes_at_the_i64_boundary_instead_of_panicking() {
+    eq("(-2**63).abs", "9223372036854775808");
+    eq("(-2**63).magnitude", "9223372036854775808");
+    eq("(-2**63).abs.class", "Integer");
+    eq("(-2**63) / -1", "9223372036854775808");
+    eq("(-2**63).divmod(-1)", "[9223372036854775808, 0]");
+    eq("(-2**63) % -1", "0");
+    eq("(-2**63).pred", "-9223372036854775809");
+    eq("(-2**63) * -1", "9223372036854775808");
+    eq("9223372036854775807.succ", "9223372036854775808");
+    // The ordinary cases keep their exact previous answers, including the two
+    // places Ruby and Rust disagree on sign: `/` floors and `%` takes the
+    // divisor's sign, where Rust truncates and takes the dividend's.
+    eq("-7 / 2", "-4");
+    eq("7 / -2", "-4");
+    eq("-7 % 3", "2");
+    eq("7 % -3", "-2");
+    eq("-7.divmod(2)", "[-4, 1]");
+    eq("0 / -3", "0");
+}
+
+/// `div` and `remainder` were missing outright, and `remainder` is the exact
+/// lookalike this sweep was looking for: it is the OTHER modulo, taking the sign
+/// of the dividend — which is Rust's `%` and not Ruby's.
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p(-7 % 3); p((-7).remainder(3))'
+///   2
+///   -1
+#[test]
+fn integer_div_and_remainder_are_the_two_different_modulos() {
+    eq("7.div(2)", "3");
+    eq("(-7).div(2)", "-4");
+    eq("7.div(-2)", "-4");
+    // `div` floors to an Integer whatever the operand types.
+    eq("7.0.div(2)", "3");
+    eq("7.div(2.0)", "3");
+    eq("(2**70).div(3)", "393530540239137101141");
+    eq("7.remainder(3)", "1");
+    eq("(-7).remainder(3)", "-1");
+    eq("7.remainder(-3)", "1");
+    eq("7.0.remainder(3)", "1.0");
+    eq("(-7.5).remainder(3)", "-1.5");
+    let caught = |src: &str| {
+        format!(
+            "begin; {src}; rescue Exception => e; [e.class.to_s, e.message]; else; :no_raise; end"
+        )
+    };
+    for src in [
+        "7.div(0)",
+        "7.0.div(0)",
+        "7.remainder(0)",
+        "7.0.remainder(0.0)",
+    ] {
+        eq(&caught(src), "[\"ZeroDivisionError\", \"divided by 0\"]");
+    }
+}
+
+/// `Float#%` and `Float#divmod` by zero RAISE in Ruby; only `/` and `fdiv`
+/// answer Infinity. Computing the modulo as `x - (x/y).floor()*y` gave IEEE's
+/// answer instead — NaN, on a zero exit:
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e '1.0 % 0'
+///   -e:1:in 'Float#%': divided by 0 (ZeroDivisionError)
+#[test]
+fn float_modulo_by_zero_raises_where_ieee_answers_nan() {
+    let caught = |src: &str| {
+        format!(
+            "begin; {src}; rescue Exception => e; [e.class.to_s, e.message]; else; :no_raise; end"
+        )
+    };
+    for src in [
+        "1.0 % 0",
+        "1.0 % 0.0",
+        "1 % 0.0",
+        "1.0.modulo(0)",
+        "1.0.divmod(0)",
+        "1.0.divmod(0.0)",
+        "1.divmod(0.0)",
+    ] {
+        eq(&caught(src), "[\"ZeroDivisionError\", \"divided by 0\"]");
+    }
+    // Division still answers Infinity rather than raising, which is the whole
+    // reason the modulo case was easy to miss.
+    eq("1.0 / 0", "Infinity");
+    eq("1.fdiv(0)", "Infinity");
+    eq("(0.0 / 0.0).nan?", "true");
+}
+
+/// `Float#round`'s tie mode. Ruby's default is half-UP (away from zero) and it
+/// also takes `half: :even` and `half: :down`, neither of which existed here —
+/// the keyword was accepted and ignored, so every tie went away from zero:
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p 2.5.round(half: :even); p 2.5.round(half: :down)'
+///   2
+///   2
+#[test]
+fn round_honours_the_half_keyword_on_exact_ties() {
+    // Default: away from zero.
+    eq("2.5.round", "3");
+    eq("(-2.5).round", "-3");
+    eq("2.5.round(half: :up)", "3");
+    // To even.
+    eq("0.5.round(half: :even)", "0");
+    eq("1.5.round(half: :even)", "2");
+    eq("2.5.round(half: :even)", "2");
+    eq("3.5.round(half: :even)", "4");
+    eq("(-2.5).round(half: :even)", "-2");
+    eq("(-3.5).round(half: :even)", "-4");
+    // Toward zero.
+    eq("2.5.round(half: :down)", "2");
+    eq("(-2.5).round(half: :down)", "-2");
+    eq("3.5.round(half: :down)", "3");
+    // A value that is NOT an exact tie ignores the mode entirely — a test using
+    // only ties would pass on an implementation that always rounded to even.
+    eq("2.675.round(half: :even)", "3");
+    eq("2.675.round(half: :down)", "3");
+    eq("0.15.round(half: :up)", "0");
+    // Integer#round(-n, half:) goes through the exact-integer path.
+    eq("1250.round(-2, half: :even)", "1200");
+    eq("1350.round(-2, half: :even)", "1400");
+    eq("(-1250).round(-2, half: :even)", "-1200");
+    eq("250.round(-2, half: :even)", "200");
+    eq("150.round(-2, half: :even)", "200");
+    eq("1250.round(-2, half: :down)", "1200");
+    eq("(-1250).round(-2, half: :down)", "-1200");
+    eq("1250.round(-2)", "1300");
+    eq("(-1250).round(-2)", "-1300");
+    // Digits after the point.
+    eq("0.125.round(2, half: :even)", "0.12");
+    eq("0.125.round(2, half: :up)", "0.13");
+    eq("0.125.round(2, half: :down)", "0.12");
+    eq("0.135.round(2, half: :down)", "0.13");
+    let caught = |src: &str| {
+        format!(
+            "begin; {src}; rescue Exception => e; [e.class.to_s, e.message]; else; :no_raise; end"
+        )
+    };
+    eq(
+        &caught("2.5.round(half: :bogus)"),
+        "[\"ArgumentError\", \"invalid rounding mode: bogus\"]",
+    );
+    // `half:` belongs to `round` alone: the others take the Hash as `ndigits`
+    // and fail converting it, which is what MRI does with it.
+    eq(
+        &caught("2.5.floor(half: :even)"),
+        "[\"TypeError\", \"no implicit conversion of Hash into Integer\"]",
+    );
+    eq("2.5.floor(1)", "2.5");
+    eq("2.5.floor(1.0)", "2.5");
+}
+
+/// An ordering operator that cannot rank its operands is not a missing method.
+/// `Integer#<` exists, it asked `<=>`, and `<=>` answered nil — MRI reports that
+/// as a comparison failure naming both sides. The arithmetic half of the same
+/// fallthrough already did this; the ordering half claimed the method was
+/// undefined:
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e '1 < "a"'
+///   -e:1:in 'Integer#<': comparison of Integer with String failed (ArgumentError)
+#[test]
+fn a_failed_ordering_is_a_comparison_error_not_a_missing_method() {
+    let caught = |src: &str| {
+        format!(
+            "begin; {src}; rescue Exception => e; [e.class.to_s, e.message]; else; :no_raise; end"
+        )
+    };
+    for op in ["<", ">", "<=", ">="] {
+        eq(
+            &caught(&format!("1 {op} \"a\"")),
+            "[\"ArgumentError\", \"comparison of Integer with String failed\"]",
+        );
+    }
+    eq(
+        &caught("1.0 < \"a\""),
+        "[\"ArgumentError\", \"comparison of Float with String failed\"]",
+    );
+    // The right-hand side is named by INSPECT when it is a Float or a special
+    // constant and by CLASS otherwise, so these two disagree on purpose.
+    eq(
+        &caught("1 >= nil"),
+        "[\"ArgumentError\", \"comparison of Integer with nil failed\"]",
+    );
+    eq(
+        &caught("\"a\" < 1"),
+        "[\"ArgumentError\", \"comparison of String with 1 failed\"]",
+    );
+    // A receiver that genuinely has no `<` still reports a missing method — a
+    // blanket comparison error would pass the cases above and fail this one.
+    eq(
+        &caught("[1] < [2]"),
+        "[\"NoMethodError\", \"undefined method '<' for an instance of Array\"]",
+    );
+}
+
+/// Collection SEARCHES use MRI's `rb_equal`, which answers true for two operands
+/// that are the same value before it ever asks `==`. A NaN is not `==` itself
+/// but it IS itself, so:
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [Float::NAN].include?(Float::NAN); p Float::NAN == Float::NAN'
+///   true
+///   false
+#[test]
+fn collection_searches_find_a_nan_that_is_not_equal_to_itself() {
+    eq("[Float::NAN].include?(Float::NAN)", "true");
+    eq("[Float::NAN].index(Float::NAN)", "0");
+    eq("[Float::NAN].rindex(Float::NAN)", "0");
+    eq("[Float::NAN].count(Float::NAN)", "1");
+    eq("[Float::NAN] == [Float::NAN]", "true");
+    // `==` itself is unchanged — the identity short-circuit belongs to the
+    // search, not to the operator.
+    eq("Float::NAN == Float::NAN", "false");
+    eq("Float::NAN != Float::NAN", "true");
+    eq("Float::NAN < 1.0", "false");
+    eq("(Float::NAN <=> 1.0).inspect", "\"nil\"");
+    // A DIFFERENT NaN bit pattern is still not found by `==`, and equal values
+    // that are not identical are still found — so this is not "always true".
+    eq("[1.0].include?(1.0)", "true");
+    eq("[1.0].include?(2.0)", "false");
+    eq("[0.0].include?(-0.0)", "true");
+    eq("[1] == [1.0]", "true");
+}
