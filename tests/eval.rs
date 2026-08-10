@@ -6799,3 +6799,47 @@ fn clamp_range_forms_cover_every_range_flavour() {
         "\"wrong argument type nil (expected Range)\"",
     );
 }
+
+#[test]
+fn a_missing_operator_names_its_receiver_the_way_every_other_message_does() {
+    // MRI has ONE receiver phrasing for NoMethodError -- `an instance of C`, or
+    // the bare literal for nil/true/false. Four sites printed the class name on
+    // its own, which is the phrasing MRI uses for nothing: unary minus and the
+    // arithmetic operators in the numeric hook, the user-method lookup, and
+    // `Proc#curry`. They now share the renderer with method dispatch.
+    let nome = |src: &str| {
+        format!("begin; {src}; rescue NoMethodError => e; e.message; else; :no_raise; end")
+    };
+    for (recv, phrase) in [
+        ("{}", "an instance of Hash"),
+        ("(1..2)", "an instance of Range"),
+        (":s", "an instance of Symbol"),
+        ("[]", "an instance of Array"),
+        ("Object.new", "an instance of Object"),
+        ("proc {}", "an instance of Proc"),
+        ("nil", "nil"),
+        ("true", "true"),
+        ("false", "false"),
+    ] {
+        eq(
+            &nome(&format!("-{recv}")),
+            &format!("\"undefined method '-@' for {phrase}\""),
+        );
+        eq(
+            &nome(&format!("{recv} + 1")),
+            &format!("\"undefined method '+' for {phrase}\""),
+        );
+    }
+    // A binary operator other than `+` takes the same phrasing.
+    eq(
+        &nome("\"a\" - 1"),
+        "\"undefined method '-' for an instance of String\"",
+    );
+    // And it matches what an ordinary method lookup on the same receiver says,
+    // which is the point of sharing the renderer.
+    eq(&nome("nil.zzz"), "\"undefined method 'zzz' for nil\"");
+    eq(
+        &nome("{}.zzz"),
+        "\"undefined method 'zzz' for an instance of Hash\"",
+    );
+}

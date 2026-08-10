@@ -13870,8 +13870,7 @@ fn dispatch_proc(
         "to_proc" => Ok(recv.clone()),
         // `Proc#===` invokes the proc, so a lambda works as a `case/when` guard.
         "===" => crate::host::call_proc_block(recv, args, block),
-        "curry" => with_host(|h| h.proc_curry(recv))
-            .ok_or_else(|| "undefined method 'curry' for Proc".to_string()),
+        "curry" => with_host(|h| h.proc_curry(recv)).ok_or_else(|| no_method_error(recv, name)),
         // Composition: `(f >> g).call(x) == g.call(f.call(x))`.
         ">>" => {
             let g = args[0].clone();
@@ -17977,15 +17976,7 @@ fn class_visibility_directive(name: &str) -> Option<crate::host::Visibility> {
 /// `class C` or `module M` for a class/module reference, `an instance of C`
 /// otherwise.
 fn receiver_phrase(recv: &Value) -> String {
-    match recv {
-        Value::Undef => "nil".to_string(),
-        Value::Bool(true) => "true".to_string(),
-        Value::Bool(false) => "false".to_string(),
-        _ => match with_host(|h| h.classref_name(recv)) {
-            Some(c) => format!("{} {c}", with_host(|h| h.class_or_module_word(&c))),
-            None => format!("an instance of {}", with_host(|h| h.class_of(recv))),
-        },
-    }
+    with_host(|h| h.receiver_phrase(recv))
 }
 
 /// Gate an EXPLICIT-receiver call (`obj.m`, not a bare `m`) on the method's

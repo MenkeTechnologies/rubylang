@@ -3335,6 +3335,23 @@ impl RubyHost {
         }
         self.methods.contains_key(name)
     }
+    /// How MRI names a receiver in a NoMethodError: `nil`/`true`/`false` as the
+    /// literal, `class C`/`module M` for a class or module reference, and
+    /// `an instance of C` for every other value. The one renderer for all of
+    /// them, so a message raised from the numeric hook reads the same as one
+    /// raised from method dispatch — several sites used to print the bare class
+    /// name, which is the phrasing MRI uses for NOTHING.
+    pub fn receiver_phrase(&self, v: &Value) -> String {
+        match v {
+            Value::Undef => "nil".to_string(),
+            Value::Bool(true) => "true".to_string(),
+            Value::Bool(false) => "false".to_string(),
+            _ => match self.classref_name(v) {
+                Some(c) => format!("{} {c}", self.class_or_module_word(&c)),
+                None => format!("an instance of {}", self.class_of(v)),
+            },
+        }
+    }
     /// The class name of any value — the dynamic class for a user object, the
     /// builtin class name otherwise.
     pub fn class_of(&self, v: &Value) -> String {
@@ -6552,7 +6569,12 @@ impl RubyHost {
             return match a {
                 Value::Int(n) => Ok(Value::Int(n.wrapping_neg())),
                 Value::Float(f) => Ok(Value::Float(-*f)),
-                _ => Err(format!("undefined method '-@' for {}", self.class_name(a))),
+                // MRI names the receiver `an instance of C` (or the bare
+                // literal for nil/true/false), never by its class alone.
+                _ => Err(format!(
+                    "undefined method '-@' for {}",
+                    self.receiver_phrase(a)
+                )),
             };
         }
         // Integer arithmetic that overflowed `i64`, or that involves a value
@@ -6897,10 +6919,12 @@ impl RubyHost {
                 return Ok(self.new_set(result));
             }
         }
+        // Same phrasing as method dispatch: an arithmetic operator that the
+        // receiver does not have is an ordinary NoMethodError.
         Err(format!(
             "undefined method '{}' for {}",
             num_op_name(op),
-            self.class_name(a)
+            self.receiver_phrase(a)
         ))
     }
 
@@ -8191,8 +8215,12 @@ pub fn call_instance_method(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
-    let (def, owner) = with_host(|h| h.find_method_owner(class, name))
-        .ok_or_else(|| format!("undefined method '{name}' for {class}"))?;
+    let (def, owner) = with_host(|h| h.find_method_owner(class, name)).ok_or_else(|| {
+        format!(
+            "undefined method '{name}' for {}",
+            with_host(|h| h.receiver_phrase(&recv))
+        )
+    })?;
     run_method(&def, recv, args, block, Some(name.into()), Some(owner))
 }
 
