@@ -32,6 +32,10 @@ pub struct Cli {
     /// ASSIGN this rather than raising it, because MRI is last-wins: `-w -W0`
     /// ends at `nil` and `-W0 -w` ends at `true`.
     pub warn_level: u8,
+    /// `--enable`/`--disable-frozen-string-literal` (and the `--enable=…`,
+    /// `all` and comma-list spellings): what a file with no
+    /// `# frozen_string_literal:` comment compiles as. Last switch wins.
+    pub frozen_string_literal: bool,
     /// `-n` — wrap the program in `while gets; … end`.
     pub loop_n: bool,
     /// `-p` — like `-n` but print `$_` at the end of each iteration.
@@ -76,6 +80,73 @@ pub struct Cli {
 
 /// The level `-w`, `-v`, `-W` and `--verbose` all select: `$VERBOSE = true`.
 const VERBOSE_LEVEL: u8 = 2;
+
+/// The features `--enable` / `--disable` name, in MRI's own order — it prints
+/// this list verbatim when it does not recognise one. Only
+/// `frozen_string_literal` and `rubyopt` change anything here; the rest are
+/// accepted so a command line written for MRI runs unaltered.
+const FEATURES: &[&str] = &[
+    "gems",
+    "error_highlight",
+    "did_you_mean",
+    "syntax_suggest",
+    "rubyopt",
+    "frozen_string_literal",
+    "yjit",
+    "zjit",
+];
+
+/// Apply one `--enable`/`--disable` argument, which may be `all`, a single
+/// feature, or a comma-separated list. Feature names are spelled with either
+/// `_` or `-` (`--enable=frozen-string-literal` and `--enable-frozen_string_literal`
+/// both work), so they are normalised before lookup.
+///
+/// An unrecognised name is a warning listing the known features, not an error:
+/// MRI prints both lines and runs the program anyway (exit 0).
+fn apply_feature(cli: &mut Cli, arg: &str, on: bool, switch: &str) {
+    for raw in arg.split(',') {
+        let feature = raw.trim().replace('-', "_");
+        if feature == "all" {
+            cli.frozen_string_literal = on;
+            // `rubyopt` is deliberately NOT toggled by `all`: it is answered by
+            // the pre-scan below, before this parser ever runs.
+            continue;
+        }
+        if !FEATURES.contains(&feature.as_str()) {
+            cli.warnings
+                .push(format!("warning: unknown argument for --{switch}: '{raw}'"));
+            cli.warnings
+                .push(format!("warning: features are [{}].", FEATURES.join(", ")));
+            continue;
+        }
+        if feature == "frozen_string_literal" {
+            cli.frozen_string_literal = on;
+        }
+        // Every other feature is accepted with no effect: rubylang has no
+        // RubyGems to disable, no YJIT/ZJIT, and no did_you_mean/error_highlight
+        // machinery for the switch to turn off.
+    }
+}
+
+/// Does this command line ask for `RUBYOPT` to be ignored?
+///
+/// This has to be answered before the ordinary parse, because it decides
+/// whether `RUBYOPT` contributes any switches at all — so it reads the raw
+/// argument vector rather than a parsed `Cli`. Only the disabling spellings
+/// matter; `rubyopt` is on unless something turns it off.
+fn rubyopt_disabled(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        let Some(long) = a.strip_prefix("--disable") else {
+            return false;
+        };
+        let arg = match long.strip_prefix(['-', '=']) {
+            Some(rest) => rest,
+            None => return false,
+        };
+        arg.split(',')
+            .any(|f| matches!(f.trim().replace('-', "_").as_str(), "rubyopt" | "all"))
+    })
+}
 
 /// The warning categories `-W:` and `-W:no-` accept. An unrecognised one is a
 /// warning, not an error, and leaves the level alone. Verified against MRI
@@ -146,11 +217,15 @@ pub fn split_env_options(rubyopt: &str) -> Result<Vec<String>, String> {
 /// Parse the real process arguments (skipping `argv[0]`), with any `RUBYOPT`
 /// switches applied first.
 pub fn parse() -> Result<Cli, String> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // `--disable-rubyopt` decides whether RUBYOPT is read at all, so it has to
+    // be seen before the switches RUBYOPT would contribute.
+    let use_env = !rubyopt_disabled(&argv);
     let mut args = match std::env::var("RUBYOPT") {
-        Ok(opt) => split_env_options(&opt)?,
-        Err(_) => Vec::new(),
+        Ok(opt) if use_env => split_env_options(&opt)?,
+        _ => Vec::new(),
     };
-    args.extend(std::env::args().skip(1));
+    args.extend(argv);
     parse_args(args)
 }
 
@@ -220,8 +295,21 @@ pub fn parse_args(args: Vec<String>) -> Result<Cli, String> {
 
 /// A `--long` option (rubylang extensions plus a few MRI long forms).
 fn apply_long(cli: &mut Cli, long: &str) -> Result<(), String> {
-    // `--name=value` split (only `--dump=` uses it today, accepted+ignored).
-    let (name, _val) = long.split_once('=').unwrap_or((long, ""));
+    // `--name=value` split (`--enable=…`/`--disable=…`, and `--dump=`).
+    let (name, val) = long.split_once('=').unwrap_or((long, ""));
+    // Feature switches come in four spellings: `--enable=X`, `--disable=X`,
+    // `--enable-X`, `--disable-X`. The first two arrive with the feature in
+    // `val`, the last two with it glued to the switch name.
+    for (prefix, on) in [("enable", true), ("disable", false)] {
+        if name == prefix {
+            apply_feature(cli, val, on, prefix);
+            return Ok(());
+        }
+        if let Some(feature) = name.strip_prefix(prefix).and_then(|r| r.strip_prefix('-')) {
+            apply_feature(cli, feature, on, prefix);
+            return Ok(());
+        }
+    }
     match name {
         "version" => cli.show_version = true,
         "help" => cli.show_help = true,
@@ -235,9 +323,8 @@ fn apply_long(cli: &mut Cli, long: &str) -> Result<(), String> {
         "dump-ast" => cli.dump_ast = true,
         "disasm" => cli.disasm = true,
         "tiers" => cli.tiers = true,
-        // Accepted for compat, no effect: rubylang has no RubyGems to disable and
-        // no external encodings to select.
-        "disable-gems" | "enable-gems" | "disable-all" | "enable-all" | "dump" => {}
+        // Accepted for compat, no effect: no external encodings to select.
+        "dump" => {}
         "debug" => cli.debug = true,
         "verbose" => cli.warn_level = VERBOSE_LEVEL,
         "copyright" => cli.show_version = true,
@@ -546,6 +633,75 @@ mod tests {
     fn unknown_switch_is_error() {
         assert!(parse_args(vec!["-Z".to_string()]).is_err());
         assert!(parse_args(vec!["--bogus".to_string()]).is_err());
+    }
+
+    #[test]
+    fn frozen_string_literal_has_four_spellings() {
+        // MRI accepts the feature glued to the switch or after an `=`, and
+        // spells the name with either `-` or `_`. All four mean the same thing.
+        for on in [
+            "--enable-frozen-string-literal",
+            "--enable=frozen-string-literal",
+            "--enable-frozen_string_literal",
+            "--enable=frozen_string_literal",
+        ] {
+            assert!(p(&[on, "-e", "0"]).frozen_string_literal, "{on}");
+        }
+        for off in [
+            "--disable-frozen-string-literal",
+            "--disable=frozen-string-literal",
+        ] {
+            assert!(!p(&[off, "-e", "0"]).frozen_string_literal, "{off}");
+        }
+        // `all` reaches it, and a comma list is applied item by item.
+        assert!(p(&["--enable=all", "-e", "0"]).frozen_string_literal);
+        assert!(p(&["--enable-all", "-e", "0"]).frozen_string_literal);
+        assert!(!p(&["--disable=all", "-e", "0"]).frozen_string_literal);
+        assert!(p(&["--enable=frozen-string-literal,gems", "-e", "0"]).frozen_string_literal);
+    }
+
+    #[test]
+    fn the_last_feature_switch_wins() {
+        let on = "--enable-frozen-string-literal";
+        let off = "--disable-frozen-string-literal";
+        assert!(!p(&[on, off, "-e", "0"]).frozen_string_literal);
+        assert!(p(&[off, on, "-e", "0"]).frozen_string_literal);
+        // …including when the earlier one arrived via `all`.
+        assert!(!p(&["--enable=all", off, "-e", "0"]).frozen_string_literal);
+    }
+
+    #[test]
+    fn an_unknown_feature_warns_and_lists_the_known_ones() {
+        // MRI prints two lines and still runs the program, so this must not be
+        // an error. The second line is the feature list verbatim.
+        let c = p(&["--enable=fsl", "-e", "0"]);
+        assert_eq!(
+            c.warnings,
+            [
+                "warning: unknown argument for --enable: 'fsl'".to_string(),
+                format!("warning: features are [{}].", FEATURES.join(", ")),
+            ]
+        );
+        // The switch name in the message follows the switch that was used.
+        let c = p(&["--disable=nope", "-e", "0"]);
+        assert!(c.warnings[0].contains("for --disable: 'nope'"));
+        // A known feature we do not act on is silent, not a warning.
+        assert!(p(&["--disable-gems", "-e", "0"]).warnings.is_empty());
+        assert!(p(&["--enable=yjit", "-e", "0"]).warnings.is_empty());
+    }
+
+    #[test]
+    fn disable_rubyopt_is_read_from_the_raw_argument_vector() {
+        // It decides whether RUBYOPT contributes switches at all, so it cannot
+        // be answered from a parsed `Cli` that RUBYOPT already fed into.
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(rubyopt_disabled(&v(&["--disable-rubyopt", "-e", "0"])));
+        assert!(rubyopt_disabled(&v(&["--disable=rubyopt", "-e", "0"])));
+        assert!(rubyopt_disabled(&v(&["--disable=all", "-e", "0"])));
+        assert!(rubyopt_disabled(&v(&["--disable=gems,rubyopt", "-e", "0"])));
+        assert!(!rubyopt_disabled(&v(&["--enable-rubyopt", "-e", "0"])));
+        assert!(!rubyopt_disabled(&v(&["--disable-gems", "-e", "0"])));
+        assert!(!rubyopt_disabled(&v(&["-e", "0"])));
     }
 
     #[test]

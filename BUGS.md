@@ -742,6 +742,22 @@ Honest limitations of this surface:
 - **`Object#clone(freeze:)`.** `clone` carries the frozen flag over (unlike
   `dup`); `freeze: false` thaws the copy and `freeze: true` freezes it regardless
   of the source.
+- **Frozen string literals.** A non-interpolated literal freezes when the file
+  asks for it. Precedence is MRI's: a `# frozen_string_literal:` magic comment
+  always wins, and `--enable`/`--disable-frozen-string-literal` only decides
+  what a file with NO comment compiles as — so `--enable` cannot freeze a file
+  whose comment says `false`. A comment value that is neither `true` nor `false`
+  is not a setting at all and leaves the switch in charge. The switch is
+  invocation-wide (an `AtomicBool`, so a file required from a spawned thread
+  compiles the same way) while the per-file flag stays thread-local. All four
+  MRI spellings work (`--enable-X`, `--enable=X`, `-` or `_` in the name), as do
+  `all` and comma lists.
+- **Divergence — an error raised by a builtin operation reports line 0.** The
+  `file:LINE:in '<main>'` prefix is right for `raise` and for a `NoMethodError`,
+  but an exception thrown from inside an operation carries no line: `1/0`,
+  `[].freeze << 1` and a frozen-literal mutation all print `:0:` where MRI
+  prints the real line. It is the op dispatch that never records a line, so
+  this is independent of which error is raised and of the entry point.
 - **Enumerator.** A block-less `each`/`map`/`select`/`reject`/`each_with_index`
   (on arrays), `String#each_char`/`each_byte`/`each_codepoint`/`each_line`, and
   `Integer#times`/`upto`/`downto`/`step`

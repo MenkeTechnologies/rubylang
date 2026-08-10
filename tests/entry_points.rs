@@ -272,6 +272,165 @@ fn an_uncaught_error_is_labelled_with_the_entry_point() {
 }
 
 #[test]
+fn frozen_string_literal_switch_reaches_every_entry_point() {
+    // The switch decides what a program with no magic comment compiles as, and
+    // it has to reach the one-liner, the script file and stdin alike.
+    let (dash_e, file, stdin) = {
+        let dir = fresh_dir("fsl");
+        let path = dir.join("prog.rb");
+        std::fs::write(&path, "p \"x\".frozen?\n").unwrap();
+        let p = path.to_str().unwrap();
+        let on = "--enable-frozen-string-literal";
+        (
+            run(&[on, "-e", "p \"x\".frozen?"], "", None).0,
+            run(&[on, p], "", None).0,
+            run(&[on], "p \"x\".frozen?\n", None).0,
+        )
+    };
+    assert_eq!(
+        (dash_e.as_str(), file.as_str(), stdin.as_str()),
+        ("true", "true", "true")
+    );
+    // Off by default, and explicitly disabling is the same as not asking.
+    assert_eq!(run(&["-e", "p \"x\".frozen?"], "", None).0, "false");
+    assert_eq!(
+        run(
+            &["--disable-frozen-string-literal", "-e", "p \"x\".frozen?"],
+            "",
+            None
+        )
+        .0,
+        "false"
+    );
+}
+
+#[test]
+fn a_magic_comment_overrides_the_frozen_string_literal_switch() {
+    // The switch is only a DEFAULT. A file that states its own setting keeps
+    // it, in both directions — so `--enable` cannot freeze a file that asked
+    // for `false`, which is what makes the switch safe to pass globally.
+    let dir = fresh_dir("fslmagic");
+    let write = |name: &str, body: &str| {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p.to_str().unwrap().to_string()
+    };
+    let none = write("none.rb", "p \"x\".frozen?\n");
+    let yes = write(
+        "true.rb",
+        "# frozen_string_literal: true\np \"x\".frozen?\n",
+    );
+    let no = write(
+        "false.rb",
+        "# frozen_string_literal: false\np \"x\".frozen?\n",
+    );
+    // A value that is neither `true` nor `false` is not a setting at all, so
+    // the switch still applies — it must not be read as an explicit `false`.
+    let bogus = write(
+        "bogus.rb",
+        "# frozen_string_literal: bogus\np \"x\".frozen?\n",
+    );
+
+    for (switch, want_none, want_bogus) in [
+        (vec![], "false", "false"),
+        (vec!["--enable-frozen-string-literal"], "true", "true"),
+        (vec!["--disable-frozen-string-literal"], "false", "false"),
+    ] {
+        let go = |f: &str| {
+            let mut args = switch.clone();
+            args.push(f);
+            run(&args, "", None).0
+        };
+        assert_eq!(go(&none), want_none, "no comment, {switch:?}");
+        assert_eq!(go(&bogus), want_bogus, "unparseable comment, {switch:?}");
+        // These two never move.
+        assert_eq!(go(&yes), "true", "comment says true, {switch:?}");
+        assert_eq!(go(&no), "false", "comment says false, {switch:?}");
+    }
+}
+
+#[test]
+fn a_frozen_literal_actually_refuses_mutation() {
+    // The flag has to reach the compiled literal, not just a query.
+    let (_, err, ok) = run(
+        &[
+            "--enable-frozen-string-literal",
+            "-e",
+            "s = \"x\"; s << \"y\"",
+        ],
+        "",
+        None,
+    );
+    assert!(!ok, "mutating a frozen literal should raise");
+    assert!(
+        err.contains(r#"can't modify frozen String: "x" (FrozenError)"#),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn the_command_line_beats_rubyopt_for_the_frozen_literal_switch() {
+    // RUBYOPT is applied first, so the explicit switch is the one that lands —
+    // in both directions.
+    let on = "--enable-frozen-string-literal";
+    let off = "--disable-frozen-string-literal";
+    assert_eq!(run(&["-e", "p \"x\".frozen?"], "", Some(on)).0, "true");
+    assert_eq!(
+        run(&[off, "-e", "p \"x\".frozen?"], "", Some(on)).0,
+        "false"
+    );
+    assert_eq!(run(&[on, "-e", "p \"x\".frozen?"], "", Some(off)).0, "true");
+}
+
+#[test]
+fn disable_rubyopt_makes_the_environment_stop_counting() {
+    // `--disable-rubyopt` is the escape hatch from an ambient RUBYOPT, so it
+    // has to be honoured BEFORE those switches are applied — not merely
+    // overridden afterwards.
+    assert_eq!(run(&["-e", "p $VERBOSE"], "", Some("-w")).0, "true");
+    for off in ["--disable-rubyopt", "--disable=rubyopt", "--disable=all"] {
+        assert_eq!(
+            run(&[off, "-e", "p $VERBOSE"], "", Some("-w")).0,
+            "false",
+            "{off}"
+        );
+    }
+    // It also suppresses a frozen-literal switch coming from the environment.
+    assert_eq!(
+        run(
+            &["--disable-rubyopt", "-e", "p \"x\".frozen?"],
+            "",
+            Some("--enable-frozen-string-literal")
+        )
+        .0,
+        "false"
+    );
+    // A switch RUBYOPT would have REJECTED is not even looked at, so an
+    // otherwise-fatal environment cannot stop the program.
+    let (out, _, ok) = run(&["--disable-rubyopt", "-e", "p 1"], "", Some("-e"));
+    assert!(ok, "a disabled RUBYOPT should not be validated");
+    assert_eq!(out, "1");
+}
+
+#[test]
+fn an_unknown_feature_warns_on_stderr_and_still_runs() {
+    let (out, err, ok) = run(&["--enable=fsl", "-e", "p 1"], "", None);
+    assert!(ok, "an unknown feature must not be fatal");
+    assert_eq!(out, "1");
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(
+        lines[0],
+        "ruby: warning: unknown argument for --enable: 'fsl'"
+    );
+    assert!(
+        lines[1].starts_with("ruby: warning: features are [gems,")
+            && lines[1].contains("frozen_string_literal"),
+        "got: {}",
+        lines[1]
+    );
+}
+
+#[test]
 fn top_level_self_prints_as_main_at_every_entry_point() {
     // `main` is an ordinary Object, but it prints as `main` — and it is the
     // same object however the program was started.

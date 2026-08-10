@@ -33,6 +33,26 @@ pub fn set_frozen_string_literals(on: bool) {
     FROZEN_STR_LITERALS.with(|c| c.set(on));
 }
 
+/// What a file with NO `# frozen_string_literal:` magic comment compiles as,
+/// set once from `--enable`/`--disable-frozen-string-literal`.
+///
+/// Process-wide rather than thread-local, because it is a property of the
+/// invocation: a file `require`d from a spawned thread was still started by the
+/// same command line and must compile the same way. The per-file flag above
+/// stays thread-local — that one really is per compilation.
+static DEFAULT_FROZEN_STR_LITERALS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The invocation-wide default for files without a magic comment.
+pub fn default_frozen_string_literals() -> bool {
+    DEFAULT_FROZEN_STR_LITERALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the invocation-wide default (the `--enable`/`--disable` switch).
+pub fn set_default_frozen_string_literals(on: bool) {
+    DEFAULT_FROZEN_STR_LITERALS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The full output of compiling a program.
 pub struct Program {
     pub main: Chunk,

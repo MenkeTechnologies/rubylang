@@ -251,7 +251,15 @@ to `ruby` work unchanged.
 | `--verbose` | `$VERBOSE = true`, without the banner. |
 | `--version` | Print the version banner and exit. |
 | `-h` / `--help` | Print usage and exit. |
+| `--enable-FEATURE` / `--disable-FEATURE` | Toggle a feature; also spelled `--enable=FEATURE`, and the name takes `-` or `_`. `FEATURE` may be `all` or a comma-separated list. Known features are `gems`, `error_highlight`, `did_you_mean`, `syntax_suggest`, `rubyopt`, `frozen_string_literal`, `yjit`, `zjit`; an unknown one warns and runs. Last switch wins. |
 | `--` | End of options; the next token is the program file, the rest is `ARGV`. |
+
+Of those features, two do something: `frozen_string_literal` sets what a file
+with **no** `# frozen_string_literal:` magic comment compiles as (a file that
+states its own setting always keeps it, so `--enable` cannot freeze a file that
+asked for `false`), and `--disable-rubyopt` makes `RUBYOPT` be ignored entirely.
+The rest are accepted with no effect so a command line written for MRI runs
+unaltered — there is no RubyGems to disable, and no YJIT/ZJIT.
 
 `RUBYOPT` is honoured, and its switches are applied *before* the command line —
 so an explicit `-W0` overrides a `RUBYOPT=-w`. Because the variable is ambient,

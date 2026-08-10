@@ -79,6 +79,9 @@ pub struct RunConfig {
     pub warn_level: u8,
     /// `-d`/`--debug` → `$DEBUG`.
     pub debug: bool,
+    /// `--enable`/`--disable-frozen-string-literal`: what a file with no
+    /// `# frozen_string_literal:` comment compiles as. MRI's default is off.
+    pub frozen_string_literal: bool,
 }
 
 impl Default for RunConfig {
@@ -90,6 +93,7 @@ impl Default for RunConfig {
             script_name: String::new(),
             warn_level: DEFAULT_WARN_LEVEL,
             debug: false,
+            frozen_string_literal: false,
         }
     }
 }
@@ -107,26 +111,50 @@ fn verbose_for_level(level: u8) -> Value {
     }
 }
 
-/// Seed `$VERBOSE`/`$DEBUG` from the warning level and debug flag.
+/// Seed `$VERBOSE`/`$DEBUG` from the warning level and debug flag, and install
+/// the invocation-wide frozen-string-literal default. Called by every run entry
+/// point before anything compiles, since `compile` reads that default.
 fn seed_verbosity(cfg: &RunConfig) {
     let verbose = verbose_for_level(cfg.warn_level);
     host::with_host(|h| {
         h.set_global("VERBOSE", verbose);
         h.set_global("DEBUG", Value::Bool(cfg.debug));
     });
+    compiler::set_default_frozen_string_literals(cfg.frozen_string_literal);
 }
 
 /// Compile a source string to a runnable program.
+///
+/// A `# frozen_string_literal:` magic comment always wins; the
+/// `--enable`/`--disable-frozen-string-literal` switch only decides what a file
+/// WITHOUT one compiles as. Verified against MRI 4.0.6: with
+/// `--enable-frozen-string-literal`, a file whose comment says `false` still
+/// gets unfrozen literals.
 pub fn compile(src: &str) -> Result<compiler::Program, String> {
-    compiler::set_frozen_string_literals(has_frozen_string_literal(src));
+    let frozen =
+        frozen_string_literal_comment(src).unwrap_or_else(compiler::default_frozen_string_literals);
+    compiler::set_frozen_string_literals(frozen);
     let stmts = parser::parse(src)?;
     compiler::compile(&stmts, false)
 }
 
-/// Detect a `# frozen_string_literal: true` magic comment. MRI honors it only in
-/// the leading comment block (after an optional shebang) and stops at the first
-/// line of code. The value must be `true`; anything else (incl. `false`) is off.
-fn has_frozen_string_literal(src: &str) -> bool {
+/// Read a `# frozen_string_literal:` magic comment: `Some(true)`/`Some(false)`
+/// when the file states one, `None` when it does not.
+///
+/// MRI honours the comment only in the leading comment block (after an optional
+/// shebang) and stops at the first line of code. The distinction between
+/// `Some(false)` and `None` is load-bearing, because only the former overrides
+/// the command-line switch. A value that is neither `true` nor `false` is not a
+/// setting at all — MRI ignores it and the switch still applies:
+///
+/// ```text
+/// $ cat bogus.rb
+/// # frozen_string_literal: bogus
+/// p "x".frozen?
+/// $ /opt/homebrew/opt/ruby/bin/ruby                                bogus.rb  # false
+/// $ /opt/homebrew/opt/ruby/bin/ruby --enable-frozen-string-literal bogus.rb  # true
+/// ```
+fn frozen_string_literal_comment(src: &str) -> Option<bool> {
     for (i, line) in src.lines().enumerate() {
         let t = line.trim();
         if t.is_empty() {
@@ -140,14 +168,15 @@ fn has_frozen_string_literal(src: &str) -> bool {
         };
         // Accept `# frozen_string_literal: true` and `-*- … -*-` emacs form.
         if let Some(after) = rest.split("frozen_string_literal:").nth(1) {
-            return after
-                .trim_start()
-                .trim_end_matches("-*-")
-                .trim()
-                .starts_with("true");
+            let value = after.trim_start().trim_end_matches("-*-").trim();
+            return match value {
+                v if v.starts_with("true") => Some(true),
+                v if v.starts_with("false") => Some(false),
+                _ => None,
+            };
         }
     }
-    false
+    None
 }
 
 /// Compile with per-statement DAP line markers enabled (`ruby --dap`).
