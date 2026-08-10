@@ -40,20 +40,31 @@ fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
     p
 }
 
-/// Whether the toolchain needed to link a standalone binary is available. When
-/// absent the test skips rather than failing (matches the mission's "gate on the
-/// availability of a linker").
-fn toolchain_ready() -> bool {
+/// Fail loudly if the toolchain needed to link a standalone binary is missing.
+///
+/// This was a `bool` whose false branch `return`ed from the test body, so a
+/// missing rlib turned both tests in this file into passes that executed zero
+/// assertions. Neither half can legitimately be absent: `rustc` compiled this
+/// binary, and `librubylang.rlib` is produced by the same `cargo test` that
+/// runs it (the crate declares `rlib` in its `crate-type`). A missing one is a
+/// build-layout regression — exactly the thing a silent skip would hide.
+fn require_toolchain() {
     let rustc = Command::new("rustc")
         .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    let rlib = Path::new(env!("CARGO_BIN_EXE_ruby"))
+    assert!(rustc, "rustc must be runnable: it built this test binary");
+    let dir = Path::new(env!("CARGO_BIN_EXE_ruby"))
         .parent()
-        .map(|d| d.join("librubylang.rlib").exists())
-        .unwrap_or(false);
-    rustc && rlib
+        .expect("test binary has a parent dir")
+        .to_path_buf();
+    let rlib = dir.join("librubylang.rlib");
+    assert!(
+        rlib.exists(),
+        "librubylang.rlib missing from {dir:?}: cargo test builds it, so its \
+         absence means the crate-type or target layout changed"
+    );
 }
 
 /// Run `ruby [args…] FILE`, returning (stdout, stderr, exit code, success).
@@ -87,10 +98,7 @@ fn mri(path: &Path) -> Option<(String, i32)> {
 
 #[test]
 fn native_binary_runs_whole_app_without_ruby_or_sources() {
-    if !toolchain_ready() {
-        eprintln!("skipping: no rustc / rubylang rlib in the build tree");
-        return;
-    }
+    require_toolchain();
 
     let dir = fresh_dir("standalone");
 
@@ -173,10 +181,7 @@ fn native_binary_runs_whole_app_without_ruby_or_sources() {
 
 #[test]
 fn native_binary_matches_mri_when_available() {
-    if !toolchain_ready() {
-        eprintln!("skipping: no rustc / rubylang rlib in the build tree");
-        return;
-    }
+    require_toolchain();
 
     let dir = fresh_dir("mriparity");
     write(
@@ -207,13 +212,24 @@ fn native_binary_matches_mri_when_available() {
     let bin_out = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(out.status.success(), "binary exit ok");
     assert_eq!(bin_out, "total=6 k=21 d=42\n", "standalone output");
-    if let Some((ref_out, ref_code)) = mri_out {
-        assert_eq!(bin_out, ref_out, "standalone vs MRI stdout");
-        assert_eq!(
-            out.status.code().unwrap_or(-1),
-            ref_code,
-            "vs MRI exit code"
-        );
+    // The MRI half is a genuine skip — an MRI-less host is a supported place to
+    // run this suite — but a SILENT one is indistinguishable from a witness that
+    // agreed. Say so on stderr, and note that the frozen literal above already
+    // fired, so this test is never reduced to zero assertions.
+    match mri_out {
+        Some((ref_out, ref_code)) => {
+            assert_eq!(bin_out, ref_out, "standalone vs MRI stdout");
+            assert_eq!(
+                out.status.code().unwrap_or(-1),
+                ref_code,
+                "vs MRI exit code"
+            );
+        }
+        None => eprintln!(
+            "SKIPPED WITNESS: native_binary_matches_mri_when_available ran its \
+             frozen-literal assertions but NOT the MRI comparison — \
+             rubylang::oracle::find() resolved no verified MRI on this host"
+        ),
     }
 
     std::fs::remove_dir_all(&dir).ok();

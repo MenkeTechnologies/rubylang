@@ -114,18 +114,35 @@ fn provenance_covers_every_example() {
         labelled.insert(stem, label);
     }
 
+    // Both loops in this test are empty-tolerant: an all-comment PROVENANCE.tsv
+    // runs no label check, and an examples/ with no .rb files leaves `missing`
+    // empty. Either would pass having verified nothing, so both sources are
+    // pinned as non-empty first.
+    assert!(
+        !labelled.is_empty(),
+        "{provenance_path:?} declared no examples — the label check above \
+         inspected nothing"
+    );
+
     let examples_dir = Path::new(manifest).join("examples");
     let mut missing = Vec::new();
+    let mut seen_scripts = 0usize;
     for entry in std::fs::read_dir(&examples_dir).expect("read examples dir") {
         let path = entry.expect("dir entry").path();
         if path.extension().map(|x| x != "rb").unwrap_or(true) {
             continue;
         }
         let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        seen_scripts += 1;
         if !labelled.contains_key(&stem) {
             missing.push(stem);
         }
     }
+    assert!(
+        seen_scripts > 0,
+        "no .rb files in {examples_dir:?} — the coverage assertion below would \
+         pass having compared nothing against {provenance_path:?}"
+    );
     missing.sort();
     assert!(
         missing.is_empty(),

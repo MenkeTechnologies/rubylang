@@ -137,7 +137,7 @@ fn b_defined_desc(vm: &mut VM, _: u8) -> Value {
             // guard that gems use to define it once).
             let defined = with_host(|h| {
                 set(h.get_const(&name)) || h.class_exists(&name) || h.is_builtin_class(&name)
-            }) || (!name.contains("::") && is_builtin_exception(&name));
+            }) || (builtin_exception_const(&name));
             defined.then_some("constant")
         }
         "ivar" => with_host(|h| set(h.get_ivar(&name))).then_some("instance-variable"),
@@ -681,7 +681,7 @@ fn b_getconst(vm: &mut VM, _: u8) -> Value {
         // like `Foo::NegativeError` would spuriously resolve and shadow the real
         // top-level `NegativeError` later in the candidate chain.
         if with_host(|h| h.class_exists(name) || h.is_builtin_class(name))
-            || (!name.contains("::") && is_builtin_exception(name))
+            || (builtin_exception_const(name))
         {
             return with_host(|h| h.class_ref(name));
         }
@@ -736,7 +736,77 @@ fn b_getconst(vm: &mut VM, _: u8) -> Value {
 /// Builtin exception class names that resolve to a class reference even without
 /// a user `class` definition.
 fn is_builtin_exception(name: &str) -> bool {
-    name.ends_with("Error") || name == "Exception" || name == "StopIteration"
+    name.ends_with("Error")
+        || name == "Exception"
+        || name == "StopIteration"
+        || name.starts_with("Errno::")
+}
+
+/// Whether `name` resolves to a BUILTIN exception class rather than a namespaced
+/// user one. A `::` in the name normally means a user class (`Foo::BarError`),
+/// so it is excluded — except the `Errno::` family, which MRI defines itself and
+/// which `rescue Errno::ENOENT` has to find.
+fn builtin_exception_const(name: &str) -> bool {
+    is_builtin_exception(name) && (!name.contains("::") || name.starts_with("Errno::"))
+}
+
+/// `Errno::<NAME>` for a raw OS error number, or `None` when the number is one
+/// this table does not name.
+///
+/// The numbers come from `libc`, never from a literal: `ENOTEMPTY` is 66 on
+/// macOS and 39 on Linux, `ECONNREFUSED` 61 and 111, `EADDRINUSE` 48 and 98. A
+/// hardcoded table would name the wrong class on one of the two platforms
+/// rubylang targets, and would do it silently.
+fn errno_class(code: i32) -> Option<&'static str> {
+    const TABLE: &[(i32, &str)] = &[
+        (libc::EPERM, "Errno::EPERM"),
+        (libc::ENOENT, "Errno::ENOENT"),
+        (libc::ESRCH, "Errno::ESRCH"),
+        (libc::EINTR, "Errno::EINTR"),
+        (libc::EIO, "Errno::EIO"),
+        (libc::ENXIO, "Errno::ENXIO"),
+        (libc::E2BIG, "Errno::E2BIG"),
+        (libc::ENOEXEC, "Errno::ENOEXEC"),
+        (libc::EBADF, "Errno::EBADF"),
+        (libc::ECHILD, "Errno::ECHILD"),
+        (libc::ENOMEM, "Errno::ENOMEM"),
+        (libc::EACCES, "Errno::EACCES"),
+        (libc::EFAULT, "Errno::EFAULT"),
+        (libc::EBUSY, "Errno::EBUSY"),
+        (libc::EEXIST, "Errno::EEXIST"),
+        (libc::EXDEV, "Errno::EXDEV"),
+        (libc::ENODEV, "Errno::ENODEV"),
+        (libc::ENOTDIR, "Errno::ENOTDIR"),
+        (libc::EISDIR, "Errno::EISDIR"),
+        (libc::EINVAL, "Errno::EINVAL"),
+        (libc::ENFILE, "Errno::ENFILE"),
+        (libc::EMFILE, "Errno::EMFILE"),
+        (libc::ENOTTY, "Errno::ENOTTY"),
+        (libc::EFBIG, "Errno::EFBIG"),
+        (libc::ENOSPC, "Errno::ENOSPC"),
+        (libc::ESPIPE, "Errno::ESPIPE"),
+        (libc::EROFS, "Errno::EROFS"),
+        (libc::EMLINK, "Errno::EMLINK"),
+        (libc::EPIPE, "Errno::EPIPE"),
+        (libc::EDOM, "Errno::EDOM"),
+        (libc::ERANGE, "Errno::ERANGE"),
+        (libc::EAGAIN, "Errno::EAGAIN"),
+        (libc::ENAMETOOLONG, "Errno::ENAMETOOLONG"),
+        (libc::ENOTEMPTY, "Errno::ENOTEMPTY"),
+        (libc::ELOOP, "Errno::ELOOP"),
+        (libc::EADDRINUSE, "Errno::EADDRINUSE"),
+        (libc::ECONNREFUSED, "Errno::ECONNREFUSED"),
+        (libc::ECONNRESET, "Errno::ECONNRESET"),
+        (libc::ECONNABORTED, "Errno::ECONNABORTED"),
+        (libc::ENOTCONN, "Errno::ENOTCONN"),
+        (libc::ETIMEDOUT, "Errno::ETIMEDOUT"),
+        (libc::EHOSTUNREACH, "Errno::EHOSTUNREACH"),
+        (libc::ENETUNREACH, "Errno::ENETUNREACH"),
+        (libc::EAFNOSUPPORT, "Errno::EAFNOSUPPORT"),
+        (libc::EINPROGRESS, "Errno::EINPROGRESS"),
+        (libc::ENOTSOCK, "Errno::ENOTSOCK"),
+    ];
+    TABLE.iter().find(|(n, _)| *n == code).map(|(_, s)| *s)
 }
 /// Whether `cls` is an exception class — a builtin one, or a user class whose
 /// superclass chain reaches a builtin exception (e.g. `class MyErr < StandardError`).
@@ -1057,7 +1127,11 @@ fn b_yield(vm: &mut VM, argc: u8) -> Value {
     let Some(block) = current_block() else {
         // MRI raises LocalJumpError here, not RuntimeError — the sibling `catch`
         // path already did, so only this one answered with the wrong class.
-        let e = raise_exc("LocalJumpError", "no block given (yield)");
+        let e = raise_exc_with(
+            "LocalJumpError",
+            "no block given (yield)",
+            &[("reason", with_host(|h| h.new_symbol("noreason")))],
+        );
         return abort(vm, e);
     };
     match call_proc(&block, &args) {
@@ -1970,9 +2044,10 @@ pub(crate) fn dispatch(
             // `frozen_guard` sibling path already emitted; this one did not.
             if with_host(|h| h.is_frozen(recv)) {
                 let (cls, insp) = with_host(|h| (h.class_of(recv).to_string(), h.inspect(recv)));
-                return Err(raise_exc(
+                return Err(raise_exc_with(
                     "FrozenError",
                     &format!("can't modify frozen {cls}: {insp}"),
+                    &[("receiver", recv.clone())],
                 ));
             }
             let raw = name_of(&args[0]);
@@ -4112,7 +4187,10 @@ fn dispatch_classref(
                 if with_host(|h| h.has_const(&qualified)) {
                     return Ok(with_host(|h| h.get_const(&qualified)));
                 }
-                if with_host(|h| h.class_exists(&qualified)) {
+                // `class_exists` covers user-defined classes; the builtin check
+                // is what makes the `Errno::*` family resolve, since none of them
+                // is declared by a `class` statement anywhere.
+                if with_host(|h| h.class_exists(&qualified) || h.is_builtin_class(&qualified)) {
                     return Ok(with_host(|h| h.class_ref(&qualified)));
                 }
                 // A pending `autoload :Const, "path"` on THIS namespace fires first
@@ -4286,7 +4364,7 @@ fn const_lookup(name: &str) -> Option<Value> {
         // exception (`rescue RuntimeError`). It must not fire on a qualified name
         // (`Mustermann::AST::Node::FooError`), which is a user constant that is
         // absent unless registered — matching the `defined?` const check.
-        if !name.contains("::") && is_builtin_exception(name) {
+        if builtin_exception_const(name) {
             Some(with_host(|h| h.class_ref(name)))
         } else {
             None
@@ -4663,9 +4741,34 @@ fn dispatch_object(
                 return Ok(stored);
             }
             let msg = with_host(|h| h.as_str(&h.ivar_of(recv, "message"))).unwrap_or_default();
-            let nm = msg.split('\'').nth(1).unwrap_or("");
-            Ok(with_host(|h| h.new_symbol(nm)))
+            // MRI leaves `#name` nil on a NameError raised without one
+            // (`raise NameError, "x"` answers nil, not an empty Symbol), so an
+            // unparsable message yields nil rather than `:""`.
+            match msg.split('\'').nth(1) {
+                Some(nm) => Ok(with_host(|h| h.new_symbol(nm))),
+                None => Ok(Value::Undef),
+            }
         }
+        // The structured readers MRI puts on specific exception classes. Each is
+        // recorded at the raise site by `raise_exc_with`; a hand-constructed
+        // exception (`KeyError.new("m")`) answers nil, as MRI's does.
+        "key" | "result" | "path" | "reason" | "exit_value" | "errno" | "destination_encoding"
+            if with_host(|h| h.is_exception_class(cls)) =>
+        {
+            Ok(with_host(|h| h.ivar_of(recv, name)))
+        }
+        // `NoMethodError#args` — the arguments the missing call was given. MRI
+        // answers an empty Array, never nil, so a caller can splat it.
+        "args" if with_host(|h| h.is_exception_class(cls)) => {
+            Ok(match with_host(|h| h.ivar_of(recv, "args")) {
+                Value::Undef => new_arr(Vec::new()),
+                v => v,
+            })
+        }
+        // `NoMethodError#private_call?` — whether the call that missed used an
+        // explicit receiver. Every miss rubylang raises comes from an explicit
+        // send, so this is false, matching `1.nope`.
+        "private_call?" if with_host(|h| h.is_exception_class(cls)) => Ok(Value::Bool(false)),
         // `NameError#receiver` / `NoMethodError#receiver`.
         "receiver" if with_host(|h| h.is_exception_class(cls)) => {
             Ok(with_host(|h| h.ivar_of(recv, "receiver")))
@@ -5427,7 +5530,16 @@ fn dispatch_bigint(
     let big = |v: num_bigint::BigInt| with_host(|h| h.new_bigint(v));
     let r = match name {
         "to_s" | "inspect" => {
-            let radix = args.first().and_then(int_arg).unwrap_or(10);
+            // `num-bigint`'s `to_str_radix` PANICS outside 2..=36, so the radix
+            // is refused here first — MRI raises a catchable ArgumentError.
+            let radix = match args.first() {
+                Some(v) => {
+                    let base = to_int(v)?;
+                    check_radix(base)?;
+                    base
+                }
+                None => 10,
+            };
             new_str(b.to_str_radix(radix as u32))
         }
         "to_i" | "to_int" => big(b.clone()),
@@ -5814,10 +5926,12 @@ fn dispatch_number(
         "upto" => iter_int_range(recv, as_i(&args[0]), 1, &block),
         "downto" => iter_int_range(recv, as_i(&args[0]), -1, &block),
         "to_s" => {
-            // `Integer#to_s(base)` renders in the given radix (2..=36).
+            // `Integer#to_s(base)` renders in the given radix (2..=36); anything
+            // else is refused, not silently rendered in base 10.
             let base_arg = args.first().map(to_int).transpose()?;
-            if let (Value::Int(n), Some(base)) = (recv, base_arg) {
-                if (2..=36).contains(&base) {
+            if let Some(base) = base_arg {
+                check_radix(base)?;
+                if let Value::Int(n) = recv {
                     return Ok(new_str(to_radix(*n, base as u32)));
                 }
             }
@@ -6785,6 +6899,28 @@ fn floor_mod(a: i128, b: i128) -> i128 {
     } else {
         r
     }
+}
+
+/// Reject a radix Ruby will not render in. MRI distinguishes two failures, and
+/// so does this:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e '255.to_s(37)'
+/// -e:1:in 'Integer#to_s': invalid radix 37 (ArgumentError)
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e '1.to_s(2**40)'
+/// -e:1:in 'Integer#to_s': integer 1099511627776 too big to convert to 'int' (RangeError)
+/// ```
+fn check_radix(base: i64) -> Result<(), String> {
+    if base > i64::from(i32::MAX) || base < i64::from(i32::MIN) {
+        return Err(raise_exc(
+            "RangeError",
+            &format!("integer {base} too big to convert to 'int'"),
+        ));
+    }
+    if !(2..=36).contains(&base) {
+        return Err(raise_exc("ArgumentError", &format!("invalid radix {base}")));
+    }
+    Ok(())
 }
 
 /// Render an integer in base 2..=36 (Ruby `Integer#to_s(base)`).
@@ -8722,7 +8858,7 @@ fn dispatch_array(
                 return Ok(Value::Undef);
             }
             let mut out = Vec::new();
-            flatten_depth_into(&arr, depth, &mut out);
+            flatten_depth_into(recv, &arr, depth, &mut out, &mut Vec::new())?;
             with_host(|h| h.set_array(recv, out));
             Ok(recv.clone())
         }
@@ -8740,8 +8876,9 @@ fn dispatch_array(
         }
         "join" => {
             let sep = args.first().map(arg_str).unwrap_or_default();
-            let parts: Vec<String> = arr.iter().map(|x| with_host(|h| h.to_s(x))).collect();
-            Ok(new_str(parts.join(&sep)))
+            let mut out = String::new();
+            join_into(recv, &arr, &sep, &mut out, &mut Vec::new())?;
+            Ok(new_str(out))
         }
         // `Array#pack(fmt)` — serialize elements to a byte string per the template
         // directives (C/c a/A N/n V/v H/h). Bytes are stored as Latin-1 codepoints
@@ -8911,7 +9048,7 @@ fn dispatch_array(
                 Some(n) => as_i(n),
             };
             let mut out = Vec::new();
-            flatten_depth_into(&arr, depth, &mut out);
+            flatten_depth_into(recv, &arr, depth, &mut out, &mut Vec::new())?;
             Ok(new_arr(out))
         }
         "concat" => {
@@ -10003,14 +10140,98 @@ fn sort_by_family(
     }
 }
 
-/// Flatten at most `depth` levels; a negative `depth` means unbounded.
-fn flatten_depth_into(arr: &[Value], depth: i64, out: &mut Vec<Value>) {
+/// Flatten at most `depth` levels; a negative `depth` means unbounded. An array
+/// reached from inside itself has no flat form, and MRI says so rather than
+/// recursing:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'a=[1];a<<a;a.flatten'
+/// -e:1:in 'Array#flatten': tried to flatten recursive array (ArgumentError)
+/// ```
+///
+/// A BOUNDED depth never re-enters, so `a.flatten(1)` still answers
+/// `[1, 1, [1, [...]]]` exactly as MRI does — the guard only fires on a real
+/// cycle, not on the presence of one.
+fn flatten_depth_into(
+    this: &Value,
+    arr: &[Value],
+    depth: i64,
+    out: &mut Vec<Value>,
+    seen: &mut Vec<u32>,
+) -> Result<(), String> {
+    // Only an UNBOUNDED flatten can fail to terminate, and MRI guards only that
+    // one: a bounded depth walks the cycle as many times as it was given and
+    // answers, however deep the request.
+    //
+    // ```console
+    // $ /opt/homebrew/opt/ruby/bin/ruby -e 'a=[1];a<<a;p a.flatten(100).size'
+    // 102
+    // ```
+    let tracked = match this {
+        Value::Obj(id) if depth < 0 => {
+            if seen.contains(id) {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    "tried to flatten recursive array",
+                ));
+            }
+            seen.push(*id);
+            true
+        }
+        _ => false,
+    };
     for x in arr {
         match with_host(|h| h.as_array(x)) {
-            Some(inner) if depth != 0 => flatten_depth_into(&inner, depth - 1, out),
+            Some(inner) if depth != 0 => flatten_depth_into(x, &inner, depth - 1, out, seen)?,
             _ => out.push(x.clone()),
         }
     }
+    if tracked {
+        seen.pop();
+    }
+    Ok(())
+}
+
+/// MRI's `Array#join`: a nested Array element is joined RECURSIVELY with the
+/// same separator rather than stringified, so
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [1, [2, [3]]].join("-")'
+/// "1-2-3"
+/// ```
+///
+/// and an array reached from inside itself has no joined form:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'a=[1];a<<a;a.join(",")'
+/// -e:1:in 'Array#join': recursive array join (ArgumentError)
+/// ```
+fn join_into(
+    this: &Value,
+    items: &[Value],
+    sep: &str,
+    out: &mut String,
+    seen: &mut Vec<u32>,
+) -> Result<(), String> {
+    if let Value::Obj(id) = this {
+        if seen.contains(id) {
+            return Err(raise_exc("ArgumentError", "recursive array join"));
+        }
+        seen.push(*id);
+    }
+    for (i, x) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str(sep);
+        }
+        match with_host(|h| h.as_array(x)) {
+            Some(inner) => join_into(x, &inner, sep, out, seen)?,
+            None => out.push_str(&with_host(|h| h.to_s(x))),
+        }
+    }
+    if matches!(this, Value::Obj(_)) {
+        seen.pop();
+    }
+    Ok(())
 }
 
 fn arr_index(arr: &[Value], args: &[Value]) -> Result<Value, String> {
@@ -10282,7 +10503,11 @@ fn proc_truthy(p: &Value, elem: &Value) -> Result<bool, String> {
 fn call_lazy_call(p: &Value, args: &[Value]) -> Result<Value, String> {
     let r = call_proc(p, args)?;
     if crate::host::take_break().is_some() {
-        return Err(raise_exc("LocalJumpError", "break from proc-closure"));
+        return Err(raise_exc_with(
+            "LocalJumpError",
+            "break from proc-closure",
+            &[("reason", with_host(|h| h.new_symbol("break")))],
+        ));
     }
     Ok(r)
 }
@@ -10618,13 +10843,13 @@ fn dispatch_enumerator(
         "next" if args.is_empty() && block.is_none() => {
             match with_host(|h| h.enum_next(recv, true)) {
                 Some(v) => Ok(v),
-                None => Err(raise_exc("StopIteration", "iteration reached an end")),
+                None => Err(stop_iteration(recv)),
             }
         }
         "peek" if args.is_empty() && block.is_none() => {
             match with_host(|h| h.enum_next(recv, false)) {
                 Some(v) => Ok(v),
-                None => Err(raise_exc("StopIteration", "iteration reached an end")),
+                None => Err(stop_iteration(recv)),
             }
         }
         "rewind" if args.is_empty() && block.is_none() => {
@@ -11161,7 +11386,32 @@ fn io_err(msg: &str) -> String {
 /// generic `SystemCallError` carries the OS text (faithful message, simpler
 /// class).
 fn sys_err(op: &str, path: &str, e: &std::io::Error) -> String {
-    raise_exc("SystemCallError", &format!("{op} - {path}: {e}"))
+    let (class, fields) = match e.raw_os_error() {
+        Some(n) => (
+            errno_class(n).unwrap_or("SystemCallError"),
+            vec![("errno", Value::Int(i64::from(n)))],
+        ),
+        None => ("SystemCallError", Vec::new()),
+    };
+    raise_exc_with(class, &format!("{op} - {path}: {e}"), &fields)
+}
+
+/// The `StopIteration` an exhausted Enumerator raises. `#result` is the value
+/// the underlying `each` answered, which for a collection-backed Enumerator is
+/// the collection:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'e=[1].each; e.next; begin; e.next; rescue => x; p x.result; end'
+/// [1]
+/// ```
+fn stop_iteration(recv: &Value) -> String {
+    let result = with_host(|h| h.enum_source(recv))
+        .unwrap_or_else(|| new_arr(with_host(|h| h.enum_buf(recv)).unwrap_or_default()));
+    raise_exc_with(
+        "StopIteration",
+        "iteration reached an end",
+        &[("result", result)],
+    )
 }
 
 /// Class methods shared by `File` and `IO`. Returns `None` for a name this
@@ -12312,7 +12562,11 @@ fn dispatch_env(name: &str, args: &[Value], block: Option<Value>) -> Result<Valu
                     } else if args.len() >= 2 {
                         Ok(args[1].clone())
                     } else {
-                        Err(raise_exc("KeyError", &format!("key not found: {k:?}")))
+                        Err(raise_exc_with(
+                            "KeyError",
+                            &format!("key not found: {k:?}"),
+                            &[("key", new_str(k.clone()))],
+                        ))
                     }
                 }
             }
@@ -13585,7 +13839,11 @@ fn dispatch_hash(
                     Some(v) => out.push(v.clone()),
                     None if name == "fetch_values" && block.is_none() => {
                         let ins = with_host(|h| h.inspect(a));
-                        return Err(raise_exc("KeyError", &format!("key not found: {ins}")));
+                        return Err(raise_exc_with(
+                            "KeyError",
+                            &format!("key not found: {ins}"),
+                            &[("key", a.clone()), ("receiver", recv.clone())],
+                        ));
                     }
                     None => match &block {
                         Some(b) => out.push(call_proc(b, std::slice::from_ref(a))?),
@@ -13632,7 +13890,11 @@ fn dispatch_hash(
                 Ok(d.clone())
             } else {
                 let ins = with_host(|h| h.inspect(&args[0]));
-                Err(raise_exc("KeyError", &format!("key not found: {ins}")))
+                Err(raise_exc_with(
+                    "KeyError",
+                    &format!("key not found: {ins}"),
+                    &[("key", args[0].clone()), ("receiver", recv.clone())],
+                ))
             }
         }
         "[]=" | "store" => {
@@ -16777,10 +17039,43 @@ fn strip_trailing_zeros(s: &mut String) {
     }
 }
 
+/// The largest precision Rust's formatter accepts. Past it `format!("{:.*}", p, f)`
+/// panics with "Formatting argument out of range", and a panic is not a Ruby
+/// error — no `rescue` can see it. MRI has no such ceiling.
+const FMT_PREC_CAP: usize = u16::MAX as usize;
+
+/// `format!("{:.*}", prec, f)` without Rust's precision ceiling. Every finite
+/// `f64` has an exact decimal expansion of at most ~1080 places, so everything
+/// past the cap is zero padding and appending it is exact:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p sprintf("%.70000f", 1.5).size'
+/// 70002
+/// ```
+fn fixed(f: f64, prec: usize) -> String {
+    if prec <= FMT_PREC_CAP {
+        return format!("{:.*}", prec, f);
+    }
+    format!("{:.*}{}", FMT_PREC_CAP, f, "0".repeat(prec - FMT_PREC_CAP))
+}
+
+/// [`fixed`] for the `{:.*e}` form: the padding belongs on the MANTISSA, before
+/// the exponent marker.
+fn sci(f: f64, prec: usize) -> String {
+    if prec <= FMT_PREC_CAP {
+        return format!("{:.*e}", prec, f);
+    }
+    let raw = format!("{:.*e}", FMT_PREC_CAP, f);
+    match raw.split_once('e') {
+        Some((mant, exp)) => format!("{mant}{}e{exp}", "0".repeat(prec - FMT_PREC_CAP)),
+        None => raw,
+    }
+}
+
 /// Render a non-negative finite float in `%e`/`%E` form with Ruby's exponent
 /// style (sign + at-least-two digits): `1.23e+04`.
 fn fmt_e(f: f64, prec: usize, upper: bool, alt: bool) -> String {
-    let raw = format!("{:.*e}", prec, f);
+    let raw = sci(f, prec);
     let (mant, exp) = raw.split_once('e').unwrap();
     let mut mant = mant.to_string();
     if alt && !mant.contains('.') {
@@ -16796,14 +17091,14 @@ fn fmt_e(f: f64, prec: usize, upper: bool, alt: bool) -> String {
 fn fmt_g(f: f64, prec: usize, upper: bool, alt: bool) -> String {
     let p = if prec == 0 { 1 } else { prec };
     // Exponent after rounding to `p` significant digits.
-    let raw = format!("{:.*e}", p - 1, f);
+    let raw = sci(f, p - 1);
     let e: i32 = raw
         .split_once('e')
         .and_then(|(_, x)| x.parse().ok())
         .unwrap_or(0);
     if e >= -4 && e < p as i32 {
         let frac = (p as i32 - 1 - e).max(0) as usize;
-        let mut s = format!("{:.*}", frac, f);
+        let mut s = fixed(f, frac);
         if !alt {
             strip_trailing_zeros(&mut s);
         } else if !s.contains('.') {
@@ -17122,7 +17417,7 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
                         sign = " ";
                     }
                     let p = prec.unwrap_or(6);
-                    let mut s = format!("{:.*}", p, f.abs());
+                    let mut s = fixed(f.abs(), p);
                     if alt && !s.contains('.') {
                         s.push('.');
                     }
@@ -18071,7 +18366,13 @@ fn do_require(args: &[Value], mode: ReqMode) -> Result<Value, String> {
         ReqMode::Relative => resolve_relative(&raw),
         ReqMode::Load => resolve_load(&raw),
     }
-    .ok_or_else(|| raise_exc("LoadError", &format!("cannot load such file -- {raw}")))?;
+    .ok_or_else(|| {
+        raise_exc_with(
+            "LoadError",
+            &format!("cannot load such file -- {raw}"),
+            &[("path", new_str(raw.to_string()))],
+        )
+    })?;
     let abs_str = abs.to_string_lossy().to_string();
 
     // `require`/`require_relative` dedup on the absolute path; `load` never does.
@@ -18759,6 +19060,21 @@ pub(crate) fn raise_exc(class: &str, msg: &str) -> String {
     msg.to_string()
 }
 
+/// [`raise_exc`], plus the STRUCTURED fields MRI exposes on the raised object.
+/// A correct message under an object that answers no `#key`, `#errno`,
+/// `#receiver` or `#result` is still a divergence: those readers are how real
+/// `rescue` bodies branch, and a string audit cannot see them missing.
+pub(crate) fn raise_exc_with(class: &str, msg: &str, fields: &[(&str, Value)]) -> String {
+    let exc = with_host(|h| h.new_exception(class, msg));
+    with_host(|h| {
+        for (k, v) in fields {
+            h.set_ivar_of(&exc, k, v.clone());
+        }
+        h.set_pending_exc(exc);
+    });
+    msg.to_string()
+}
+
 /// Raise `FrozenError` when `name` is a mutating method (any `!`-suffixed method,
 /// or one of the explicit `mutators`) and `recv` is frozen — MRI's
 /// `can't modify frozen <Class>: <inspect>`. A no-op for unfrozen receivers, so
@@ -18767,9 +19083,10 @@ fn frozen_guard(recv: &Value, name: &str, mutators: &[&str]) -> Result<(), Strin
     let is_mutator = (name.len() > 1 && name.ends_with('!')) || mutators.contains(&name);
     if is_mutator && with_host(|h| h.is_frozen(recv)) {
         let (cls, insp) = with_host(|h| (h.class_of(recv).to_string(), h.inspect(recv)));
-        return Err(raise_exc(
+        return Err(raise_exc_with(
             "FrozenError",
             &format!("can't modify frozen {cls}: {insp}"),
+            &[("receiver", recv.clone())],
         ));
     }
     Ok(())

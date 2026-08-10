@@ -32,6 +32,15 @@ fn corpus_matches_reference_ruby() {
 
     let snips = snippets(corpus);
     let wants = expected_blocks(expected);
+    // The comparison loop below is over `snips`; an empty corpus runs zero
+    // iterations and the terminal `failures.is_empty()` passes having compared
+    // nothing. This is the CI replay of the whole differential harness, so a
+    // corpus that silently stopped parsing must fail, not report green.
+    assert!(
+        !snips.is_empty(),
+        "tests/data/parity_corpus.rb parsed to zero snippets — the replay below \
+         would pass having run nothing"
+    );
     assert_eq!(
         snips.len(),
         wants.len(),

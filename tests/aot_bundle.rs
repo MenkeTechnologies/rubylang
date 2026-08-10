@@ -164,9 +164,21 @@ fn mri_parity_for_bundled_app() {
     let (bundled, e3, o3) = run_home(&home, &[], &a);
     assert!(o3, "{e3}");
 
+    // A frozen literal, not just `direct == bundled`. Without it this test was
+    // rubylang compared against rubylang on any host with no MRI installed: a
+    // regression that broke BOTH paths identically passed, and nothing said so.
+    // Pinned from ruby 4.0.6 at /opt/homebrew/opt/ruby/bin/ruby.
+    let expected = "CB\n";
+    assert_eq!(direct, expected, "direct output");
+    assert_eq!(bundled, expected, "bundled output");
     assert_eq!(direct, bundled, "direct vs bundled");
-    if let Some(ref_out) = mri(&a) {
-        assert_eq!(bundled, ref_out, "bundled vs MRI");
+    match mri(&a) {
+        Some(ref_out) => assert_eq!(bundled, ref_out, "bundled vs MRI"),
+        None => eprintln!(
+            "SKIPPED WITNESS: mri_parity_for_bundled_app ran its frozen-literal \
+             assertions but NOT the MRI comparison — rubylang::oracle::find() \
+             resolved no verified MRI on this host"
+        ),
     }
 
     std::fs::remove_dir_all(&dir).ok();

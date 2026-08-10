@@ -483,3 +483,81 @@ fn the_oracle_refuses_a_rubylang_that_no_path_check_could_catch() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Runaway recursion is a RESCUABLE `SystemStackError`, never a process abort.
+///
+/// This is pinned at the BINARY entry point on purpose. The interpreter runs on
+/// a worker thread with a 1 GB stack (`src/main.rs`), so the depth at which
+/// recursion is refused is a property of the entry point, not of the language —
+/// an in-process `eval_to_string` test would measure the test harness's much
+/// smaller thread stack instead and prove nothing about `ruby -e`.
+///
+/// Recursion through a BLOCK — `Proc#call`, a `define_method` body, a Hash
+/// default proc — pushes no interpreter frame, so the frame-depth guard could
+/// not see it and the native stack overflowed:
+///
+/// ```console
+/// $ ruby -e 'h = Hash.new { |hh, k| hh[k] }; h[:a]'
+/// fatal runtime error: stack overflow, aborting
+/// ```
+///
+/// MRI raises for every shape below, and `rescue SystemStackError` catches it:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'h = Hash.new { |hh, k| hh[k] }; h[:a]'
+/// -e:1:in 'block in <main>': stack level too deep (SystemStackError)
+/// ```
+#[test]
+fn runaway_recursion_raises_a_rescuable_error_rather_than_aborting_the_process() {
+    let caught = |src: &str| {
+        let probe = format!("begin; {src}; rescue SystemStackError; print :stack_error; end");
+        let (out, err, ok) = run(&["-e", &probe], "", None);
+        assert!(
+            ok,
+            "`{src}` did not exit cleanly — stderr: {err}\nstdout: {out}"
+        );
+        assert!(
+            !err.contains("stack overflow") && !err.contains("panicked"),
+            "`{src}` aborted instead of raising — stderr: {err}"
+        );
+        out
+    };
+
+    // Through a block: none of these pushes an interpreter frame.
+    assert_eq!(
+        caught("h = Hash.new { |hh, k| hh[k] }; h[:a]"),
+        "stack_error"
+    );
+    assert_eq!(
+        caught("f = nil; f = ->() { f.call }; f.call"),
+        "stack_error"
+    );
+    assert_eq!(
+        caught("f = nil; f = proc { f.call }; f.call"),
+        "stack_error"
+    );
+    assert_eq!(
+        caught("c = Class.new { define_method(:g) { g } }; c.new.g"),
+        "stack_error"
+    );
+    // Through a method body: the guard this mirrors, pinned so the two stay
+    // consistent with each other.
+    assert_eq!(caught("def m; m; end; m"), "stack_error");
+    assert_eq!(
+        caught("c = Class.new { def method_missing(n, *a); send(n); end }; c.new.zz"),
+        "stack_error"
+    );
+
+    // Neither guard fires on ordinary depth: a bounded block chain answers, and
+    // so does ordinary nesting.
+    let (out, err, ok) = run(
+        &[
+            "-e",
+            "f = ->(n) { n.zero? ? 0 : f.call(n - 1) }; print f.call(900)",
+        ],
+        "",
+        None,
+    );
+    assert!(ok, "bounded block recursion failed: {err}");
+    assert_eq!(out, "0", "900 nested block calls must still answer");
+}

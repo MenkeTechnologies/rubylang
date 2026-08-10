@@ -7859,3 +7859,336 @@ fn out_of_domain_arguments_raise_rather_than_wrapping_or_answering_nan() {
         "[\"Math::DomainError\", \"Numerical argument is out of domain - \\\"isqrt\\\"\"]",
     );
 }
+
+/// A container that reaches ITSELF has no finite rendering, no flat form, and
+/// no terminating structural walk. Every one of these operations recursed until
+/// the native stack overflowed and the process ABORTED (`fatal runtime error:
+/// stack overflow`, rc=134) — an abort, unlike an exception, is invisible to
+/// `rescue`, so no Ruby program could defend against it.
+///
+/// Every value below is a recorded run of ruby 4.0.6 at
+/// /opt/homebrew/opt/ruby/bin/ruby, e.g.
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'a=[1];a<<a;p a'
+/// [1, [...]]
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'a=[1];a<<a;a.join(",")'
+/// -e:1:in 'Array#join': recursive array join (ArgumentError)
+/// ```
+#[test]
+fn a_container_that_holds_itself_answers_instead_of_aborting() {
+    // Rendering elides the re-entry rather than recursing.
+    eq("a=[1];a<<a;a.inspect", "\"[1, [...]]\"");
+    eq("a=[1];a<<a;a.to_s", "\"[1, [...]]\"");
+    eq("h={};h[:a]=h;h.inspect", "\"{a: {...}}\"");
+    eq(
+        "require 'set';s=Set.new;s<<s;s.inspect",
+        "\"Set[Set[...]]\"",
+    );
+    eq(
+        "S=Struct.new(:a);x=S.new(nil);x.a=x;x.inspect",
+        "\"#<struct S a=#<struct S:...>>\"",
+    );
+    // A cycle one level down, and a two-object cycle.
+    eq("n=[1];n<<[n];n.inspect", "\"[1, [[...]]]\"");
+    eq("x=[];y=[x];x<<y;x.inspect", "\"[[[...]]]\"");
+    // The marker is for RE-ENTRY, not for repetition: the same array twice in a
+    // list renders twice, because the first render pops before the second.
+    eq("x=[1];[x,x].inspect", "\"[[1], [1]]\"");
+
+    // Structural walks terminate and answer.
+    eq("a=[1];a<<a;a.hash.class", "Integer");
+    eq("h={};h[:a]=h;h.hash.class", "Integer");
+    eq("a=[1];a<<a;a == a.dup", "true");
+    eq("a=[1];a<<a;a.eql?(a)", "true");
+    eq("a=[1];a<<a;b=[1];b<<b;a == b", "true");
+    eq("a=[1];a<<a;b=[2];b<<b;a == b", "false");
+    eq("a=[1];a<<a;[a,a].uniq.size", "1");
+    eq("a=[1];a<<a;h={};h[a]=1;h.size", "1");
+
+    // The two operations MRI refuses outright.
+    raises(
+        "a=[1];a<<a;a.join(\",\")",
+        "ArgumentError",
+        "recursive array join",
+    );
+    raises(
+        "a=[1];a<<a;a.flatten",
+        "ArgumentError",
+        "tried to flatten recursive array",
+    );
+    raises(
+        "a=[1];a<<a;a.flatten!",
+        "ArgumentError",
+        "tried to flatten recursive array",
+    );
+    // A BOUNDED flatten cannot fail to terminate, so MRI does not guard it: it
+    // walks the cycle exactly as many times as asked, however deep.
+    eq("a=[1];a<<a;a.flatten(0).size", "2");
+    eq("a=[1];a<<a;a.flatten(1)", "[1, 1, [1, [...]]]");
+    eq("a=[1];a<<a;a.flatten(3).size", "5");
+    eq("a=[1];a<<a;a.flatten(100).size", "102");
+}
+
+/// `Array#join` joins a nested Array RECURSIVELY with the same separator; it
+/// does not stringify it. Pinned from ruby 4.0.6:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [1, [2, [3]]].join("-")'
+/// "1-2-3"
+/// ```
+#[test]
+fn join_flattens_nested_arrays_with_the_same_separator() {
+    eq("[[1,2],[3]].join(\",\")", "\"1,2,3\"");
+    eq("[1,[2,[3]]].join(\"-\")", "\"1-2-3\"");
+    eq("[1,nil,2].join(\",\")", "\"1,,2\"");
+    eq("[].join(\",\")", "\"\"");
+    eq("[[]].join(\",\")", "\"\"");
+    eq("[1,[]].join(\",\")", "\"1,\"");
+}
+
+/// A radix outside 2..=36 reached `num-bigint`'s `to_str_radix`, which PANICS
+/// ("The radix must be within 2...36"); the fixnum path silently answered base
+/// 10 instead. MRI refuses both, and distinguishes an out-of-range radix from
+/// one that does not fit a C `int`:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e '255.to_s(37)'
+/// -e:1:in 'Integer#to_s': invalid radix 37 (ArgumentError)
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e '1.to_s(2**40)'
+/// -e:1:in 'Integer#to_s': integer 1099511627776 too big to convert to 'int' (RangeError)
+/// ```
+#[test]
+fn an_out_of_range_radix_is_refused_not_panicked_on() {
+    for base in ["1", "0", "-3", "37", "99"] {
+        raises(
+            &format!("255.to_s({base})"),
+            "ArgumentError",
+            &format!("invalid radix {base}"),
+        );
+        raises(
+            &format!("(10**30).to_s({base})"),
+            "ArgumentError",
+            &format!("invalid radix {base}"),
+        );
+    }
+    raises(
+        "1.to_s(2**40)",
+        "RangeError",
+        "integer 1099511627776 too big to convert to 'int'",
+    );
+    // The radices Ruby does render still render, at both integer widths.
+    eq("255.to_s(16)", "\"ff\"");
+    eq("255.to_s(2)", "\"11111111\"");
+    eq("255.to_s(36)", "\"73\"");
+    eq("(10**30).to_s(16)", "\"c9f2c9cd04674edea40000000\"");
+    eq("255.to_s", "\"255\"");
+}
+
+/// Rust's formatter panics ("Formatting argument out of range") for a precision
+/// above `u16::MAX`, and a panic is not a Ruby error. MRI has no such ceiling:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p sprintf("%.70000f", 1.5).size'
+/// 70002
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p sprintf("%.70000e", 1.5).size'
+/// 70006
+/// ```
+#[test]
+fn a_precision_past_rusts_formatter_ceiling_still_formats() {
+    eq("sprintf(\"%.70000f\", 1.5).size", "70002");
+    eq("sprintf(\"%.70000e\", 1.5).size", "70006");
+    eq("sprintf(\"%.70000g\", 1.5).size", "3");
+    // Exactly at and either side of the ceiling.
+    eq("sprintf(\"%.65535f\", 1.0).size", "65537");
+    eq("sprintf(\"%.65536f\", 1.0).size", "65538");
+    // Everything past the value's exact decimal expansion is zero padding, so
+    // the tail the padding produces is the tail MRI produces.
+    eq(
+        "sprintf(\"%.70000f\", 1.5).end_with?(\"0\" * 60000)",
+        "true",
+    );
+    eq("sprintf(\"%.70000f\", 1.5).start_with?(\"1.5\")", "true");
+    // The ordinary precisions are unchanged.
+    eq("sprintf(\"%.3f\", 1.5)", "\"1.500\"");
+    eq("sprintf(\"%.2e\", 1234.5)", "\"1.23e+03\"");
+}
+
+/// An exception's SHAPE, not its wording. A right message under an object that
+/// answers no `#key`, `#errno`, `#receiver` or `#result` is a divergence a
+/// message audit cannot see: those readers are how a `rescue` body branches.
+///
+/// Pinned from ruby 4.0.6 at /opt/homebrew/opt/ruby/bin/ruby:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'begin; {a: 1}.fetch(:k); rescue => e; p [e.key, e.receiver]; end'
+/// [:k, {a: 1}]
+/// ```
+#[test]
+fn an_exception_carries_the_structured_fields_mri_puts_on_it() {
+    let after = |src: &str, read: &str| format!("begin; {src}; rescue => e; {read}; end");
+
+    // KeyError names the key it missed AND the collection it missed in.
+    eq(
+        &after("{a: 1}.fetch(:k)", "[e.class.to_s, e.key, e.receiver]"),
+        "[\"KeyError\", :k, {a: 1}]",
+    );
+    eq(&after("{}.fetch(:k)", "e.key"), ":k");
+    eq(
+        &after("{a: 1}.fetch_values(:a, :k)", "[e.key, e.receiver]"),
+        "[:k, {a: 1}]",
+    );
+
+    // StopIteration#result is what the underlying `each` answered.
+    eq(&after("e2=[1].each; e2.next; e2.next", "e.result"), "[1]");
+    eq(
+        &after("e2=[].each; e2.next", "[e.class.to_s, e.result]"),
+        "[\"StopIteration\", []]",
+    );
+
+    // FrozenError names the object that could not be modified.
+    eq(
+        &after("[1].freeze << 2", "[e.class.to_s, e.receiver]"),
+        "[\"FrozenError\", [1]]",
+    );
+    eq(&after("\"a\".freeze << \"b\"", "e.receiver"), "\"a\"");
+    eq(
+        &after("h={a: 1}.freeze; h.delete(:a)", "e.receiver"),
+        "{a: 1}",
+    );
+    eq(
+        &after(
+            "Object.new.freeze.instance_variable_set(:@a, 1)",
+            "e.class.to_s",
+        ),
+        "\"FrozenError\"",
+    );
+
+    // LoadError names the path it could not load. It is caught by NAME, not by
+    // a bare `rescue`: LoadError descends from ScriptError, not StandardError,
+    // in rubylang exactly as in MRI.
+    eq(
+        "begin; require 'no_such_lib_xyz'; rescue LoadError => e; [e.class.to_s, e.path]; end",
+        "[\"LoadError\", \"no_such_lib_xyz\"]",
+    );
+    eq(
+        "begin; (begin; require 'no_such_lib_xyz'; rescue => e; :bare_caught_it; end); rescue LoadError; :fell_through_bare_rescue; end",
+        ":fell_through_bare_rescue",
+    );
+
+    // LocalJumpError names why the jump had nowhere to go. (`proc { break }.call`
+    // is the other shape MRI raises for; rubylang still swallows that one — see
+    // BUGS.md — so the reader is pinned on the shape that does raise.)
+    eq(
+        &after("def m; yield; end; m", "[e.class.to_s, e.reason]"),
+        "[\"LocalJumpError\", :noreason]",
+    );
+
+    // NoMethodError#args is an Array, never nil, so a caller can splat it.
+    eq(
+        &after("1.nope", "[e.class.to_s, e.name, e.args]"),
+        "[\"NoMethodError\", :nope, []]",
+    );
+
+    // NameError#name is nil — not an empty Symbol — when the raise carried none.
+    eq(&after("raise NameError, \"x\"", "e.name"), "nil");
+}
+
+/// `Exception#inspect` is the class WRAPPING the message, not the message. `p e`
+/// in a rescue body printed a bare sentence with no indication of what was
+/// raised.
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p RuntimeError.new("x")'
+/// #<RuntimeError: x>
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ArgumentError.new("")'
+/// ArgumentError
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p RuntimeError.new("a\nb").inspect'
+/// "#<RuntimeError:\"a\\nb\">"
+/// ```
+#[test]
+fn exception_inspect_names_the_class_not_only_the_message() {
+    eq("RuntimeError.new(\"x\").inspect", "\"#<RuntimeError: x>\"");
+    eq(
+        "ArgumentError.new(\"m\").inspect",
+        "\"#<ArgumentError: m>\"",
+    );
+    // An empty message degrades to the bare class name.
+    eq("ArgumentError.new(\"\").inspect", "\"ArgumentError\"");
+    // A multi-line message is inspected and loses the space, so the form stays
+    // on one line.
+    eq(
+        "RuntimeError.new(\"a\\nb\").inspect",
+        "\"#<RuntimeError:\\\"a\\\\nb\\\">\"",
+    );
+    // `#message` and `#to_s` are unchanged — only `#inspect` wraps.
+    eq(
+        "e = RuntimeError.new(\"x\"); [e.message, e.to_s, e.inspect]",
+        "[\"x\", \"x\", \"#<RuntimeError: x>\"]",
+    );
+    eq(
+        "begin; Integer(\"z\"); rescue => e; e.inspect; end",
+        "\"#<ArgumentError: invalid value for Integer(): \\\"z\\\">\"",
+    );
+    eq(
+        "begin; 1.nope; rescue => e; e.inspect; end",
+        "\"#<NoMethodError: undefined method 'nope' for an instance of Integer>\"",
+    );
+}
+
+/// A filesystem failure raises the SPECIFIC `Errno::*` class, under
+/// `SystemCallError`, carrying its `errno`. It used to raise one flat
+/// `SystemCallError` with no number, so `rescue Errno::ENOENT` — the ordinary
+/// way to tell "missing" from "denied" — never matched.
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'begin; File.read("/nope/xyz"); rescue => e; p [e.class, e.class.superclass, e.errno]; end'
+/// [Errno::ENOENT, SystemCallError, 2]
+/// ```
+///
+/// The errno NUMBERS come from `libc` at compile time, never from a literal:
+/// `ENOTEMPTY` is 66 on macOS and 39 on Linux, so a hardcoded table would name
+/// the wrong class on one of the two platforms rubylang targets.
+#[test]
+fn a_filesystem_failure_raises_its_specific_errno_class() {
+    let after = |src: &str, read: &str| format!("begin; {src}; rescue => e; {read}; end");
+
+    eq(
+        &after("File.read(\"/nope/xyz\")", "[e.class.to_s, e.errno]"),
+        "[\"Errno::ENOENT\", 2]",
+    );
+    eq(
+        &after(
+            "File.read(\"/nope/xyz\")",
+            "e.class.ancestors[0, 4].map(&:to_s)",
+        ),
+        "[\"Errno::ENOENT\", \"SystemCallError\", \"StandardError\", \"Exception\"]",
+    );
+    eq(
+        &after("Dir.mkdir(\"/nope/xyz/abc\")", "e.class.to_s"),
+        "\"Errno::ENOENT\"",
+    );
+
+    // The class is REACHABLE by name, which is the point: each of these rescue
+    // clauses has to match (or not) on its own.
+    eq(
+        "begin; File.read(\"/nope/xyz\"); rescue Errno::EACCES; :wrong; rescue Errno::ENOENT; :right; end",
+        ":right",
+    );
+    eq(
+        "begin; File.read(\"/nope/xyz\"); rescue SystemCallError => e; e.class.to_s; end",
+        "\"Errno::ENOENT\"",
+    );
+    // And a bare `rescue` still catches it, because SystemCallError is a
+    // StandardError.
+    eq(
+        &after("File.read(\"/nope/xyz\")", ":caught_by_bare_rescue"),
+        ":caught_by_bare_rescue",
+    );
+
+    // The constants resolve as values, not as a method call on nil.
+    eq("Errno::ENOENT.to_s", "\"Errno::ENOENT\"");
+    eq("Errno::ENOENT.superclass.to_s", "\"SystemCallError\"");
+    eq("defined?(Errno::ENOENT)", "\"constant\"");
+    eq("Errno.to_s", "\"Errno\"");
+}

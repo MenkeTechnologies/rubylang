@@ -81,6 +81,8 @@ so a gap can be closed on purpose rather than stumbled into.
 | `parity-fuzz` | Output produced before a timeout | `run_with_timeout` discards stdout on the timeout path and reports an empty buffer | Open |
 | `parity-fuzz` | A hang that both sides share | Two timeouts compare equal and count as parity | Open — cannot be distinguished from agreement without a reference runtime |
 | `parity-fuzz` | Locale- or TZ-dependent behaviour | Neither `run_oracle` nor `run_ours` pins `LANG`/`LC_ALL`/`TZ`; both inherit the developer's ambient environment, so a divergence that only appears under another locale cannot appear here | Open — see the locale note below |
+| all harnesses | A PANIC or ABORT on a degenerate input | Every generator and every frozen corpus builds a WELL-FORMED program, so a self-referential container, an out-of-range radix and a past-`u16::MAX` precision were all unreachable — the nine abort shapes above were found by hand-built degenerate input, not by any harness | Open — the shapes are now pinned as regression tests, but nothing GENERATES new ones |
+| all harnesses | The exception CLASS and its attribute readers | `bin/parity` and `tests/parity.rs` compare stdout, so a snippet that prints nothing and raises is invisible; `parity-fuzz --stderr` compares the message TEXT, which is identical when only the class or a missing `#key`/`#errno` differs | Open — the Theme-C findings above came from probes that print `e.class`/`e.key`/`e.errno` explicitly |
 | all generators | Type-mismatched operands | Every generator built a WELL-TYPED program, so the whole implicit-conversion surface was unreachable | **Closed** — `typeerr` mode; it found 21 real divergences on its first outing |
 | all generators | Anything involving `Time` | The determinism invariant bans `Time`, and the ban was read as covering the class rather than the clock — but `Time.at(<const>)` is deterministic | **Closed** — `timefmt` mode; ten `strftime` directives were unimplemented behind it |
 
@@ -206,6 +208,159 @@ escapes the C0 controls, DEL, the C1 controls and U+2028/U+2029, which covers
 every character that occurs in practice, and prints assigned-but-unusual
 codepoints raw where MRI would escape them. Closing this needs a Unicode
 category table, which is a dependency decision rather than a bug fix.
+
+## An abort is not an exception
+
+MRI's failures are all catchable. rubylang's were not: eight shapes ended the
+process with `fatal runtime error: stack overflow, aborting` (rc=134) or a Rust
+`panicked at …` (rc=101 / rc=1) rather than raising. A `rescue` cannot see
+either, so no Ruby program could defend against them, and the happy path
+matching hid every one. All eight are closed; the census below is the record of
+where they were, because the same shape recurs wherever a walk has no base case.
+
+| Shape | Was | MRI | Closed by |
+| --- | --- | --- | --- |
+| `a=[1];a<<a; p a` (also `to_s`, Hash, Set, Struct) | stack-overflow abort | `[1, [...]]` | `RubyHost::cycle_marker` + the `rendering` stack |
+| `a=[1];a<<a; a.join(",")` | stack-overflow abort | `ArgumentError: recursive array join` | `join_into` |
+| `a=[1];a<<a; a.flatten` | stack-overflow abort | `ArgumentError: tried to flatten recursive array` | `flatten_depth_into` |
+| `a=[1];a<<a; a.hash` / `h[a]=1` | stack-overflow abort | a finite Integer | `to_key_seen` + `RKey::Recursive` |
+| `a=[1];a<<a; a == a.dup` | stack-overflow abort | `true` | `EQ_PAIRS` |
+| `a=[1];a<<a; a.eql?(a)` / `uniq` | stack-overflow abort | `true` | `EQL_PAIRS` |
+| `h = Hash.new { \|hh,k\| hh[k] }; h[:a]` (also `Proc#call`, `define_method`) | stack-overflow abort | `SystemStackError` | `ProcDepth` in `call_proc_self_ctx` |
+| `(10**30).to_s(1)` | `panicked at num-bigint … The radix must be within 2...36` | `ArgumentError: invalid radix 1` | `check_radix` |
+| `sprintf("%.65536f", 1.0)` (also `%e`, `%g`) | `panicked at … Formatting argument out of range` | the formatted string | `fixed` / `sci` |
+
+Three things about the fixes are worth stating, because each was wrong once:
+
+- **The elision marker is for RE-ENTRY, not repetition.** `rendering` is a
+  STACK, not a set: `x = [1]; [x, x].inspect` is `[[1], [1]]` because the first
+  render pops before the second begins. A set would have printed `[[1], [...]]`.
+- **A BOUNDED `flatten` cannot fail to terminate, so MRI does not guard it.**
+  The first fix raised for `a.flatten(1)`, where MRI answers
+  `[1, 1, [1, [...]]]`. MRI's detection is armed only for the unbounded form;
+  `a.flatten(100)` walks the cycle a hundred times and answers a 102-element
+  array. The guard now arms only when `depth < 0`.
+- **`==` and `eql?` need SEPARATE pair stacks.** Sharing one made
+  `class Z; def ==(o); true; end; end; Z.new.eql?(Z.new)` answer true where MRI
+  answers false: `eql?` falls through to `==` for a non-container, so an
+  in-flight `eql?` was satisfying the very `==` it delegated to. Caught by
+  `tests/eval.rs::eql_is_equality_with_numeric_class_strictness`, which is the
+  reason that test exists.
+
+The block-recursion ceiling is 2000 nested activations, the same number
+`run_method` applies to `def` bodies. Blocks do not push a `Frame` — they swap
+`active_scope` — which is exactly why the frame-depth guard could not see them.
+Native exhaustion is between 8000 and 16000 on the interpreter's 1 GB worker
+thread (`src/main.rs`), measured, so the guard sits an order of magnitude clear
+of it. Pinned at the BINARY entry point by
+`tests/entry_points.rs::runaway_recursion_raises_a_rescuable_error_rather_than_aborting_the_process`:
+an in-process `eval_to_string` test would measure the test harness's much
+smaller thread stack and prove nothing about `ruby -e`.
+
+### Still aborts nothing, but still diverges
+
+- **`proc { break }.call` is swallowed.** MRI raises
+  `LocalJumpError: break from proc-closure` with `#reason == :break`; rubylang
+  evaluates it to nil and prints nothing. The raise site exists and now records
+  `#reason`, but the `break` signal from a stored proc never reaches it. The
+  other `LocalJumpError` shape (`def m; yield; end; m`) does raise, with
+  `#reason == :noreason`, and is pinned.
+- **A bare undefined identifier answers nil instead of raising.** `p nope` is
+  `nil` where MRI raises `NameError: undefined local variable or method 'nope'`,
+  and `p Nope` likewise. Only the CALL form raises (`nope()` is a
+  `NoMethodError`). This is broader than the "some unimplemented constants
+  answer nil" note at the top of this file — it is every bareword — and it makes
+  a typo in a variable name silently produce nil rather than stopping the
+  program. Not fixed here: the read path lowers a bareword to a load that
+  defaults to `Value::Undef`, so closing it is a compiler change, not a builtin
+  one.
+- **`p obj` does not dispatch a user-defined `#inspect`**, and `Array#join` does
+  not dispatch a user-defined `#to_s`. `Class.new { def inspect; "Y"; end }.new`
+  inspects as `#<#<Class:1>>` rather than `Y`; `[obj].join(",")` stringifies the
+  default form rather than calling the object's `to_s`.
+
+## Exception SHAPE, not exception wording
+
+A right message under the wrong class — or under an object that answers no
+`#key`, `#errno`, `#receiver` or `#result` — is a divergence no message audit
+can see, because those readers are how a `rescue` body branches. Closed here:
+
+| Reader | Was | Now |
+| --- | --- | --- |
+| `Exception#inspect` | the bare message (`"x"`) | `#<RuntimeError: x>`; a bare class name for an empty message; the message INSPECTED (and the space dropped) when it is multi-line |
+| `KeyError#key` / `#receiver` | `NoMethodError` | the missed key and the collection |
+| `StopIteration#result` | `NoMethodError` | what the underlying `each` answered |
+| `LoadError#path` | `NoMethodError` | the path that would not load |
+| `SystemCallError#errno` | `NoMethodError` | the OS error number |
+| `FrozenError#receiver` | `nil` | the object that could not be modified |
+| `NoMethodError#args` / `#private_call?` | `NoMethodError` | `[]` / `false` |
+| `LocalJumpError#reason` | `NoMethodError` | `:noreason` / `:break` |
+| `NameError#name` with no name | `:""` | `nil`, as MRI answers for `raise NameError, "x"` |
+| the `Errno::*` family | one flat `SystemCallError` | the specific class, `rescue`-able by name (see File/IO) |
+
+`raise_exc_with` is the mechanism: it records the structured fields on the
+exception object at the raise site, where they are known. A hand-constructed
+exception (`KeyError.new("m")`) answers nil for them, as MRI's does.
+
+**Not closed, and why:**
+
+- **`NoMethodError#receiver` and `#args` are empty for a native miss.** The
+  dispatcher reports an undefined method by returning a bare `Err(String)`;
+  the exception object is synthesized later by `infer_exc_class`, which has only
+  the message. `#name` survives because it is parseable out of the message text;
+  the receiver and the argument list are not. Converting those sites to
+  `raise_exc_with` is the fix, and it touches every `undefined method` raise in
+  the dispatcher.
+- **`Exception#backtrace` is `[]`, never `nil` and never populated.** MRI
+  answers `nil` for an exception that was never raised and a real frame list for
+  one that was. rubylang retains no per-exception Ruby backtrace (see the line-0
+  note above), so both cases answer the same empty Array. Callers splat it or
+  call `.first` on it, so `[]` is the safer of the two wrong answers.
+- **`Exception#full_message` takes no keyword arguments.**
+  `full_message(highlight: false, order: :top)` raises
+  `ArgumentError: wrong number of arguments (given 1, expected 0)`.
+- **`eval` reports a syntax error as a `RuntimeError`.** MRI raises
+  `SyntaxError`, which is a `ScriptError` and therefore NOT caught by a bare
+  `rescue`; rubylang's is caught by one. The class tree is right —
+  `builtin_exception_parent` already puts `SyntaxError` under `ScriptError` —
+  but the eval path does not raise it.
+- **`exit(3)` is not rescuable as `SystemExit`**, and an uncaught `throw` is not
+  rescuable as `UncaughtThrowError`. Both terminate instead of raising an object
+  a handler can inspect.
+- **MRI's `DidYouMean::Correctable` / `ErrorHighlight::CoreExt` do not appear in
+  `ancestors`.** These are gems MRI injects into `NameError`/`KeyError`/
+  `TypeError`. Deliberately absent — rubylang emits no "did you mean"
+  suggestions at all — so the ancestor lists are one or two entries shorter than
+  MRI's while the class itself and its real superclass chain match.
+
+## A test that can pass having asserted nothing
+
+Two sibling frontends shipped tests that reported PASS while executing zero
+assertions. A census of all 439 `#[test]` functions here found 17 with the same
+shape; every one is now either loud or visibly reported. The rule applied: a
+test may skip only through a mechanism a reader of the output can SEE, and it
+may not skip at all when the condition it gates on cannot legitimately be false.
+
+| File | Was | Now |
+| --- | --- | --- |
+| `tests/ffi.rs` (2) | `if !rustc_available() { return }` — one of them with no message at all | `require_rustc()` ASSERTS. This file is compiled and linked by the very `rustc` it was checking for, so a missing one is a broken environment, not an unsupported one |
+| `tests/aot_native.rs` (2) | `if !toolchain_ready() { eprintln!; return }` | `require_toolchain()` asserts both halves. `librubylang.rlib` is produced by the same `cargo test` that runs the test, so its absence is a build-layout regression |
+| `tests/aot_bundle.rs::mri_parity_for_bundled_app` | no frozen literal at all: with no MRI installed it was `assert_eq!(direct, bundled)` — rubylang against rubylang | a frozen `"CB\n"` measured from ruby 4.0.6, asserted unconditionally, plus a `SKIPPED WITNESS:` line when the oracle resolves nothing |
+| `tests/aot_native.rs::native_binary_matches_mri_when_available` | silent when the oracle was absent | same `SKIPPED WITNESS:` line; its frozen literal already fired |
+| `tests/name_keys.rs` (6) | `assert_sorted` is `for pair in keys.windows(2)`, which yields NOTHING for a 0- or 1-element slice | `assert_sorted` requires `len() > 1`; `lsp_corpus_…` requires a non-empty corpus |
+| `tests/examples.rs::provenance_covers_every_example` | two empty-tolerant loops — an all-comment TSV checked no label, an empty `examples/` compared no coverage | both sources pinned non-empty first |
+| `tests/parity.rs::corpus_matches_reference_ruby` | no non-empty guard on the corpus; a corpus that stopped parsing passes | `!snips.is_empty()` |
+| `tests/fiddle.rs` (4) | `assert!(out == "5" \|\| out == ":unresolved")` — nothing distinguished a verified C call from the escape | `assert_call` prints `SKIPPED C CALL:` when the sentinel fires, and a new `fiddle_core_libc_symbols_resolve` fails if `strlen` stops resolving, so all four cannot silently skip together |
+
+The `ffi.rs` fix was verified to FIRE rather than being decorative: with
+`RUSTC=/nonexistent/rustc-xyz`, the two tests that previously both passed now
+both fail with `rustc (/nonexistent/rustc-xyz) must be runnable`.
+
+Shapes the census looked for and did NOT find anywhere in `tests/`: `#[ignore]`,
+`#[should_panic]`, `cfg!(target_os)` gating, `TMPDIR`/`HOME`/`CI`/locale skip
+guards, network-availability skips, `assert!(true)`, and `let _ = <the Result
+under test>`. `tests/io.rs::dir_home_matches_env` reads `HOME` with `.unwrap()`,
+which PANICS on an unset `HOME` rather than skipping — the right shape.
 
 ## Working (for reference)
 
@@ -1487,10 +1642,24 @@ too)/`close`/`closed?`/`flush`/`inspect`
 `File.open`.
 
 **Known gaps / divergences:**
-- **No `Errno` hierarchy.** Filesystem failures raise a single
-  `SystemCallError` carrying the OS message, not the specific `Errno::ENOENT` /
-  `Errno::EEXIST` MRI raises. The error is still a rescuable `StandardError`
-  descendant; only the class name differs.
+- ~~**No `Errno` hierarchy.**~~ **Closed.** A filesystem failure now raises the
+  specific `Errno::*` class under `SystemCallError`, carrying `#errno`, and the
+  constant resolves by name so `rescue Errno::ENOENT` matches:
+
+  ```console
+  $ ruby -e 'begin; File.read("/nope/xyz"); rescue => e; p [e.class, e.class.superclass, e.errno]; end'
+  [Errno::ENOENT, SystemCallError, 2]
+  ```
+
+  The errno NUMBERS come from `libc` at compile time, never from a literal —
+  `ENOTEMPTY` is 66 on macOS and 39 on Linux, `ECONNREFUSED` 61 and 111, so a
+  hardcoded table would name the wrong class on one of the two platforms
+  rubylang targets and would do it silently. `errno_class` covers 46 names; an
+  errno outside that set still raises a plain `SystemCallError` with the number
+  attached. Pinned by
+  `tests/eval.rs::a_filesystem_failure_raises_its_specific_errno_class`.
+- **`Errno::ENOENT::Errno`** (the per-class errno constant) is unimplemented;
+  read the number off an instance's `#errno` instead.
 - **`IO#to_s` returns the `inspect` form** (`#<IO:<STDOUT>>`, `#<File:/path>`)
   rather than MRI's non-deterministic address form (`#<IO:0x0000…>`). Chosen for
   a deterministic, testable string; `#inspect` itself is exact.
@@ -1545,10 +1714,13 @@ end-to-end (`tests/socket.rs`, incl. a raw `std::net` client and `curl`).
   buffered model has no pending-queue to peek). No `IO.select`-based
   multiplexing means one connection at a time unless the caller threads.
 - **No TLS/SSL.** No `OpenSSL::SSL::SSLSocket` — plaintext HTTP only, not HTTPS.
-- **No `Errno` hierarchy.** Connect/bind failures raise a single `SocketError`
-  carrying the OS message, not the specific `Errno::ECONNREFUSED` /
-  `Errno::EADDRINUSE` MRI raises. Still a rescuable `StandardError` descendant;
-  only the class name differs.
+- **No `Errno` hierarchy on the SOCKET path.** Connect/bind failures still raise
+  a single `SocketError` carrying the OS message, not the specific
+  `Errno::ECONNREFUSED` / `Errno::EADDRINUSE` MRI raises. The `Errno::*` classes
+  themselves now exist and the FILESYSTEM path uses them (see File/IO above);
+  only the socket raise sites have not been converted, because they do not go
+  through `sys_err`. Still a rescuable `StandardError` descendant; only the
+  class name differs.
 - **No socket options / timeouts.** No `setsockopt`/`getsockopt`,
   `SO_REUSEADDR`, `TCP_NODELAY`, `#recv`/`#send` with flags, connect/read
   timeouts, or `#shutdown`. `#close_read`/`#close_write` close the whole socket.

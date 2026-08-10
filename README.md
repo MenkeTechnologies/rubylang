@@ -323,9 +323,12 @@ harness** — `cargo run --bin parity` diffs the snippet corpus
 `tests/parity.rs` replays the frozen outputs in CI with no `ruby` installed.
 Unimplemented METHODS raise `undefined method` rather than answering a
 plausible value. That guarantee does not extend to unimplemented CONSTANTS: a
-few native pseudo-modules (`FileUtils`, `Socket`, `Errno`) leave their constant
-bound to `nil` instead of raising `NameError`, and a handful of flag-valued
-APIs answer a wrong number rather than refusing. BUGS.md lists them.
+few native pseudo-modules (`FileUtils`, `Socket`) leave their constant bound to
+`nil` instead of raising `NameError`, a bare undefined identifier evaluates to
+`nil` rather than raising `NameError`, and a handful of flag-valued APIs answer
+a wrong number rather than refusing. BUGS.md lists them. (`Errno` is no longer
+among them: the `Errno::*` classes resolve by name, sit under
+`SystemCallError`, and carry `#errno`.)
 
 Alongside the fixed corpus, a **differential parity fuzzer** — `cargo run --bin
 parity-fuzz` — generates thousands of seed-deterministic Ruby snippets across

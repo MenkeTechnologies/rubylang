@@ -691,6 +691,23 @@ pub fn regex_option_bits(flags: &str) -> u8 {
     bits
 }
 
+thread_local! {
+    /// Container heap-id pairs whose structural `==` is currently being decided.
+    /// A cycle re-enters the same pair, and MRI answers true for it rather than
+    /// recursing; without this the native stack overflows and the process
+    /// aborts, which no `rescue` can catch. Thread-local because each Ruby
+    /// `Thread` runs its own comparisons.
+    static EQ_PAIRS: std::cell::RefCell<Vec<(u32, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The same, for `eql?`. Deliberately a SEPARATE stack: `eql?` falls through
+    /// to `==` for anything that is neither a number nor a container, so one
+    /// shared stack would let an in-flight `eql?` answer the `==` it delegates
+    /// to — which made `class Z; def ==(o); true; end; end; Z.new.eql?(Z.new)`
+    /// report true where MRI reports false.
+    static EQL_PAIRS: std::cell::RefCell<Vec<(u32, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// A hashable Ruby value used as a Hash key. `Ord` is derived purely to give
 /// the order-independent containers (`Hash`, `Set`) a canonical element order
 /// to sort into; it is not a Ruby-visible ordering.
@@ -735,6 +752,12 @@ pub enum RKey {
     /// is in `compare_by_identity` mode so distinct-but-equal objects (two `[1]`
     /// arrays, two `"ab"` strings) hash as separate keys.
     Identity(u32),
+    /// The stand-in for a container that reaches itself. `[1, a].hash` where
+    /// `a` is that very array cannot key its own elements, and MRI still answers
+    /// a finite Integer; keying the re-entry as this constant terminates the
+    /// walk. Distinct from every other variant, so a recursive container never
+    /// collides with a non-recursive one.
+    Recursive,
 }
 
 /// A compiled method: positional parameter names, the index of a splat
@@ -1006,6 +1029,15 @@ pub struct RubyHost {
     /// `puts` cannot corrupt its display. `None` (the default) is the ordinary
     /// standalone `ruby` behaviour.
     capture: Option<String>,
+    /// Heap ids of the containers whose `to_s`/`inspect` rendering is currently
+    /// on the stack. A container that (directly or through a cycle) holds
+    /// itself would otherwise recurse until the native stack overflows and the
+    /// process aborts — an abort no `rescue` can catch. MRI instead elides the
+    /// re-entry (`[1, [...]]`, `{a: {...}}`, `Set[Set[...]]`,
+    /// `#<struct S a=#<struct S:...>>`), which is what `cycle_marker` renders.
+    /// A stack, not a set: `[x, x]` renders `x` twice because the first render
+    /// pops before the second begins; only genuine re-entry elides.
+    rendering: Vec<u32>,
 }
 
 /// One live `SQLite3::Database`, indexed by `RObj::Db.id`. Wraps the owned
@@ -1614,6 +1646,7 @@ impl RubyHost {
             active_scope: None,
             frozen: HashSet::new(),
             enum_sinks: Vec::new(),
+            rendering: Vec::new(),
             multi_yield_packs: HashSet::new(),
             around_stack: Vec::new(),
             threads: Vec::new(),
@@ -4948,7 +4981,8 @@ impl RubyHost {
         // are all top-level, so a qualified name is never one of them — without
         // that guard a namespaced probe like `Foo::NegativeError` would resolve
         // to a phantom class just for ending in "Error".
-        if !name.contains("::") && is_builtin_exception_name(name) {
+        if is_builtin_exception_name(name) && (!name.contains("::") || name.starts_with("Errno::"))
+        {
             return true;
         }
         matches!(
@@ -4983,6 +5017,9 @@ impl RubyHost {
                 | "Date"
                 | "DateTime"
                 | "Math"
+                // The `Errno` namespace itself, so `Errno::ENOENT` resolves as a
+                // constant path rather than dispatching `ENOENT` on nil.
+                | "Errno"
                 | "JSON"
                 | "ERB"
                 | "Fiber"
@@ -5923,7 +5960,10 @@ impl RubyHost {
     /// user classes are resolved through the superclass chain.
     pub fn is_exception_class(&self, class: &str) -> bool {
         fn builtin(n: &str) -> bool {
-            n.ends_with("Error") || n == "Exception" || n == "StopIteration"
+            n.ends_with("Error")
+                || n == "Exception"
+                || n == "StopIteration"
+                || n.starts_with("Errno::")
         }
         let mut cur = Some(class.to_string());
         while let Some(name) = cur {
@@ -5963,8 +6003,44 @@ impl RubyHost {
         !matches!(v, Value::Undef | Value::Bool(false))
     }
 
-    /// `to_s` — the human string form used by `puts`/interpolation.
+    /// The `(heap id, elision marker)` MRI would use if rendering `v` re-entered
+    /// `v` itself. `None` for everything that cannot contain itself — the
+    /// overwhelmingly common case, and one heap lookup.
+    fn cycle_marker(&self, v: &Value) -> Option<(u32, String)> {
+        let Value::Obj(id) = v else { return None };
+        let marker = match self.obj(v)? {
+            RObj::Array(_) => "[...]".to_string(),
+            RObj::Hash { .. } => "{...}".to_string(),
+            RObj::Set(_) => "Set[...]".to_string(),
+            RObj::Object { class, .. } if self.struct_defs.contains_key(class) => format!(
+                "#<{} {class}:...>",
+                if self.is_data_class(class) {
+                    "data"
+                } else {
+                    "struct"
+                }
+            ),
+            _ => return None,
+        };
+        Some((*id, marker))
+    }
+
+    /// `to_s` — the human string form used by `puts`/interpolation. Renders the
+    /// MRI elision marker instead of recursing when a container holds itself.
     pub fn to_s(&mut self, v: &Value) -> String {
+        let Some((id, marker)) = self.cycle_marker(v) else {
+            return self.uncycled_to_s(v);
+        };
+        if self.rendering.contains(&id) {
+            return marker;
+        }
+        self.rendering.push(id);
+        let out = self.uncycled_to_s(v);
+        self.rendering.pop();
+        out
+    }
+
+    fn uncycled_to_s(&mut self, v: &Value) -> String {
         if is_main(v) {
             return "main".to_string();
         }
@@ -6140,8 +6216,23 @@ impl RubyHost {
         }
     }
 
-    /// `inspect` — the debug form used by `p`/`inspect` (quotes strings).
+    /// `inspect` — the debug form used by `p`/`inspect` (quotes strings). Shares
+    /// `rendering` with `to_s`, so a struct whose member is the struct itself
+    /// elides once no matter which of the two entered first.
     pub fn inspect(&mut self, v: &Value) -> String {
+        let Some((id, marker)) = self.cycle_marker(v) else {
+            return self.inspect_uncycled(v);
+        };
+        if self.rendering.contains(&id) {
+            return marker;
+        }
+        self.rendering.push(id);
+        let out = self.inspect_uncycled(v);
+        self.rendering.pop();
+        out
+    }
+
+    fn inspect_uncycled(&mut self, v: &Value) -> String {
         if is_main(v) {
             return "main".to_string();
         }
@@ -6223,6 +6314,32 @@ impl RubyHost {
                     out.push('>');
                     out
                 }
+                // `Exception#inspect` is NOT the message — MRI wraps it with the
+                // class, which is what makes `p e` in a rescue body readable:
+                //
+                //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p RuntimeError.new("x")'
+                //   #<RuntimeError: x>
+                //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ArgumentError.new("")'
+                //   ArgumentError
+                //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p RuntimeError.new("a\nb")'
+                //   #<RuntimeError:"a\nb">
+                //
+                // An empty message degrades to the bare class name, and a
+                // multi-line one is inspected (and loses the space) so the form
+                // stays on one line.
+                Some(RObj::Object { class, ivars }) if self.is_exception_class(&class) => {
+                    let msg = match ivars.get("message") {
+                        Some(m) => self.to_s(&m.clone()),
+                        None => class.clone(),
+                    };
+                    if msg.is_empty() {
+                        class
+                    } else if msg.contains('\n') {
+                        format!("#<{class}:{}>", inspect_string(&msg))
+                    } else {
+                        format!("#<{class}: {msg}>")
+                    }
+                }
                 // `Encoding#inspect`: `#<Encoding:UTF-8>`. The binary encoding
                 // inspects as `#<Encoding:BINARY (ASCII-8BIT)>` (MRI names the
                 // object BINARY with its ASCII-8BIT alias in parens).
@@ -6249,9 +6366,9 @@ impl RubyHost {
                         format!("#<OpenStruct {}>", body.join(", "))
                     }
                 }
-                _ => self.to_s(v),
+                _ => self.uncycled_to_s(v),
             },
-            _ => self.to_s(v),
+            _ => self.uncycled_to_s(v),
         }
     }
 
@@ -6321,6 +6438,9 @@ impl RubyHost {
                 let v = self.key_to_value(&k.clone());
                 self.inspect(&v)
             }
+            // Only reachable through a container that keys itself, which the
+            // renderer elides the same way.
+            RKey::Recursive => "[...]".to_string(),
         }
     }
 
@@ -6400,6 +6520,32 @@ impl RubyHost {
         hasher.finish() as i64
     }
     fn to_key(&self, v: &Value) -> RKey {
+        self.to_key_seen(v, &mut Vec::new())
+    }
+
+    /// `to_key`, carrying the stack of container heap ids already being keyed.
+    /// A container that holds itself would otherwise recurse until the native
+    /// stack overflows; MRI answers a finite `hash` for one, so the re-entry
+    /// keys as [`RKey::Recursive`] and the walk terminates.
+    fn to_key_seen(&self, v: &Value, seen: &mut Vec<u32>) -> RKey {
+        if let Value::Obj(id) = v {
+            if seen.contains(id) {
+                return RKey::Recursive;
+            }
+            if matches!(
+                self.obj(v),
+                Some(RObj::Array(_) | RObj::Hash { .. } | RObj::Set(_) | RObj::Object { .. })
+            ) {
+                seen.push(*id);
+                let k = self.to_key_inner(v, seen);
+                seen.pop();
+                return k;
+            }
+        }
+        self.to_key_inner(v, seen)
+    }
+
+    fn to_key_inner(&self, v: &Value, seen: &mut Vec<u32>) -> RKey {
         match v {
             Value::Int(n) => RKey::Int(*n),
             // `0.0.eql?(-0.0)` is true in Ruby and the two are the SAME Hash key,
@@ -6417,7 +6563,7 @@ impl RubyHost {
                 Some(RObj::Symbol(s)) => RKey::Sym(s.clone()),
                 Some(RObj::ClassRef(n)) => RKey::Class(n.clone()),
                 Some(RObj::Array(items)) => {
-                    RKey::Array(items.iter().map(|e| self.to_key(e)).collect())
+                    RKey::Array(items.iter().map(|e| self.to_key_seen(e, seen)).collect())
                 }
                 // A Hash and a Set are unordered for equality and hashing
                 // (`{a: 1, b: 2}` equals `{b: 2, a: 1}` and hashes the same), so
@@ -6425,7 +6571,7 @@ impl RubyHost {
                 Some(RObj::Hash { map, .. }) => {
                     let mut pairs: Vec<(RKey, RKey)> = map
                         .iter()
-                        .map(|(k, v)| (k.clone(), self.to_key(v)))
+                        .map(|(k, v)| (k.clone(), self.to_key_seen(v, seen)))
                         .collect();
                     pairs.sort();
                     RKey::Hash(pairs)
@@ -6443,7 +6589,10 @@ impl RubyHost {
                 Some(RObj::Rational(q)) => RKey::Rational(q.clone()),
                 Some(RObj::Complex { re, im }) => {
                     let (re, im) = (re.clone(), im.clone());
-                    RKey::Complex(Box::new(self.to_key(&re)), Box::new(self.to_key(&im)))
+                    RKey::Complex(
+                        Box::new(self.to_key_seen(&re, seen)),
+                        Box::new(self.to_key_seen(&im, seen)),
+                    )
                 }
                 Some(RObj::Range { lo, hi, exclusive }) => RKey::Range(*lo, *hi, *exclusive),
                 Some(RObj::StrRange { lo, hi, exclusive }) => {
@@ -6457,7 +6606,7 @@ impl RubyHost {
                 // `hash` — so key it on its class plus its members.
                 Some(RObj::Object { class, ivars }) if self.struct_defs.contains_key(class) => {
                     let mut parts = vec![RKey::Class(class.clone())];
-                    parts.extend(ivars.values().map(|m| self.to_key(m)));
+                    parts.extend(ivars.values().map(|m| self.to_key_seen(m, seen)));
                     RKey::Array(parts)
                 }
                 // Keyed by the same `(source, options)` pair `eq_values`
@@ -6520,6 +6669,9 @@ impl RubyHost {
                 self.new_regex(source, &flags).unwrap_or(Value::Undef)
             }
             RKey::Identity(i) => Value::Obj(*i),
+            // A recursive container's key has no standalone value to rebuild;
+            // the container it stands for is reachable from the outer key.
+            RKey::Recursive => Value::Undef,
         }
     }
 
@@ -7066,6 +7218,28 @@ impl RubyHost {
     /// deeper. Anything that is neither a number nor a container falls through
     /// to `==`, which is what Ruby's default `eql?` amounts to for it.
     pub fn eql_values(&self, a: &Value, b: &Value) -> bool {
+        // Same cycle guard `eq_values` carries, for the same reason: `eql?` is
+        // the recursive half of the `hash`/`eql?` pair, so `uniq`, the Array set
+        // operators and `Set` all reach it, and a self-referential container
+        // walked without a guard aborts the process.
+        if let (Value::Obj(x), Value::Obj(y)) = (a, b) {
+            if self.is_container(a) && self.is_container(b) {
+                let pair = (*x, *y);
+                if EQL_PAIRS.with(|p| p.borrow().contains(&pair)) {
+                    return true;
+                }
+                EQL_PAIRS.with(|p| p.borrow_mut().push(pair));
+                let out = self.eql_values_uncycled(a, b);
+                EQL_PAIRS.with(|p| {
+                    p.borrow_mut().pop();
+                });
+                return out;
+            }
+        }
+        self.eql_values_uncycled(a, b)
+    }
+
+    fn eql_values_uncycled(&self, a: &Value, b: &Value) -> bool {
         let numeric = |c: &str| matches!(c, "Integer" | "Float" | "Rational" | "Complex");
         let (ca, cb) = (self.class_of(a), self.class_of(b));
         if ca != cb && numeric(&ca) && numeric(&cb) {
@@ -7161,6 +7335,46 @@ impl RubyHost {
     }
 
     pub fn eq_values(&self, a: &Value, b: &Value) -> bool {
+        // Container equality is a structural walk, so a container that holds
+        // itself would recurse until the native stack overflows. MRI's
+        // `rb_exec_recursive_paired` answers TRUE for a pair it is already
+        // deciding, which is why
+        //
+        //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'a=[1];a<<a;b=[1];b<<b;p a==b'
+        //   true
+        //
+        // The guard is only armed for containers: everything else is compared
+        // by value in one step and cannot re-enter.
+        if let (Value::Obj(x), Value::Obj(y)) = (a, b) {
+            if self.is_container(a) && self.is_container(b) {
+                let pair = (*x, *y);
+                if EQ_PAIRS.with(|p| p.borrow().contains(&pair)) {
+                    return true;
+                }
+                EQ_PAIRS.with(|p| p.borrow_mut().push(pair));
+                let out = self.eq_values_uncycled(a, b);
+                EQ_PAIRS.with(|p| {
+                    p.borrow_mut().pop();
+                });
+                return out;
+            }
+        }
+        self.eq_values_uncycled(a, b)
+    }
+
+    /// Whether `v` is one of the containers whose equality walk descends into
+    /// elements, and so can reach itself. A PLAIN object is excluded: its
+    /// equality is one step (or a user `==`), it cannot cycle, and arming the
+    /// guard for it only risks a false positive.
+    fn is_container(&self, v: &Value) -> bool {
+        match self.obj(v) {
+            Some(RObj::Array(_) | RObj::Hash { .. } | RObj::Set(_)) => true,
+            Some(RObj::Object { class, .. }) => self.struct_defs.contains_key(class),
+            _ => false,
+        }
+    }
+
+    fn eq_values_uncycled(&self, a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => x == y,
             (Value::Float(x), Value::Float(y)) => x == y,
@@ -7666,8 +7880,10 @@ fn gemspec_require_paths(spec: &std::path::Path) -> Option<Vec<String>> {
 
 /// Whether `name` is a builtin exception class name (for ancestry).
 fn is_builtin_exception_name(name: &str) -> bool {
-    // Most are `*Error`; the rest are the handful MRI named otherwise.
+    // Most are `*Error`; the rest are the handful MRI named otherwise. The
+    // `Errno::` family is the one namespaced group MRI defines itself.
     name.ends_with("Error")
+        || name.starts_with("Errno::")
         || matches!(
             name,
             "Exception" | "StopIteration" | "SystemExit" | "SignalException" | "Interrupt"
@@ -7689,6 +7905,9 @@ fn builtin_exception_parent(name: &str) -> Option<&'static str> {
         "LoadError" | "NotImplementedError" | "SyntaxError" => "ScriptError",
         "Interrupt" => "SignalException",
         // Intermediate parents inside StandardError.
+        // Every `Errno::*` is a SystemCallError, which is what makes
+        // `rescue SystemCallError` catch a missing file the same way MRI does.
+        n if n.starts_with("Errno::") => "SystemCallError",
         "UncaughtThrowError" => "ArgumentError",
         "EOFError" => "IOError",
         "KeyError" | "StopIteration" => "IndexError",
@@ -10188,6 +10407,43 @@ pub fn tcp_closed(v: &Value) -> bool {
     }
 }
 
+thread_local! {
+    /// Nested Ruby-level `Proc`/block bodies currently running on this thread.
+    /// See the guard in [`call_proc_self_ctx`].
+    static PROC_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The same activation ceiling `run_method` applies to `def` bodies, so block
+/// recursion and method recursion fail at the same depth.
+const PROC_DEPTH_LIMIT: usize = 2000;
+
+/// Counts one nested block activation for as long as it is alive. A `Drop`
+/// guard rather than a manual decrement because the body has many early exits
+/// (`break`/`return` signals, raised exceptions, the delegating `ProcKind`s),
+/// and a leaked increment would make an unrelated later call raise.
+struct ProcDepth;
+
+impl ProcDepth {
+    fn enter() -> Result<Self, String> {
+        let depth = PROC_DEPTH.with(|c| {
+            let next = c.get() + 1;
+            c.set(next);
+            next
+        });
+        if depth > PROC_DEPTH_LIMIT {
+            PROC_DEPTH.with(|c| c.set(c.get() - 1));
+            return Err("stack level too deep: block".to_string());
+        }
+        Ok(ProcDepth)
+    }
+}
+
+impl Drop for ProcDepth {
+    fn drop(&mut self) {
+        PROC_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
 /// Like `call_proc`, but `self_override` (when given) rebinds `self` inside the
 /// proc body — used for `define_method`, where the block runs as an instance
 /// method with `self` = the receiver, yet still closes over its defining scope.
@@ -10221,6 +10477,18 @@ pub fn call_proc_self_ctx(
     method_ctx: Option<(String, String)>,
     passed_block: Option<Value>,
 ) -> Result<Value, String> {
+    // A block body does NOT push a `Frame` — it swaps `active_scope` — so
+    // `run_method`'s frame-depth guard cannot see recursion that goes through
+    // `Proc#call`, a `define_method` body, or a Hash default proc. Those paths
+    // ran until the native stack overflowed and the process aborted:
+    //
+    //   $ ruby -e 'h = Hash.new { |hh, k| hh[k] }; h[:a]'
+    //   fatal runtime error: stack overflow, aborting
+    //
+    // where MRI raises a rescuable SystemStackError. This counter closes that
+    // hole at the same 2000 activations the method guard uses, an order of
+    // magnitude below where the native stack actually gives out.
+    let _depth = ProcDepth::enter()?;
     let (template, scope, kind, is_lambda) = match with_host(|h| h.obj(proc_val).cloned()) {
         Some(RObj::Proc {
             template,

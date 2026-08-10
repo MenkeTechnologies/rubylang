@@ -1,24 +1,34 @@
 //! End-to-end inline Rust FFI: a `rust { ... }` block is desugared, compiled to
 //! a cdylib via `rustc`, dlopened, and its exports called by bareword from Ruby.
-//! Requires `rustc` on PATH (always present in a Rust CI); skips cleanly
-//! otherwise so a toolchain-less environment never reports a false failure.
+//!
+//! These tests used to `return` early when `rustc` was missing — one of them
+//! silently, with no message at all. That is a test that PASSES having executed
+//! zero assertions, and nothing in a green run distinguishes it from a real one.
+//! It cannot legitimately skip either: this file is compiled and linked by the
+//! very `rustc` it was checking for, so an unavailable `rustc` here means the
+//! environment is broken, not unsupported. `require_rustc` therefore FAILS.
 
 use rubylang::eval_to_string as ev;
 
-fn rustc_available() -> bool {
-    std::process::Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+/// Fail loudly if the compiler that built this test binary cannot be invoked.
+/// A broken `$RUSTC` override is a real defect and must not read as a pass.
+fn require_rustc() {
+    let name = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let ok = std::process::Command::new(&name)
         .arg("--version")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    assert!(
+        ok,
+        "rustc ({name}) must be runnable: this test binary was built by it, so \
+         its absence is a broken environment, not an unsupported one"
+    );
 }
 
 #[test]
 fn rust_block_exports_are_callable_across_all_v1_signatures() {
-    if !rustc_available() {
-        eprintln!("skipping FFI test: rustc not on PATH");
-        return;
-    }
+    require_rustc();
     // Distinct names so this test's registry entries never collide with another
     // test's. Exercises int-arity, float-arity, and string→int marshalling
     // (Ruby String args are host heap handles, marshalled to native strings).
@@ -38,9 +48,7 @@ rust {
 
 #[test]
 fn rust_block_with_no_exports_errors() {
-    if !rustc_available() {
-        return;
-    }
+    require_rustc();
     // A block with no `pub extern "C" fn` is a hard error — v1 requires at least
     // one exported function.
     let src = "rust { fn helper() -> i64 { 1 } }\n1\n";

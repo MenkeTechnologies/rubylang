@@ -17,6 +17,56 @@
 
 use rubylang::eval_to_string as ev;
 
+/// Assert a real C call's result, or REPORT that the symbol did not resolve.
+///
+/// The `:unresolved` sentinel is a legitimate escape on a stripped libc, but a
+/// SILENT one is indistinguishable from a verified call: every one of these
+/// tests would stay green with the C-call path entirely broken and nothing
+/// would say which branch ran. `fiddle_core_libc_symbols_resolve` below is the
+/// backstop — it fails if the sentinel becomes the normal outcome.
+fn assert_call(test: &str, out: &str, expected: &str) {
+    if out == ":unresolved" {
+        eprintln!(
+            "SKIPPED C CALL: {test} took the :unresolved branch — dlopen(NULL) \
+             could not resolve the symbol on this host, so the libffi call, the \
+             marshalling and the return conversion were NOT exercised"
+        );
+        return;
+    }
+    assert_eq!(out, expected, "{test}");
+}
+
+/// The backstop for the `:unresolved` escape in the four C-call tests below.
+///
+/// Each of those may legitimately skip on a host that cannot resolve its
+/// symbol. All four skipping at once is not a host quirk — it is `dlopen(NULL)`
+/// or the symbol-lookup path being broken, which is exactly the failure the
+/// per-test sentinel is shaped to hide. `strlen` is in the C runtime of every
+/// Unix this crate builds for, so requiring at least it to resolve costs no
+/// portability and turns a silent all-skip into a red test.
+#[test]
+fn fiddle_core_libc_symbols_resolve() {
+    let src = r#"
+        require "fiddle"
+        libc = Fiddle.dlopen(nil)
+        %w[strlen].map do |sym|
+          begin
+            libc[sym]
+            :ok
+          rescue Fiddle::DLError
+            :unresolved
+          end
+        end
+    "#;
+    let out = ev(src).expect("eval");
+    assert_eq!(
+        out, "[:ok]",
+        "dlopen(NULL) could not resolve strlen — the :unresolved escape in the \
+         C-call tests is then taken everywhere and they all pass having called \
+         no C at all"
+    );
+}
+
 /// `require "fiddle"` is a no-op that succeeds (returns true), like a builtin lib.
 #[test]
 fn fiddle_require_is_a_noop() {
@@ -65,7 +115,7 @@ fn fiddle_strlen() {
         end
     "#;
     let out = ev(src).expect("eval");
-    assert!(out == "5" || out == ":unresolved", "got {out:?}");
+    assert_call("fiddle_strlen", &out, "5");
 }
 
 /// Real call: `abs(-7)` → 7. A signed `int` argument and return.
@@ -83,7 +133,7 @@ fn fiddle_abs() {
         end
     "#;
     let out = ev(src).expect("eval");
-    assert!(out == "7" || out == ":unresolved", "got {out:?}");
+    assert_call("fiddle_abs", &out, "7");
 }
 
 /// Real call: `sqrt(16.0)` → 4.0. A `double` argument and return (gated — libm
@@ -102,7 +152,7 @@ fn fiddle_sqrt_double() {
         end
     "#;
     let out = ev(src).expect("eval");
-    assert!(out == "4.0" || out == ":unresolved", "got {out:?}");
+    assert_call("fiddle_sqrt_double", &out, "4.0");
 }
 
 /// Real call returning a `char*`: `strdup("world")` returns a `Fiddle::Pointer`,
@@ -125,9 +175,10 @@ fn fiddle_strdup_returns_readable_pointer() {
         end
     "#;
     let out = ev(src).expect("eval");
-    assert!(
-        out == r#"["Fiddle::Pointer", "world"]"# || out == ":unresolved",
-        "got {out:?}"
+    assert_call(
+        "fiddle_strdup_returns_readable_pointer",
+        &out,
+        r#"["Fiddle::Pointer", "world"]"#,
     );
 }
 

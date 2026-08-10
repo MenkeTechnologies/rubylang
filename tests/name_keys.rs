@@ -61,6 +61,17 @@ fn assert_no_duplicates(table: &str, consequence: &str, dups: Vec<String>) {
 /// `binary_search_by` on an unsorted slice reports "not found" for rows that are
 /// present. Assert the exact ordering each lookup relies on.
 fn assert_sorted<K: Ord + Debug>(table: &str, keys: Vec<K>) {
+    // `windows(2)` yields NOTHING for a 0- or 1-element slice, so without this
+    // precondition an emptied table passes every sortedness check in this file
+    // having compared no pair at all — a green run that measured nothing. Two
+    // rows is the smallest input that can actually be out of order.
+    assert!(
+        keys.len() > 1,
+        "`{table}` has {} row(s): the sortedness check compares adjacent pairs, \
+         so fewer than two rows means this assertion examined nothing. Either \
+         the table was emptied or its generator stopped emitting.",
+        keys.len()
+    );
     for pair in keys.windows(2) {
         assert!(
             pair[0] < pair[1],
@@ -173,6 +184,14 @@ fn builtin_modules_are_sorted_and_unique() {
 #[test]
 fn lsp_corpus_has_one_entry_per_name_per_chapter() {
     let corpus = rubylang::lsp::corpus();
+    // An empty corpus has no duplicates, so the assertion below would pass
+    // having inspected nothing. The corpus is the source for LSP completion and
+    // `docs/reference.html`; empty means the generator broke, not that the
+    // invariant holds.
+    assert!(
+        !corpus.is_empty(),
+        "lsp::corpus() is empty — the duplicate check below would pass vacuously"
+    );
     let dups = duplicates(
         corpus
             .iter()
