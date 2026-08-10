@@ -105,15 +105,24 @@ keeps both.
   dangerously, made `==` answer TRUE for two values that cannot be compared.
   `==`/`!=` are the exception that does not raise: an unrankable pair is simply
   not equal.
-- **Divergence — some `NoMethodError` messages name the receiver by class where
-  MRI names an instance.** MRI says `undefined method '<' for an instance of
-  Complex`; the numeric hook's fallthrough says `undefined method '<' for
-  Complex`. `no_method_error`/`receiver_phrase` already produce MRI's wording,
-  so this is confined to the sites that build the sentence by hand instead of
-  calling it: `host.rs` `num_op`'s fallthrough and its `-@` arm, plus the
-  method-lookup and `define_method`-target messages. They should all route
-  through `receiver_phrase`; fixing one of four would only make the wording
-  inconsistent, so they need doing together.
+- **One receiver phrasing for `NoMethodError`.** MRI names the receiver exactly
+  one way: `an instance of C`, the bare literal for `nil`/`true`/`false`, or
+  `class C`/`module M` for a class or module reference. `Host::receiver_phrase`
+  is the only renderer, and every site routes through it — method dispatch, the
+  numeric hook's `-@` arm and its binary-operator fallthrough, the user-method
+  lookup, and `Proc#curry`. Those four used to build the sentence by hand and
+  print the bare class name, which is a phrasing MRI uses for nothing
+  (`-[]` said `for Array`, `{} + 1` said `for Hash`, `-nil` said `for
+  NilClass`); they were fixed together, because fixing one of four only makes
+  the wording inconsistent.
+- **Divergence — a module or class that is not a class reference names itself
+  bare.** `GC`, `ObjectSpace`, `Random`, `SecureRandom` and `ENV` build their
+  own message and omit MRI's `module `/`class ` prefix (`GC.zzz` says
+  `for GC:Module`, MRI says `for module GC`; `Random.zzz` says `for Random`,
+  MRI says `for class Random`). These are the class/module case, not the
+  instance one, and they do not reach `receiver_phrase` because the receiver is
+  not a class-reference value. `ENV` is separate again: MRI answers
+  `for #<Object:0x…>`, an address.
 
 ## Language
 
@@ -780,24 +789,51 @@ Honest limitations of this surface:
   them: `compact`, `grep`/`grep_v`, `with_index`, `eager`, `chunk`/`chunk_while`,
   `slice_before`/`slice_after`/`slice_when`, block-less `each`, and `size` (MRI
   answers nil for a lazy enumerator of unknown length).
-- **Divergence — `sort`/`min`/`max` never raise on an unrankable pair.** Ruby
-  raises `ArgumentError: comparison of X with Y failed` when a comparison inside
-  a sort has no answer; `[1, "a"].sort`, `[1, nil].sort`, `[1.0, Float::NAN].sort`
-  and `[Object.new, Object.new].sort` all answer an arbitrary order here instead.
-  The comparator (`cmp_values`) returns a bare `Ordering` with no error channel
-  and feeds `sort_by`, which cannot fail, so closing this means making the
-  comparator fallible across all twelve of its call sites (`sort`, `sort_by`,
-  `min`/`max`, `min_by`/`max_by`, `Array#<=>`). The ORDERING OPERATORS
-  themselves do raise correctly — this is only the sort/min/max path.
-- **`Comparable`'s derived helpers are not on Rational.** `Rational#between?`
-  and `Rational#clamp` raise `NoMethodError`; MRI derives both from `<=>` like
-  the operators. `clamp` additionally has a contract the shared implementation
-  does not yet keep: MRI ranks `min` against `max` BEFORE it looks at the
-  receiver, so an inverted range raises `ArgumentError: min argument must be
-  less than or equal to max argument` even when the receiver already sits inside
-  it (`5.clamp(3, 1)` answers 1 here), and an unrankable `min`/`max` pair reports
-  the failure against `min` rather than against the receiver. The single-argument
-  Range form (`x.clamp(1..5)`) is separate again.
+- **`sort`/`min`/`max` raise on a pair they cannot rank.** They are DEFINED by
+  `<=>`, so when `<=>` answers nil the caller raises `ArgumentError: comparison
+  of X with Y failed`. `cmp_values` answers `Option<Ordering>`, where `None` IS
+  that nil, and each of its callers decides what it means — they disagree:
+  `Array#<=>` answers nil (`[1, "a"] <=> [1, 2]`), while `sort`, `sort!`,
+  `min`, `max`, `minmax`, `sort_by`, `min_by`, `max_by`, `minmax_by`, `min(n)`,
+  `max(n)` and the block forms of all of them raise. A block that answers nil is
+  the same unrankable pair and raises too. All of these used to ANSWER: the
+  comparator had no error channel, so it invented a ranking by comparing `as_f`
+  values, and `[1, "a"].sort` came back `["a", 1]` from `0.0` against `1.0`.
+  The ranking mirrors MRI's `<=>` — Int/Int, a user `<=>`, Time/Date/DateTime,
+  Symbol, Array elementwise, String, number (a Complex counts only when its
+  imaginary part is zero), any other class's own `<=>`, and finally
+  `Object#<=>`: 0 when the pair is `==`, nil otherwise, which is what makes
+  `[nil, nil]` and `[{}, {}]` sortable while `[true, false]` is not.
+  **Known limit — which of the two operands the message names first.** MRI
+  raises from inside whichever loop it selects by the receiver's length and
+  element kinds, and the loops disagree about both which pair they reach and
+  which operand leads: `[1, 2, "a", 3].min` names `"a"` and `1`, `.max` names
+  `"a"` and `2`, `.min(2)` names `"a"` and `2`. At TWO elements the rule IS
+  knowable: 1,399 of the 1,400 ordered pairs of
+  `1 "a" nil :s 2.5 [9] true 1r Float::NAN 2**70`, across every entry point,
+  match ruby 4.0.6 byte for byte (the one that does not is
+  `[1, Float::NAN].sort_by`). At three or more the operand order is not
+  reproducible outside MRI. `min(n)` also
+  selects rather than sorts, so its order among `==`-equal but distinct values
+  (`1` and `1r`) is its quickselect's, not a stable sort's.
+- **`between?` and `clamp` are one implementation for every receiver.**
+  Comparable, Integer, Float, String and Rational all reach them through
+  `cmp_int` — MRI's `cmpint`, which ranks through the receiver's own `<=>`.
+  They disagree by design and the difference is the point: `clamp` rejects a min
+  above its max BEFORE ranking the receiver against either (`5.clamp(3, 1)` is
+  `ArgumentError: min argument must be less than or equal to max argument`) and
+  treats a nil bound as NO bound (`5.clamp(nil, 9)` is 5); `between?` has no
+  min-vs-max rule at all (`5.between?(3, 1)` is false), ranks against a nil
+  bound and so raises on it, and short-circuits to false below min without ever
+  ranking max. Each comparison reports its OWN operand — blaming min for a max
+  that failed names the wrong value. Every receiver used to carry its own copy:
+  none had the min-vs-max check, the numeric copies compared `as_f` values (so
+  `5.clamp("a", "z")` answered `"z"` and `Float::NAN.clamp(1, 3)` answered NaN),
+  the String copy coerced its bounds with `arg_str`, and Rational had neither
+  method at all. `clamp(range)` accepts every range flavour, rejects an
+  exclusive one only when it HAS an end (`5.clamp(1...)` is legal,
+  `5.clamp(...9)` is not), and names a non-Range argument MRI's way
+  (`wrong argument type Integer (expected Range)`).
 - **Block-based generators.** `Enumerator.new { |y| ... }` drives the block with
   a native `Enumerator::Yielder`; `y << v` and its alias `y.yield(v)` push
   yielded values. `to_a`/`first(n)`/`take(n)`/`each`/`lazy` re-run the block on

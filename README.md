@@ -355,8 +355,13 @@ overflow) are supported. A `Regexp` is a value as well as a matcher: `==`,
 `eql?` and `hash` compare its source and option bitmask, so `/a/ == /a/` and it
 works as a Hash key. `Set#<=>` answers the subset relation (`nil` when neither
 set contains the other), `Enumerator::Lazy#uniq` streams over an infinite
-source, and the `Comparable` operators raise `ArgumentError` on an unrankable
-pair (`Rational(1, 2) < Float::NAN`) instead of answering false. `extend` / `prepend` / `class << self`, the full
+source, and everything derived from `<=>` treats an unrankable pair the way
+Ruby does: the `Comparable` operators raise `ArgumentError` rather than
+answering false (`Rational(1, 2) < Float::NAN`), and so do `sort`/`min`/`max`
+and their `_by` and block forms (`[1, "a"].sort`), while `Array#<=>` answers
+nil. `between?` and `clamp` are one implementation across Comparable, Integer,
+Float, String and Rational, keeping the two rules that differ — `clamp` rejects
+a min above its max and skips a nil bound, `between?` does neither. `extend` / `prepend` / `class << self`, the full
 `case/in` pattern surface (two-sided find patterns, `**nil` exact-key matching,
 alternation binding, the `deconstruct`/`deconstruct_keys` protocol on user
 objects) plus the one-line forms (`expr => pattern` rightward assignment and
