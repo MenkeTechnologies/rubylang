@@ -6314,3 +6314,180 @@ fn lazy_uniq_inspects_as_a_named_stage() {
         "\"#<Enumerator::Lazy: #<Enumerator::Lazy: [1, 2]>:uniq>\"",
     );
 }
+
+/// The exact ArgumentError message for `src`, or `:no_raise`, as a Ruby literal.
+fn cmp_msg(src: &str) -> String {
+    format!("begin; {src}; rescue ArgumentError => e; e.message; else; :no_raise; end")
+}
+
+#[test]
+fn sorting_raises_on_a_pair_it_cannot_rank() {
+    // `sort`/`min`/`max` are DEFINED by `<=>`, and when `<=>` answers nil the
+    // caller raises `comparison of X with Y failed`. Every one of these
+    // ANSWERED before: the comparator returned a bare Ordering, so it had to
+    // invent a ranking for a pair Ruby refuses to rank, and `[1, "a"].sort`
+    // came back `["a", 1]` from comparing `0.0` against `1.0`.
+    for m in ["sort", "sort!", "min", "max", "minmax"] {
+        eq(
+            &cmp_msg(&format!("[1, \"a\"].{m}")),
+            match m {
+                // `min`/`max` name the element under test first; the rest name
+                // the pair in source order.
+                "min" | "max" => "\"comparison of String with 1 failed\"",
+                _ => "\"comparison of Integer with String failed\"",
+            },
+        );
+    }
+    for m in ["sort_by", "min_by", "max_by", "minmax_by"] {
+        eq(
+            &cmp_msg(&format!("[1, \"a\"].{m} {{ |e| e }}")),
+            match m {
+                "min_by" | "max_by" => "\"comparison of String with 1 failed\"",
+                _ => "\"comparison of Integer with String failed\"",
+            },
+        );
+    }
+    // `min(n)`/`max(n)` sort internally -- a third path, which also answered.
+    eq(
+        &cmp_msg("[1, \"a\"].min(1)"),
+        "\"comparison of String with 1 failed\"",
+    );
+    eq(
+        &cmp_msg("[1, \"a\"].max(1)"),
+        "\"comparison of String with 1 failed\"",
+    );
+    // The block forms rank by what the BLOCK answers, and a nil from the block
+    // is the same unrankable pair -- it was read through `as_i` as 0, which
+    // silently kept the original order.
+    eq(
+        &cmp_msg("[1, \"a\"].sort { |a, b| a <=> b }"),
+        "\"comparison of Integer with String failed\"",
+    );
+    eq(
+        &cmp_msg("[1, \"a\"].max { |a, b| a <=> b }"),
+        "\"comparison of String with 1 failed\"",
+    );
+    eq(
+        &cmp_msg("[1, \"a\"].minmax { |a, b| a <=> b }"),
+        "\"comparison of Integer with String failed\"",
+    );
+    // Every cross-domain pair, not just String: each was ANSWERED before.
+    for (rhs, msg) in [
+        ("nil", "\"comparison of Integer with nil failed\""),
+        (":s", "\"comparison of Integer with :s failed\""),
+        ("true", "\"comparison of Integer with true failed\""),
+        ("[9]", "\"comparison of Integer with Array failed\""),
+        ("Object.new", "\"comparison of Integer with Object failed\""),
+        // A NaN ranks against nothing at all, itself included.
+        ("Float::NAN", "\"comparison of Integer with NaN failed\""),
+    ] {
+        eq(&cmp_msg(&format!("[1, {rhs}].sort")), msg);
+    }
+    // Two Arrays whose elements cannot be ranked are themselves unrankable.
+    eq(
+        &cmp_msg("[[1, 2], [1, \"a\"]].sort"),
+        "\"comparison of Array with Array failed\"",
+    );
+    // A key the block computes is ranked the same way as an element.
+    eq(
+        &cmp_msg("(1..3).min_by { |x| x == 2 ? nil : x }"),
+        "\"comparison of NilClass with 1 failed\"",
+    );
+}
+
+#[test]
+fn the_operand_order_of_a_sort_failure_follows_the_method() {
+    // MRI raises from inside whichever loop the method uses, so which operand
+    // it names FIRST is per entry point -- and, for the block-less `min`/`max`,
+    // per operand KIND. Measured against ruby 4.0.6 over every ordered pair of
+    // `1 "a" nil :s 2.5 [9] true 1r Float::NAN 2**70`.
+    // Both special constants: the running extreme leads.
+    eq(
+        &cmp_msg("[1, nil].min"),
+        "\"comparison of Integer with nil failed\"",
+    );
+    eq(
+        &cmp_msg("[nil, 1].min"),
+        "\"comparison of NilClass with 1 failed\"",
+    );
+    // Not both: the element under test leads instead.
+    eq(
+        &cmp_msg("[1, [9]].max"),
+        "\"comparison of Array with 1 failed\"",
+    );
+    eq(
+        &cmp_msg("[[9], 1].max"),
+        "\"comparison of Integer with Array failed\"",
+    );
+    // A Rational sits on the special-constant side of that split even though it
+    // is a heap object, and a non-finite Float sits on the other side.
+    eq(
+        &cmp_msg("[nil, 1r].min"),
+        "\"comparison of NilClass with Rational failed\"",
+    );
+    eq(
+        &cmp_msg("[nil, Float::NAN].min"),
+        "\"comparison of Float with nil failed\"",
+    );
+    // `sort` names the pair in source order, both ways round.
+    eq(
+        &cmp_msg("[\"a\", 1].sort"),
+        "\"comparison of String with 1 failed\"",
+    );
+    eq(
+        &cmp_msg("[1, \"a\"].sort"),
+        "\"comparison of Integer with String failed\"",
+    );
+}
+
+#[test]
+fn ranking_that_succeeds_still_succeeds() {
+    // Pinned so the raising above cannot be satisfied by refusing to rank
+    // anything. Every pair here IS rankable in Ruby.
+    eq("[3, 1, 2].sort", "[1, 2, 3]");
+    eq(
+        "[1, 2.0, 1r, 2**70].sort",
+        "[1, (1/1), 2.0, 1180591620717411303424]",
+    );
+    eq("[1, 2**70].max", "1180591620717411303424");
+    eq("[2**70, 1r].min", "(1/1)");
+    // `<=>` across the integer widths and Rational, which answered nil for a
+    // BigInt against a Rational and made the pair unrankable.
+    eq("(2**70) <=> 1r", "1");
+    eq("1r <=> (2**70)", "-1");
+    // `Object#<=>`: 0 for a pair that is `==`, nil otherwise. Every receiver
+    // that defines no `<=>` of its own inherits it, so these sort rather than
+    // raising NoMethodError from a bare `a <=> b`.
+    eq("[nil, nil].sort", "[nil, nil]");
+    eq("[{}, {}].sort", "[{}, {}]");
+    eq("nil <=> nil", "0");
+    eq("{} <=> {}", "0");
+    eq("true <=> false", "nil");
+    eq("(1..2) <=> (1..3)", "nil");
+    // A Complex ranks only where the complex plane has an order.
+    eq("(1+0i) <=> 1", "0");
+    eq("1 <=> (1+0i)", "0");
+    eq("(1+2i) <=> (1+2i)", "nil");
+    eq(
+        &cmp_msg("[(1+2i), (1+2i)].sort"),
+        "\"comparison of Complex with Complex failed\"",
+    );
+    // `Array#<=>` answers nil for an unrankable element pair rather than
+    // raising -- the one caller that does NOT raise. It answered -1/1 before.
+    eq("[1, \"a\"] <=> [1, 2]", "nil");
+    eq("[1, 2] <=> [1, \"a\"]", "nil");
+    eq("[1, \"a\"] <=> [1, \"a\"]", "0");
+    // An earlier pair that DOES rank decides the order, so the later
+    // unrankable pair is never reached.
+    eq("[1, \"a\"] <=> [2, 3]", "-1");
+    // A NaN receiver answers nil rather than 0: the guard only checked the
+    // argument, so `Float::NAN <=> 1.0` reported the two as EQUAL.
+    eq("Float::NAN <=> 1.0", "nil");
+    eq("1.0 <=> Float::NAN", "nil");
+    eq("Float::NAN <=> Float::NAN", "nil");
+    // Ties keep the FIRST element, which reading an ascending sort backwards
+    // did not: `[1, 1r].max(1)` answered `[(1/1)]`.
+    eq("[1, 1r].max(1)", "[1]");
+    eq("[1r, 1].max(1)", "[(1/1)]");
+    eq("[1, 1r, 2.5].max(3)", "[2.5, (1/1), 1]");
+}

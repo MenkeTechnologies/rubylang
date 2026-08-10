@@ -2462,6 +2462,20 @@ pub(crate) fn dispatch(
                 with_host(|h| h.take_pending_exc());
                 return call_instance_method(recv.clone(), "Object", name, args, fallback_block);
             }
+            // `Object#<=>`, inherited by every class that defines no `<=>` of
+            // its own: 0 for a pair that is `==`, nil otherwise. It is why
+            // `nil <=> nil` and `{} <=> {}` are 0 while `true <=> false` is nil,
+            // and why `[nil, nil].sort` answers where `[true, false].sort`
+            // raises. Without it those receivers raised NoMethodError from a
+            // sort block that only did `a <=> b`.
+            if name == "<=>" && args.len() == 1 {
+                with_host(|h| h.take_pending_exc());
+                return Ok(if with_host(|h| h.eq_values(recv, &args[0])) {
+                    Value::Int(0)
+                } else {
+                    Value::Undef
+                });
+            }
         }
     }
     result
@@ -4577,6 +4591,15 @@ fn dispatch_object(
                 Ok(with_host(|h| h.ivar_of(recv, &field)))
             }
         }
+        // `Object#<=>`, inherited by every class that defines none of its own:
+        // 0 for a pair that is `==`, nil otherwise. It is a real method in MRI,
+        // so it resolves ahead of `method_missing`, and it is what makes
+        // `[o, o].sort` answer while `[Object.new, Object.new].sort` raises.
+        "<=>" if args.len() == 1 => Ok(if with_host(|h| h.eq_values(recv, &args[0])) {
+            Value::Int(0)
+        } else {
+            Value::Undef
+        }),
         // A class that defines `method_missing` handles any otherwise-undefined
         // method: `method_missing(:name, *args, &block)`.
         _ if with_host(|h| h.find_method_owner(cls, "method_missing")).is_some() => {
@@ -4981,14 +5004,22 @@ fn dispatch_bigint(
         },
         // Against another Integer this is an exact BigInt compare; against a
         // Float it stays exact rather than promoting the Integer, so
-        // `(2**64 + 1) <=> 2.0**64` is 1 and not 0. Anything else is nil.
+        // `(2**64 + 1) <=> 2.0**64` is 1 and not 0. A Rational ranks too --
+        // `(2**70) <=> 1r` is 1, and answering nil there made `[1r, 2**70]`
+        // unrankable for a sort block that only did `a <=> b`. Anything that is
+        // not a number at all is nil.
         "<=>" => match with_host(|h| h.as_bigint(&args[0])) {
             Some(o) => Value::Int(ord_to_i(b.cmp(&o))),
             None => match &args[0] {
                 Value::Float(f) if f.is_nan() => Value::Undef,
                 Value::Float(f) if f.is_infinite() => Value::Int(if *f > 0.0 { -1 } else { 1 }),
                 Value::Float(f) => Value::Int(ord_to_i(cmp_bigint_float(&b, *f))),
-                _ => Value::Undef,
+                other => match with_host(|h| h.as_rational(other)) {
+                    Some(o) => {
+                        Value::Int(ord_to_i(num_rational::BigRational::from(b.clone()).cmp(&o)))
+                    }
+                    None => Value::Undef,
+                },
             },
         },
         // `Integer#coerce` promotes SELF to the argument's kind when that is a
@@ -5501,14 +5532,13 @@ fn dispatch_number(
         }
         // `Integer#<=>` is EXACT against a Float, so `3**34 <=> (3**34).to_f` is
         // 1 — the double rounded down. Casting both to `f64` first collapsed
-        // them onto the same value and answered 0. NaN orders against nothing,
-        // and a non-numeric argument is nil rather than a comparison.
-        "<=>" => {
-            if !is_numeric_value(&args[0]) || as_f(&args[0]).is_nan() {
-                return Ok(Value::Undef);
-            }
-            Ok(Value::Int(ord_to_i(cmp_numeric(recv, &args[0]))))
-        }
+        // them onto the same value and answered 0. NaN orders against nothing —
+        // as the RECEIVER too, which the old argument-only guard missed, so
+        // `Float::NAN <=> 1.0` answered 0 — and a non-numeric argument is nil.
+        "<=>" => Ok(match cmp_values(recv, &args[0]) {
+            Some(o) => Value::Int(ord_to_i(o)),
+            None => Value::Undef,
+        }),
         // Bit operations promote to BigInt on overflow (`1 << 64`) and accept
         // already-promoted operands.
         "<<" | ">>" | "&" | "|" | "^" => {
@@ -7700,9 +7730,12 @@ fn dispatch_array(
                 let n = arr.len().min(other.len());
                 for i in 0..n {
                     match cmp_values(&arr[i], &other[i]) {
-                        Ordering::Equal => {}
-                        Ordering::Less => return Ok(Value::Int(-1)),
-                        Ordering::Greater => return Ok(Value::Int(1)),
+                        // An element pair that cannot be ranked makes the whole
+                        // comparison nil -- `[1, "a"] <=> [1, 2]` is nil, not -1.
+                        None => return Ok(Value::Undef),
+                        Some(Ordering::Equal) => {}
+                        Some(Ordering::Less) => return Ok(Value::Int(-1)),
+                        Some(Ordering::Greater) => return Ok(Value::Int(1)),
                     }
                 }
                 Ok(Value::Int(match arr.len().cmp(&other.len()) {
@@ -8011,11 +8044,7 @@ fn dispatch_array(
         "sort" | "sort!" => {
             let a = match &block {
                 Some(bl) => sort_with_block(arr, bl)?,
-                None => {
-                    let mut a = arr;
-                    a.sort_by(cmp_values);
-                    a
-                }
+                None => sort_values(&arr, CmpOrder::Source, false)?,
             };
             // `sort!` sorts in place and returns the receiver.
             if name == "sort!" {
@@ -8030,14 +8059,20 @@ fn dispatch_array(
             }
             let (mut lo, mut hi) = (arr[0].clone(), arr[0].clone());
             let cmp = |x: &Value, y: &Value| -> Result<i64, String> {
-                Ok(match &block {
-                    Some(bl) => as_i(&call_proc(bl, &[x.clone(), y.clone()])?),
-                    None => match cmp_values(x, y) {
-                        std::cmp::Ordering::Less => -1,
-                        std::cmp::Ordering::Equal => 0,
-                        std::cmp::Ordering::Greater => 1,
+                match &block {
+                    // A nil from the block is the same unrankable pair. The
+                    // running extreme `y` is named first: it is the earlier of
+                    // the two in source order, which is the operand MRI leads
+                    // with here.
+                    Some(bl) => match call_proc(bl, &[x.clone(), y.clone()])? {
+                        Value::Undef => Err(cmp_error(y, x)),
+                        v => Ok(as_i(&v)),
                     },
-                })
+                    None => match cmp_values(x, y) {
+                        Some(o) => Ok(ord_to_i(o)),
+                        None => Err(unrankable_error(&arr, CmpOrder::Source, x, y)),
+                    },
+                }
             };
             for x in &arr[1..] {
                 if cmp(x, &lo)? < 0 {
@@ -8058,26 +8093,34 @@ fn dispatch_array(
                 });
             }
             let want_max = name == "max";
-            // `min(n)` / `max(n)` returns the n extremes, sorted.
+            // `min(n)` / `max(n)` return the n extremes, extreme-most first. The
+            // two differ only over a TIE between distinct values (`1` and `1r`
+            // rank equal). Asking for the whole array is a plain ascending sort
+            // read backwards, ties and all; asking for fewer selects instead of
+            // sorting and keeps the FIRST of a tie, so `max` has to sort
+            // DESCENDING there — reading an ascending sort backwards kept the
+            // last, and `[1, 1r].max(1)` answered `[(1/1)]`.
             if let Some(n) = args.first().filter(|_| block.is_none()) {
-                let mut sorted = arr.clone();
-                sorted.sort_by(cmp_values);
-                let k = (as_i(n).max(0) as usize).min(sorted.len());
-                let picked: Vec<Value> = if want_max {
-                    sorted.iter().rev().take(k).cloned().collect()
+                let k = (as_i(n).max(0) as usize).min(arr.len());
+                let sorted = if want_max && k >= arr.len() {
+                    let mut s = sort_values(&arr, CmpOrder::Reversed, false)?;
+                    s.reverse();
+                    s
                 } else {
-                    sorted.iter().take(k).cloned().collect()
+                    sort_values(&arr, CmpOrder::Reversed, want_max)?
                 };
-                return Ok(new_arr(picked));
+                return Ok(new_arr(sorted.into_iter().take(k).collect()));
             }
             let mut best = arr[0].clone();
             for x in &arr[1..] {
                 let c = match &block {
-                    Some(bl) => as_i(&call_proc(bl, &[x.clone(), best.clone()])?),
+                    Some(bl) => match call_proc(bl, &[x.clone(), best.clone()])? {
+                        Value::Undef => return Err(cmp_error(x, &best)),
+                        v => as_i(&v),
+                    },
                     None => match cmp_values(x, &best) {
-                        std::cmp::Ordering::Less => -1,
-                        std::cmp::Ordering::Equal => 0,
-                        std::cmp::Ordering::Greater => 1,
+                        Some(o) => ord_to_i(o),
+                        None => return Err(extreme_error(&best, x)),
                     },
                 };
                 if (want_max && c > 0) || (!want_max && c < 0) {
@@ -9167,37 +9210,46 @@ fn sort_by_family(
         let k = call_proc(b, std::slice::from_ref(x))?;
         keyed.push((k, x.clone()));
     }
-    match name {
-        "min_by" => Ok(keyed
-            .into_iter()
-            .min_by(|a, c| cmp_values(&a.0, &c.0))
-            .map(|p| p.1)
-            .unwrap_or(Value::Undef)),
-        // Ruby's max_by returns the FIRST element on a key tie; Rust's `max_by`
-        // returns the last. Iterating reversed makes the last-of-ties the first
-        // in original order. (min_by already returns first-of-ties, like Ruby.)
-        "max_by" => Ok(keyed
-            .into_iter()
-            .rev()
-            .max_by(|a, c| cmp_values(&a.0, &c.0))
-            .map(|p| p.1)
-            .unwrap_or(Value::Undef)),
-        "minmax_by" => {
-            let lo = keyed
-                .iter()
-                .min_by(|a, c| cmp_values(&a.0, &c.0))
-                .map(|p| p.1.clone())
-                .unwrap_or(Value::Undef);
-            let hi = keyed
-                .iter()
-                .rev()
-                .max_by(|a, c| cmp_values(&a.0, &c.0))
-                .map(|p| p.1.clone())
-                .unwrap_or(Value::Undef);
-            Ok(new_arr(vec![lo, hi]))
+    // The keys in SOURCE order: a failure names its pair from this, and the sort
+    // below is about to lose the ordering.
+    let keys: Vec<Value> = keyed.iter().map(|p| p.0.clone()).collect();
+    // Keep the running extreme's key and value. Ruby returns the FIRST element
+    // on a key tie, for `min_by` and `max_by` alike, so both tests strictly.
+    // `minmax_by` runs the same two scans but reports a failure in source
+    // order, where the single-extreme forms report the later key first.
+    let extreme = |want_max: bool, order: CmpOrder| -> Result<Value, String> {
+        let Some((mut bk, mut bv)) = keyed.first().cloned() else {
+            return Ok(Value::Undef);
+        };
+        for (k, v) in &keyed[1..] {
+            let Some(o) = cmp_values(k, &bk) else {
+                return Err(unrankable_error(&keys, order, k, &bk));
+            };
+            if (want_max && o.is_gt()) || (!want_max && o.is_lt()) {
+                (bk, bv) = (k.clone(), v.clone());
+            }
         }
+        Ok(bv)
+    };
+    match name {
+        "min_by" => extreme(false, CmpOrder::Reversed),
+        "max_by" => extreme(true, CmpOrder::Reversed),
+        "minmax_by" => Ok(new_arr(vec![
+            extreme(false, CmpOrder::Source)?,
+            extreme(true, CmpOrder::Source)?,
+        ])),
         _ => {
-            keyed.sort_by(|a, c| cmp_values(&a.0, &c.0));
+            let mut bad: Option<(Value, Value)> = None;
+            keyed.sort_by(|a, c| match cmp_values(&a.0, &c.0) {
+                Some(o) => o,
+                None => {
+                    bad.get_or_insert_with(|| (a.0.clone(), c.0.clone()));
+                    std::cmp::Ordering::Equal
+                }
+            });
+            if let Some((x, y)) = bad {
+                return Err(unrankable_error(&keys, CmpOrder::Source, &x, &y));
+            }
             Ok(new_arr(keyed.into_iter().map(|p| p.1).collect()))
         }
     }
@@ -9269,6 +9321,17 @@ fn dispatch_complex(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
             Ok(with_host(|h| h.new_complex(re.clone(), neg_im)))
         }
         "rectangular" | "rect" => Ok(new_arr(vec![re.clone(), im.clone()])),
+        // `Complex#<=>` ranks only where the complex plane has an order: both
+        // operands real. `Complex(1, 0) <=> 1` is 0, `Complex(1, 2) <=> 1` is
+        // nil. Defining it is what keeps a Complex out of `Object#<=>`, which
+        // would have reported two equal non-real Complexes as rankable.
+        "<=>" if !args.is_empty() => Ok(match (rankable_number(recv), rankable_number(&args[0])) {
+            (Some(x), Some(y)) => match cmp_numeric(&x, &y) {
+                Some(o) => Value::Int(ord_to_i(o)),
+                None => Value::Undef,
+            },
+            _ => Value::Undef,
+        }),
         // Numeric conversions succeed only for a real Complex (imaginary == 0),
         // delegating to the real part; otherwise MRI raises RangeError.
         "to_i" | "to_int" | "to_f" | "to_r" if as_f(&im) == 0.0 => dispatch(&re, name, &[], None),
@@ -18431,52 +18494,190 @@ fn add_values(a: &Value, b: &Value) -> Value {
     }
 }
 
-fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+/// Rank two values the way Ruby's `<=>` does. `None` IS `<=>`'s nil answer: the
+/// two belong to different ordering domains (`1 <=> "a"`), or one of them is a
+/// NaN, which ranks against nothing. The Option is the whole point — the caller
+/// decides what an unrankable pair means, and they disagree: `Array#<=>`
+/// answers nil, while `sort`/`min`/`max` raise `ArgumentError: comparison of X
+/// with Y failed`. Returning a bare `Ordering` forced every caller to invent a
+/// ranking for a pair Ruby refuses to rank, which is how `[1, "a"].sort`
+/// answered `["a", 1]` (it compared `0.0` against `1.0` through `as_f`).
+fn cmp_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
-    // A user object compares through its `<=>` method (Comparable).
-    if with_host(|h| h.object_class(a)).is_some() {
+    // Two Integers, before any host lookup: the overwhelmingly common pair.
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        return Some(x.cmp(y));
+    }
+    // A user object compares through its `<=>` method (Comparable). A nil answer
+    // is the object itself declaring the pair unrankable.
+    let user = with_host(|h| h.object_class(a)).is_some();
+    if user {
         if let Ok(v) = dispatch(a, "<=>", std::slice::from_ref(b), None) {
-            return as_i(&v).cmp(&0);
+            return (!matches!(v, Value::Undef)).then(|| as_i(&v).cmp(&0));
         }
     }
     // Two Times order by their epoch seconds.
     if let (Some(x), Some(y)) = with_host(|h| (h.time_secs(a), h.time_secs(b))) {
-        return x.total_cmp(&y);
+        return Some(x.total_cmp(&y));
     }
     // Two Dates order by their day count.
     if let (Some(x), Some(y)) = with_host(|h| (h.date_days(a), h.date_days(b))) {
-        return x.cmp(&y);
+        return Some(x.cmp(&y));
     }
     // Two DateTimes order by their epoch seconds.
     if let (Some(x), Some(y)) = with_host(|h| (h.datetime_secs(a), h.datetime_secs(b))) {
-        return x.total_cmp(&y);
+        return Some(x.total_cmp(&y));
     }
     // Two Symbols order lexicographically by name (`[:b, :a].sort == [:a, :b]`).
     if let (Some(x), Some(y)) = with_host(|h| (h.as_symbol(a), h.as_symbol(b))) {
-        return x.cmp(&y);
+        return Some(x.cmp(&y));
     }
     // Two Arrays compare element-wise, shorter-is-less on a common prefix
-    // (`Array#<=>`), so `[[:b,2],[:a,1]].sort` orders by the first element.
+    // (`Array#<=>`), so `[[:b,2],[:a,1]].sort` orders by the first element. An
+    // element pair that cannot be ranked makes the WHOLE comparison nil, but
+    // only if an earlier pair has not already decided the order.
     if let (Some(xs), Some(ys)) = with_host(|h| (h.as_array(a), h.as_array(b))) {
         for (x, y) in xs.iter().zip(ys.iter()) {
-            let o = cmp_values(x, y);
-            if o != Ordering::Equal {
-                return o;
+            match cmp_values(x, y)? {
+                Ordering::Equal => {}
+                o => return Some(o),
             }
         }
-        return xs.len().cmp(&ys.len());
+        return Some(xs.len().cmp(&ys.len()));
     }
-    match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Str(_), _) | (_, Value::Str(_)) | (Value::Obj(_), _) | (_, Value::Obj(_)) => {
-            let (xs, ys) = with_host(|h| (h.as_str(a), h.as_str(b)));
-            match (xs, ys) {
-                (Some(x), Some(y)) => x.cmp(&y),
-                _ => cmp_numeric(a, b),
+    // Two Strings order lexicographically. A String against anything else has
+    // no ranking at all — `"a" <=> 1` is nil.
+    if let (Some(x), Some(y)) = with_host(|h| (h.as_str(a), h.as_str(b))) {
+        return Some(x.cmp(&y));
+    }
+    // Two numbers, across every width and class.
+    let (na, nb) = (rankable_number(a), rankable_number(b));
+    if let (Some(x), Some(y)) = (&na, &nb) {
+        return cmp_numeric(x, y);
+    }
+    // Any other receiver that defines `<=>` itself — `Set`, or a builtin class a
+    // script reopened — ranks through its own method. A user object already
+    // tried this above; re-entering it would run a side-effecting `<=>` twice.
+    // A NUMBER is excluded because `Integer#<=>`/`Float#<=>` are defined in
+    // terms of THIS function: dispatching one here recurses until the stack
+    // overflows, which is exactly what `[1, "a"].sort` did.
+    if !user && na.is_none() {
+        if let Ok(v) = dispatch(a, "<=>", std::slice::from_ref(b), None) {
+            return (!matches!(v, Value::Undef)).then(|| as_i(&v).cmp(&0));
+        }
+    }
+    // `Object#<=>`, which every class that defines no `<=>` of its own inherits:
+    // 0 for a pair that is `==`, nil otherwise. It is what makes `[nil, nil]`
+    // and `[{}, {}]` sortable while `[true, false]` is not.
+    with_host(|h| h.eq_values(a, b)).then_some(Ordering::Equal)
+}
+
+/// MRI's `rb_cmperr` — `comparison of X with Y failed`, X named by its class
+/// and Y by `inspect` when Y is a special constant or a Float. Reached from the
+/// sort/extreme loops rather than from an operator, but the same renderer.
+fn cmp_error(x: &Value, y: &Value) -> String {
+    with_host(|h| h.cmp_failed(x, y))
+}
+
+/// The first pair of `vals`, IN ORDER, that `<=>` cannot rank.
+fn first_unrankable(vals: &[Value]) -> Option<(Value, Value)> {
+    for (i, x) in vals.iter().enumerate() {
+        for y in &vals[i + 1..] {
+            if cmp_values(x, y).is_none() {
+                return Some((x.clone(), y.clone()));
             }
         }
-        _ => cmp_numeric(a, b),
     }
+    None
+}
+
+/// Which of the two unrankable operands MRI names FIRST. Each ordering method
+/// raises from inside its own loop, so the answer is per entry point; these
+/// were measured against ruby 4.0.6 over every ordered pair of
+/// `1 "a" nil :s 2.5 [9]`. For three or more elements the pair MRI names also
+/// depends on the algorithm it selects by length and element type, which is not
+/// reproducible outside MRI; two-element arrays match exactly.
+#[derive(Clone, Copy)]
+enum CmpOrder {
+    /// `sort`, `sort_by`, `minmax`, `minmax_by`: source order.
+    Source,
+    /// `min_by`, `max_by`, `min(n)`, `max(n)`: the later operand first.
+    Reversed,
+}
+
+/// The ArgumentError an unrankable pair earns, naming the first pair `vals`
+/// cannot rank IN SOURCE ORDER. The rescan re-runs `<=>`, so `x`/`y` — the pair
+/// the caller itself tripped on — is the fallback for a side-effecting `<=>`
+/// that no longer answers nil the second time.
+fn unrankable_error(vals: &[Value], order: CmpOrder, x: &Value, y: &Value) -> String {
+    let (p, q) = first_unrankable(vals).unwrap_or_else(|| (x.clone(), y.clone()));
+    match order {
+        CmpOrder::Source => cmp_error(&p, &q),
+        CmpOrder::Reversed => cmp_error(&q, &p),
+    }
+}
+
+/// The ArgumentError the block-less `Array#min`/`#max` raise. They compare each
+/// element against the RUNNING extreme, not in source order, and they name the
+/// element first — except for the operand kinds below, where MRI's loop has the
+/// running extreme as the `<=>` receiver and so names it first.
+fn extreme_error(best: &Value, v: &Value) -> String {
+    if names_extreme_first(best) && names_extreme_first(v) {
+        cmp_error(best, v)
+    } else {
+        cmp_error(v, best)
+    }
+}
+
+/// MRI picks its `Array#min`/`#max` loop by the elements' kinds, and the loops
+/// disagree about which operand is the `<=>` receiver — so which of the two the
+/// failure message leads with is a property of the PAIR, not of the method. The
+/// split that reproduces every ordered pair of `1 "a" nil :s 2.5 [9] true 1r
+/// Float::NAN 2**70` measured against ruby 4.0.6, for `min` and `max` alike, is
+/// this one: a fixnum, a finite Float, a Symbol, nil, true, false, or a
+/// Rational. (A NaN, an infinity and a bignum fall outside it, as do String and
+/// Array.) Nothing but the operand ORDER of the message depends on this.
+fn names_extreme_first(v: &Value) -> bool {
+    match v {
+        Value::Int(_) | Value::Bool(_) | Value::Undef => true,
+        Value::Float(f) => f.is_finite(),
+        _ => {
+            with_host(|h| h.as_symbol(v).is_some() || matches!(h.class_of(v).as_str(), "Rational"))
+        }
+    }
+}
+
+/// Sort a copy of `vals` by `<=>`, or raise the ArgumentError an unrankable
+/// pair earns. The copy is what lets the error name the pair in SOURCE order:
+/// the sort permutes its input, so by the time the failure is known the
+/// original order is gone. One `Value` memcpy against `n log n` host-dispatched
+/// comparisons.
+fn sort_values(vals: &[Value], order: CmpOrder, desc: bool) -> Result<Vec<Value>, String> {
+    let mut out = vals.to_vec();
+    let mut bad: Option<(Value, Value)> = None;
+    out.sort_by(|x, y| match cmp_values(x, y) {
+        Some(o) if desc => o.reverse(),
+        Some(o) => o,
+        None => {
+            bad.get_or_insert_with(|| (x.clone(), y.clone()));
+            std::cmp::Ordering::Equal
+        }
+    });
+    match bad {
+        None => Ok(out),
+        Some((x, y)) => Err(unrankable_error(vals, order, &x, &y)),
+    }
+}
+
+/// The number a value ranks as, or `None` when it is not a number. A Complex is
+/// a number only when its imaginary part is zero: `Complex(1, 0) <=> 1` is 0
+/// while `Complex(1, 2) <=> 1` is nil, so the pair with an imaginary part left
+/// over is unrankable rather than merely unequal.
+fn rankable_number(v: &Value) -> Option<Value> {
+    if let Some((re, im)) = with_host(|h| h.complex_parts(v)) {
+        return with_host(|h| h.eq_values(&im, &Value::Int(0))).then_some(re);
+    }
+    is_numeric_value(v).then(|| v.clone())
 }
 
 /// Order two numbers. Integers wider than `i64` and Rationals compare EXACTLY:
@@ -18484,18 +18685,21 @@ fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
 /// double and reports them EQUAL, which made `max`/`min` keep whichever element
 /// happened to come first (`[2**64, 2**64 + 1].max` answered `2**64`). Only a
 /// Float operand, which no rational can represent, falls back to the double.
-fn cmp_numeric(a: &Value, b: &Value) -> std::cmp::Ordering {
+/// `None` only for a NaN, which ranks against no number at all — not even
+/// itself. Both operands must already be numbers (`rankable_number`).
+fn cmp_numeric(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     let (ra, rb) = with_host(|h| (h.as_rational(a), h.as_rational(b)));
     // A FINITE Float converts to an exact rational too, so a mixed pair stays
     // exact: `3**34` really is greater than `(3**34).to_f`, which rounded down.
     let ra = ra.or_else(|| as_exact_rational(a));
     let rb = rb.or_else(|| as_exact_rational(b));
     if let (Some(x), Some(y)) = (ra, rb) {
-        return x.cmp(&y);
+        return Some(x.cmp(&y));
     }
-    as_f(a)
-        .partial_cmp(&as_f(b))
-        .unwrap_or(std::cmp::Ordering::Equal)
+    // Only an infinity or a NaN has no exact rational value. An infinity still
+    // ranks against every finite number and against the other infinity; a NaN
+    // is where `partial_cmp` answers None.
+    as_f(a).partial_cmp(&as_f(b))
 }
 
 /// Whether a value is one of Ruby's numbers — the operand kinds `<=>` will
@@ -18580,7 +18784,12 @@ fn sort_with_block(mut arr: Vec<Value>, bl: &Value) -> Result<Vec<Value>, String
     for i in 1..arr.len() {
         let mut j = i;
         while j > 0 {
-            let c = as_i(&call_proc(bl, &[arr[j - 1].clone(), arr[j].clone()])?);
+            // A nil from the block is Ruby's "these cannot be ranked", and the
+            // sort raises rather than treating it as 0 and keeping the order.
+            let c = match call_proc(bl, &[arr[j - 1].clone(), arr[j].clone()])? {
+                Value::Undef => return Err(cmp_error(&arr[j - 1], &arr[j])),
+                v => as_i(&v),
+            };
             if c > 0 {
                 arr.swap(j - 1, j);
                 j -= 1;
