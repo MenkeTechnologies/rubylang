@@ -6772,12 +6772,18 @@ impl RubyHost {
         }
         // String and Array operators.
         match (self.obj(a).cloned(), op) {
+            // `String + x` demands a String. `to_s`-ing the operand made
+            // `"a" + 1` answer `"a1"` where Ruby raises a TypeError.
             (Some(RObj::Str(s)), Add) => {
-                let bs = self.to_s(b);
-                return Ok(self.new_string(format!("{s}{bs}")));
+                let s = s.clone();
+                return match self.as_str(b) {
+                    Some(bs) => Ok(self.new_string(format!("{s}{bs}"))),
+                    None => Err(self.no_conversion(b, "String")),
+                };
             }
             (Some(RObj::Str(s)), Mul) => {
-                let n = as_int(b).unwrap_or(0).max(0) as usize;
+                let s = s.clone();
+                let n = self.to_int_operand(b)?.max(0) as usize;
                 return Ok(self.new_string(s.repeat(n)));
             }
             (Some(RObj::Str(s)), Lt | Gt | Le | Ge) => {
@@ -6786,10 +6792,11 @@ impl RubyHost {
                 }
             }
             (Some(RObj::Array(mut xs)), Add) => {
-                if let Some(RObj::Array(ys)) = self.obj(b).cloned() {
-                    xs.extend(ys);
-                    return Ok(self.new_array(xs));
-                }
+                let Some(RObj::Array(ys)) = self.obj(b).cloned() else {
+                    return Err(self.no_conversion(b, "Array"));
+                };
+                xs.extend(ys);
+                return Ok(self.new_array(xs));
             }
             // `Array - Array`: difference, preserving order and duplicates in the
             // left operand that are absent from the right. This is the NATIVE
@@ -6805,8 +6812,14 @@ impl RubyHost {
                     return Ok(self.new_array(kept));
                 }
             }
+            // `Array * String` is `join`; `Array * Integer` repeats. Anything
+            // else converts with `to_int` and so is a TypeError.
             (Some(RObj::Array(xs)), Mul) => {
-                let n = as_int(b).unwrap_or(0).max(0) as usize;
+                if let Some(sep) = self.as_str(b) {
+                    let parts: Vec<String> = xs.iter().map(|v| self.to_s(v)).collect();
+                    return Ok(self.new_string(parts.join(&sep)));
+                }
+                let n = self.to_int_operand(b)?.max(0) as usize;
                 let mut out = Vec::with_capacity(xs.len() * n);
                 for _ in 0..n {
                     out.extend(xs.iter().cloned());
@@ -6945,6 +6958,21 @@ impl RubyHost {
                 return Ok(self.new_set(result));
             }
         }
+        // A NUMERIC receiver reaching here means the operand could not be
+        // coerced, which Ruby reports as a TypeError naming both sides — not as
+        // a missing method on a class that plainly has `+`.
+        if matches!(op, Add | Sub | Mul | Div | Mod | Pow) {
+            let recv_class = self.class_of(a);
+            if matches!(
+                recv_class.as_str(),
+                "Integer" | "Float" | "Rational" | "Complex"
+            ) {
+                return Err(format!(
+                    "{} can't be coerced into {recv_class}",
+                    self.coerce_operand_name(b)
+                ));
+            }
+        }
         // Same phrasing as method dispatch: an arithmetic operator that the
         // receiver does not have is an ordinary NoMethodError.
         Err(format!(
@@ -6952,6 +6980,45 @@ impl RubyHost {
             num_op_name(op),
             self.receiver_phrase(a)
         ))
+    }
+
+    /// How MRI names an operand inside a coercion TypeError: `nil`, `true` and
+    /// `false` by literal, a Symbol by its `:name` form, anything else by class.
+    pub fn coerce_operand_name(&self, v: &Value) -> String {
+        match v {
+            Value::Undef => "nil".to_string(),
+            Value::Bool(true) => "true".to_string(),
+            Value::Bool(false) => "false".to_string(),
+            _ => match self.obj(v) {
+                Some(RObj::Symbol(s)) => format!(":{s}"),
+                _ => self.class_of(v),
+            },
+        }
+    }
+
+    /// MRI's `no implicit conversion of X into <target>`, for an operand that
+    /// had to be of a particular class. `nil`/`true`/`false` are named by
+    /// literal; everything else by class.
+    pub fn no_conversion(&self, v: &Value, target: &str) -> String {
+        let named = match v {
+            Value::Undef => "nil".to_string(),
+            Value::Bool(true) => "true".to_string(),
+            Value::Bool(false) => "false".to_string(),
+            _ => self.class_of(v),
+        };
+        format!("no implicit conversion of {named} into {target}")
+    }
+
+    /// MRI's implicit integer conversion for a NATIVE operator operand. A Float
+    /// truncates; `nil` and everything else raise rather than silently reading
+    /// as 0, which had made `"ab" * nil` answer `""`.
+    pub fn to_int_operand(&self, v: &Value) -> Result<i64, String> {
+        match v {
+            Value::Int(n) => Ok(*n),
+            Value::Float(f) => Ok(*f as i64),
+            Value::Undef => Err("no implicit conversion from nil to integer".to_string()),
+            _ => as_int(v).ok_or_else(|| self.no_conversion(v, "Integer")),
+        }
     }
 
     /// Structural equality (`==`).

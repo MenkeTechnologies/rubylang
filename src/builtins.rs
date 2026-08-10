@@ -3524,7 +3524,7 @@ fn dispatch_classref(
             }
             // `Array.new(n)` / `Array.new(n, val)` / `Array.new(n) { |i| ... }`.
             if cls == "Array" {
-                let n = args.first().map(as_i).unwrap_or(0).max(0) as usize;
+                let n = args.first().map(to_int).transpose()?.unwrap_or(0).max(0) as usize;
                 let items: Vec<Value> = if let Some(bl) = &block {
                     (0..n)
                         .map(|i| call_proc(bl, &[Value::Int(i as i64)]))
@@ -3591,7 +3591,8 @@ fn dispatch_classref(
                             h.new_string(s)
                         }),
                         "Array" => {
-                            let n = args.first().map(as_i).unwrap_or(0).max(0) as usize;
+                            let n =
+                                args.first().map(to_int).transpose()?.unwrap_or(0).max(0) as usize;
                             let items: Vec<Value> = if let Some(bl) = &block {
                                 (0..n)
                                     .map(|i| call_proc(bl, &[Value::Int(i as i64)]))
@@ -4789,6 +4790,107 @@ fn as_i(v: &Value) -> i64 {
     }
 }
 
+/// How MRI names an operand in a `no implicit conversion` TypeError: `nil`,
+/// `true` and `false` by literal, anything else by its class name.
+fn conv_operand_name(v: &Value) -> String {
+    match v {
+        Value::Undef => "nil".to_string(),
+        Value::Bool(true) => "true".to_string(),
+        Value::Bool(false) => "false".to_string(),
+        _ => with_host(|h| h.class_of(v)),
+    }
+}
+
+/// MRI's implicit integer conversion (`to_int`) for an argument position that
+/// requires an Integer.
+///
+/// [`as_i`] answers 0 for `nil` and every other non-numeric, which silently
+/// turns `"ab" * nil` into `""` and `[1,2].first(nil)` into `[]` instead of
+/// raising the TypeError Ruby raises. Argument positions MRI converts with
+/// `to_int` go through here so a type error is an error rather than a wrong
+/// answer. Floats truncate, matching `Float#to_int`.
+fn to_int(v: &Value) -> Result<i64, String> {
+    match v {
+        Value::Int(n) => Ok(*n),
+        Value::Float(f) => Ok(*f as i64),
+        Value::Undef => Err(raise_exc(
+            "TypeError",
+            "no implicit conversion from nil to integer",
+        )),
+        // A BigInt is a heap object but still an integer.
+        _ => int_arg(v).ok_or_else(|| {
+            raise_exc(
+                "TypeError",
+                &format!(
+                    "no implicit conversion of {} into Integer",
+                    conv_operand_name(v)
+                ),
+            )
+        }),
+    }
+}
+
+/// The text `String#<<` / `String#concat` appends for one operand.
+///
+/// A String appends itself; an Integer appends the CHARACTER at that codepoint,
+/// so `"a" << 98` is `"ab"` and not `"a98"`. Every other type is a TypeError —
+/// notably `nil`, `:sym` and Float, which a `to_s` would have silently accepted.
+fn str_append_operand(v: &Value) -> Result<String, String> {
+    if let Some(other) = with_host(|h| h.as_str(v)) {
+        return Ok(other);
+    }
+    match v {
+        Value::Int(n) => match u32::try_from(*n).ok().and_then(char::from_u32) {
+            Some(c) => Ok(c.to_string()),
+            None => Err(raise_exc("RangeError", &format!("{n} out of char range"))),
+        },
+        _ => Err(conv_error(v, "String")),
+    }
+}
+
+/// The `f64` value of a numeric operand for an arithmetic fallback, or MRI's
+/// coercion TypeError naming the receiver's class.
+///
+/// [`as_f`] reads a String (and every other non-numeric) as `0.0`, which made
+/// `1 / "a"` answer `Infinity` and `1 % "a"` answer `NaN` — wrong values on a
+/// zero exit status — where Ruby raises
+/// `String can't be coerced into Integer`.
+fn coerce_num(recv: &Value, v: &Value) -> Result<f64, String> {
+    let numeric = matches!(v, Value::Int(_) | Value::Float(_))
+        || with_host(|h| h.as_rational(v).is_some() || h.as_bigint(v).is_some());
+    if numeric {
+        return Ok(as_f(v));
+    }
+    let (recv_class, named) = with_host(|h| (h.class_of(recv), h.coerce_operand_name(v)));
+    Err(raise_exc(
+        "TypeError",
+        &format!("{named} can't be coerced into {recv_class}"),
+    ))
+}
+
+/// `Integer#gcd`/`lcm`/`gcdlcm`, whose operand must already be an Integer.
+/// MRI words this one `not an integer`, not `no implicit conversion`, and it
+/// does NOT accept a Float.
+fn int_operand(v: &Value) -> Result<i64, String> {
+    match v {
+        Value::Int(n) => Ok(*n),
+        _ => int_arg(v).ok_or_else(|| raise_exc("TypeError", "not an integer")),
+    }
+}
+
+/// MRI's `no implicit conversion of X into <target>` for an argument that must
+/// already be of a particular class — `String#+`, `Hash#merge` and friends,
+/// which require an operand of their own type rather than calling `to_int`.
+fn conv_error(v: &Value, target: &str) -> String {
+    raise_exc(
+        "TypeError",
+        &format!(
+            "no implicit conversion of {} into {target}",
+            conv_operand_name(v)
+        ),
+    )
+}
+
 /// An integer argument as `i64` (an immediate or a small-enough BigInt), or
 /// `None` when the value is not an integer at all (e.g. a Float).
 fn int_arg(v: &Value) -> Option<i64> {
@@ -5286,7 +5388,7 @@ fn dispatch_number(
                 let r = num_rational::BigRational::new(num_bigint::BigInt::from(1), denom);
                 return Ok(with_host(|h| h.new_rational(r)));
             }
-            Ok(Value::Float(as_f(recv).powf(as_f(&args[0]))))
+            Ok(Value::Float(as_f(recv).powf(coerce_num(recv, &args[0])?)))
         }
         "/" => match (recv, &args[0]) {
             (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
@@ -5299,7 +5401,7 @@ fn dispatch_number(
             {
                 with_host(|h| h.num_op(fusevm::NumOp::Div, recv, &args[0]))
             }
-            _ => Ok(Value::Float(as_f(recv) / as_f(&args[0]))),
+            _ => Ok(Value::Float(as_f(recv) / coerce_num(recv, &args[0])?)),
         },
         "%" | "modulo" => match (recv, &args[0]) {
             (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
@@ -5311,7 +5413,7 @@ fn dispatch_number(
                 with_host(|h| h.num_op(fusevm::NumOp::Mod, recv, &args[0]))
             }
             _ => {
-                let (x, y) = (as_f(recv), as_f(&args[0]));
+                let (x, y) = (as_f(recv), coerce_num(recv, &args[0])?);
                 Ok(Value::Float(x - (x / y).floor() * y))
             }
         },
@@ -5402,7 +5504,8 @@ fn dispatch_number(
         "downto" => iter_int_range(recv, as_i(&args[0]), -1, &block),
         "to_s" => {
             // `Integer#to_s(base)` renders in the given radix (2..=36).
-            if let (Value::Int(n), Some(base)) = (recv, args.first().map(as_i)) {
+            let base_arg = args.first().map(to_int).transpose()?;
+            if let (Value::Int(n), Some(base)) = (recv, base_arg) {
                 if (2..=36).contains(&base) {
                     return Ok(new_str(to_radix(*n, base as u32)));
                 }
@@ -5539,9 +5642,9 @@ fn dispatch_number(
             "ArgumentError",
             "wrong number of arguments (given 0, expected 1)",
         )),
-        "gcd" => Ok(Value::Int(gcd(as_i(recv), as_i(&args[0])))),
+        "gcd" => Ok(Value::Int(gcd(as_i(recv), int_operand(&args[0])?))),
         "lcm" => {
-            let (a, b) = (as_i(recv), as_i(&args[0]));
+            let (a, b) = (as_i(recv), int_operand(&args[0])?);
             Ok(Value::Int(if a == 0 || b == 0 {
                 0
             } else {
@@ -5557,7 +5660,7 @@ fn dispatch_number(
             )),
         },
         "gcdlcm" => {
-            let (a, b) = (as_i(recv), as_i(&args[0]));
+            let (a, b) = (as_i(recv), int_operand(&args[0])?);
             let g = gcd(a, b);
             let l = if a == 0 || b == 0 {
                 0
@@ -6583,7 +6686,7 @@ fn dispatch_string(
             }
         }
         "center" => {
-            let width = as_i(&args[0]).max(0) as usize;
+            let width = to_int(&args[0])?.max(0) as usize;
             let padstr = pad_str(args);
             let len = s.chars().count();
             if len >= width || padstr.is_empty() {
@@ -6641,7 +6744,7 @@ fn dispatch_string(
         }
         "empty?" => Ok(Value::Bool(s.is_empty())),
         "to_i" => {
-            let base = args.first().map(as_i).unwrap_or(10);
+            let base = args.first().map(to_int).transpose()?.unwrap_or(10);
             if base != 0 && !(2..=36).contains(&base) {
                 return Err(raise_exc("ArgumentError", &format!("invalid radix {base}")));
             }
@@ -6765,19 +6868,26 @@ fn dispatch_string(
             with_host(|h| h.set_str(recv, n));
             Ok(recv.clone())
         }
-        "<<" | "+" => {
-            let other = with_host(|h| h.to_s(&args[0]));
-            if name == "+" {
-                Ok(new_str(format!("{s}{other}")))
-            } else {
-                with_host(|h| h.set_str(recv, format!("{s}{other}")));
-                Ok(recv.clone())
-            }
+        // `+` demands a String; `to_s`-ing the operand made `"a" + 1` answer
+        // `"a1"` where Ruby raises. `<<` and `concat` are the append forms, and
+        // they take an Integer as a CODEPOINT (`"a" << 98` => `"ab"`), so the
+        // two cannot share one coercion.
+        "+" => match with_host(|h| h.as_str(&args[0])) {
+            Some(other) => Ok(new_str(format!("{s}{other}"))),
+            None => Err(conv_error(&args[0], "String")),
+        },
+        "<<" => {
+            let other = str_append_operand(&args[0])?;
+            with_host(|h| h.set_str(recv, format!("{s}{other}")));
+            Ok(recv.clone())
         }
         // `concat(*strs)` appends every argument in order, mutating and
         // returning the receiver: `"a".concat("b", "c")` => "abc".
         "concat" => {
-            let joined: String = args.iter().map(|a| with_host(|h| h.to_s(a))).collect();
+            let mut joined = String::new();
+            for a in args {
+                joined.push_str(&str_append_operand(a)?);
+            }
             with_host(|h| h.set_str(recv, format!("{s}{joined}")));
             Ok(recv.clone())
         }
@@ -6795,7 +6905,7 @@ fn dispatch_string(
         // where a min above its max is an error.
         "between?" => comparable_between(recv, args),
         "clamp" => comparable_clamp(recv, args),
-        "*" => Ok(new_str(s.repeat(as_i(&args[0]).max(0) as usize))),
+        "*" => Ok(new_str(s.repeat(to_int(&args[0])?.max(0) as usize))),
         "%" => {
             // `"%d-%d" % [1, 2]` or `"%d" % 5`; a Hash operand feeds named
             // references `%<name>s` / `%{name}`.
@@ -6809,13 +6919,13 @@ fn dispatch_string(
         }
         "ljust" => Ok(new_str(pad(
             &s,
-            as_i(&args[0]).max(0) as usize,
+            to_int(&args[0])?.max(0) as usize,
             pad_str(args),
             true,
         ))),
         "rjust" => Ok(new_str(pad(
             &s,
-            as_i(&args[0]).max(0) as usize,
+            to_int(&args[0])?.max(0) as usize,
             pad_str(args),
             false,
         ))),
@@ -6835,8 +6945,8 @@ fn dispatch_string(
                 Ok(with_host(|h| h.new_enumerator(chars, "each")))
             }
         }
-        "[]" => Ok(str_index(&s, args)),
-        "slice" => Ok(str_index(&s, args)),
+        "[]" => str_index(&s, args),
+        "slice" => str_index(&s, args),
         // `eql?` is content equality with no type coercion: only another String
         // (not a Symbol) can be equal.
         "eql?" => Ok(Value::Bool(
@@ -7413,25 +7523,25 @@ fn expand_backrefs(repl: &str, caps: &fancy_regex::Captures) -> String {
 
 /// Ruby `dig`: index into nested Arrays/Hashes by each key in turn, short-
 /// circuiting to `nil` the moment a step is `nil`.
-fn dig(recv: &Value, keys: &[Value]) -> Value {
+fn dig(recv: &Value, keys: &[Value]) -> Result<Value, String> {
     let mut cur = recv.clone();
     for k in keys {
         if matches!(cur, Value::Undef) {
-            return Value::Undef;
+            return Ok(Value::Undef);
         }
         cur = if with_host(|h| h.as_array(&cur)).is_some() {
             arr_index(
                 &with_host(|h| h.as_array(&cur).unwrap()),
                 std::slice::from_ref(k),
-            )
+            )?
         } else if let Some(m) = with_host(|h| h.as_hash(&cur)) {
             let key = with_host(|h| h.value_to_key(k));
             m.get(&key).cloned().unwrap_or(Value::Undef)
         } else {
-            return Value::Undef;
+            return Ok(Value::Undef);
         };
     }
-    cur
+    Ok(cur)
 }
 
 /// Split a string into lines, keeping each trailing `\n` (Ruby `String#lines`).
@@ -7622,9 +7732,9 @@ fn str_slice_remove(s: &str, args: &[Value]) -> Option<(String, String)> {
     }
 }
 
-fn str_index(s: &str, args: &[Value]) -> Value {
+fn str_index(s: &str, args: &[Value]) -> Result<Value, String> {
     let chars: Vec<char> = s.chars().collect();
-    match args {
+    Ok(match args {
         [Value::Int(i)] => {
             let idx = norm_idx(*i, chars.len());
             idx.and_then(|k| chars.get(k))
@@ -7664,7 +7774,13 @@ fn str_index(s: &str, args: &[Value]) -> Value {
                     Value::Undef
                 }
             } else {
-                Value::Undef
+                // Not a Range/Regexp/String selector, so MRI converts it with
+                // `to_int`: a Float truncates, and nil (or anything else) is a
+                // TypeError rather than a silent nil.
+                norm_idx(to_int(rng)?, chars.len())
+                    .and_then(|k| chars.get(k))
+                    .map(|c| new_str(c.to_string()))
+                    .unwrap_or(Value::Undef)
             }
         }
         // `s[/re/, n]` — the nth capture group of the match (0 = whole match).
@@ -7679,7 +7795,7 @@ fn str_index(s: &str, args: &[Value]) -> Value {
             }
         }
         _ => Value::Undef,
-    }
+    })
 }
 
 /// Ruby `String#succ` / `Symbol#succ`: increment the rightmost alphanumeric,
@@ -7870,13 +7986,16 @@ fn dispatch_array(
         }
         "first" => match args.first() {
             Some(n) => Ok(new_arr(
-                arr.iter().take(as_i(n).max(0) as usize).cloned().collect(),
+                arr.iter()
+                    .take(to_int(n)?.max(0) as usize)
+                    .cloned()
+                    .collect(),
             )),
             None => Ok(arr.first().cloned().unwrap_or(Value::Undef)),
         },
         "last" => match args.first() {
             Some(n) => {
-                let k = as_i(n).max(0) as usize;
+                let k = to_int(n)?.max(0) as usize;
                 let start = arr.len().saturating_sub(k);
                 Ok(new_arr(arr[start..].to_vec()))
             }
@@ -7901,7 +8020,7 @@ fn dispatch_array(
                 }))
             }
         }
-        "dig" => Ok(dig(recv, args)),
+        "dig" => dig(recv, args),
         "empty?" => Ok(Value::Bool(arr.is_empty())),
         "reverse" => Ok(new_arr(arr.into_iter().rev().collect())),
         "reverse!" => {
@@ -8636,10 +8755,10 @@ fn dispatch_array(
             Ok(acc)
         }
         "min_by" | "max_by" | "sort_by" | "minmax_by" => sort_by_family(recv, name, &arr, &block),
-        "[]" => Ok(arr_index(&arr, args)),
+        "[]" => arr_index(&arr, args),
         "fetch" => {
             let len = arr.len();
-            let raw = as_i(&args[0]);
+            let raw = to_int(&args[0])?;
             match norm_idx(raw, len).filter(|&i| i < len) {
                 Some(i) => Ok(arr[i].clone()),
                 // Out of bounds: an explicit default, else a block, else IndexError.
@@ -8665,12 +8784,12 @@ fn dispatch_array(
         }
         "take" => Ok(new_arr(
             arr.into_iter()
-                .take(as_i(&args[0]).max(0) as usize)
+                .take(to_int(&args[0])?.max(0) as usize)
                 .collect(),
         )),
         "drop" => Ok(new_arr(
             arr.into_iter()
-                .skip(as_i(&args[0]).max(0) as usize)
+                .skip(to_int(&args[0])?.max(0) as usize)
                 .collect(),
         )),
         "partition" => {
@@ -8798,7 +8917,7 @@ fn dispatch_array(
             Ok(new_arr(rows.into_iter().map(new_arr).collect()))
         }
         "combination" => {
-            let n = as_i(&args[0]);
+            let n = to_int(&args[0])?;
             let combos = combinations(&arr, n);
             let out: Vec<Value> = combos.into_iter().map(new_arr).collect();
             if let Some(bl) = &block {
@@ -9103,7 +9222,7 @@ fn dispatch_array(
             Ok(new_arr(out))
         }
         "rotate" => {
-            let n = args.first().map(as_i).unwrap_or(1);
+            let n = args.first().map(to_int).transpose()?.unwrap_or(1);
             let len = arr.len() as i64;
             if len == 0 {
                 return Ok(new_arr(arr));
@@ -9333,8 +9452,8 @@ fn flatten_depth_into(arr: &[Value], depth: i64, out: &mut Vec<Value>) {
     }
 }
 
-fn arr_index(arr: &[Value], args: &[Value]) -> Value {
-    match args {
+fn arr_index(arr: &[Value], args: &[Value]) -> Result<Value, String> {
+    Ok(match args {
         [Value::Int(i)] => norm_idx(*i, arr.len())
             .and_then(|k| arr.get(k))
             .cloned()
@@ -9355,11 +9474,17 @@ fn arr_index(arr: &[Value], args: &[Value]) -> Value {
                     None => Value::Undef,
                 }
             } else {
-                Value::Undef
+                // Not a Range, so MRI converts the subscript with `to_int`: a
+                // Float truncates, and nil (or anything else) is a TypeError
+                // rather than a silent nil.
+                norm_idx(to_int(rng)?, arr.len())
+                    .and_then(|k| arr.get(k))
+                    .cloned()
+                    .unwrap_or(Value::Undef)
             }
         }
         _ => Value::Undef,
-    }
+    })
 }
 
 // ---- Hash -----------------------------------------------------------------
@@ -12252,6 +12377,40 @@ fn strf_num(n: i64, width: usize, pad: char, flag: Option<char>) -> String {
     format!("{sign}{}{body}", pad.to_string().repeat(need))
 }
 
+/// Weekday of Jan 1 of `y`, `0` = Sunday. 1970-01-01 is day 0 and a Thursday
+/// (`wday` 4), so the epoch day number offsets by 4.
+fn jan1_wday(y: i64) -> i64 {
+    (crate::host::days_from_civil(y, 1, 1) + 4).rem_euclid(7)
+}
+
+/// Number of ISO-8601 weeks in `y`: 53 when Jan 1 is a Thursday, or when `y` is
+/// a leap year starting on a Wednesday; 52 otherwise.
+fn iso_weeks_in_year(y: i64) -> i64 {
+    let j = jan1_wday(y);
+    if j == 4 || (crate::host::is_leap_year(y) && j == 3) {
+        53
+    } else {
+        52
+    }
+}
+
+/// The ISO-8601 week number and week-based year for a date, as `%V` and `%G`.
+///
+/// A date in early January can belong to the last week of the previous year,
+/// and one in late December to week 1 of the next; both are resolved here so
+/// `%G` is the year that owns the week, not the calendar year.
+fn iso_week_year(y: i64, yday: i64, wday: i64) -> (i64, i64) {
+    let iso_wday = if wday == 0 { 7 } else { wday };
+    let week = (yday - iso_wday + 10) / 7;
+    if week < 1 {
+        (iso_weeks_in_year(y - 1), y - 1)
+    } else if week > iso_weeks_in_year(y) {
+        (1, y + 1)
+    } else {
+        (week, y)
+    }
+}
+
 /// `Time#strftime` over the common directive set, including the `-`/`_`/`0`
 /// padding flags (`%-d` = no pad, `%_d` = space, `%0e` = zero). Unrecognized
 /// directives are emitted verbatim (leading `%` kept), matching MRI's lenient
@@ -12307,7 +12466,39 @@ fn time_strftime(
             Some('F') => out.push_str(&format!("{y:04}-{mo:02}-{d:02}")),
             Some('T') | Some('X') => out.push_str(&format!("{hh:02}:{mi:02}:{ss:02}")),
             Some('R') => out.push_str(&format!("{hh:02}:{mi:02}")),
-            Some('D') => out.push_str(&format!("{:02}/{d:02}/{:02}", mo, y.rem_euclid(100))),
+            Some('D') | Some('x') => {
+                out.push_str(&format!("{:02}/{d:02}/{:02}", mo, y.rem_euclid(100)))
+            }
+            Some('N') => out.push_str(&strf_num((frac * 1e9).round() as i64, 9, '0', None)),
+            Some('r') => out.push_str(&format!(
+                "{hour12:02}:{mi:02}:{ss:02} {}",
+                if hh < 12 { "AM" } else { "PM" }
+            )),
+            // `%c` is `%a %b %e %H:%M:%S %Y`, with the day space-padded.
+            Some('c') => out.push_str(&format!(
+                "{} {} {:>2} {hh:02}:{mi:02}:{ss:02} {y:04}",
+                &WDAY_FULL[wday as usize][..3],
+                &MON_FULL[(mo - 1) as usize][..3],
+                d
+            )),
+            // `%v` is VMS-style `%e-%^b-%Y`: space-padded day, uppercase month.
+            Some('v') => out.push_str(&format!(
+                "{:>2}-{}-{y:04}",
+                d,
+                MON_FULL[(mo - 1) as usize][..3].to_uppercase()
+            )),
+            // Week of year counting from the first Sunday (`%U`) or the first
+            // Monday (`%W`); days before it are week 0.
+            Some('U') => out.push_str(&strf_num((yday + 6 - wday) / 7, 2, '0', flag)),
+            Some('W') => out.push_str(&strf_num((yday + 6 - (wday + 6) % 7) / 7, 2, '0', flag)),
+            Some('V') => out.push_str(&strf_num(iso_week_year(y, yday, wday).0, 2, '0', flag)),
+            Some('G') => out.push_str(&strf_num(iso_week_year(y, yday, wday).1, 4, '0', flag)),
+            Some('g') => out.push_str(&strf_num(
+                iso_week_year(y, yday, wday).1.rem_euclid(100),
+                2,
+                '0',
+                flag,
+            )),
             Some('n') => out.push('\n'),
             Some('t') => out.push('\t'),
             Some('%') => out.push('%'),
@@ -12911,20 +13102,23 @@ fn dispatch_hash(
             // by `block.call(key, old_value, new_value)`.
             let mut m = map;
             for a in args {
-                if let Some(other) = with_host(|h| h.as_hash(a)) {
-                    if let Some(b) = &block {
-                        for (k, v) in other {
-                            if let Some(old) = m.get(&k) {
-                                let kv = with_host(|h| h.key_value(&k));
-                                let merged = call_proc(b, &[kv, old.clone(), v.clone()])?;
-                                m.insert(k, merged);
-                            } else {
-                                m.insert(k, v);
-                            }
+                // A non-Hash operand used to be skipped silently, so
+                // `h.merge(1)` answered a copy of `h` where Ruby raises.
+                let Some(other) = with_host(|h| h.as_hash(a)) else {
+                    return Err(conv_error(a, "Hash"));
+                };
+                if let Some(b) = &block {
+                    for (k, v) in other {
+                        if let Some(old) = m.get(&k) {
+                            let kv = with_host(|h| h.key_value(&k));
+                            let merged = call_proc(b, &[kv, old.clone(), v.clone()])?;
+                            m.insert(k, merged);
+                        } else {
+                            m.insert(k, v);
                         }
-                    } else {
-                        m.extend(other);
                     }
+                } else {
+                    m.extend(other);
                 }
             }
             Ok(with_host(|h| h.new_hash(m)))
@@ -12941,20 +13135,23 @@ fn dispatch_hash(
         "merge!" | "update" => {
             let mut m = map;
             for a in args {
-                if let Some(other) = with_host(|h| h.as_hash(a)) {
-                    if let Some(b) = &block {
-                        for (k, v) in other {
-                            if let Some(old) = m.get(&k) {
-                                let kv = with_host(|h| h.key_value(&k));
-                                let merged = call_proc(b, &[kv, old.clone(), v.clone()])?;
-                                m.insert(k, merged);
-                            } else {
-                                m.insert(k, v);
-                            }
+                // A non-Hash operand used to be skipped silently, so
+                // `h.merge(1)` answered a copy of `h` where Ruby raises.
+                let Some(other) = with_host(|h| h.as_hash(a)) else {
+                    return Err(conv_error(a, "Hash"));
+                };
+                if let Some(b) = &block {
+                    for (k, v) in other {
+                        if let Some(old) = m.get(&k) {
+                            let kv = with_host(|h| h.key_value(&k));
+                            let merged = call_proc(b, &[kv, old.clone(), v.clone()])?;
+                            m.insert(k, merged);
+                        } else {
+                            m.insert(k, v);
                         }
-                    } else {
-                        m.extend(other);
                     }
+                } else {
+                    m.extend(other);
                 }
             }
             with_host(|h| h.set_hash(recv, m));
@@ -13288,7 +13485,7 @@ fn dispatch_hash(
                 }))
             }
         }
-        "dig" => Ok(dig(recv, args)),
+        "dig" => dig(recv, args),
         _ => Err(no_method_error(recv, name)),
     }
 }
@@ -13822,7 +14019,7 @@ fn dispatch_symbol(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
             Ok(with_host(|h| h.new_symbol(&cap)))
         }
         // `Symbol#[]` indexes the name and returns a String, like `String#[]`.
-        "[]" | "slice" => Ok(str_index(&s, args)),
+        "[]" | "slice" => str_index(&s, args),
         "start_with?" => Ok(Value::Bool(args.iter().any(|a| s.starts_with(&arg_str(a))))),
         "end_with?" => Ok(Value::Bool(args.iter().any(|a| s.ends_with(&arg_str(a))))),
         // `match?` tests the name against a Regexp (or string pattern) without $~.

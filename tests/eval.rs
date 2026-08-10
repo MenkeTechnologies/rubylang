@@ -6890,26 +6890,45 @@ fn a_missing_operator_names_its_receiver_the_way_every_other_message_does() {
     let nome = |src: &str| {
         format!("begin; {src}; rescue NoMethodError => e; e.message; else; :no_raise; end")
     };
-    for (recv, phrase) in [
-        ("{}", "an instance of Hash"),
-        ("(1..2)", "an instance of Range"),
-        (":s", "an instance of Symbol"),
-        ("[]", "an instance of Array"),
-        ("Object.new", "an instance of Object"),
-        ("proc {}", "an instance of Proc"),
-        ("nil", "nil"),
-        ("true", "true"),
-        ("false", "false"),
+    // `plus_is_nome` is false for the one receiver that HAS `+`: Array. MRI
+    // reports `[] + 1` as a TypeError about the operand, not as a missing
+    // method, and it is asserted separately below.
+    for (recv, phrase, plus_is_nome) in [
+        ("{}", "an instance of Hash", true),
+        ("(1..2)", "an instance of Range", true),
+        (":s", "an instance of Symbol", true),
+        ("[]", "an instance of Array", false),
+        ("Object.new", "an instance of Object", true),
+        ("proc {}", "an instance of Proc", true),
+        ("nil", "nil", true),
+        ("true", "true", true),
+        ("false", "false", true),
     ] {
         eq(
             &nome(&format!("-{recv}")),
             &format!("\"undefined method '-@' for {phrase}\""),
         );
-        eq(
-            &nome(&format!("{recv} + 1")),
-            &format!("\"undefined method '+' for {phrase}\""),
-        );
+        if plus_is_nome {
+            eq(
+                &nome(&format!("{recv} + 1")),
+                &format!("\"undefined method '+' for {phrase}\""),
+            );
+        }
     }
+    // Array defines `+`, so a non-Array operand is a conversion failure. Pinning
+    // this as a NoMethodError had frozen a divergence from MRI:
+    //   $ /opt/homebrew/opt/ruby/bin/ruby -e '[] + 1'
+    //   -e:1:in 'Array#+': no implicit conversion of Integer into Array (TypeError)
+    let type_err =
+        |src: &str| format!("begin; {src}; rescue TypeError => e; e.message; else; :no_raise; end");
+    eq(
+        &type_err("[] + 1"),
+        "\"no implicit conversion of Integer into Array\"",
+    );
+    eq(
+        &type_err("[] + nil"),
+        "\"no implicit conversion of nil into Array\"",
+    );
     // A binary operator other than `+` takes the same phrasing.
     eq(
         &nome("\"a\" - 1"),
@@ -6922,4 +6941,160 @@ fn a_missing_operator_names_its_receiver_the_way_every_other_message_does() {
         &nome("{}.zzz"),
         "\"undefined method 'zzz' for an instance of Hash\"",
     );
+}
+
+/// An argument position that MRI converts with `to_int` must REJECT a value
+/// that has no integer conversion instead of silently reading it as 0.
+///
+/// Every expectation below was captured from the reference MRI, e.g.
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p "ab" * nil'
+///   -e:1:in 'String#*': no implicit conversion from nil to integer (TypeError)
+/// Before the check existed these answered a WRONG VALUE and exited 0 —
+/// `"ab" * nil` was `""`, `[1,2].first(nil)` was `[]` — which is the failure a
+/// stdout+exit-code differential harness is built to catch, and could not,
+/// because no generator emits a type-mismatched operand.
+#[test]
+fn an_integer_argument_position_rejects_a_value_with_no_integer_conversion() {
+    let msg =
+        |src: &str| format!("begin; {src}; rescue TypeError => e; e.message; else; :no_raise; end");
+    // nil takes MRI's `from nil to integer` wording ...
+    for src in [
+        "\"abc\" * nil",
+        "\"abc\"[nil]",
+        "\"abc\".center(nil)",
+        "\"abc\".ljust(nil)",
+        "\"abc\".rjust(nil)",
+        "[1, 2] * nil",
+        "[1, 2][nil]",
+        "[1, 2].first(nil)",
+        "[1, 2].last(nil)",
+        "[1, 2].take(nil)",
+        "[1, 2].drop(nil)",
+        "[1, 2].fetch(nil)",
+        "[1, 2].rotate(nil)",
+        "[1, 2].combination(nil).to_a",
+        "255.to_s(nil)",
+        "\"ff\".to_i(nil)",
+        "Array.new(nil)",
+    ] {
+        eq(&msg(src), "\"no implicit conversion from nil to integer\"");
+    }
+    // ... every other type is named by class.
+    eq(
+        &msg("\"abc\" * \"b\""),
+        "\"no implicit conversion of String into Integer\"",
+    );
+    eq(
+        &msg("\"abc\" * true"),
+        "\"no implicit conversion of true into Integer\"",
+    );
+    // A Float still converts, by truncation, exactly as `Float#to_int` does.
+    eq("\"ab\" * 2.7", "\"abab\"");
+    eq("\"abc\"[1.7]", "\"b\"");
+    eq("[1, 2, 3].first(1.9)", "[1]");
+}
+
+/// `String#+` demands a String and `Hash#merge` a Hash. Both used to coerce the
+/// operand instead — `"a" + 1` answered `"a1"` and `{a: 1}.merge(1)` answered a
+/// copy of the receiver, each exiting 0 where MRI raises:
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p "a" + 1'
+///   -e:1:in 'String#+': no implicit conversion of Integer into String (TypeError)
+#[test]
+fn a_typed_operand_position_rejects_the_wrong_class_rather_than_coercing_it() {
+    let msg =
+        |src: &str| format!("begin; {src}; rescue TypeError => e; e.message; else; :no_raise; end");
+    for (src, want) in [
+        ("\"a\" + 1", "Integer into String"),
+        ("\"a\" + nil", "nil into String"),
+        ("\"a\" + :b", "Symbol into String"),
+        ("\"a\" + []", "Array into String"),
+        ("({a: 1}).merge(1)", "Integer into Hash"),
+        ("({a: 1}).merge!(nil)", "nil into Hash"),
+    ] {
+        eq(&msg(src), &format!("\"no implicit conversion of {want}\""));
+    }
+    // `<<` and `concat` are the APPEND forms, and they take an Integer as a
+    // codepoint — so they must NOT share `+`'s rule.
+    eq("\"a\" << 98", "\"ab\"");
+    eq("\"a\".concat(98)", "\"ab\"");
+    eq("\"a\" << \"b\"", "\"ab\"");
+    eq(
+        &msg("\"a\" << nil"),
+        "\"no implicit conversion of nil into String\"",
+    );
+    eq(
+        &msg("\"a\" << :b"),
+        "\"no implicit conversion of Symbol into String\"",
+    );
+    // `Array#*` joins on a String operand and repeats on an Integer.
+    eq("[1, 2] * \"x\"", "\"1x2\"");
+    eq("[1, 2] * 2", "[1, 2, 1, 2]");
+}
+
+/// A numeric receiver whose operand cannot be coerced is a TypeError naming
+/// both sides, not a NoMethodError about an operator Integer plainly has:
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e '1 + "a"'
+///   -e:1:in 'Integer#+': String can't be coerced into Integer (TypeError)
+#[test]
+fn an_uncoercible_operand_on_a_numeric_receiver_names_both_sides() {
+    let msg =
+        |src: &str| format!("begin; {src}; rescue TypeError => e; e.message; else; :no_raise; end");
+    for (src, want) in [
+        ("1 + \"a\"", "String can't be coerced into Integer"),
+        ("1 - nil", "nil can't be coerced into Integer"),
+        ("1 * :a", ":a can't be coerced into Integer"),
+        ("1 / \"a\"", "String can't be coerced into Integer"),
+        ("1 % \"a\"", "String can't be coerced into Integer"),
+        ("1 + true", "true can't be coerced into Integer"),
+        ("1 + []", "Array can't be coerced into Integer"),
+        ("1.0 + \"a\"", "String can't be coerced into Float"),
+        ("1.5 * nil", "nil can't be coerced into Float"),
+    ] {
+        eq(&msg(src), &format!("\"{want}\""));
+    }
+    // `gcd`/`lcm` are the exception: MRI words theirs `not an integer`, and they
+    // do not accept a Float either.
+    eq(&msg("5.gcd(nil)"), "\"not an integer\"");
+    eq(&msg("5.lcm(\"a\")"), "\"not an integer\"");
+}
+
+/// The ten `strftime` directives that were emitted verbatim (`"%c"` for `%c`)
+/// because no generator in the differential harness ever produced a `Time`.
+///
+/// Every expectation is the reference MRI's, e.g.
+///   $ TZ=UTC /opt/homebrew/opt/ruby/bin/ruby -e \
+///       'print Time.at(1234567890).utc.strftime("%c")'
+///   Fri Feb 13 23:31:30 2009
+#[test]
+fn strftime_covers_the_composite_and_week_number_directives() {
+    let t = "Time.at(1234567890).utc";
+    for (fmt, want) in [
+        ("%c", "Fri Feb 13 23:31:30 2009"),
+        ("%x", "02/13/09"),
+        ("%r", "11:31:30 PM"),
+        ("%v", "13-FEB-2009"),
+        ("%N", "000000000"),
+        ("%U", "06"),
+        ("%W", "06"),
+        ("%V", "07"),
+        ("%G", "2009"),
+        ("%g", "09"),
+    ] {
+        eq(&format!("{t}.strftime({fmt:?})"), &format!("{want:?}"));
+    }
+    // `%c` and `%v` space-pad a single-digit day, as MRI does.
+    eq(
+        "Time.utc(2009, 2, 3, 1, 5, 7).strftime(\"%c|%v|%r\")",
+        "\"Tue Feb  3 01:05:07 2009| 3-FEB-2009|01:05:07 AM\"",
+    );
+    // The ISO week-based year is NOT the calendar year at a year boundary:
+    // 2010-01-01 belongs to week 53 of 2009, and 2007-12-31 to week 1 of 2008.
+    eq("Time.utc(2010, 1, 1).strftime(\"%G-W%V\")", "\"2009-W53\"");
+    eq(
+        "Time.utc(2007, 12, 31).strftime(\"%G-W%V\")",
+        "\"2008-W01\"",
+    );
+    // %U counts from the first Sunday, %W from the first Monday, so they differ
+    // for a year starting mid-week.
+    eq("Time.utc(2007, 12, 31).strftime(\"%U|%W\")", "\"52|53\"");
 }
