@@ -7694,3 +7694,168 @@ fn collection_searches_find_a_nan_that_is_not_equal_to_itself() {
     eq("[0.0].include?(-0.0)", "true");
     eq("[1] == [1.0]", "true");
 }
+
+/// A size argument MRI REFUSES, clamped instead of checked. `to_int(n)?.max(0)`
+/// reads as defensive and is not: it accepts an argument the reference rejects,
+/// so a negative size answered an empty collection where MRI raises. Eleven
+/// call sites shared the shape, and MRI uses SIX different sentences across
+/// them — a single "negative argument" everywhere would be wrong five ways:
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e '[1,2,3].take(-1)'
+///   -e:1:in 'Array#take': attempt to take negative size (ArgumentError)
+#[test]
+fn a_negative_size_is_refused_and_not_clamped_to_zero() {
+    let caught = |src: &str| {
+        format!(
+            "begin; {src}; rescue Exception => e; [e.class.to_s, e.message]; else; :no_raise; end"
+        )
+    };
+    for (src, msg) in [
+        ("[1,2,3].first(-1)", "negative array size"),
+        ("[1,2,3].last(-1)", "negative array size"),
+        ("[].first(-1)", "negative array size"),
+        ("\"abc\".chars.first(-1)", "negative array size"),
+        ("Array.new(-1)", "negative array size"),
+        ("[1,2,3].take(-1)", "attempt to take negative size"),
+        ("[1,2,3].drop(-1)", "attempt to drop negative size"),
+        ("[1,2,3].each_slice(0).to_a", "invalid slice size"),
+        ("[1,2,3].each_slice(-1).to_a", "invalid slice size"),
+        ("[1,2,3].each_cons(0).to_a", "invalid size"),
+        ("[1,2,3].each_cons(-1).to_a", "invalid size"),
+        ("[1,2,3].min(-1)", "negative size (-1)"),
+        ("[1,2,3].max(-1)", "negative size (-1)"),
+        ("\"x\" * -1", "negative argument"),
+        ("[1] * -1", "negative argument"),
+    ] {
+        eq(&caught(src), &format!("[\"ArgumentError\", {msg:?}]"));
+    }
+    // The valid side is unchanged — a test of only the rejections would pass on
+    // an implementation that refused every size.
+    eq("[1,2,3].first(2)", "[1, 2]");
+    eq("[1,2,3].last(2)", "[2, 3]");
+    eq("[1,2,3].first(0)", "[]");
+    eq("[1,2,3].take(0)", "[]");
+    eq("[1,2,3].drop(0)", "[1, 2, 3]");
+    eq("[1,2,3].each_slice(2).to_a", "[[1, 2], [3]]");
+    eq("[1,2,3].each_cons(2).to_a", "[[1, 2], [2, 3]]");
+    eq("[1,2,3].min(2)", "[1, 2]");
+    eq("\"x\" * 3", "\"xxx\"");
+    eq("[1] * 2", "[1, 1]");
+    eq("Array.new(2)", "[nil, nil]");
+    // A `break` out of a summing block is not a summand: it carries the call's
+    // value out, and adding the absent one reported a type error for a sum that
+    // was not happening.
+    eq("[1,2,3].sum { break 5 }", "5");
+}
+
+/// Operand TYPE checks that were absent, so each answered a plausible wrong
+/// value instead of raising: `[1,2,3].values_at("a")` read the String as index
+/// 0 and returned `[1]`, `[1,2].zip(1)` padded with nil, `[1,2].sum("")` added
+/// through `as_f` and answered 3.0, `[1].to_h` silently dropped the element.
+#[test]
+fn an_operand_of_the_wrong_type_raises_instead_of_answering() {
+    let caught = |src: &str| {
+        format!(
+            "begin; {src}; rescue Exception => e; [e.class.to_s, e.message]; else; :no_raise; end"
+        )
+    };
+    eq(
+        &caught("[1,2,3].values_at(\"a\")"),
+        "[\"TypeError\", \"no implicit conversion of String into Integer\"]",
+    );
+    eq(
+        &caught("[1,2].zip(1)"),
+        "[\"TypeError\", \"wrong argument type Integer (must respond to :each)\"]",
+    );
+    eq(
+        &caught("[1,2].sum(\"\")"),
+        "[\"TypeError\", \"no implicit conversion of Integer into String\"]",
+    );
+    eq(
+        &caught("[1].to_h"),
+        "[\"TypeError\", \"wrong element type Integer at 0 (expected array)\"]",
+    );
+    eq(
+        &caught("[[1,2],[3,4,5]].to_h"),
+        "[\"ArgumentError\", \"wrong array length at 1 (expected 2, was 3)\"]",
+    );
+    eq(
+        &caught("Hash[[1,2]]"),
+        "[\"ArgumentError\", \"wrong element type Integer at 0 (expected array)\"]",
+    );
+    eq(
+        &caught("Hash[1,2,3]"),
+        "[\"ArgumentError\", \"odd number of arguments for Hash\"]",
+    );
+    eq(
+        &caught("String.new(1)"),
+        "[\"TypeError\", \"no implicit conversion of Integer into String\"]",
+    );
+    eq(
+        &caught("Struct.new(:a).new(1, 2)"),
+        "[\"ArgumentError\", \"struct size differs\"]",
+    );
+    // The accepting side of each, so none of these is "always raises".
+    eq("[1,2,3].values_at(0, 2)", "[1, 3]");
+    eq("[1,2].zip([3,4])", "[[1, 3], [2, 4]]");
+    eq("[1,2].sum", "3");
+    eq("[\"a\",\"b\"].sum(\"\")", "\"ab\"");
+    eq("[[1,2]].to_h", "{1 => 2}");
+    eq("Hash[[[1,2],[3,4]]]", "{1 => 2, 3 => 4}");
+    eq("Hash[1,2]", "{1 => 2}");
+    eq("String.new(\"x\")", "\"x\"");
+    eq("String.new", "\"\"");
+    eq("Struct.new(:a, :b).new(1).to_a", "[1, nil]");
+}
+
+/// `Integer#chr` is a BYTE, so only 0..255 is in range; the implementation cast
+/// through `as u8`, which WRAPS. `256.chr` answered "\u0000" and `-1.chr`
+/// answered a character, both of which MRI refuses:
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e '256.chr'
+///   -e:1:in 'Integer#chr': 256 out of char range (RangeError)
+///
+/// The Math functions had the mirror-image problem: an argument outside the
+/// domain produced IEEE's NaN on a zero exit, where MRI raises.
+#[test]
+fn out_of_domain_arguments_raise_rather_than_wrapping_or_answering_nan() {
+    let caught = |src: &str| {
+        format!(
+            "begin; {src}; rescue Exception => e; [e.class.to_s, e.message]; else; :no_raise; end"
+        )
+    };
+    eq(
+        &caught("256.chr"),
+        "[\"RangeError\", \"256 out of char range\"]",
+    );
+    eq(
+        &caught("-1.chr"),
+        "[\"RangeError\", \"-1 out of char range\"]",
+    );
+    eq("65.chr", "\"A\"");
+    eq("0.chr", "\"\\u0000\"");
+    for (src, fname) in [
+        ("Math.sqrt(-1)", "sqrt"),
+        ("Math.log(-1)", "log"),
+        ("Math.acos(2)", "acos"),
+        ("Math.asin(2)", "asin"),
+    ] {
+        eq(
+            &caught(src),
+            &format!("[\"Math::DomainError\", \"Numerical argument is out of domain - {fname}\"]"),
+        );
+    }
+    // In-domain calls still answer, and an argument that is ITSELF a NaN
+    // propagates rather than being reported as out of domain.
+    eq("Math.sqrt(9)", "3.0");
+    eq("Math.log(1)", "0.0");
+    eq("Math.acos(1)", "0.0");
+    eq("Math.sqrt(Float::NAN).nan?", "true");
+    // `Integer.sqrt` did not exist; it shares the domain rule, and MRI quotes
+    // the internal name in its message.
+    eq("Integer.sqrt(9)", "3");
+    eq("Integer.sqrt(0)", "0");
+    eq("Integer.sqrt(15)", "3");
+    eq(
+        &caught("Integer.sqrt(-1)"),
+        "[\"Math::DomainError\", \"Numerical argument is out of domain - \\\"isqrt\\\"\"]",
+    );
+}

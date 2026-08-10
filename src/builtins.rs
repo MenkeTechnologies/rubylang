@@ -2964,6 +2964,11 @@ fn dispatch_classref(
                     with_host(|h| h.set_ivar_of(&obj, m, v));
                 }
             } else {
+                // A Struct accepts FEWER values than it has members (the rest
+                // are nil) but never more; extra ones were silently dropped.
+                if args.len() > members.len() {
+                    return Err(raise_exc("ArgumentError", "struct size differs"));
+                }
                 for (i, m) in members.iter().enumerate() {
                     let v = args.get(i).cloned().unwrap_or(Value::Undef);
                     with_host(|h| h.set_ivar_of(&obj, m, v));
@@ -3399,8 +3404,32 @@ fn dispatch_classref(
             _ => None,
         };
         if let Some(v) = f {
+            // A NaN out of a function whose ARGUMENT was not a NaN means the
+            // argument was outside the function's domain, which MRI reports
+            // rather than propagating IEEE's answer.
+            if v.is_nan()
+                && !args
+                    .iter()
+                    .any(|a| matches!(a, Value::Float(f) if f.is_nan()))
+            {
+                return Err(raise_exc(
+                    "Math::DomainError",
+                    &format!("Numerical argument is out of domain - {name}"),
+                ));
+            }
             return Ok(Value::Float(v));
         }
+        // `Integer.sqrt` lives on Integer, not Math, but shares the domain rule.
+    }
+    if cls == "Integer" && name == "sqrt" {
+        let n = to_int(&args[0])?;
+        if n < 0 {
+            return Err(raise_exc(
+                "Math::DomainError",
+                "Numerical argument is out of domain - \"isqrt\"",
+            ));
+        }
+        return Ok(Value::Int((n as f64).sqrt() as i64));
     }
     // The `JSON` module (dependency-free, hand-written over the host value model).
     // `generate`/`dump` encode; `parse`/`load` decode; `pretty_generate` indents.
@@ -3545,7 +3574,10 @@ fn dispatch_classref(
                         return Ok(new_arr(items));
                     }
                 }
-                let n = args.first().map(to_int).transpose()?.unwrap_or(0).max(0) as usize;
+                let n = match args.first() {
+                    Some(a) => checked_size(a, 0, "negative array size")?,
+                    None => 0,
+                };
                 let items: Vec<Value> = if let Some(bl) = &block {
                     (0..n)
                         .map(|i| call_proc(bl, &[Value::Int(i as i64)]))
@@ -3569,10 +3601,17 @@ fn dispatch_classref(
             // `RObj::Str`), not an opaque object. Encoding keywords are accepted
             // and ignored (only UTF-8/binary bytes are modeled).
             if cls == "String" {
-                let s = args
-                    .first()
-                    .and_then(|a| with_host(|h| h.as_str(a)))
-                    .unwrap_or_default();
+                // A non-String argument is refused rather than read as "".
+                let s = match args.first() {
+                    Some(a) if !with_host(|h| h.as_hash(a).is_some()) => {
+                        match with_host(|h| h.as_str(a)) {
+                            Some(s) => s,
+                            None => return Err(conv_error(a, "String")),
+                        }
+                    }
+                    // A lone keyword Hash is `String.new(encoding:)`, not a value.
+                    _ => String::new(),
+                };
                 return Ok(with_host(|h| h.new_string(s)));
             }
             // `Hash.new(default)` builds a real Hash whose `[]` returns `default`
@@ -3895,20 +3934,37 @@ fn dispatch_classref(
             }
             let mut map = IndexMap::new();
             // `Hash[[[k,v],...]]` (one array-of-pairs arg) vs `Hash[k,v,k,v]`.
-            let pairs: Vec<Value> =
-                if args.len() == 1 && with_host(|h| h.as_array(&args[0])).is_some() {
-                    with_host(|h| h.as_array(&args[0]).unwrap())
-                        .iter()
-                        .flat_map(|p| with_host(|h| h.as_array(p)).unwrap_or_default())
-                        .collect()
-                } else {
-                    args.to_vec()
-                };
-            for pair in pairs.chunks(2) {
-                if pair.len() == 2 {
-                    let k = with_host(|h| h.value_to_key(&pair[0]));
-                    map.insert(k, pair[1].clone());
+            if args.len() == 1 && with_host(|h| h.as_array(&args[0])).is_some() {
+                for (i, p) in with_host(|h| h.as_array(&args[0]).unwrap())
+                    .iter()
+                    .enumerate()
+                {
+                    // An element that is not an array names its position; a
+                    // one-element array pads its value with nil rather than
+                    // being dropped, which is how MRI reads it.
+                    let Some(pair) = with_host(|h| h.as_array(p)) else {
+                        let cls = with_host(|h| h.class_of(p));
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            &format!("wrong element type {cls} at {i} (expected array)"),
+                        ));
+                    };
+                    let Some(k) = pair.first() else { continue };
+                    let k = with_host(|h| h.value_to_key(k));
+                    map.insert(k, pair.get(1).cloned().unwrap_or(Value::Undef));
                 }
+                return Ok(with_host(|h| h.new_hash(map)));
+            }
+            // The flat `Hash[k, v, k, v]` form needs an even count.
+            if args.len() % 2 != 0 {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    "odd number of arguments for Hash",
+                ));
+            }
+            for pair in args.chunks(2) {
+                let k = with_host(|h| h.value_to_key(&pair[0]));
+                map.insert(k, pair[1].clone());
             }
             Ok(with_host(|h| h.new_hash(map)))
         }
@@ -5904,10 +5960,16 @@ fn dispatch_number(
                 Ok(new_arr(vec![Value::Int(q as i64), Value::Float(x - q * y)]))
             }
         },
-        "chr" => Ok(with_host(|h| {
-            let c = (as_i(recv) as u8) as char;
-            h.new_string(c.to_string())
-        })),
+        // `Integer#chr` is a BYTE, so only 0..255 is in range. Casting through
+        // `as u8` wrapped instead: `256.chr` answered " " and `-1.chr`
+        // answered "ÿ", both of which MRI refuses.
+        "chr" => {
+            let n = as_i(recv);
+            if !(0..=255).contains(&n) {
+                return Err(raise_exc("RangeError", &format!("{n} out of char range")));
+            }
+            Ok(with_host(|h| h.new_string((n as u8 as char).to_string())))
+        }
         // These require exactly one argument; Ruby raises ArgumentError rather
         // than crashing when it is omitted.
         "gcd" | "lcm" | "gcdlcm" | "ceildiv" if args.is_empty() => Err(raise_exc(
@@ -6670,6 +6732,22 @@ fn iter_int_range(
     Ok(with_host(|h| h.new_enumerator(vals, "each")))
 }
 
+/// A count argument MRI REFUSES rather than clamps.
+///
+/// `to_int(n)?.max(0)` reads as defensive and is not: it silently accepts an
+/// argument the reference rejects, so `[1, 2, 3].first(-1)` answered `[]` where
+/// MRI raises. Clamping is the wrong shape for every one of these — a negative
+/// size is a programming error in Ruby, not a request for nothing. `floor` is
+/// the smallest value accepted (0 for a size, 1 for a window width), and `msg`
+/// is the wording MRI uses for that particular method.
+fn checked_size(v: &Value, floor: i64, msg: &str) -> Result<usize, String> {
+    let n = to_int(v)?;
+    if n < floor {
+        return Err(raise_exc("ArgumentError", msg));
+    }
+    Ok(n as usize)
+}
+
 /// An integer result that may not fit in an `i64`.
 ///
 /// Ruby has one Integer type and it is unbounded, so every arithmetic result is
@@ -7345,7 +7423,11 @@ fn dispatch_string(
         // where a min above its max is an error.
         "between?" => comparable_between(recv, args),
         "clamp" => comparable_clamp(recv, args),
-        "*" => Ok(new_str(s.repeat(to_int(&args[0])?.max(0) as usize))),
+        "*" => Ok(new_str(s.repeat(checked_size(
+            &args[0],
+            0,
+            "negative argument",
+        )?))),
         "%" => {
             // `"%d-%d" % [1, 2]` or `"%d" % 5`; a Hash operand feeds named
             // references `%<name>s` / `%{name}`.
@@ -8427,7 +8509,7 @@ fn dispatch_array(
         "first" => match args.first() {
             Some(n) => Ok(new_arr(
                 arr.iter()
-                    .take(to_int(n)?.max(0) as usize)
+                    .take(checked_size(n, 0, "negative array size")?)
                     .cloned()
                     .collect(),
             )),
@@ -8435,14 +8517,14 @@ fn dispatch_array(
         },
         "last" => match args.first() {
             Some(n) => {
-                let k = to_int(n)?.max(0) as usize;
+                let k = checked_size(n, 0, "negative array size")?;
                 let start = arr.len().saturating_sub(k);
                 Ok(new_arr(arr[start..].to_vec()))
             }
             None => Ok(arr.last().cloned().unwrap_or(Value::Undef)),
         },
         "each_cons" => {
-            let n = as_i(&args[0]).max(1) as usize;
+            let n = checked_size(&args[0], 1, "invalid size")?;
             let windows: Vec<Value> = arr.windows(n).map(|w| new_arr(w.to_vec())).collect();
             if let Some(bl) = &block {
                 for w in &windows {
@@ -8591,7 +8673,9 @@ fn dispatch_array(
                         out.push(arr.get(k).cloned().unwrap_or(Value::Undef));
                     }
                 } else {
-                    let v = norm_idx(as_i(a), arr.len())
+                    // A non-integer index is a TypeError, not index 0: `as_i`
+                    // answered 0 for a String and quietly returned arr[0].
+                    let v = norm_idx(to_int(a)?, arr.len())
                         .and_then(|k| arr.get(k))
                         .cloned()
                         .unwrap_or(Value::Undef);
@@ -8728,7 +8812,9 @@ fn dispatch_array(
             // DESCENDING there — reading an ascending sort backwards kept the
             // last, and `[1, 1r].max(1)` answered `[(1/1)]`.
             if let Some(n) = args.first().filter(|_| block.is_none()) {
-                let k = (as_i(n).max(0) as usize).min(arr.len());
+                // MRI names the offending value here, unlike the other size
+                // diagnostics: `negative size (-1)`.
+                let k = checked_size(n, 0, &format!("negative size ({})", as_i(n)))?.min(arr.len());
                 let sorted = if want_max && k >= arr.len() {
                     let mut s = sort_values(&arr, CmpOrder::Reversed, false)?;
                     s.reverse();
@@ -8763,7 +8849,13 @@ fn dispatch_array(
                     Some(bl) => call_proc(bl, std::slice::from_ref(x))?,
                     None => x.clone(),
                 };
-                acc = add_values(&acc, &v);
+                // A `break` out of the block leaves a pending signal and no real
+                // value; adding it would report a type error for a sum that is
+                // not happening. The signal carries the call's value upward.
+                if has_pending_signal() {
+                    break;
+                }
+                acc = add_values(&acc, &v)?;
             }
             Ok(acc)
         }
@@ -9231,12 +9323,12 @@ fn dispatch_array(
         }
         "take" => Ok(new_arr(
             arr.into_iter()
-                .take(to_int(&args[0])?.max(0) as usize)
+                .take(checked_size(&args[0], 0, "attempt to take negative size")?)
                 .collect(),
         )),
         "drop" => Ok(new_arr(
             arr.into_iter()
-                .skip(to_int(&args[0])?.max(0) as usize)
+                .skip(checked_size(&args[0], 0, "attempt to drop negative size")?)
                 .collect(),
         )),
         "partition" => {
@@ -9316,8 +9408,18 @@ fn dispatch_array(
         "zip" => {
             let others: Vec<Vec<Value>> = args
                 .iter()
-                .map(|a| with_host(|h| h.as_array(a).unwrap_or_default()))
-                .collect();
+                .map(|a| {
+                    // An operand that is not enumerable is refused; treating it
+                    // as an empty array padded the rows with nil instead.
+                    with_host(|h| h.as_array(a)).ok_or_else(|| {
+                        let cls = with_host(|h| h.class_of(a));
+                        raise_exc(
+                            "TypeError",
+                            &format!("wrong argument type {cls} (must respond to :each)"),
+                        )
+                    })
+                })
+                .collect::<Result<_, _>>()?;
             let rows: Vec<Value> = arr
                 .iter()
                 .enumerate()
@@ -9680,7 +9782,7 @@ fn dispatch_array(
             Ok(new_arr(out))
         }
         "each_slice" => {
-            let n = as_i(&args[0]).max(1) as usize;
+            let n = checked_size(&args[0], 1, "invalid slice size")?;
             let slices: Vec<Value> = arr.chunks(n).map(|c| new_arr(c.to_vec())).collect();
             if let Some(bl) = &block {
                 for s in &slices {
@@ -9730,18 +9832,30 @@ fn dispatch_array(
         }
         "to_h" => {
             let mut m = IndexMap::new();
-            for x in &arr {
+            for (i, x) in arr.iter().enumerate() {
                 // With a block each element is mapped to the `[key, value]` pair.
                 let elem = match &block {
                     Some(b) => call_proc(b, std::slice::from_ref(x))?,
                     None => x.clone(),
                 };
-                if let Some(pair) = with_host(|h| h.as_array(&elem)) {
-                    if pair.len() == 2 {
-                        let k = with_host(|h| h.value_to_key(&pair[0]));
-                        m.insert(k, pair[1].clone());
-                    }
+                // An element that is not a pair is REFUSED, naming its position.
+                // Skipping it silently made `[1].to_h` answer `{}`.
+                let pair = with_host(|h| h.as_array(&elem));
+                let Some(pair) = pair else {
+                    let cls = with_host(|h| h.class_of(&elem));
+                    return Err(raise_exc(
+                        "TypeError",
+                        &format!("wrong element type {cls} at {i} (expected array)"),
+                    ));
+                };
+                if pair.len() != 2 {
+                    return Err(raise_exc(
+                        "ArgumentError",
+                        &format!("wrong array length at {i} (expected 2, was {})", pair.len()),
+                    ));
                 }
+                let k = with_host(|h| h.value_to_key(&pair[0]));
+                m.insert(k, pair[1].clone());
             }
             Ok(with_host(|h| h.new_hash(m)))
         }
@@ -19429,16 +19543,18 @@ fn norm_idx(i: i64, len: usize) -> Option<usize> {
     }
 }
 
-fn add_values(a: &Value, b: &Value) -> Value {
+/// `+` for `Array#sum`, which must PROPAGATE a type mismatch. Falling back to
+/// `as_f` on a failed host add made `[1, 2].sum("")` answer 3.0 where MRI
+/// raises `no implicit conversion of Integer into String`.
+fn add_values(a: &Value, b: &Value) -> Result<Value, String> {
     match (a, b) {
-        (Value::Int(x), Value::Int(y)) => Value::Int(x + y),
+        (Value::Int(x), Value::Int(y)) => Ok(int_wide(*x as i128 + *y as i128)),
         (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
-            Value::Float(as_f(a) + as_f(b))
+            Ok(Value::Float(as_f(a) + as_f(b)))
         }
         // Object operands (Rational, BigInt, String, Array, …) add through host
         // dispatch so `sum`/`reduce(:+)` stay exact and type-correct.
-        _ => with_host(|h| h.num_op(fusevm::NumOp::Add, a, b))
-            .unwrap_or_else(|_| Value::Float(as_f(a) + as_f(b))),
+        _ => with_host(|h| h.num_op(fusevm::NumOp::Add, a, b)),
     }
 }
 

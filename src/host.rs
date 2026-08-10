@@ -6783,7 +6783,16 @@ impl RubyHost {
             }
             (Some(RObj::Str(s)), Mul) => {
                 let s = s.clone();
-                let n = self.to_int_operand(b)?.max(0) as usize;
+                // MRI REFUSES a negative repeat count rather than treating it as
+                // zero: `"x" * -1` is `ArgumentError: negative argument`.
+                let raw = self.to_int_operand(b)?;
+                if raw < 0 {
+                    return Err(crate::builtins::raise_exc(
+                        "ArgumentError",
+                        "negative argument",
+                    ));
+                }
+                let n = raw as usize;
                 return Ok(self.new_string(s.repeat(n)));
             }
             (Some(RObj::Str(s)), Lt | Gt | Le | Ge) => {
@@ -6819,7 +6828,16 @@ impl RubyHost {
                     let parts: Vec<String> = xs.iter().map(|v| self.to_s(v)).collect();
                     return Ok(self.new_string(parts.join(&sep)));
                 }
-                let n = self.to_int_operand(b)?.max(0) as usize;
+                // MRI REFUSES a negative repeat count rather than treating it as
+                // zero: `"x" * -1` is `ArgumentError: negative argument`.
+                let raw = self.to_int_operand(b)?;
+                if raw < 0 {
+                    return Err(crate::builtins::raise_exc(
+                        "ArgumentError",
+                        "negative argument",
+                    ));
+                }
+                let n = raw as usize;
                 let mut out = Vec::with_capacity(xs.len() * n);
                 for _ in 0..n {
                     out.extend(xs.iter().cloned());

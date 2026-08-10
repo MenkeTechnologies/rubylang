@@ -1038,6 +1038,22 @@ Honest limitations of this surface:
   language explicitly does not specify, and being stable is the stronger
   guarantee. Left as-is on purpose; it is the one open row of the
   name-lookalike sweep.
+- **A size argument is CHECKED, not clamped.** `first(-1)`, `last(-1)`,
+  `take(-1)`, `drop(-1)`, `each_slice(0)`, `each_cons(0)`, `min(-1)`, `max(-1)`,
+  `Array.new(-1)`, `"x" * -1` and `[1] * -1` each raise, and MRI uses six
+  different sentences across them (`negative array size`, `attempt to take
+  negative size`, `attempt to drop negative size`, `invalid slice size`,
+  `invalid size`, `negative size (-1)`, `negative argument`). Clamping with
+  `.max(0)` had answered an empty collection for all eleven.
+- **Operand type checks.** `values_at` converts its index rather than reading a
+  non-integer as 0; `zip` refuses an operand that is not enumerable rather than
+  padding with nil; `Array#sum` propagates a type mismatch instead of falling
+  back to `as_f`; `to_h` and `Hash[]` name the offending element's position;
+  `String.new` refuses a non-String; `Struct#new` refuses more values than the
+  struct has members; `Integer#chr` refuses anything outside 0..255 instead of
+  wrapping through `as u8`; the `Math` functions raise `Math::DomainError`
+  rather than answering IEEE's NaN, and `Integer.sqrt` exists and shares that
+  rule.
 - **Collection searches use `rb_equal`, not `==`.** `include?`, `index`,
   `rindex`, `count(obj)` and element-wise `Array#==` answer true for two
   operands that are the same value before asking `==`, which is what MRI does.
@@ -1285,7 +1301,9 @@ Honest limitations of this surface:
   `U+0000..=U+00FF` (its low 8 bits). `pack` produces such a string and `unpack`
   reads it back the same way, so any `pack`-produced binary string round-trips
   (`bytes.pack("C*").unpack("C*")`, `(0..255).to_a.pack("C*").unpack("C*")`), and
-  `Integer#chr` (`n & 0xff → U+00nn`) round-trips through `unpack("C*")` too. Two
+  `Integer#chr` (`n → U+00nn`, and only for `0..255` — outside that MRI raises
+  `RangeError: N out of char range`, where masking with `& 0xff` used to answer
+  a wrapped character) round-trips through `unpack("C*")` too. Two
   documented divergences remain from the lack of a true ASCII-8BIT type: (1)
   `unpack` on a *genuine* multibyte-UTF-8 text string reads code points, not the
   raw UTF-8 bytes MRI would — `"é".unpack("C*")` is `[233]` here vs `[195, 169]`
