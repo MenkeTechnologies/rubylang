@@ -4674,39 +4674,12 @@ fn comparable_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<
             };
             Ok(Some(Value::Bool(b)))
         }
-        // MRI compares against `min` first and returns false immediately when the
-        // receiver is below it, so a `max` that cannot be compared is never
-        // reached in that case. Each comparison also reports ITS OWN operand:
-        // blaming `lo` for a `hi` that failed names the wrong value.
-        "between?" => {
-            let (lo, hi) = (&args[0], &args[1]);
-            let Some(a) = spaceship(lo)? else {
-                return Err(cmp_err(lo));
-            };
-            if a < 0 {
-                return Ok(Some(Value::Bool(false)));
-            }
-            let Some(b) = spaceship(hi)? else {
-                return Err(cmp_err(hi));
-            };
-            Ok(Some(Value::Bool(b <= 0)))
-        }
-        "clamp" => {
-            let (lo, hi) = (&args[0], &args[1]);
-            let Some(a) = spaceship(lo)? else {
-                return Err(cmp_err(lo));
-            };
-            if a < 0 {
-                return Ok(Some(lo.clone()));
-            }
-            let Some(b) = spaceship(hi)? else {
-                return Err(cmp_err(hi));
-            };
-            if b > 0 {
-                return Ok(Some(hi.clone()));
-            }
-            Ok(Some(recv.clone()))
-        }
+        // The two non-operator `<=>` consumers are shared with the numerics and
+        // String -- one implementation, driven by whatever `<=>` the receiver
+        // has. A user Comparable used to have its own copy, which was missing
+        // clamp's min-vs-max check and clamp's nil-bound rule.
+        "between?" => comparable_between(recv, args).map(Some),
+        "clamp" => comparable_clamp(recv, args).map(Some),
         _ => Ok(None),
     }
 }
@@ -4937,20 +4910,122 @@ fn now_epoch_secs() -> f64 {
 /// (`5.clamp(..10)`, `5.clamp(3..)`), decoded from the range sentinels.
 fn clamp_bounds(args: &[Value]) -> Result<(Option<Value>, Option<Value>), String> {
     if args.len() == 1 {
-        if let Some((lo, hi, exclusive)) = with_host(|h| h.as_range(&args[0])) {
-            if exclusive {
-                return Err(raise_exc(
-                    "ArgumentError",
-                    "cannot clamp with an exclusive range",
-                ));
-            }
-            let lo = (lo != crate::host::RANGE_BEGINLESS).then_some(Value::Int(lo));
-            let hi = (hi != crate::host::RANGE_ENDLESS).then_some(Value::Int(hi));
-            return Ok((lo, hi));
+        // Every range flavour, not just the Integer one: `"m".clamp("a".."z")`
+        // and a Range of any other object clamp exactly as the two-argument
+        // form does.
+        let parts = with_host(|h| {
+            h.as_range(&args[0])
+                .map(|(lo, hi, ex)| {
+                    (
+                        (lo != crate::host::RANGE_BEGINLESS).then_some(Value::Int(lo)),
+                        (hi != crate::host::RANGE_ENDLESS).then_some(Value::Int(hi)),
+                        ex,
+                    )
+                })
+                .or_else(|| {
+                    h.as_float_range(&args[0])
+                        .map(|(lo, hi, ex)| (Some(Value::Float(lo)), Some(Value::Float(hi)), ex))
+                })
+                .or_else(|| {
+                    h.as_str_range(&args[0])
+                        .map(|(lo, hi, ex)| (Some(new_str(lo)), Some(new_str(hi)), ex))
+                })
+                .or_else(|| {
+                    h.as_obj_range(&args[0]).map(|(lo, hi, ex)| {
+                        (
+                            (!matches!(lo, Value::Undef)).then_some(lo),
+                            (!matches!(hi, Value::Undef)).then_some(hi),
+                            ex,
+                        )
+                    })
+                })
+        });
+        let Some((lo, hi, exclusive)) = parts else {
+            // MRI names the offending argument's class, with `nil`/`true`/
+            // `false` spelled as the literal rather than as NilClass etc.
+            let kind = match &args[0] {
+                Value::Undef => "nil".to_string(),
+                Value::Bool(b) => b.to_string(),
+                v => with_host(|h| h.class_of(v)),
+            };
+            return Err(raise_exc(
+                "TypeError",
+                &format!("wrong argument type {kind} (expected Range)"),
+            ));
+        };
+        // An exclusive range has no representable maximum -- but only if it HAS
+        // an end at all: `5.clamp(1...)` is fine, `5.clamp(...9)` is not.
+        if exclusive && hi.is_some() {
+            return Err(raise_exc(
+                "ArgumentError",
+                "cannot clamp with an exclusive range",
+            ));
         }
-        return Err(raise_exc("TypeError", "wrong argument type"));
+        return Ok((lo, hi));
     }
-    Ok((Some(args[0].clone()), Some(args[1].clone())))
+    // A nil bound means NO bound, so `5.clamp(nil, 9)` is 5. (`between?` has no
+    // such rule: `5.between?(nil, 9)` raises, because it ranks against nil.)
+    let opt = |v: &Value| (!matches!(v, Value::Undef)).then(|| v.clone());
+    Ok((opt(&args[0]), opt(&args[1])))
+}
+
+/// MRI's `cmpint`: rank `a` against `b` through `a <=> b`, `None` when `<=>`
+/// answers nil. Every `<=>`-derived method that is not an operator goes through
+/// this, so a user Comparable class, the numerics and String all take the same
+/// path -- the receiver's own `<=>` decides.
+fn cmp_int(a: &Value, b: &Value) -> Result<Option<std::cmp::Ordering>, String> {
+    Ok(match dispatch(a, "<=>", std::slice::from_ref(b), None)? {
+        Value::Undef => None,
+        v => Some(as_i(&v).cmp(&0)),
+    })
+}
+
+/// `Comparable#between?` — `min <= self <= max`. MRI ranks against min FIRST
+/// and answers false immediately when the receiver is below it, so a max that
+/// cannot be ranked is never reached in that case. There is NO min-vs-max
+/// check: `5.between?(3, 1)` is false, not an error. Each comparison reports
+/// its OWN operand; blaming min for a max that failed names the wrong value.
+fn comparable_between(recv: &Value, args: &[Value]) -> Result<Value, String> {
+    let (lo, hi) = (&args[0], &args[1]);
+    if cmp_int(recv, lo)?
+        .ok_or_else(|| cmp_error(recv, lo))?
+        .is_lt()
+    {
+        return Ok(Value::Bool(false));
+    }
+    Ok(Value::Bool(
+        !cmp_int(recv, hi)?
+            .ok_or_else(|| cmp_error(recv, hi))?
+            .is_gt(),
+    ))
+}
+
+/// `Comparable#clamp(min, max)` / `#clamp(range)`. Where `between?` has no
+/// min-vs-max rule, clamp REJECTS a min above its max before ranking the
+/// receiver against either -- `5.clamp(3, 1)` answered `1`, MRI raises. And a
+/// nil bound is no bound rather than an operand: `5.clamp(nil, 9)` is 5 while
+/// `5.between?(nil, 9)` raises.
+fn comparable_clamp(recv: &Value, args: &[Value]) -> Result<Value, String> {
+    let (lo, hi) = clamp_bounds(args)?;
+    if let (Some(l), Some(h)) = (&lo, &hi) {
+        if cmp_int(l, h)?.ok_or_else(|| cmp_error(l, h))?.is_gt() {
+            return Err(raise_exc(
+                "ArgumentError",
+                "min argument must be less than or equal to max argument",
+            ));
+        }
+    }
+    if let Some(l) = &lo {
+        if cmp_int(recv, l)?.ok_or_else(|| cmp_error(recv, l))?.is_lt() {
+            return Ok(l.clone());
+        }
+    }
+    if let Some(h) = &hi {
+        if cmp_int(recv, h)?.ok_or_else(|| cmp_error(recv, h))?.is_gt() {
+            return Ok(h.clone());
+        }
+    }
+    Ok(recv.clone())
 }
 
 // ---- Integer / Float ------------------------------------------------------
@@ -5539,26 +5614,13 @@ fn dispatch_number(
                 _ => as_f(recv) / as_f(&args[0]),
             },
         )),
-        "clamp" => {
-            // Ruby returns the receiver when in range, otherwise the bound
-            // itself (preserving its type, so `(-2.7).clamp(-1.0, 1.0)` is a Float).
-            // Accepts `clamp(lo, hi)` or `clamp(range)`; a beginless/endless range
-            // clamps only one side. An exclusive range is rejected like
-            // `Comparable#clamp`.
-            let (lo, hi) = clamp_bounds(args)?;
-            let x = as_f(recv);
-            if let Some(lo) = &lo {
-                if x < as_f(lo) {
-                    return Ok(lo.clone());
-                }
-            }
-            if let Some(hi) = &hi {
-                if x > as_f(hi) {
-                    return Ok(hi.clone());
-                }
-            }
-            Ok(recv.clone())
-        }
+        // `clamp`/`between?` are Comparable's non-operator `<=>` consumers, and
+        // a number reaches them through the one shared implementation. The `as_f`
+        // copies here answered where MRI raises -- `5.clamp(3, 1)` gave `1`
+        // rather than rejecting a min above its max, `5.between?(nil, 9)` gave
+        // true rather than reporting the pair it cannot rank, and
+        // `Float::NAN.clamp(1, 3)` gave NaN.
+        "clamp" => comparable_clamp(recv, args),
         // `Integer#<=>` is EXACT against a Float, so `3**34 <=> (3**34).to_f` is
         // 1 — the double rounded down. Casting both to `f64` first collapsed
         // them onto the same value and answered 0. NaN orders against nothing —
@@ -5590,10 +5652,7 @@ fn dispatch_number(
                 _ => Err(raise_exc("TypeError", "no implicit conversion to Integer")),
             }
         }
-        "between?" => {
-            let n = as_f(recv);
-            Ok(Value::Bool(n >= as_f(&args[0]) && n <= as_f(&args[1])))
-        }
+        "between?" => comparable_between(recv, args),
         // Arithmetic/comparison operators normally lower to native VM ops, so they
         // only reach here through an explicit send (`5.method(:+).call(3)`,
         // `5.send(:+, 3)`). Compute them the same way the VM would: an Int/Int pair
@@ -6725,37 +6784,12 @@ fn dispatch_string(
             })),
             None => Ok(Value::Undef),
         },
-        "between?" => {
-            let (lo, hi) = (arg_str(&args[0]), arg_str(&args[1]));
-            Ok(Value::Bool(s >= lo && s <= hi))
-        }
-        "clamp" => {
-            // `clamp(lo, hi)` or `clamp("a".."z")`; exclusive ranges are rejected
-            // just as `Comparable#clamp` does.
-            let (lo, hi) = if args.len() == 1 {
-                match with_host(|h| h.as_str_range(&args[0])) {
-                    Some((lo, hi, exclusive)) => {
-                        if exclusive {
-                            return Err(raise_exc(
-                                "ArgumentError",
-                                "cannot clamp with an exclusive range",
-                            ));
-                        }
-                        (lo, hi)
-                    }
-                    None => return Err(raise_exc("TypeError", "wrong argument type")),
-                }
-            } else {
-                (arg_str(&args[0]), arg_str(&args[1]))
-            };
-            if s < lo {
-                Ok(new_str(lo))
-            } else if s > hi {
-                Ok(new_str(hi))
-            } else {
-                Ok(recv.clone())
-            }
-        }
+        // Shared with every other Comparable receiver. The String copy coerced
+        // its bounds with `arg_str`, so `"m".between?(nil, "z")` answered true
+        // on a pair `<=>` cannot rank, and `"m".clamp("z", "a")` answered "z"
+        // where a min above its max is an error.
+        "between?" => comparable_between(recv, args),
+        "clamp" => comparable_clamp(recv, args),
         "*" => Ok(new_str(s.repeat(as_i(&args[0]).max(0) as usize))),
         "%" => {
             // `"%d-%d" % [1, 2]` or `"%d" % 5`; a Hash operand feeds named
@@ -9515,6 +9549,11 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
         },
         "hash" => Ok(Value::Int(r.to_i64().unwrap_or(0))),
         "integer?" => Ok(Value::Bool(r.is_integer())),
+        // Rational takes `between?`/`clamp` from Comparable like every other
+        // number, through the one shared implementation. Neither existed here
+        // at all: `Rational(1, 2).between?(0, 1)` raised NoMethodError.
+        "between?" => comparable_between(recv, args),
+        "clamp" => comparable_clamp(recv, args),
         // The arithmetic/comparison operators reach here when invoked as methods
         // (`r.+(x)`, e.g. `reduce(:+)`); delegate to the numeric hook.
         "+" | "-" | "*" | "%" | "==" | "<" | ">" | "<=" | ">=" => {

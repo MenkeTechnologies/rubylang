@@ -6663,3 +6663,139 @@ fn a_module_singleton_class_is_materialized_on_demand() {
         "\"undefined method 'nope' for module 'LzI'\"",
     );
 }
+
+#[test]
+fn clamp_rejects_a_min_above_its_max_on_every_receiver() {
+    // `clamp` is not `between?`: it checks min against max BEFORE ranking the
+    // receiver against either. Every receiver answered the max instead --
+    // `5.clamp(3, 1)` gave `1`.
+    let want = "\"min argument must be less than or equal to max argument\"";
+    eq(&cmp_msg("5.clamp(3, 1)"), want);
+    eq(&cmp_msg("0.clamp(3, 1)"), want);
+    eq(&cmp_msg("5.0.clamp(3.0, 1.0)"), want);
+    eq(&cmp_msg("5.clamp(3..1)"), want);
+    eq(&cmp_msg("\"m\".clamp(\"z\", \"a\")"), want);
+    eq(
+        &cmp_msg("Rational(5, 1).clamp(Rational(3, 1), Rational(1, 1))"),
+        want,
+    );
+    eq(
+        &cmp_msg(
+            "class J; include Comparable; attr_reader :v; def initialize(v); @v = v; end; \
+             def <=>(o); o.is_a?(J) ? v <=> o.v : nil; end; end; \
+             J.new(2).clamp(J.new(3), J.new(1))",
+        ),
+        want,
+    );
+    // `between?` has no such rule -- it answers false and does not raise.
+    eq("5.between?(3, 1)", "false");
+    eq("\"m\".between?(\"z\", \"a\")", "false");
+    eq(
+        "Rational(5, 1).between?(Rational(3, 1), Rational(1, 1))",
+        "false",
+    );
+}
+
+#[test]
+fn clamp_treats_a_nil_bound_as_no_bound_where_between_ranks_against_it() {
+    // The two disagree deliberately. `clamp` skips a nil bound; `between?` ranks
+    // against it and so reports a pair it cannot rank. `5.clamp(1, nil)`
+    // answered nil, and `5.between?(nil, 9)` answered true.
+    eq("5.clamp(nil, 9)", "5");
+    eq("5.clamp(1, nil)", "5");
+    eq("5.clamp(nil, nil)", "5");
+    eq("Rational(1, 1).clamp(2, nil)", "2");
+    eq("\"m\".clamp(nil, \"z\")", "\"m\"");
+    eq(
+        &cmp_msg("5.between?(nil, 9)"),
+        "\"comparison of Integer with nil failed\"",
+    );
+    eq(
+        &cmp_msg("5.between?(1, nil)"),
+        "\"comparison of Integer with nil failed\"",
+    );
+    eq(
+        &cmp_msg("\"m\".between?(nil, \"z\")"),
+        "\"comparison of String with nil failed\"",
+    );
+    // A bound from another `<=>` domain is reported, not coerced. These
+    // answered: the numeric copy compared `as_f` values and the String copy
+    // called `arg_str` on its bounds.
+    eq(
+        &cmp_msg("5.clamp(\"a\", \"z\")"),
+        "\"comparison of Integer with String failed\"",
+    );
+    eq(
+        &cmp_msg("5.between?(\"a\", \"z\")"),
+        "\"comparison of Integer with String failed\"",
+    );
+    eq(
+        &cmp_msg("Rational(5, 1).clamp(\"a\", \"z\")"),
+        "\"comparison of Rational with String failed\"",
+    );
+    // A NaN receiver ranks against neither bound.
+    eq(
+        &cmp_msg("Float::NAN.clamp(1, 3)"),
+        "\"comparison of Float with 1 failed\"",
+    );
+    eq(
+        &cmp_msg("5.clamp(Float::NAN, 3)"),
+        "\"comparison of Float with 3 failed\"",
+    );
+}
+
+#[test]
+fn rational_has_between_and_clamp_at_all() {
+    // Both raised NoMethodError: Rational reaches Comparable through its own
+    // dispatch, which had neither.
+    eq("Rational(1, 2).between?(0, 1)", "true");
+    eq("Rational(3, 2).between?(0, 1)", "false");
+    eq(
+        "Rational(1, 2).between?(Rational(1, 3), Rational(2, 3))",
+        "true",
+    );
+    eq("Rational(5, 1).clamp(1, 3)", "3");
+    eq("Rational(1, 2).clamp(1, 3)", "1");
+    eq("Rational(2, 1).clamp(1, 3)", "(2/1)");
+    eq("Rational(5, 1).clamp(1..3)", "3");
+    eq("Rational(5, 1).clamp(1..)", "(5/1)");
+}
+
+#[test]
+fn clamp_range_forms_cover_every_range_flavour() {
+    // An exclusive range has no representable maximum -- but only when it HAS
+    // an end: `5.clamp(1...)` is legal, `5.clamp(...9)` is not.
+    eq("5.clamp(1..3)", "3");
+    eq("5.clamp(1..)", "5");
+    eq("5.clamp(..9)", "5");
+    eq("5.clamp(1...)", "5");
+    eq("\"m\".clamp(\"a\"..\"z\")", "\"m\"");
+    eq(
+        &cmp_msg("5.clamp(1...3)"),
+        "\"cannot clamp with an exclusive range\"",
+    );
+    eq(
+        &cmp_msg("\"m\".clamp(\"a\"...\"z\")"),
+        "\"cannot clamp with an exclusive range\"",
+    );
+    eq(
+        &cmp_msg("5.clamp(...9)"),
+        "\"cannot clamp with an exclusive range\"",
+    );
+    // A single non-Range argument names its class, with nil spelled as the
+    // literal. The message was a bare "wrong argument type".
+    let type_msg =
+        |src: &str| format!("begin; {src}; rescue TypeError => e; e.message; else; :no_raise; end");
+    eq(
+        &type_msg("5.clamp(3)"),
+        "\"wrong argument type Integer (expected Range)\"",
+    );
+    eq(
+        &type_msg("\"m\".clamp(3)"),
+        "\"wrong argument type Integer (expected Range)\"",
+    );
+    eq(
+        &type_msg("5.clamp(nil)"),
+        "\"wrong argument type nil (expected Range)\"",
+    );
+}
