@@ -702,6 +702,8 @@ enum Mode {
     Multiyield,
     Eqlident,
     Numwide,
+    Typeerr,
+    Timefmt,
     /// Round-robin over every mode in `ALL_MODES`. Not itself a member of
     /// `ALL_MODES` (that would recurse), so adding a mode never changes any
     /// other mode's own seed→case mapping — but it DOES reshuffle which mode
@@ -755,6 +757,8 @@ const ALL_MODES: &[Mode] = &[
     Mode::Multiyield,
     Mode::Eqlident,
     Mode::Numwide,
+    Mode::Typeerr,
+    Mode::Timefmt,
 ];
 
 fn gen_intmeth(seed: u64) -> Vec<String> {
@@ -1926,6 +1930,8 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Multiyield => gen_multiyield(seed),
         Mode::Eqlident => gen_eqlident(seed),
         Mode::Numwide => gen_numwide(seed),
+        Mode::Typeerr => gen_typeerr(seed),
+        Mode::Timefmt => gen_timefmt(seed),
         Mode::All => gen_case(seed, ALL_MODES[(seed as usize) % ALL_MODES.len()]),
     }
 }
@@ -2110,6 +2116,130 @@ fn gen_frozen(seed: u64) -> Vec<String> {
     })
 }
 
+/// A TYPE-MISMATCHED operand — the question no other generator asks.
+///
+/// Every generator in this file builds a well-typed program, so a builtin that
+/// silently coerced a bad operand agreed with the reference on every case they
+/// can emit. `"ab" * nil` answered `""`, `[1,2].first(nil)` answered `[]`,
+/// `1 / "a"` answered `Infinity`: wrong values on a ZERO exit status, which is
+/// exactly what `differs` compares — the generators, not the comparison, were
+/// the blind spot.
+///
+/// The probe prints the exception class AND its message, so a divergence in
+/// either lands on stdout where it is compared by default, rather than only in
+/// stderr (off unless `--stderr`). Operands are restricted to values whose
+/// `inspect` is stable: no bare `Object.new`, whose address would differ.
+fn gen_typeerr(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let bad = ["nil", "\"x\"", ":s", "true", "false", "[]", "{}", "1.5"];
+    let b = *r.pick(&bad);
+    let w = ww(r);
+    let n = r.range(1, 4);
+    // Wrap so BOTH outcomes reach stdout: a raise prints class + message, and a
+    // wrong-but-successful answer prints the value the call produced.
+    let probe =
+        |expr: &str| format!("begin\n  p({expr})\nrescue => e\n  p [e.class, e.message]\nend");
+    one(match r.below(22) {
+        0 => probe(&format!("\"{w}\" * {b}")),
+        1 => probe(&format!("\"{w}\" + {b}")),
+        2 => probe(&format!("\"{w}\".dup << {b}")),
+        3 => probe(&format!("\"{w}\"[{b}]")),
+        4 => probe(&format!("\"{w}\".center({b})")),
+        5 => probe(&format!("\"{w}\".ljust({b})")),
+        6 => probe(&format!("\"{w}\".rjust({b})")),
+        7 => probe(&format!("[{n}, {n} + 1] * {b}")),
+        8 => probe(&format!("[{n}, {n} + 1][{b}]")),
+        9 => probe(&format!("[{n}, {n} + 1].first({b})")),
+        10 => probe(&format!("[{n}, {n} + 1].last({b})")),
+        11 => probe(&format!("[{n}, {n} + 1].take({b})")),
+        12 => probe(&format!("[{n}, {n} + 1].drop({b})")),
+        13 => probe(&format!("[{n}, {n} + 1].fetch({b})")),
+        14 => probe(&format!("[{n}, {n} + 1].rotate({b})")),
+        15 => probe(&format!("[{n}] + {b}")),
+        16 => probe(&format!("{{ a: {n} }}.merge({b})")),
+        17 => probe(&format!("{n} + {b}")),
+        18 => probe(&format!("{n} / {b}")),
+        19 => probe(&format!("{n} % {b}")),
+        20 => probe(&format!("{n}.gcd({b})")),
+        _ => probe(&format!("Array.new({b})")),
+    })
+}
+
+/// `Time` formatting over a FIXED epoch.
+///
+/// The determinism invariant at the top of this file bans `Time`, and that ban
+/// was read as covering the whole class — so no generator ever produced one,
+/// and ten `strftime` directives sat unimplemented, `%c` emitting the two
+/// characters `%c`. But only the CLOCK is nondeterministic: `Time.at(<const>)`
+/// is as fixed as any integer literal. Every case here pins the epoch and calls
+/// `.utc`, which also keeps the machine's `TZ` out of the comparison.
+fn gen_timefmt(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    // Epochs chosen to cover ISO-week year boundaries, a leap day, and a
+    // single-digit day/hour (where `%c`/`%v`/`%e` space-pad).
+    const EPOCHS: &[&str] = &[
+        "0",
+        "1234567890",
+        "946684800",
+        "1104537600",
+        "1230768000",
+        "1262304000",
+        "1609459200",
+        "1709164800",
+        "-86400",
+        "2147483647",
+        "1199059200",
+        "1451606400",
+    ];
+    const DIRECTIVES: &[&str] = &[
+        "%Y-%m-%d",
+        "%H:%M:%S",
+        "%c",
+        "%x",
+        "%X",
+        "%r",
+        "%v",
+        "%N",
+        "%L",
+        "%U",
+        "%W",
+        "%V",
+        "%G",
+        "%g",
+        "%j",
+        "%u",
+        "%w",
+        "%a %b",
+        "%A %B",
+        "%F %T",
+        "%D",
+        "%R",
+        "%e",
+        "%k",
+        "%l",
+        "%I %p",
+        "%C",
+        "%y",
+        "%s",
+        "%-d/%-m",
+        "%_d|%0e",
+        "%G-W%V-%u",
+        "%%Y",
+        "%n%t",
+    ];
+    let e = *r.pick(EPOCHS);
+    let d = *r.pick(DIRECTIVES);
+    let t = format!("Time.at({e}).utc");
+    one(match r.below(6) {
+        0 => format!("p {t}.strftime({d:?})"),
+        1 => format!("p [{t}.year, {t}.month, {t}.day]"),
+        2 => format!("p [{t}.hour, {t}.min, {t}.sec]"),
+        3 => format!("p [{t}.wday, {t}.yday, {t}.leap?]"),
+        4 => format!("p [{t}.to_i, {t}.utc?, {t}.monday?]"),
+        _ => format!("p {t}.strftime({:?})", format!("{d}|{d}")),
+    })
+}
+
 /// `Data.define` value objects (Ruby 3.2+): construction both ways, `with`,
 /// equality, deconstruction and the errors a bad call raises.
 fn gen_datacls(seed: u64) -> Vec<String> {
@@ -2264,6 +2394,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Multiyield => "multiyield",
         Mode::Eqlident => "eqlident",
         Mode::Numwide => "numwide",
+        Mode::Typeerr => "typeerr",
+        Mode::Timefmt => "timefmt",
         Mode::All => "all",
     }
 }
