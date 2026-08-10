@@ -25,7 +25,10 @@
 //!    survives rubylang growing better MRI mimicry.
 //! 2. **MRI-shaped `--version`.** MRI prints
 //!    `ruby 4.0.6 (2026-07-14 revision 03b6d3f889) +PRISM [arm64-darwin25]`.
-//!    rubylang prints `ruby 0.1.3` — no `revision`, no bracketed platform.
+//!    rubylang prints `ruby 3.4.0 (rubylang 0.1.4) [aarch64-macos]`. It has
+//!    since grown a bracketed platform, so the `revision` substring is the only
+//!    part of this proof still discriminating — proof 1 (path) and proof 3
+//!    (`RUBY_ENGINE`) are what actually reject a rubylang today.
 //! 3. **`RUBY_ENGINE`.** MRI prints `ruby`; anything that cannot answer the
 //!    question the same way is not the reference.
 

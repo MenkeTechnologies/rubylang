@@ -4,8 +4,13 @@ rubylang is in active development. The pipeline (lex → parse → lower to fuse
 bytecode → run) is solid for the implemented surface, verified against the
 reference `ruby` by the parity harness (`cargo run --bin parity`, replayed in CI
 by `tests/parity.rs`). This file tracks what is deliberately not done yet, so the
-gaps are honest rather than surprising. Nothing is faked as working — an
-unimplemented method raises `undefined method`.
+gaps are honest rather than surprising. Unimplemented METHODS raise
+`undefined method` rather than answering a plausible value. The guarantee stops
+at methods: some unimplemented CONSTANTS answer `nil` instead of raising
+`NameError` (`FileUtils`, `Socket`, `UNIXServer`, `Addrinfo`, and `Errno::*`
+through it), and a few flag-valued APIs answer a wrong number rather than
+refusing (`Regexp::EXTENDED`/`MULTILINE` read back as `1`; `~/re/` answers
+`-1`). Those are listed in their own sections below.
 
 ## The oracle is never bare `ruby`
 
@@ -21,7 +26,9 @@ answer. Nothing fails, so nothing reveals it.
 to a `PATH` lookup, and a candidate must pass three independent proofs before it
 is accepted: it must not canonicalize into a `rubylang` install or a `target/`
 build dir; its `--version` must have MRI's `ruby X.Y.Z (… revision …)
-[platform]` shape (rubylang prints `ruby 0.1.3`); and `RUBY_ENGINE` must be
+[platform]` shape (rubylang prints `ruby 3.4.0 (rubylang 0.1.4) [aarch64-macos]`
+— note that the mimicry has since grown a bracketed platform, so `revision` is
+now the only part of that shape doing the discriminating); and `RUBY_ENGINE` must be
 `"ruby"` (rubylang's is deliberately `"rubylang"`, so this stays true however
 close the mimicry gets). An unresolvable oracle is a hard error, not a skip.
 `RUBYLANG_ORACLE_RUBY` names one explicitly and is never silently replaced.
@@ -38,6 +45,103 @@ Two consequences worth knowing:
   not have installed, so MRI exits with a `LoadError`; their `.out` files are
   rubylang self-baselines and are labelled `NOT-REFERENCE`. The other fifteen
   were re-verified byte-for-byte against ruby 4.0.6.
+
+## What the harnesses structurally cannot report
+
+Gating the oracle answers *which reference* is consulted. It says nothing about
+which questions get asked, or which parts of the answer are compared. Both are
+bounded, and a bug inside a blind spot is not "not yet found" — it is
+unfindable by that harness at any case count. The census below is per harness,
+so a gap can be closed on purpose rather than stumbled into.
+
+| Harness | Cannot report | Why | State |
+| --- | --- | --- | --- |
+| `tests/parity.rs` | Any stderr difference | Compares `stdout` only; stderr is never captured | Open — by design; it is the CI replay, and stderr carries paths |
+| `tests/parity.rs` | The *reason* a rejected snippet was rejected | A frozen `<error>` asserts only a non-zero exit, so a snippet that fails for a NEW reason still passes | Open |
+| `bin/parity` | Exit-code differences | Compares captured stdout; a rubylang error becomes the same `<error>` marker regardless of class or message | Open |
+| `bin/parity` | Anything about a snippet MRI rejects | Both sides collapse to `<error>` | Open |
+| `parity-fuzz` | Stderr, unless `--stderr` | `differs` compares stdout + exit; stderr is opt-in | Open — deliberate, the wording is noisier than the behaviour |
+| `parity-fuzz` | The LINE NUMBER in any diagnostic | `norm_stderr` strips the leading `-e:LINE:` prefix — so the line-0 bug below is invisible even WITH `--stderr` | Open — stripping is what makes wording comparable at all |
+| `parity-fuzz` | The FRAME NAME in any diagnostic | `norm_stderr` strips through the first `": "`, taking `in 'Integer#/'` with it | Open — same mechanism |
+| `parity-fuzz` | Output produced before a timeout | `run_with_timeout` discards stdout on the timeout path and reports an empty buffer | Open |
+| `parity-fuzz` | A hang that both sides share | Two timeouts compare equal and count as parity | Open — cannot be distinguished from agreement without a reference runtime |
+| `parity-fuzz` | Locale- or TZ-dependent behaviour | Neither `run_oracle` nor `run_ours` pins `LANG`/`LC_ALL`/`TZ`; both inherit the developer's ambient environment, so a divergence that only appears under another locale cannot appear here | Open — see the locale note below |
+| all generators | Type-mismatched operands | Every generator built a WELL-TYPED program, so the whole implicit-conversion surface was unreachable | **Closed** — `typeerr` mode; it found 21 real divergences on its first outing |
+| all generators | Anything involving `Time` | The determinism invariant bans `Time`, and the ban was read as covering the class rather than the clock — but `Time.at(<const>)` is deterministic | **Closed** — `timefmt` mode; ten `strftime` directives were unimplemented behind it |
+
+The two closures share a shape worth naming: in both, the COMPARISON was
+already strong enough to catch the bug — wrong stdout AND wrong exit status —
+and only the generators stood between the fuzzer and the finding. A blind-spot
+census that only audits the comparison would have missed both.
+
+### The line-0 bug, and why no harness sees it
+
+An exception raised from inside a builtin operation reports line 0:
+
+```console
+$ ./target/debug/ruby -e $'x=1\ny=2\n1/0'
+-e:0:in '<main>': divided by 0 (ZeroDivisionError)
+$ /opt/homebrew/opt/ruby/bin/ruby -e $'x=1\ny=2\n1/0'
+-e:3:in 'Integer#/': divided by 0 (ZeroDivisionError)
+```
+
+It is 0, not a stale line — moving the error to line 3 does not change it — so
+any pin asserting a line number through this path is measuring a constant.
+`1/0`, `7 % 0`, `(2**70)/0`, `[].freeze << 1` and `"a".freeze << "b"` all take
+it. The line is lost inside fusevm's native arithmetic, which never reaches the
+host's `abort`, so the fix is upstream rather than here.
+
+A SECOND, distinct defect lives next to it: an error raised by the native
+operator path returns a bare `Err(String)` and never sets a pending exception,
+so `format_uncaught` has nothing to decorate and the diagnostic prints with no
+location and no class tag at all:
+
+```console
+$ ./target/debug/ruby -e 'nil + 1'
+undefined method '+' for nil
+$ /opt/homebrew/opt/ruby/bin/ruby -e 'nil + 1'
+-e:1:in '<main>': undefined method '+' for nil (NoMethodError)
+```
+
+Both are invisible to `parity-fuzz` for the same reason: `norm_stderr` strips
+exactly the part that differs.
+
+### Locale
+
+Checked against the reference under `LC_ALL` of `C`, `en_US.UTF-8`,
+`tr_TR.UTF-8` and `de_DE.UTF-8`, with a pinned `TZ`:
+
+- **`Encoding.default_external` is the one real locale divergence.** MRI reports
+  `US-ASCII` under `LC_ALL=C` and `UTF-8` under a `.UTF-8` locale; rubylang
+  always answers `UTF-8`. Related: under `LC_ALL=C`, MRI rejects non-ASCII
+  source as `invalid multibyte character`, while rubylang accepts it.
+- `String#upcase`/`downcase` are NOT locale-sensitive in either (`"istanbul"`
+  upcases to `ISTANBUL` even under `tr_TR.UTF-8`, per Ruby's Unicode default).
+- `sort` on non-ASCII is codepoint-ordered in both — no collation.
+- `Integer#to_s` never groups in either.
+- `strftime` day/month names are English in both regardless of locale (Ruby does
+  not consult `LC_TIME`).
+
+No frozen record depends on the locale, because rubylang's own output is
+locale-invariant on all five axes — the risk is one-sided: running
+`parity --freeze` under a non-UTF-8 locale would capture MRI's
+locale-dependent answers as the baseline. The harnesses do not pin the
+environment, so that remains possible.
+
+### Frozen-record provenance
+
+Every frozen expectation was re-run through the reference and compared
+mechanically, asking two questions: does the current reference still produce
+this string, and could ANY reference have produced it (a pin that fails the
+second test was written from memory, not captured, and no oracle gate can
+detect that).
+
+- `tests/data/parity_expected.txt` — 570 pins, **570 reproduce byte-for-byte**
+  against ruby 4.0.6. No stale pins, no fabricated pins.
+- `tests/data/examples/*.out` — 15 rows labelled `reference` in
+  `PROVENANCE.tsv`, **all 15 reproduce**. The 3 rows labelled `NOT-REFERENCE`
+  are rubylang self-baselines and were not compared, which is what the label is
+  for.
 
 ## Working (for reference)
 
@@ -86,11 +190,17 @@ keeps both.
   Array operand passed that guard and got an ordered element-wise answer. The
   subset PREDICATES (`subset?`/`<=`/`superset?`/`>=`/`proper_*`) were correct
   throughout, which is how it went unnoticed: they can all agree with MRI while
-  `<=>` disagrees. Still absent from Set and reached through the Array delegate,
-  which builds a COPY, so the in-place mutators silently mutate the temporary
-  and leave the Set unchanged: `map!`, `collect!`, `select!`/`filter!`,
-  `reject!`, `delete_if`, `keep_if`, `flatten!`, plus `classify`, `divide`,
-  `subtract`, `replace`, `reset` and `compare_by_identity`.
+  `<=>` disagrees. Still absent from Set, in two different ways —
+  the distinction matters, because one is silent and one is not.
+
+  Reached through the Array delegate, which builds a COPY, so the call succeeds
+  and mutates the temporary, leaving the Set unchanged: `map!`, `collect!`,
+  `select!`/`filter!`, `reject!`, `delete_if`, `keep_if`, `flatten!` and
+  `replace`. These are the dangerous ones — no error, wrong result.
+
+  Not reached at all, raising `NoMethodError: undefined method '<name>' for an
+  instance of Set`: `subtract`, `classify`, `divide`, `reset` and
+  `compare_by_identity`. These fail loudly.
 - **Ordering operators derive from `<=>`, so an unrankable pair raises.** Ruby
   gets `< <= > >=` from `Comparable`: when `<=>` answers nil the operator raises
   `ArgumentError`, it does not answer false. This is ASYMMETRIC and the asymmetry
@@ -139,8 +249,8 @@ keeps both.
   each module's instance methods (following `M`'s own `include` chain, plus
   `define_method` blocks) into the object's singleton table.
 - **Class-level instance variables** (`@n` inside a `def self.m` / an `extend`ed
-  method) do not persist across calls — the class object has no per-instance
-  variable store yet, so `@n ||= 0; @n += 1` restarts each call.
+  method) persist across calls: the class object has its own variable store, so
+  `@n ||= 0; @n += 1` counts up (`1`, `2`, `3`) as in MRI.
 - **Class-body statements** run at definition time with `self` bound to the
   class, so `def`, `attr_*`, `include`, class variables (`@@x = 0`), constants,
   and other executable statements all take effect. Constants are namespaced
@@ -148,10 +258,10 @@ keeps both.
 - **Modifier `rescue` inside call-args / array literals.** Numeric-literal
   binding (`-7.abs` → `(-7).abs`, with `-2**2` → `-(2**2)`) and modifier
   `rescue` precedence (`x = a rescue b` → `x = (a rescue b)`, plus grouping
-  parens and statement-level) both match MRI now. The one residual divergence:
-  MRI rejects a bare modifier `rescue` directly in method-call arguments
-  (`p(1/0 rescue 5)`) and array elements (`[1/0 rescue 5]`); this parser accepts
-  them (a permissive superset — no valid MRI program breaks).
+  parens and statement-level) both match MRI now. A bare modifier `rescue` directly in
+  method-call arguments (`p(1/0 rescue 5)`) or array elements
+  (`[1/0 rescue 5]`) is a syntax error here as it is in MRI, so the parser is no
+  longer a permissive superset on this point.
 - **Splat-only / anonymous params.** A bare `*` splat, a `*name` splat, and a
   bare `**` keyword-splat parse as the sole (or any) parameter of a method,
   block, or lambda: `def f(*)`, `def f(**)`, `def f(*, **)`, `->(*) { }`,
@@ -550,9 +660,10 @@ Honest limitations of this surface:
   plus `case`/`when /re/` case-equality. A successful match sets the globals
   `$~` (MatchData), `$&` (whole match), `` $` ``/`$'` (pre/post text), `$+`
   (last group), and `$1`..`$9` (numbered groups) — visible after `=~`/`match`
-  and inside a `sub`/`gsub` block. (The punctuation globals `` $` `` and `$'`
-  can't yet appear inside a *brace* `#{...}` interpolation — the interp scanner
-  reads the quote as a string delimiter. The sigil shorthand does work:
+  and inside a `sub`/`gsub` block. (`` $` `` reads correctly inside a *brace*
+  `#{...}` interpolation; `$'` still cannot, because the interp scanner reads
+  its quote as a string delimiter and the read fails with
+  `unterminated string`. The sigil shorthand works for both:
   `` "pre=#$` post=#$'" ``.) Backed by `fancy-regex`, a backtracking engine, so
   the Onigmo constructs the `regex` crate rejects DO work: backreferences within
   the pattern (`/(ab)\1/`) and lookaround (`/foo(?=bar)/`, `/(?<=foo)bar/`).
@@ -678,29 +789,24 @@ Honest limitations of this surface:
   from outside (`M::X` answers the value where MRI raises
   `NameError: private constant M::X referenced`). Only the return value is
   faithful today.
-- **Divergence — a bare `==`/`<`/`<=`/`>`/`>=` between an `i64`-range Integer
-  and a Float is not exact.** Ruby compares an Integer to a Float exactly, never
-  by rounding the Integer, so `3**34 == (3**34).to_f` is false and
-  `7**53 <= (7**53).to_f` is false. Every path rubylang owns does that:
-  `Integer#<=>`, `eql?`, Hash keys, `uniq`, `include?`/`index`, `max`/`min`/
-  `sort`, and all of `<` `<=` `>` `>=` `==` once either side is a BigInt,
-  Rational or Complex. The one path it does NOT own is the bare operator when
-  BOTH sides are still native — an `i64` Integer and a Float — because fusevm
-  compares those inline: `vm.rs` `cmp_int_fast` matches
-  `(a, b, _) if is_native_num(a) && is_native_num(b)` and answers
-  `float_cmp(a.to_float(), b.to_float())`, with the strict-numeric-mode flag
-  ignored, so the numeric hook is never consulted and rubylang never sees the
-  operands. It only shows above 2^53, where the `f64` cast starts rounding.
-  `(3**34).send(:==, (3**34).to_f)` goes through dispatch and IS exact.
-  Closing this needs a fusevm release that delegates a native Int/Float
-  comparison to the hook. The upstream fix now EXISTS — `843e45484c` ("strict
-  numeric mode must not answer from a rounded f64") and `56842a3597` (the same
-  for the AOT tier) — but `git describe` puts them at `v0.17.0-14` and
-  `v0.17.0-16`, i.e. AFTER the tag, and rubylang consumes fusevm 0.17.0 from
-  crates.io. So the divergence is still live here and still measurable:
-  `3**34 == (3**34).to_f` answers true against MRI's false, and fuzz mode
-  `numwide` reports it. rubylang itself needs no change when the fix ships —
-  its hook already dispatches generically — only the pin.
+- **Integer-to-Float comparison is exact everywhere, including the bare
+  operator.** Ruby compares an Integer to a Float exactly, never by rounding the
+  Integer, so `3**34 == (3**34).to_f` is false and `7**53 <= (7**53).to_f` is
+  false. Every path rubylang owns did that from the start: `Integer#<=>`,
+  `eql?`, Hash keys, `uniq`, `include?`/`index`, `max`/`min`/`sort`, and all of
+  `<` `<=` `>` `>=` `==` once either side is a BigInt, Rational or Complex. The
+  one path it did NOT own was the bare operator with BOTH sides still native —
+  an `i64` Integer and a Float — which fusevm compared inline from a rounded
+  `f64`, so the numeric hook never saw the operands and the answer went wrong
+  above 2^53. That is fixed upstream and rubylang now pins fusevm 0.22.0, which
+  carries it; rubylang itself needed no change, its hook already dispatched
+  generically. Verified against the reference:
+
+  ```console
+  $ ./target/debug/ruby -e 'p(3**34 == (3**34).to_f)'      # false
+  $ ./target/debug/ruby -e 'p(7**53 <= (7**53).to_f)'      # false
+  $ ./target/debug/ruby -e 'p(2**60+1 == (2**60+1).to_f)'  # false
+  ```
 - **Composite Hash keys.** Arrays (`{[1, 2] => v}`, nested), Hashes
   (`{{a: 1} => v}`), Sets, Ranges (`{(1..3) => v}`, Integer/String/Float
   endpoints), `BigInt`/`Rational`/`Complex` numbers, and class objects work as
@@ -992,8 +1098,11 @@ Honest limitations of this surface:
   BigInt, String, and Array elements.
 - **`Time` is UTC-only.** `Time.at`, `Time.utc`/`Time.gm`, and `Time.now`
   construct times; the field readers (`year`/`month`/`day`/`hour`/`min`/`sec`/
-  `wday`/`yday`), `to_i`/`to_f`, `to_s`/`inspect`, `strftime` (common directives
-  plus the `-`/`_`/`0` padding flags), arithmetic (`Time - Time → Float`,
+  `wday`/`yday`), `to_i`/`to_f`, `to_s`/`inspect`, `strftime` (every directive
+  MRI documents except a numeric field WIDTH such as `%6N`, including the
+  composites `%c`/`%x`/`%r`/`%v`, the week numbers `%U`/`%W`, the ISO-8601
+  week-based `%V`/`%G`/`%g`, `%N`, and the `-`/`_`/`0` padding flags),
+  arithmetic (`Time - Time → Float`,
   `Time ± Numeric → Time`) and comparison/sort all work, with a dependency-free
   proleptic-Gregorian calendar (valid for negative epochs too). The
   local-timezone offset is **not** modeled — there is no tz database, so
@@ -1026,8 +1135,9 @@ Honest limitations of this surface:
   `strftime`, day/month/year arithmetic (`+`/`-`/`next_day`/`prev_day`/
   `next_month`/`prev_month`/`>>`/`<<` with last-day clamping), `Date - Date →
   Rational`, and comparison/sort all work over the same proleptic-Gregorian
-  calendar as `Time`. `Date#>>`-with-fractional and locale-aware formatting are
-  not implemented.
+  calendar as `Time`. `Date#>>` accepts a fractional argument
+  (`Date.new(2020,1,31) >> 1.5` is 2020-02-29, as in MRI). Locale-aware
+  formatting is not implemented — see the `strftime` note under Time.
 - **`DateTime`** (also available without `require "date"`; it is a `Date`
   subclass carrying a time of day). `DateTime.new`/`civil` (year through second),
   `DateTime.now` (UTC here), `DateTime.jd`, and `DateTime.parse` (ISO8601
@@ -1074,8 +1184,7 @@ Honest limitations of this surface:
   `f64`. `Math.gamma` (Lanczos) and `Math.erf`/`erfc` (Abramowitz-Stegun
   7.1.26) are implemented approximately: gamma to ~1e-9, erf to ~1.5e-7. These
   do NOT match MRI's libm output in the trailing digits, so they are excluded
-  from the parity corpus and tested only with a tolerance. `Math.class` reports
-  `Class` rather than `Module` (modules aren't distinguished from classes yet).
+  from the parity corpus and tested only with a tolerance. `Math.class` reports `Module`, as MRI does.
 - **`JSON` (dependency-free).** `require "json"` is a no-op; the module is always
   available. `JSON.generate`/`JSON.dump` and `#to_json` (on any value — Array,
   Hash, String, Symbol, Integer, Float, `true`/`false`/`nil`, Bignum, and a
@@ -1087,9 +1196,9 @@ Honest limitations of this surface:
   `JSON.pretty_generate` uses 2-space indent. `JSON.parse`/`JSON.load` is a
   hand-written recursive-descent decoder producing Hashes with string keys (or
   symbol keys under `symbolize_names: true`), Integer/Bignum/Float numbers, and
-  arrays/scalars; malformed input raises `JSON::ParserError` (catchable via bare
-  `rescue` / `rescue => e`; the `JSON::ParserError` constant is not registered for
-  explicit-constant rescue). `Rational`/`Complex`/`Time` encode as their quoted
+  arrays/scalars; malformed input raises `JSON::ParserError`, catchable by bare
+  `rescue`, by `rescue => e`, and by naming the constant
+  (`rescue JSON::ParserError => e`). `Rational`/`Complex`/`Time` encode as their quoted
   `to_s` (MRI's default `Object#to_json`), so those are excluded from the exact
   parity corpus.
 - **`ERB` (dependency-free templating).** `require "erb"` is a no-op; the class is
@@ -1206,7 +1315,7 @@ bytes. rubylang stores a `"\xNN"` source escape as the Unicode code point U+00NN
 (UTF-8-encoded), not a single raw byte like MRI's ASCII-8BIT, so hashing/encoding
 a string built from non-ASCII byte escapes differs from MRI. Pure ASCII/UTF-8
 text is byte-exact. (2) The streaming `Digest` instance API
-(`Digest::MD5.new.update(...).hexdigest`) is not implemented — only the
+(`Digest::MD5.new.update(...).hexdigest`) is implemented alongside the
 class-level one-shot `hexdigest`/`digest`/`base64digest`.
 
 ## File / IO / Dir
@@ -1458,10 +1567,11 @@ Not modeled / boundaries:
   completion); `YAML` block-style emit/parse for Hash/Array/String/Symbol/
   Integer/Float/bool/nil plus inline flow collections on load, `dump` output
   round-trips through `load` (no anchors/tags/multi-doc/block scalars/custom
-  objects). Not yet: `module_function` (these libs use `def self.`), `to_yaml` on
-  builtin receivers (only user objects — reopening `Object` does not reach
-  builtin types), and `FileUtils`/similar native pseudo-modules whose *constant*
-  is unbound (`FileUtils.mkdir_p` works, but `FileUtils.class` is `NilClass`).
+  objects). `module_function` (both the bare-directive and
+  `module_function :m` forms) and `to_yaml` on builtin receivers both work.
+  Not yet: `FileUtils`/similar native pseudo-modules whose *constant* is unbound
+  (`FileUtils.mkdir_p` works, but `FileUtils.class` is `NilClass` where MRI
+  raises `NameError: uninitialized constant FileUtils`).
 - **`__dir__`** returns the directory of the file currently running (from the
   same file-dir stack), a String. MRI computes `File.dirname(File.realpath(
   __FILE__))`, so under `-e`/stdin — where `__FILE__` is the literal `"-e"` /
@@ -1479,10 +1589,10 @@ Not modeled / boundaries:
   builtin no-op list. Autoload, `require` of a `.so`/`.bundle`, and thread-safe
   concurrent require are out of scope. A required file's top-level *locals* are
   isolated from the caller's (MRI-faithful), but its top-level `self` is the same
-  shared main object rather than a per-file binding. The punctuation globals
-  `$"` and `$:` can't appear inside a `#{...}` string interpolation (the interp
-  scanner reads the quote/colon as a delimiter — the same pre-existing limitation
-  noted for `` $` ``/`$'`); reference them outside interpolation.
+  shared main object rather than a per-file binding. `$:` reads correctly inside a `#{...}` string
+  interpolation; `$"` still cannot (the interp scanner reads the quote as a
+  string delimiter, and the read fails with `unterminated string`). Reference
+  `$"` outside interpolation, or use the sigil shorthand.
 
 
 ## AOT bundling (`ruby --build`)

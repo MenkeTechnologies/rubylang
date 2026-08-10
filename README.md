@@ -73,7 +73,7 @@ JIT. rubylang carries no VM or JIT of its own. Highlights:
 - **AOP intercepts** — a glob-matched before/after/around method-intercept
   registry, the same design as zshrs's function intercepts.
 - **Editor-ready** — an LSP server, a DAP debugger (source-line breakpoints
-  inside methods, stepping, stack + locals), and an `irb`-style REPL on a
+  inside methods, stepping, call stack), and an `irb`-style REPL on a
   persistent host, all over stdio.
 - **Differential parity** — a snippet corpus diffed live against the
   reference `ruby`, frozen and replayed in CI with no `ruby` installed, plus a
@@ -282,7 +282,7 @@ rather than silently mis-running.
 | --- | --- |
 | `--repl` | Interactive REPL on a persistent host. |
 | `--lsp` | Language Server Protocol over stdio. |
-| `--dap` | Debug Adapter Protocol over stdio: source-line and function breakpoints, stepping, call stack, locals, and expression `evaluate`. |
+| `--dap` | Debug Adapter Protocol over stdio: source-line and function breakpoints, stepping, and the call stack. The `variables` request reports a method frame's parameters only, and `evaluate` is not implemented — it answers `<cannot evaluate ...>` for every expression. |
 | `--build FILE` | AOT-bundle the whole app — the entrypoint plus every file it statically `require`s / `require_relative`s — into one program in the on-disk cache. A later `ruby FILE` runs it directly, needing none of the required sources on disk. |
 | `--build --native FILE` | Emit a **standalone native executable** next to the script (`app.rb` → `app`). It runs the whole app with no `ruby` interpreter and no `.rb` sources present. `fusevm`'s Cranelift AOT emitter compiles the main chunk to a native object; the full program (methods/classes/blocks/constants) is baked in and linked against the rubylang runtime (`rustc` + the crate rlib). Needs `rustc` and the build tree present. |
 | `--dump-tokens FILE` | Print the lexer token stream and exit. |
@@ -321,7 +321,11 @@ Behaviour is checked against the reference `ruby` by a **differential parity
 harness** — `cargo run --bin parity` diffs the snippet corpus
 (`tests/data/parity_corpus.rb`) live against the system `ruby`, and
 `tests/parity.rs` replays the frozen outputs in CI with no `ruby` installed.
-Nothing is faked as working: an unimplemented method raises `undefined method`.
+Unimplemented METHODS raise `undefined method` rather than answering a
+plausible value. That guarantee does not extend to unimplemented CONSTANTS: a
+few native pseudo-modules (`FileUtils`, `Socket`, `Errno`) leave their constant
+bound to `nil` instead of raising `NameError`, and a handful of flag-valued
+APIs answer a wrong number rather than refusing. BUGS.md lists them.
 
 Alongside the fixed corpus, a **differential parity fuzzer** — `cargo run --bin
 parity-fuzz` — generates thousands of seed-deterministic Ruby snippets across
@@ -367,7 +371,7 @@ namespaced-constant reads resolve exactly as under `ruby FILE`. Method/block
 bodies run through the interpreter from that host; only the top-level chunk is
 native today.
 
-The DAP debugger (`ruby --dap`) sets source-line and function breakpoints (break on method entry), steps (next/stepIn/stepOut), evaluates expressions against the paused frame, and inspects the call stack and locals; markers are emitted only in --dap mode, so normal runs are unaffected.
+The DAP debugger (`ruby --dap`) sets source-line and function breakpoints (break on method entry), steps (next/stepIn/stepOut), and inspects the call stack; markers are emitted only in --dap mode, so normal runs are unaffected. Two limits: `evaluate` is wired but answers `<cannot evaluate EXPR>` for every expression, and `variables` reports only a method frame's parameters — a top-level frame answers an empty list, and locals assigned in a method body are absent.
 Regex literals (`/pat/flags`), `=~`/`!~`, `String#{match,scan,match?,sub,gsub}`
 with `Regexp`, `MatchData`, and arbitrary-precision `Integer` (auto-promotion on
 overflow) are supported. A `Regexp` is a value as well as a matcher: `==`,
