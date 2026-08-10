@@ -29,6 +29,12 @@ fn run() -> ExitCode {
         Err(e) => return fail(&e),
     };
 
+    // Option warnings MRI emits before doing anything else, prefixed with the
+    // program name exactly as its `rb_warn` does.
+    for w in &cli.warnings {
+        eprintln!("ruby: {w}");
+    }
+
     // Informational, exit immediately (MRI prints to stdout and exits 0).
     if cli.show_version {
         println!("{}", rubylang::version_banner());
@@ -92,7 +98,13 @@ fn run() -> ExitCode {
         };
     }
 
-    if let Some(mut file) = cli.file.clone() {
+    // `ruby -` names STDIN as the program, exactly like `ruby` with a piped
+    // script; it is not a request to open a file called "-". Because it says so
+    // explicitly it also skips the interactive REPL that a bare `ruby` on a
+    // terminal starts.
+    let stdin_program = cli.file.as_deref() == Some("-");
+
+    if let Some(mut file) = cli.file.clone().filter(|_| !stdin_program) {
         // `-S`: resolve a bare program name against `$PATH`.
         if cli.search_path {
             file = search_path(&file).unwrap_or(file);
@@ -145,7 +157,7 @@ fn run() -> ExitCode {
         };
     }
 
-    if cli.repl || atty_stdin() {
+    if cli.repl || (atty_stdin() && !stdin_program) {
         rubylang::repl::run();
         return ExitCode::SUCCESS;
     }

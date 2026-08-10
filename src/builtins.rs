@@ -450,12 +450,21 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
             })
         }
         // The directory of the file currently running (the top of the require
-        // file-dir stack), as a String. For a `-e` one-liner or piped stdin the
-        // stack is seeded with the current directory, so `__dir__` returns that.
+        // file-dir stack), as a String.
+        //
+        // MRI computes `File.dirname(File.realpath(__FILE__))`. Under `-e` and
+        // piped stdin `__FILE__` is the literal `"-e"` / `"-"`, which names no
+        // file, so the realpath step drops out and the answer is the relative
+        // `File.dirname("-e")` — `"."`. The dir stack is still seeded with the
+        // current directory there, because `require_relative` resolves against
+        // it; only what `__dir__` reports differs.
         "__dir__" => {
-            return match crate::host::current_file_dir() {
-                Some(d) => new_str(d.to_string_lossy().to_string()),
-                None => Value::Undef,
+            return match crate::host::current_file_path().as_deref() {
+                Some("-e") | Some("-") => new_str(".".to_string()),
+                _ => match crate::host::current_file_dir() {
+                    Some(d) => new_str(d.to_string_lossy().to_string()),
+                    None => Value::Undef,
+                },
             }
         }
         // The path of the file currently running (top of the file-path stack) —
@@ -1301,10 +1310,10 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
                     with_host(|h| h.set_class_method_visibility(&cls, &m, vis));
                 }
             }
-            return Ok(match args {
-                [one] if name != "module_function" => one.clone(),
-                _ => Value::Undef,
-            });
+            // `self` in a class/module body IS the class, and that is what the
+            // receiver-returning directives answer.
+            let this = with_host(|h| h.current_self());
+            return Ok(directive_result(name, &this, args));
         }
         // Route to class-receiver dispatch for the class's own class methods and
         // for instance methods it inherits as a `Class < Module` object (Rails
@@ -1941,10 +1950,7 @@ pub(crate) fn dispatch(
                     }
                 }
             }
-            return Ok(match args {
-                [one] if name != "module_function" => one.clone(),
-                _ => Value::Undef,
-            });
+            return Ok(directive_result(name, recv, args));
         }
         "frozen?" => return Ok(Value::Bool(with_host(|h| h.is_frozen(recv)))),
         "instance_variable_get" => {
@@ -4637,10 +4643,9 @@ fn dispatch_object(
             mm_args.extend_from_slice(args);
             call_instance_method(recv.clone(), cls, "method_missing", &mm_args, block)
         }
-        _ => Err(raise_exc(
-            "NoMethodError",
-            &format!("undefined method '{name}' for an instance of {cls}"),
-        )),
+        // One phrasing for every receiver, so `main` reads as `main` here too
+        // rather than as `an instance of Object`.
+        _ => Err(no_method_error(recv, name)),
     }
 }
 
@@ -17969,6 +17974,40 @@ fn class_visibility_directive(name: &str) -> Option<crate::host::Visibility> {
         "private_class_method" => Some(crate::host::Visibility::Private),
         "public_class_method" => Some(crate::host::Visibility::Public),
         _ => None,
+    }
+}
+
+/// What a visibility / constant directive ANSWERS. Three shapes, and which one
+/// applies is a property of the directive, not of how many arguments it got.
+/// Verified against MRI 4.0.6 (`/opt/homebrew/opt/ruby/bin/ruby`):
+///
+/// ```text
+/// class K; def a;end; def b;end; p(private :a);      end   # :a
+/// class K; def a;end; def b;end; p(private :a, :b);  end   # [:a, :b]
+/// class K;                       p(private);         end   # nil
+/// class K; def a;end;            p(private "a");     end   # "a"  (not :a)
+/// module M; X=1;                 p(private_constant :X); end  # M
+/// class K; def self.a;end; p(private_class_method :a);  end  # K
+/// class K; def a(*x);end;  p(ruby2_keywords :a);        end  # nil
+/// ```
+///
+/// So the name-list directives echo their own arguments back (the single-argument
+/// case returns the very same object, which is why a String argument stays a
+/// String), the constant- and class-method-level spellings answer the receiver,
+/// and `ruby2_keywords` answers nothing.
+fn directive_result(name: &str, recv: &Value, args: &[Value]) -> Value {
+    match name {
+        "private_constant"
+        | "public_constant"
+        | "deprecate_constant"
+        | "private_class_method"
+        | "public_class_method" => recv.clone(),
+        "ruby2_keywords" => Value::Undef,
+        _ => match args {
+            [] => Value::Undef,
+            [one] => one.clone(),
+            many => with_host(|h| h.new_array(many.to_vec())),
+        },
     }
 }
 

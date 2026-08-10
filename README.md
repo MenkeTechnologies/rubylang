@@ -239,16 +239,27 @@ to `ruby` work unchanged.
 | --- | --- |
 | `FILE [args…]` | Run a `.rb` script; `args` become `ARGV`, `$0`/`$PROGRAM_NAME`/`__FILE__` are set. Runs a matching `--build` bundle from the cache if one is current, else compiles fresh. |
 | `-e SRC [args…]` | Run a one-liner (repeatable; multiple `-e` are joined with newlines). Trailing `args` become `ARGV`; `$0` is `-e`. |
+| `-` | Read the program from stdin (as a bare `ruby` with piped input does); `$0`/`__FILE__` are `-` and the following tokens are `ARGV`. |
 | `-I DIR` | Prepend `DIR` to `$LOAD_PATH` (repeatable; glued `-Idir` or detached). |
 | `-r LIB` | `require LIB` before the program runs (repeatable). |
 | `-c` | Check syntax only — print `Syntax OK`, do not run. |
-| `-w` / `-W[level]` | Warning level → `$VERBOSE` (`-W0` → `nil`, `-w`/`-W1` → `false`, `-W2` → `true`). |
+| `-w` / `-W[level]` | Warning level → `$VERBOSE`. No switch → `false`; `-W0` → `nil`; `-W1` → `false`; `-w`, `-W`, `-W2`…`-W7` → `true`. The level is scanned as octal, so `-W8`/`-W9` are not levels — the digit is re-read as its own (invalid) switch. Last switch wins, so `-w -W0` ends at `nil`. |
+| `-W:CATEGORY` | Select a warning category (`deprecated`, `experimental`, `performance`, `strict_unused_block`, each also with a `no-` prefix) instead of a level; `$VERBOSE` is untouched. An unknown category warns and runs. |
 | `-d` / `--debug` | Set `$DEBUG`. |
 | `-S` | Search `$PATH` for the program file. |
-| `-v` | Print the version banner, then run any program. |
+| `-v` | Print the version banner, then run any program — and run it verbosely (`$VERBOSE = true`), as `--verbose` does. |
+| `--verbose` | `$VERBOSE = true`, without the banner. |
 | `--version` | Print the version banner and exit. |
 | `-h` / `--help` | Print usage and exit. |
 | `--` | End of options; the next token is the program file, the rest is `ARGV`. |
+
+`RUBYOPT` is honoured, and its switches are applied *before* the command line —
+so an explicit `-W0` overrides a `RUBYOPT=-w`. Because the variable is ambient,
+only switches that cannot change *what* runs are accepted there: `-I`, `-r`,
+`-d`, `-v`, `-w`, `-W`, `-K`, `-U`, `-E`, `--verbose`, `--debug`, and the
+`--enable-*` / `--disable-*` families. Anything else (notably `-e`, the `-n`/
+`-p`/`-a`/`-l` line-loop switches, `-c`, `-S`, `-x`, `-0`, `--version`,
+`--help`) is refused with `invalid switch in RUBYOPT: …`.
 
 `RUBY_VERSION` reports `3.4.0` (the targeted MRI language level, so gems'
 `required_ruby_version` checks pass); `RUBY_ENGINE` is `rubylang`,

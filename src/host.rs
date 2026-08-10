@@ -1557,6 +1557,25 @@ impl Default for RubyHost {
     }
 }
 
+/// The heap slot `main` — the top-level `self` — always occupies. It is the
+/// first thing `RubyHost::new` puts on the heap and nothing ever displaces it.
+pub const MAIN_OBJ_ID: u32 = 0;
+
+/// Is this the top-level `main` object?
+///
+/// `main` is an ordinary `Object` (so `self.class` is `Object`), but MRI gives
+/// it a singleton `to_s`/`inspect` answering `"main"`, and names it `main` in a
+/// `NoMethodError` rather than `an instance of Object`:
+///
+/// ```text
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p self'      # main
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'self.nope'
+/// -e:1:in '<main>': undefined method 'nope' for main (NoMethodError)
+/// ```
+pub fn is_main(v: &Value) -> bool {
+    matches!(v, Value::Obj(id) if *id == MAIN_OBJ_ID)
+}
+
 impl RubyHost {
     pub fn new() -> Self {
         // MRI's top-level `self` is `main`, an ordinary Object — so
@@ -3343,6 +3362,7 @@ impl RubyHost {
     /// name, which is the phrasing MRI uses for NOTHING.
     pub fn receiver_phrase(&self, v: &Value) -> String {
         match v {
+            _ if is_main(v) => "main".to_string(),
             Value::Undef => "nil".to_string(),
             Value::Bool(true) => "true".to_string(),
             Value::Bool(false) => "false".to_string(),
@@ -5945,6 +5965,9 @@ impl RubyHost {
 
     /// `to_s` — the human string form used by `puts`/interpolation.
     pub fn to_s(&mut self, v: &Value) -> String {
+        if is_main(v) {
+            return "main".to_string();
+        }
         match v {
             Value::Undef => String::new(),
             Value::Bool(b) => b.to_string(),
@@ -6119,6 +6142,9 @@ impl RubyHost {
 
     /// `inspect` — the debug form used by `p`/`inspect` (quotes strings).
     pub fn inspect(&mut self, v: &Value) -> String {
+        if is_main(v) {
+            return "main".to_string();
+        }
         match v {
             Value::Undef => "nil".to_string(),
             Value::Str(s) => inspect_string(s),

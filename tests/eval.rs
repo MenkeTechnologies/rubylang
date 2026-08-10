@@ -4365,6 +4365,19 @@ fn top_level_self_is_an_object_named_main() {
     eq("self.class.name", r#""Object""#);
     eq("self.is_a?(Object)", "true");
     eq("self.nil?", "false");
+    // …and it is actually NAMED `main`, which is the half this test asserted
+    // nothing about while `to_s` still answered the generic `#<Object>`.
+    eq("self.to_s", r#""main""#);
+    eq("self.inspect", r#""main""#);
+    eq(r##""#{self}""##, r#""main""#);
+    // The name reaches error messages too: MRI says `for main`, not `for an
+    // instance of Object`.
+    eq(
+        "begin; self.nope; rescue NoMethodError => e; e.message; end",
+        r#""undefined method 'nope' for main""#,
+    );
+    // Only `main` is special-cased; an ordinary Object still prints generically.
+    eq(r##"Object.new.to_s.start_with?("#<Object")"##, "true");
 }
 
 #[test]
@@ -5201,15 +5214,82 @@ fn grep_and_visibility_directives() {
         "[10, 20, 30, 40]",
     );
     eq("[1, \"a\", 2].grep_v(Integer)", "[\"a\"]");
-    // Visibility directives with args are accepted (rubylang doesn't enforce
-    // visibility); private_constant/private return the name, module_function nil.
+    // `send` reaches a private method — that is `send`'s contract, in MRI as
+    // much as here, so this pins the BYPASS and says nothing about enforcement.
+    eq(
+        "class C1; def a; 1; end; private :a; end; C1.new.send(:a)",
+        "1",
+    );
+    // Enforcement itself, which the line above cannot see. An ordinary call to
+    // the same method raises, so a regression that stopped honouring `private`
+    // would land here instead of passing unnoticed.
+    eq(
+        "class C1b; def a; 1; end; private :a; end; \
+         begin; C1b.new.a; rescue NoMethodError => e; e.message; end",
+        "\"private method 'a' called for an instance of C1b\"",
+    );
+    eq(
+        "class C1c; def a; 1; end; protected :a; end; \
+         begin; C1c.new.a; rescue NoMethodError => e; e.message; end",
+        "\"protected method 'a' called for an instance of C1c\"",
+    );
+    // Reading a `private_constant` from INSIDE the module is legal in MRI too,
+    // so this pins the read path, not the privacy.
     eq(
         "module M1; X = 5; private_constant :X; def self.g; X; end; end; M1.g",
         "5",
     );
+    // Known divergence: the constant is not actually made private. MRI raises
+    // `NameError: private constant M1b::X referenced` for the outside read.
+    // Pinned so implementing it turns this red rather than leaving it silent.
+    eq("module M1b; X = 5; private_constant :X; end; M1b::X", "5");
+    // What each directive ANSWERS. The name-list spellings echo their arguments
+    // (a single one by identity, so a String stays a String); the constant- and
+    // class-method-level ones answer the receiver; `ruby2_keywords` answers nil.
+    // Verified against MRI 4.0.6. The result is captured in a global rather than
+    // read off the `class` expression, because a class body's *value* is a
+    // separate divergence (rubylang answers nil where MRI answers the last
+    // statement) that would otherwise mask what these lines measure.
+    eq("class C2; def a; end; $r = (private :a); end; $r", ":a");
     eq(
-        "class C1; def a; 1; end; private :a; end; C1.new.send(:a)",
-        "1",
+        "class C2b; def a; end; def b; end; $r = (private :a, :b); end; $r",
+        "[:a, :b]",
+    );
+    eq("class C2c; $r = private; end; $r", "nil");
+    eq(
+        "class C2d; def a; end; $r = (private \"a\"); end; $r",
+        "\"a\"",
+    );
+    eq(
+        "module M2; def a; end; $r = (module_function :a); end; $r",
+        ":a",
+    );
+    eq("module M2b; $r = module_function; end; $r", "nil");
+    eq(
+        "module M3; X = 1; $r = (private_constant :X); end; $r",
+        "M3",
+    );
+    eq(
+        "class C3; def self.a; end; $r = (private_class_method :a); end; $r",
+        "C3",
+    );
+    eq(
+        "class C3b; def self.a; end; $r = (public_class_method :a); end; $r",
+        "C3b",
+    );
+    eq(
+        "class C4; def a(*x); end; $r = (ruby2_keywords :a); end; $r",
+        "nil",
+    );
+    // The explicit-receiver spelling answers the same way.
+    eq("class C5; def a; end; end; C5.send(:private, :a)", ":a");
+    eq(
+        "module M5; X = 1; end; M5.send(:private_constant, :X)",
+        "M5",
+    );
+    eq(
+        "class C6; def self.a; end; end; C6.private_class_method(:a)",
+        "C6",
     );
 }
 

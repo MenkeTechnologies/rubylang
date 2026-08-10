@@ -54,29 +54,62 @@ pub fn version_banner() -> String {
     )
 }
 
+/// The warning level of an interpreter started with no `-w`/`-W`/`-v` switch.
+///
+/// MRI's default is level 1 — `$VERBOSE` is `false`, not `nil`. Level 0 is
+/// reachable only by asking for it with `-W0`, so "no switch given" and `-W0`
+/// are *different* states and cannot share the zero value a derived `Default`
+/// would hand out. Verified against MRI 4.0.6:
+///
+/// ```text
+/// $ /opt/homebrew/opt/ruby/bin/ruby     -e 'p $VERBOSE'   # false
+/// $ /opt/homebrew/opt/ruby/bin/ruby -W0 -e 'p $VERBOSE'   # nil
+/// ```
+pub const DEFAULT_WARN_LEVEL: u8 = 1;
+
 /// Program-invocation configuration threaded in from the command line: `ARGV`,
 /// `-I` load-path prepends, `-r` requires, and the `$0` script name.
-#[derive(Default)]
 pub struct RunConfig {
     pub argv: Vec<String>,
     pub includes: Vec<String>,
     pub requires: Vec<String>,
     pub script_name: String,
-    /// `-w`/`-W` level: 0 → `$VERBOSE = nil`, 1 → `false`, 2 → `true`.
+    /// MRI verbosity level: 0 → `$VERBOSE = nil`, 1 → `false`, ≥2 → `true`.
+    /// Defaults to [`DEFAULT_WARN_LEVEL`], never to 0.
     pub warn_level: u8,
     /// `-d`/`--debug` → `$DEBUG`.
     pub debug: bool,
 }
 
-/// Seed `$VERBOSE`/`$DEBUG` from the warning level and debug flag (MRI: `-W0`
-/// silences to `nil`, `-w`/`-W2` set `$VERBOSE = true`, default is `false`).
-fn seed_verbosity(cfg: &RunConfig) {
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            argv: Vec::new(),
+            includes: Vec::new(),
+            requires: Vec::new(),
+            script_name: String::new(),
+            warn_level: DEFAULT_WARN_LEVEL,
+            debug: false,
+        }
+    }
+}
+
+/// `$VERBOSE` for a warning level: `-W0` silences to `nil`, level 1 (the
+/// default) is `false`, and `-w`/`-v`/`-W2` and above are `true`. MRI scans the
+/// `-W` digit as OCTAL, so levels up to 7 are reachable and all of 2..=7 mean
+/// `true`.
+fn verbose_for_level(level: u8) -> Value {
     // Ruby `nil` is `Value::Undef` in this runtime.
-    let verbose = match cfg.warn_level {
+    match level {
         0 => Value::Undef,
         1 => Value::Bool(false),
         _ => Value::Bool(true),
-    };
+    }
+}
+
+/// Seed `$VERBOSE`/`$DEBUG` from the warning level and debug flag.
+fn seed_verbosity(cfg: &RunConfig) {
+    let verbose = verbose_for_level(cfg.warn_level);
     host::with_host(|h| {
         h.set_global("VERBOSE", verbose);
         h.set_global("DEBUG", Value::Bool(cfg.debug));
@@ -194,6 +227,9 @@ pub fn eval_str_captured(src: &str, globals: &[(&str, &str)]) -> (Result<Value, 
         host::push_file_dir(cwd);
         host::push_file_path("-e".to_string());
         host::with_host(|h| h.set_program_args(&[], "-e"));
+        // An embedded program sees the same default verbosity a command-line one
+        // does; without this `$VERBOSE` would read `nil` here and `false` there.
+        seed_verbosity(&RunConfig::default());
         run_prelude()?;
         // Seeded after the prelude: it runs ordinary Ruby, and a local set
         // before it would not survive into the program's scope.

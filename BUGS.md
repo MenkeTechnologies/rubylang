@@ -313,8 +313,11 @@ Implemented and verified against the reference `ruby`:
     `#public_instance_method` are the implemented spellings.
   - `main`'s singleton methods (`include`, `private`, `public`, `define_method`,
     `using`, `ruby2_keywords`) are not modeled, so `self.method(:include)` at the
-    top level raises. rubylang has no `main` object at all — top-level `self` is a
-    plain `Object` and inspects as `#<Object>`, not `main`.
+    top level raises. The object itself now exists and names itself: top-level
+    `self` is heap slot 0, an ordinary `Object` (so `self.class` is `Object`)
+    whose `to_s`/`inspect` answer `"main"` and which a `NoMethodError` calls
+    `main` rather than `an instance of Object` — it is only the singleton method
+    set that is still missing.
   - MRI `undef`s the `Comparable`/`Numeric` methods `Complex` inherits (`<`,
     `clamp`, `between?`, `round`, …); the generated table records no
     "undefined here" column, so the ancestor's row is still found — 19 of the 24
@@ -373,7 +376,13 @@ Implemented and verified against the reference `ruby`:
   names) match MRI exactly.
 - **Top-level `self`.** Fixed to `main`, an ordinary `Object`, so
   `self.class.name == "Object"` (was `"NilClass"`). Top-level instance variables
-  now live on that object.
+  now live on that object, and it prints as `main` (see the `Method` section).
+- **Divergence — a `class`/`module` definition evaluates to `nil`.** In MRI the
+  body is an expression and the definition answers its last statement, so
+  `p(class Foo; 42; end)` prints `42`; rubylang prints `nil`. It matters mainly
+  for the one-liner idiom of reading a directive's result straight off the body
+  (`x = class C; private :m; end`); assigning inside the body and reading after
+  is the working spelling.
 - **`eval` / `class_eval` / `instance_eval` / `instance_exec`.** `eval("code")`
   compiles and runs the string on the current host (methods/classes/constants it
   defines persist), returning the last value. `Module#class_eval`/`module_eval`
@@ -656,6 +665,19 @@ Honest limitations of this surface:
   answer `[]` where MRI lists the class methods, and `C.methods` omits class
   methods entirely (even public ones). Enforcement above does not depend on it;
   it needs `#<Class:C>` to be populated from the owning class's `class_methods`.
+  **What the directives ANSWER.** Three shapes, and which one applies is a
+  property of the directive rather than of its argument count. The name-list
+  spellings (`private`, `public`, `protected`, `module_function`) echo their own
+  arguments — `nil` bare, the single argument itself by identity (so
+  `private "a"` answers the String `"a"`, not `:a`), an Array for several. The
+  constant- and class-method-level spellings (`private_constant`,
+  `public_constant`, `deprecate_constant`, `private_class_method`,
+  `public_class_method`) answer the RECEIVER, so `private_constant :X` inside
+  `module M` is `M`. `ruby2_keywords` answers `nil`.
+  Still open: `private_constant` records nothing, so the constant stays readable
+  from outside (`M::X` answers the value where MRI raises
+  `NameError: private constant M::X referenced`). Only the return value is
+  faithful today.
 - **Divergence — a bare `==`/`<`/`<=`/`>`/`>=` between an `i64`-range Integer
   and a Float is not exact.** Ruby compares an Integer to a Float exactly, never
   by rounding the Integer, so `3**34 == (3**34).to_f` is false and
@@ -1425,8 +1447,12 @@ Not modeled / boundaries:
   builtin types), and `FileUtils`/similar native pseudo-modules whose *constant*
   is unbound (`FileUtils.mkdir_p` works, but `FileUtils.class` is `NilClass`).
 - **`__dir__`** returns the directory of the file currently running (from the
-  same file-dir stack), a String; under `-e`/stdin it returns the seeded current
-  directory (MRI returns the relative `"."` there).
+  same file-dir stack), a String. MRI computes `File.dirname(File.realpath(
+  __FILE__))`, so under `-e`/stdin — where `__FILE__` is the literal `"-e"` /
+  `"-"` and names no file — the realpath step drops out and the answer is the
+  relative `"."`; rubylang matches. The dir stack is still seeded with the
+  current directory there, so `require_relative` from a one-liner resolves
+  against the real directory; only what `__dir__` *reports* is `"."`.
 - **`__FILE__`** returns the path of the file currently running (a parallel
   file-path stack): the script path exactly as given on the command line for the
   top-level script (not canonicalized, matching MRI), the required file's own
