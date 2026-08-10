@@ -3524,6 +3524,13 @@ fn dispatch_classref(
             }
             // `Array.new(n)` / `Array.new(n, val)` / `Array.new(n) { |i| ... }`.
             if cls == "Array" {
+                // `Array.new(ary)` COPIES it: the size argument is tried as
+                // `to_ary` before `to_int`, so an Array is not a size error.
+                if args.len() == 1 && block.is_none() {
+                    if let Some(items) = with_host(|h| h.as_array(&args[0])) {
+                        return Ok(new_arr(items));
+                    }
+                }
                 let n = args.first().map(to_int).transpose()?.unwrap_or(0).max(0) as usize;
                 let items: Vec<Value> = if let Some(bl) = &block {
                     (0..n)

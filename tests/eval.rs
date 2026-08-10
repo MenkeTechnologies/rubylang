@@ -7098,3 +7098,28 @@ fn strftime_covers_the_composite_and_week_number_directives() {
     // for a year starting mid-week.
     eq("Time.utc(2007, 12, 31).strftime(\"%U|%W\")", "\"52|53\"");
 }
+
+/// `Array.new` tries `to_ary` BEFORE `to_int`, so a single Array argument is a
+/// copy request and not a bad size. Tightening the size argument to reject
+/// non-integers had made `Array.new([1, 2])` raise where MRI answers a copy:
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p Array.new([1, 2])'
+///   [1, 2]
+/// Found by the `typeerr` fuzz mode on its first run.
+#[test]
+fn array_new_copies_an_array_argument_but_still_rejects_a_bad_size() {
+    eq("Array.new([])", "[]");
+    eq("Array.new([1, 2])", "[1, 2]");
+    eq("Array.new(3)", "[nil, nil, nil]");
+    eq("Array.new(2, 0)", "[0, 0]");
+    eq("Array.new(3) { |i| i }", "[0, 1, 2]");
+    let msg =
+        |src: &str| format!("begin; {src}; rescue TypeError => e; e.message; else; :no_raise; end");
+    eq(
+        &msg("Array.new(\"x\")"),
+        "\"no implicit conversion of String into Integer\"",
+    );
+    eq(
+        &msg("Array.new(nil)"),
+        "\"no implicit conversion from nil to integer\"",
+    );
+}
