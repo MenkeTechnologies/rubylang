@@ -40,7 +40,12 @@ fn every_write_path_is_captured() {
 #[test]
 fn output_before_a_raise_is_kept() {
     let (result, out) = rubylang::eval_str_captured("puts 'before'\nraise 'boom'", &[]);
-    assert!(result.is_err(), "expected the raise to surface");
+    // The MESSAGE, not just `is_err`: any failure at all satisfied that, so the
+    // test passed whether the raise surfaced or the program failed to parse.
+    assert_eq!(
+        result.err().as_deref(),
+        Some("-e:2:in '<main>': boom (RuntimeError)")
+    );
     assert_eq!(out, "before\n");
 }
 

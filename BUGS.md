@@ -23,15 +23,30 @@ snippet agrees, the fuzzer reports zero divergences on a broken build, and
 answer. Nothing fails, so nothing reveals it.
 
 `src/oracle.rs` is the single resolver every harness uses. It never falls back
-to a `PATH` lookup, and a candidate must pass three independent proofs before it
+to a `PATH` lookup, and a candidate must pass four independent proofs before it
 is accepted: it must not canonicalize into a `rubylang` install or a `target/`
-build dir; its `--version` must have MRI's `ruby X.Y.Z (… revision …)
-[platform]` shape (rubylang prints `ruby 3.4.0 (rubylang 0.1.4) [aarch64-macos]`
-— note that the mimicry has since grown a bracketed platform, so `revision` is
-now the only part of that shape doing the discriminating); and `RUBY_ENGINE` must be
-`"ruby"` (rubylang's is deliberately `"rubylang"`, so this stays true however
-close the mimicry gets). An unresolvable oracle is a hard error, not a skip.
-`RUBYLANG_ORACLE_RUBY` names one explicitly and is never silently replaced.
+build dir; **its executable must not contain `oracle::SELF_MARKER`**; its
+`--version` must have MRI's `ruby X.Y.Z (… revision …) [platform]` shape; and
+`RUBY_ENGINE` must be `"ruby"`. An unresolvable oracle is a hard error, not a
+skip. `RUBYLANG_ORACLE_RUBY` names one explicitly and is never silently
+replaced.
+
+**Three of those four proofs decay as rubylang matures, and the decay is
+silent.** They ask the candidate to describe itself, and rubylang's job is to
+answer the way MRI does; nothing fails when a clause stops discriminating, it
+just stops contributing. It has already happened to the `--version` shape:
+rubylang prints `ruby 3.4.0 (rubylang 0.1.4) [aarch64-macos]`, which now matches
+the leading `ruby ` and the bracketed platform, so `revision` is the only clause
+of that proof still separating the two. `RUBY_ENGINE` is one compatibility shim
+away from going the same way — it answers `"rubylang"` only because rubylang
+chooses to.
+
+The content proof is the one that cannot decay, because it asks nothing: a
+rubylang binary carries the marker and an MRI binary cannot, however close the
+mimicry gets. It catches a rubylang renamed, installed outside a `rubylang`
+path, given MRI's exact `--version` and made to answer `RUBY_ENGINE` as
+`"ruby"` — a case the path proof cannot see, pinned by
+`tests/entry_points.rs::the_oracle_refuses_a_rubylang_that_no_path_check_could_catch`.
 
 Two consequences worth knowing:
 
@@ -57,7 +72,7 @@ so a gap can be closed on purpose rather than stumbled into.
 | Harness | Cannot report | Why | State |
 | --- | --- | --- | --- |
 | `tests/parity.rs` | Any stderr difference | Compares `stdout` only; stderr is never captured | Open — by design; it is the CI replay, and stderr carries paths |
-| `tests/parity.rs` | The *reason* a rejected snippet was rejected | A frozen `<error>` asserts only a non-zero exit, so a snippet that fails for a NEW reason still passes | Open |
+| `tests/parity.rs` | The exact *reason* a rejected snippet was rejected | A frozen `<error>` records no class or message, so a snippet that fails for a different Ruby-level reason still passes | Open — narrowed: it now also requires empty stdout, no Rust panic, and a `… (SomeError)` line on stderr, so a PANIC and a silent non-zero exit no longer satisfy it |
 | `bin/parity` | Exit-code differences | Compares captured stdout; a rubylang error becomes the same `<error>` marker regardless of class or message | Open |
 | `bin/parity` | Anything about a snippet MRI rejects | Both sides collapse to `<error>` | Open |
 | `parity-fuzz` | Stderr, unless `--stderr` | `differs` compares stdout + exit; stderr is opt-in | Open — deliberate, the wording is noisier than the behaviour |
@@ -143,6 +158,55 @@ detect that).
   are rubylang self-baselines and were not compared, which is what the label is
   for.
 
+### Hardcoded-wording provenance (the other direction)
+
+The frozen records above are data files, and a fabricated pin in one is caught
+by re-running the reference. A diagnostic sentence hardcoded in `src/` is not:
+no oracle gate, no version gate and no frozen record can see a string frozen in
+the implementation source. Every diagnostic rubylang EMITS was written by a
+person, so the same two questions have to be asked of those too.
+
+Method: 144 literals were extracted mechanically from the `raise_exc`/`abort`
+call sites and matched against the string constants in `libruby.4.0.dylib`,
+every bundled extension and the whole installed stdlib, with `{…}` placeholders
+and digit runs treated as argument slots. 43 had no MRI wording behind them; each
+was then put to the reference interpreter directly. **51 wording families
+measured, 17 agreed, 34 did not; 23 corrected, 11 left as measured gaps below.**
+
+Four failure shapes turned up, and only the first is the obvious one:
+
+- **Never any MRI's words.** `tried to create Enumerator without a block`, `index
+  0 outside of array bounds: -0...0` (a minus sign written as literal text next
+  to a placeholder), `can't convert to Rational`.
+- **An older MRI's words, frozen where no gate can see them.** `for GC:Module` is
+  what MRI said before it started saying `for module GC`. `step can't be
+  negative` is a real message applied to `step(0)` as well, so it gave the wrong
+  reason for zero and raised at all for a negative step, which MRI answers `[]`.
+- **A real MRI string on the wrong feature.** `no receiver is available` exists
+  in `libruby`; the message for `:sym.to_proc.call` is `no receiver given`.
+- **Right words, wrong class, or right in one place and wrong in another.**
+  `no block given (yield)` was a RuntimeError from `b_yield` and a LocalJumpError
+  from `catch`. `can't modify frozen Integer: 1` was already correct in
+  `frozen_guard` and wrong in the `instance_variable_set` arm four thousand lines
+  away.
+
+Remaining measured gaps in this family, all left deliberately: the frame name in
+a diagnostic (`in 'Kernel#require'` vs `in '<main>'`) and the line-0 bug, both
+already listed above; `ENV`'s address-bearing receiver phrase; `Module.new`'s
+`#<Module:0x…>` address; `NoMatchingPatternError` omitting which clause failed
+and why (`99: 1 === 99 does not return true`); MRI's `Socket::ResolutionError`
+class and its `getaddrinfo` wording; `Zlib::GzipFile::Error`; and MRI's
+multi-line Prism syntax-error rendering.
+
+### `inspect` escapes a smaller set than MRI
+
+MRI escapes any character its encoding calls unprintable, which is a full
+Unicode general-category table — 1044 codepoints below U+3000 alone. rubylang
+escapes the C0 controls, DEL, the C1 controls and U+2028/U+2029, which covers
+every character that occurs in practice, and prints assigned-but-unusual
+codepoints raw where MRI would escape them. Closing this needs a Unicode
+category table, which is a dependency decision rather than a bug fix.
+
 ## Working (for reference)
 
 Classes with `initialize`/`attr_*`/instance methods, single inheritance, `super`
@@ -225,14 +289,19 @@ keeps both.
   (`-[]` said `for Array`, `{} + 1` said `for Hash`, `-nil` said `for
   NilClass`); they were fixed together, because fixing one of four only makes
   the wording inconsistent.
-- **Divergence — a module or class that is not a class reference names itself
-  bare.** `GC`, `ObjectSpace`, `Random`, `SecureRandom` and `ENV` build their
-  own message and omit MRI's `module `/`class ` prefix (`GC.zzz` says
-  `for GC:Module`, MRI says `for module GC`; `Random.zzz` says `for Random`,
-  MRI says `for class Random`). These are the class/module case, not the
-  instance one, and they do not reach `receiver_phrase` because the receiver is
-  not a class-reference value. `ENV` is separate again: MRI answers
-  `for #<Object:0x…>`, an address.
+  A fifth site was found in the round-6 audit and joined them: the terminal
+  `Kernel` arm dropped the clause entirely, so a top-level `no_such(1)` said
+  `undefined method 'no_such'` where MRI says `undefined method 'no_such' for
+  main`.
+- **`GC`, `ObjectSpace`, `Random` and `SecureRandom` now use MRI's wording.**
+  These four build their own message rather than reaching `receiver_phrase`
+  (the receiver is not a class-reference value), and each had the phrasing MRI
+  used BEFORE it changed to `for module X` / `for class X` — `GC.zzz` said `for
+  GC:Module`. A version gate cannot see a string frozen in the implementation
+  source, so nothing flagged it. Corrected against ruby 4.0.6.
+- **Divergence — `ENV` still names itself.** `ENV.zzz` says `for ENV`; MRI
+  answers `for #<Object:0x…>`, an address. Left alone deliberately: the MRI
+  form embeds a heap address, which is not reproducible and not comparable.
 
 ## Language
 
@@ -960,6 +1029,20 @@ Honest limitations of this surface:
   reproducible outside MRI. `min(n)` also
   selects rather than sorts, so its order among `==`-equal but distinct values
   (`1` and `1r`) is its quickselect's, not a stable sort's.
+- **Divergence — `sort`/`sort_by` are STABLE here and unstable in MRI.**
+  `(1..20).sort_by { |x| x % 3 }` returns a different permutation of the
+  equal-keyed elements in each; below roughly a dozen elements they agree,
+  because MRI's `ruby_qsort` only switches strategy above a size threshold.
+  Ruby documents `sort` as not stable, so neither answer is wrong — matching MRI
+  means reproducing its qsort exactly in order to agree on an ordering the
+  language explicitly does not specify, and being stable is the stronger
+  guarantee. Left as-is on purpose; it is the one open row of the
+  name-lookalike sweep.
+- **Collection searches use `rb_equal`, not `==`.** `include?`, `index`,
+  `rindex`, `count(obj)` and element-wise `Array#==` answer true for two
+  operands that are the same value before asking `==`, which is what MRI does.
+  One value distinguishes the two rules: `[Float::NAN].include?(Float::NAN)` is
+  true while `Float::NAN == Float::NAN` stays false.
 - **`between?` and `clamp` are one implementation for every receiver.**
   Comparable, Integer, Float, String and Rational all reach them through
   `cmp_int` — MRI's `cmpint`, which ranks through the receiver's own `<=>`.
@@ -1049,8 +1132,10 @@ Honest limitations of this surface:
   threads a value in as `Fiber.yield`'s return (and as the block's first
   parameter on the initial resume); the block's final value is the last
   `resume`'s result, and side effects fire lazily at the real yield boundaries.
-  Resuming a fiber whose block has returned raises `FiberError` (dead fiber);
-  `Fiber.yield` at the root raises `FiberError`. Each fiber runs its own `VM`
+  Resuming a fiber whose block has returned raises `FiberError` (`attempt to
+  resume a terminated fiber`); `Fiber.yield` at the root raises `FiberError`
+  (`attempt to yield on a not resumed fiber`). Both wordings were rubylang's own
+  until the round-6 audit measured them. Each fiber runs its own `VM`
   instance and its own volatile execution context (scope/signal/frames), swapped
   at every resume/suspend boundary, so fibers are isolated and nest correctly.
   That swap includes the pending-exception slot, so a raise inside the body has
@@ -1085,7 +1170,35 @@ Honest limitations of this surface:
   MRI: values that fit stay `i64` immediates, and only the overflow path
   allocates a `BigInt` heap object (backed by `num-bigint`). Arithmetic, bit
   ops, `**`, comparison, `to_s(base)`, `bit_length`, and `digits` all cross the
-  boundary transparently.
+  boundary transparently. Five operations used to CRASH at the `i64` boundary
+  rather than promote — `(-2**63)` under `abs`, `/ -1`, `% -1`, `divmod(-1)` and
+  `pred` each panicked the interpreter, because Rust's `i64` arithmetic does not
+  overflow, it aborts. Division and modulo are taken in `i128`, where the `i64`
+  quotient always fits, and every result leaves through one promotion point.
+- **`Integer#/` floors and `#%` takes the divisor's sign** — neither is Rust's.
+  Rust's `/` truncates toward zero and its `%` takes the DIVIDEND's sign, which
+  is Ruby's `remainder`, not Ruby's `%`. Both Ruby spellings are implemented:
+  `-7 / 2` is `-4`, `-7 % 3` is `2`, `(-7).remainder(3)` is `-1`.
+- **`Float#round(half:)`.** Ruby's default tie rule is half-UP (away from zero),
+  and `half: :even` and `half: :down` are real modes that change only values
+  sitting exactly on the halfway point. All three go through the f64 path, the
+  exact-integer path for a negative `ndigits`, and the rational path past
+  `DBL_DIG`. `half:` belongs to `round` alone; `floor`/`ceil`/`truncate` take
+  the keyword Hash as their `ndigits` positional and fail converting it, as MRI
+  does.
+- **`Float#%` and `#divmod` by zero raise.** `1.0 % 0` is a `ZeroDivisionError`,
+  not IEEE's NaN; only `/` and `fdiv` answer Infinity.
+- **Ruby's whitespace is not Rust's, and there are three different sets.**
+  `String#strip`/`lstrip`/`rstrip` remove a FIXED ASCII set plus NUL; Rust's
+  `str::trim` shares the name but uses the Unicode `White_Space` property, so it
+  removed the NBSP and ideographic space MRI keeps and kept the NUL MRI strips.
+  Awk-mode `split(" ")` uses the same fixed set, so an NBSP is a field and not a
+  separator. The numeric scanners (`to_i`, `to_f`, `to_r`, `Kernel#Integer`,
+  `Kernel#Float`) skip C `isspace`, which INCLUDES the vertical tab that Rust's
+  `is_ascii_whitespace` omits and EXCLUDES the NUL that `strip` removes — so
+  `"\v12".to_i` is 12 and `Integer("\0" + "12")` is refused. Each set is a named
+  constant in `src/builtins.rs` rather than a call to a Rust predicate that
+  happens to be close.
 - **`Integer#pow(e, m)`.** Modular exponentiation for `e >= 0`. A negative
   exponent with a modulus raises `RangeError` (`Integer#pow() 1st argument
   cannot be negative when 2nd argument specified`), matching MRI — no modular
@@ -1096,6 +1209,17 @@ Honest limitations of this surface:
   tolerance) are supported, backed by `num-rational`. `nil.to_a`/`to_h` return
   the empty collection. `Array#sum` (and `reduce(:+)`) stay exact for Rational,
   BigInt, String, and Array elements.
+  `Kernel#Rational` takes the whole surface MRI takes — Integer, Float
+  (exactly), Rational, a Complex whose imaginary part is zero, and the string
+  grammar with exponents, digit-grouping underscores and a decimal denominator
+  — and rejects with MRI's four different classes (`ArgumentError` naming the
+  string, `TypeError` naming the class, `ZeroDivisionError`, `FloatDomainError`,
+  and `RangeError` for a Complex with an imaginary part). `Integer`, `Float`,
+  `Rational`, `Complex`, `String`, `Array` and `Hash` check their argument count
+  against the measured table and honour `exception: false`.
+- **Gap — `String#to_c` is not implemented.** `"12".to_c` raises
+  `NoMethodError`; MRI answers `(12+0i)`. `Integer#to_c` and `Float#to_c` are
+  present, so this is the String half only.
 - **`Time` is UTC-only.** `Time.at`, `Time.utc`/`Time.gm`, and `Time.now`
   construct times; the field readers (`year`/`month`/`day`/`hour`/`min`/`sec`/
   `wday`/`yday`), `to_i`/`to_f`, `to_s`/`inspect`, `strftime` (every directive

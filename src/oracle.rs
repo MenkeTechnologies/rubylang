@@ -15,25 +15,69 @@
 //! guess. A candidate is only accepted after it PROVES it is MRI, and there is
 //! no fallback to bare `ruby` — an unresolvable oracle is a hard error.
 //!
-//! # The three independent proofs
+//! # The four independent proofs
 //!
 //! A candidate must pass all of them; any one failing rejects it.
 //!
 //! 1. **Not us, by path.** The candidate is canonicalized (following the
 //!    Homebrew symlink) and rejected if it lands inside a `rubylang`
-//!    installation or in a `target/` build directory. This is the check that
-//!    survives rubylang growing better MRI mimicry.
-//! 2. **MRI-shaped `--version`.** MRI prints
+//!    installation or in a `target/` build directory.
+//! 2. **Not us, by CONTENT.** The candidate's executable is scanned for
+//!    [`SELF_MARKER`], a string every rubylang build contains and no MRI build
+//!    can. See the erosion note below: this is the proof that does not decay.
+//! 3. **MRI-shaped `--version`.** MRI prints
 //!    `ruby 4.0.6 (2026-07-14 revision 03b6d3f889) +PRISM [arm64-darwin25]`.
-//!    rubylang prints `ruby 3.4.0 (rubylang 0.1.4) [aarch64-macos]`. It has
-//!    since grown a bracketed platform, so the `revision` substring is the only
-//!    part of this proof still discriminating — proof 1 (path) and proof 3
-//!    (`RUBY_ENGINE`) are what actually reject a rubylang today.
-//! 3. **`RUBY_ENGINE`.** MRI prints `ruby`; anything that cannot answer the
+//!    rubylang prints `ruby 3.4.0 (rubylang 0.1.4) [aarch64-macos]`.
+//! 4. **`RUBY_ENGINE`.** MRI prints `ruby`; anything that cannot answer the
 //!    question the same way is not the reference.
+//!
+//! # Why proofs 3 and 4 are not enough, and were quietly getting weaker
+//!
+//! Proofs 3 and 4 both ask the candidate to DESCRIBE ITSELF, and rubylang's job
+//! is to become indistinguishable from MRI. Every such proof therefore decays as
+//! the frontend matures, and the decay is invisible: nothing fails when a clause
+//! stops discriminating, it just stops contributing.
+//!
+//! That already happened. Proof 3 once rested on the whole `ruby X.Y.Z (…
+//! revision …) [platform]` shape. rubylang has since grown the bracketed
+//! platform and the leading `ruby `, so of the three clauses only `revision`
+//! still separates the two — measured again this round, and still true:
+//!
+//! ```text
+//! $ /opt/homebrew/opt/ruby/bin/ruby --version
+//! ruby 4.0.6 (2026-07-14 revision 03b6d3f889) +PRISM [arm64-darwin25]
+//! $ target/debug/ruby --version
+//! ruby 3.4.0 (rubylang 0.1.4) [aarch64-macos]
+//! ```
+//!
+//! Proof 4 is one line from being defeated the same way: `RUBY_ENGINE` answers
+//! `"rubylang"` only because rubylang chooses to, and a compatibility shim that
+//! made it answer `"ruby"` would silently turn the whole guard into proof 1.
+//!
+//! Proof 2 cannot decay, because it does not ask a question the frontend gets to
+//! answer. A rubylang binary contains [`SELF_MARKER`]; an MRI binary does not,
+//! and no amount of MRI mimicry puts it there. It survives the candidate being
+//! renamed, installed outside a `rubylang` path, given MRI's exact `--version`
+//! and made to answer `RUBY_ENGINE` as `"ruby"`. The only way to defeat it is to
+//! delete the marker from rubylang, which `tests/entry_points.rs` pins.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// A string every rubylang build contains and no MRI build can.
+///
+/// This is the one part of the guard that does not depend on rubylang
+/// describing itself honestly, so it is the one part that cannot be eroded by
+/// rubylang getting better at being MRI. It is deliberately unmistakable rather
+/// than short: it must never collide with an ordinary string inside a real
+/// interpreter.
+pub const SELF_MARKER: &str = "rubylang-differential-oracle-self-marker/v1";
+
+/// Keeps [`SELF_MARKER`] in the emitted binary whether or not any reachable code
+/// path formats it. Without this the linker is free to drop the literal from a
+/// build that never prints it, and proof 2 would pass a rubylang.
+#[used]
+static SELF_MARKER_ANCHOR: &[u8] = SELF_MARKER.as_bytes();
 
 /// The environment variable that names the oracle explicitly. When it is set
 /// but unusable, resolution is a HARD ERROR rather than a fallback: silently
@@ -79,6 +123,36 @@ impl Oracle {
     }
 }
 
+/// Whether `path`'s bytes contain `needle`, read in chunks so the size of the
+/// candidate does not matter. Chunks overlap by `needle.len() - 1` bytes so a
+/// match straddling a boundary is still found. An unreadable file answers
+/// false: proof 1 and the `--version` probe below deal with those.
+fn file_contains(path: &Path, needle: &[u8]) -> bool {
+    use std::io::Read as _;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let overlap = needle.len().saturating_sub(1);
+    let mut buf = vec![0u8; 1 << 20];
+    let mut filled = 0usize;
+    loop {
+        match f.read(&mut buf[filled..]) {
+            Ok(0) => return false,
+            Ok(n) => {
+                filled += n;
+                if buf[..filled].windows(needle.len()).any(|w| w == needle) {
+                    return true;
+                }
+                if filled + overlap >= buf.len() {
+                    buf.copy_within(filled - overlap..filled, 0);
+                    filled = overlap;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
 /// Why a candidate is not the reference interpreter.
 fn reject_reason(path: &Path) -> Option<String> {
     let real = match path.canonicalize() {
@@ -97,7 +171,16 @@ fn reject_reason(path: &Path) -> Option<String> {
         return Some(format!("resolves to a build directory ({shown})"));
     }
 
-    // Proof 2: MRI-shaped `--version`.
+    // Proof 2: not us, by content. Unlike every other proof here, this one does
+    // not ask the candidate anything, so mimicry cannot answer its way past it.
+    if file_contains(&real, SELF_MARKER.as_bytes()) {
+        return Some(format!(
+            "{shown} carries rubylang's own build marker — that is rubylang \
+             itself, however it identifies"
+        ));
+    }
+
+    // Proof 3: MRI-shaped `--version`.
     let ver = match Command::new(&real).arg("--version").output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         Ok(o) => return Some(format!("`--version` exited {}", o.status)),
@@ -110,7 +193,7 @@ fn reject_reason(path: &Path) -> Option<String> {
         ));
     }
 
-    // Proof 3: RUBY_ENGINE.
+    // Proof 4: RUBY_ENGINE.
     match Command::new(&real)
         .arg("-e")
         .arg("print RUBY_ENGINE")

@@ -8340,7 +8340,14 @@ pub fn call_method(name: &str, args: &[Value], block: Option<Value>) -> Result<V
     }
     let def = with_host(|h| h.methods.get(name).cloned());
     let Some(def) = def else {
-        return Err(format!("undefined method '{name}'"));
+        // MRI names the receiver even when the call had none written — a
+        // top-level call reports `for main`. Omitting the clause produced a
+        // sentence in no MRI's vocabulary, and the two callers that recognise
+        // this message both accept the longer form.
+        return Err(format!(
+            "undefined method '{name}' for {}",
+            with_host(|h| h.receiver_phrase(&self_obj))
+        ));
     };
     run_method(&def, self_obj, args, block, Some(name.into()), None)
 }

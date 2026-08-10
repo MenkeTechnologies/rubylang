@@ -441,3 +441,45 @@ fn top_level_self_prints_as_main_at_every_entry_point() {
     assert_eq!(file, want);
     assert_eq!(stdin, want);
 }
+
+/// The oracle guard's one proof that cannot decay.
+///
+/// Three of the four proofs in `src/oracle.rs` ask the candidate to describe
+/// itself — its `--version` shape, its `RUBY_ENGINE` — and rubylang's whole
+/// purpose is to answer those the way MRI does. Such a proof gets weaker every
+/// time the frontend matures, silently: nothing fails when a clause stops
+/// discriminating. It has already happened once, to the `--version` shape.
+///
+/// The content proof does not ask a question. A rubylang binary carries
+/// `oracle::SELF_MARKER`; an MRI binary cannot. This test pins both halves of
+/// that: the marker really is in the binary we ship, and a rubylang placed
+/// where no path check can see it is still refused.
+#[test]
+fn the_oracle_refuses_a_rubylang_that_no_path_check_could_catch() {
+    let me = PathBuf::from(env!("CARGO_BIN_EXE_ruby"));
+    let marker = rubylang::oracle::SELF_MARKER.as_bytes();
+    let bytes = std::fs::read(&me).expect("read our own binary");
+    assert!(
+        bytes.windows(marker.len()).any(|w| w == marker),
+        "the built `ruby` does not contain oracle::SELF_MARKER — proof 2 would \
+         accept a rubylang as the reference interpreter"
+    );
+
+    // Copied out of `target/` and away from any `rubylang`-shaped path, so
+    // proof 1 has nothing to go on. Proof 2 must still refuse it. The directory
+    // name deliberately avoids `rubylang`: `fresh_dir` puts it in the path, and
+    // proof 1 would then answer first and this test would prove nothing.
+    let dir = std::env::temp_dir().join(format!("oracle_decoy_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let decoy = dir.join("ruby");
+    std::fs::copy(&me, &decoy).expect("copy the binary");
+    let why = rubylang::oracle::verify(&decoy)
+        .err()
+        .expect("a rubylang must never verify as the reference interpreter");
+    assert!(
+        why.contains("build marker"),
+        "expected the CONTENT proof to reject it (the path proof cannot see \
+         this one), got: {why}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

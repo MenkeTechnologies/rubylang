@@ -105,4 +105,8 @@ fn no_ruby_prefix_on_uncaught_exception() {
         !stderr.starts_with("ruby:"),
         "unexpected ruby: prefix: {stderr:?}"
     );
+    // The absence check alone cannot fail for the right reason: EMPTY stderr,
+    // or any wrong diagnostic, also fails to start with `ruby:`. Pin what the
+    // line must be, so removing the prefix by removing the printer is caught.
+    assert_eq!(stderr, "-e:1:in '<main>': boom (RuntimeError)\n");
 }

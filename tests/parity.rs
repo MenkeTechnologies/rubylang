@@ -49,13 +49,36 @@ fn corpus_matches_reference_ruby() {
             .expect("run ruby binary");
         let got = String::from_utf8_lossy(&out.stdout).to_string();
         let want = want.strip_suffix('\n').unwrap_or(want);
-        // A frozen `<error>` means the reference `ruby` rejected the snippet;
-        // assert rubyrs also rejects it (non-zero exit) rather than matching
-        // stdout, which is empty on both sides.
+        // A frozen `<error>` means the reference `ruby` rejected the snippet.
+        // Its stdout is empty on both sides, so there is nothing to compare —
+        // but "exited non-zero" alone is satisfied by a great many wrong
+        // outcomes, including the one that matters most: an interpreter PANIC
+        // also exits non-zero and printed no Ruby diagnostic at all. Three
+        // further things are therefore required, all of which the reference
+        // does and none of which a panic does.
         if want == "<error>" {
-            if out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).to_string();
+            let reported_an_exception = err
+                .lines()
+                .any(|l| l.trim_end().ends_with(')') && l.contains(" ("));
+            let why = if out.status.success() {
+                Some("the reference rejected it, but rubyrs accepted it".to_string())
+            } else if !got.is_empty() {
+                Some(format!(
+                    "expected no stdout before the failure, got {got:?}"
+                ))
+            } else if err.contains("panicked at") {
+                Some(format!("rubyrs PANICKED instead of raising: {err:?}"))
+            } else if !reported_an_exception {
+                Some(format!(
+                    "expected a `… (SomeError)` diagnostic on stderr, got {err:?}"
+                ))
+            } else {
+                None
+            };
+            if let Some(why) = why {
                 failures.push(format!(
-                    "── snippet #{i} ──\n{}\n  expected: reference rejected it, but rubyrs accepted it",
+                    "── snippet #{i} ──\n{}\n  {why}",
                     snippet.lines().next().unwrap_or("")
                 ));
             }

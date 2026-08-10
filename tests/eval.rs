@@ -13,6 +13,34 @@ fn eq(src: &str, expected: &str) {
     }
 }
 
+/// Assert that `src` raises `class` with exactly `message`.
+///
+/// This replaces `assert!(ev(src).is_err())`, which cannot fail for the reason
+/// its test is named for: it passes when the snippet fails for ANY reason, so a
+/// typo in the snippet, a parse error, or the feature raising the WRONG class
+/// all satisfy it — and so would deleting the feature, since a missing method
+/// also raises. Both halves have to be pinned, because either alone passes on
+/// the other being wrong: the class alone accepts an invented sentence, the
+/// message alone accepts the wrong class carrying the right words.
+fn raises(src: &str, class: &str, message: &str) {
+    let probe = format!(
+        "begin; {src}; rescue Exception => e; [e.class.to_s, e.message]; \
+         else; :evaluated_without_raising; end"
+    );
+    eq(&probe, &format!("[{class:?}, {message:?}]"));
+}
+
+/// Assert that `src` is REJECTED BEFORE IT RUNS, with exactly `message`.
+/// For the errors `raises` cannot see: a `begin`/`rescue` around a snippet that
+/// fails to parse never runs, so a parse-time rejection has to be read off the
+/// evaluator's own error rather than out of a rescue.
+fn rejects(src: &str, message: &str) {
+    match ev(src) {
+        Ok(got) => panic!("expected `{src}` to be rejected, got {got}"),
+        Err(e) => assert_eq!(e, message, "for source: {src}"),
+    }
+}
+
 #[test]
 fn arithmetic_and_precedence() {
     eq("1 + 2 * 3", "7");
@@ -1029,10 +1057,26 @@ fn kernel_convert_batch() {
     eq("42.yield_self { |x| x + 1 }", "43");
     eq("x = 0; loop { x += 1; break if x > 3 }; x", "4");
     // Bad input raises the right exception class.
-    assert!(ev("Integer(\"3.14\")").is_err());
-    assert!(ev("Integer(\"abc\")").is_err());
-    assert!(ev("Integer(nil)").is_err());
-    assert!(ev("Float(\"inf\")").is_err());
+    raises(
+        "Integer(\"3.14\")",
+        "ArgumentError",
+        "invalid value for Integer(): \"3.14\"",
+    );
+    raises(
+        "Integer(\"abc\")",
+        "ArgumentError",
+        "invalid value for Integer(): \"abc\"",
+    );
+    raises(
+        "Integer(nil)",
+        "TypeError",
+        "can't convert nil into Integer",
+    );
+    raises(
+        "Float(\"inf\")",
+        "ArgumentError",
+        "invalid value for Float(): \"inf\"",
+    );
 }
 
 #[test]
@@ -1253,8 +1297,16 @@ fn radix_batch() {
     eq("Integer(\"010\")", "8");
     eq("Integer(\"-0x10\")", "-16");
     // Integer() is strict: trailing garbage raises.
-    assert!(ev("Integer(\"ff\")").is_err());
-    assert!(ev("Integer(\"099\")").is_err());
+    raises(
+        "Integer(\"ff\")",
+        "ArgumentError",
+        "invalid value for Integer(): \"ff\"",
+    );
+    raises(
+        "Integer(\"099\")",
+        "ArgumentError",
+        "invalid value for Integer(): \"099\"",
+    );
 }
 
 #[test]
@@ -2259,7 +2311,11 @@ fn endless_and_beginless_ranges() {
     eq("(..5).include?(3)", "true");
     eq("(..5).cover?(10)", "false");
     // Materializing an endless range raises rather than hanging.
-    assert!(ev("(1..).to_a").is_err());
+    raises(
+        "(1..).to_a",
+        "RangeError",
+        "cannot convert endless range to an array",
+    );
 }
 
 #[test]
@@ -2274,7 +2330,11 @@ fn format_positional_and_case_and_tr() {
     eq("\"ÜBER\".downcase(:ascii)", "\"Über\"");
     eq("\"groß\".upcase", "\"GROSS\"");
     // A descending tr range raises ArgumentError.
-    assert!(ev("\"12345\".tr(\"0-9\", \"9-0\")").is_err());
+    raises(
+        "\"12345\".tr(\"0-9\", \"9-0\")",
+        "ArgumentError",
+        "invalid range \"9-0\" in string transliteration",
+    );
     eq("\"hello\".tr(\"a-y\", \"*\")", "\"*****\"");
 }
 
@@ -2469,7 +2529,11 @@ fn pattern_matching_case_in() {
         "[1, 2]",
     );
     // No matching clause and no else raises.
-    assert!(ev("case 99; in 1; :x; end").is_err());
+    // rubylang names the unmatched VALUE; MRI adds which clause failed and why
+    // (`99: 1 === 99 does not return true`). Pinned to what rubylang really
+    // says so the class is checked and a change here has to be deliberate; the
+    // missing detail is a measured gap, not a passing test.
+    raises("case 99; in 1; :x; end", "NoMatchingPatternError", "99");
 }
 
 #[test]
@@ -2490,7 +2554,11 @@ fn method_missing_and_respond_to_missing() {
         "[true, false]",
     );
     // A class with no method_missing still raises.
-    assert!(ev("class Q; end; Q.new.nope").is_err());
+    raises(
+        "class Q; end; Q.new.nope",
+        "NoMethodError",
+        "undefined method 'nope' for an instance of Q",
+    );
     // A proxy forwards calls (incl. a block through a splat) via method_missing.
     eq(
         "class Px; def initialize(t); @t = t; end; def method_missing(n, *a, &b); @t.send(n, *a, &b); end; end; \
@@ -3205,41 +3273,59 @@ fn blockless_iterators_return_enumerators() {
 
 #[test]
 fn no_method_error_messages() {
-    // Ruby 4.0 message form: instances say "for an instance of <Class>".
-    eq(
-        "begin; \"x\".nope; rescue => e; e.message; end",
-        "\"undefined method 'nope' for an instance of String\"",
+    // Ruby 4.0 message form: instances say "for an instance of <Class>". Each
+    // pins the CLASS as well as the wording: `rescue => e` catches every
+    // StandardError, so a message-only assertion is satisfied by a NameError —
+    // or by any other class — carrying the same sentence.
+    raises(
+        "\"x\".nope",
+        "NoMethodError",
+        "undefined method 'nope' for an instance of String",
     );
-    eq(
-        "begin; 5.nope; rescue => e; e.message; end",
-        "\"undefined method 'nope' for an instance of Integer\"",
+    raises(
+        "5.nope",
+        "NoMethodError",
+        "undefined method 'nope' for an instance of Integer",
     );
-    eq(
-        "begin; [].nope; rescue => e; e.message; end",
-        "\"undefined method 'nope' for an instance of Array\"",
+    raises(
+        "[].nope",
+        "NoMethodError",
+        "undefined method 'nope' for an instance of Array",
     );
     // Range/Set/Enumerator name their own class, not the delegated Array.
-    eq(
-        "begin; (1..2).nope; rescue => e; e.message; end",
-        "\"undefined method 'nope' for an instance of Range\"",
+    raises(
+        "(1..2).nope",
+        "NoMethodError",
+        "undefined method 'nope' for an instance of Range",
     );
-    eq(
-        "begin; [1].each.nope; rescue => e; e.message; end",
-        "\"undefined method 'nope' for an instance of Enumerator\"",
+    raises(
+        "[1].each.nope",
+        "NoMethodError",
+        "undefined method 'nope' for an instance of Enumerator",
     );
     // nil/true/false use the bare-value form (not "an instance of").
-    eq(
-        "begin; nil.nope; rescue => e; e.message; end",
-        "\"undefined method 'nope' for nil\"",
+    raises(
+        "nil.nope",
+        "NoMethodError",
+        "undefined method 'nope' for nil",
     );
-    eq(
-        "begin; true.nope; rescue => e; e.message; end",
-        "\"undefined method 'nope' for true\"",
+    raises(
+        "true.nope",
+        "NoMethodError",
+        "undefined method 'nope' for true",
     );
     // A class/module reference says "for class <Name>".
-    eq(
-        "begin; Integer.nope; rescue => e; e.message; end",
-        "\"undefined method 'nope' for class Integer\"",
+    raises(
+        "Integer.nope",
+        "NoMethodError",
+        "undefined method 'nope' for class Integer",
+    );
+    // A receiverless call names `main`, which the terminal Kernel arm used to
+    // omit entirely.
+    raises(
+        "no_such_top_level(1)",
+        "NoMethodError",
+        "undefined method 'no_such_top_level' for main",
     );
     // The exception class is NoMethodError (rescuable specifically).
     eq(
@@ -3341,8 +3427,16 @@ fn no_panic_on_edge_inputs() {
     eq("{a: 1, b: 2}.merge", "{a: 1, b: 2}");
     eq("{a: 1}.merge({b: 2}, {c: 3})", "{a: 1, b: 2, c: 3}");
     // A required argument omitted raises ArgumentError instead of panicking.
-    assert!(ev("10.gcd").is_err());
-    assert!(ev("10.ceildiv").is_err());
+    raises(
+        "10.gcd",
+        "ArgumentError",
+        "wrong number of arguments (given 0, expected 1)",
+    );
+    raises(
+        "10.ceildiv",
+        "ArgumentError",
+        "wrong number of arguments (given 0, expected 1)",
+    );
     eq(
         "begin; 10.gcd; rescue ArgumentError; :caught; end",
         ":caught",
@@ -3351,7 +3445,11 @@ fn no_panic_on_edge_inputs() {
 
 #[test]
 fn undefined_method_is_an_error() {
-    assert!(ev("no_such_method_here(1)").is_err());
+    raises(
+        "no_such_method_here(1)",
+        "NoMethodError",
+        "undefined method 'no_such_method_here' for main",
+    );
 }
 
 // --- Fanout completion: numeric / Math -------------------------------------
@@ -3516,7 +3614,12 @@ fn find_pattern_two_sided() {
     eq("case [1, 2, 3, 4]; in [*, x, y, *]; [x, y]; end", "[1, 2]");
     eq("case [1, 2, 2, 3]; in [*, 2 => x, *]; x; end", "2");
     // Empty / too-short array does not match a find pattern.
-    assert!(ev("case []; in [*, x, *]; x; end").is_err());
+    // MRI: `[]: [] length mismatch (given 0, expected 1+)` — same gap as above.
+    raises(
+        "case []; in [*, x, *]; x; end",
+        "NoMatchingPatternError",
+        "[]",
+    );
 }
 
 #[test]
@@ -3542,7 +3645,12 @@ fn alternation_binding_and_capture_rejection() {
     // Chained `=>` binds the subject repeatedly.
     eq("case 5; in Integer => a => b; [a, b]; end", "[5, 5]");
     // Variable capture inside an alternation branch is rejected (MRI SyntaxError).
-    assert!(ev("case 5; in a | Integer; :x; end").is_err());
+    // Rejected at PARSE time, so no rescue can see it; MRI rejects it too, with
+    // its own multi-line syntax-error rendering.
+    rejects(
+        "case 5; in a | Integer; :x; end",
+        "line 1: variable capture in alternative pattern",
+    );
 }
 
 // --- Fanout round 2: reserved-word keyword labels --------------------------
@@ -5497,7 +5605,8 @@ fn one_line_pattern_matching() {
         "[\"x\", 5]",
     );
     // A non-matching `=>` raises NoMatchingPatternError.
-    assert!(ev("1 => String").is_err());
+    // MRI: `1: String === 1 does not return true` — same gap as above.
+    raises("1 => String", "NoMatchingPatternError", "1");
     // The `=>` inside a hash literal stays a pair separator (no regression).
     eq("{1 => 2, 3 => 4}", "{1 => 2, 3 => 4}");
     eq("({:a => 1, :b => 2})", "{a: 1, b: 2}");
@@ -5553,7 +5662,11 @@ fn string_unicode_normalize() {
     // `unicode_normalized?` reports whether the string already equals its form.
     eq("\"abc\".unicode_normalized?", "true");
     // An unknown form raises ArgumentError.
-    assert!(ev("\"x\".unicode_normalize(:bogus)").is_err());
+    raises(
+        "\"x\".unicode_normalize(:bogus)",
+        "ArgumentError",
+        "Invalid normalization form bogus.",
+    );
 }
 
 /// `String#b` returns an ASCII-8BIT (BINARY) copy; `#encoding` tracks the tag and

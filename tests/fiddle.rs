@@ -6,10 +6,14 @@
 //! `sqrt` (libm) may not be linked on every host, so its test gates cleanly.
 //!
 //! The gating pattern: each C-call test resolves the symbol inside a `rescue`
-//! and returns the sentinel `"SKIP"` when the symbol is unresolvable, so the
-//! test passes on a stripped/minimal libc rather than failing spuriously. The
-//! pure-Ruby surface (type-code constants, `require`, `Fiddle::Pointer[str]`)
-//! is asserted unconditionally.
+//! and answers the sentinel `:unresolved` when the SYMBOL LOOKUP fails, so the
+//! test passes on a stripped/minimal libc rather than failing spuriously.
+//!
+//! Only the lookup is inside the rescue. Wrapping the whole call in it — which
+//! is what these did — let a broken `Function.new`, a broken `call`, or a
+//! marshalling bug take the skip branch too, so every one of these tests passed
+//! on every host with the feature removed. The pure-Ruby surface (type-code
+//! constants, `require`, `Fiddle::Pointer[str]`) is asserted unconditionally.
 
 use rubylang::eval_to_string as ev;
 
@@ -53,14 +57,15 @@ fn fiddle_strlen() {
         require "fiddle"
         libc = Fiddle.dlopen(nil)
         begin
-          f = Fiddle::Function.new(libc["strlen"], [Fiddle::TYPE_VOIDP], Fiddle::TYPE_SIZE_T)
-          f.call("hello")
+          ptr = libc["strlen"]
         rescue Fiddle::DLError
-          "SKIP"
+          :unresolved
+        else
+          Fiddle::Function.new(ptr, [Fiddle::TYPE_VOIDP], Fiddle::TYPE_SIZE_T).call("hello")
         end
     "#;
     let out = ev(src).expect("eval");
-    assert!(out == "5" || out == "\"SKIP\"", "got {out:?}");
+    assert!(out == "5" || out == ":unresolved", "got {out:?}");
 }
 
 /// Real call: `abs(-7)` → 7. A signed `int` argument and return.
@@ -70,14 +75,15 @@ fn fiddle_abs() {
         require "fiddle"
         libc = Fiddle.dlopen(nil)
         begin
-          abs = Fiddle::Function.new(libc["abs"], [Fiddle::TYPE_INT], Fiddle::TYPE_INT)
-          abs.call(-7)
+          ptr = libc["abs"]
         rescue Fiddle::DLError
-          "SKIP"
+          :unresolved
+        else
+          Fiddle::Function.new(ptr, [Fiddle::TYPE_INT], Fiddle::TYPE_INT).call(-7)
         end
     "#;
     let out = ev(src).expect("eval");
-    assert!(out == "7" || out == "\"SKIP\"", "got {out:?}");
+    assert!(out == "7" || out == ":unresolved", "got {out:?}");
 }
 
 /// Real call: `sqrt(16.0)` → 4.0. A `double` argument and return (gated — libm
@@ -88,14 +94,15 @@ fn fiddle_sqrt_double() {
         require "fiddle"
         libc = Fiddle.dlopen(nil)
         begin
-          sq = Fiddle::Function.new(libc["sqrt"], [Fiddle::TYPE_DOUBLE], Fiddle::TYPE_DOUBLE)
-          sq.call(16.0)
+          ptr = libc["sqrt"]
         rescue Fiddle::DLError
-          "SKIP"
+          :unresolved
+        else
+          Fiddle::Function.new(ptr, [Fiddle::TYPE_DOUBLE], Fiddle::TYPE_DOUBLE).call(16.0)
         end
     "#;
     let out = ev(src).expect("eval");
-    assert!(out == "4.0" || out == "\"SKIP\"", "got {out:?}");
+    assert!(out == "4.0" || out == ":unresolved", "got {out:?}");
 }
 
 /// Real call returning a `char*`: `strdup("world")` returns a `Fiddle::Pointer`,
@@ -106,18 +113,20 @@ fn fiddle_strdup_returns_readable_pointer() {
         require "fiddle"
         libc = Fiddle.dlopen(nil)
         begin
-          sd = Fiddle::Function.new(libc["strdup"], [Fiddle::TYPE_VOIDP], Fiddle::TYPE_VOIDP)
+          ptr = libc["strdup"]
+        rescue Fiddle::DLError
+          :unresolved
+        else
+          sd = Fiddle::Function.new(ptr, [Fiddle::TYPE_VOIDP], Fiddle::TYPE_VOIDP)
           p = sd.call("world")
           r = [p.class.to_s, p.to_s]
           p.free
           r
-        rescue Fiddle::DLError
-          "SKIP"
         end
     "#;
     let out = ev(src).expect("eval");
     assert!(
-        out == r#"["Fiddle::Pointer", "world"]"# || out == "\"SKIP\"",
+        out == r#"["Fiddle::Pointer", "world"]"# || out == ":unresolved",
         "got {out:?}"
     );
 }

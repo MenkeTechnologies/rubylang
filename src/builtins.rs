@@ -15649,7 +15649,16 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
                 o
             }))
         }
-        _ => Err(format!("undefined method '{name}'")),
+        // MRI names the receiver even for a call written without one: a
+        // top-level `no_such(1)` reports `for main`. The bare sentence this used
+        // to end with is one no MRI prints.
+        _ => Err(format!(
+            "undefined method '{name}' for {}",
+            with_host(|h| {
+                let this = h.current_self();
+                h.receiver_phrase(&this)
+            })
+        )),
     }
 }
 
