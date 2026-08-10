@@ -310,23 +310,53 @@ module Gen
   # An unknown keyword separates the two cases: a method that takes keywords
   # complains about the KEYWORD, and one that does not counts the Hash as one more
   # positional and complains about the COUNT. Both counts are asked because a
-  # sentinel is the wrong TYPE for many parameters and a `TypeError` from the
-  # positional half answers nothing — `Integer#round` rejects a sentinel before it
-  # ever looks at keywords.
+  # method can look at keywords at one arity and not another — `Integer#round`
+  # ignores an unknown keyword with no positional and complains about it with one.
   def keywords?(recv, name, min, max)
     return false if max.negative?
     [min, max].uniq.any? { |n| kw_refused?(recv, name, n) }
   end
 
+  # The values tried as positional FILLER, in order. `SENTINEL` is deliberately a
+  # bare Object so that nothing runs a body it understands, but that makes it the
+  # wrong TYPE for a numeric parameter, and a `TypeError` raised while converting
+  # the positional half answers nothing about keywords: the method never reached
+  # them. `Integer#round(SENTINEL, unknown: 1)` raises `no implicit conversion of
+  # Object into Integer` and used to be recorded as taking no keywords, which is
+  # how `1.round(-2, half: :even)` came to be refused as a two-positional call.
+  #
+  # A `TypeError` therefore retries with an Integer, which every arity-shaped
+  # numeric parameter accepts. This can only ever DISCOVER a keyword the sentinel
+  # probe missed: a method that answers "unknown keyword" to one filler answers it
+  # to the other or is not asked again. Widening this column never narrows an
+  # accepted range — it only stops the consuming guard counting a keyword Hash as
+  # a positional — so a wrong answer here costs coverage, never correctness.
+  KW_FILLERS = [SENTINEL, 0].freeze
+
   # Whether `n` positional arguments plus one unknown keyword is refused FOR THE
   # KEYWORD. False for every other outcome, including the call being accepted:
   # a count MRI accepts needs no leniency from the guard.
   def kw_refused?(recv, name, n)
-    recv.__send__(name, *Array.new(n) { SENTINEL }, **{ KW_PROBE => 1 })
+    KW_FILLERS.each do |filler|
+      answer = kw_refused_with?(recv, name, n, filler)
+      return true if answer == true
+      # `nil` means the positional half was refused on TYPE, so the question was
+      # never reached; anything else is a real answer and ends the search.
+      return false unless answer.nil?
+    end
+    false
+  end
+
+  # One probe. `true`/`false` answer the question; `nil` means it was not reached
+  # because the filler was the wrong type for a positional parameter.
+  def kw_refused_with?(recv, name, n, filler)
+    recv.__send__(name, *Array.new(n) { filler }, **{ KW_PROBE => 1 })
     false
   rescue ArgumentError => e
     msg = (e.message rescue nil)
     !msg.nil? && msg.include?("keyword")
+  rescue TypeError
+    nil
   rescue Exception
     false
   end

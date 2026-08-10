@@ -4911,7 +4911,7 @@ pub static BUILTIN_ARG_SHAPES: &[ArgShapeRow] = &[
     ("Integer", "pred", 0, 0, "0", 0, 0, "0", false),
     ("Integer", "rationalize", 0, 1, "0..1", 0, 1, "0..1", false),
     ("Integer", "remainder", 1, 1, "1", 1, 1, "1", false),
-    ("Integer", "round", 0, 1, "0..1", 0, 1, "0..1", false),
+    ("Integer", "round", 0, 1, "0..1", 0, 1, "0..1", true),
     ("Integer", "size", 0, 0, "0", 0, 0, "0", false),
     ("Integer", "succ", 0, 0, "0", 0, 0, "0", false),
     ("Integer", "times", 0, 0, "0", 0, 0, "0", false),
@@ -5507,7 +5507,7 @@ pub static BUILTIN_ARG_SHAPES: &[ArgShapeRow] = &[
     ("Numeric", "rect", 0, 0, "0", 0, 0, "0", false),
     ("Numeric", "rectangular", 0, 0, "0", 0, 0, "0", false),
     ("Numeric", "remainder", 1, 1, "1", 1, 1, "1", false),
-    ("Numeric", "round", 0, 1, "0..1", 0, 1, "0..1", false),
+    ("Numeric", "round", 0, 1, "0..1", 0, 1, "0..1", true),
     (
         "Numeric",
         "singleton_method_added",
