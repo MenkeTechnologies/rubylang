@@ -7385,7 +7385,11 @@ pub fn inspect_string(s: &str) -> String {
             '\u{0c}' => out.push_str("\\f"),
             '\r' => out.push_str("\\r"),
             '\u{1b}' => out.push_str("\\e"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+            // Anything MRI does not consider printable is escaped as `\uXXXX`.
+            // That is the C0 controls and DEL, the C1 controls, and the line and
+            // paragraph separators — a raw U+2028 inside an inspect form would
+            // otherwise break the line it is printed on.
+            c if (c as u32) < 0x20 || matches!(c as u32, 0x7f..=0x9f | 0x2028 | 0x2029) => {
                 out.push_str(&format!("\\u{:04X}", c as u32));
             }
             c => out.push(c),
@@ -8965,7 +8969,7 @@ pub fn fiber_yield(v: Value) -> Result<Value, String> {
         None => {
             return Err(crate::builtins::raise_exc(
                 "FiberError",
-                "can't yield from root fiber",
+                "attempt to yield on a not resumed fiber",
             ))
         }
     };
@@ -8988,7 +8992,7 @@ pub fn fiber_resume(fiber: &Value, v: Value) -> Result<Value, String> {
     if with_fibers(|fibers| fibers[id as usize].done) {
         return Err(crate::builtins::raise_exc(
             "FiberError",
-            "dead fiber called",
+            "attempt to resume a terminated fiber",
         ));
     }
     let mut coro = with_fibers(|fibers| fibers[id as usize].coro.take())
@@ -10211,7 +10215,7 @@ pub fn call_proc_self_ctx(
         Some(RObj::SymProc(s)) => {
             return match args.split_first() {
                 Some((recv, rest)) => crate::builtins::dispatch(recv, &s, rest, None),
-                None => Err("no receiver is available".to_string()),
+                None => Err("no receiver given".to_string()),
             };
         }
         _ => return Err("not a proc".to_string()),

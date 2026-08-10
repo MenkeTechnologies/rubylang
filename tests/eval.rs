@@ -7123,3 +7123,235 @@ fn array_new_copies_an_array_argument_but_still_rejects_a_bad_size() {
         "\"no implicit conversion from nil to integer\"",
     );
 }
+
+/// Every `Kernel#Rational` rejection MRI makes, and the wording it makes it in.
+/// The previous implementation converted through `as_bigint`, so it accepted
+/// only Integers and answered ONE invented sentence — `can't convert to
+/// Rational` — for every other argument, a phrasing MRI never prints. MRI uses
+/// four different classes here, and only the String case names the value:
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p Rational("3/4"); p Rational(1.5)'
+///   (3/4)
+///   (3/2)
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'Rational("x")'
+///   -e:1:in 'Kernel#Rational': invalid value for convert(): "x" (ArgumentError)
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'Rational([])'
+///   -e:1:in 'Kernel#Rational': can't convert Array into Rational (TypeError)
+#[test]
+fn kernel_rational_accepts_what_mri_accepts_and_refuses_in_mris_wording() {
+    // Accepted forms: Integer, Float (exactly), Rational, and the string
+    // grammar — including an exponent, which is exact rather than float-rounded.
+    eq("Rational(3, 4)", "(3/4)");
+    eq("Rational(3)", "(3/1)");
+    eq("Rational(1.5)", "(3/2)");
+    eq("Rational(1.5, 2)", "(3/4)");
+    eq("Rational(3, 1.5)", "(2/1)");
+    eq("Rational(4, -2)", "(-2/1)");
+    eq("Rational(Rational(3, 4), Rational(1, 2))", "(3/2)");
+    eq("Rational(Complex(3, 0))", "(3/1)");
+    eq("Rational(2 ** 70, 3)", "(1180591620717411303424/3)");
+    eq("Rational(\"3/4\")", "(3/4)");
+    eq("Rational(\"2/4\")", "(1/2)");
+    eq("Rational(\"-3/4\")", "(-3/4)");
+    eq("Rational(\"  3/4  \")", "(3/4)");
+    eq("Rational(\"1.5\")", "(3/2)");
+    eq("Rational(\".5\")", "(1/2)");
+    eq("Rational(\"5.\")", "(5/1)");
+    eq("Rational(\"1_0\")", "(10/1)");
+    eq("Rational(\"1e3\")", "(1000/1)");
+    eq("Rational(\"1e-3\")", "(1/1000)");
+    eq("Rational(\"3/4.5\")", "(2/3)");
+
+    // Both halves of every rejection: a test that checked only the message
+    // would pass with the wrong exception class, and one that checked only the
+    // class would pass with an invented sentence.
+    let caught = |src: &str| {
+        format!(
+            "begin; {src}; rescue Exception => e; [e.class.to_s, e.message]; else; :no_raise; end"
+        )
+    };
+    eq(
+        &caught("Rational(\"x\")"),
+        "[\"ArgumentError\", \"invalid value for convert(): \\\"x\\\"\"]",
+    );
+    eq(
+        &caught("Rational(\"3 / 4\")"),
+        "[\"ArgumentError\", \"invalid value for convert(): \\\"3 / 4\\\"\"]",
+    );
+    // A denominator may be a decimal but may not carry a sign.
+    eq(
+        &caught("Rational(\"3/-4\")"),
+        "[\"ArgumentError\", \"invalid value for convert(): \\\"3/-4\\\"\"]",
+    );
+    // An underscore is grouping only between digits.
+    eq(
+        &caught("Rational(\"1__0\")"),
+        "[\"ArgumentError\", \"invalid value for convert(): \\\"1__0\\\"\"]",
+    );
+    eq(
+        &caught("Rational(nil)"),
+        "[\"TypeError\", \"can't convert nil into Rational\"]",
+    );
+    eq(
+        &caught("Rational([])"),
+        "[\"TypeError\", \"can't convert Array into Rational\"]",
+    );
+    eq(
+        &caught("Rational(:a)"),
+        "[\"TypeError\", \"can't convert Symbol into Rational\"]",
+    );
+    eq(
+        &caught("Rational(3, 0)"),
+        "[\"ZeroDivisionError\", \"divided by 0\"]",
+    );
+    eq(
+        &caught("Rational(\"3/0\")"),
+        "[\"ZeroDivisionError\", \"divided by 0\"]",
+    );
+    eq(
+        &caught("Rational(1.0 / 0)"),
+        "[\"FloatDomainError\", \"Infinity\"]",
+    );
+    eq(
+        &caught("Rational(Float::NAN)"),
+        "[\"FloatDomainError\", \"NaN\"]",
+    );
+    eq(
+        &caught("Rational(Complex(3, 1))"),
+        "[\"RangeError\", \"can't convert 3+1i into Rational\"]",
+    );
+}
+
+/// A receiverless `Kernel` conversion had no argument-count check at all, so
+/// `Rational()` indexed `args[0]` on an empty slice and PANICKED the
+/// interpreter where MRI raises a rescuable ArgumentError:
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'Rational()'
+///   -e:1:in 'Kernel#Rational': wrong number of arguments (given 0, expected 1..2) (ArgumentError)
+/// `check_builtin_arity` could not cover these: it is keyed by the receiver's
+/// builtin owner, and these calls have no receiver.
+#[test]
+fn receiverless_kernel_conversions_check_their_argument_count() {
+    let caught = |src: &str| {
+        format!(
+            "begin; {src}; rescue Exception => e; [e.class.to_s, e.message]; else; :no_raise; end"
+        )
+    };
+    for (src, expected) in [
+        ("Rational()", "1..2"),
+        ("Integer()", "1..2"),
+        ("Float()", "1"),
+        ("String()", "1"),
+        ("Array()", "1"),
+        ("Complex()", "1..2"),
+    ] {
+        eq(
+            &caught(src),
+            &format!(
+                "[\"ArgumentError\", \"wrong number of arguments (given 0, expected {expected})\"]"
+            ),
+        );
+    }
+    eq(
+        &caught("Integer(\"1\", 2, 3)"),
+        "[\"ArgumentError\", \"wrong number of arguments (given 3, expected 1..2)\"]",
+    );
+    eq(
+        &caught("Float(\"1\", 2)"),
+        "[\"ArgumentError\", \"wrong number of arguments (given 2, expected 1)\"]",
+    );
+    // `exception: false` is a keyword, so it must not count as a positional —
+    // and it turns each of these rejections into nil rather than a raise.
+    eq("Integer(\"ff\", 16, exception: false)", "255");
+    eq("Integer(\"x\", exception: false)", "nil");
+    eq("Integer(nil, exception: false)", "nil");
+    eq("Float(\"x\", exception: false)", "nil");
+    eq("Rational(\"x\", exception: false)", "nil");
+    eq("Rational(nil, exception: false)", "nil");
+}
+
+/// Ruby's whitespace is not Rust's whitespace, and the two disagree three
+/// different ways. `String#strip` was `str::trim`, whose name matches but whose
+/// character set is the Unicode `White_Space` property:
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p "\u00a0x\u00a0".strip; p "\0x\0".strip'
+///   " x "
+///   "x"
+/// Rust `trim` answered the opposite on both — it removed the NBSP MRI keeps and
+/// kept the NUL MRI removes. The numeric scanners had a third variant: Rust's
+/// `is_ascii_whitespace` omits the vertical tab, so `"\v12".to_i` read 0 where
+/// MRI reads 12.
+#[test]
+fn the_strip_and_scan_character_sets_are_rubys_not_rusts() {
+    // NUL is stripped; every non-ASCII space is kept.
+    eq(r#""\0x\0".strip"#, r#""x""#);
+    eq(r#""\0x".lstrip"#, r#""x""#);
+    eq(r#""x\0".rstrip"#, r#""x""#);
+    eq(r#""\0".strip"#, r#""""#);
+    eq(r#""\u00a0x\u00a0".strip"#, "\"\u{a0}x\u{a0}\"");
+    eq(r#""\u3000x\u3000".strip"#, "\"\u{3000}x\u{3000}\"");
+    eq(r#""\u2028x".lstrip"#, r#""\u2028x""#);
+    eq(r#""\u0085x".lstrip"#, r#""\u0085x""#);
+    // The whole ASCII set, including the vertical tab, still goes.
+    eq(r#""\0\t\n\v\f\r x \0".strip"#, r#""x""#);
+    // `strip!` answers nil only when it changed nothing, so the set drives the
+    // return value too, not just the content.
+    eq(r#""\0x".strip!"#, r#""x""#);
+    eq(r#""\u00a0x".strip!"#, "nil");
+    // Awk-mode split is the same set: an NBSP is a FIELD, not a separator.
+    eq(r#""\u00a0 a b".split(" ")"#, "[\"\u{a0}\", \"a\", \"b\"]");
+    // The numeric scanners skip the vertical tab.
+    eq(r#""\v12".to_i"#, "12");
+    eq(r#""\v1.5".to_f"#, "1.5");
+    eq(r#"Integer("\v12")"#, "12");
+    eq(r#"Float("\v1.5")"#, "1.5");
+    // …and skip nothing outside ASCII, so these are refused rather than read.
+    let caught = |src: &str| {
+        format!(
+            "begin; {src}; rescue Exception => e; [e.class.to_s, e.message]; else; :no_raise; end"
+        )
+    };
+    eq(
+        &caught(r#"Integer("\u00a012")"#),
+        "[\"ArgumentError\", \"invalid value for Integer(): \\\"\u{a0}12\\\"\"]",
+    );
+    eq(
+        &caught(r#"Float("\u30001.5")"#),
+        "[\"ArgumentError\", \"invalid value for Float(): \\\"\u{3000}1.5\\\"\"]",
+    );
+    eq(r#""\u00a03/4".to_r"#, "(0/1)");
+    // A NUL is refused by Float() with its own sentence, before the value is
+    // quoted back.
+    eq(
+        &caught(r#"Float("\0001.5")"#),
+        "[\"ArgumentError\", \"string for Float contains null byte\"]",
+    );
+}
+
+/// `inspect` escapes what MRI cannot print, and the conversion diagnostics quote
+/// through the same function. Two bugs met here: the C1 controls and the line
+/// and paragraph separators were emitted RAW, and `Integer()`/`Float()` quoted
+/// their argument with Rust's `{:?}` — a Debug format that looks like inspect
+/// and is not, spelling U+0085 as `\u{85}` where Ruby spells it `\u0085`.
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p "\u0085"; Integer("\u008512")'
+///   "\u0085"
+///   -e:1:in 'Kernel#Integer': invalid value for Integer(): "\u008512" (ArgumentError)
+#[test]
+fn inspect_escapes_the_unprintables_and_the_diagnostics_use_it() {
+    eq(r#""\u0080""#, r#""\u0080""#);
+    eq(r#""\u0085""#, r#""\u0085""#);
+    eq(r#""\u008a""#, r#""\u008A""#);
+    eq(r#""\u009f""#, r#""\u009F""#);
+    eq(r#""\u2028""#, r#""\u2028""#);
+    eq(r#""\u2029""#, r#""\u2029""#);
+    eq(r#""\x00""#, r#""\u0000""#);
+    eq(r#""\x7f""#, r#""\u007F""#);
+    // Assigned printable characters above ASCII are NOT escaped — an escape-
+    // everything rule would pass the cases above and fail these.
+    eq(r#""\u00a0""#, "\"\u{a0}\"");
+    eq(r#""\u00ff""#, "\"\u{ff}\"");
+    eq(r#""\u3000""#, "\"\u{3000}\"");
+    eq(r#""\ufeff""#, "\"\u{feff}\"");
+    // The diagnostic quotes with Ruby's spelling, not Rust's `\u{85}`.
+    eq(
+        "begin; Integer(\"\\u008512\"); rescue ArgumentError => e; e.message; end",
+        r#""invalid value for Integer(): \"\\u008512\"""#,
+    );
+}

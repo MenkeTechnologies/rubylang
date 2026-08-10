@@ -1055,7 +1055,10 @@ fn b_mkregex(vm: &mut VM, _: u8) -> Value {
 fn b_yield(vm: &mut VM, argc: u8) -> Value {
     let args = pop_n(vm, argc as usize);
     let Some(block) = current_block() else {
-        return abort(vm, "no block given (yield)".into());
+        // MRI raises LocalJumpError here, not RuntimeError — the sibling `catch`
+        // path already did, so only this one answered with the wrong class.
+        let e = raise_exc("LocalJumpError", "no block given (yield)");
+        return abort(vm, e);
     };
     match call_proc(&block, &args) {
         Ok(v) => propagate(vm, v),
@@ -1178,7 +1181,10 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
         if name == "define_method" {
             let mname = name_of(&args[0]);
             let proc = block.or_else(|| args.get(1).cloned()).ok_or_else(|| {
-                raise_exc("ArgumentError", "tried to create method without a block")
+                raise_exc(
+                    "ArgumentError",
+                    "tried to create Proc object without a block",
+                )
             })?;
             with_host(|h| h.add_define_method(&cls, &mname, proc));
             // `define_method` on a singleton class `#<Class:X>` redefines X's class
@@ -1959,12 +1965,14 @@ pub(crate) fn dispatch(
             return Ok(with_host(|h| h.ivar_of(recv, key)));
         }
         "instance_variable_set" => {
-            // A frozen object rejects ivar mutation (MRI raises FrozenError).
+            // A frozen object rejects ivar mutation. MRI names the receiver as
+            // well as its class — `can't modify frozen Integer: 1` — which the
+            // `frozen_guard` sibling path already emitted; this one did not.
             if with_host(|h| h.is_frozen(recv)) {
-                let cls = with_host(|h| h.class_of(recv));
+                let (cls, insp) = with_host(|h| (h.class_of(recv).to_string(), h.inspect(recv)));
                 return Err(raise_exc(
                     "FrozenError",
-                    &format!("can't modify frozen {cls}"),
+                    &format!("can't modify frozen {cls}: {insp}"),
                 ));
             }
             let raw = name_of(&args[0]);
@@ -2357,7 +2365,10 @@ pub(crate) fn dispatch(
                 .clone()
                 .or_else(|| args.get(1).cloned())
                 .ok_or_else(|| {
-                    raise_exc("ArgumentError", "tried to create Proc without a block")
+                    raise_exc(
+                        "ArgumentError",
+                        "tried to create Proc object without a block",
+                    )
                 })?;
             // On a class/module object a singleton method is a *class method*,
             // inherited by subclasses — register it under the class name rather
@@ -2686,7 +2697,7 @@ fn dispatch_classref(
             "stat" | "latest_gc_info" => Ok(with_host(|h| h.new_hash(IndexMap::new()))),
             _ => Err(raise_exc(
                 "NoMethodError",
-                &format!("undefined method '{name}' for GC:Module"),
+                &format!("undefined method '{name}' for module GC"),
             )),
         };
     }
@@ -2709,7 +2720,7 @@ fn dispatch_classref(
             _ => {
                 return Err(raise_exc(
                     "NoMethodError",
-                    &format!("undefined method '{name}' for ObjectSpace:Module"),
+                    &format!("undefined method '{name}' for module ObjectSpace"),
                 ))
             }
         }
@@ -2794,7 +2805,7 @@ fn dispatch_classref(
             "new_seed" => Ok(Value::Int((rng_next() >> 1) as i64)),
             _ => Err(raise_exc(
                 "NoMethodError",
-                &format!("undefined method '{name}' for Random"),
+                &format!("undefined method '{name}' for class Random"),
             )),
         };
     }
@@ -2974,7 +2985,7 @@ fn dispatch_classref(
         let b = block.ok_or_else(|| {
             raise_exc(
                 "ArgumentError",
-                "tried to create Enumerator without a block",
+                "tried to create Proc object without a block",
             )
         })?;
         return Ok(with_host(|h| h.new_generator(b)));
@@ -2985,7 +2996,10 @@ fn dispatch_classref(
         match name {
             "new" => {
                 let b = block.ok_or_else(|| {
-                    raise_exc("ArgumentError", "tried to create a Fiber without a block")
+                    raise_exc(
+                        "ArgumentError",
+                        "tried to create Proc object without a block",
+                    )
                 })?;
                 return Ok(crate::host::new_fiber(b));
             }
@@ -3478,7 +3492,7 @@ fn dispatch_classref(
         // Without this it fell through to the generic `new` and produced a plain
         // object of class Proc, which has no `call`.
         "new" if cls == "Proc" => {
-            block.ok_or_else(|| String::from("tried to create Proc without a block"))
+            block.ok_or_else(|| String::from("tried to create Proc object without a block"))
         }
         "new" => {
             // `Class.new([Super]) { body }` / `Module.new { body }` — an anonymous
@@ -3965,7 +3979,10 @@ fn dispatch_classref(
         "define_method" => {
             let mname = name_of(&args[0]);
             let proc = block.or_else(|| args.get(1).cloned()).ok_or_else(|| {
-                raise_exc("ArgumentError", "tried to create method without a block")
+                raise_exc(
+                    "ArgumentError",
+                    "tried to create Proc object without a block",
+                )
             })?;
             with_host(|h| h.add_define_method(cls, &mname, proc));
             // Defining a method on a singleton class `#<Class:X>` is a class-method
@@ -4968,10 +4985,13 @@ fn simplest_rational_within(f: f64, eps: f64) -> num_rational::BigRational {
 fn string_to_rational(s: &str) -> num_rational::BigRational {
     use num_bigint::BigInt;
     let zero = || num_rational::BigRational::from(BigInt::from(0));
-    let s = s.trim_start();
+    let s = s.trim_start_matches(RUBY_SPACE);
     // `numerator/denominator` form.
     if let Some((n, d)) = s.split_once('/') {
-        if let (Ok(n), Ok(d)) = (n.trim().parse::<BigInt>(), d.trim().parse::<BigInt>()) {
+        if let (Ok(n), Ok(d)) = (
+            n.trim_matches(RUBY_SPACE).parse::<BigInt>(),
+            d.trim_matches(RUBY_SPACE).parse::<BigInt>(),
+        ) {
             if d != BigInt::from(0) {
                 return num_rational::BigRational::new(n, d);
             }
@@ -5006,6 +5026,200 @@ fn string_to_rational(s: &str) -> num_rational::BigRational {
             num_rational::BigRational::new(num, den)
         }
         Err(_) => zero(),
+    }
+}
+
+/// The characters Ruby strips as whitespace. This is a FIXED ASCII set plus NUL,
+/// not Rust's `char::is_whitespace`, which is the Unicode set: Rust would strip
+/// NBSP, U+2028 and the ideographic space (all of which MRI keeps) and would
+/// keep the NUL that MRI removes.
+pub(crate) const RUBY_STRIP: &[char] = &['\0', ' ', '\t', '\n', '\x0b', '\x0c', '\r'];
+
+/// The characters Ruby's numeric parsers skip around a number. NUL is NOT one of
+/// them — `Integer("\0" + "12")` is refused, not parsed as 12.
+pub(crate) const RUBY_SPACE: &[char] = &[' ', '\t', '\n', '\x0b', '\x0c', '\r'];
+
+/// C `isspace` in the C locale, which is the set MRI's numeric scanners skip.
+///
+/// Rust's `is_ascii_whitespace` is a DIFFERENT set with the same name: it omits
+/// the vertical tab. `"\v12".to_i` therefore read as 0 where MRI reads 12.
+pub(crate) fn is_ruby_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// Why a `Kernel#Rational` string argument was refused. MRI answers with two
+/// different classes and only one of them mentions the string.
+enum RatParse {
+    Ok(num_rational::BigRational),
+    Invalid,
+    DivZero,
+}
+
+/// Strict `Kernel#Rational` string parse, which is a narrower grammar than
+/// `String#to_r`: `to_r` takes the leading numeric run and answers `0/1` for
+/// anything else, while `Rational()` must consume the WHOLE string.
+///
+/// Accepted: surrounding ASCII whitespace, an optional sign, then either a
+/// decimal (`3`, `.5`, `5.`, `1.5e2`, digit-grouping underscores) or a
+/// `numerator/denominator` pair whose denominator may itself be a decimal but
+/// may NOT carry a sign — `Rational("3/-4")` is refused by MRI.
+fn parse_rational_strict(s: &str) -> RatParse {
+    use num_bigint::BigInt;
+    use num_traits::Zero as _;
+    let body = s.trim_matches(RUBY_SPACE);
+    let mut parts = body.splitn(2, '/');
+    let num_src = parts.next().unwrap_or("");
+    let den_src = parts.next();
+    // A second `/` is not part of the grammar: `Rational("3/4/5")` is refused.
+    if den_src.is_some_and(|d| d.contains('/')) {
+        return RatParse::Invalid;
+    }
+    let Some(num) = parse_decimal_exact(num_src, true) else {
+        return RatParse::Invalid;
+    };
+    let den = match den_src {
+        Some(d) => match parse_decimal_exact(d, false) {
+            Some(v) => v,
+            None => return RatParse::Invalid,
+        },
+        None => num_rational::BigRational::from(BigInt::from(1)),
+    };
+    if den.is_zero() {
+        return RatParse::DivZero;
+    }
+    RatParse::Ok(num / den)
+}
+
+/// One `[sign] digits[.digits][e[sign]digits]` decimal, parsed EXACTLY as a
+/// rational (so `1e400` is a whole number, not a saturated float). `None` unless
+/// the entire slice is consumed and it holds at least one digit. `allow_sign` is
+/// false for a denominator, which MRI does not let carry one.
+fn parse_decimal_exact(s: &str, allow_sign: bool) -> Option<num_rational::BigRational> {
+    use num_bigint::BigInt;
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut neg = false;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        if !allow_sign {
+            return None;
+        }
+        neg = b[i] == b'-';
+        i += 1;
+    }
+    // `digits` collects the mantissa with the decimal point removed; `scale`
+    // counts how many of them sit after the point.
+    let mut digits = String::new();
+    let mut scale = 0i64;
+    let take_digits = |i: &mut usize, into: &mut String| -> usize {
+        let start = *i;
+        while *i < b.len() {
+            if b[*i].is_ascii_digit() {
+                into.push(b[*i] as char);
+                *i += 1;
+            } else if b[*i] == b'_' {
+                // An underscore is only grouping when it sits between digits.
+                let ok = *i > start
+                    && b[*i - 1].is_ascii_digit()
+                    && b.get(*i + 1).is_some_and(u8::is_ascii_digit);
+                if !ok {
+                    break;
+                }
+                *i += 1;
+            } else {
+                break;
+            }
+        }
+        into.len()
+    };
+    let int_len = take_digits(&mut i, &mut digits);
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        let before = digits.len();
+        take_digits(&mut i, &mut digits);
+        scale = (digits.len() - before) as i64;
+    }
+    if digits.is_empty() {
+        return None;
+    }
+    let _ = int_len;
+    if i < b.len() && (b[i] | 0x20) == b'e' {
+        i += 1;
+        let mut eneg = false;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            eneg = b[i] == b'-';
+            i += 1;
+        }
+        let mut exp_digits = String::new();
+        take_digits(&mut i, &mut exp_digits);
+        let exp: i64 = exp_digits.parse().ok()?;
+        scale += if eneg { exp } else { -exp };
+    }
+    if i != b.len() {
+        return None;
+    }
+    let mut num: BigInt = digits.parse().ok()?;
+    if neg {
+        num = -num;
+    }
+    let pow = |n: i64| BigInt::from(10).pow(n.unsigned_abs() as u32);
+    Some(if scale > 0 {
+        num_rational::BigRational::new(num, pow(scale))
+    } else {
+        num_rational::BigRational::from(num * pow(scale))
+    })
+}
+
+/// One `Kernel#Rational` argument, converted the way MRI converts it. Every
+/// rejection below was measured against the reference interpreter: the class
+/// differs per rejected type, and only the String case names the value.
+fn rational_arg(v: &Value) -> Result<num_rational::BigRational, String> {
+    // `as_rational` already covers both Integer flavours and Rational itself.
+    if let Some(r) = with_host(|h| h.as_rational(v)) {
+        return Ok(r);
+    }
+    match v {
+        Value::Float(f) => {
+            if f.is_nan() {
+                return Err(raise_exc("FloatDomainError", "NaN"));
+            }
+            if f.is_infinite() {
+                let s = if *f > 0.0 { "Infinity" } else { "-Infinity" };
+                return Err(raise_exc("FloatDomainError", s));
+            }
+            num_rational::BigRational::from_float(*f)
+                .ok_or_else(|| raise_exc("FloatDomainError", "NaN"))
+        }
+        _ => {
+            if let Some(s) = with_host(|h| h.as_str(v)) {
+                return match parse_rational_strict(&s) {
+                    RatParse::Ok(r) => Ok(r),
+                    RatParse::DivZero => Err(raise_exc("ZeroDivisionError", "divided by 0")),
+                    RatParse::Invalid => Err(raise_exc(
+                        "ArgumentError",
+                        &format!(
+                            "invalid value for convert(): {}",
+                            crate::host::inspect_string(&s)
+                        ),
+                    )),
+                };
+            }
+            // A Complex is convertible only when it is really a real number;
+            // MRI names the value rather than the class for that one.
+            if let Some((re, im)) = with_host(|h| h.complex_parts(v)) {
+                if as_f(&im) == 0.0 {
+                    return rational_arg(&re);
+                }
+                let shown = with_host(|h| h.to_s(v));
+                return Err(raise_exc(
+                    "RangeError",
+                    &format!("can't convert {shown} into Rational"),
+                ));
+            }
+            Err(raise_exc(
+                "TypeError",
+                &format!("can't convert {} into Rational", type_name_for(v)),
+            ))
+        }
     }
 }
 
@@ -6444,9 +6658,14 @@ fn dispatch_string(
             Ok(new_str(out))
         }
         "reverse" => Ok(new_str(s.chars().rev().collect())),
-        "strip" => Ok(new_str(s.trim().to_string())),
-        "lstrip" => Ok(new_str(s.trim_start().to_string())),
-        "rstrip" => Ok(new_str(s.trim_end().to_string())),
+        // Ruby's strip set is FIXED — the ASCII whitespace characters plus NUL —
+        // and is not Rust's `trim`, which is the Unicode `White_Space` property.
+        // The two names describe different operations: `trim` removed NBSP,
+        // U+2028 and the ideographic space, which MRI keeps, and kept the NUL,
+        // which MRI removes.
+        "strip" => Ok(new_str(s.trim_matches(RUBY_STRIP).to_string())),
+        "lstrip" => Ok(new_str(s.trim_start_matches(RUBY_STRIP).to_string())),
+        "rstrip" => Ok(new_str(s.trim_end_matches(RUBY_STRIP).to_string())),
         "chomp" => {
             let out = match args.first() {
                 Some(a) => {
@@ -6830,10 +7049,13 @@ fn dispatch_string(
             let parts: Vec<String> = if awk {
                 if limit > 0 {
                     // Keep at most `limit` fields; the last holds the remainder.
-                    let trimmed = s.trim_start();
+                    let trimmed = s.trim_start_matches(RUBY_SPACE);
                     split_ws_limit(trimmed, limit as usize)
                 } else {
-                    s.split_whitespace().map(str::to_string).collect()
+                    s.split(RUBY_SPACE)
+                        .filter(|f| !f.is_empty())
+                        .map(str::to_string)
+                        .collect()
                 }
             } else if let Some(re) = str_regex(&args[0]) {
                 regex_split(&re, &s, limit)
@@ -7379,10 +7601,10 @@ fn split_ws_limit(s: &str, limit: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = s;
     while out.len() + 1 < limit {
-        match rest.find(char::is_whitespace) {
+        match rest.find(RUBY_SPACE) {
             Some(i) => {
                 out.push(rest[..i].to_string());
-                rest = rest[i..].trim_start();
+                rest = rest[i..].trim_start_matches(RUBY_SPACE);
             }
             None => break,
         }
@@ -8774,7 +8996,14 @@ fn dispatch_array(
                     Some(b) => call_proc(b, &[Value::Int(raw)]),
                     None => Err(raise_exc(
                         "IndexError",
-                        &format!("index {raw} outside of array bounds: -{len}...{len}"),
+                        // MRI prints the bounds as two signed integers, so an
+                        // EMPTY array reads `0...0` — writing the minus sign as
+                        // literal text made it `-0...0`, a number MRI never
+                        // prints.
+                        &format!(
+                            "index {raw} outside of array bounds: {}...{len}",
+                            -(len as i64)
+                        ),
                     )),
                 },
             }
@@ -13622,6 +13851,9 @@ fn dispatch_range(
             // Ruby (`(1..2).step(0.5)` → `[1.0, 1.5, 2.0]`).
             if matches!(args.first(), Some(Value::Float(_))) {
                 let by = as_f(&args[0]);
+                if by == 0.0 {
+                    return Err(raise_exc("ArgumentError", "step can't be 0"));
+                }
                 let vals = float_range_step(lo as f64, hi as f64, excl, by);
                 return match block {
                     Some(b) => {
@@ -13637,10 +13869,18 @@ fn dispatch_range(
                 };
             }
             let n = as_i(&args[0]);
-            if n <= 0 {
-                return Err(raise_exc("ArgumentError", "step can't be negative"));
+            // Only a ZERO step is refused. A negative step over an ascending
+            // range simply produces nothing — the older `step can't be negative`
+            // wording was applied to both, so `step(0)` reported the wrong
+            // reason and `step(-1)` raised where MRI answers `[]`.
+            if n == 0 {
+                return Err(raise_exc("ArgumentError", "step can't be 0"));
             }
-            let vals: Vec<Value> = (lo..end).step_by(n as usize).map(Value::Int).collect();
+            let vals: Vec<Value> = if n < 0 {
+                Vec::new()
+            } else {
+                (lo..end).step_by(n as usize).map(Value::Int).collect()
+            };
             if let Some(b) = &block {
                 for v in vals {
                     call_proc(b, &[v])?;
@@ -14062,7 +14302,7 @@ fn dispatch_proc(
         return match name {
             "call" | "()" | "[]" | "yield" => {
                 if args.is_empty() {
-                    Err(raise_exc("ArgumentError", "no receiver is available"))
+                    Err(raise_exc("ArgumentError", "no receiver given"))
                 } else {
                     dispatch(&args[0], &sym, &args[1..], None)
                 }
@@ -14534,7 +14774,7 @@ fn strip_underscores(s: &str, base: i64) -> Option<String> {
 /// prefix (0x/0b/0o/0d) or a bare leading `0` (octal); an explicit base in
 /// 2..=36 must agree with any prefix present. Returns `None` on invalid input.
 fn ruby_integer_str(input: &str, base: i64) -> Option<i64> {
-    let s = input.trim();
+    let s = input.trim_matches(RUBY_SPACE);
     let bytes = s.as_bytes();
     if bytes.is_empty() {
         return None;
@@ -14583,7 +14823,7 @@ fn ruby_integer_str(input: &str, base: i64) -> Option<i64> {
 /// underscores and `.5`/`5.` forms) or a C99 hex float (`0x1.8p3`). Unlike
 /// Rust's `f64::from_str`, this rejects `inf`/`nan`/`Infinity`. `None` if invalid.
 fn ruby_float_str(input: &str) -> Option<f64> {
-    let s = input.trim();
+    let s = input.trim_matches(RUBY_SPACE);
     if s.is_empty() {
         return None;
     }
@@ -14641,7 +14881,87 @@ fn parse_hex_float(s: &str) -> Option<f64> {
     Some(val * 2f64.powi(exp))
 }
 
+/// The same argument-count check [`check_builtin_arity`] applies to a method
+/// call, applied to a RECEIVERLESS `Kernel` call.
+///
+/// `check_builtin_arity` is keyed by `builtin_owner(recv, name)`, and a bare
+/// `Rational()` has no receiver to key on, so the whole `Kernel` conversion
+/// surface reached its body unchecked and indexed `args[0]` on an empty slice —
+/// an interpreter panic where MRI raises a rescuable `ArgumentError`.
+fn check_kernel_arity(name: &str, args: &[Value]) -> Result<(), String> {
+    let Some((min, max, expected, .., keywords)) = crate::arity_table::arg_shape("Kernel", name)
+    else {
+        return Ok(());
+    };
+    if min < 0 || expected.is_empty() {
+        return Ok(());
+    }
+    let given = args.len() as i16;
+    let fits = |n: i16| n >= min && (max < 0 || n <= max);
+    if fits(given) {
+        return Ok(());
+    }
+    // Keyword arguments arrive as one trailing Hash positional, so they must not
+    // count against a maximum measured without them.
+    if keywords
+        && given > 0
+        && with_host(|h| h.as_hash(args.last().unwrap()).is_some())
+        && fits(given - 1)
+    {
+        return Ok(());
+    }
+    Err(raise_exc(
+        "ArgumentError",
+        &format!("wrong number of arguments (given {given}, expected {expected})"),
+    ))
+}
+
+/// `Integer(…, exception: false)` and friends answer `nil` instead of raising.
+/// Returns the argument list with the keyword Hash removed, and whether the
+/// caller opted out. A Hash that is a real positional argument — `Hash({})` —
+/// has no `exception` key, so it is left alone.
+fn split_exception_kwarg(args: &[Value]) -> (Vec<Value>, bool) {
+    let Some(last) = args.last() else {
+        return (args.to_vec(), true);
+    };
+    let Some(map) = with_host(|h| h.as_hash(last)) else {
+        return (args.to_vec(), true);
+    };
+    match map.get(&crate::host::RKey::Sym("exception".into())) {
+        Some(v) => (args[..args.len() - 1].to_vec(), with_host(|h| h.truthy(v))),
+        None => (args.to_vec(), true),
+    }
+}
+
 fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, String> {
+    // Only the conversion functions are gated: they are the arms that index
+    // `args[0]` unconditionally, and the rest of this surface is reached by
+    // internal callers whose argument lists are not the user's.
+    if matches!(
+        name,
+        "Integer" | "Float" | "Rational" | "Complex" | "String" | "Array" | "Hash"
+    ) {
+        check_kernel_arity(name, args)?;
+        let (rest, raising) = split_exception_kwarg(args);
+        if !raising {
+            // Drop the pending exception object too: `exception: false` means the
+            // failure never happened, so nothing may be left for a later `raise`.
+            return match kernel_convert(name, &rest, block) {
+                Ok(v) => Ok(v),
+                Err(_) => {
+                    with_host(|h| h.take_pending_exc());
+                    Ok(Value::Undef)
+                }
+            };
+        }
+        if rest.len() != args.len() {
+            return kernel_convert(name, &rest, block);
+        }
+    }
+    kernel_convert(name, args, block)
+}
+
+fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, String> {
     match name {
         // `eval("code")` — compile and run the string on the current host in the
         // current self/scope; definitions it makes persist. (Only the top-level /
@@ -14853,7 +15173,10 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
                             Some(n) => Ok(Value::Int(n)),
                             None => Err(raise_exc(
                                 "ArgumentError",
-                                &format!("invalid value for Integer(): {s:?}"),
+                                &format!(
+                                    "invalid value for Integer(): {}",
+                                    crate::host::inspect_string(&s)
+                                ),
                             )),
                         }
                     }
@@ -14870,9 +15193,18 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             _ => match with_host(|h| h.as_str(&args[0])) {
                 Some(s) => match ruby_float_str(&s) {
                     Some(f) => Ok(Value::Float(f)),
+                    // An embedded NUL is refused BEFORE the value is described:
+                    // MRI does not quote a string it will not read.
+                    None if s.contains('\0') => Err(raise_exc(
+                        "ArgumentError",
+                        "string for Float contains null byte",
+                    )),
                     None => Err(raise_exc(
                         "ArgumentError",
-                        &format!("invalid value for Float(): {s:?}"),
+                        &format!(
+                            "invalid value for Float(): {}",
+                            crate::host::inspect_string(&s)
+                        ),
                     )),
                 },
                 None => Err(raise_exc(
@@ -14882,19 +15214,16 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             },
         },
         "Rational" => {
-            let num = with_host(|h| h.as_bigint(&args[0]))
-                .ok_or_else(|| raise_exc("TypeError", "can't convert to Rational"))?;
+            let num = rational_arg(&args[0])?;
             let den = match args.get(1) {
-                Some(d) => with_host(|h| h.as_bigint(d))
-                    .ok_or_else(|| raise_exc("TypeError", "can't convert to Rational"))?,
-                None => num_bigint::BigInt::from(1),
+                Some(d) => rational_arg(d)?,
+                None => num_rational::BigRational::from(num_bigint::BigInt::from(1)),
             };
             use num_traits::Zero as _;
             if den.is_zero() {
                 return Err(raise_exc("ZeroDivisionError", "divided by 0"));
             }
-            let r = num_rational::BigRational::new(num, den);
-            Ok(with_host(|h| h.new_rational(r)))
+            Ok(with_host(|h| h.new_rational(num / den)))
         }
         "Complex" => {
             let re = args.first().cloned().unwrap_or(Value::Int(0));
@@ -14988,9 +15317,10 @@ fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, Str
             with_host(|h| h.set_global("_", line.clone()));
             Ok(line)
         }
-        "proc" => block.ok_or_else(|| "tried to create Proc without a block".into()),
+        "proc" => block.ok_or_else(|| "tried to create Proc object without a block".into()),
         "lambda" => {
-            let b = block.ok_or_else(|| String::from("tried to create Proc without a block"))?;
+            let b =
+                block.ok_or_else(|| String::from("tried to create Proc object without a block"))?;
             with_host(|h| h.set_proc_lambda(&b));
             Ok(b)
         }
@@ -15744,7 +16074,7 @@ fn zlib_inflate(data: &[u8]) -> Result<Vec<u8>, String> {
     let mut dec = ZlibDecoder::new(data);
     let mut out = Vec::new();
     dec.read_to_end(&mut out)
-        .map_err(|_| raise_exc("Zlib::DataError", "invalid zlib stream"))?;
+        .map_err(|_| raise_exc("Zlib::DataError", "incorrect header check"))?;
     Ok(out)
 }
 
@@ -15952,7 +16282,7 @@ fn dispatch_secure_random(name: &str, args: &[Value]) -> Result<Value, String> {
         }
         _ => Err(raise_exc(
             "NoMethodError",
-            &format!("undefined method '{name}' for SecureRandom"),
+            &format!("undefined method '{name}' for module SecureRandom"),
         )),
     }
 }
@@ -17700,7 +18030,7 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
             other => {
                 return Err(raise_exc(
                     "ArgumentError",
-                    &format!("unsupported pack directive '{other}'"),
+                    &format!("unknown pack directive '{other}' in '{fmt}'"),
                 ))
             }
         }
@@ -17894,7 +18224,7 @@ fn unpack_bytes(bytes: &[u8], fmt: &str) -> Result<Vec<Value>, String> {
             other => {
                 return Err(raise_exc(
                     "ArgumentError",
-                    &format!("unsupported unpack directive '{other}'"),
+                    &format!("unknown unpack directive '{other}' in '{fmt}'"),
                 ))
             }
         }
@@ -18620,7 +18950,7 @@ fn scan_int(s: &str, base: i64) -> Option<(i64, usize)> {
     let bytes = s.as_bytes();
     let n = bytes.len();
     let mut i = 0;
-    while i < n && (bytes[i] as char).is_ascii_whitespace() {
+    while i < n && is_ruby_space(bytes[i]) {
         i += 1;
     }
     let mut neg = false;
@@ -18699,7 +19029,7 @@ fn scan_int_value(s: &str, base: i64) -> Option<Value> {
     let (_, end) = scan_int(s, base)?;
     let bytes = s.as_bytes();
     let mut i = 0;
-    while i < end && (bytes[i] as char).is_ascii_whitespace() {
+    while i < end && is_ruby_space(bytes[i]) {
         i += 1;
     }
     let neg = i < end && bytes[i] == b'-';
@@ -18742,7 +19072,7 @@ fn scan_int_value(s: &str, base: i64) -> Option<Value> {
 fn has_radix_prefix(s: &str) -> bool {
     let b = s.as_bytes();
     let mut i = 0;
-    while i < b.len() && (b[i] as char).is_ascii_whitespace() {
+    while i < b.len() && is_ruby_space(b[i]) {
         i += 1;
     }
     if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
@@ -18787,7 +19117,7 @@ fn take_digit_run(b: &[u8], i: &mut usize, out: &mut String) -> bool {
 fn parse_leading_float(s: &str) -> f64 {
     let b = s.as_bytes();
     let mut i = 0;
-    while i < b.len() && b[i].is_ascii_whitespace() {
+    while i < b.len() && is_ruby_space(b[i]) {
         i += 1;
     }
     // With `badcheck` off MRI refuses a hex float outright rather than reading
