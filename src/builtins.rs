@@ -8875,15 +8875,43 @@ fn dispatch_array(
         },
         // Set-like operators: `&` intersection (deduped), `|` union (deduped),
         // `-` difference. `-` also arrives via the native path (num_op).
-        "&" | "intersection" | "|" | "union" | "-" | "difference" if !args.is_empty() => {
-            let other = with_host(|h| h.as_array(&args[0]).unwrap_or_default());
-            let has = set_member;
+        // Set-like operators: `&` intersection (deduped), `|` union (deduped),
+        // `-` difference. `-` also arrives via the native path (num_op).
+        //
+        // The named forms are VARIADIC where the operators are binary:
+        // `intersection`, `union` and `difference` each take any number of
+        // arrays and fold over all of them. Only `args[0]` used to be read, so
+        // `[1,2,3].intersection([2,3],[3])` answered `[2, 3]` instead of `[3]`
+        // and `[1,2,3].difference([1],[2])` answered `[2, 3]` instead of `[3]`
+        // — every argument past the first was silently discarded.
+        "&" | "intersection" | "|" | "union" | "-" | "difference" => {
+            // `arr.intersection` and `arr.union` with NO argument are legal and
+            // answer the receiver (deduped); the operators always take one.
+            if args.is_empty() && matches!(name, "&" | "|" | "-") {
+                return Err(no_method_error(recv, name));
+            }
+            let others: Vec<Vec<Value>> = args
+                .iter()
+                .map(|a| with_host(|h| h.as_array(a).unwrap_or_default()))
+                .collect();
             let out = match name {
-                "&" | "intersection" => {
-                    dedup_keep(arr.iter().filter(|v| has(&other, v)).cloned().collect())
-                }
-                "-" | "difference" => arr.iter().filter(|v| !has(&other, v)).cloned().collect(),
-                _ => dedup_keep(arr.iter().chain(other.iter()).cloned().collect()),
+                "&" | "intersection" => dedup_keep(
+                    arr.iter()
+                        .filter(|v| others.iter().all(|o| set_member(o, v)))
+                        .cloned()
+                        .collect(),
+                ),
+                "-" | "difference" => arr
+                    .iter()
+                    .filter(|v| !others.iter().any(|o| set_member(o, v)))
+                    .cloned()
+                    .collect(),
+                _ => dedup_keep(
+                    arr.iter()
+                        .chain(others.iter().flatten())
+                        .cloned()
+                        .collect(),
+                ),
             };
             Ok(new_arr(out))
         }
@@ -8903,21 +8931,38 @@ fn dispatch_array(
             with_host(|h| h.set_array(recv, a));
             Ok(recv.clone())
         }
-        "pop" => {
+        // `pop`/`shift` take an optional COUNT, and the count changes the return
+        // type: bare, they answer the single element (or nil when empty); with
+        // a count they answer an Array of up to that many, clamped to the
+        // length. The count used to be ignored entirely, so `[1,2,3].pop(2)`
+        // answered `3` and removed one element where MRI answers `[2, 3]` and
+        // removes two — a wrong value AND a wrong mutation.
+        "pop" | "shift" => {
             let mut a = arr;
-            let v = a.pop().unwrap_or(Value::Undef);
-            with_host(|h| h.set_array(recv, a));
-            Ok(v)
-        }
-        "shift" => {
-            let mut a = arr;
-            let v = if a.is_empty() {
-                Value::Undef
+            let from_front = name == "shift";
+            let Some(n) = args.first() else {
+                let v = if a.is_empty() {
+                    Value::Undef
+                } else if from_front {
+                    a.remove(0)
+                } else {
+                    a.pop().unwrap()
+                };
+                with_host(|h| h.set_array(recv, a));
+                return Ok(v);
+            };
+            let n = as_i(n);
+            if n < 0 {
+                return Err(raise_exc("ArgumentError", "negative array size"));
+            }
+            let n = (n as usize).min(a.len());
+            let taken: Vec<Value> = if from_front {
+                a.drain(..n).collect()
             } else {
-                a.remove(0)
+                a.split_off(a.len() - n)
             };
             with_host(|h| h.set_array(recv, a));
-            Ok(v)
+            Ok(new_arr(taken))
         }
         "unshift" | "prepend" => {
             let mut a = arr;
@@ -9233,10 +9278,42 @@ fn dispatch_array(
             // sorting and keeps the FIRST of a tie, so `max` has to sort
             // DESCENDING there — reading an ascending sort backwards kept the
             // last, and `[1, 1r].max(1)` answered `[(1/1)]`.
-            if let Some(n) = args.first().filter(|_| block.is_none()) {
+            if let Some(n) = args.first() {
                 // MRI names the offending value here, unlike the other size
                 // diagnostics: `negative size (-1)`.
                 let k = checked_size(n, 0, &format!("negative size ({})", as_i(n)))?.min(arr.len());
+                // `min(n) { |a, b| … }` / `max(n) { … }` rank with the block as
+                // the comparator and still answer n elements. The count used to
+                // be honoured only WITHOUT a block, so the block form fell
+                // through to the single-extreme scan below and answered a
+                // scalar: `[3,1,2,4].min(3) { |a,b| (a%2)<=>(b%2) }` was `2`.
+                if let Some(bl) = &block {
+                    let mut sorted = arr.clone();
+                    let mut err: Option<String> = None;
+                    sorted.sort_by(|a, c| {
+                        if err.is_some() {
+                            return std::cmp::Ordering::Equal;
+                        }
+                        // `max` sorts descending outright: reversing an
+                        // ascending sort would flip the tied elements too.
+                        let (l, r) = if want_max { (c, a) } else { (a, c) };
+                        match call_proc(bl, &[l.clone(), r.clone()]) {
+                            Ok(Value::Undef) => {
+                                err = Some(cmp_error(l, r));
+                                std::cmp::Ordering::Equal
+                            }
+                            Ok(v) => as_i(&v).cmp(&0),
+                            Err(e) => {
+                                err = Some(e);
+                                std::cmp::Ordering::Equal
+                            }
+                        }
+                    });
+                    if let Some(e) = err {
+                        return Err(e);
+                    }
+                    return Ok(new_arr(sorted.into_iter().take(k).collect()));
+                }
                 let sorted = if want_max && k >= arr.len() {
                     let mut s = sort_values(&arr, CmpOrder::Reversed, false)?;
                     s.reverse();
@@ -9708,7 +9785,9 @@ fn dispatch_array(
             }
             Ok(acc)
         }
-        "min_by" | "max_by" | "sort_by" | "minmax_by" => sort_by_family(recv, name, &arr, &block),
+        "min_by" | "max_by" | "sort_by" | "minmax_by" => {
+            sort_by_family(recv, name, &arr, &block, args)
+        }
         "[]" => arr_index(&arr, args),
         "fetch" => {
             let len = arr.len();
@@ -10371,6 +10450,7 @@ fn sort_by_family(
     name: &str,
     arr: &[Value],
     block: &Option<Value>,
+    args: &[Value],
 ) -> Result<Value, String> {
     let Some(b) = block else {
         return Ok(recv.clone());
@@ -10401,6 +10481,42 @@ fn sort_by_family(
         }
         Ok(bv)
     };
+    // `min_by(n)`/`max_by(n)` answer the n extreme ELEMENTS as an Array rather
+    // than the single extreme: n smallest ascending by key, or n largest
+    // descending by key, clamped to the length. The count was ignored, so
+    // `[1,2,3].max_by(2) { |x| -x }` answered the scalar `1` instead of
+    // `[1, 2]`.
+    if matches!(name, "min_by" | "max_by") {
+        if let Some(n) = args.first() {
+            let n = as_i(n);
+            if n < 0 {
+                return Err(raise_exc("ArgumentError", "negative size"));
+            }
+            let mut bad: Option<(Value, Value)> = None;
+            // A stable sort keeps ties in SOURCE order, which is what decides
+            // which of two equal-keyed elements is reported. `max_by` therefore
+            // has to sort descending outright rather than sort ascending and
+            // reverse — reversing flips the tied elements too, so
+            // `[1,1,2].max_by(2) { 0 }` came back `[2, 1]` where MRI says
+            // `[1, 1]`.
+            let descending = name == "max_by";
+            keyed.sort_by(|a, c| {
+                let (l, r) = if descending { (&c.0, &a.0) } else { (&a.0, &c.0) };
+                match cmp_values(l, r) {
+                    Some(o) => o,
+                    None => {
+                        bad.get_or_insert_with(|| (a.0.clone(), c.0.clone()));
+                        std::cmp::Ordering::Equal
+                    }
+                }
+            });
+            if let Some((x, y)) = bad {
+                return Err(unrankable_error(&keys, CmpOrder::Reversed, &x, &y));
+            }
+            let n = (n as usize).min(keyed.len());
+            return Ok(new_arr(keyed[..n].iter().map(|p| p.1.clone()).collect()));
+        }
+    }
     match name {
         "min_by" => extreme(false, CmpOrder::Reversed),
         "max_by" => extreme(true, CmpOrder::Reversed),

@@ -1045,9 +1045,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 }
                 // allow trailing ? / ! on symbol/method names, or a single `=` for
                 // a setter symbol (`:x=`) — but not `==`/`=~`/`=>` which are ops.
+                //
+                // `?` and `!` carry the same guard as an ordinary identifier: a
+                // following `=` means the operator, not the suffix, so `:b!=:a`
+                // is `:b != :a` and not the symbol `:b!` being assigned to.
                 if i < b.len()
-                    && (b[i] == b'?'
-                        || b[i] == b'!'
+                    && (((b[i] == b'?' || b[i] == b'!') && b.get(i + 1) != Some(&b'='))
                         || (b[i] == b'='
                             && !matches!(b.get(i + 1), Some(b'=') | Some(b'~') | Some(b'>'))))
                 {
@@ -1074,8 +1077,20 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                     i += 1;
                 }
-                // method-name suffixes ? and !
-                if i < b.len() && (b[i] == b'?' || b[i] == b'!') {
+                // Method-name suffixes `?` and `!`, with MRI's one condition on
+                // them (parse.y `parse_ident`): the suffix is taken only when
+                // the NEXT character is not `=`.
+                //
+                //     if ((c == '!' || c == '?') && !peek(p, '=')) tokadd(p, c);
+                //
+                // Without that guard `b!=a` reads as the bang-method name `b!`
+                // followed by `=`, so the whole comparison silently became an
+                // ASSIGNMENT — `p b!=a` printed 1 (the assigned value) instead
+                // of true, and `arr.size!=1` raised NoMethodError for a method
+                // named `size!=`. Spaces hid it (`b != a` was always right),
+                // which is why it survived: only the unspaced form is affected,
+                // and that is the form most Ruby is written in.
+                if i < b.len() && (b[i] == b'?' || b[i] == b'!') && b.get(i + 1) != Some(&b'=') {
                     i += 1;
                 }
                 let word = &src[start..i];

@@ -3724,3 +3724,54 @@ end
 # 56-bit mantissa and a double has 53.
 p (1..23).map { |i| Math.gamma(i) }
 p Math.gamma(-2.5), Math.gamma(0.5), Math.gamma(0.0), Math.gamma(-0.0)
+#==#
+# MRI's parse.y takes a trailing `?`/`!` into a method name only when the next
+# character is not `=` (`if ((c == '!' || c == '?') && !peek(p, '=')) tokadd`).
+# Without that guard `b!=a` lexed as the bang-method name `b!` followed by `=`,
+# so a COMPARISON silently became an ASSIGNMENT: `p b!=a` printed the assigned
+# value instead of true, and `arr.size!=1` raised NoMethodError for a method
+# named `size!=`. A space always hid it, so only the unspaced form — the one
+# most Ruby is written in — was wrong.
+a = 1
+b = 2
+p b!=a, b!=a+1, (b!=a), a!=b, a!=1&&true
+arr = [1]
+p arr.size!=1, arr.empty?!=true, :b!=:a, :b! == :b!, :b?
+p [1, 2, 4].slice_when { |x, y| y!=x+1 }.to_a
+p [1, 2, 3].map { |v| v!=1 }, (1..3).select { |v| v!=2 }
+n = 0
+n += 1 while n!=3
+p n
+#==#
+# `pop`/`shift` take an optional COUNT, and it changes the return type: bare
+# they answer one element, with a count an Array of up to that many. The count
+# was ignored, so `[1,2,3].pop(2)` answered `3` and removed ONE element where
+# MRI answers `[2, 3]` and removes two — wrong value and wrong mutation.
+p [1, 2, 3].pop(2), [1, 2, 3].pop(0), [1, 2, 3].pop(9), [1, 2, 3].pop
+p [1, 2, 3].shift(2), [1, 2, 3].shift(0), [1, 2, 3].shift(9), [1, 2, 3].shift
+p [].pop, [].pop(2), [].shift, [].shift(1)
+x = [1, 2, 3]
+x.pop(2)
+y = [1, 2, 3]
+y.shift(2)
+p x, y
+#==#
+# `intersection`, `union` and `difference` are VARIADIC where `&`, `|` and `-`
+# are binary, and they accept zero arguments. Only the first argument was read,
+# so every later one was silently discarded.
+p [1, 2, 3].intersection([2, 3], [3]), [1, 2, 3].intersection([2, 3])
+p [1, 2].intersection, [1, 2, 3].union([4], [5]), [1, 2, 2].union
+p [1, 2, 3].difference([1], [2]), [1, 2, 3].difference
+p([1, 2, 3] & [2, 3], [1, 2, 3] | [4], [1, 2, 3] - [1])
+#==#
+# The n-argument forms of the extreme finders answer n ELEMENTS as an Array.
+# `min_by(n)`/`max_by(n)` ignored the count and answered the single extreme,
+# and `min(n)`/`max(n)` honoured it only WITHOUT a block — with one they fell
+# through to the single-extreme scan and answered a scalar too.
+p [1, 2, 3].max_by(2) { |x| -x }, [1, 2, 3].min_by(2) { |x| -x }
+p [1, 2, 3].max_by(0) { |x| -x }, [1, 2, 3].max_by(9) { |x| -x }
+p %w[aa b ccc].max_by(2) { |s| s.size }, %w[aa b ccc].min_by(2) { |s| s.size }
+p [3, 1, 2, 4].min(2) { |x, y| x <=> y }, [3, 1, 2, 4].max(2) { |x, y| x <=> y }
+p %w[bb a ccc].min(2) { |x, y| x.size <=> y.size }
+p [].min(2) { |x, y| x <=> y }, [3, 1, 2, 4].max(0) { |x, y| x <=> y }
+p [1, 2, 3].max_by { |x| -x }, [1, 2, 3].minmax_by { |x| -x }
