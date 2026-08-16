@@ -880,10 +880,28 @@ Honest limitations of this surface:
   a `def` list (`def m(a, (b, c))`) still does not parse — the block and lambda
   forms do. An anonymous keyword collector in a block parameter list
   (`{ |**| }`) does not parse; the named form (`{ |**rest| }`) does.
+- **Named captures suppress the unnamed ones.** A pattern holding ANY named
+  group stops numbering its plain `(…)` groups: `/(?<a>b)(c)/.match("bc")` has
+  size 2, `to_a` `["bc", "b"]`, and `$2`/`m[2]` nil. This is Onigmo's
+  `ONIG_SYN_CAPTURE_ONLY_NAMED_GROUP` — `regcomp.c` splices the unnamed node out
+  of the AST and sets `num_mem = num_named`, so the group COUNT shrinks rather
+  than the slot going nil — and Ruby documents it as "When a regexp contains a
+  named capture, there are no unnamed captures". There is no way to switch it
+  off: `ONIG_OPTION_CAPTURE_GROUP` exists in the C API but `re.c` never sets it.
+  It is implemented by rewriting the source `(` to `(?:` before compiling, so
+  `fancy-regex`'s own numbering matches Onigmo's and `to_a`/`captures`/`size`/
+  `[]`/`values_at`/`scan`/`split`/`$1`..`$9`/`$+` all follow from one place. The
+  same rule applies to a REPLACEMENT string: `\1`..`\9` expand to nothing when
+  the pattern has a named capture, even where the number would have resolved.
 - **Regexp.** Supported: `/pat/flags` literals, `=~`/`!~`, `String#match`
-  (returns `MatchData` with `[n]`/`pre_match`/`post_match`/`to_a`/`captures`),
-  `match?`, `scan`, `split(re)`, `sub`/`gsub` with a Regexp (backrefs `\1`..`\9`
-  in the replacement and a block form), and `Regexp#{source,match,scan,match?}`
+  (returns `MatchData` with `[n]`/`pre_match`/`post_match`/`to_a`/`captures`/
+  `values_at`/`regexp`/`begin`/`end`/`offset` and the byte-addressed
+  `bytebegin`/`byteend`/`byteoffset` — the character forms and the byte forms
+  part company on any multi-byte subject), `match?`, `scan`, `split(re)`,
+  `sub`/`gsub` with a Regexp (a block form, and a replacement string with the
+  full escape set `\0`, `\1`..`\9`, `\&`, `` \` ``, `\'`, `\+`, `\\` and
+  `\k<name>`; an unrecognized escape keeps its backslash, and `\k<name>` naming
+  no group is an `IndexError`), and `Regexp#{source,match,scan,match?}`
   plus `case`/`when /re/` case-equality. A successful match sets the globals
   `$~` (MatchData), `$&` (whole match), `` $` ``/`$'` (pre/post text), `$+`
   (last group), and `$1`..`$9` (numbered groups) — visible after `=~`/`match`
@@ -1160,6 +1178,17 @@ Honest limitations of this surface:
   them: `compact`, `grep`/`grep_v`, `with_index`, `eager`, `chunk`/`chunk_while`,
   `slice_before`/`slice_after`/`slice_when`, block-less `each`, and `size` (MRI
   answers nil for a lazy enumerator of unknown length).
+- **Tie order in `min(n)`/`max(n)`/`min_by(n)`/`max_by(n)` is source order, not
+  MRI's.** The n-argument forms answer the right n ELEMENTS, and agree with the
+  reference whenever the keys are distinct. They can differ in the ORDER MRI
+  reports among EQUAL keys: `[5,4,3,2,1].min_by(2) { 0 }` answers `[5, 4]` here
+  and `[3, 5]` in MRI. That is not a rule MRI documents — `enum.c` reaches these
+  through `nmin_filter`'s median-of-three quickselect and then a final
+  `ruby_qsort`, neither of which is stable, so the order among ties is an
+  artifact of that particular partitioning. Reproducing it means porting
+  `ruby_qsort` itself; a stable sort by key is used instead, which keeps ties in
+  source order. The tie cases are deliberately kept OUT of the parity corpus
+  rather than frozen as though they matched.
 - **`sort`/`min`/`max` raise on a pair they cannot rank.** They are DEFINED by
   `<=>`, so when `<=>` answers nil the caller raises `ArgumentError: comparison
   of X with Y failed`. `cmp_values` answers `Option<Ordering>`, where `None` IS
@@ -1479,12 +1508,16 @@ Honest limitations of this surface:
   local-declaration quirk (`x = 1 unless defined?(x)` — MRI treats `x` as an
   already-declared local from the unexecuted assignment) is not modeled.
 - **`Math` module.** `Math.sqrt`/`cbrt`/`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/
-  `atan2`/`sinh`/`cosh`/`tanh`/`exp`/`log`(with optional base)/`log2`/`log10`/
-  `hypot`/`ldexp` and the constants `Math::PI` / `Math::E` are implemented over
-  `f64`. `Math.gamma` (Lanczos) and `Math.erf`/`erfc` (Abramowitz-Stegun
-  7.1.26) are implemented approximately: gamma to ~1e-9, erf to ~1.5e-7. These
-  do NOT match MRI's libm output in the trailing digits, so they are excluded
-  from the parity corpus and tested only with a tolerance. `Math.class` reports `Module`, as MRI does.
+  `atan2`/`sinh`/`cosh`/`tanh`/`asinh`/`acosh`/`atanh`/`exp`/`log`(with optional
+  base)/`log2`/`log10`/`hypot` and the constants `Math::PI` / `Math::E` are
+  implemented over `f64`. `Math.erf`/`erfc`/`lgamma`/`log1p`/`expm1`/`frexp`/
+  `ldexp`/`gamma` bind the C library's own entries, which is what MRI's `math.c`
+  does — each of those is a one-line wrapper there — so they agree with the
+  reference to the last bit and are covered by the parity corpus rather than
+  tested with a tolerance. `Math.gamma` additionally carries MRI's exact
+  factorial table for integral arguments in `1..23`, because Γ(n) has an exact
+  double representation that `tgamma` is not required to land on.
+  `Math.class` reports `Module`, as MRI does.
 - **`JSON` (dependency-free).** `require "json"` is a no-op; the module is always
   available. `JSON.generate`/`JSON.dump` and `#to_json` (on any value — Array,
   Hash, String, Symbol, Integer, Float, `true`/`false`/`nil`, Bignum, and a

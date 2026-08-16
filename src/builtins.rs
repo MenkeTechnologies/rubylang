@@ -6183,6 +6183,63 @@ fn dispatch_number(
             let (nd, half) = round_args(args)?;
             round_like(recv, nd, RoundKind::Round, half)
         }
+        // The bit-mask predicates, all against the same mask `m`: `allbits?` is
+        // `n & m == m`, `anybits?` is `n & m != 0`, `nobits?` is `n & m == 0`.
+        "allbits?" | "anybits?" | "nobits?" => {
+            let n = as_i(recv);
+            let m = to_int(&args[0])?;
+            Ok(Value::Bool(match name {
+                "allbits?" => n & m == m,
+                "anybits?" => n & m != 0,
+                _ => n & m == 0,
+            }))
+        }
+        // The adjacent representable doubles. Stepping the IEEE 754 bit pattern
+        // by one is the definition — `x + Float::EPSILON` is not, since EPSILON
+        // is the gap at 1.0 only.
+        "next_float" | "prev_float" => {
+            let x = as_f(recv);
+            if x.is_nan() {
+                return Ok(Value::Float(x));
+            }
+            let up = name == "next_float";
+            let bits = x.to_bits();
+            // Away from zero raises the magnitude, toward zero lowers it; the
+            // two signed zeroes both step off zero itself.
+            let next = if x == 0.0 {
+                if up { 1 } else { (1u64 << 63) | 1 }
+            } else if (x > 0.0) == up {
+                bits + 1
+            } else {
+                bits - 1
+            };
+            Ok(Value::Float(f64::from_bits(next)))
+        }
+        // `quo` is EXACT division, which is what separates it from `/`: on two
+        // Integers it answers a Rational and never truncates, so `4.quo(2)` is
+        // `(2/1)` rather than `2`. A Float on either side makes it a Float.
+        "quo" => {
+            if let (Value::Int(a), Value::Int(b)) = (recv, &args[0]) {
+                if *b == 0 {
+                    return Err(raise_exc("ZeroDivisionError", "divided by 0"));
+                }
+                let r = num_rational::BigRational::new((*a).into(), (*b).into());
+                return Ok(with_host(|h| h.new_rational(r)));
+            }
+            Ok(Value::Float(as_f(recv) / as_f(&args[0])))
+        }
+        // A real number's `arg`/`angle`/`phase` is the argument of the complex
+        // number it stands for: 0 when non-negative, π when negative. The test
+        // is on the SIGN BIT, not on `< 0` — `-0.0.angle` is π, and `-0.0 < 0`
+        // is false. The zero answer is the INTEGER 0 for a Float receiver too.
+        "arg" | "angle" | "phase" => {
+            let x = as_f(recv);
+            Ok(if x.is_sign_negative() && !x.is_nan() {
+                Value::Float(std::f64::consts::PI)
+            } else {
+                Value::Int(0)
+            })
+        }
         "nan?" if matches!(recv, Value::Float(_)) => {
             Ok(Value::Bool(matches!(recv, Value::Float(f) if f.is_nan())))
         }
@@ -7421,6 +7478,100 @@ fn dispatch_string(
             })),
         },
         // Byte at index `i` (supports negatives); nil when out of range.
+        // `byteindex`/`byterindex` are `index`/`rindex` reporting a BYTE offset
+        // rather than a character one. The two agree only while the text is
+        // all-ASCII: `"héllo".byteindex("l")` is 3 where `index` is 2.
+        "byteindex" | "byterindex" => {
+            let from_end = name == "byterindex";
+            // Searching backwards starts at the END by default, not at 0 —
+            // otherwise the only position considered is the very start and
+            // every `byterindex` with a match past byte 0 answers nil.
+            let default_start = if from_end { s.len() as i64 } else { 0 };
+            let start = args.get(1).map(as_i).unwrap_or(default_start);
+            let start = if start < 0 { start + s.len() as i64 } else { start };
+            if start < 0 || start > s.len() as i64 {
+                return Ok(Value::Undef);
+            }
+            let found = match with_host(|h| h.as_regex(&args[0])) {
+                Some((re, _)) => {
+                    let hits: Vec<usize> = re
+                        .find_iter(&s)
+                        .filter_map(Result::ok)
+                        .map(|m| m.start())
+                        .collect();
+                    if from_end {
+                        hits.into_iter().filter(|&i| i as i64 <= start.max(0)).next_back()
+                    } else {
+                        hits.into_iter().find(|&i| i as i64 >= start)
+                    }
+                }
+                None => {
+                    let pat = arg_str(&args[0]);
+                    if from_end {
+                        // `start` is the last position the match may BEGIN at,
+                        // not a slice bound — the match itself may run past it.
+                        s.rmatch_indices(&pat)
+                            .map(|(i, _)| i)
+                            .find(|&i| i as i64 <= start)
+                    } else {
+                        s[start as usize..].find(&pat).map(|i| i + start as usize)
+                    }
+                }
+            };
+            Ok(found.map(|i| Value::Int(i as i64)).unwrap_or(Value::Undef))
+        }
+        // `bytesplice(offset, len, str)` overwrites a BYTE range in place and
+        // answers the receiver.
+        "bytesplice" => {
+            let off = as_i(&args[0]).max(0) as usize;
+            let len = as_i(&args[1]).max(0) as usize;
+            let repl = arg_str(&args[2]);
+            let b = s.as_bytes();
+            let off = off.min(b.len());
+            let end = (off + len).min(b.len());
+            let mut out = Vec::with_capacity(b.len() + repl.len());
+            out.extend_from_slice(&b[..off]);
+            out.extend_from_slice(repl.as_bytes());
+            out.extend_from_slice(&b[end..]);
+            let new = String::from_utf8_lossy(&out).into_owned();
+            with_host(|h| h.set_str(recv, new));
+            Ok(recv.clone())
+        }
+        // `setbyte(index, byte)` writes one byte in place and answers the BYTE
+        // that was written, not the receiver.
+        "setbyte" => {
+            let raw = as_i(&args[0]);
+            let mut b = s.into_bytes();
+            let idx = if raw < 0 { raw + b.len() as i64 } else { raw };
+            if idx < 0 || idx >= b.len() as i64 {
+                return Err(raise_exc("IndexError", &format!("index {raw} out of string")));
+            }
+            let byte = as_i(&args[1]);
+            b[idx as usize] = (byte & 0xff) as u8;
+            let new = String::from_utf8_lossy(&b).into_owned();
+            with_host(|h| h.set_str(recv, new));
+            Ok(Value::Int(byte))
+        }
+        // `dedup` (and its operator spelling `-@`) answers a FROZEN copy — the
+        // deduplicated string MRI keeps in its fstring table.
+        "dedup" => {
+            let v = new_str(s);
+            with_host(|h| h.freeze_value(&v));
+            Ok(v)
+        }
+        // `undump` is the inverse of `inspect`: it reads back the quoted,
+        // escaped form. Anything that is not a complete `"…"` is a RuntimeError.
+        "undump" => {
+            let inner = s
+                .strip_prefix('"')
+                .and_then(|r| r.strip_suffix('"'))
+                .ok_or_else(|| raise_exc("RuntimeError", "invalid dumped string"))?;
+            Ok(new_str(unescape_dumped(inner)?))
+        }
+        // The scrubbing methods replace invalid byte sequences. Every String
+        // here is already valid UTF-8 (it is a Rust `String`), so there is
+        // nothing to replace and the faithful answer is the text unchanged.
+        "scrub" => Ok(new_str(s)),
         "getbyte" => {
             let bytes = s.as_bytes();
             let raw = as_i(&args[0]);
@@ -7601,7 +7752,7 @@ fn dispatch_string(
         // `157/50` (exact decimal), other leading text → `0/1`.
         "to_r" => Ok(with_host(|h| h.new_rational(string_to_rational(&s)))),
         "to_s" | "to_str" => Ok(recv.clone()),
-        "to_sym" => Ok(with_host(|h| h.new_symbol(&s))),
+        "to_sym" | "intern" => Ok(with_host(|h| h.new_symbol(&s))),
         "include?" => Ok(Value::Bool(s.contains(&arg_str(&args[0])))),
         "start_with?" => Ok(Value::Bool(args.iter().any(|a| {
             match str_regex(a) {
@@ -7625,7 +7776,7 @@ fn dispatch_string(
         "=~" => match str_regex(&args[0]) {
             // `=~` sets `$~`/`$1`.. as a side effect, then yields the char offset.
             Some(re) => {
-                match_data(&re, &s);
+                match_data(&re, &s, &args[0]);
                 Ok(re
                     .find(&s)
                     .ok()
@@ -7636,7 +7787,7 @@ fn dispatch_string(
             None => Ok(Value::Undef),
         },
         "match" => match str_regex(&args[0]) {
-            Some(re) => Ok(match_data(&re, &s)),
+            Some(re) => Ok(match_data(&re, &s, &args[0])),
             None => Ok(Value::Undef),
         },
         "scan" => match str_regex(&args[0]) {
@@ -7645,7 +7796,7 @@ fn dispatch_string(
             // grouped pattern. Without a block, collect them into an array.
             Some(re) => match &block {
                 Some(bl) => {
-                    scan_each(&re, &s, bl)?;
+                    scan_each(&re, &s, bl, &args[0])?;
                     Ok(recv.clone())
                 }
                 None => Ok(scan_regex(&re, &s)),
@@ -7685,7 +7836,7 @@ fn dispatch_string(
         "sub" | "gsub" => {
             let all = name == "gsub";
             if let Some(re) = str_regex(&args[0]) {
-                return regex_replace(&re, &s, &args[1..], &block, all);
+                return regex_replace(&re, &s, &args[1..], &block, all, &args[0]);
             }
             let from = arg_str(&args[0]);
             // With a block the pattern is the ONLY argument, so there is no
@@ -7696,7 +7847,7 @@ fn dispatch_string(
             if block.is_some() {
                 let re = fancy_regex::Regex::new(&regex_escape(&from))
                     .map_err(|e| raise_exc("RegexpError", &e.to_string()))?;
-                return regex_replace(&re, &s, &[], &block, all);
+                return regex_replace(&re, &s, &[], &block, all, &args[0]);
             }
             let to = arg_str(&args[1]);
             Ok(new_str(if all {
@@ -8037,6 +8188,71 @@ fn str_index_set(recv: &Value, s: &str, args: &[Value]) -> Result<Value, String>
     Ok(repl[0].clone())
 }
 
+/// Read back the escapes `String#dump`/`#inspect` write, for `String#undump`.
+///
+/// This is the inverse of the dumped form only — the escapes `dump` actually
+/// emits — not of Ruby's whole double-quoted literal syntax. An unrecognized
+/// escape is the character itself, which is what a Ruby literal does too.
+fn unescape_dumped(s: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(s.len());
+    let mut c = s.chars().peekable();
+    while let Some(ch) = c.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match c.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some('a') => out.push('\u{7}'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('v') => out.push('\u{b}'),
+            Some('e') => out.push('\u{1b}'),
+            Some('s') => out.push(' '),
+            // `\xNN` — one raw byte, written by `dump` for non-UTF-8 data.
+            Some('x') => {
+                let mut hex = String::new();
+                while hex.len() < 2 && c.peek().is_some_and(|h| h.is_ascii_hexdigit()) {
+                    hex.push(c.next().unwrap());
+                }
+                let n = u32::from_str_radix(&hex, 16)
+                    .map_err(|_| raise_exc("RuntimeError", "invalid dumped string"))?;
+                out.push(char::from_u32(n).unwrap_or('\u{fffd}'));
+            }
+            // `\u{...}` and `\uNNNN` — a code point.
+            Some('u') => {
+                let mut hex = String::new();
+                if c.peek() == Some(&'{') {
+                    c.next();
+                    while let Some(&h) = c.peek() {
+                        c.next();
+                        if h == '}' {
+                            break;
+                        }
+                        hex.push(h);
+                    }
+                } else {
+                    while hex.len() < 4 && c.peek().is_some_and(|h| h.is_ascii_hexdigit()) {
+                        hex.push(c.next().unwrap());
+                    }
+                }
+                let n = u32::from_str_radix(&hex, 16)
+                    .map_err(|_| raise_exc("RuntimeError", "invalid dumped string"))?;
+                out.push(
+                    char::from_u32(n)
+                        .ok_or_else(|| raise_exc("RuntimeError", "invalid dumped string"))?,
+                );
+            }
+            Some(other) => out.push(other),
+            None => return Err(raise_exc("RuntimeError", "invalid dumped string")),
+        }
+    }
+    Ok(out)
+}
+
 /// The compiled regex for a value that is a Regexp, else `None`.
 fn str_regex(v: &Value) -> Option<fancy_regex::Regex> {
     with_host(|h| h.as_regex(v)).map(|(re, _)| re)
@@ -8044,11 +8260,11 @@ fn str_regex(v: &Value) -> Option<fancy_regex::Regex> {
 
 /// Build a `MatchData` value for the first match of `re` in `s`, or `nil`, and
 /// update the match globals (`$~`, `$&`, `` $` ``, `$'`, `$+`, `$1`..`$9`).
-fn match_data(re: &fancy_regex::Regex, s: &str) -> Value {
+fn match_data(re: &fancy_regex::Regex, s: &str, re_val: &Value) -> Value {
     // fancy-regex's backtracking `captures` returns a Result; a match error is
     // treated as no match (MRI raises nothing here — it just fails to match).
     let caps = re.captures(s).ok().flatten();
-    set_match_globals(caps.as_ref().map(|c| (c, s)), re)
+    set_match_globals(caps.as_ref().map(|c| (c, s)), re, re_val)
 }
 
 /// `(name, group_index)` for each named capture `(?<name>…)` in `re`, in group
@@ -8065,7 +8281,11 @@ fn capture_name_map(re: &fancy_regex::Regex) -> Vec<(String, usize)> {
 /// failed match), and return the corresponding `MatchData` value (or `nil`).
 /// Ruby names these `$~` (the MatchData), `$&` (whole match), `` $` ``/`$'`
 /// (pre/post text), `$+` (last matched group), and `$1`..`$9` (numbered groups).
-fn set_match_globals(m: Option<(&fancy_regex::Captures, &str)>, re: &fancy_regex::Regex) -> Value {
+fn set_match_globals(
+    m: Option<(&fancy_regex::Captures, &str)>,
+    re: &fancy_regex::Regex,
+    re_val: &Value,
+) -> Value {
     with_host(|h| {
         // Clear the numbered globals first so a failed match leaves no stale
         // captures behind.
@@ -8087,13 +8307,20 @@ fn set_match_globals(m: Option<(&fancy_regex::Captures, &str)>, re: &fancy_regex
         let to_val = |h: &mut RubyHost, o: &Option<String>| -> Value {
             o.clone().map(|s| h.new_string(s)).unwrap_or(Value::Undef)
         };
+        // The BYTE span of every group, kept alongside the text: `#begin` and
+        // friends cannot be answered from the captured text alone, because two
+        // equal substrings differ only in where they sat.
+        let offsets: Vec<Option<(usize, usize)>> =
+            (0..c.len()).map(|i| c.get(i).map(|g| (g.start(), g.end()))).collect();
         let pre = s[..whole.start()].to_string();
         let post = s[whole.end()..].to_string();
         let md = h.new_matchdata(
             groups.clone(),
             capture_name_map(re),
+            offsets,
             pre.clone(),
             post.clone(),
+            re_val.clone(),
         );
         h.set_global("~", md.clone());
         let g0 = to_val(h, groups.first().unwrap_or(&None));
@@ -8119,6 +8346,31 @@ fn set_match_globals(m: Option<(&fancy_regex::Captures, &str)>, re: &fancy_regex
 }
 
 /// `MatchData#[n]`, `#pre_match`, `#post_match`, `#to_a`, `#captures`, `#to_s`.
+/// Resolve a `MatchData` group selector — a group NUMBER, or a String/Symbol
+/// naming a `(?<name>…)` capture — to its index, the way `#[]` does. A negative
+/// number counts back from the end; a name the pattern does not define is an
+/// IndexError, where an out-of-range number simply misses.
+fn matchdata_group_index(
+    key: &Value,
+    names: &[(String, usize)],
+    groups: &[Option<String>],
+) -> Result<usize, String> {
+    if let Some(k) = with_host(|h| h.as_symbol(key).or_else(|| h.as_str(key))) {
+        return match names.iter().find(|(n, _)| *n == k) {
+            Some((_, i)) => Ok(*i),
+            None => Err(raise_exc(
+                "IndexError",
+                &format!("undefined group name reference: {k}"),
+            )),
+        };
+    }
+    let i = as_i(key);
+    let i = if i < 0 { groups.len() as i64 + i } else { i };
+    // An index still negative after counting back is out of range; hand back
+    // one past the end so the caller's `.get()` misses and answers nil.
+    Ok(if i < 0 { groups.len() } else { i as usize })
+}
+
 fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     let (groups, names, pre, post) = match with_host(|h| h.as_matchdata(recv)) {
         Some(t) => t,
@@ -8147,10 +8399,57 @@ fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value,
         }
         "pre_match" => Ok(new_str(pre)),
         "post_match" => Ok(new_str(post)),
-        // `#regexp` — the pattern the match ran against. The runtime does not
-        // retain it on the MatchData, so report nil; mustermann's
-        // `Match#initialize` then falls back to `pattern.regexp`.
-        "regexp" => Ok(Value::Undef),
+        // `#regexp` — the pattern the match ran against, retained on the
+        // MatchData when it was built. This used to answer nil unconditionally,
+        // which is a legal MatchData shape nowhere in MRI.
+        "regexp" => Ok(with_host(|h| h.matchdata_regexp(recv)).unwrap_or(Value::Undef)),
+        // The position methods. `#begin`/`#end`/`#offset` count CHARACTERS and
+        // `#bytebegin`/`#byteend`/`#byteoffset` count BYTES; the two agree only
+        // while the subject is all-ASCII, so the character forms convert
+        // against the subject rather than reusing the engine's byte figures.
+        // Every one of them answers nil for a group that did not match, and
+        // `#offset`/`#byteoffset` answer the pair `[begin, end]`.
+        "begin" | "end" | "offset" | "bytebegin" | "byteend" | "byteoffset" => {
+            let offsets = with_host(|h| h.matchdata_offsets(recv)).unwrap_or_default();
+            let idx = matchdata_group_index(&args[0], &names, &groups)?;
+            let Some((bs, be)) = offsets.get(idx).copied().flatten() else {
+                // A group that did not participate has no position. `#offset`
+                // still answers a pair, of two nils.
+                return Ok(if name.ends_with("offset") {
+                    new_arr(vec![Value::Undef, Value::Undef])
+                } else {
+                    Value::Undef
+                });
+            };
+            let whole = groups.first().and_then(|o| o.clone()).unwrap_or_default();
+            let subject = format!("{pre}{whole}{post}");
+            let in_bytes = name.starts_with("byte");
+            // A byte offset is a valid char boundary here, so counting the
+            // characters before it is the conversion.
+            let at = |b: usize| -> i64 {
+                if in_bytes {
+                    b as i64
+                } else {
+                    subject[..b].chars().count() as i64
+                }
+            };
+            Ok(match name {
+                "begin" | "bytebegin" => Value::Int(at(bs)),
+                "end" | "byteend" => Value::Int(at(be)),
+                _ => new_arr(vec![Value::Int(at(bs)), Value::Int(at(be))]),
+            })
+        }
+        // `#values_at` — the named groups by index, in the order asked for,
+        // with nil for one that did not match or does not exist.
+        "values_at" => {
+            let mut out = Vec::with_capacity(args.len());
+            for a in args {
+                let idx = matchdata_group_index(a, &names, &groups)?;
+                out.push(groups.get(idx).map(strv).unwrap_or(Value::Undef));
+            }
+            Ok(new_arr(out))
+        }
+        "deconstruct" => Ok(new_arr(groups.iter().skip(1).map(strv).collect())),
         // `#string` — the entire subject the match ran against: the text before
         // the match, the whole match, and the text after. mustermann's
         // `Match#initialize` captures it via `match.string`.
@@ -8291,10 +8590,15 @@ fn regex_split(re: &fancy_regex::Regex, s: &str, limit: i64) -> Vec<String> {
 
 /// `String#scan(re) { ... }`: yield each match (setting `$~`), passing the whole
 /// match for an ungrouped pattern or the capture-group array for a grouped one.
-fn scan_each(re: &fancy_regex::Regex, s: &str, bl: &Value) -> Result<(), String> {
+fn scan_each(
+    re: &fancy_regex::Regex,
+    s: &str,
+    bl: &Value,
+    re_val: &Value,
+) -> Result<(), String> {
     let ngroups = re.captures_len();
     for caps in re.captures_iter(s).filter_map(Result::ok) {
-        set_match_globals(Some((&caps, s)), re);
+        set_match_globals(Some((&caps, s)), re, re_val);
         let arg = if ngroups <= 1 {
             new_str(caps.get(0).unwrap().as_str().to_string())
         } else {
@@ -8320,6 +8624,7 @@ fn regex_replace(
     rest: &[Value],
     block: &Option<Value>,
     all: bool,
+    re_val: &Value,
 ) -> Result<Value, String> {
     let mut out = String::new();
     let mut last = 0;
@@ -8331,7 +8636,7 @@ fn regex_replace(
         out.push_str(&s[last..m.start()]);
         if let Some(bl) = block {
             // Expose `$~`/`$1`.. to the block for the current match.
-            set_match_globals(Some((&caps, s)), re);
+            set_match_globals(Some((&caps, s)), re, re_val);
             let r = call_proc(bl, &[new_str(m.as_str().to_string())])?;
             out.push_str(&with_host(|h| h.to_s(&r)));
         } else if let Some(map) = rest.first().and_then(|v| with_host(|h| h.as_hash(v))) {
@@ -9076,6 +9381,47 @@ fn dispatch_array(
             };
             Ok(pos.map(|p| Value::Int(p as i64)).unwrap_or(Value::Undef))
         }
+        // `bsearch_index` runs the identical search and answers the INDEX
+        // instead of the element, so it delegates rather than repeating the
+        // three-way block protocol.
+        "bsearch_index" => {
+            let Some(bl) = &block else {
+                return Ok(recv.clone());
+            };
+            let found = dispatch_array(recv, "bsearch", args, Some(bl.clone()))?;
+            if matches!(found, Value::Undef) {
+                return Ok(Value::Undef);
+            }
+            // The search visited exactly one satisfying element; find its
+            // position by identity-or-equality against the array it searched.
+            Ok(arr
+                .iter()
+                .position(|v| with_host(|h| h.eq_values(v, &found)))
+                .map(|i| Value::Int(i as i64))
+                .unwrap_or(Value::Undef))
+        }
+        // `fetch_values(*indexes)` is `values_at` that RAISES on a missing
+        // index instead of answering nil, unless a block supplies the default.
+        "fetch_values" => {
+            let mut out = Vec::with_capacity(args.len());
+            for a in args {
+                let i = to_int(a)?;
+                match norm_idx(i, arr.len()).and_then(|k| arr.get(k)) {
+                    Some(v) => out.push(v.clone()),
+                    None => match &block {
+                        Some(b) => out.push(call_proc(b, std::slice::from_ref(a))?),
+                        None => {
+                            return Err(raise_exc(
+                                "IndexError",
+                                &format!("index {i} outside of array bounds: {}...{}",
+                                    -(arr.len() as i64), arr.len()),
+                            ))
+                        }
+                    },
+                }
+            }
+            Ok(new_arr(out))
+        }
         "bsearch" => {
             // Binary search over a partitioned array. A block returning true/false
             // selects find-minimum mode (smallest element satisfying the block);
@@ -9230,6 +9576,52 @@ fn dispatch_array(
                 return Ok(recv.clone());
             }
             Ok(new_arr(a))
+        }
+        // `sort_by!` is `sort_by` written back into the receiver, answering
+        // self. Without a block MRI answers an Enumerator, which `sort_by`
+        // already models by answering the receiver.
+        "sort_by!" => {
+            let sorted = sort_by_family(recv, "sort_by", &arr, &block, args)?;
+            if block.is_some() {
+                let a = with_host(|h| h.as_array(&sorted).unwrap_or_default());
+                with_host(|h| h.set_array(recv, a));
+            }
+            Ok(recv.clone())
+        }
+        // `slice_before`/`slice_after` cut the sequence at elements the pattern
+        // or block selects. They differ only in which side of the cut the
+        // matching element lands on: `slice_before` starts a new run AT it,
+        // `slice_after` ends the current run WITH it. Both take a pattern
+        // (matched with `===`) as an alternative to the block.
+        "slice_before" | "slice_after" => {
+            let before = name == "slice_before";
+            let mut chunks: Vec<Value> = Vec::new();
+            let mut cur: Vec<Value> = Vec::new();
+            for x in &arr {
+                let hit = match (&block, args.first()) {
+                    (Some(bl), _) => {
+                        let r = call_proc(bl, std::slice::from_ref(x))?;
+                        with_host(|h| h.truthy(&r))
+                    }
+                    (None, Some(pat)) => dispatch(pat, "===", std::slice::from_ref(x), None)
+                        .map(|v| with_host(|h| h.truthy(&v)))
+                        .unwrap_or(false),
+                    (None, None) => {
+                        return Err(raise_exc("ArgumentError", "wrong number of arguments (given 0, expected 1)"))
+                    }
+                };
+                if hit && before && !cur.is_empty() {
+                    chunks.push(new_arr(std::mem::take(&mut cur)));
+                }
+                cur.push(x.clone());
+                if hit && !before {
+                    chunks.push(new_arr(std::mem::take(&mut cur)));
+                }
+            }
+            if !cur.is_empty() {
+                chunks.push(new_arr(cur));
+            }
+            Ok(with_host(|h| h.new_enumerator(chunks, "each")))
         }
         "minmax" => {
             if arr.is_empty() {
@@ -14527,6 +14919,32 @@ fn dispatch_hash(
             }
             Ok(with_host(|h| h.new_hash(out)))
         }
+        // The in-place transforms write the rebuilt Hash back into the receiver
+        // and answer self, rather than answering a new Hash.
+        "transform_values!" | "transform_keys!" => {
+            let base = name.strip_suffix('!').unwrap();
+            let rebuilt = dispatch_hash(recv, base, args, block.clone())?;
+            let m = with_host(|h| h.as_hash(&rebuilt)).unwrap_or_default();
+            with_host(|h| h.set_hash(recv, m));
+            Ok(recv.clone())
+        }
+        // `#shift` removes the FIRST pair and answers it as `[key, value]`, or
+        // nil when the Hash is empty.
+        "shift" => {
+            let mut m = map.clone();
+            let Some(k) = m.keys().next().cloned() else {
+                return Ok(Value::Undef);
+            };
+            let v = m.shift_remove(&k).unwrap();
+            with_host(|h| h.set_hash(recv, m));
+            let kv = with_host(|h| h.key_value(&k));
+            Ok(new_arr(vec![kv, v]))
+        }
+        // `#rehash` re-indexes after a key was mutated in place. Keys here are
+        // owned `RKey` values rebuilt from the current contents rather than
+        // hashes of a shared buffer, so there is no stale index to repair and
+        // the faithful behaviour is to answer self having changed nothing.
+        "rehash" => Ok(recv.clone()),
         "each_with_object" => {
             let Some(memo) = args.first().cloned() else {
                 return Err(raise_exc(
@@ -14819,6 +15237,22 @@ fn dispatch_range(
         // `cover?` (only) accepts a Range argument (Ruby 2.6+): true when the
         // other range's span lies entirely within self. `include?`/`member?`/
         // `===` treat the argument as a single element, never a sub-range.
+        // `overlap?` (Ruby 3.3+) asks whether the two ranges share ANY element,
+        // where `cover?` asks whether one contains the other outright. Two
+        // ranges overlap when each one's start is at or below the other's
+        // inclusive end, and neither is empty.
+        "overlap?" => {
+            let Some((olo, ohi, oexcl)) = with_host(|h| h.as_range(&args[0])) else {
+                return Err(raise_exc("TypeError", "wrong argument type (expected Range)"));
+            };
+            let smax = if excl { hi - 1 } else { hi };
+            let omax = if oexcl { ohi - 1 } else { ohi };
+            if lo > smax || olo > omax {
+                // Either range is empty, so there is nothing to share.
+                return Ok(Value::Bool(false));
+            }
+            Ok(Value::Bool(lo <= omax && olo <= smax))
+        }
         "cover?" if with_host(|h| h.as_range(&args[0]).is_some()) => {
             let (olo, ohi, oexcl) = with_host(|h| h.as_range(&args[0]).unwrap());
             if olo == crate::host::RANGE_BEGINLESS || ohi == crate::host::RANGE_ENDLESS {
@@ -15223,6 +15657,14 @@ fn dispatch_symbol(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         // `=~`/`match` operate on the symbol's name (Journey's visitors do
         // `private_instance_method_symbol =~ /^visit_/`). `match?` is below.
         "=~" | "match" => dispatch_string(&new_str(s), name, args, None),
+        // `casecmp`/`casecmp?` compare the NAMES case-insensitively, and answer
+        // nil for a non-Symbol argument rather than raising.
+        "casecmp" | "casecmp?" => {
+            let Some(other) = with_host(|h| h.as_symbol(&args[0])) else {
+                return Ok(Value::Undef);
+            };
+            dispatch_string(&new_str(s), name, &[new_str(other)], None)
+        }
         "length" | "size" => Ok(Value::Int(s.chars().count() as i64)),
         "empty?" => Ok(Value::Bool(s.is_empty())),
         // Case/`succ`/`capitalize` all return a Symbol (unlike String's String).
@@ -15665,7 +16107,7 @@ fn dispatch_regexp(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         }
         "=~" => {
             let s = arg_str(&args[0]);
-            match_data(&re, &s); // sets `$~`/`$1`..
+            match_data(&re, &s, recv); // sets `$~`/`$1`..
             Ok(re
                 .find(&s)
                 .ok()
@@ -15675,7 +16117,7 @@ fn dispatch_regexp(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         }
         "match" => {
             let s = arg_str(&args[0]);
-            Ok(match_data(&re, &s))
+            Ok(match_data(&re, &s, recv))
         }
         "scan" => {
             let s = arg_str(&args[0]);
@@ -20309,6 +20751,8 @@ const STRING_MUTATORS: &[&str] = &[
     "prepend",
     "[]=",
     "force_encoding",
+    "bytesplice",
+    "setbyte",
 ];
 
 /// Explicit (non-`!`) Array mutators guarded against a frozen receiver.
@@ -20333,7 +20777,17 @@ const ARRAY_MUTATORS: &[&str] = &[
 
 /// Explicit (non-`!`) Hash mutators guarded against a frozen receiver.
 const HASH_MUTATORS: &[&str] = &[
-    "[]=", "store", "delete", "clear", "replace", "update", "merge!",
+    "[]=",
+    "store",
+    "delete",
+    "clear",
+    "replace",
+    "update",
+    "merge!",
+    "shift",
+    "rehash",
+    "transform_values!",
+    "transform_keys!",
 ];
 
 /// Raise a `NoMethodError` with the ruby-4.0 message form for `recv`:

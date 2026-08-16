@@ -3499,13 +3499,27 @@ fn clamp_with_open_ranges() {
 }
 
 #[test]
-fn math_gamma_and_erf_approximate() {
-    // Approximations (Lanczos / Abramowitz-Stegun) don't match MRI's libm to
-    // the last bit, so assert within tolerance rather than exact inspect form.
-    eq("(Math.gamma(5) - 24.0).abs < 1e-6", "true");
-    eq("(Math.gamma(10) - 362880.0).abs < 1e-3", "true");
-    eq("(Math.erf(1.0) - 0.8427007929497148).abs < 1e-6", "true");
-    eq("(Math.erfc(1.0) - 0.15729920705028516).abs < 1e-6", "true");
+fn math_gamma_and_erf_are_exact() {
+    // These used to be a Lanczos gamma and an Abramowitz & Stegun 7.1.26 erf,
+    // neither of which reaches MRI's trailing digits, so they could only be
+    // asserted within a tolerance — and a tolerance of 1e-6 accepts an erf that
+    // is wrong from the seventh digit, which is exactly what was shipping.
+    // They now bind the same libm entries MRI's math.c calls, so the assertion
+    // is the full inspect form and any drift fails.
+    eq("Math.gamma(5)", "24.0");
+    eq("Math.gamma(10)", "362880.0");
+    eq("Math.erf(1.0)", "0.8427007929497148");
+    eq("Math.erfc(1.0)", "0.15729920705028516");
+    // `erfc` is its own libm entry, not `1 - erf(x)`: that subtraction cancels
+    // catastrophically once erf(x) approaches 1.
+    eq("Math.erfc(5.0)", "1.537459794428035e-12");
+    // The integral arguments come from MRI's exact factorial table, which no
+    // series lands on — a Lanczos gamma made this 23.999999999999996.
+    eq("(1..23).map { |i| Math.gamma(i) }.all? { |v| v == v.round }", "true");
+    eq("Math.lgamma(5.0)", "[3.1780538303479453, 1]");
+    eq("Math.lgamma(-0.5)", "[1.2655121234846454, -1]");
+    eq("Math.frexp(8.0)", "[0.5, 4]");
+    eq("Math.ldexp(0.5, 4)", "8.0");
 }
 
 // --- Fanout completion: lexer ----------------------------------------------

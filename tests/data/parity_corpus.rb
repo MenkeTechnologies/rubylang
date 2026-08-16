@@ -3775,3 +3775,103 @@ p [3, 1, 2, 4].min(2) { |x, y| x <=> y }, [3, 1, 2, 4].max(2) { |x, y| x <=> y }
 p %w[bb a ccc].min(2) { |x, y| x.size <=> y.size }
 p [].min(2) { |x, y| x <=> y }, [3, 1, 2, 4].max(0) { |x, y| x <=> y }
 p [1, 2, 3].max_by { |x| -x }, [1, 2, 3].minmax_by { |x| -x }
+#==#
+# A MatchData kept only the captured TEXT, which cannot answer the position
+# methods: two equal substrings differ only in where they sat, so the offset is
+# not recoverable by searching for the text afterwards. Byte spans are now kept
+# alongside. `#begin`/`#end`/`#offset` count CHARACTERS and the byte-named forms
+# count BYTES — the two agree only while the subject is all-ASCII.
+m = /l(l)/.match("hello")
+p m.begin(0), m.end(0), m.begin(1), m.end(1), m.offset(0), m.offset(1)
+p m.bytebegin(0), m.byteend(0), m.byteoffset(1)
+n = /é(l)/.match("héllo")
+p n.begin(0), n.bytebegin(0), n.end(0), n.byteend(0), n.offset(0), n.byteoffset(0)
+o = /(x)?l/.match("hello")
+p o.begin(1), o.end(1), o.offset(1)
+q = /(?<a>b)/.match("abcd")
+p q.begin(:a), q.end(:a), q.offset(:a)
+begin
+  q.begin(:zz)
+rescue IndexError => e
+  p [e.class.to_s, e.message]
+end
+#==#
+# `#regexp` answered nil unconditionally — a MatchData shape that exists nowhere
+# in MRI. The Regexp is retained when the match is built, including for the
+# `$~` a sub/gsub block sees. `#values_at` was missing entirely.
+p(/l(l)/.match("hello").regexp)
+p(/(?<x>l)/.match("hello").regexp)
+p("hello".sub(/l(l)/) { $~.regexp })
+p(/(?<a>b)(c)/.match("abcd").values_at(0, 1))
+p(/(b)(c)?/.match("abcd").values_at(1, 2))
+p(/(a)(b)(c)/.match("abc").values_at(0, 1, 2, 3))
+"hello" =~ /l(l)/
+p $~.begin(0), $~.regexp
+#==#
+# Hash in-place transforms, `#shift` and `#rehash`, and the Array selectors that
+# were absent: `bsearch_index`, `fetch_values`, `sort_by!`, `slice_before` and
+# `slice_after`.
+h = {a: 1}
+h.transform_values! { |v| v + 1 }
+g = {a: 1, b: 2}
+g.transform_keys!(&:to_s)
+p h, g, {a: 1}.rehash
+k = {a: 1, b: 2}
+p k.shift, k, {}.shift
+p [1, 2, 3, 4].bsearch_index { |x| x >= 3 }, [1, 2, 3, 4].bsearch_index { |x| x >= 9 }
+p [1, 2, 3, 4].bsearch_index { |x| 3 <=> x }
+p [1, 2, 3].fetch_values(0, 2), [1, 2, 3].fetch_values, [1, 2, 3].fetch_values(-1)
+p [1, 2, 3].fetch_values(9) { |i| i * 2 }
+begin
+  [1, 2, 3].fetch_values(9)
+rescue IndexError => e
+  p [e.class.to_s, e.message]
+end
+z = [3, 1, 2]
+z.sort_by! { |x| x }
+p z
+p [1, 2, 3, 4].slice_before { |x| x.even? }.to_a
+p [1, 2, 3, 4].slice_after { |x| x.even? }.to_a
+p [1, 2, 3, 4].slice_before(2).to_a, [1, 2, 3, 4].slice_after(2).to_a
+p %w[a b c].slice_before(/b/).to_a, [1, 2, 3].slice_after { false }.to_a
+p [].slice_before { true }.to_a, [1, 2, 3].slice_before { true }.to_a
+#==#
+# String byte-addressed methods and the aliases that were missing. `byteindex`
+# reports a BYTE offset where `index` reports a character one, so the two part
+# company on any multi-byte subject. Searching backwards defaults its start to
+# the END of the string, and that start bounds where a match may BEGIN.
+p "hello".byteindex("l"), "hello".byteindex("z"), "héllo".byteindex("l")
+p "hello".byteindex("l", 3), "hello".byterindex("l"), "héllo".byterindex("l")
+p "hello".byteindex(/l+/), "hello".byterindex(/l/)
+p "hello".byterindex("l", 2), "hello".byterindex(/l/, 2)
+p "hellolo".byterindex("lo"), "abc".byterindex("a", 0)
+w = "hello"
+p w.bytesplice(1, 2, "XY"), w
+v = "abc"
+p v.setbyte(0, 98), v
+p "a".dedup, "a".dedup.frozen?, "abc".scrub
+p "\"a\\nb\"".undump, "\"\\u00e9\"".undump
+p "abc".intern, "abc".intern.class, "abc".to_sym == "abc".intern
+p :abc.casecmp(:ABC), :abc.casecmp(:abd), :abc.casecmp?(:ABC), :abc.casecmp("ABC")
+#==#
+# The bit-mask predicates, the adjacent-double steppers, exact `quo`, the
+# argument of a real number, and `Range#overlap?`.
+p 0b1010.allbits?(0b1000), 0b1010.anybits?(0b0100), 0b1010.nobits?(0b0101)
+p 0b1010.allbits?(0b1010), 0b1010.anybits?(0b1000), 0b1010.nobits?(0b1000)
+p 1.0.next_float, 1.0.prev_float, 0.0.next_float, 0.0.prev_float
+p(-0.0.next_float, (-1.0).next_float, (-1.0).prev_float)
+p Float::INFINITY.prev_float, 1e308.next_float
+# `quo` is EXACT division, so two Integers answer a Rational and never truncate.
+p 1.quo(3), 1.0.quo(3), 4.quo(2), 1.quo(3.0)
+begin
+  1.quo(0)
+rescue ZeroDivisionError => e
+  p e.class.to_s
+end
+# The argument test is on the SIGN BIT, not `< 0`: `-0.0` is negative and `-0.0 < 0`
+# is false, so `-0.0.angle` is π.
+p 1.0.angle, (-1.0).angle, 1.angle, (-1).angle, 0.0.angle, (-0.0).angle
+p 1.0.arg, (-1.0).phase
+p (1..5).overlap?(4..9), (1..5).overlap?(6..9), (1..5).overlap?(5..9)
+p (1...5).overlap?(4..9), (1...5).overlap?(5..9), (1..5).overlap?(0..0)
+p (1..5).overlap?(1..5), (1..0).overlap?(1..5)

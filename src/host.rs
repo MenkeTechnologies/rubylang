@@ -378,8 +378,24 @@ pub enum RObj {
         /// `(name, group_index)` for each named capture `(?<name>…)`, so
         /// `MatchData#[:name]` / `#["name"]` resolves to the right group.
         names: Vec<(String, usize)>,
+        /// The `[start, end)` BYTE span of each group in the subject, parallel
+        /// to `groups` (`None` for a group that did not match). Only the
+        /// captured TEXT used to be kept, which is not enough to answer
+        /// `#begin`/`#end`/`#offset`: two identical substrings have the same
+        /// text and different positions, so the offset cannot be recovered by
+        /// searching for the text afterwards.
+        ///
+        /// Byte offsets are what the engine reports, and the byte-named methods
+        /// (`#bytebegin`/`#byteend`/`#byteoffset`) want them unchanged; the
+        /// character-named ones convert against the subject, since a Ruby index
+        /// counts characters and any multi-byte text makes the two disagree.
+        offsets: Vec<Option<(usize, usize)>>,
         pre: String,
         post: String,
+        /// The Regexp this match came from, for `#regexp`. `nil` when the match
+        /// was produced by an internally-built pattern with no Ruby-level
+        /// Regexp object behind it.
+        regexp: Value,
     },
     /// A concrete `Enumerator`: the yielded values already materialized into a
     /// buffer, plus an external-iteration cursor. Returned by block-less
@@ -2731,7 +2747,23 @@ impl RubyHost {
                 names,
                 pre,
                 post,
+                ..
             }) => Some((groups.clone(), names.clone(), pre.clone(), post.clone())),
+            _ => None,
+        }
+    }
+    /// The per-group `[start, end)` BYTE spans of a `MatchData`, parallel to its
+    /// groups (`None` where the group did not match).
+    pub fn matchdata_offsets(&self, v: &Value) -> Option<Vec<Option<(usize, usize)>>> {
+        match self.obj(v) {
+            Some(RObj::MatchData { offsets, .. }) => Some(offsets.clone()),
+            _ => None,
+        }
+    }
+    /// The Regexp a `MatchData` was produced by, for `#regexp`.
+    pub fn matchdata_regexp(&self, v: &Value) -> Option<Value> {
+        match self.obj(v) {
+            Some(RObj::MatchData { regexp, .. }) => Some(regexp.clone()),
             _ => None,
         }
     }
@@ -2751,18 +2783,23 @@ impl RubyHost {
     }
     /// Build a `MatchData` for `re.captures(subject)` at the point where the whole
     /// match spans `[start, end)`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_matchdata(
         &mut self,
         groups: Vec<Option<String>>,
         names: Vec<(String, usize)>,
+        offsets: Vec<Option<(usize, usize)>>,
         pre: String,
         post: String,
+        regexp: Value,
     ) -> Value {
         self.alloc(RObj::MatchData {
             groups,
             names,
+            offsets,
             pre,
             post,
+            regexp,
         })
     }
 
