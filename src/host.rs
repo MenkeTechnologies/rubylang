@@ -321,6 +321,19 @@ pub enum RObj {
     /// block of the Enumerator an endless Range (`(1..)`) answers a block-less
     /// enumerator method with. Bounded by the consumer, like `CycleProc`.
     SeqProc(i64),
+    /// A native generator body yielding `from`, `from + by`, `from + 2·by`, …
+    /// forever: the driving block of the Enumerator a limitless `Numeric#step`
+    /// (`1.step(by: 3)`) answers with. Bounded by the consumer, like `SeqProc`.
+    /// Integer successors come from `+`, so the sequence keeps its receiver's
+    /// numeric class and promotes on overflow exactly as MRI's does. `float`
+    /// selects MRI's `ruby_float_step` formula instead — the i-th value is
+    /// `i·by + from`, NOT the running sum, and the two disagree on accumulated
+    /// error (`0.0.step(by: 0.1).first(7).last` is `0.6000000000000001`).
+    StepProc {
+        from: Value,
+        by: Value,
+        float: bool,
+    },
     /// A native generator body that reshapes another generator's values. `src` is
     /// that source generator's own driving block (re-run from the start on each
     /// batch, as generator blocks are pure); `kind` is the transform.
@@ -2186,6 +2199,12 @@ impl RubyHost {
         let seq = self.alloc(RObj::SeqProc(lo));
         self.new_derived_enumerator(seq, kind)
     }
+    /// The Enumerator a limitless `Numeric#step` answers with: `from`,
+    /// `from + by`, … forever, materialized only as far as a consumer pulls.
+    pub fn new_step_enumerator(&mut self, from: Value, by: Value, float: bool) -> Value {
+        let seq = self.alloc(RObj::StepProc { from, by, float });
+        self.new_generator(seq)
+    }
     /// The driving block of a `Generator`, if `v` is one.
     pub fn generator_block(&self, v: &Value) -> Option<Value> {
         match self.obj(v) {
@@ -3233,6 +3252,73 @@ impl RubyHost {
             None => Vec::new(),
         }
     }
+    /// `Proc#parameters`. Shaped like [`Self::method_parameters`], with one
+    /// difference the reference is explicit about: a NON-lambda proc reports its
+    /// required positionals as `:opt`, because a block accepts a call that does
+    /// not supply them. The `lambda:` keyword forces either reading.
+    ///
+    /// ```console
+    /// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p proc { |a| }.parameters, lambda { |a| }.parameters'
+    /// [[:opt, :a]]
+    /// [[:req, :a]]
+    /// ```
+    pub fn proc_parameters(
+        &self,
+        v: &Value,
+        lambda: Option<bool>,
+    ) -> Vec<(&'static str, Option<String>)> {
+        match self.obj(v) {
+            Some(RObj::Proc {
+                template,
+                is_lambda,
+                kind,
+                ..
+            }) => {
+                // A curried or composed proc has no written parameter list left;
+                // MRI describes all three as taking a bare rest.
+                if matches!(
+                    kind,
+                    ProcKind::Curried { .. }
+                        | ProcKind::MethodCurried { .. }
+                        | ProcKind::Composed { .. }
+                ) {
+                    return vec![("rest", None)];
+                }
+                let p = &self.procs[*template];
+                // The parser desugars a block's keyword params into one synthetic
+                // trailing capture param, which is not a parameter of the proc.
+                let positional = match p.params.last().map(String::as_str) {
+                    Some("__blockkw") => &p.params[..p.params.len() - 1],
+                    _ => &p.params[..],
+                };
+                let mut out = written_params(
+                    positional,
+                    p.splat,
+                    p.arity.opt as usize,
+                    &p.arity.kwnames,
+                    &p.arity.kwreq,
+                    p.arity.kwsplat.as_deref(),
+                    p.arity.blockparam.as_deref(),
+                );
+                if !lambda.unwrap_or(*is_lambda) {
+                    for e in out.iter_mut() {
+                        if e.0 == "req" {
+                            e.0 = "opt";
+                        }
+                    }
+                }
+                out
+            }
+            // `Symbol#to_proc` takes the receiver plus whatever the method takes.
+            Some(RObj::SymProc(_)) => vec![("req", None), ("rest", None)],
+            Some(RObj::Method {
+                recv,
+                name,
+                unbound,
+            }) => self.method_parameters(recv, name, *unbound),
+            _ => Vec::new(),
+        }
+    }
     /// `Method#arity`. A written method reports the count of its required
     /// parameters, negated (`-(n+1)`) when the call shape is not a single fixed
     /// count; a built-in reports the arity the reference interpreter declares for
@@ -3305,6 +3391,7 @@ impl RubyHost {
                 | Some(RObj::SymProc(_))
                 | Some(RObj::CycleProc(_))
                 | Some(RObj::SeqProc(_))
+                | Some(RObj::StepProc { .. })
                 | Some(RObj::DeriveProc { .. })
         )
     }
@@ -6141,6 +6228,7 @@ impl RubyHost {
                 | Some(RObj::SymProc(_))
                 | Some(RObj::CycleProc(_))
                 | Some(RObj::SeqProc(_))
+                | Some(RObj::StepProc { .. })
                 | Some(RObj::DeriveProc { .. }) => "#<Proc>".to_string(),
                 // MRI renders the DEFINING module, not the receiver's class, and
                 // tags an UnboundMethod as one. (MRI also appends the written
@@ -6487,6 +6575,7 @@ impl RubyHost {
                 | Some(RObj::SymProc(_))
                 | Some(RObj::CycleProc(_))
                 | Some(RObj::SeqProc(_))
+                | Some(RObj::StepProc { .. })
                 | Some(RObj::DeriveProc { .. }) => "Proc",
                 // An UnboundMethod is its own class in MRI, with its own surface
                 // (`bind`/`bind_call` but no `call`/`receiver`), so it must not
@@ -7783,7 +7872,16 @@ fn written_params(
         } else {
             "opt"
         };
-        out.push((kind, Some(name)));
+        // A DESTRUCTURING parameter — `->(a, (b, c)) {}` — has no written name.
+        // The parser gives it a synthetic one to bind against, and MRI reports
+        // such a parameter as a one-element entry:
+        //
+        // ```console
+        // $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ->(a, (b, c)) {}.parameters'
+        // [[:req, :a], [:req]]
+        // ```
+        let written = (!name.starts_with("__destructure_")).then_some(name);
+        out.push((kind, written));
     }
     for k in kwnames {
         let kind = if kwreq.contains(k) { "keyreq" } else { "key" };
@@ -10535,6 +10633,43 @@ pub fn call_proc_self_ctx(
                     return Ok(Value::Undef);
                 }
                 i += 1;
+            }
+        }
+        // The limitless-`step` generator body: add `by` forever until the
+        // yielder's limit breaks out. `+` keeps the sequence in the receiver's
+        // numeric class and promotes on overflow, as MRI's does.
+        Some(RObj::StepProc { from, by, float }) => {
+            let Some(yielder) = args.first().cloned() else {
+                return Err("no yielder is available".to_string());
+            };
+            if float {
+                let to_f = |v: &Value| -> Result<f64, String> {
+                    match crate::builtins::dispatch(v, "to_f", &[], None)? {
+                        Value::Float(f) => Ok(f),
+                        other => Ok(match other {
+                            Value::Int(n) => n as f64,
+                            _ => 0.0,
+                        }),
+                    }
+                };
+                let (base, unit) = (to_f(&from)?, to_f(&by)?);
+                let mut i = 0.0f64;
+                loop {
+                    let v = Value::Float(i * unit + base);
+                    crate::builtins::dispatch(&yielder, "<<", &[v], None)?;
+                    if has_pending_signal() {
+                        return Ok(Value::Undef);
+                    }
+                    i += 1.0;
+                }
+            }
+            let mut cur = from;
+            loop {
+                crate::builtins::dispatch(&yielder, "<<", std::slice::from_ref(&cur), None)?;
+                if has_pending_signal() {
+                    return Ok(Value::Undef);
+                }
+                cur = crate::builtins::dispatch(&cur, "+", std::slice::from_ref(&by), None)?;
             }
         }
         // A derived generator body: pull the source in batches and forward the

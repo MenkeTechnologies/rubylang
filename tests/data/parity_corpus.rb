@@ -3558,3 +3558,94 @@ p [big > 1.0, big < Float::INFINITY, 1.0 < big, Rational(1, 2) < 0.6]
 # `eql?` stays class-strict, and the two remain distinct Hash keys.
 p [big.eql?(big.to_f), big.eql?(big), [big, big.to_f].uniq.size]
 p({big => :i}[big.to_f])
+#==#
+# `%f`/`%e`/`%g` round through MRI's `dtoa`, not through correct rounding of the
+# exact value. Below `Quick_max` (14) digits a floating-point shortcut runs and
+# ties in ITS digits break to even; past it the exact big-integer path takes
+# over, so one more requested digit can flip the answer. A libc `printf` gives
+# 2.35 / 2.67 / 0.3 for the first three.
+p ["%.2f" % 2.345, "%.2f" % 2.675, "%.1f" % 0.35, "%.2f" % 1.005]
+p ["%.2f" % 8.835, "%.1f" % 0.25, "%.0f" % 0.5, "%.0f" % 1.5, "%.0f" % 2.5]
+p ["%.2e" % 2.345, "%.20f" % 0.1, "%.17g" % 0.1]
+v = 0.8730584682565505
+p ["%.14f" % v, "%.15f" % v]
+# The shortcut's accumulated error carries a digit the exact value would not
+# (647003.6098933348 is exactly 647003.60989333479…), and when it stops within
+# its error bound of a tie it leaves `half` set, which suppresses the exact
+# path's increment on an even last digit.
+p ["%.8f" % 647003.6098933348, "%.13e" % 8.061175494477254e42]
+# `%g` shows exactly the digits `dtoa` returned: no ALT flag pads them back, so
+# suppression happens where dtoa suppresses and nowhere else.
+p ["%.14G" % 8.511594981705056e17, "%.10g" % 1.5, "%.9G" % 5531451705.0]
+p ["%.2f" % 1e23, "%.5e" % 1e23, "%g" % 1e-5, "%.3f" % 0.0]
+#==#
+# `%f` on an Integer or Rational is exact integer arithmetic — it never round
+# trips through a double — and `#` does not apply on that path.
+p ["%f" % 98335312630379694749, "%f" % 98335312630379694749.0]
+p ["%.3f" % (2**70), "%f" % Rational(1, 3), "%20.2f" % (10**30 + 1)]
+p ["%#.0f" % 122, "%#.0f" % 122.5]
+# Integer base conversions span promoted Integers, in both signs, and the `..`
+# two's-complement notation counts its own marker toward the precision.
+p ["%d" % (2**70), "%x" % (2**70), "%o" % (2**70), "%#x" % (2**70)]
+p ["%d" % (-2**70), "%x" % (-2**70), "%.30d" % (2**70)]
+p ["%.11x" % -137, "%.5x" % -255, "%.10b" % -5, "%#.0o" % 0, "%.0o" % 0]
+#==#
+# Every way a format string can disagree with its operands raises rather than
+# substituting a 0 or an empty string.
+def caught
+  yield
+rescue StandardError => e
+  [e.class.to_s, e.message]
+end
+p ["%d" % "0x1f", "%d" % "1_0", "%x" % "12"]
+p caught { "%d" % "x" }, caught { "%f" % "x" }, caught { "%d" % nil }
+p caught { "%d" % :sym }, caught { "%s %s" % ["a"] }, caught { "%*d" % [5] }
+p caught { "%" % [] }, caught { "%q" % 1 }, caught { "%0$s" % ["a"] }
+p caught { "%<a>s" % {b: 1} }, caught { "%{a}" % {b: 1} }
+p caught { "%1$s %s" % ["a", "b"] }, caught { "%s %1$s" % ["a", "b"] }
+p caught { "%s %<a>s" % {a: 1} }, caught { "%1$s %{a}" % {a: 1} }
+p ["%1$s %2$s" % ["a", "b"], "%1$s %1$s" % ["a"], "%1$*2$d" % [5, 8]]
+p caught { "%c" % :sym }, caught { "%c" % nil }, caught { "%c" % (2**70) }
+p caught { "%c" % (2**40) }, caught { "%c" % 1114112 }
+p ["%c" % 65, "%c" % "hello"]
+#==#
+# `Numeric#step` reads `to:`/`by:` keywords. Arriving as one trailing Hash they
+# measured as a limit of 0 and produced an EMPTY enumeration — a wrong answer
+# with no error raised anywhere.
+p 1.step(by: 2, to: 7).to_a, 1.step(to: 5).to_a, 10.step(by: -2, to: 4).to_a
+p 1.0.step(by: 0.5, to: 2.5).to_a, 1.step(to: 10.0, by: 3).to_a
+p 1.step(by: 2.0, to: 7).to_a, 1.step(1, by: 2).to_a
+a = []
+1.step(by: 2, to: 7) { |i| a << i }
+p a, 1.step(by: 2, to: 7).size, 1.step(by: 2, to: 7).each_slice(2).to_a
+def caught
+  yield
+rescue StandardError => e
+  [e.class.to_s, e.message]
+end
+p caught { 1.step(5, to: 7).to_a }, caught { 1.step(5, 2, by: 3).to_a }
+#==#
+# A limitless step is INFINITE, so it has to stay a generator the consumer
+# bounds; materializing it hung. A Float sequence is `i*by + from`, not the
+# running sum, so the seventh value is `6 * 0.1`.
+p 1.step(by: 3).first(4), 1.step(by: 1).take(3)
+p 1.step(by: 3).lazy.map { |x| x * 2 }.first(3)
+b = []
+1.step(by: 3) { |i| b << i; break if b.size == 4 }
+d = []
+5.step(by: -2) { |i| d << i; break if d.size == 3 }
+p b, d
+p 1.step(Float::INFINITY, 3).first(4), 1.step(-Float::INFINITY, 3).first(3)
+p 1.step(Float::INFINITY, -3).first(3), 0.0.step(by: 0.1).first(8)
+#==#
+# `Proc#parameters` reports a NON-lambda proc's required positionals as `:opt`,
+# and a destructuring parameter as a one-element entry (it has no written name,
+# so the synthetic one the parser binds it to must not leak).
+p ->(a, b = 1, *c, d:, e: 2, **f, &g) {}.parameters
+p proc { |a, b| }.parameters, lambda { |a, b| }.parameters
+p proc { |a, b = 1, *c, d:| }.parameters, proc {}.parameters
+p ->(*a) {}.parameters, ->(**k) {}.parameters
+p proc { |a, b| }.parameters(lambda: true), ->(a, b) {}.parameters(lambda: false)
+p ->(a, (b, c)) {}.parameters, proc { |a, (b, c)| }.parameters
+p :upcase.to_proc.parameters, 1.method(:+).to_proc.parameters
+p ->(a, b) {}.curry.parameters, (->(a) {} >> ->(b) {}).parameters

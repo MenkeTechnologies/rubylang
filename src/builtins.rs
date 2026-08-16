@@ -5841,17 +5841,77 @@ fn dispatch_number(
             }
         },
         "step" => {
+            // Port of MRI's `num_step_extract_args`: the limit and the step can
+            // come positionally OR as `to:`/`by:` keywords, never both, and an
+            // absent limit means the sequence never ends. Without this the
+            // keyword form reached the code below as a single Hash argument,
+            // which measured as a limit of 0 and answered an EMPTY enumeration:
+            //
+            // ```console
+            // $ /usr/bin/ruby -e 'p 1.step(by: 2, to: 7).to_a'
+            // [1, 3, 5, 7]
+            // ```
+            let mut pos: Vec<Value> = args.to_vec();
+            let (mut kw_to, mut kw_by) = (None, None);
+            if let Some(kw) = pos.last().and_then(|a| with_host(|h| h.as_hash(a))) {
+                let t = kw.get(&RKey::Sym("to".into())).cloned();
+                let b = kw.get(&RKey::Sym("by".into())).cloned();
+                if t.is_some() || b.is_some() {
+                    pos.pop();
+                    if t.is_some() && !pos.is_empty() {
+                        return Err(raise_exc("ArgumentError", "to is given twice"));
+                    }
+                    if b.is_some() && pos.len() > 1 {
+                        return Err(raise_exc("ArgumentError", "step is given twice"));
+                    }
+                    kw_to = t;
+                    kw_by = b;
+                }
+            }
+            let to = kw_to.or_else(|| pos.first().cloned());
+            let by_val = kw_by.or_else(|| pos.get(1).cloned());
+            // No limit: the sequence runs forever. A block loops on it; without
+            // one the Enumerator stays unmaterialized so `first(n)` bounds it.
+            let Some(to) = to else {
+                let by_val = by_val.unwrap_or(Value::Int(1));
+                // A Float anywhere switches to `ruby_float_step`'s `i·by + from`.
+                let float = matches!(recv, Value::Float(_)) || matches!(by_val, Value::Float(_));
+                let Some(bl) = &block else {
+                    return Ok(with_host(|h| {
+                        h.new_step_enumerator(recv.clone(), by_val, float)
+                    }));
+                };
+                if float {
+                    let (base, unit) = (as_f(recv), as_f(&by_val));
+                    let mut i = 0.0f64;
+                    loop {
+                        call_proc(bl, &[Value::Float(i * unit + base)])?;
+                        if has_pending_signal() {
+                            return Ok(recv.clone());
+                        }
+                        i += 1.0;
+                    }
+                }
+                let mut cur = recv.clone();
+                loop {
+                    call_proc(bl, std::slice::from_ref(&cur))?;
+                    if has_pending_signal() {
+                        return Ok(recv.clone());
+                    }
+                    cur = dispatch(&cur, "+", std::slice::from_ref(&by_val), None)?;
+                }
+            };
             // All-Integer receiver/limit/step iterate over Integers; any Float
             // participant switches to Float stepping (matching Numeric#step).
             let all_int = matches!(recv, Value::Int(_))
-                && matches!(&args[0], Value::Int(_))
-                && args
-                    .get(1)
+                && matches!(&to, Value::Int(_))
+                && by_val
+                    .as_ref()
                     .map(|v| matches!(v, Value::Int(_)))
                     .unwrap_or(true);
             if all_int {
-                let limit = as_i(&args[0]);
-                let by = args.get(1).map(as_i).unwrap_or(1);
+                let limit = as_i(&to);
+                let by = by_val.as_ref().map(as_i).unwrap_or(1);
                 if by != 0 {
                     if let Some(bl) = &block {
                         let mut i = as_i(recv);
@@ -5875,8 +5935,32 @@ fn dispatch_number(
                 }
             } else {
                 let from = as_f(recv);
-                let to = as_f(&args[0]);
-                let by = args.get(1).map(as_f).unwrap_or(1.0);
+                let to = as_f(&to);
+                let by = by_val.as_ref().map(as_f).unwrap_or(1.0);
+                // An INFINITE limit makes `ruby_float_step_size` infinite too,
+                // so MRI's `for (i = 0; i < n; i++)` never stops. Materializing
+                // that hung; a limit pointing the other way is simply empty.
+                if to.is_infinite() && by != 0.0 && by.is_finite() {
+                    if (by > 0.0) != (to > 0.0) {
+                        return match &block {
+                            Some(_) => Ok(recv.clone()),
+                            None => Ok(with_host(|h| h.new_enumerator(Vec::new(), "each"))),
+                        };
+                    }
+                    let Some(bl) = &block else {
+                        return Ok(with_host(|h| {
+                            h.new_step_enumerator(Value::Float(from), Value::Float(by), true)
+                        }));
+                    };
+                    let mut i = 0.0f64;
+                    loop {
+                        call_proc(bl, &[Value::Float(i * by + from)])?;
+                        if has_pending_signal() {
+                            return Ok(recv.clone());
+                        }
+                        i += 1.0;
+                    }
+                }
                 if by != 0.0 && by.is_finite() {
                     // Ruby's float-step count: floor((to-from)/by + err) + 1,
                     // yielding `from + i*by` with the final value clamped to `to`.
@@ -7568,11 +7652,13 @@ fn dispatch_string(
             // `"%d-%d" % [1, 2]` or `"%d" % 5`; a Hash operand feeds named
             // references `%<name>s` / `%{name}`.
             if let Some(map) = with_host(|h| h.as_hash(&args[0])) {
-                Ok(new_str(sprintf(&s, &[], Some(&map))))
+                // The Hash is BOTH the named source and the sole positional
+                // operand: `"%s" % {a: 1}` prints the Hash.
+                Ok(new_str(sprintf(&s, &args[..1], Some(&map))?))
             } else {
                 let fargs =
                     with_host(|h| h.as_array(&args[0])).unwrap_or_else(|| vec![args[0].clone()]);
-                Ok(new_str(sprintf(&s, &fargs, None)))
+                Ok(new_str(sprintf(&s, &fargs, None)?))
             }
         }
         "ljust" => Ok(new_str(pad(
@@ -14895,12 +14981,27 @@ fn dispatch_proc(
                 }
             }
             "to_proc" => Ok(recv.clone()),
+            "parameters" => Ok(parameters_array(with_host(|h| {
+                h.proc_parameters(recv, None)
+            }))),
             _ => Err(no_method_error(recv, name)),
         };
     }
     match name {
         "call" | "()" | "[]" | "yield" => crate::host::call_proc_block(recv, args, block),
         "arity" => Ok(Value::Int(with_host(|h| h.proc_arity(recv)).unwrap_or(0))),
+        // `Proc#parameters(lambda: bool)` — the keyword overrides whether the
+        // required positionals read as `:req` or `:opt`.
+        "parameters" => {
+            let lambda = args
+                .first()
+                .and_then(|a| with_host(|h| h.as_hash(a)))
+                .and_then(|m| m.get(&RKey::Sym("lambda".into())).cloned())
+                .map(|v| with_host(|h| h.truthy(&v)));
+            Ok(parameters_array(with_host(|h| {
+                h.proc_parameters(recv, lambda)
+            })))
+        }
         "lambda?" => Ok(Value::Bool(with_host(|h| h.proc_is_lambda(recv)))),
         // `to_proc` on a Proc is the identity.
         "to_proc" => Ok(recv.clone()),
@@ -14951,6 +15052,28 @@ pub(crate) fn call_bound(
     }
 }
 
+/// Wrap a `(kind, name)` list as the Array-of-Arrays `#parameters` answers with.
+/// A parameter with no written name — a built-in's, or a destructuring one — is
+/// a ONE-element entry, which is how MRI reports it.
+fn parameters_array(pairs: Vec<(&'static str, Option<String>)>) -> Value {
+    with_host(|h| {
+        let arr: Vec<Value> = pairs
+            .iter()
+            .map(|(kind, pname)| {
+                let k = h.new_symbol(kind);
+                match pname {
+                    Some(n) => {
+                        let n = h.new_symbol(n);
+                        h.new_array(vec![k, n])
+                    }
+                    None => h.new_array(vec![k]),
+                }
+            })
+            .collect();
+        h.new_array(arr)
+    })
+}
+
 fn dispatch_method(
     recv: &Value,
     name: &str,
@@ -14990,25 +15113,9 @@ fn dispatch_method(
             let owner = h.method_owner(&mrecv, &mname, unbound);
             h.class_ref(&owner)
         })),
-        "parameters" => Ok(with_host(|h| {
-            let pairs = h.method_parameters(&mrecv, &mname, unbound);
-            let arr: Vec<Value> = pairs
-                .iter()
-                .map(|(kind, pname)| {
-                    let k = h.new_symbol(kind);
-                    // A built-in's parameters have no written names, and MRI
-                    // reports those as one-element entries.
-                    match pname {
-                        Some(n) => {
-                            let n = h.new_symbol(n);
-                            h.new_array(vec![k, n])
-                        }
-                        None => h.new_array(vec![k]),
-                    }
-                })
-                .collect();
-            h.new_array(arr)
-        })),
+        "parameters" => Ok(parameters_array(with_host(|h| {
+            h.method_parameters(&mrecv, &mname, unbound)
+        }))),
         "name" => Ok(with_host(|h| h.new_symbol(&mname))),
         // An UnboundMethod has no receiver — its stored value is the class the
         // name was looked up on — so MRI defines `#receiver` on `Method` only.
@@ -15878,10 +15985,10 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             // A lone trailing Hash supplies named references (`%<name>s`).
             if args.len() == 2 {
                 if let Some(map) = with_host(|h| h.as_hash(&args[1])) {
-                    return Ok(new_str(sprintf(&fmt, &[], Some(&map))));
+                    return Ok(new_str(sprintf(&fmt, &args[1..], Some(&map))?));
                 }
             }
-            Ok(new_str(sprintf(&fmt, &args[1..], None)))
+            Ok(new_str(sprintf(&fmt, &args[1..], None)?))
         }
         "printf" => {
             // `printf(fmt, *args)` writes the formatted string to stdout and
@@ -15889,11 +15996,11 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             let fmt = arg_str(&args[0]);
             let out = if args.len() == 2 {
                 match with_host(|h| h.as_hash(&args[1])) {
-                    Some(map) => sprintf(&fmt, &[], Some(&map)),
-                    None => sprintf(&fmt, &args[1..], None),
+                    Some(map) => sprintf(&fmt, &args[1..], Some(&map))?,
+                    None => sprintf(&fmt, &args[1..], None)?,
                 }
             } else {
-                sprintf(&fmt, &args[1..], None)
+                sprintf(&fmt, &args[1..], None)?
             };
             crate::host::write_stdout(&out);
             Ok(Value::Undef)
@@ -16997,13 +17104,11 @@ fn digit_char(d: u8, upper: bool) -> char {
 /// base `b` (b ∈ {2,8,16}): e.g. `-255` in hex → `"..f01"`. Returns the digit
 /// text *including* the leading `".."` and the repeating fill digit (for
 /// zero-padding). Computed as the b-1's complement of the magnitude plus one.
-fn complement_body(n: i128, base: u8, upper: bool) -> (String, char) {
-    let mut v = n.unsigned_abs();
-    let mut digits: Vec<u8> = Vec::new();
-    while v > 0 {
-        digits.push((v % base as u128) as u8);
-        v /= base as u128;
-    }
+///
+/// `digits` is the magnitude's digit values in `base`, LEAST significant
+/// first — see [`radix_digits`], which supplies them for any Integer width.
+fn complement_body(digits: &[u8], base: u8, upper: bool) -> (String, char) {
+    let mut digits = digits.to_vec();
     if digits.is_empty() {
         digits.push(0);
     }
@@ -17026,49 +17131,475 @@ fn complement_body(n: i128, base: u8, upper: bool) -> (String, char) {
     (format!("..{rc}{stripped}"), rc)
 }
 
-/// Strip trailing zeros (and a trailing `.`) from a fixed-point string — the
-/// C `%g` cleanup applied unless the `#` flag is set.
-fn strip_trailing_zeros(s: &mut String) {
-    if s.contains('.') {
-        while s.ends_with('0') {
-            s.pop();
+/// Round `digits` (the value `0.<digits> × 10^decpt`) to `keep` SIGNIFICANT
+/// digits, returning the kept digits and the — on a carry out of the leading
+/// digit, incremented — `decpt`.
+///
+/// This is `dtoa`'s big-integer tail over digits already known exactly, so its
+/// `b = lshift(b,1); j = cmp(b,S)` comparison against half is a plain digit
+/// inspection. It runs whenever [`dtoa_quick`] does not.
+///
+/// `half` is `dtoa`'s flag of the same name, set when the floating-point
+/// shortcut landed within its error bound of a tie and gave up. It turns the
+/// final increment into `if (!half || (*s - '0') & 1) ++*s;` — round up ONLY on
+/// an odd last digit, even when the exact remainder is strictly above half.
+/// That is observable, and it is why MRI truncates here where a correctly
+/// rounding `printf` carries:
+///
+/// ```console
+/// $ /usr/bin/ruby -e 'printf("%.13e\n", 8.061175494477254e42)'
+/// 8.0611754944772e+42
+/// ```
+///
+/// The exact value is `8.0611754944772535306…e42`, so the digit dropped is a
+/// `5` with a nonzero tail — but the last kept digit is an even `2`.
+fn round_significant(
+    digits: &[u8],
+    decpt: i32,
+    keep: isize,
+    half: bool,
+    trim: bool,
+) -> (Vec<u8>, i32) {
+    if keep >= digits.len() as isize {
+        return (digits.to_vec(), decpt);
+    }
+    if keep < 0 {
+        // The rounding position sits at least two places left of the leading
+        // digit, so the value is below half of the last retained place.
+        return (Vec::new(), decpt);
+    }
+    let k = keep as usize;
+    let d = digits[k];
+    // `j > 0 || (j == 0 && (dig & 1))`: past half, or exactly half with an odd
+    // last kept digit. Nothing is kept at `keep == 0`, where the digit left of
+    // the cut is an implicit even 0.
+    let roundoff = d > b'5'
+        || (d == b'5'
+            && (digits[k + 1..].iter().any(|&b| b != b'0')
+                || (k > 0 && (digits[k - 1] - b'0') % 2 == 1)));
+    if !roundoff {
+        // `else { while (*--s == '0') ; }`: `dtoa` suppresses trailing zeros on
+        // the way out. `%f`/`%e` pad them straight back, but `%g` shows exactly
+        // what came back, so the suppression is load-bearing there.
+        let mut out = digits[..k].to_vec();
+        while trim && out.len() > 1 && out.last() == Some(&b'0') {
+            out.pop();
         }
-        if s.ends_with('.') {
-            s.pop();
+        return (out, decpt);
+    }
+    if k == 0 {
+        return (vec![b'1'], decpt + 1);
+    }
+    let mut out = digits[..k].to_vec();
+    // `while (*--s == '9')`: back over a run of nines, which the trailing `s++`
+    // then drops. A carry off the front widens the number by a place.
+    let mut i = out.len();
+    loop {
+        i -= 1;
+        if out[i] != b'9' {
+            break;
+        }
+        if i == 0 {
+            return (vec![b'1'], decpt + 1);
+        }
+    }
+    out.truncate(i + 1);
+    if !half || (out[i] - b'0') % 2 == 1 {
+        out[i] += 1;
+    }
+    (out, decpt)
+}
+
+/// The EXACT decimal expansion of a finite, non-negative `f64`, in the same
+/// `0.<digits> × 10^decpt` convention as [`dtoa_quick`].
+///
+/// Reached only when the caller asks for more digits than the shortest
+/// round-trip form has, which is where MRI stops agreeing with it:
+///
+/// ```console
+/// $ /usr/bin/ruby -e 'p sprintf("%.20f", 0.1)'
+/// "0.10000000000000000555"
+/// ```
+///
+/// `f` is `mantissa × 2^exp2`. A negative `exp2` becomes `mantissa × 5^k`
+/// with the decimal point moved `k` places left, since `2^-k = 5^k / 10^k`,
+/// keeping the whole computation in exact integer arithmetic.
+fn exact_digits(f: f64) -> (Vec<u8>, i32) {
+    const LIMB: u64 = 1_000_000_000;
+    if f == 0.0 {
+        return (Vec::new(), 0);
+    }
+    let bits = f.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    // Subnormals have no implicit leading 1 and a fixed exponent.
+    let (mantissa, exp2) = if biased == 0 {
+        (frac, -1074)
+    } else {
+        (frac | (1u64 << 52), biased - 1075)
+    };
+
+    let mut limbs = vec![
+        (mantissa % LIMB) as u32,
+        ((mantissa / LIMB) % LIMB) as u32,
+        (mantissa / (LIMB * LIMB)) as u32,
+    ];
+    while limbs.len() > 1 && limbs.last() == Some(&0) {
+        limbs.pop();
+    }
+
+    let (factor, mut reps, shift) = if exp2 >= 0 {
+        (2u32, exp2, 0)
+    } else {
+        (5u32, -exp2, -exp2)
+    };
+    // Largest power of the factor whose product with a full limb still fits a
+    // `u64`: 2^29 · (10^9−1) and 5^12 · (10^9−1) both do.
+    let per_pass = if factor == 2 { 29 } else { 12 };
+    while reps > 0 {
+        let n = reps.min(per_pass);
+        let mul = (factor as u64).pow(n as u32);
+        let mut carry = 0u64;
+        for l in limbs.iter_mut() {
+            let v = *l as u64 * mul + carry;
+            *l = (v % LIMB) as u32;
+            carry = v / LIMB;
+        }
+        while carry > 0 {
+            limbs.push((carry % LIMB) as u32);
+            carry /= LIMB;
+        }
+        reps -= n;
+    }
+
+    let mut digits = limbs.last().copied().unwrap_or(0).to_string().into_bytes();
+    for l in limbs.iter().rev().skip(1) {
+        digits.extend_from_slice(format!("{l:09}").as_bytes());
+    }
+    let decpt = digits.len() as i32 - shift;
+    while digits.len() > 1 && digits.last() == Some(&b'0') {
+        digits.pop();
+    }
+    (digits, decpt)
+}
+
+/// `dtoa`'s `Quick_max` for an IEEE double: the largest digit count it will
+/// still try to produce with plain floating-point arithmetic
+/// (`floor((P-1)·log(2)/log(10) − 1)` for `P = 53`).
+const QUICK_MAX: isize = 14;
+
+/// `dtoa`'s `Int_max`: the largest `k` for which its exact "small integer"
+/// division path applies (`floor(P·log(2)/log(10) − 1)` for `P = 53`).
+const INT_MAX: i32 = 14;
+
+/// `dtoa`'s `tens` / `bigtens` scaling tables and its `Bletch` overflow guard.
+const TENS: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+];
+const BIGTENS: [f64; 5] = [1e16, 1e32, 1e64, 1e128, 1e256];
+const BLETCH: i32 = 0x10;
+
+/// `dtoa`'s estimate `k` of `decpt - 1`, plus the `k_check` flag saying whether
+/// the estimate is still allowed to be one too high.
+///
+/// Port of the `ds = (dval(d2)-1.5)*0.289529654602168 + …` block of
+/// `ruby/util.c`'s `dtoa`. `d2` is the significand normalized into `[1, 2)` and
+/// `i` the binary exponent; the C code derives both from the raw bits, with a
+/// separate branch for subnormals, and this reproduces that split.
+fn k_estimate(f: f64) -> (i32, bool) {
+    let bits = f.to_bits();
+    const FRAC: u64 = (1u64 << 52) - 1;
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let (d2, i) = if biased != 0 {
+        (
+            f64::from_bits((bits & FRAC) | (1023u64 << 52)),
+            biased - 1023,
+        )
+    } else {
+        let frac = bits & FRAC;
+        let top = 63 - frac.leading_zeros() as i32;
+        (
+            f64::from_bits(((frac << (52 - top as u32)) & FRAC) | (1023u64 << 52)),
+            top - 1074,
+        )
+    };
+    // These three literals are `dtoa`'s, not derivable constants. The last is a
+    // TRUNCATED `log10(2)` and the middle term a constant `dtoa` deliberately
+    // rounded up ("We want k to be too large rather than too small"), so
+    // substituting `f64::consts::LOG10_2` would change `k` at a boundary and
+    // with it which digits the shortcut generates.
+    #[allow(clippy::approx_constant)]
+    let ds = (d2 - 1.5) * 0.289529654602168 + 0.1760912590558 + i as f64 * 0.301029995663981;
+    let mut k = ds as i32;
+    if ds < 0.0 && ds != k as f64 {
+        k -= 1; // want k = floor(ds)
+    }
+    let mut k_check = true;
+    if (0..=22).contains(&k) {
+        if f < TENS[k as usize] {
+            k -= 1;
+        }
+        k_check = false;
+    }
+    (k, k_check)
+}
+
+/// Port of `dtoa`'s "try to get by with floating-point arithmetic" shortcut for
+/// the `leftright == 0` modes (2 and 3), the only ones MRI's float formatting
+/// uses. `None` is `dtoa`'s `fast_failed`: the caller must redo the digits
+/// exactly.
+///
+/// The shortcut is not merely an optimization — it is OBSERVABLE. It generates
+/// `ilim` digits by repeated multiplication of a scaled double, so accumulated
+/// error can push the residual past the `eps` guard and carry a digit the exact
+/// value would not:
+///
+/// ```console
+/// $ /usr/bin/ruby -e 'printf("%.8f\n", 647003.6098933348)'
+/// 647003.60989334
+/// $ printf '%.8f\n' 647003.6098933348   # libc, exact-value rounding
+/// 647003.60989333
+/// ```
+///
+/// The exact expansion is `647003.60989333479…`, so MRI's answer is the one the
+/// shortcut produces, and reproducing it means reproducing the arithmetic.
+enum Quick {
+    /// The shortcut committed to these digits and this `decpt`.
+    Digits(Vec<u8>, i32),
+    /// `fast_failed`. The `bool` is `dtoa`'s `half`, which survives the retry
+    /// and changes how the exact path rounds off — see [`round_significant`].
+    Failed(bool),
+}
+
+fn dtoa_quick(f: f64, k_in: i32, k_check: bool, ilim_in: isize, ilim1: isize) -> Quick {
+    let mut d = f;
+    let mut k = k_in;
+    let mut ilim = ilim_in;
+    let mut ieps = 2.0f64; // conservative
+    let mut i = 0usize;
+    if k > 0 {
+        let mut ds = TENS[(k & 0xf) as usize];
+        let mut j = k >> 4;
+        if j & BLETCH != 0 {
+            // prevent overflows
+            j &= BLETCH - 1;
+            d /= BIGTENS[BIGTENS.len() - 1];
+            ieps += 1.0;
+        }
+        while j != 0 {
+            if j & 1 != 0 {
+                ieps += 1.0;
+                ds *= BIGTENS[i];
+            }
+            j >>= 1;
+            i += 1;
+        }
+        d /= ds;
+    } else if -k != 0 {
+        let j1 = -k;
+        d *= TENS[(j1 & 0xf) as usize];
+        let mut j = j1 >> 4;
+        while j != 0 {
+            if j & 1 != 0 {
+                ieps += 1.0;
+                d *= BIGTENS[i];
+            }
+            j >>= 1;
+            i += 1;
+        }
+    }
+    if k_check && d < 1.0 && ilim > 0 {
+        if ilim1 <= 0 {
+            return Quick::Failed(false);
+        }
+        ilim = ilim1;
+        k -= 1;
+        d *= 10.0;
+        ieps += 1.0;
+    }
+    let mut eps = ieps * d + 7.0;
+    // `word0(eps) -= (P-1)*Exp_msk1`: 52 off the exponent field, i.e. eps/2^52.
+    // `eps >= 7.0` here, so the exponent cannot underflow.
+    eps = f64::from_bits(eps.to_bits() - (52u64 << 52));
+    if ilim <= 0 {
+        // `dtoa` handles this with its own `one_digit`/`no_digits` exits; leave
+        // it to the exact path, which resolves the same question without a
+        // tolerance.
+        return Quick::Failed(false);
+    }
+
+    // "Generate ilim digits, then fix them up."
+    eps *= TENS[(ilim - 1) as usize];
+    let mut s: Vec<u8> = Vec::with_capacity(ilim as usize);
+    let mut i = 1isize;
+    loop {
+        let l = d as i32;
+        d -= l as f64;
+        if d == 0.0 {
+            ilim = i;
+        }
+        s.push(b'0' + l as u8);
+        if i == ilim {
+            if d > 0.5 + eps {
+                let (s, decpt) = quick_bump_up(s, k);
+                return Quick::Digits(s, decpt);
+            } else if d < 0.5 - eps {
+                while s.len() > 1 && s.last() == Some(&b'0') {
+                    s.pop();
+                }
+                return Quick::Digits(s, k + 1);
+            }
+            // Within `eps` of a tie. `dtoa` sets `half = 1` and rounds up only
+            // for an odd last digit; on an even one it falls through to
+            // `fast_failed`, and the exact path's `if (!half || (*s-'0') & 1)`
+            // then suppresses the increment — half-to-even either way.
+            if (s[s.len() - 1] - b'0') & 1 == 1 {
+                let (s, decpt) = quick_bump_up(s, k);
+                return Quick::Digits(s, decpt);
+            }
+            return Quick::Failed(true);
+        }
+        i += 1;
+        d *= 10.0;
+    }
+}
+
+/// `dtoa`'s `bump_up`: increment the last digit, carrying through a run of
+/// nines and widening `k` when the carry runs off the front.
+fn quick_bump_up(mut s: Vec<u8>, mut k: i32) -> (Vec<u8>, i32) {
+    let mut idx = s.len();
+    loop {
+        idx -= 1;
+        if s[idx] != b'9' {
+            s[idx] += 1;
+            s.truncate(idx + 1);
+            return (s, k + 1);
+        }
+        if idx == 0 {
+            k += 1;
+            s[0] = b'1';
+            s.truncate(1);
+            return (s, k + 1);
         }
     }
 }
 
-/// The largest precision Rust's formatter accepts. Past it `format!("{:.*}", p, f)`
-/// panics with "Formatting argument out of range", and a panic is not a Ruby
-/// error — no `rescue` can see it. MRI has no such ceiling.
-const FMT_PREC_CAP: usize = u16::MAX as usize;
-
-/// `format!("{:.*}", prec, f)` without Rust's precision ceiling. Every finite
-/// `f64` has an exact decimal expansion of at most ~1080 places, so everything
-/// past the cap is zero padding and appending it is exact:
+/// The digit string and `decpt` MRI produces for a `keep`-significant-digit
+/// budget, mirroring `dtoa`'s two regimes: [`dtoa_quick`] up to [`QUICK_MAX`]
+/// digits, the exact big-integer expansion past it or whenever the shortcut
+/// gives up.
+///
+/// The boundary is observable — one more requested digit crosses it and flips
+/// the answer:
 ///
 /// ```console
-/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p sprintf("%.70000f", 1.5).size'
+/// $ /usr/bin/ruby -e 'v = 0.8730584682565505; printf("%.14f %.15f\n", v, v)'
+/// 0.87305846825655 0.873058468256551
+/// ```
+///
+/// `mode3` selects `dtoa`'s mode 3 (`%f`: `ndigits` places past the decimal
+/// point, so the digit budget moves with `decpt`) over mode 2 (`%e`/`%g`:
+/// `ndigits` significant digits). The two also disagree on `ilim1`, which is
+/// what `dtoa` falls back to when its `k` estimate came out one too high.
+fn mri_digits(f: f64, mode3: bool, ndigits: isize) -> (Vec<u8>, i32) {
+    let budget = |decpt: i32| {
+        if mode3 {
+            decpt as isize + ndigits
+        } else {
+            ndigits.max(1)
+        }
+    };
+    if f == 0.0 {
+        return (Vec::new(), 0);
+    }
+    let (k, k_check) = k_estimate(f);
+    let (ilim, ilim1) = if mode3 {
+        let i = ndigits + k as isize + 1;
+        (i, i - 1)
+    } else {
+        let n = ndigits.max(1);
+        (n, n)
+    };
+    let mut half = false;
+    if (0..=QUICK_MAX).contains(&ilim) {
+        match dtoa_quick(f, k, k_check, ilim, ilim1) {
+            Quick::Digits(digits, decpt) => return (digits, decpt),
+            Quick::Failed(h) => half = h,
+        }
+    }
+    let (digits, decpt) = exact_digits(f);
+    // `dtoa`'s "Do we have a 'small' integer?" branch, `be >= 0 && k <=
+    // Int_max`: an integral value below 10^15 gets its digits by exact
+    // division. That exit reaches neither the `half` override nor the trailing
+    // zero suppression of the big-integer tail, and both are observable:
+    //
+    // ```console
+    // $ /usr/bin/ruby -e 'printf("%.9G\n", 5531451705.0)'
+    // 5.53145170E+09
+    // ```
+    let small_int = f == f.trunc() && (0..=INT_MAX).contains(&k);
+    if small_int {
+        half = false;
+    }
+    round_significant(&digits, decpt, budget(decpt), half, !small_int)
+}
+
+/// `%f`'s digits: `prec` places after the decimal point, MRI-rounded.
+///
+/// Unlike `format!("{:.*}", prec, f)` this has no precision ceiling (Rust's
+/// formatter panics past `u16::MAX`, and a panic is not a Ruby error that any
+/// `rescue` could see) and it rounds the way MRI does — see
+/// [`round_significant`].
+///
+/// ```console
+/// $ /usr/bin/ruby -e 'p sprintf("%.70000f", 1.5).size'
 /// 70002
 /// ```
 fn fixed(f: f64, prec: usize) -> String {
-    if prec <= FMT_PREC_CAP {
-        return format!("{:.*}", prec, f);
+    let (digits, decpt) = mri_digits(f, true, prec as isize);
+    let mut int = String::new();
+    let mut frac = String::new();
+    if decpt <= 0 || digits.is_empty() {
+        int.push('0');
+        if !digits.is_empty() {
+            frac.push_str(&"0".repeat((-decpt) as usize));
+        }
+    } else {
+        let take = (decpt as usize).min(digits.len());
+        int.push_str(std::str::from_utf8(&digits[..take]).unwrap_or("0"));
+        int.push_str(&"0".repeat(decpt as usize - take));
     }
-    format!("{:.*}{}", FMT_PREC_CAP, f, "0".repeat(prec - FMT_PREC_CAP))
+    let start = decpt.max(0) as usize;
+    if start < digits.len() {
+        frac.push_str(std::str::from_utf8(&digits[start..]).unwrap_or(""));
+    }
+    frac.truncate(prec);
+    if frac.len() < prec {
+        frac.push_str(&"0".repeat(prec - frac.len()));
+    }
+    if prec == 0 {
+        int
+    } else {
+        format!("{int}.{frac}")
+    }
 }
 
-/// [`fixed`] for the `{:.*e}` form: the padding belongs on the MANTISSA, before
-/// the exponent marker.
+/// [`fixed`] for the `{:.*e}` form — `prec` digits after the leading one, with
+/// Rust's bare exponent (`1.50e3`) that [`fmt_e`] and [`fmt_g`] re-render.
 fn sci(f: f64, prec: usize) -> String {
-    if prec <= FMT_PREC_CAP {
-        return format!("{:.*e}", prec, f);
+    let (digits, decpt) = mri_digits(f, false, prec as isize + 1);
+    let mut digits = digits;
+    if digits.is_empty() {
+        digits.push(b'0');
     }
-    let raw = format!("{:.*e}", FMT_PREC_CAP, f);
-    match raw.split_once('e') {
-        Some((mant, exp)) => format!("{mant}{}e{exp}", "0".repeat(prec - FMT_PREC_CAP)),
-        None => raw,
+    let exp = if f == 0.0 { 0 } else { decpt - 1 };
+    digits.resize(prec + 1, b'0');
+    let s = String::from_utf8(digits).unwrap_or_default();
+    if prec == 0 {
+        format!("{s}e{exp}")
+    } else {
+        format!("{}.{}e{exp}", &s[..1], &s[1..])
     }
 }
 
@@ -17088,57 +17619,333 @@ fn fmt_e(f: f64, prec: usize, upper: bool, alt: bool) -> String {
 }
 
 /// Render a non-negative finite float in `%g`/`%G` form (C general format).
+///
+/// Unlike `%f`/`%e`, MRI's `vsnprintf` does NOT set the `ALT` flag for `%g`, so
+/// nothing pads the digits back out — `%g` shows exactly the digits `dtoa`
+/// returned. Trailing zeros therefore disappear because `dtoa` suppressed them,
+/// not because of a post-pass, and the distinction is visible: `dtoa`'s
+/// round-off exit does no such suppression, so a rounded `%g` can end in `0`.
+///
+/// ```console
+/// $ /usr/bin/ruby -e 'printf("%.14G|%.10g\n", 8.511594981705056e17, 1.5)'
+/// 8.5115949817050E+17|1.5
+/// ```
 fn fmt_g(f: f64, prec: usize, upper: bool, alt: bool) -> String {
     let p = if prec == 0 { 1 } else { prec };
-    // Exponent after rounding to `p` significant digits.
-    let raw = sci(f, p - 1);
-    let e: i32 = raw
-        .split_once('e')
-        .and_then(|(_, x)| x.parse().ok())
-        .unwrap_or(0);
-    if e >= -4 && e < p as i32 {
-        let frac = (p as i32 - 1 - e).max(0) as usize;
-        let mut s = fixed(f, frac);
-        if !alt {
-            strip_trailing_zeros(&mut s);
-        } else if !s.contains('.') {
-            s.push('.');
-        }
-        s
+    // `expt` is `vsnprintf`'s name for `dtoa`'s `decpt`.
+    let (mut digits, expt) = if f == 0.0 {
+        (vec![b'0'], 1)
     } else {
-        let (mant, exp) = raw.split_once('e').unwrap();
-        let mut mant = mant.to_string();
-        if !alt {
-            strip_trailing_zeros(&mut mant);
-        } else if !mant.contains('.') {
-            mant.push('.');
+        mri_digits(f, false, p as isize)
+    };
+    if digits.is_empty() {
+        digits.push(b'0');
+    }
+    if alt && digits.len() < p {
+        // `cvt`'s "Print trailing zeros" branch, which `#` is the only way to
+        // reach for `%g`.
+        digits.resize(p, b'0');
+    }
+    let ndig = digits.len();
+    let ds = std::str::from_utf8(&digits).unwrap_or("0");
+    // `if (expt <= -4 || (expt > prec && expt > 1)) ch = 'e'`.
+    if expt <= -4 || (expt > p as i32 && expt > 1) {
+        let mut out = String::from(&ds[..1]);
+        if ndig > 1 || alt {
+            out.push('.');
+            out.push_str(&ds[1..]);
         }
-        let ee: i32 = exp.parse().unwrap_or(0);
+        let ee = expt - 1;
         let ec = if upper { 'E' } else { 'e' };
         let es = if ee < 0 { '-' } else { '+' };
-        format!("{mant}{ec}{es}{:02}", ee.abs())
+        format!("{out}{ec}{es}{:02}", ee.abs())
+    } else if expt <= 0 {
+        format!("0.{}{ds}", "0".repeat((-expt) as usize))
+    } else if expt as usize >= ndig {
+        let mut out = format!("{ds}{}", "0".repeat(expt as usize - ndig));
+        if alt {
+            out.push('.');
+        }
+        out
+    } else {
+        format!("{}.{}", &ds[..expt as usize], &ds[expt as usize..])
+    }
+}
+
+/// The digit VALUES of `n`'s magnitude in `base`, least significant first.
+///
+/// Goes through `BigInt` so an Integer wider than 64 bits renders its real
+/// digits. Reading the operand as an `i64` had silently truncated every such
+/// value to `0`:
+///
+/// ```console
+/// $ /usr/bin/ruby -e 'p "%x" % (2**70)'
+/// "400000000000000000"
+/// ```
+fn radix_digits(n: &num_bigint::BigInt, base: u8) -> Vec<u8> {
+    n.magnitude()
+        .to_str_radix(base as u32)
+        .bytes()
+        .rev()
+        .map(|c| {
+            if c.is_ascii_digit() {
+                c - b'0'
+            } else {
+                c - b'a' + 10
+            }
+        })
+        .collect()
+}
+
+/// `sprintf`'s Integer operand conversion, MRI's `rb_Integer`: a String is
+/// parsed with `Integer()`'s rules (radix prefixes, `_` separators, surrounding
+/// space) and anything unconvertible RAISES rather than formatting as `0`.
+///
+/// ```console
+/// $ /usr/bin/ruby -e 'p "%d" % "0x1f"'
+/// "31"
+/// $ /usr/bin/ruby -e 'p "%d" % "x"'
+/// -e:1:in `%': invalid value for Integer(): "x" (ArgumentError)
+/// ```
+fn sprintf_int(v: &Value) -> Result<num_bigint::BigInt, String> {
+    use num_traits::FromPrimitive as _;
+    if let Some(b) = with_host(|h| h.as_bigint(v)) {
+        return Ok(b);
+    }
+    if let Value::Float(f) = v {
+        return num_bigint::BigInt::from_f64(f.trunc()).ok_or_else(|| {
+            let name = if f.is_nan() { "NaN" } else { "Infinity" };
+            raise_exc("FloatDomainError", name)
+        });
+    }
+    match with_host(|h| h.as_str(v)) {
+        Some(s) => match ruby_integer_str(&s, 0) {
+            Some(n) => Ok(num_bigint::BigInt::from(n)),
+            None => Err(raise_exc(
+                "ArgumentError",
+                &format!(
+                    "invalid value for Integer(): {}",
+                    crate::host::inspect_string(&s)
+                ),
+            )),
+        },
+        None => Err(raise_exc(
+            "TypeError",
+            &format!("can't convert {} into Integer", type_name_for(v)),
+        )),
+    }
+}
+
+/// `%f`'s digits for an EXACT operand, MRI's `case 'f':` before it falls
+/// through to `float_value`. An Integer or Rational never goes near a double
+/// there, so every digit of a wide value survives:
+///
+/// ```console
+/// $ /usr/bin/ruby -e 'p "%f" % 98335312630379694749'
+/// "98335312630379694749.000000"
+/// $ /usr/bin/ruby -e 'p "%f" % 98335312630379694749.0'
+/// "98335312630379692032.000000"
+/// ```
+///
+/// Returns the sign and the unsigned digit text. A Rational is scaled by
+/// `10^prec` and divided with `+den/2` first, which rounds halves AWAY from
+/// zero — not the half-to-even a Float goes through.
+fn exact_fixed(r: &num_rational::BigRational, prec: usize) -> (bool, String) {
+    use num_traits::{One as _, Signed as _};
+    let neg = r.is_negative();
+    let mut num = r.numer().abs();
+    let den = r.denom().clone();
+    let mut zero = 0usize;
+    if den.is_one() {
+        zero = prec;
+    } else {
+        num *= num_bigint::BigInt::from(10u8).pow(prec as u32);
+        num += &den / num_bigint::BigInt::from(2u8);
+        num /= &den;
+    }
+    let val = num.to_string();
+    let len = val.len() + zero;
+    let mut out = String::new();
+    if len > prec {
+        out.push_str(&val[..val.len() - prec.saturating_sub(zero)]);
+    } else {
+        out.push('0');
+    }
+    if prec > 0 {
+        out.push('.');
+    }
+    if zero > 0 {
+        out.push_str(&"0".repeat(zero));
+    } else if prec > len {
+        out.push_str(&"0".repeat(prec - len));
+        out.push_str(&val);
+    } else if prec > 0 {
+        out.push_str(&val[len - prec..]);
+    }
+    (neg, out)
+}
+
+/// `sprintf`'s Float operand conversion, MRI's `rb_Float`. Same shape as
+/// [`sprintf_int`]: a String goes through `Float()`, everything else that is
+/// not numeric is a TypeError.
+fn sprintf_float(v: &Value) -> Result<f64, String> {
+    match v {
+        Value::Int(n) => return Ok(*n as f64),
+        Value::Float(f) => return Ok(*f),
+        _ => {}
+    }
+    if let Some(f) = with_host(|h| h.as_f64(v)) {
+        return Ok(f);
+    }
+    match with_host(|h| h.as_str(v)) {
+        Some(s) => ruby_float_str(&s).ok_or_else(|| {
+            if s.contains('\0') {
+                raise_exc("ArgumentError", "string for Float contains null byte")
+            } else {
+                raise_exc(
+                    "ArgumentError",
+                    &format!(
+                        "invalid value for Float(): {}",
+                        crate::host::inspect_string(&s)
+                    ),
+                )
+            }
+        }),
+        None => Err(raise_exc(
+            "TypeError",
+            &format!("can't convert {} into Float", type_name_for(v)),
+        )),
+    }
+}
+
+/// `%c`'s operand: an Integer codepoint or a ONE-character String. MRI rejects
+/// anything else instead of quietly taking a prefix or emitting nothing.
+///
+/// ```console
+/// $ /usr/bin/ruby -e '"%c" % "ab"'
+/// -e:1:in `%': %c requires a character (ArgumentError)
+/// ```
+fn sprintf_char(v: &Value) -> Result<String, String> {
+    use num_traits::ToPrimitive as _;
+    // A String operand yields its FIRST character, and an empty one yields
+    // nothing. The `%c requires a character` ArgumentError older MRIs raised
+    // for a longer string is gone from the reference this tracks:
+    //
+    // ```console
+    // $ /opt/homebrew/opt/ruby/bin/ruby -e 'p "%c" % "ab", "%c" % ""'
+    // "a"
+    // ""
+    // ```
+    if let Some(s) = with_host(|h| h.as_str(v)) {
+        return Ok(s.chars().next().map(String::from).unwrap_or_default());
+    }
+    if matches!(v, Value::Undef) {
+        return Err(raise_exc(
+            "TypeError",
+            "no implicit conversion from nil to integer",
+        ));
+    }
+    // Everything else goes through `NUM2INT`, whose two range failures MRI
+    // words differently: a promoted Integer that will not fit a `long`, and one
+    // that fits a `long` but not an `int`.
+    let n = match v {
+        Value::Int(n) => *n,
+        Value::Float(f) => f.trunc() as i64,
+        _ => match with_host(|h| h.as_bigint(v)) {
+            Some(b) => b
+                .to_i64()
+                .ok_or_else(|| raise_exc("RangeError", "bignum too big to convert into 'long'"))?,
+            None => {
+                return Err(raise_exc(
+                    "TypeError",
+                    &format!(
+                        "no implicit conversion of {} into Integer",
+                        type_name_for(v)
+                    ),
+                ))
+            }
+        },
+    };
+    if i32::try_from(n).is_err() {
+        let side = if n < 0 { "small" } else { "big" };
+        return Err(raise_exc(
+            "RangeError",
+            &format!("integer {n} too {side} to convert to 'int'"),
+        ));
+    }
+    match u32::try_from(n).ok().and_then(char::from_u32) {
+        Some(c) => Ok(String::from(c)),
+        None => Err(raise_exc("ArgumentError", "invalid character")),
     }
 }
 
 /// `format`/`sprintf`/`String#%` — handles `%[flags][width][.precision]conv`
 /// with flags `-`, `0`, `+`, ` `, `#`, `*` dynamic width/precision, and
 /// conversions d/i/u/f/e/E/g/G/s/p/x/X/o/b/B/c/%.
-fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> String {
+fn sprintf(
+    fmt: &str,
+    args: &[Value],
+    named: Option<&IndexMap<RKey, Value>>,
+) -> Result<String, String> {
     let bytes: Vec<char> = fmt.chars().collect();
     let mut out = String::new();
     let mut i = 0;
     let mut ai = 0;
-    let next_arg = |ai: &mut usize| {
-        let v = args.get(*ai).cloned().unwrap_or(Value::Undef);
+    // MRI's `posarg`, the state that keeps the three ways of naming an operand
+    // from being mixed: 0 = none used yet, > 0 = the 1-based index of the last
+    // UNNUMBERED one, -1 = named mode, -2 = numbered mode. Mixing them is an
+    // error rather than a silent reinterpretation of the format string.
+    let mut posarg: i32 = 0;
+    // Running out of operands is an error in MRI, not an empty substitution.
+    let next_arg = |ai: &mut usize, posarg: &mut i32| -> Result<Value, String> {
+        let nextarg = *ai as i32 + 1;
+        // `check_next_arg`
+        match *posarg {
+            -1 => {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!("unnumbered({nextarg}) mixed with named"),
+                ))
+            }
+            -2 => {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!("unnumbered({nextarg}) mixed with numbered"),
+                ))
+            }
+            _ => {}
+        }
+        let v = args
+            .get(*ai)
+            .cloned()
+            .ok_or_else(|| raise_exc("ArgumentError", "too few arguments"))?;
+        *posarg = nextarg;
         *ai += 1;
-        v
+        Ok(v)
     };
     // Resolve a named reference (`%<name>` / `%{name}`) from the Hash operand.
-    let named_val = |name: &str| -> Value {
-        named
-            .and_then(|m| m.get(&RKey::Sym(name.to_string())).cloned())
-            .unwrap_or(Value::Undef)
-    };
+    // An absent key is a KeyError; MRI spells the reference the way it was
+    // written, so the brackets are the caller's.
+    let named_val =
+        |name: &str, open: char, close: char, posarg: &mut i32| -> Result<Value, String> {
+            // `check_name_arg`
+            if *posarg > 0 {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!("named{open}{name}{close} after unnumbered({posarg})"),
+                ));
+            }
+            if *posarg == -2 {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!("named{open}{name}{close} after numbered"),
+                ));
+            }
+            *posarg = -1;
+            named
+                .and_then(|m| m.get(&RKey::Sym(name.to_string())).cloned())
+                .ok_or_else(|| raise_exc("KeyError", &format!("key{open}{name}{close} not found")))
+        };
     while i < bytes.len() {
         if bytes[i] != '%' {
             out.push(bytes[i]);
@@ -17162,25 +17969,44 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
             if i < bytes.len() {
                 i += 1; // consume '}'
             }
-            out.push_str(&arg_str(&named_val(&nm)));
+            out.push_str(&arg_str(&named_val(&nm, '{', '}', &mut posarg)?));
             continue;
         }
         // `%N$` positional argument selector (1-based): `%2$s` uses args[1] and
         // does not advance the sequential counter. Only consumes the digits when
         // they are actually followed by `$`.
+        //
+        // A LEADING ZERO is not an index: MRI reaches the numbered form from
+        // `case '1' ... '9':` only, so `%0$s` is the `0` flag followed by an
+        // unknown `$` conversion and is rejected as a malformed format string.
         let mut pos_arg: Option<usize> = None;
+        if bytes
+            .get(i)
+            .is_some_and(|c| c.is_ascii_digit() && *c != '0')
         {
             let save = i;
             let mut n = 0usize;
-            let mut saw = false;
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 n = n * 10 + (bytes[i] as usize - '0' as usize);
                 i += 1;
-                saw = true;
             }
-            if saw && i < bytes.len() && bytes[i] == '$' {
+            if bytes.get(i) == Some(&'$') {
                 i += 1;
-                pos_arg = n.checked_sub(1);
+                // `check_pos_arg`
+                if posarg > 0 {
+                    return Err(raise_exc(
+                        "ArgumentError",
+                        &format!("numbered({n}) after unnumbered({posarg})"),
+                    ));
+                }
+                if posarg == -1 {
+                    return Err(raise_exc(
+                        "ArgumentError",
+                        &format!("numbered({n}) after named"),
+                    ));
+                }
+                posarg = -2;
+                pos_arg = Some(n - 1);
             } else {
                 i = save;
             }
@@ -17201,7 +18027,7 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
                     if i < bytes.len() {
                         i += 1; // consume '>'
                     }
-                    named_arg = Some(named_val(&nm));
+                    named_arg = Some(named_val(&nm, '<', '>', &mut posarg)?);
                 }
             };
         }
@@ -17221,11 +18047,45 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
             i += 1;
         }
         probe_named!();
+        // `GETASTER`: after a `*`, `N$` selects the N-th operand for the
+        // width/precision; a bare `*` takes the next sequential one.
+        macro_rules! aster_arg {
+            () => {{
+                let save = i;
+                let mut n = 0usize;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    n = n * 10 + (bytes[i] as usize - '0' as usize);
+                    i += 1;
+                }
+                if n >= 1 && bytes.get(i) == Some(&'$') {
+                    i += 1;
+                    if posarg > 0 {
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            &format!("numbered({n}) after unnumbered({posarg})"),
+                        ));
+                    }
+                    if posarg == -1 {
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            &format!("numbered({n}) after named"),
+                        ));
+                    }
+                    posarg = -2;
+                    args.get(n - 1)
+                        .cloned()
+                        .ok_or_else(|| raise_exc("ArgumentError", "too few arguments"))?
+                } else {
+                    i = save;
+                    next_arg(&mut ai, &mut posarg)?
+                }
+            }};
+        }
         // width (`*` = dynamic; a negative dynamic width means left-align)
         let mut width = 0usize;
         if i < bytes.len() && bytes[i] == '*' {
             i += 1;
-            let w = as_i(&next_arg(&mut ai));
+            let w = as_i(&aster_arg!());
             if w < 0 {
                 left = true;
                 width = w.unsigned_abs() as usize;
@@ -17245,7 +18105,7 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
             i += 1;
             if i < bytes.len() && bytes[i] == '*' {
                 i += 1;
-                let p = as_i(&next_arg(&mut ai));
+                let p = as_i(&aster_arg!());
                 if p >= 0 {
                     prec = Some(p as usize);
                 }
@@ -17258,16 +18118,26 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
                 prec = Some(p);
             }
         }
-        let conv = if i < bytes.len() { bytes[i] } else { '%' };
+        // A spec that runs off the end of the string is an error, not a stray
+        // `%`: MRI names the `%%` escape the writer probably meant.
+        let Some(&conv) = bytes.get(i) else {
+            return Err(raise_exc(
+                "ArgumentError",
+                "incomplete format specifier; use %% (double %) instead",
+            ));
+        };
         i += 1;
         if conv == '%' {
             out.push('%');
             continue;
         }
         let arg = match (pos_arg, named_arg) {
-            (Some(k), _) => args.get(k).cloned().unwrap_or(Value::Undef),
+            (Some(k), _) => args
+                .get(k)
+                .cloned()
+                .ok_or_else(|| raise_exc("ArgumentError", "too few arguments"))?,
             (None, Some(v)) => v,
-            (None, None) => next_arg(&mut ai),
+            (None, None) => next_arg(&mut ai, &mut posarg)?,
         };
 
         // Per-conversion: (sign, prefix, body, numeric, int_conv, complement fill).
@@ -17279,84 +18149,88 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
         let mut complement: Option<char> = None;
 
         // Integer base conversions share sign / precision / `#` handling.
-        let base_conv = |base: u8, up: bool| -> (String, Option<char>, String, &'static str) {
-            let n = as_i(&arg) as i128;
-            let neg = n < 0;
-            if neg && !(plus || space) {
-                // Ruby two's-complement `..` notation (no leading sign).
-                let (b, rc) = complement_body(n, base, up);
-                let pfx = if alt {
-                    match base {
-                        16 if up => "0X".to_string(),
-                        16 => "0x".to_string(),
-                        8 => String::new(), // handled by digit form below
-                        2 if up => "0B".to_string(),
-                        2 => "0b".to_string(),
-                        _ => String::new(),
-                    }
-                } else {
-                    String::new()
-                };
-                (b, Some(rc), pfx, "")
-            } else {
-                let mag = n.unsigned_abs();
-                let mut b = String::new();
-                let mut v = mag;
-                if v == 0 {
-                    b.push('0');
-                }
-                while v > 0 {
-                    b.push(digit_char((v % base as u128) as u8, up));
-                    v /= base as u128;
-                }
-                let mut b: String = b.chars().rev().collect();
-                // precision = minimum number of digits
-                if let Some(p) = prec {
-                    if mag == 0 && p == 0 {
-                        b.clear();
-                    } else if b.len() < p {
-                        b = format!("{}{}", "0".repeat(p - b.len()), b);
-                    }
-                }
-                let sgn = if neg {
-                    "-"
-                } else if plus {
-                    "+"
-                } else if space {
-                    " "
-                } else {
-                    ""
-                };
-                let pfx = if alt && mag != 0 {
-                    match base {
-                        16 if up => "0X".to_string(),
-                        16 => "0x".to_string(),
-                        2 if up => "0B".to_string(),
-                        2 => "0b".to_string(),
-                        8 => {
-                            if b.starts_with('0') {
-                                String::new()
-                            } else {
-                                b.insert(0, '0');
-                                String::new()
-                            }
+        let base_conv =
+            |base: u8, up: bool| -> Result<(String, Option<char>, String, &'static str), String> {
+                use num_traits::Signed as _;
+                let n = sprintf_int(&arg)?;
+                let neg = n.is_negative();
+                let mag = radix_digits(&n, base);
+                if neg && !(plus || space) {
+                    // Ruby two's-complement `..` notation (no leading sign).
+                    let (mut b, rc) = complement_body(&mag, base, up);
+                    // Precision counts the `..` marker as two of its own places:
+                    // `"%.11x" % -137` is `"..fffffff77"` — eleven characters, nine
+                    // of them digits.
+                    if let Some(p) = prec {
+                        let (want, have) = (p.saturating_sub(2), b.len() - 2);
+                        if want > have {
+                            b.insert_str(2, &rc.to_string().repeat(want - have));
                         }
-                        _ => String::new(),
                     }
+                    let pfx = if alt {
+                        match base {
+                            16 if up => "0X".to_string(),
+                            16 => "0x".to_string(),
+                            8 => String::new(), // handled by digit form below
+                            2 if up => "0B".to_string(),
+                            2 => "0b".to_string(),
+                            _ => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    };
+                    Ok((b, Some(rc), pfx, ""))
                 } else {
-                    String::new()
-                };
-                (b, None, pfx, sgn)
-            }
-        };
+                    let is_zero = mag.iter().all(|&d| d == 0);
+                    let mut b: String = mag.iter().rev().map(|&d| digit_char(d, up)).collect();
+                    if b.is_empty() {
+                        b.push('0');
+                    }
+                    // precision = minimum number of digits
+                    if let Some(p) = prec {
+                        if is_zero && p == 0 {
+                            b.clear();
+                        } else if b.len() < p {
+                            b = format!("{}{}", "0".repeat(p - b.len()), b);
+                        }
+                    }
+                    let sgn = if neg {
+                        "-"
+                    } else if plus {
+                        "+"
+                    } else if space {
+                        " "
+                    } else {
+                        ""
+                    };
+                    let pfx = if alt && !is_zero {
+                        match base {
+                            16 if up => "0X".to_string(),
+                            16 => "0x".to_string(),
+                            2 if up => "0B".to_string(),
+                            2 => "0b".to_string(),
+                            _ => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    };
+                    // Octal's `#` is a leading DIGIT, not a prefix, and unlike
+                    // the `0x`/`0b` prefixes it survives a zero value — MRI
+                    // gives `"%#.0o" % 0` as `"0"` where `"%.0o" % 0` is `""`.
+                    if alt && base == 8 && !b.starts_with('0') {
+                        b.insert(0, '0');
+                    }
+                    Ok((b, None, pfx, sgn))
+                }
+            };
 
         let body: String = match conv {
             'd' | 'i' | 'u' => {
+                use num_traits::Signed as _;
                 numeric = true;
                 int_conv = true;
-                let n = as_i(&arg);
-                let neg = n < 0;
-                sign = if neg {
+                let n = sprintf_int(&arg)?;
+                sign = if n.is_negative() {
                     "-"
                 } else if plus {
                     "+"
@@ -17365,9 +18239,9 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
                 } else {
                     ""
                 };
-                let mut b = n.unsigned_abs().to_string();
+                let mut b = n.magnitude().to_string();
                 if let Some(p) = prec {
-                    if n == 0 && p == 0 {
+                    if b == "0" && p == 0 {
                         b.clear();
                     } else if b.len() < p {
                         b = format!("{}{}", "0".repeat(p - b.len()), b);
@@ -17385,7 +18259,7 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
                     'B' => (2, true),
                     _ => (2, false),
                 };
-                let (b, cpl, pfx, sgn) = base_conv(base, up);
+                let (b, cpl, pfx, sgn) = base_conv(base, up)?;
                 prefix = pfx;
                 complement = cpl;
                 sign = sgn;
@@ -17393,40 +18267,57 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
             }
             'f' => {
                 numeric = true;
-                let f = as_f(&arg);
-                if !f.is_finite() {
-                    zero_ok = false;
-                    if !f.is_nan() && f.is_sign_negative() {
-                        sign = "-";
-                    } else if !f.is_nan() && plus {
-                        sign = "+";
-                    } else if !f.is_nan() && space {
-                        sign = " ";
-                    }
-                    if f.is_nan() {
-                        "NaN".into()
-                    } else {
-                        "Inf".into()
-                    }
-                } else {
-                    if f.is_sign_negative() {
-                        sign = "-";
+                // An Integer or Rational operand is formatted EXACTLY; only the
+                // other types reach `float_value` and its `dtoa` rounding. MRI
+                // never applies `#` on this path, so no trailing `.` is added.
+                if let Some(r) = with_host(|h| h.as_rational(&arg)) {
+                    let (neg, s) = exact_fixed(&r, prec.unwrap_or(6));
+                    sign = if neg {
+                        "-"
                     } else if plus {
-                        sign = "+";
+                        "+"
                     } else if space {
-                        sign = " ";
-                    }
-                    let p = prec.unwrap_or(6);
-                    let mut s = fixed(f.abs(), p);
-                    if alt && !s.contains('.') {
-                        s.push('.');
-                    }
+                        " "
+                    } else {
+                        ""
+                    };
                     s
+                } else {
+                    let f = sprintf_float(&arg)?;
+                    if !f.is_finite() {
+                        zero_ok = false;
+                        if !f.is_nan() && f.is_sign_negative() {
+                            sign = "-";
+                        } else if !f.is_nan() && plus {
+                            sign = "+";
+                        } else if !f.is_nan() && space {
+                            sign = " ";
+                        }
+                        if f.is_nan() {
+                            "NaN".into()
+                        } else {
+                            "Inf".into()
+                        }
+                    } else {
+                        if f.is_sign_negative() {
+                            sign = "-";
+                        } else if plus {
+                            sign = "+";
+                        } else if space {
+                            sign = " ";
+                        }
+                        let p = prec.unwrap_or(6);
+                        let mut s = fixed(f.abs(), p);
+                        if alt && !s.contains('.') {
+                            s.push('.');
+                        }
+                        s
+                    }
                 }
             }
             'e' | 'E' | 'g' | 'G' => {
                 numeric = true;
-                let f = as_f(&arg);
+                let f = sprintf_float(&arg)?;
                 let up = conv == 'E' || conv == 'G';
                 if !f.is_finite() {
                     zero_ok = false;
@@ -17459,15 +18350,7 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
             }
             'c' => {
                 zero_ok = false;
-                match &arg {
-                    Value::Int(n) => char::from_u32(*n as u32)
-                        .map(String::from)
-                        .unwrap_or_default(),
-                    _ => {
-                        let s = arg_str(&arg);
-                        s.chars().next().map(String::from).unwrap_or_default()
-                    }
-                }
+                sprintf_char(&arg)?
             }
             'p' => {
                 zero_ok = false;
@@ -17486,10 +18369,10 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
                 s
             }
             other => {
-                out.push('%');
-                out.push(other);
-                ai -= 1;
-                continue;
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!("malformed format string - %{other}"),
+                ))
             }
         };
 
@@ -17527,7 +18410,7 @@ fn sprintf(fmt: &str, args: &[Value], named: Option<&IndexMap<RKey, Value>>) -> 
             out.push_str(&body);
         }
     }
-    out
+    Ok(out)
 }
 
 // ---- small value helpers --------------------------------------------------

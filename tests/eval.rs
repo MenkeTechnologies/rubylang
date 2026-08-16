@@ -1243,9 +1243,20 @@ fn sprintf_full_batch() {
     eq("format(\"%g\", 12345.678)", "\"12345.7\"");
     eq("format(\"%g\", 1000000.0)", "\"1e+06\"");
     eq("format(\"%g\", 0.0001)", "\"0.0001\"");
-    // Character conversion (codepoint or first char of a string).
+    // Character conversion (codepoint or first char of a string). A non-numeric,
+    // non-string operand is refused rather than read as codepoint 0.
+    //
+    // ```console
+    // $ /opt/homebrew/opt/ruby/bin/ruby -e 'format("%c", :sym)'
+    // -e:1:in 'Kernel#format': no implicit conversion of Symbol into Integer (TypeError)
+    // ```
     eq("format(\"%c\", 65)", "\"A\"");
     eq("format(\"%c\", \"hello\")", "\"h\"");
+    raises(
+        "format(\"%c\", :sym)",
+        "TypeError",
+        "no implicit conversion of Symbol into Integer",
+    );
     // Width, precision, flags, and `*` dynamic width/precision.
     eq("format(\"%-8d|\", 42)", "\"42      |\"");
     eq("format(\"% d\", 42)", "\" 42\"");
@@ -8191,4 +8202,393 @@ fn a_filesystem_failure_raises_its_specific_errno_class() {
     eq("Errno::ENOENT.superclass.to_s", "\"SystemCallError\"");
     eq("defined?(Errno::ENOENT)", "\"constant\"");
     eq("Errno.to_s", "\"Errno\"");
+}
+
+/// `%f`/`%e`/`%g` round the way MRI's `dtoa` does, which is NOT the
+/// exactly-correct rounding a libc `printf` performs. Up to `Quick_max` (14)
+/// digits `dtoa` takes a floating-point shortcut whose tie-break is
+/// half-to-even over the digits that shortcut produced; past it the exact
+/// big-integer path runs. Both regimes are observable, and they disagree with
+/// each other AND with libc in both directions.
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'printf("%.2f %.2f %.1f\n", 2.345, 2.675, 0.35)'
+/// 2.34 2.68 0.4
+/// $ printf '%.2f %.2f %.1f\n' 2.345 2.675 0.35     # libc: exact-value rounding
+/// 2.35 2.67 0.3
+/// ```
+#[test]
+fn float_formatting_rounds_like_dtoa_not_like_libc() {
+    // Exact ties in the SHORTEST digits, resolved half-to-even. `2345` keeps the
+    // even `4`; `2675` rounds the odd `7` up. Rounding the exact expansions
+    // (2.34500000000000019…, 2.67499999999999982…) would answer the other way
+    // for both, so a wrong implementation cannot pass these by accident.
+    eq(r#""%.2f" % 2.345"#, r#""2.34""#);
+    eq(r#""%.2f" % 2.675"#, r#""2.68""#);
+    eq(r#""%.1f" % 0.35"#, r#""0.4""#);
+    eq(r#""%.2f" % 1.005"#, r#""1.00""#);
+    eq(r#""%.2f" % 8.835"#, r#""8.84""#);
+    eq(r#""%.2e" % 2.345"#, r#""2.34e+00""#);
+
+    // Past 14 digits the exact path takes over, so ONE more requested digit
+    // flips the answer for the same value:
+    //
+    // ```console
+    // $ /opt/homebrew/opt/ruby/bin/ruby -e 'v = 0.8730584682565505; printf("%.14f %.15f\n", v, v)'
+    // 0.87305846825655 0.873058468256551
+    // ```
+    eq(r#""%.14f" % 0.8730584682565505"#, r#""0.87305846825655""#);
+    eq(r#""%.15f" % 0.8730584682565505"#, r#""0.873058468256551""#);
+    // Exact digits well past the shortest form, which a shortest-digits-only
+    // implementation pads with zeros instead.
+    eq(r#""%.20f" % 0.1"#, r#""0.10000000000000000555""#);
+    eq(r#""%.17g" % 0.1"#, r#""0.10000000000000001""#);
+
+    // The floating-point shortcut is not merely an optimization: its
+    // accumulated error carries a digit the exact value would not.
+    //
+    // ```console
+    // $ /opt/homebrew/opt/ruby/bin/ruby -e 'printf("%.8f\n", 647003.6098933348)'
+    // 647003.60989334
+    // $ printf '%.8f\n' 647003.6098933348   # exact value is 647003.60989333479…
+    // 647003.60989333
+    // ```
+    eq(r#""%.8f" % 647003.6098933348"#, r#""647003.60989334""#);
+    // And when it gives up near a tie it leaves `half` set, which suppresses the
+    // exact path's increment on an even last digit even though the remainder is
+    // strictly above half (exact: 8.0611754944772535306…e42).
+    eq(
+        r#""%.13e" % 8.061175494477254e42"#,
+        r#""8.0611754944772e+42""#,
+    );
+
+    // `%g` shows exactly the digits `dtoa` returned — MRI sets no `ALT` flag for
+    // it, so trailing zeros vanish because `dtoa` suppressed them, and the
+    // round-off exit that does NOT suppress them leaves one visible.
+    eq(
+        r#""%.14G" % 8.511594981705056e17"#,
+        r#""8.5115949817050E+17""#,
+    );
+    eq(r#""%.10g" % 1.5"#, r#""1.5""#);
+    // `dtoa`'s exact "small integer" exit likewise never trims, and never
+    // consults `half`.
+    eq(r#""%.9G" % 5531451705.0"#, r#""5.53145170E+09""#);
+
+    // A wide value keeps every digit: `%f` on an Integer or Rational is computed
+    // in exact integer arithmetic and never round-trips through a double, while
+    // the same magnitude AS a Float shows what the double actually holds.
+    eq(
+        r#""%f" % 98335312630379694749"#,
+        r#""98335312630379694749.000000""#,
+    );
+    eq(
+        r#""%f" % 98335312630379694749.0"#,
+        r#""98335312630379692032.000000""#,
+    );
+    eq(r#""%.3f" % (2**70)"#, r#""1180591620717411303424.000""#);
+    eq(r#""%f" % Rational(1, 3)"#, r#""0.333333""#);
+    // `#` never applies on that exact path, so an Integer gains no trailing dot
+    // where a Float does.
+    eq(r#""%#.0f" % 122"#, r#""122""#);
+    eq(r#""%#.0f" % 122.5"#, r#""122.""#);
+}
+
+/// Integer conversions accept an Integer of ANY width. Reading the operand as
+/// an `i64` silently formatted every promoted Integer as `0`.
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p "%x" % (2**70), "%d" % (2**70)'
+/// "400000000000000000"
+/// "1180591620717411303424"
+/// ```
+#[test]
+fn sprintf_integer_conversions_span_promoted_integers() {
+    eq(r#""%d" % (2**70)"#, r#""1180591620717411303424""#);
+    eq(r#""%d" % (-2**70)"#, r#""-1180591620717411303424""#);
+    eq(r#""%x" % (2**70)"#, r#""400000000000000000""#);
+    eq(r#""%X" % (2**70)"#, r#""400000000000000000""#);
+    eq(r#""%o" % (2**70)"#, r#""200000000000000000000000""#);
+    eq(r#""%#x" % (2**70)"#, r#""0x400000000000000000""#);
+    eq(r#""%+d" % (2**70)"#, r#""+1180591620717411303424""#);
+    eq(
+        r#""%.30d" % (2**70)"#,
+        r#""000000001180591620717411303424""#,
+    );
+    // Two's-complement `..` notation for a negative one, which needs the same
+    // arbitrary-width digits.
+    eq(r#""%x" % (-2**70)"#, r#""..fc00000000000000000""#);
+    eq(
+        r#""%b" % (-2**70)"#,
+        r#""..10000000000000000000000000000000000000000000000000000000000000000000000""#,
+    );
+    // Precision counts the `..` marker as two of its own places.
+    eq(r#""%.11x" % -137"#, r#""..fffffff77""#);
+    eq(r#""%.5x" % -255"#, r#""..f01""#);
+    eq(r#""%.10b" % -5"#, r#""..11111011""#);
+    // Octal's `#` is a leading digit rather than a prefix, so it survives a zero
+    // value that suppresses `0x`/`0b`.
+    eq(r#""%#.0o" % 0"#, r#""0""#);
+    eq(r#""%.0o" % 0"#, r#""""#);
+    eq(r#""%#.0x" % 0"#, r#""""#);
+}
+
+/// Every way a format string can fail to match its operands RAISES. Each of
+/// these used to substitute a `0` or an empty string, which is the worst
+/// possible outcome: the format string is wrong and the program keeps running.
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e '"%s %s" % ["a"]'
+/// -e:1:in 'String#%': too few arguments (ArgumentError)
+/// ```
+#[test]
+fn sprintf_rejects_operands_it_cannot_convert() {
+    // Operand conversion goes through `rb_Integer`/`rb_Float`, so a String is
+    // PARSED (radix prefixes and `_` separators included) and only an
+    // unparseable one raises.
+    eq(r#""%d" % "0x1f""#, r#""31""#);
+    eq(r#""%d" % "1_0""#, r#""10""#);
+    eq(r#""%x" % "12""#, r#""c""#);
+    raises(
+        r#""%d" % "x""#,
+        "ArgumentError",
+        "invalid value for Integer(): \"x\"",
+    );
+    raises(
+        r#""%f" % "x""#,
+        "ArgumentError",
+        "invalid value for Float(): \"x\"",
+    );
+    raises(
+        r#""%d" % nil"#,
+        "TypeError",
+        "can't convert nil into Integer",
+    );
+    raises(
+        r#""%d" % :sym"#,
+        "TypeError",
+        "can't convert Symbol into Integer",
+    );
+    raises(r#""%f" % nil"#, "TypeError", "can't convert nil into Float");
+
+    // Running out of operands, in each of the three places one is consumed.
+    raises(r#""%s %s" % ["a"]"#, "ArgumentError", "too few arguments");
+    raises(r#""%*d" % [5]"#, "ArgumentError", "too few arguments");
+    raises(r#""%2$s" % ["a"]"#, "ArgumentError", "too few arguments");
+
+    // A malformed or unterminated specifier.
+    raises(
+        r#""%" % []"#,
+        "ArgumentError",
+        "incomplete format specifier; use %% (double %) instead",
+    );
+    raises(
+        r#""%q" % 1"#,
+        "ArgumentError",
+        "malformed format string - %q",
+    );
+    // `%0$s` is the `0` FLAG followed by an unknown `$` conversion, because MRI
+    // reaches the numbered form from `1`-`9` only.
+    raises(
+        r#""%0$s" % ["a"]"#,
+        "ArgumentError",
+        "malformed format string - %$",
+    );
+
+    // A named reference with no such key.
+    raises(r#""%<a>s" % {b: 1}"#, "KeyError", "key<a> not found");
+    raises(r#""%{a}" % {b: 1}"#, "KeyError", "key{a} not found");
+
+    // The three ways of naming an operand cannot be mixed, in either order.
+    raises(
+        r#""%1$s %s" % ["a", "b"]"#,
+        "ArgumentError",
+        "unnumbered(1) mixed with numbered",
+    );
+    raises(
+        r#""%s %1$s" % ["a", "b"]"#,
+        "ArgumentError",
+        "numbered(1) after unnumbered(1)",
+    );
+    raises(
+        r#""%s %s %1$s" % ["a", "b"]"#,
+        "ArgumentError",
+        "numbered(1) after unnumbered(2)",
+    );
+    raises(
+        r#""%s %<a>s" % {a: 1}"#,
+        "ArgumentError",
+        "named<a> after unnumbered(1)",
+    );
+    raises(
+        r#""%{a} %s" % {a: 1}"#,
+        "ArgumentError",
+        "unnumbered(1) mixed with named",
+    );
+    raises(
+        r#""%1$s %{a}" % {a: 1}"#,
+        "ArgumentError",
+        "named{a} after numbered",
+    );
+    // Numbered selection stays legal when it is used consistently, including for
+    // a `*` width.
+    eq(r#""%1$s %2$s" % ["a", "b"]"#, r#""a b""#);
+    eq(r#""%1$s %1$s" % ["a"]"#, r#""a a""#);
+    eq(r#""%1$*2$d" % [5, 8]"#, r#""       5""#);
+    // A Hash operand is BOTH the named source and the single positional one.
+    eq(r#""%<a>s" % {a: 1}"#, r#""1""#);
+    eq(r#"("%s" % {a: 1}).size > 0"#, "true");
+    raises(r#""%s %s" % {a: 1}"#, "ArgumentError", "too few arguments");
+
+    // `%c` takes a codepoint or a String; anything else goes through `NUM2INT`,
+    // whose two range failures MRI words differently.
+    eq(r#""%c" % 65"#, r#""A""#);
+    eq(r#""%c" % "hello""#, r#""h""#);
+    raises(
+        r#""%c" % :sym"#,
+        "TypeError",
+        "no implicit conversion of Symbol into Integer",
+    );
+    raises(
+        r#""%c" % nil"#,
+        "TypeError",
+        "no implicit conversion from nil to integer",
+    );
+    raises(
+        r#""%c" % (2**70)"#,
+        "RangeError",
+        "bignum too big to convert into 'long'",
+    );
+    raises(
+        r#""%c" % (2**40)"#,
+        "RangeError",
+        "integer 1099511627776 too big to convert to 'int'",
+    );
+    raises(r#""%c" % 1114112"#, "ArgumentError", "invalid character");
+}
+
+/// `Numeric#step` accepts `to:`/`by:` keywords, and an ABSENT limit means the
+/// sequence never ends. The keyword form used to arrive as a single trailing
+/// Hash, which measured as a limit of `0` and answered an EMPTY enumeration —
+/// a wrong answer with no error anywhere.
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p 1.step(by: 2, to: 7).to_a'
+/// [1, 3, 5, 7]
+/// ```
+#[test]
+fn numeric_step_takes_to_and_by_keywords() {
+    eq("1.step(by: 2, to: 7).to_a", "[1, 3, 5, 7]");
+    eq("1.step(to: 5).to_a", "[1, 2, 3, 4, 5]");
+    eq("10.step(by: -2, to: 4).to_a", "[10, 8, 6, 4]");
+    eq("1.0.step(by: 0.5, to: 2.5).to_a", "[1.0, 1.5, 2.0, 2.5]");
+    // A Float ANYWHERE switches the whole sequence to Float stepping.
+    eq("1.step(to: 10.0, by: 3).to_a", "[1.0, 4.0, 7.0, 10.0]");
+    eq("1.step(by: 2.0, to: 7).to_a", "[1.0, 3.0, 5.0, 7.0]");
+    // The block form and the Enumerator agree.
+    eq(
+        "a = []; 1.step(by: 2, to: 7) { |i| a << i }; a",
+        "[1, 3, 5, 7]",
+    );
+    eq("1.step(by: 2, to: 7).size", "4");
+    eq("1.step(by: 2, to: 7).sum", "16");
+    eq(
+        "1.step(by: 2, to: 7).each_slice(2).to_a",
+        "[[1, 3], [5, 7]]",
+    );
+    // Positional and keyword forms of the same argument are refused together;
+    // `by:` alongside ONE positional (the limit) is fine.
+    eq("1.step(1, by: 2).to_a", "[1]");
+    raises(
+        "1.step(5, to: 7).to_a",
+        "ArgumentError",
+        "to is given twice",
+    );
+    raises(
+        "1.step(5, 2, by: 3).to_a",
+        "ArgumentError",
+        "step is given twice",
+    );
+}
+
+/// A limitless `Numeric#step` — no `to:`, or a limit of Infinity — is INFINITE.
+/// Materializing it hung; it has to stay a generator the consumer bounds.
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p 1.step(by: 3).first(4)'
+/// [1, 4, 7, 10]
+/// ```
+#[test]
+fn a_limitless_step_stays_unmaterialized() {
+    eq("1.step(by: 3).first(4)", "[1, 4, 7, 10]");
+    eq("1.step(by: 1).take(3)", "[1, 2, 3]");
+    eq(
+        "1.step(by: 3).lazy.map { |x| x * 2 }.first(3)",
+        "[2, 8, 14]",
+    );
+    eq(
+        "b = []; 1.step(by: 3) { |i| b << i; break if b.size == 4 }; b",
+        "[1, 4, 7, 10]",
+    );
+    eq(
+        "d = []; 5.step(by: -2) { |i| d << i; break if d.size == 3 }; d",
+        "[5, 3, 1]",
+    );
+    // An explicit Infinity limit is endless in that direction and EMPTY in the
+    // other, and it makes the sequence Float.
+    eq(
+        "1.step(Float::INFINITY, 3).first(4)",
+        "[1.0, 4.0, 7.0, 10.0]",
+    );
+    eq("1.step(-Float::INFINITY, 3).first(3)", "[]");
+    eq("1.step(Float::INFINITY, -3).first(3)", "[]");
+    // A Float sequence is `i * by + from`, NOT the running sum: the seventh
+    // value is `6 * 0.1`, not `0.1` added six times.
+    eq(
+        "0.0.step(by: 0.1).first(8)",
+        "[0.0, 0.1, 0.2, 0.30000000000000004, 0.4, 0.5, 0.6000000000000001, 0.7000000000000001]",
+    );
+    eq("0.0.step(Float::INFINITY, 0.1).first(3)", "[0.0, 0.1, 0.2]");
+}
+
+/// `Proc#parameters`, which reports a NON-lambda proc's required positionals as
+/// `:opt` because a block accepts a call that does not supply them.
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p proc { |a| }.parameters, lambda { |a| }.parameters'
+/// [[:opt, :a]]
+/// [[:req, :a]]
+/// ```
+#[test]
+fn proc_parameters_reports_the_written_shape() {
+    eq(
+        "->(a, b = 1, *c, d:, e: 2, **f, &g) {}.parameters",
+        "[[:req, :a], [:opt, :b], [:rest, :c], [:keyreq, :d], [:key, :e], [:keyrest, :f], [:block, :g]]",
+    );
+    eq("proc { |a, b| }.parameters", "[[:opt, :a], [:opt, :b]]");
+    eq("lambda { |a, b| }.parameters", "[[:req, :a], [:req, :b]]");
+    eq(
+        "proc { |a, b = 1, *c, d:| }.parameters",
+        "[[:opt, :a], [:opt, :b], [:rest, :c], [:keyreq, :d]]",
+    );
+    eq("proc { }.parameters", "[]");
+    eq("->(*a){}.parameters", "[[:rest, :a]]");
+    eq("->(**k){}.parameters", "[[:keyrest, :k]]");
+    // The `lambda:` keyword forces either reading.
+    eq(
+        "proc { |a, b| }.parameters(lambda: true)",
+        "[[:req, :a], [:req, :b]]",
+    );
+    eq(
+        "->(a, b){}.parameters(lambda: false)",
+        "[[:opt, :a], [:opt, :b]]",
+    );
+    // A DESTRUCTURING parameter has no written name, so it is a one-element
+    // entry — the synthetic name the parser binds it to must not leak.
+    eq("->(a, (b, c)){}.parameters", "[[:req, :a], [:req]]");
+    eq("proc { |a, (b, c)| }.parameters", "[[:opt, :a], [:opt]]");
+    // Procs that are not written parameter lists at all.
+    eq(":upcase.to_proc.parameters", "[[:req], [:rest]]");
+    eq("1.method(:+).to_proc.parameters", "[[:req]]");
+    eq("->(a, b){}.curry.parameters", "[[:rest]]");
+    eq("(->(a){} >> ->(b){}).parameters", "[[:rest]]");
 }

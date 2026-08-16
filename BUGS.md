@@ -873,9 +873,12 @@ Honest limitations of this surface:
     asks MRI directly, with an unknown keyword: a method that takes keywords
     complains about the keyword, one that does not counts the Hash as one more
     positional and complains about the count.
-- **Blocks and procs.** `Proc#parameters` is not implemented (`->(a, **rest) { }
-  .parameters` raises `undefined method`), though the written shape it needs is
-  now recorded. An anonymous keyword collector in a block parameter list
+- **Blocks and procs.** `Proc#parameters` is implemented, including the
+  `lambda:` keyword and the rule that a NON-lambda proc reports its required
+  positionals as `:opt`; a destructuring parameter (`->(a, (b, c)) { }`) is a
+  one-element entry, since it has no written name. A destructuring parameter in
+  a `def` list (`def m(a, (b, c))`) still does not parse — the block and lambda
+  forms do. An anonymous keyword collector in a block parameter list
   (`{ |**| }`) does not parse; the named form (`{ |**rest| }`) does.
 - **Regexp.** Supported: `/pat/flags` literals, `=~`/`!~`, `String#match`
   (returns `MatchData` with `[n]`/`pre_match`/`post_match`/`to_a`/`captures`),
