@@ -3649,3 +3649,78 @@ p proc { |a, b| }.parameters(lambda: true), ->(a, b) {}.parameters(lambda: false
 p ->(a, (b, c)) {}.parameters, proc { |a, (b, c)| }.parameters
 p :upcase.to_proc.parameters, 1.method(:+).to_proc.parameters
 p ->(a, b) {}.curry.parameters, (->(a) {} >> ->(b) {}).parameters
+#==#
+# Onigmo's `ONIG_SYN_CAPTURE_ONLY_NAMED_GROUP`: a pattern holding ANY named
+# group stops numbering its plain `(…)` groups — regcomp.c splices the unnamed
+# node out of the AST and hard-sets `num_mem = num_named`, so the group COUNT
+# shrinks. Every unnamed group used to keep capturing, so `to_a` carried an
+# extra element, `size` was one too many, and `$2` answered text MRI calls nil.
+m = /(?<a>b)(c)/.match("abcd")
+p m.to_a, m.captures, m.size, m[1], m[2], m[:a]
+p /(?<a>b)(c)(?<d>e)/.match("bce").to_a, /(?<a>b)(c)(?<d>e)/.named_captures
+p /(x)(?<a>b)/.match("xb").to_a, /(?'a'b)(c)/.match("bc").to_a
+p /(?<=x)(?<a>b)(c)/.match("xbc").to_a, /(?#z)(?<a>b)(c)/.match("bc").to_a
+p /[(](?<a>b)(c)/.match("(bc").to_a, /\((?<a>b)(c)/.match("(bc").to_a
+p Regexp.new("(?<a>b)(c)").match("bc").to_a, /(?<a>b)|(c)/.match("c").to_a
+p "abc" =~ /(?<a>b)(c)/, $~.to_a, $1, $2, $+
+p "bcbc".scan(/(?<a>b)(c)/), "bcbc".scan(/(b)(c)/), "a-b".split(/(?<d>-)/)
+p /(?<a>b)(c)/.source, /(?<a>b)(c)/.names, /(a)(b)/.names
+#==#
+# Plain patterns keep every numbered group: the rule above is conditional on a
+# named group being present, so an all-unnamed pattern must be untouched.
+p /(a)(b)/.match("ab").to_a, /(a)(b)/.match("ab").size
+p /(a)(b)\1/.match("aba").to_a, /(?<a>x)\k<a>/.match("xx").to_a
+p /(?<a>x)(?<b>y)/.match("xy").to_a, /(?<a>x)(?<b>y)/.match("xy")[2]
+p /((?<a>b))/.match("b").to_a, /(?<a>(b))/.match("b").to_a
+p "bc"[/(?<a>b)(c)/, 1], "bc"[/(b)(c)/, 2], /(?<a>b)(c)/i.match("BC").to_a
+#==#
+# The replacement mini-language of `sub`/`gsub` is larger than `\1`..`\9`, and
+# every escape it does not define keeps its backslash. `\&`, `` \` ``, `\'`,
+# `\+`, `\\` and `\k<name>` were all passed through as literal text.
+p "abcd".sub(/(b)(c)/, '<\0|\1|\2|\&>')
+p "abcd".sub(/(b)(c)/, "<#{'\\`'}|#{"\\'"}>")
+p "bc".sub(/(b)(c)?/, '<\+>'), "b".sub(/(b)(c)?/, '<\+>')
+p "bc".sub(/(b)(c)/, '<\9>'), "bc".sub(/(b)(c)/, '<\q>')
+p "bc".sub(/(b)(c)/, '<\\\\1>'), "bc".sub(/(b)(c)/, '<\\\\>')
+p "bc".sub(/(?<a>b)(c)/, '<\k<a>>'), "bce".sub(/(?<a>b)(c)(?<d>e)/, '<\k<a>|\k<d>>')
+p "bc".sub(/(?<a>b)/, '<\k>'), "bc".sub(/(?<a>b)/, "<\\k'a'>")
+#==#
+# The same Onigmo rule on the replacement side: with a named capture anywhere in
+# the pattern the NUMBERED refs expand to nothing, even when every group is
+# named and the number would have resolved. `\0`/`\&` are the whole match and
+# are never suppressed. A `\k<name>` naming no group is an IndexError.
+p "bc".sub(/(?<a>b)(c)/, '<\1|\2>'), "bc".sub(/(?<a>b)(?<d>c)/, '<\1|\2>')
+p "bc".sub(/(?<a>b)(?<d>c)/, '<\k<a>|\k<d>>'), "bc".sub(/(?<a>b)(c)/, '<\0|\&>')
+begin
+  "bc".sub(/(?<a>b)/, '<\k<zz>>')
+rescue IndexError => e
+  p [e.class.to_s, e.message]
+end
+#==#
+# MRI's math.c is a thin wrapper over the C library's own entries, so the only
+# way to agree with it to the last bit is to call the same libm. An Abramowitz &
+# Stegun 7.1.26 series answered `Math.erf(1.0)` as 0.8427006897475899 where the
+# reference says 0.8427007929497148, and `erfc` was computed as `1 - erf(x)`,
+# which cancels catastrophically for large x.
+p Math.erf(1.0), Math.erf(-2.5), Math.erf(0.0)
+p Math.erfc(1.0), Math.erfc(5.0), Math.erfc(-3.0)
+p Math.log1p(0.0), Math.log1p(1e-16), Math.expm1(0.0), Math.expm1(1e-16)
+p Math.frexp(8.0), Math.frexp(0.0), Math.frexp(-1.5)
+p Math.ldexp(0.5, 4), Math.ldexp(1.0, -1074)
+#==#
+# `Math.lgamma` answers `[log|Γ(x)|, sign]`, where the sign is `lgamma_r`'s own
+# out-parameter — MRI does not derive it. Only the infinities and the two signed
+# zeroes are special-cased in math.c itself.
+p Math.lgamma(5.0), Math.lgamma(-0.5), Math.lgamma(0.0), Math.lgamma(-0.0)
+p Math.lgamma(Float::INFINITY)
+begin
+  Math.lgamma(-Float::INFINITY)
+rescue Math::DomainError => e
+  p [e.class.to_s, e.message]
+end
+# `Math.gamma` answers the small integer arguments from an EXACT factorial
+# table, which no series lands on: a Lanczos approximation made `Math.gamma(5.0)`
+# 23.999999999999996. The table stops at fact(22) because fact(23) needs a
+# 56-bit mantissa and a double has 53.
+p (1..23).map { |i| Math.gamma(i) }
+p Math.gamma(-2.5), Math.gamma(0.5), Math.gamma(0.0), Math.gamma(-0.0)

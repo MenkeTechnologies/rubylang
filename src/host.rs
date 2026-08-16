@@ -683,6 +683,165 @@ pub struct RescueDef {
     pub body: usize,
 }
 
+/// Onigmo's `ONIG_SYN_CAPTURE_ONLY_NAMED_GROUP` rewrite: in a pattern that
+/// contains at least one NAMED group, every plain `(…)` group stops capturing.
+///
+/// Ruby's own documentation states the rule outright — "When a regexp contains a
+/// named capture, there are no unnamed captures" (doc/_regexp.rdoc, "Named
+/// Captures") — and MRI implements it by AST surgery, not by nulling a slot.
+/// `regcomp.c`'s `noname_disable_map` splices an unnamed `ENCLOSE_MEMORY` node
+/// out of the tree (`*plink = en->target; onig_node_free(node)`) and renumbers
+/// the surviving named groups densely from 1, then hard-sets
+/// `reg->num_mem = env->num_named`. So the unnamed group does not become a nil
+/// capture — it ceases to exist, and the group COUNT shrinks with it.
+///
+/// That distinction is the whole reason this is a source rewrite rather than a
+/// filter applied to the captures afterwards. `/(?<a>b)(c)/.match("bc")` must
+/// report `size` 2 and `to_a` `["bc", "b"]`; a post-filter that merely blanked
+/// group 2 would still report 3. Rewriting `(` to `(?:` before compiling makes
+/// fancy-regex's own numbering agree with Onigmo's for free, so `to_a`,
+/// `captures`, `size`, `[]`, `values_at`, `$1`..`$9` and `$+` all follow without
+/// a special case each.
+///
+/// There is no escape hatch to re-enable numbered capture: `ONIG_OPTION_CAPTURE_GROUP`
+/// exists in the C API but MRI never sets it and never exposes it — `re.c`
+/// references only `IGNORECASE`, `EXTEND` and `MULTILINE` — so the behavior is
+/// unconditional for a Ruby `Regexp`, whether built from a literal or from
+/// `Regexp.new`.
+///
+/// Only unnamed `(` is rewritten. `(?<n>…)`/`(?'n'…)` stay capturing, and every
+/// other `(?…)` form — `(?:`, `(?=`, `(?!`, `(?<=`, `(?<!`, `(?>`, `(?i:`,
+/// `(?#…)` — is already non-capturing and is passed through untouched. A `(`
+/// that is escaped (`\(`), inside a character class (`[(]`), inside a `(?#…)`
+/// comment, or inside an `/x`-mode `#` comment is not a group at all, so the
+/// scan tracks each of those states rather than matching on the byte alone.
+fn suppress_unnamed_groups(source: &str, extended: bool) -> String {
+    // The rule is keyed on the pattern containing a named group ANYWHERE — the
+    // trigger in regcomp.c is `scan_env.num_named > 0` over the whole regex,
+    // with no locality — so nothing is rewritten unless the first pass finds one.
+    if !scan_regex_groups(source, extended, None) {
+        return source.to_string();
+    }
+    let mut out = String::with_capacity(source.len() + 16);
+    scan_regex_groups(source, extended, Some(&mut out));
+    out
+}
+
+/// One shared scanner for both passes over a regex source.
+///
+/// With `out` as `None` it only reports whether a named group is present; with
+/// `Some(buf)` it copies the source into `buf`, expanding each unnamed
+/// capturing `(` to `(?:`. Sharing the walk keeps the two passes from drifting
+/// into disagreeing about what counts as a group.
+fn scan_regex_groups(source: &str, extended: bool, mut out: Option<&mut String>) -> bool {
+    let c: Vec<char> = source.chars().collect();
+    let mut i = 0;
+    let mut named = false;
+    let mut in_class = false;
+    // `push` mirrors the source into `out` when rewriting, and is a no-op on the
+    // detection pass.
+    macro_rules! push {
+        ($ch:expr) => {
+            if let Some(o) = out.as_deref_mut() {
+                o.push($ch);
+            }
+        };
+    }
+    while i < c.len() {
+        let ch = c[i];
+        // A backslash escapes whatever follows, so `\(` and `\[` never open
+        // anything. This is checked first, and inside classes too, because an
+        // escape is the one construct that outranks every other state.
+        if ch == '\\' {
+            push!(ch);
+            i += 1;
+            if i < c.len() {
+                push!(c[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if in_class {
+            // `[[:alpha:]]` — the `]` closing a POSIX bracket expression belongs
+            // to that expression, not to the enclosing class, so consume the
+            // whole `[:…:]` token rather than letting its `]` end the class.
+            if ch == '[' && c.get(i + 1) == Some(&':') {
+                if let Some(end) = (i + 2..c.len()).find(|&j| c[j] == ':' && c.get(j + 1) == Some(&']')) {
+                    for &x in &c[i..=end + 1] {
+                        push!(x);
+                    }
+                    i = end + 2;
+                    continue;
+                }
+            }
+            if ch == ']' {
+                in_class = false;
+            }
+            push!(ch);
+            i += 1;
+            continue;
+        }
+        // `/x` mode: an unescaped `#` outside a class comments out the rest of
+        // the line, so neither a `(` nor a `(?<` in it is a group.
+        if extended && ch == '#' {
+            while i < c.len() && c[i] != '\n' {
+                push!(c[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '[' {
+            // A `]` always closes the class, even immediately: Ruby rejects
+            // `/[]]/` with "empty char-class", which is only possible if the
+            // first `]` closed an empty `[]`. POSIX's "leading `]` is literal"
+            // rule does NOT apply here, so no leading-position special case.
+            in_class = true;
+            push!(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '(' {
+            if c.get(i + 1) == Some(&'?') {
+                // `(?#…)` is a comment; its body is not pattern text and may
+                // hold anything, including an unbalanced `(`.
+                if c.get(i + 2) == Some(&'#') {
+                    while i < c.len() && c[i] != ')' {
+                        push!(c[i]);
+                        i += 1;
+                    }
+                    continue;
+                }
+                // `(?<n>…)` is a named group, but `(?<=…)`/`(?<!…)` are
+                // lookbehind — same three-character prefix, opposite meaning.
+                let named_here = match c.get(i + 2) {
+                    Some('<') => !matches!(c.get(i + 3), Some('=') | Some('!')),
+                    Some('\'') => true,
+                    _ => false,
+                };
+                named |= named_here;
+                // Every `(?…)` form is either already non-capturing or a named
+                // group that keeps capturing, so none of them are rewritten.
+                push!('(');
+                push!('?');
+                i += 2;
+                continue;
+            }
+            // A bare `(` is the only capturing form, and the only thing this
+            // rewrite touches.
+            if out.is_some() {
+                push!('(');
+                push!('?');
+                push!(':');
+            }
+            i += 1;
+            continue;
+        }
+        push!(ch);
+        i += 1;
+    }
+    named
+}
+
 /// Ruby's `Regexp#options` bitmask for a regexp's flag text: `IGNORECASE` 1,
 /// `EXTENDED` 2, `MULTILINE` 4.
 ///
@@ -2545,10 +2704,11 @@ impl RubyHost {
         if flags.contains('x') {
             inline.push('x');
         }
+        let body = suppress_unnamed_groups(source, flags.contains('x'));
         let full = if inline.is_empty() {
-            source.to_string()
+            body
         } else {
-            format!("(?{inline}){source}")
+            format!("(?{inline}){body}")
         };
         match fancy_regex::Regex::new(&full) {
             Ok(re) => Ok(self.alloc(RObj::Regexp {

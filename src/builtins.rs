@@ -3447,6 +3447,43 @@ fn dispatch_classref(
     if cls == "Math" {
         let x = || as_f(&args[0]);
         let y = || as_f(&args[1]);
+        // `frexp` and `lgamma` answer a 2-element Array, so they are handled
+        // before the scalar table below.
+        match name {
+            // MRI: `frexp` splits x into a fraction in [0.5, 1) and an exponent
+            // (math.c `math_frexp`, a straight `frexp(3m)` passthrough).
+            "frexp" => {
+                let mut exp: i32 = 0;
+                let fr = unsafe { libm_frexp(x(), &mut exp) };
+                return Ok(new_arr(vec![Value::Float(fr), Value::Int(exp as i64)]));
+            }
+            // MRI's `math_lgamma` (math.c) special-cases the infinities and both
+            // signed zeroes itself and otherwise returns `lgamma_r`'s value with
+            // that function's own out-parameter sign — it does NOT derive the
+            // sign. The pole sign at negative integers is therefore whatever the
+            // platform libm reports, which is why calling libm (as MRI does) is
+            // the only way to agree with it.
+            "lgamma" => {
+                let d = x();
+                if d.is_infinite() {
+                    if d.is_sign_negative() {
+                        return Err(raise_exc(
+                            "Math::DomainError",
+                            "Numerical argument is out of domain - lgamma",
+                        ));
+                    }
+                    return Ok(new_arr(vec![Value::Float(f64::INFINITY), Value::Int(1)]));
+                }
+                if d == 0.0 {
+                    let sign = if d.is_sign_negative() { -1 } else { 1 };
+                    return Ok(new_arr(vec![Value::Float(f64::INFINITY), Value::Int(sign)]));
+                }
+                let mut sign: i32 = 1;
+                let v = unsafe { libm_lgamma_r(d, &mut sign) };
+                return Ok(new_arr(vec![Value::Float(v), Value::Int(sign as i64)]));
+            }
+            _ => {}
+        }
         let f = match name {
             "PI" => Some(std::f64::consts::PI),
             "E" => Some(std::f64::consts::E),
@@ -3472,10 +3509,26 @@ fn dispatch_classref(
             "log2" => Some(x().log2()),
             "log10" => Some(x().log10()),
             "hypot" => Some(x().hypot(y())),
-            "ldexp" => Some(x() * 2f64.powi(as_i(&args[1]) as i32)),
+            // `x * 2**e` loses the low bits for a subnormal result, where
+            // `ldexp(3m)` scales the exponent field directly; MRI calls the
+            // latter, so this does too.
+            "ldexp" => Some(unsafe { libm_ldexp(x(), as_i(&args[1]) as i32) }),
+            // `log1p(x)`/`expm1(x)` exist precisely because `(1+x).ln()` and
+            // `x.exp()-1` lose all significance as x → 0. Rust std has no
+            // binding for either, and MRI calls the libm ones.
+            "log1p" => Some(unsafe { libm_log1p(x()) }),
+            "expm1" => Some(unsafe { libm_expm1(x()) }),
             "gamma" => Some(math_gamma(x())),
-            "erf" => Some(math_erf(x())),
-            "erfc" => Some(1.0 - math_erf(x())),
+            // MRI's `math_erf`/`math_erfc` are one-line `erf(3m)`/`erfc(3m)`
+            // passthroughs with no domain check and no series of their own
+            // (math.c). Calling the same libm is what makes these agree to the
+            // last bit; the previous Abramowitz & Stegun 7.1.26 approximation
+            // was only good to ~1.5e-7, so `Math.erf(1.0)` answered
+            // 0.8427006897475899 where MRI answers 0.8427007929497148.
+            // `erfc` is likewise its own libm entry, not `1 - erf(x)`: that
+            // subtraction cancels catastrophically for large x.
+            "erf" => Some(unsafe { libm_erf(x()) }),
+            "erfc" => Some(unsafe { libm_erfc(x()) }),
             _ => None,
         };
         if let Some(v) = f {
@@ -7068,42 +7121,93 @@ fn mod_pow(base: i64, exp: i64, m: i64) -> i64 {
 /// formula for x < 0.5. Accurate to ~1e-9 on the tested domain; does NOT match
 /// MRI's libm gamma bit-for-bit (excluded from the parity corpus).
 fn math_gamma(x: f64) -> f64 {
-    const G: [f64; 9] = [
-        0.999_999_999_999_809_9,
-        676.5203681218851,
-        -1259.1392167224028,
-        771.323_428_777_653_1,
-        -176.615_029_162_140_6,
-        12.507343278686905,
-        -0.13857109526572012,
-        9.984_369_578_019_572e-6,
-        1.5056327351493116e-7,
+    // MRI's `math_gamma` (math.c) answers the small integer arguments from an
+    // exact factorial table and only then falls through to `tgamma(3m)`. The
+    // table is not an optimization: Γ(n) for integral n has an exact double
+    // representation, and neither `tgamma` nor a Lanczos series is required to
+    // land on it. A Lanczos approximation answered `Math.gamma(5.0)` as
+    // 23.999999999999996 where the reference says 24.0.
+    //
+    // The table stops at fact(22) because fact(23) = 25852016738884976640000
+    // needs a 56-bit mantissa, which IEEE 754 double (53 bits) cannot hold
+    // exactly — past that point `tgamma` is as good as it gets.
+    const FACT_TABLE: [f64; 23] = [
+        1.0,                      // fact(0)
+        1.0,                      // fact(1)
+        2.0,                      // fact(2)
+        6.0,                      // fact(3)
+        24.0,                     // fact(4)
+        120.0,                    // fact(5)
+        720.0,                    // fact(6)
+        5040.0,                   // fact(7)
+        40320.0,                  // fact(8)
+        362880.0,                 // fact(9)
+        3628800.0,                // fact(10)
+        39916800.0,               // fact(11)
+        479001600.0,              // fact(12)
+        6227020800.0,             // fact(13)
+        87178291200.0,            // fact(14)
+        1307674368000.0,          // fact(15)
+        20922789888000.0,         // fact(16)
+        355687428096000.0,        // fact(17)
+        6402373705728000.0,       // fact(18)
+        121645100408832000.0,     // fact(19)
+        2432902008176640000.0,    // fact(20)
+        51090942171709440000.0,   // fact(21)
+        1124000727777607680000.0, // fact(22)
     ];
-    if x < 0.5 {
-        std::f64::consts::PI / ((std::f64::consts::PI * x).sin() * math_gamma(1.0 - x))
-    } else {
-        let x = x - 1.0;
-        let t = x + 7.5;
-        let mut a = G[0];
-        for (i, g) in G.iter().enumerate().skip(1) {
-            a += g / (x + i as f64);
-        }
-        (2.0 * std::f64::consts::PI).sqrt() * t.powf(x + 0.5) * (-t).exp() * a
+    // `-Infinity` and the negative integers are outside the domain; both reach
+    // the caller as NaN out of `tgamma`, which the Math dispatch turns into the
+    // `Math::DomainError` MRI raises. `±0.0` is not NaN and keeps its sign.
+    if x.is_infinite() {
+        return if x.is_sign_negative() {
+            f64::NAN
+        } else {
+            f64::INFINITY
+        };
     }
+    if x == 0.0 {
+        return if x.is_sign_negative() {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+    if x == x.floor() && (1.0..=FACT_TABLE.len() as f64).contains(&x) {
+        return FACT_TABLE[x as usize - 1];
+    }
+    unsafe { libm_tgamma(x) }
 }
 
-/// Error function via Abramowitz & Stegun 7.1.26 (max abs error ~1.5e-7). Does
-/// NOT match MRI's libm erf bit-for-bit (excluded from the parity corpus).
-fn math_erf(x: f64) -> f64 {
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.3275911 * x);
-    let y = 1.0
-        - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t
-            + 0.254829592)
-            * t)
-            * (-x * x).exp();
-    sign * y
+// The C library's own math entries, for the `Math` functions Rust's `f64` does
+// not expose. MRI's math.c is a thin wrapper over exactly these symbols, so
+// binding them is what makes `Math.erf`, `Math.lgamma`, `Math.log1p`,
+// `Math.expm1`, `Math.frexp` and `Math.ldexp` agree with the reference to the
+// last bit rather than to a series approximation's error term.
+//
+// Every one of these is C99 §7.12, present in glibc, musl and Apple's libm
+// alike, and Rust links the platform libm on all three targets rubylang builds
+// for (macOS aarch64, Linux x86_64, Linux aarch64) — so this needs no new
+// dependency and no per-platform cfg.
+extern "C" {
+    #[link_name = "erf"]
+    fn libm_erf(x: f64) -> f64;
+    #[link_name = "erfc"]
+    fn libm_erfc(x: f64) -> f64;
+    /// Writes the sign of Γ(x) through `signp` and returns log|Γ(x)|.
+    #[link_name = "lgamma_r"]
+    fn libm_lgamma_r(x: f64, signp: *mut i32) -> f64;
+    #[link_name = "log1p"]
+    fn libm_log1p(x: f64) -> f64;
+    #[link_name = "expm1"]
+    fn libm_expm1(x: f64) -> f64;
+    /// Writes the exponent through `exp` and returns the fraction in [0.5, 1).
+    #[link_name = "frexp"]
+    fn libm_frexp(x: f64, exp: *mut i32) -> f64;
+    #[link_name = "ldexp"]
+    fn libm_ldexp(x: f64, exp: i32) -> f64;
+    #[link_name = "tgamma"]
+    fn libm_tgamma(x: f64) -> f64;
 }
 
 // ---- String ---------------------------------------------------------------
@@ -8240,7 +8344,7 @@ fn regex_replace(
             }
         } else {
             let repl = arg_str(&rest[0]);
-            out.push_str(&expand_backrefs(&repl, &caps));
+            out.push_str(&expand_backrefs(&repl, &caps, re, s)?);
         }
         last = m.end();
     }
@@ -8248,21 +8352,116 @@ fn regex_replace(
     Ok(new_str(out))
 }
 
-/// Expand `\1`..`\9` (and `\0`) group back-references in a replacement string.
-fn expand_backrefs(repl: &str, caps: &fancy_regex::Captures) -> String {
+/// Expand the back-references of a `sub`/`gsub` replacement string.
+///
+/// Ruby's replacement mini-language is larger than `\1`..`\9`, and every escape
+/// it does not define is passed through with its backslash intact:
+///
+/// | escape        | expands to                                    |
+/// |---------------|-----------------------------------------------|
+/// | `\0`, `\&`    | the whole match                               |
+/// | `\1`..`\9`    | that numbered group                           |
+/// | `` \` ``      | the text before the match                     |
+/// | `\'`          | the text after the match                      |
+/// | `\+`          | the last group that actually matched          |
+/// | `\k<name>`    | that named group                              |
+/// | `\\`          | one literal backslash                         |
+/// | anything else | the backslash and the character, unchanged    |
+///
+/// The numbered forms answer the EMPTY string — not the group text — whenever
+/// the pattern contains a named capture, which is the replacement-side face of
+/// the same Onigmo rule that stops unnamed groups from capturing (see
+/// `suppress_unnamed_groups` in host.rs). It holds even when every group is
+/// named and the number would have resolved:
+/// `"bc".sub(/(?<a>b)(?<d>c)/, '<\1|\2>')` is `"<|>"`, though `md[1]` is `"b"`.
+///
+/// `\k<name>` naming a group the pattern does not have is an `IndexError`, not
+/// an empty expansion — the only failure in the table. `\k` not followed by
+/// `<` is not the named form at all and stays literal, and `\k'name'` is
+/// likewise NOT accepted here even though `(?'name'…)` is accepted in a
+/// pattern.
+fn expand_backrefs(
+    repl: &str,
+    caps: &fancy_regex::Captures,
+    re: &fancy_regex::Regex,
+    subject: &str,
+) -> Result<String, String> {
+    let whole = caps.get(0).expect("group 0 always matched");
+    let has_named = re.capture_names().any(|n| n.is_some());
+    let group = |i: usize| caps.get(i).map(|m| m.as_str()).unwrap_or("");
     let mut out = String::new();
     let mut chars = repl.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(d) = chars.peek().and_then(|c| c.to_digit(10)) {
-                chars.next();
-                out.push_str(caps.get(d as usize).map(|m| m.as_str()).unwrap_or(""));
-                continue;
-            }
+        if c != '\\' {
+            out.push(c);
+            continue;
         }
-        out.push(c);
+        match chars.peek().copied() {
+            Some(d @ '0'..='9') => {
+                chars.next();
+                let n = d.to_digit(10).unwrap() as usize;
+                // `\0` is the whole match and is never suppressed; only the
+                // group numbers are.
+                if n == 0 {
+                    out.push_str(whole.as_str());
+                } else if !has_named {
+                    out.push_str(group(n));
+                }
+            }
+            Some('&') => {
+                chars.next();
+                out.push_str(whole.as_str());
+            }
+            Some('`') => {
+                chars.next();
+                out.push_str(&subject[..whole.start()]);
+            }
+            Some('\'') => {
+                chars.next();
+                out.push_str(&subject[whole.end()..]);
+            }
+            Some('+') => {
+                chars.next();
+                let last = (1..caps.len()).rev().find(|&i| caps.get(i).is_some());
+                if let Some(i) = last {
+                    out.push_str(group(i));
+                }
+            }
+            Some('\\') => {
+                chars.next();
+                out.push('\\');
+            }
+            Some('k') => {
+                // Only `\k<name>` is the named form. Peek past the `k` for the
+                // `<`, and if it is not there leave `\k` alone.
+                let rest: String = chars.clone().collect();
+                match rest.strip_prefix("k<").and_then(|r| {
+                    r.find('>')
+                        .map(|end| (r[..end].to_string(), "k<".len() + end + 1))
+                }) {
+                    Some((nm, consumed)) => {
+                        for _ in 0..consumed {
+                            chars.next();
+                        }
+                        match re.capture_names().position(|n| n == Some(nm.as_str())) {
+                            Some(i) => out.push_str(group(i)),
+                            None => {
+                                return Err(raise_exc(
+                                    "IndexError",
+                                    &format!("undefined group name reference: {nm}"),
+                                ))
+                            }
+                        }
+                    }
+                    None => out.push('\\'),
+                }
+            }
+            // A backslash at the very end of the replacement, or before any
+            // other character, is literal.
+            _ => out.push('\\'),
+        }
     }
-    out
+    Ok(out)
 }
 
 /// Ruby `dig`: index into nested Arrays/Hashes by each key in turn, short-
@@ -15281,8 +15480,16 @@ fn regex_escape(s: &str) -> String {
 }
 
 /// The named capture groups of a regex source as `(name, group_index)` pairs, in
-/// source order (`(?<name>…)` / `(?'name'…)`). Group indices count capturing
-/// groups only — `(?:…)`, lookarounds, and atomic groups do not advance the count.
+/// source order (`(?<name>…)` / `(?'name'…)`).
+///
+/// Only NAMED groups advance the index. That is not a simplification: this
+/// function returns nothing unless the pattern has a named group, and a pattern
+/// with a named group is exactly the case where Onigmo stops numbering the
+/// unnamed ones (see `suppress_unnamed_groups` in host.rs). So a plain `(…)`
+/// never contributes a number to any pair reported here, and counting it made
+/// `/(?<a>b)(c)(?<d>e)/.named_captures` answer `{"a" => [1], "d" => [3]}` where
+/// the reference answers `{"a" => [1], "d" => [2]}`. `(?:…)`, lookarounds, and
+/// atomic groups do not advance the count either.
 fn regex_named_groups(source: &str) -> Vec<(String, i64)> {
     let b = source.as_bytes();
     let mut out = Vec::new();
@@ -15320,9 +15527,10 @@ fn regex_named_groups(source: &str) -> Vec<(String, i64)> {
                         continue;
                     }
                     // Any other `(?…)` is a non-capturing construct.
-                } else {
-                    group_index += 1; // a plain capturing group
                 }
+                // A plain `(…)` deliberately does NOT advance `group_index`:
+                // reaching here at all means the pattern may hold a named
+                // group, and Onigmo gives unnamed groups no number in that case.
             }
             _ => {}
         }
