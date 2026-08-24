@@ -3633,10 +3633,72 @@ impl RubyHost {
         }
     }
 
+    /// One value by key, without copying the map. `None` when `v` is not a Hash;
+    /// `Some(None)` when the key is absent.
+    ///
+    /// This and its siblings exist because `as_hash` hands back a CLONE of the
+    /// whole `IndexMap`, so reaching one pair through it costs a copy of every
+    /// pair — see the fast-path note in `dispatch_hash`.
+    pub fn hash_at(&self, v: &Value, k: &RKey) -> Option<Option<Value>> {
+        match self.obj(v) {
+            Some(RObj::Hash { map, .. }) => Some(map.get(k).cloned()),
+            _ => None,
+        }
+    }
+
+    /// Whether a key is present, without copying the map.
+    pub fn hash_has_key(&self, v: &Value, k: &RKey) -> Option<bool> {
+        match self.obj(v) {
+            Some(RObj::Hash { map, .. }) => Some(map.contains_key(k)),
+            _ => None,
+        }
+    }
+
+    /// A hash's pair count, without copying it.
+    pub fn hash_len(&self, v: &Value) -> Option<usize> {
+        match self.obj(v) {
+            Some(RObj::Hash { map, .. }) => Some(map.len()),
+            _ => None,
+        }
+    }
+
+    /// Insert in place, without copying the map. `None` when `v` is not a Hash.
+    pub fn hash_insert(&mut self, v: &Value, k: RKey, val: Value) -> Option<()> {
+        match self.obj_mut(v) {
+            Some(RObj::Hash { map, .. }) => {
+                map.insert(k, val);
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    /// Remove in place, without copying the map. `shift_remove` keeps insertion
+    /// order, which is the order Ruby iterates a Hash in.
+    pub fn hash_remove(&mut self, v: &Value, k: &RKey) -> Option<Option<Value>> {
+        match self.obj_mut(v) {
+            Some(RObj::Hash { map, .. }) => Some(map.shift_remove(k)),
+            _ => None,
+        }
+    }
+
     /// An array's length without copying it. `None` when `v` is not an array.
     pub fn array_len(&self, v: &Value) -> Option<usize> {
         match self.obj(v) {
             Some(RObj::Array(xs)) => Some(xs.len()),
+            _ => None,
+        }
+    }
+
+    /// Overwrite one element by non-negative index, without copying the array.
+    /// `None` when `v` is not an array or the index is past the end — growing
+    /// the array is the caller's business, and is not a fast path.
+    pub fn array_set(&mut self, v: &Value, i: usize, val: Value) -> Option<()> {
+        match self.obj_mut(v) {
+            Some(RObj::Array(xs)) if i < xs.len() => {
+                xs[i] = val;
+                Some(())
+            }
             _ => None,
         }
     }

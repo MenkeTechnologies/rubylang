@@ -9365,6 +9365,46 @@ fn dispatch_array(
                 return Ok(Value::Int(n as i64));
             }
         }
+        "empty?" if args.is_empty() && block.is_none() => {
+            if let Some(n) = with_host(|h| h.array_len(recv)) {
+                return Ok(Value::Bool(n == 0));
+            }
+        }
+        // Indexing by a single Integer, and assigning to an index that already
+        // exists — the two shapes that appear inside a `while` over an array.
+        // Everything else (ranges, two-argument slices, growth past the end) is
+        // left to the general path, which needs the whole Vec anyway.
+        "[]" | "at" if matches!(args, [Value::Int(_)]) => {
+            let Value::Int(i) = args[0] else { unreachable!() };
+            if let Some(len) = with_host(|h| h.array_len(recv)) {
+                return Ok(match norm_idx(i, len) {
+                    Some(k) => with_host(|h| h.array_at(recv, k))
+                        .flatten()
+                        .unwrap_or(Value::Undef),
+                    None => Value::Undef,
+                });
+            }
+        }
+        "[]=" if matches!(args, [Value::Int(_), _]) => {
+            let Value::Int(i) = args[0] else { unreachable!() };
+            let len = with_host(|h| h.array_len(recv));
+            if let Some(k) = len.and_then(|n| norm_idx(i, n)) {
+                if with_host(|h| h.array_set(recv, k, args[1].clone())).is_some() {
+                    return Ok(args[1].clone());
+                }
+            }
+        }
+        "first" | "last" if args.is_empty() && block.is_none() => {
+            if let Some(len) = with_host(|h| h.array_len(recv)) {
+                if len == 0 {
+                    return Ok(Value::Undef);
+                }
+                let i = if name == "first" { 0 } else { len - 1 };
+                return Ok(with_host(|h| h.array_at(recv, i))
+                    .flatten()
+                    .unwrap_or(Value::Undef));
+            }
+        }
         _ => {}
     }
     let arr = with_host(|h| h.as_array(recv).unwrap_or_default());
@@ -14885,6 +14925,54 @@ fn dispatch_hash(
     block: Option<Value>,
 ) -> Result<Value, String> {
     frozen_guard(recv, name, HASH_MUTATORS)?;
+    // Answer the O(1) methods that appear inside loops BEFORE the read-out
+    // below, which clones the whole backing `IndexMap` for every method call —
+    // the same fast-path shape `dispatch_array` already uses, and for the same
+    // reason. Reaching one pair through a full copy of the map makes a loop over
+    // a hash quadratic in its size: 40 K writes plus 40 K reads against a
+    // 5 000-key hash took 55 s of CPU, essentially all of it copying keys.
+    //
+    // Only the paths that need nothing but the one pair are answered here. A
+    // MISS on `[]`/`fetch`/`delete` falls through to the general arm below, so
+    // the default value, the default proc and the miss block keep their single
+    // implementation.
+    match name {
+        "[]" | "fetch" if !args.is_empty() => {
+            let k = with_host(|h| h.hash_key(recv, &args[0]));
+            if let Some(Some(v)) = with_host(|h| h.hash_at(recv, &k)) {
+                return Ok(v);
+            }
+        }
+        "[]=" | "store" if args.len() == 2 => {
+            let k = with_host(|h| h.hash_key(recv, &args[0]));
+            if with_host(|h| h.hash_insert(recv, k, args[1].clone())).is_some() {
+                return Ok(args[1].clone());
+            }
+        }
+        "key?" | "has_key?" | "include?" | "member?" if args.len() == 1 => {
+            let k = with_host(|h| h.hash_key(recv, &args[0]));
+            if let Some(b) = with_host(|h| h.hash_has_key(recv, &k)) {
+                return Ok(Value::Bool(b));
+            }
+        }
+        "delete" if args.len() == 1 => {
+            let k = with_host(|h| h.hash_key(recv, &args[0]));
+            if let Some(Some(v)) = with_host(|h| h.hash_remove(recv, &k)) {
+                return Ok(v);
+            }
+        }
+        "size" | "length" if args.is_empty() && block.is_none() => {
+            if let Some(n) = with_host(|h| h.hash_len(recv)) {
+                return Ok(Value::Int(n as i64));
+            }
+        }
+        "empty?" if args.is_empty() && block.is_none() => {
+            if let Some(n) = with_host(|h| h.hash_len(recv)) {
+                return Ok(Value::Bool(n == 0));
+            }
+        }
+        _ => {}
+    }
     let map = with_host(|h| h.as_hash(recv).unwrap_or_default());
     match name {
         "size" | "length" => Ok(Value::Int(map.len() as i64)),
