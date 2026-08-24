@@ -3498,37 +3498,58 @@ fn clamp_with_open_ranges() {
     eq("5.clamp(3..)", "5");
 }
 
+/// Assert that `src` evaluates to a float within `rel` relative error of
+/// `expected`.
+///
+/// For libm-backed results only. `erf`/`erfc` are not bit-identical across
+/// libms — glibc and Apple's libm disagree by a few ulp on erf(1.0) and
+/// erfc(1.0) — and MRI inherits exactly the same spread, since its math.c
+/// calls the same entries. An equality pin on one platform's digits is a
+/// pin on the runner, not on the implementation.
+fn close(src: &str, expected: f64, rel: f64) {
+    let text = ev(src).unwrap_or_else(|e| panic!("eval error for `{src}`: {e}"));
+    let got: f64 = text
+        .parse()
+        .unwrap_or_else(|e| panic!("`{src}` evaluated to {text:?}, not a float: {e}"));
+    let err = (got - expected).abs() / expected.abs();
+    assert!(
+        err <= rel,
+        "`{src}` = {got:e}, {err:e} away from {expected:e} (allowed {rel:e})"
+    );
+}
+
 #[test]
-fn math_gamma_and_erf_are_exact() {
+fn math_gamma_is_exact_and_erf_matches_libm() {
     // These used to be a Lanczos gamma and an Abramowitz & Stegun 7.1.26 erf,
     // neither of which reaches MRI's trailing digits, so they could only be
     // asserted within a tolerance — and a tolerance of 1e-6 accepts an erf that
     // is wrong from the seventh digit, which is exactly what was shipping.
-    // They now bind the same libm entries MRI's math.c calls, so the assertion
-    // is the full inspect form and any drift fails.
+    // They now bind the same libm entries MRI's math.c calls.
     eq("Math.gamma(5)", "24.0");
     eq("Math.gamma(10)", "362880.0");
-    // Apple's libm and glibc differ by one ulp on erf(1.0) — 0.8427007929497148
-    // against 0.8427007929497149 — and each is the platform's own libm answer,
-    // which is exactly what MRI prints there. The pin accepts either; it still
-    // rejects a series approximation, which is wrong from the seventh digit.
-    let erf1 = ev("Math.erf(1.0)").expect("Math.erf(1.0) evaluates");
-    assert!(
-        matches!(erf1.as_str(), "0.8427007929497148" | "0.8427007929497149"),
-        "Math.erf(1.0) = {erf1}, which is neither platform libm's answer"
-    );
-    eq("Math.erfc(1.0)", "0.15729920705028516");
+    // The libm entries are pinned at 1e-15 relative — about four ulp, which
+    // covers the glibc/Apple-libm spread and nothing else. The A&S series this
+    // replaced is off by ~1e-7 relative, eight orders of magnitude outside, so
+    // it fails this assertion exactly as hard as it failed the equality one.
+    close("Math.erf(1.0)", 0.842_700_792_949_714_9, 1e-15);
+    close("Math.erfc(1.0)", 0.157_299_207_050_285_13, 1e-15);
     // `erfc` is its own libm entry, not `1 - erf(x)`: that subtraction cancels
-    // catastrophically once erf(x) approaches 1.
-    eq("Math.erfc(5.0)", "1.537459794428035e-12");
+    // catastrophically once erf(x) approaches 1. A `1 - erf(x)` erfc(5.0) lands
+    // near 1e-12 with no correct digits at all, so the tolerance still names it.
+    close("Math.erfc(5.0)", 1.537_459_794_428_035e-12, 1e-15);
     // The integral arguments come from MRI's exact factorial table, which no
     // series lands on — a Lanczos gamma made this 23.999999999999996.
     eq(
         "(1..23).map { |i| Math.gamma(i) }.all? { |v| v == v.round }",
         "true",
     );
-    eq("Math.lgamma(5.0)", "[3.1780538303479453, 1]");
-    eq("Math.lgamma(-0.5)", "[1.2655121234846454, -1]");
+    // `lgamma` is libm too: pin the sign exactly and the log-gamma value at the
+    // same four-ulp tolerance.
+    close("Math.lgamma(5.0)[0]", 3.178_053_830_347_945_3, 1e-15);
+    eq("Math.lgamma(5.0)[1]", "1");
+    close("Math.lgamma(-0.5)[0]", 1.265_512_123_484_645_4, 1e-15);
+    eq("Math.lgamma(-0.5)[1]", "-1");
+    // frexp/ldexp are exponent arithmetic, exact on every platform.
     eq("Math.frexp(8.0)", "[0.5, 4]");
     eq("Math.ldexp(0.5, 4)", "8.0");
 }
