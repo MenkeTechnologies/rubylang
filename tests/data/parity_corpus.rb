@@ -3887,3 +3887,76 @@ p 1.0.arg, (-1.0).phase
 p (1..5).overlap?(4..9), (1..5).overlap?(6..9), (1..5).overlap?(5..9)
 p (1...5).overlap?(4..9), (1...5).overlap?(5..9), (1..5).overlap?(0..0)
 p (1..5).overlap?(1..5), (1..0).overlap?(1..5)
+#==#
+# Ruby's `^`/`$` are LINE anchors with no flag that turns that off (`\A`/`\z` are
+# the string anchors), and its inline `(?m)` is dot-matches-newline — both differ
+# from the Perl spellings the regex engine underneath uses.
+p "a\nb" =~ /^b/, "a\nb" =~ /a$/, "a\nb" =~ /\Ab/
+p "a\nb".scan(/^./), "a\nb".gsub(/^/, ">"), "abc\n".sub(/$/, "X")
+p "a\nb" =~ /(?m)a.b/, "a\nb" =~ /(?m:a.b)/, "a\nb" =~ /a.b/m, "a\nb" =~ /a.b/
+p "ab" =~ /(?m)a.b/, "A" =~ /(?i)a/, "hello" =~ /(?ix) H E L L O /
+p "a\nb\n".split(/^/), "foo\nbar".split(/$/)
+p(/(?<a>b)(c)/.match("bc").to_a)
+#==#
+# A zero-width match is a match: MRI advances one CHARACTER past it rather than
+# skipping it, which is what makes an empty-capable pattern walk the string.
+p "abc".split(//), "hello".split(/l*/), "abc".split(/x*/), "abc".split(/(?=b)/)
+p "abc".split(//, 2), "abc".split(//, -1), "abc".split(//, 1), "abc".split(/b*/, -1)
+p "abc".split("", 2), "abc".split("", -1), "abc".split("", 1), "café".split(//)
+p "aaa".gsub(/a*/, "X"), "hello".gsub(/l*/, "[\0]"), "abc".gsub(//, "-")
+p "aXbXXc".scan(/X*/), "abc".scan(//), "abc".gsub(/b*/) { |m| "<#{m}>" }
+p "a,b,,c,".split(","), "a,b,,c,".split(",", -1), "a1b2c".split(/(\d)/)
+#==#
+# `break` out of a comparator or a key block ends the call and its operand is the
+# call's value — it is not a "these cannot be ranked" nil.
+p [1, 2, 3, 4].max_by { |x| break x * 10 if x == 2; x }
+p [1, 2, 3].min_by { |x| break 9 if x == 2; x }
+p [1, 2, 3].sort_by { |x| break 9 if x == 2; x }
+p [3, 1, 2].sort { |a, b| break 8 }
+p [3, 1, 2].min { |a, b| break 5 }, [3, 1, 2].max { |a, b| break 5 }
+p [3, 1, 2].minmax { |a, b| break 5 }, [3, 1, 2].max_by(2) { |x| break 5 }
+p [1, 2].to_h { break 4 }
+a = [3, 1, 2]
+p a.sort! { |x, y| break 8 }, a
+b = [3, 1, 2]
+p b.sort_by! { |x| break 8 }, b
+#==#
+# Comparable and Enumerable are mixins, so what they provide has to show up in
+# reflection as well as in dispatch.
+class ParityCmp
+  include Comparable
+  def initialize(v); @v = v; end
+  attr_reader :v
+  def <=>(o); v <=> o.v; end
+end
+x = ParityCmp.new(1)
+p x.respond_to?(:<), x.respond_to?(:between?), x.respond_to?(:clamp)
+p x.respond_to?(:==), x.respond_to?(:no_such_thing)
+p ParityCmp.method_defined?(:<=), ParityCmp.instance_methods.include?(:>)
+p Comparable.instance_methods.sort
+class ParityEnum
+  include Enumerable
+  def each; yield 1; yield 2; end
+end
+y = ParityEnum.new
+p y.respond_to?(:map), y.respond_to?(:sort), y.respond_to?(:no_such_thing)
+p y.map { |n| n * 2 }, y.sort
+#==#
+# Ruby hoists a local to nil from the parse position of its first assignment,
+# whether or not that assignment runs; every other bareword is a NameError.
+[10].each { |q| r = (r || 0) + 1; p r }
+[10].each { |q| if false then s = 1 end; p s }
+p(t = t)
+[1].each { p(u = u) }
+def parity_hoist; w = (w || 0) + 1; w; end
+p parity_hoist
+begin
+  no_such_local_or_method
+rescue NameError => e
+  p e.class, e.message, e.name
+end
+begin
+  "a".no_such_method
+rescue NoMethodError => e
+  p e.class, e.receiver, e.name
+end
