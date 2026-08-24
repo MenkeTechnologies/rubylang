@@ -356,6 +356,7 @@ fn m_from(
     (
         name,
         MethodDef {
+            chunk_id: crate::host::next_method_chunk_id(),
             params,
             splat,
             kwparams,

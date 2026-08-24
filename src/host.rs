@@ -1098,6 +1098,11 @@ pub struct MethodDef {
     pub opt: u16,
     pub kwreq: Vec<String>,
     pub chunk: Chunk,
+    /// Identifies this definition's chunk for VM reuse — see [`ChunkId`]. Minted
+    /// at construction, never serialized: a `MethodDef` read back from the
+    /// bytecode cache mints a fresh one, so an id from a previous process can
+    /// never collide with one from this one.
+    pub chunk_id: u64,
     /// Number of leading positional params bound directly into the body's fusevm
     /// frame slots `0..slot_params` (native-lowerable) instead of the host env.
     /// Non-zero only for a simple signature (all required positional, no defaults/
@@ -1122,6 +1127,16 @@ pub enum MethodShape {
         arity: i16,
         params: &'static str,
     },
+}
+
+/// A proc template's calling shape, without its compiled body — see
+/// [`RubyHost::proc_sig`].
+#[derive(Clone)]
+pub struct ProcSig {
+    pub params: Vec<String>,
+    /// Index of a `*rest` splat parameter, if any.
+    pub splat: Option<usize>,
+    pub arity: crate::ast::BlockArity,
 }
 
 /// A compiled block template.
@@ -2985,7 +3000,13 @@ impl RubyHost {
                 | ProcKind::Composed { .. } => Some(-1),
                 ProcKind::Collect(_) | ProcKind::Around(_) => Some(1),
                 ProcKind::Normal => {
-                    Some(ArityFacts::of_proc(&self.procs[*template]).arity_value(*is_lambda))
+                    Some(
+                        ArityFacts::of_block(
+                            &self.procs[*template].arity,
+                            self.procs[*template].splat.is_some(),
+                        )
+                        .arity_value(*is_lambda),
+                    )
                 }
             },
             // A `Symbol#to_proc` proc takes the receiver plus the method's own
@@ -3654,7 +3675,11 @@ impl RubyHost {
         match self.resolve_method_shape(recv, name, unbound) {
             Some(MethodShape::Def { def, .. }) => ArityFacts::of_method(&def).arity_value(true),
             Some(MethodShape::Block { template, .. }) => {
-                ArityFacts::of_proc(&self.procs[template]).arity_value(true)
+                ArityFacts::of_block(
+                    &self.procs[template].arity,
+                    self.procs[template].splat.is_some(),
+                )
+                .arity_value(true)
             }
             Some(MethodShape::Builtin { arity, .. }) => arity as i64,
             None => -1,
@@ -6518,6 +6543,22 @@ impl RubyHost {
         self.procs[id].clone()
     }
 
+    /// A proc template's calling shape, WITHOUT its compiled body.
+    ///
+    /// The block call path used to take `procs[id].clone()`, which copies the
+    /// whole chunk, and then cloned the chunk a second time to run it — two full
+    /// copies of the compiled body per block invocation. A block whose body was
+    /// large but mostly unexecuted therefore ran 6.6x slower than a tiny one for
+    /// the same number of iterations (200 K yields: 1.43 s vs 9.41 s of CPU).
+    pub fn proc_sig(&self, id: usize) -> ProcSig {
+        let p = &self.procs[id];
+        ProcSig {
+            params: p.params.clone(),
+            splat: p.splat,
+            arity: p.arity.clone(),
+        }
+    }
+
     // ---- truthiness / conversion -----------------------------------------
 
     /// Ruby truth: everything is true except `nil` and `false`.
@@ -8497,11 +8538,51 @@ thread_local! {
 /// past this depth the extras are dropped on return rather than retained.
 const VM_POOL_MAX: usize = 64;
 
+/// Which chunk a pooled VM is holding.
+///
+/// `VM::reset` takes an OWNED `Chunk`, so running a method or block normally
+/// means copying its compiled body on every call. When the VM being recycled
+/// already holds exactly that chunk, it can be handed its own back
+/// (`mem::take` + `reset`) and the copy disappears — but only if "exactly that
+/// chunk" can be decided, which is what this is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChunkId {
+    /// No stable identity: the top level, a required file, an ad-hoc chunk.
+    /// Never matches anything, so those keep copying as before.
+    None,
+    /// `procs[i]`. The proc table is append-only and `rebase_program` keeps a
+    /// later program's ids above the current length, so an index is never reused
+    /// for a different template.
+    Proc(usize),
+    /// A `MethodDef`'s minted id — see `next_method_chunk_id`. Minted per
+    /// construction, so redefining a method yields a new id and its stale VM is
+    /// simply never asked for again.
+    Method(u64),
+}
+
+impl ChunkId {
+    /// Whether a VM tagged `other` is holding THIS chunk. `None` never matches,
+    /// not even itself.
+    fn same(self, other: ChunkId) -> bool {
+        !matches!(self, ChunkId::None) && self == other
+    }
+}
+
 thread_local! {
-    /// VMs recycled across nested chunk runs — see `run_chunk_seeded`. Per
+    /// VMs recycled across nested chunk runs — see `run_chunk_pooled`. Per
     /// thread because a `VM` is not shared, and because each Ruby `Thread` runs
     /// its own chunks.
-    static VM_POOL: std::cell::RefCell<Vec<VM>> = const { std::cell::RefCell::new(Vec::new()) };
+    static VM_POOL: std::cell::RefCell<Vec<(ChunkId, VM)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A fresh id for a `MethodDef`'s chunk. Process-wide and monotonic, so two
+/// different definitions never share one; a `MethodDef` CLONE keeps its id,
+/// which is correct because the clone's chunk is identical.
+pub fn next_method_chunk_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Enable/disable DAP debug execution (installs the line-marker hook path).
@@ -8511,7 +8592,15 @@ pub fn set_debug_mode(on: bool) {
 
 /// Register every rubylang builtin + the numeric hook on a VM, then run it.
 fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
-    run_chunk_seeded(chunk, &[])
+    run_chunk_pooled(ChunkId::None, &[], || chunk)
+}
+
+/// Run the block template `id`'s body. The chunk is fetched from the host only
+/// when no pooled VM already holds it, so a repeated block call copies nothing.
+pub fn run_proc_chunk(id: usize) -> Result<Value, String> {
+    run_chunk_pooled(ChunkId::Proc(id), &[], || {
+        with_host(|h| h.procs[id].chunk.clone())
+    })
 }
 
 /// Run a method's body chunk, seeding the leading frame slots with the call's
@@ -8520,46 +8609,70 @@ fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
 /// 0 (every param host-bound).
 fn run_method_chunk(def: &MethodDef, args: &[Value]) -> Result<Value, String> {
     let n = def.slot_params as usize;
-    if n == 0 {
-        return run_chunk_on(def.chunk.clone());
-    }
     let seed: Vec<Value> = (0..n)
         .map(|i| args.get(i).cloned().unwrap_or(Value::Undef))
         .collect();
-    run_chunk_seeded(def.chunk.clone(), &seed)
+    run_chunk_pooled(ChunkId::Method(def.chunk_id), &seed, || def.chunk.clone())
 }
 
 /// Build the VM for `chunk`, seed its leading frame slots with `slot_seed`
 /// (`slot_params` binding, empty for the common case), and run it — via the
 /// linked AOT native driver when the chunk carries one, else the interpreter.
-fn run_chunk_seeded(chunk: Chunk, slot_seed: &[Value]) -> Result<Value, String> {
+fn run_chunk_pooled(
+    id: ChunkId,
+    slot_seed: &[Value],
+    fetch: impl FnOnce() -> Chunk,
+) -> Result<Value, String> {
+    // Every method call and every block invocation lands here, and each one used
+    // to pay for two things that a recycled VM already has:
+    //
+    //   * `VM::new` + `install` — 57 `register_builtin` calls, each growing the
+    //     VM's builtin table, plus an Arc for the numeric hook.
+    //   * a full copy of the chunk, because `VM::reset` takes an owned one. That
+    //     cost is proportional to the BODY SIZE, so a 200-op body that never ran
+    //     still made every call 2.2x (methods) / 6.6x (blocks) slower than a
+    //     one-line body.
+    //
+    // `VM::reset` clears the stack, frames, globals and JIT recorder while
+    // preserving the builtin table and the tracing-JIT flag, so the first cost
+    // goes away for any recycled VM. The second goes away only for a VM that is
+    // already holding this exact chunk, which is what `ChunkId` decides: hand it
+    // back its own chunk and nothing is copied at all.
+    //
+    // Popping before the run and pushing after keeps this re-entrant — a nested
+    // call takes the next VM, or makes one.
+    let mut vm = match VM_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        pool.iter()
+            .rposition(|(k, _)| id.same(*k))
+            .map(|i| pool.swap_remove(i).1)
+    }) {
+        Some(mut vm) => {
+            let own = std::mem::take(&mut vm.chunk);
+            vm.reset(own);
+            vm
+        }
+        None => match VM_POOL.with(|p| p.borrow_mut().pop()) {
+            Some((_, mut vm)) => {
+                vm.reset(fetch());
+                vm
+            }
+            None => {
+                let mut vm = VM::new(fetch());
+                crate::builtins::install(&mut vm);
+                vm.set_numeric_hook(std::sync::Arc::new(|op, a, b| {
+                    crate::builtins::numeric_hook(op, a, b)
+                }));
+                vm
+            }
+        },
+    };
     // In a `--build --native` binary each method/block chunk carries a non-zero
     // `native_id` and its AOT-lowered native driver is linked in (see aot.rs). Run
     // that machine code directly on the VM instead of interpreting the ops — the
     // driver still needs the builtins + numeric hook installed (its threaded ops
     // call back through them), just not the interpreter loop or the tracing JIT.
-    let native = crate::aot::native_entry(chunk.native_id);
-    // Every method call and every block invocation lands here, and a fresh
-    // `VM::new` + `install` costs 57 `register_builtin` calls (each growing the
-    // VM's builtin table) plus an Arc for the numeric hook — per call. A
-    // recycled VM keeps both, because `VM::reset` clears the stack, frames,
-    // globals and JIT recorder while PRESERVING the builtin table and the
-    // tracing-JIT flag. Popping before the run and pushing after keeps this
-    // re-entrant: a nested call takes the next VM, or makes one.
-    let mut vm = match VM_POOL.with(|p| p.borrow_mut().pop()) {
-        Some(mut vm) => {
-            vm.reset(chunk);
-            vm
-        }
-        None => {
-            let mut vm = VM::new(chunk);
-            crate::builtins::install(&mut vm);
-            vm.set_numeric_hook(std::sync::Arc::new(|op, a, b| {
-                crate::builtins::numeric_hook(op, a, b)
-            }));
-            vm
-        }
-    };
+    let native = crate::aot::native_entry(vm.chunk.native_id);
     // Seed the leading frame slots with the caller's positional args before the
     // body runs (native driver or interpreter both read them via `GetSlot`).
     for (i, v) in slot_seed.iter().enumerate() {
@@ -8597,7 +8710,7 @@ fn run_chunk_seeded(chunk: Chunk, slot_seed: &[Value]) -> Result<Value, String> 
         // Bounded so a deeply recursive program does not keep every VM it ever
         // needed alive for the rest of the process.
         if pool.len() < VM_POOL_MAX {
-            pool.push(vm);
+            pool.push((id, vm));
         }
     });
     result
@@ -8805,14 +8918,17 @@ impl<'a> ArityFacts<'a> {
             has_kwrest: def.kwsplat.is_some(),
         }
     }
-    pub fn of_proc(def: &'a ProcDef) -> Self {
+    /// Takes the written `BlockArity` and whether the template has a `*rest`,
+    /// rather than a whole `ProcDef` — the block call path holds only the
+    /// template's SHAPE, never a copy of its compiled body.
+    pub fn of_block(arity: &'a crate::ast::BlockArity, has_rest: bool) -> Self {
         ArityFacts {
-            req: def.arity.req,
-            opt: def.arity.opt,
-            has_rest: def.splat.is_some(),
-            kwnames: &def.arity.kwnames,
-            kwreq: &def.arity.kwreq,
-            has_kwrest: def.arity.kwsplat.is_some(),
+            req: arity.req,
+            opt: arity.opt,
+            has_rest,
+            kwnames: &arity.kwnames,
+            kwreq: &arity.kwreq,
+            has_kwrest: arity.kwsplat.is_some(),
         }
     }
     /// MRI's `rb_iseq_min_max_arity`: the mandatory count, and the maximum
@@ -9521,7 +9637,7 @@ fn run_template(id: usize, args: &[Value]) -> Result<Value, String> {
             })
             .collect()
     });
-    let r = run_chunk_on(def.chunk.clone());
+    let r = run_proc_chunk(id);
     with_host(|h| {
         let env = h.cur_env();
         for (p, prev) in saved {
@@ -11245,14 +11361,17 @@ pub fn call_proc_self_ctx(
         ProcKind::Normal => {}
     }
 
-    let def = with_host(|h| h.procs[template].clone());
+    let def = with_host(|h| h.proc_sig(template));
 
     // A lambda — and a `define_method` body, which MRI also gives method
     // semantics — is arity-checked before its body runs, exactly like a `def`.
     // A plain block is lenient: it binds missing params to nil and drops extras.
     let strict = is_lambda || method_ctx.is_some();
     if strict {
-        check_call_arity(&ArityFacts::of_proc(&def), args)?;
+        check_call_arity(
+            &ArityFacts::of_block(&def.arity, def.splat.is_some()),
+            args,
+        )?;
     }
 
     // Auto-splat: a block with more than one parameter slot destructures a single
@@ -11334,7 +11453,7 @@ pub fn call_proc_self_ctx(
     // their bound values and any local the body already assigned survives (MRI
     // does not re-bind either), so the child env is deliberately not rebuilt.
     let r = loop {
-        let r = run_chunk_on(def.chunk.clone());
+        let r = run_proc_chunk(template);
         if r.is_err() || !take_redo_signal() {
             break r;
         }

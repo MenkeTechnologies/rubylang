@@ -1114,6 +1114,7 @@ impl Compiler {
             .map(|p| p.name.clone())
             .collect();
         Ok(MethodDef {
+            chunk_id: crate::host::next_method_chunk_id(),
             params: pnames,
             splat,
             kwparams,
@@ -3019,6 +3020,7 @@ impl Compiler {
         b.emit(Op::LoadConst(idx), 0);
         b.emit(Op::CallBuiltin(ops::GETIVAR, 1), 0);
         MethodDef {
+            chunk_id: crate::host::next_method_chunk_id(),
             params: vec![],
             splat: None,
             kwparams: vec![],
@@ -3042,6 +3044,7 @@ impl Compiler {
         b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
         b.emit(Op::CallBuiltin(ops::SETIVAR, 2), 0);
         MethodDef {
+            chunk_id: crate::host::next_method_chunk_id(),
             params: vec!["value".to_string()],
             splat: None,
             kwparams: vec![],
