@@ -3702,8 +3702,15 @@ end
 # Stegun 7.1.26 series answered `Math.erf(1.0)` as 0.8427006897475899 where the
 # reference says 0.8427007929497148, and `erfc` was computed as `1 - erf(x)`,
 # which cancels catastrophically for large x.
-p Math.erf(1.0), Math.erf(-2.5), Math.erf(0.0)
-p Math.erfc(1.0), Math.erfc(5.0), Math.erfc(-3.0)
+# The LAST BIT of an erf/erfc is the platform libm's, not MRI's: glibc answers
+# erf(1.0) as 0.8427007929497149 and erfc(1.0) as 0.15729920705028513 where
+# Apple's libm says ...148 and ...516, and MRI prints whichever its own libm
+# produced. Twelve significant digits sit far inside that spread and far
+# outside a series approximation's error — A&S 7.1.26 is wrong from the
+# seventh digit — so the value stays pinned without freezing one platform's
+# ulp into the corpus. The arguments that agreed on both are printed raw.
+p "%.12g" % Math.erf(1.0), Math.erf(-2.5), Math.erf(0.0)
+p "%.12g" % Math.erfc(1.0), "%.12g" % Math.erfc(5.0), Math.erfc(-3.0)
 p Math.log1p(0.0), Math.log1p(1e-16), Math.expm1(0.0), Math.expm1(1e-16)
 p Math.frexp(8.0), Math.frexp(0.0), Math.frexp(-1.5)
 p Math.ldexp(0.5, 4), Math.ldexp(1.0, -1074)
@@ -3711,7 +3718,12 @@ p Math.ldexp(0.5, 4), Math.ldexp(1.0, -1074)
 # `Math.lgamma` answers `[log|Γ(x)|, sign]`, where the sign is `lgamma_r`'s own
 # out-parameter — MRI does not derive it. Only the infinities and the two signed
 # zeroes are special-cased in math.c itself.
-p Math.lgamma(5.0), Math.lgamma(-0.5), Math.lgamma(0.0), Math.lgamma(-0.0)
+# lgamma(5.0) and gamma(-2.5) are the two values in this snippet whose last
+# bit differs between glibc and Apple's libm, so they print to twelve
+# significant digits for the same reason as the erf snippet above; the sign
+# out-parameter and every other argument are exact and print raw.
+lg5 = Math.lgamma(5.0)
+p ["%.12g" % lg5[0], lg5[1]], Math.lgamma(-0.5), Math.lgamma(0.0), Math.lgamma(-0.0)
 p Math.lgamma(Float::INFINITY)
 begin
   Math.lgamma(-Float::INFINITY)
@@ -3723,7 +3735,7 @@ end
 # 23.999999999999996. The table stops at fact(22) because fact(23) needs a
 # 56-bit mantissa and a double has 53.
 p (1..23).map { |i| Math.gamma(i) }
-p Math.gamma(-2.5), Math.gamma(0.5), Math.gamma(0.0), Math.gamma(-0.0)
+p "%.12g" % Math.gamma(-2.5), Math.gamma(0.5), Math.gamma(0.0), Math.gamma(-0.0)
 #==#
 # MRI's parse.y takes a trailing `?`/`!` into a method name only when the next
 # character is not `=` (`if ((c == '!' || c == '?') && !peek(p, '=')) tokadd`).
