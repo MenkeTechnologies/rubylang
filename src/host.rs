@@ -731,16 +731,55 @@ pub struct RescueDef {
 /// that is escaped (`\(`), inside a character class (`[(]`), inside a `(?#…)`
 /// comment, or inside an `/x`-mode `#` comment is not a group at all, so the
 /// scan tracks each of those states rather than matching on the byte alone.
-fn suppress_unnamed_groups(source: &str, extended: bool) -> String {
-    // The rule is keyed on the pattern containing a named group ANYWHERE — the
-    // trigger in regcomp.c is `scan_env.num_named > 0` over the whole regex,
-    // with no locality — so nothing is rewritten unless the first pass finds one.
-    if !scan_regex_groups(source, extended, None) {
+///
+/// # The second rewrite: Ruby's inline `m` is fancy-regex's `s`
+///
+/// Ruby's only regexp options are `i`, `m` and `x`, and its `m` means DOT
+/// MATCHES NEWLINE — `/(?s)a/` is a `SyntaxError` ("undefined group option").
+/// fancy-regex uses the Perl spelling, where `s` is dot-matches-newline and `m`
+/// is *line anchors*. An inline `(?m)` therefore does not fail to compile; it
+/// silently means something else, and `"a\nb" =~ /(?m)a.b/` answered `nil`
+/// where MRI answers `0`. Every inline flag group is rewritten, so `(?m)`,
+/// `(?im:…)` and the `(?-mix:…)` that `Regexp#to_s` emits all keep their Ruby
+/// meaning.
+fn ruby_regex_to_fancy(source: &str, extended: bool) -> String {
+    // The unnamed-group rule is keyed on the pattern containing a named group
+    // ANYWHERE — the trigger in regcomp.c is `scan_env.num_named > 0` over the
+    // whole regex, with no locality — so the first pass reports it for the
+    // second. An inline flag group is enough on its own to require a rewrite.
+    let scan = scan_regex_groups(source, extended, None, false);
+    if !scan.named && !scan.inline_flags {
         return source.to_string();
     }
     let mut out = String::with_capacity(source.len() + 16);
-    scan_regex_groups(source, extended, Some(&mut out));
+    scan_regex_groups(source, extended, Some(&mut out), scan.named);
     out
+}
+
+/// What the detection pass of [`scan_regex_groups`] found.
+#[derive(Default)]
+struct RegexScan {
+    /// The pattern has a named group, so every unnamed `(` stops capturing.
+    named: bool,
+    /// The pattern has an inline flag group, so its `m` needs translating.
+    inline_flags: bool,
+}
+
+/// The end of an inline flag group starting at `i` (just past the `(?`), if
+/// that is what this is: `[imx-]*` terminated by `)` or `:`.
+///
+/// The terminator is what separates `(?i)` from `(?i…` — and, more to the
+/// point, what keeps `(?<name>…)`, `(?=…)` and `(?>…)` out of this path, since
+/// none of their bodies are flag characters.
+fn inline_flag_group_end(c: &[char], i: usize) -> Option<usize> {
+    let mut j = i;
+    while matches!(c.get(j), Some('i') | Some('m') | Some('x') | Some('-')) {
+        j += 1;
+    }
+    match c.get(j) {
+        Some(')') | Some(':') if j > i => Some(j),
+        _ => None,
+    }
 }
 
 /// One shared scanner for both passes over a regex source.
@@ -749,10 +788,15 @@ fn suppress_unnamed_groups(source: &str, extended: bool) -> String {
 /// `Some(buf)` it copies the source into `buf`, expanding each unnamed
 /// capturing `(` to `(?:`. Sharing the walk keeps the two passes from drifting
 /// into disagreeing about what counts as a group.
-fn scan_regex_groups(source: &str, extended: bool, mut out: Option<&mut String>) -> bool {
+fn scan_regex_groups(
+    source: &str,
+    extended: bool,
+    mut out: Option<&mut String>,
+    suppress_unnamed: bool,
+) -> RegexScan {
     let c: Vec<char> = source.chars().collect();
     let mut i = 0;
-    let mut named = false;
+    let mut scan = RegexScan::default();
     let mut in_class = false;
     // `push` mirrors the source into `out` when rewriting, and is a no-op on the
     // detection pass.
@@ -829,6 +873,20 @@ fn scan_regex_groups(source: &str, extended: bool, mut out: Option<&mut String>)
                     }
                     continue;
                 }
+                // An inline flag group. Ruby's `m` is dot-matches-newline, which
+                // fancy-regex spells `s`; passing it through unchanged turns it
+                // into a line-anchor switch instead.
+                if let Some(end) = inline_flag_group_end(&c, i + 2) {
+                    scan.inline_flags = true;
+                    push!('(');
+                    push!('?');
+                    for &f in &c[i + 2..end] {
+                        push!(if f == 'm' { 's' } else { f });
+                    }
+                    push!(c[end]);
+                    i = end + 1;
+                    continue;
+                }
                 // `(?<n>…)` is a named group, but `(?<=…)`/`(?<!…)` are
                 // lookbehind — same three-character prefix, opposite meaning.
                 let named_here = match c.get(i + 2) {
@@ -836,7 +894,7 @@ fn scan_regex_groups(source: &str, extended: bool, mut out: Option<&mut String>)
                     Some('\'') => true,
                     _ => false,
                 };
-                named |= named_here;
+                scan.named |= named_here;
                 // Every `(?…)` form is either already non-capturing or a named
                 // group that keeps capturing, so none of them are rewritten.
                 push!('(');
@@ -846,10 +904,12 @@ fn scan_regex_groups(source: &str, extended: bool, mut out: Option<&mut String>)
             }
             // A bare `(` is the only capturing form, and the only thing this
             // rewrite touches.
-            if out.is_some() {
+            if suppress_unnamed {
                 push!('(');
                 push!('?');
                 push!(':');
+            } else {
+                push!('(');
             }
             i += 1;
             continue;
@@ -857,7 +917,7 @@ fn scan_regex_groups(source: &str, extended: bool, mut out: Option<&mut String>)
         push!(ch);
         i += 1;
     }
-    named
+    scan
 }
 
 /// Ruby's `Regexp#options` bitmask for a regexp's flag text: `IGNORECASE` 1,
@@ -2712,7 +2772,14 @@ impl RubyHost {
     /// `\Z`/`\G`), `\h`/`\H`, named groups, and POSIX classes are all supported
     /// by its parser, so patterns pass through unrewritten.
     pub fn new_regex(&mut self, source: &str, flags: &str) -> Result<Value, String> {
-        let mut inline = String::new();
+        // Ruby's `^` and `$` are LINE anchors always — there is no flag that
+        // turns that off, and `\A`/`\z` are the string anchors. fancy-regex
+        // follows Perl, where `^`/`$` bind to the whole haystack unless `m` is
+        // set, so `m` is unconditional here rather than derived from the Ruby
+        // flags. Without it `"a\nb" =~ /^b/` answered `nil` where MRI answers
+        // `2`, and every `^`/`$` in a multi-line subject was silently wrong:
+        // `"a\nb".gsub(/^/, ">")` anchored once instead of per line.
+        let mut inline = String::from("m");
         if flags.contains('i') {
             inline.push('i');
         }
@@ -2722,12 +2789,8 @@ impl RubyHost {
         if flags.contains('x') {
             inline.push('x');
         }
-        let body = suppress_unnamed_groups(source, flags.contains('x'));
-        let full = if inline.is_empty() {
-            body
-        } else {
-            format!("(?{inline}){body}")
-        };
+        let body = ruby_regex_to_fancy(source, flags.contains('x'));
+        let full = format!("(?{inline}){body}");
         match fancy_regex::Regex::new(&full) {
             Ok(re) => Ok(self.alloc(RObj::Regexp {
                 source: source.to_string(),
