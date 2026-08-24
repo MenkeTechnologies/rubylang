@@ -9375,7 +9375,9 @@ fn dispatch_array(
         // Everything else (ranges, two-argument slices, growth past the end) is
         // left to the general path, which needs the whole Vec anyway.
         "[]" | "at" if matches!(args, [Value::Int(_)]) => {
-            let Value::Int(i) = args[0] else { unreachable!() };
+            let Value::Int(i) = args[0] else {
+                unreachable!()
+            };
             if let Some(len) = with_host(|h| h.array_len(recv)) {
                 return Ok(match norm_idx(i, len) {
                     Some(k) => with_host(|h| h.array_at(recv, k))
@@ -9386,7 +9388,9 @@ fn dispatch_array(
             }
         }
         "[]=" if matches!(args, [Value::Int(_), _]) => {
-            let Value::Int(i) = args[0] else { unreachable!() };
+            let Value::Int(i) = args[0] else {
+                unreachable!()
+            };
             let len = with_host(|h| h.array_len(recv));
             if let Some(k) = len.and_then(|n| norm_idx(i, n)) {
                 if with_host(|h| h.array_set(recv, k, args[1].clone())).is_some() {

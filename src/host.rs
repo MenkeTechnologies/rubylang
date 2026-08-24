@@ -2999,15 +2999,13 @@ impl RubyHost {
                 | ProcKind::MethodCurried { .. }
                 | ProcKind::Composed { .. } => Some(-1),
                 ProcKind::Collect(_) | ProcKind::Around(_) => Some(1),
-                ProcKind::Normal => {
-                    Some(
-                        ArityFacts::of_block(
-                            &self.procs[*template].arity,
-                            self.procs[*template].splat.is_some(),
-                        )
-                        .arity_value(*is_lambda),
+                ProcKind::Normal => Some(
+                    ArityFacts::of_block(
+                        &self.procs[*template].arity,
+                        self.procs[*template].splat.is_some(),
                     )
-                }
+                    .arity_value(*is_lambda),
+                ),
             },
             // A `Symbol#to_proc` proc takes the receiver plus the method's own
             // arguments (MRI reports `-2`); a bound `Method` used as a proc
@@ -3674,13 +3672,11 @@ impl RubyHost {
     pub fn method_arity(&self, recv: &Value, name: &str, unbound: bool) -> i64 {
         match self.resolve_method_shape(recv, name, unbound) {
             Some(MethodShape::Def { def, .. }) => ArityFacts::of_method(&def).arity_value(true),
-            Some(MethodShape::Block { template, .. }) => {
-                ArityFacts::of_block(
-                    &self.procs[template].arity,
-                    self.procs[template].splat.is_some(),
-                )
-                .arity_value(true)
-            }
+            Some(MethodShape::Block { template, .. }) => ArityFacts::of_block(
+                &self.procs[template].arity,
+                self.procs[template].splat.is_some(),
+            )
+            .arity_value(true),
             Some(MethodShape::Builtin { arity, .. }) => arity as i64,
             None => -1,
         }
@@ -11368,10 +11364,7 @@ pub fn call_proc_self_ctx(
     // A plain block is lenient: it binds missing params to nil and drops extras.
     let strict = is_lambda || method_ctx.is_some();
     if strict {
-        check_call_arity(
-            &ArityFacts::of_block(&def.arity, def.splat.is_some()),
-            args,
-        )?;
+        check_call_arity(&ArityFacts::of_block(&def.arity, def.splat.is_some()), args)?;
     }
 
     // Auto-splat: a block with more than one parameter slot destructures a single
