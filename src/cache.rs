@@ -18,12 +18,14 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 /// Bump on any incompatible change to `CProg` / the lowering.
-const SCHEMA: u64 = 8;
+const SCHEMA: u64 = 9;
 
-/// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
+/// The outer, rkyv-archived shard: the [`build_stamp`] of the binary that wrote
+/// it, then a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
 #[archive(check_bytes)]
 struct Shard {
+    stamp: u64,
     entries: Vec<Entry>,
 }
 
@@ -144,12 +146,107 @@ pub fn key_for_file(abs_path: &str, src: &str) -> u64 {
     h.finish()
 }
 
-fn shard_path() -> Option<PathBuf> {
+fn shard_dir() -> Option<PathBuf> {
     let dir = dirs::home_dir()?.join(".rubylang");
     let _ = std::fs::create_dir_all(&dir);
-    Some(dir.join("scripts.rkyv"))
+    Some(dir)
 }
 
+fn shard_path() -> Option<PathBuf> {
+    Some(shard_dir()?.join("scripts.rkyv"))
+}
+
+/// Identifies the BINARY that wrote the shard: the running executable's size and
+/// mtime, plus the schema and crate version.
+///
+/// Every blob in the shard is bytecode this binary's compiler emitted, so a
+/// rebuilt binary must not read them back. Nothing else in the key moved on a
+/// rebuild — `SCHEMA` is hand-bumped and `CARGO_PKG_VERSION` only changes at a
+/// release — so a dev build that changed lowering silently REPLAYED the previous
+/// build's bytecode. Measured rather than reasoned about: with `BinOp::Mul`
+/// deliberately lowered to `Op::Add` and the binary rebuilt, a script already in
+/// the shard still printed `6 * 7 => 42` while a fresh one printed the broken
+/// `13`. A compiler fix would appear to do nothing until the shard was deleted
+/// by hand.
+///
+/// Size and mtime rather than a hash of the executable: the shard is consulted
+/// on the startup path of every run, and rubylang's binary is ~58 MB.
+fn build_stamp() -> u64 {
+    match std::env::current_exe() {
+        Ok(p) => exe_stamp(&p),
+        // No `current_exe` (an embedder, a stripped environment): the version
+        // and schema still separate releases, they just cannot separate two dev
+        // builds of the same version.
+        Err(_) => exe_stamp(std::path::Path::new("")),
+    }
+}
+
+/// [`build_stamp`] for a named executable. Split out so the invalidation test
+/// can prove two builds get different stamps without touching the binary it is
+/// itself running from.
+pub fn exe_stamp(path: &std::path::Path) -> u64 {
+    let mut h = rustc_hash::FxHasher::default();
+    SCHEMA.hash(&mut h);
+    env!("CARGO_PKG_VERSION").hash(&mut h);
+    if let Ok(md) = std::fs::metadata(path) {
+        md.len().hash(&mut h);
+        if let Ok(t) = md.modified() {
+            if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                d.as_nanos().hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
+/// An exclusive advisory lock over the shard, held for the caller's whole
+/// read-modify-write.
+///
+/// `store_keyed` reads the whole shard, adds one entry and writes the whole
+/// thing back. Up to 16 rubylang processes share one `~/.rubylang`, so two
+/// concurrent stores would each read the same shard and the second write would
+/// drop the first's entry. `flock` is advisory and process-wide, which is
+/// exactly the scope needed here; a failure to take it is not fatal — the store
+/// proceeds unlocked rather than failing the build.
+struct ShardLock(Option<std::fs::File>);
+
+impl ShardLock {
+    fn acquire() -> ShardLock {
+        let Some(dir) = shard_dir() else {
+            return ShardLock(None);
+        };
+        let Ok(f) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("scripts.lock"))
+        else {
+            return ShardLock(None);
+        };
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `f` is an open file this process owns for as long as the lock.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return ShardLock(None);
+        }
+        ShardLock(Some(f))
+    }
+}
+
+impl Drop for ShardLock {
+    fn drop(&mut self) {
+        if let Some(f) = &self.0 {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: same descriptor, still open until this returns.
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+/// The stored shard, or an empty one when it was written by a DIFFERENT binary.
+///
+/// Discarding the whole shard on a stamp mismatch is also how stale entries are
+/// pruned: every one of them was emitted by the previous build, and none of
+/// their keys will ever be asked for again.
 fn load_shard() -> Shard {
     let Some(path) = shard_path() else {
         return Shard::default();
@@ -157,13 +254,27 @@ fn load_shard() -> Shard {
     let Ok(bytes) = std::fs::read(&path) else {
         return Shard::default();
     };
-    rkyv::from_bytes::<Shard>(&bytes).unwrap_or_default()
+    let shard = rkyv::from_bytes::<Shard>(&bytes).unwrap_or_default();
+    if shard.stamp != build_stamp() {
+        return Shard::default();
+    }
+    shard
 }
 
-fn write_shard(shard: &Shard) -> Result<(), String> {
+/// Write the shard through a temp file and a rename, so a reader never sees a
+/// half-written archive. A torn read fails `check_bytes` and lands on
+/// `unwrap_or_default()`, which silently discards EVERY entry — a whole-cache
+/// loss from an unrelated process's write.
+fn write_shard(shard: &mut Shard) -> Result<(), String> {
     let path = shard_path().ok_or("no home dir for cache")?;
+    shard.stamp = build_stamp();
     let bytes = rkyv::to_bytes::<_, 4096>(shard).map_err(|e| format!("cache serialize: {e}"))?;
-    std::fs::write(&path, &bytes).map_err(|e| format!("cache write: {e}"))
+    let tmp = path.with_extension(format!("rkyv.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("cache write: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cache write: {e}")
+    })
 }
 
 /// Look up a compiled program for the source-only key `src` (single-unit cache;
@@ -215,10 +326,13 @@ fn store_keyed(key: u64, prog: &Program, deps: Vec<(String, u64)>) -> Result<(),
     let mut cp = to_cprog(prog);
     cp.deps = deps;
     let blob = bincode::serialize(&cp).map_err(|e| format!("cache encode: {e}"))?;
+    // Read, modify and write under one lock: a concurrent store would otherwise
+    // read the same shard and drop this entry when it wrote its own back.
+    let _lock = ShardLock::acquire();
     let mut shard = load_shard();
     shard.entries.retain(|e| e.key != key);
     shard.entries.push(Entry { key, blob });
-    write_shard(&shard)
+    write_shard(&mut shard)
 }
 
 fn m_to(name: &str, m: &MethodDef) -> CMethod {
