@@ -14,17 +14,42 @@ fn ruby(src: &str) -> String {
 /// `a << x` grows the array in place. It used to read the backing `Vec` out
 /// through `as_array` (a full clone), append to the clone and store it back, so
 /// building an array one push at a time was quadratic — 50 K pushes took 9.4 s.
-/// A linear build of 200 K finishes in well under the time the quadratic one
-/// needed for a twentieth of that, so a regression re-fails this on time alone.
+///
+/// The property is SCALING, and a wall-clock ceiling does not measure it: a
+/// fixed "under 10 s" pinned the runner instead of the code, and a debug build
+/// on a CI runner blew through it while the same code passed locally. Both
+/// samples are timed INSIDE one interpreter with `Process.clock_gettime`, so
+/// process startup — 1.3 s of it in a debug build, more than the small sample
+/// costs — is not in either number. 4x the pushes is about 4x the time when
+/// the append is in place and about 16x when it copies; the assertion sits at
+/// 8x, between the two and far from both.
 #[test]
 fn push_is_linear_not_quadratic() {
-    let t = std::time::Instant::now();
-    let out = ruby("a = []; 200_000.times { |i| a << i }; puts a.size");
-    assert_eq!(out, "200000\n");
+    let out = ruby(
+        "def bench(n)\n\
+         \x20 t = Process.clock_gettime(Process::CLOCK_MONOTONIC)\n\
+         \x20 a = []\n\
+         \x20 n.times { |i| a << i }\n\
+         \x20 [Process.clock_gettime(Process::CLOCK_MONOTONIC) - t, a.size]\n\
+         end\n\
+         small, small_n = bench(50_000)\n\
+         large, large_n = bench(200_000)\n\
+         puts small_n, large_n, (large / [small, 1e-6].max).round(2)\n",
+    );
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "expected two sizes and a ratio, got {out:?}"
+    );
+    assert_eq!(lines[0], "50000");
+    assert_eq!(lines[1], "200000");
+    let ratio: f64 = lines[2]
+        .parse()
+        .unwrap_or_else(|e| panic!("ratio {:?} is not a number: {e}", lines[2]));
     assert!(
-        t.elapsed().as_secs() < 10,
-        "200 K pushes took {:?} — push is copying the array again",
-        t.elapsed()
+        ratio < 8.0,
+        "4x the pushes cost {ratio}x the time — push is copying the array again"
     );
 }
 
