@@ -370,7 +370,11 @@ pub enum RObj {
     /// A compiled regular expression: its Ruby source plus the compiled matcher.
     Regexp {
         source: String,
-        re: fancy_regex::Regex,
+        /// Shared with every other Regexp built from the same source+flags —
+        /// see [`compiled_regex`]. A Regexp VALUE is still its own object; only
+        /// the compiled engine, which is immutable and holds no match state, is
+        /// shared.
+        re: std::sync::Arc<fancy_regex::Regex>,
         /// The literal Ruby flag letters present at construction (`i`, `m`, `x`),
         /// kept so `Regexp#options`/`#casefold?`/`#to_s` can report them (the
         /// compiled `re` bakes them in and can't be read back).
@@ -703,6 +707,63 @@ pub struct RescueDef {
     pub splat: Option<usize>,
     pub binding: Option<String>,
     pub body: usize,
+}
+
+/// The compiled engine for a Ruby pattern, built once per distinct
+/// `(source, flags)` and shared by every Regexp value made from it.
+///
+/// A regex LITERAL is compiled at every evaluation — `Expr::Regex` lowers to
+/// `MKREGEX`, which is an ordinary op inside whatever loop encloses it — so
+/// `s =~ /\A[\w.]+@[\w.]+\z/` inside a 50 000-iteration loop parsed and
+/// compiled that pattern 50 000 times. A `sample` profile of exactly that loop
+/// was almost entirely `regex_syntax::ast::parse`, `regex_automata` NFA
+/// construction and `aho_corasick` table building — pattern COMPILATION, with
+/// matching nowhere near the top.
+///
+/// Two things the cache must not break:
+///
+/// * **The Regexp value stays fresh.** Only the engine is shared, and it is
+///   immutable and holds no per-match state (`$~` and friends live on the host).
+///   Each evaluation still allocates its own `RObj::Regexp`, so `#source`,
+///   `#options`, identity and freezing are unaffected.
+/// * **An invalid pattern raises EVERY time.** The compile ERROR is cached
+///   beside the engine, so the second evaluation of a bad pattern raises exactly
+///   as the first did rather than silently succeeding on a cache miss-shaped
+///   hole.
+///
+/// Keyed on the pattern TEXT, so `/#{x}/` re-compiles only when the
+/// interpolation actually produces a different pattern.
+fn compiled_regex(
+    source: &str,
+    flags: &str,
+    inline: &str,
+) -> Result<std::sync::Arc<fancy_regex::Regex>, String> {
+    /// Cap on distinct patterns held. Interpolated literals can mint a new
+    /// pattern per iteration, and an unbounded map would then be a leak; a
+    /// program with more live patterns than this simply recompiles as before.
+    const MAX_CACHED: usize = 1024;
+    type Entry = Result<std::sync::Arc<fancy_regex::Regex>, String>;
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<(String, String), Entry>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = (source.to_string(), flags.to_string());
+    if let Some(hit) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let body = ruby_regex_to_fancy(source, flags.contains('x'));
+    let full = format!("(?{inline}){body}");
+    let entry: Entry = fancy_regex::Regex::new(&full)
+        .map(std::sync::Arc::new)
+        .map_err(|e| format!("invalid regex /{source}/: {e}"));
+    CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        if m.len() >= MAX_CACHED {
+            m.clear();
+        }
+        m.insert(key, entry.clone());
+    });
+    entry
 }
 
 /// Onigmo's `ONIG_SYN_CAPTURE_ONLY_NAMED_GROUP` rewrite: in a pattern that
@@ -2795,15 +2856,13 @@ impl RubyHost {
         if flags.contains('x') {
             inline.push('x');
         }
-        let body = ruby_regex_to_fancy(source, flags.contains('x'));
-        let full = format!("(?{inline}){body}");
-        match fancy_regex::Regex::new(&full) {
+        match compiled_regex(source, flags, &inline) {
             Ok(re) => Ok(self.alloc(RObj::Regexp {
                 source: source.to_string(),
                 re,
                 flags: flags.chars().filter(|c| "imx".contains(*c)).collect(),
             })),
-            Err(e) => Err(format!("invalid regex /{source}/: {e}")),
+            Err(e) => Err(e),
         }
     }
     /// The `(groups, names, pre, post)` of a `MatchData` value, if `v` is one.
@@ -2839,7 +2898,7 @@ impl RubyHost {
         }
     }
     /// The compiled matcher + source of a regex value, if `v` is one.
-    pub fn as_regex(&self, v: &Value) -> Option<(fancy_regex::Regex, String)> {
+    pub fn as_regex(&self, v: &Value) -> Option<(std::sync::Arc<fancy_regex::Regex>, String)> {
         match self.obj(v) {
             Some(RObj::Regexp { re, source, .. }) => Some((re.clone(), source.clone())),
             _ => None,
@@ -8434,6 +8493,17 @@ thread_local! {
     static DEBUG_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// The most VMs kept for reuse. Deep recursion checks out one per active frame;
+/// past this depth the extras are dropped on return rather than retained.
+const VM_POOL_MAX: usize = 64;
+
+thread_local! {
+    /// VMs recycled across nested chunk runs — see `run_chunk_seeded`. Per
+    /// thread because a `VM` is not shared, and because each Ruby `Thread` runs
+    /// its own chunks.
+    static VM_POOL: std::cell::RefCell<Vec<VM>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Enable/disable DAP debug execution (installs the line-marker hook path).
 pub fn set_debug_mode(on: bool) {
     DEBUG_MODE.with(|d| d.set(on));
@@ -8469,11 +8539,27 @@ fn run_chunk_seeded(chunk: Chunk, slot_seed: &[Value]) -> Result<Value, String> 
     // driver still needs the builtins + numeric hook installed (its threaded ops
     // call back through them), just not the interpreter loop or the tracing JIT.
     let native = crate::aot::native_entry(chunk.native_id);
-    let mut vm = VM::new(chunk);
-    crate::builtins::install(&mut vm);
-    vm.set_numeric_hook(std::sync::Arc::new(|op, a, b| {
-        crate::builtins::numeric_hook(op, a, b)
-    }));
+    // Every method call and every block invocation lands here, and a fresh
+    // `VM::new` + `install` costs 57 `register_builtin` calls (each growing the
+    // VM's builtin table) plus an Arc for the numeric hook — per call. A
+    // recycled VM keeps both, because `VM::reset` clears the stack, frames,
+    // globals and JIT recorder while PRESERVING the builtin table and the
+    // tracing-JIT flag. Popping before the run and pushing after keeps this
+    // re-entrant: a nested call takes the next VM, or makes one.
+    let mut vm = match VM_POOL.with(|p| p.borrow_mut().pop()) {
+        Some(mut vm) => {
+            vm.reset(chunk);
+            vm
+        }
+        None => {
+            let mut vm = VM::new(chunk);
+            crate::builtins::install(&mut vm);
+            vm.set_numeric_hook(std::sync::Arc::new(|op, a, b| {
+                crate::builtins::numeric_hook(op, a, b)
+            }));
+            vm
+        }
+    };
     // Seed the leading frame slots with the caller's positional args before the
     // body runs (native driver or interpreter both read them via `GetSlot`).
     for (i, v) in slot_seed.iter().enumerate() {
@@ -8496,14 +8582,25 @@ fn run_chunk_seeded(chunk: Chunk, slot_seed: &[Value]) -> Result<Value, String> 
         vm.enable_tracing_jit();
         vm.run()
     };
-    if let Some(e) = with_host(|h| h.take_error()) {
-        return Err(e);
-    }
-    match outcome {
-        VMResult::Ok(v) => Ok(v),
-        VMResult::Halted => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),
-        VMResult::Error(e) => Err(e),
-    }
+    // Read everything needed off the VM, then recycle it — including on the
+    // error paths, which is why the result is computed before the release.
+    let result = match with_host(|h| h.take_error()) {
+        Some(e) => Err(e),
+        None => match outcome {
+            VMResult::Ok(v) => Ok(v),
+            VMResult::Halted => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),
+            VMResult::Error(e) => Err(e),
+        },
+    };
+    VM_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        // Bounded so a deeply recursive program does not keep every VM it ever
+        // needed alive for the rest of the process.
+        if pool.len() < VM_POOL_MAX {
+            pool.push(vm);
+        }
+    });
+    result
 }
 
 /// Run the top-level program chunk. Clears any leftover control signal (a

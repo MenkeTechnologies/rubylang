@@ -8340,7 +8340,7 @@ fn unescape_dumped(s: &str) -> Result<String, String> {
 }
 
 /// The compiled regex for a value that is a Regexp, else `None`.
-fn str_regex(v: &Value) -> Option<fancy_regex::Regex> {
+fn str_regex(v: &Value) -> Option<std::sync::Arc<fancy_regex::Regex>> {
     with_host(|h| h.as_regex(v)).map(|(re, _)| re)
 }
 
