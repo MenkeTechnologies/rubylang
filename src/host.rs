@@ -164,11 +164,11 @@ pub mod ops {
     pub const BEGIN_IN_LOOP: u16 = 54; // [begin_id] -> run begin/rescue/ensure
     pub const SIG_REDO: u16 = 55; // [v] -> re-run the current block iteration
     pub const TAKE_LOOP_REDO: u16 = 56; // [] -> Bool; consume a pending `redo`
-    // A bare-name read the COMPILER proved is a local: the scope has an
-    // assignment to it at or before this point. Ruby hoists such a name to nil
-    // from that parse position, so an unset one reads nil and is never retried
-    // as a zero-arg method call — which is what separates it from `GETLOCAL`,
-    // whose name might still turn out to be a method.
+                                        // A bare-name read the COMPILER proved is a local: the scope has an
+                                        // assignment to it at or before this point. Ruby hoists such a name to nil
+                                        // from that parse position, so an unset one reads nil and is never retried
+                                        // as a zero-arg method call — which is what separates it from `GETLOCAL`,
+                                        // whose name might still turn out to be a method.
     pub const GETLOCAL_DECLARED: u16 = 57; // [name] -> value or nil
 }
 

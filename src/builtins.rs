@@ -4994,66 +4994,65 @@ fn mixin_provides(class: &str, method: &str) -> bool {
 /// `instance_methods` all have to agree with what dispatch will accept, and
 /// they did not: `C.new.respond_to?(:<)` answered false on a class that
 /// `include Comparable` while `C.new < other` worked.
-pub(crate) const COMPARABLE_METHODS: &[&str] =
-    &["<", "<=", "==", ">", ">=", "between?", "clamp"];
+pub(crate) const COMPARABLE_METHODS: &[&str] = &["<", "<=", "==", ">", ">=", "between?", "clamp"];
 
 /// The methods `Enumerable` derives from a class's `each`, for the same two
 /// consumers. Unlike Comparable this is NOT all of MRI's `Enumerable` — it is
 /// the subset `enumerable_method` implements, and reflection reports exactly
 /// that subset so a `respond_to?` answer and a real call never disagree.
 pub(crate) const ENUMERABLE_METHODS: &[&str] = &[
-        "map",
-        "collect",
-        "flat_map",
-        "collect_concat",
-        "select",
-        "filter",
-        "find_all",
-        "grep",
-        "grep_v",
-        "filter_map",
-        "reject",
-        "reduce",
-        "inject",
-        "to_a",
-        "entries",
-        "find",
-        "detect",
-        "find_index",
-        "count",
-        "min",
-        "max",
-        "minmax",
-        "min_by",
-        "max_by",
-        "sort",
-        "sort_by",
-        "sum",
-        "include?",
-        "member?",
-        "first",
-        "take",
-        "drop",
-        "take_while",
-        "drop_while",
-        "each_with_index",
-        "each_with_object",
-        "group_by",
-        "partition",
-        "tally",
-        "uniq",
-        "zip",
-        "any?",
-        "all?",
-        "none?",
-        "one?",
-        "each_slice",
-        "each_cons",
-        "chunk_while",
-        "chunk",
-        "slice_when",
-        "reverse_each",
-        "to_h",
+    "map",
+    "collect",
+    "flat_map",
+    "collect_concat",
+    "select",
+    "filter",
+    "find_all",
+    "grep",
+    "grep_v",
+    "filter_map",
+    "reject",
+    "reduce",
+    "inject",
+    "to_a",
+    "entries",
+    "find",
+    "detect",
+    "find_index",
+    "count",
+    "min",
+    "max",
+    "minmax",
+    "min_by",
+    "max_by",
+    "sort",
+    "sort_by",
+    "sum",
+    "include?",
+    "member?",
+    "first",
+    "take",
+    "drop",
+    "take_while",
+    "drop_while",
+    "each_with_index",
+    "each_with_object",
+    "group_by",
+    "partition",
+    "tally",
+    "uniq",
+    "zip",
+    "any?",
+    "all?",
+    "none?",
+    "one?",
+    "each_slice",
+    "each_cons",
+    "chunk_while",
+    "chunk",
+    "slice_when",
+    "reverse_each",
+    "to_h",
 ];
 
 /// Materialize a user `Enumerable`'s elements by driving its own `each` with a
@@ -8622,7 +8621,12 @@ fn scan_regex(re: &fancy_regex::Regex, s: &str) -> Value {
         .iter()
         .map(|c| {
             if ngroups <= 1 {
-                new_str(c.get(0).expect("group 0 always matched").as_str().to_string())
+                new_str(
+                    c.get(0)
+                        .expect("group 0 always matched")
+                        .as_str()
+                        .to_string(),
+                )
             } else {
                 let groups: Vec<Value> = (1..ngroups)
                     .map(|i| {
@@ -9936,9 +9940,7 @@ fn dispatch_array(
                         match call_proc(bl, &[l.clone(), r.clone()]) {
                             // A `break` in the comparator: the Undef is the
                             // signal, and the caller answers with its operand.
-                            Ok(Value::Undef) if has_pending_signal() => {
-                                std::cmp::Ordering::Equal
-                            }
+                            Ok(Value::Undef) if has_pending_signal() => std::cmp::Ordering::Equal,
                             Ok(Value::Undef) => {
                                 err = Some(cmp_error(l, r));
                                 std::cmp::Ordering::Equal
