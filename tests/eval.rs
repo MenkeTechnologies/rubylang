@@ -3515,7 +3515,10 @@ fn math_gamma_and_erf_are_exact() {
     eq("Math.erfc(5.0)", "1.537459794428035e-12");
     // The integral arguments come from MRI's exact factorial table, which no
     // series lands on — a Lanczos gamma made this 23.999999999999996.
-    eq("(1..23).map { |i| Math.gamma(i) }.all? { |v| v == v.round }", "true");
+    eq(
+        "(1..23).map { |i| Math.gamma(i) }.all? { |v| v == v.round }",
+        "true",
+    );
     eq("Math.lgamma(5.0)", "[3.1780538303479453, 1]");
     eq("Math.lgamma(-0.5)", "[1.2655121234846454, -1]");
     eq("Math.frexp(8.0)", "[0.5, 4]");

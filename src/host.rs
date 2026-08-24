@@ -782,7 +782,9 @@ fn scan_regex_groups(source: &str, extended: bool, mut out: Option<&mut String>)
             // to that expression, not to the enclosing class, so consume the
             // whole `[:…:]` token rather than letting its `]` end the class.
             if ch == '[' && c.get(i + 1) == Some(&':') {
-                if let Some(end) = (i + 2..c.len()).find(|&j| c[j] == ':' && c.get(j + 1) == Some(&']')) {
+                if let Some(end) =
+                    (i + 2..c.len()).find(|&j| c[j] == ':' && c.get(j + 1) == Some(&']'))
+                {
                     for &x in &c[i..=end + 1] {
                         push!(x);
                     }
@@ -3542,6 +3544,40 @@ impl RubyHost {
     pub fn set_array(&mut self, v: &Value, xs: Vec<Value>) {
         if let Some(RObj::Array(slot)) = self.obj_mut(v) {
             *slot = xs;
+        }
+    }
+
+    /// `a.push(…)` / `a << x` against the array where it lives. `None` when `v`
+    /// is not an array, so the caller can fall through to the general path.
+    ///
+    /// The general path reads the array out with [`Self::as_array`], which
+    /// clones the whole backing `Vec`, appends to the clone and writes it back.
+    /// That is a full copy per element appended, so building an array one push
+    /// at a time cost time quadratic in its length.
+    pub fn array_push(&mut self, v: &Value, items: &[Value]) -> Option<()> {
+        match self.obj_mut(v) {
+            Some(RObj::Array(xs)) => {
+                xs.extend_from_slice(items);
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    /// An array's length without copying it. `None` when `v` is not an array.
+    pub fn array_len(&self, v: &Value) -> Option<usize> {
+        match self.obj(v) {
+            Some(RObj::Array(xs)) => Some(xs.len()),
+            _ => None,
+        }
+    }
+
+    /// One element by non-negative index, without copying the array. `None`
+    /// when `v` is not an array; `Some(None)` when the index is past the end.
+    pub fn array_at(&self, v: &Value, i: usize) -> Option<Option<Value>> {
+        match self.obj(v) {
+            Some(RObj::Array(xs)) => Some(xs.get(i).cloned()),
+            _ => None,
         }
     }
     pub fn as_str(&self, v: &Value) -> Option<String> {

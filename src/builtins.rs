@@ -6207,7 +6207,11 @@ fn dispatch_number(
             // Away from zero raises the magnitude, toward zero lowers it; the
             // two signed zeroes both step off zero itself.
             let next = if x == 0.0 {
-                if up { 1 } else { (1u64 << 63) | 1 }
+                if up {
+                    1
+                } else {
+                    (1u64 << 63) | 1
+                }
             } else if (x > 0.0) == up {
                 bits + 1
             } else {
@@ -7488,7 +7492,11 @@ fn dispatch_string(
             // every `byterindex` with a match past byte 0 answers nil.
             let default_start = if from_end { s.len() as i64 } else { 0 };
             let start = args.get(1).map(as_i).unwrap_or(default_start);
-            let start = if start < 0 { start + s.len() as i64 } else { start };
+            let start = if start < 0 {
+                start + s.len() as i64
+            } else {
+                start
+            };
             if start < 0 || start > s.len() as i64 {
                 return Ok(Value::Undef);
             }
@@ -7500,7 +7508,9 @@ fn dispatch_string(
                         .map(|m| m.start())
                         .collect();
                     if from_end {
-                        hits.into_iter().filter(|&i| i as i64 <= start.max(0)).next_back()
+                        hits.into_iter()
+                            .filter(|&i| i as i64 <= start.max(0))
+                            .next_back()
                     } else {
                         hits.into_iter().find(|&i| i as i64 >= start)
                     }
@@ -7544,7 +7554,10 @@ fn dispatch_string(
             let mut b = s.into_bytes();
             let idx = if raw < 0 { raw + b.len() as i64 } else { raw };
             if idx < 0 || idx >= b.len() as i64 {
-                return Err(raise_exc("IndexError", &format!("index {raw} out of string")));
+                return Err(raise_exc(
+                    "IndexError",
+                    &format!("index {raw} out of string"),
+                ));
             }
             let byte = as_i(&args[1]);
             b[idx as usize] = (byte & 0xff) as u8;
@@ -8310,8 +8323,9 @@ fn set_match_globals(
         // The BYTE span of every group, kept alongside the text: `#begin` and
         // friends cannot be answered from the captured text alone, because two
         // equal substrings differ only in where they sat.
-        let offsets: Vec<Option<(usize, usize)>> =
-            (0..c.len()).map(|i| c.get(i).map(|g| (g.start(), g.end()))).collect();
+        let offsets: Vec<Option<(usize, usize)>> = (0..c.len())
+            .map(|i| c.get(i).map(|g| (g.start(), g.end())))
+            .collect();
         let pre = s[..whole.start()].to_string();
         let post = s[whole.end()..].to_string();
         let md = h.new_matchdata(
@@ -8590,12 +8604,7 @@ fn regex_split(re: &fancy_regex::Regex, s: &str, limit: i64) -> Vec<String> {
 
 /// `String#scan(re) { ... }`: yield each match (setting `$~`), passing the whole
 /// match for an ungrouped pattern or the capture-group array for a grouped one.
-fn scan_each(
-    re: &fancy_regex::Regex,
-    s: &str,
-    bl: &Value,
-    re_val: &Value,
-) -> Result<(), String> {
+fn scan_each(re: &fancy_regex::Regex, s: &str, bl: &Value, re_val: &Value) -> Result<(), String> {
     let ngroups = re.captures_len();
     for caps in re.captures_iter(s).filter_map(Result::ok) {
         set_match_globals(Some((&caps, s)), re, re_val);
@@ -9140,6 +9149,25 @@ fn dispatch_array(
     block: Option<Value>,
 ) -> Result<Value, String> {
     frozen_guard(recv, name, ARRAY_MUTATORS)?;
+    // Answer the methods that appear inside loops over big arrays before the
+    // read-out below, which clones the whole backing `Vec` for *every* method
+    // call. Cloning to append made building an array one element at a time
+    // quadratic in its length (50 K pushes took 9.4 s), and made `size` O(n).
+    // Anything not handled here, and any receiver that is not a plain array,
+    // falls through to the general path unchanged.
+    match name {
+        "push" | "append" | "<<" => {
+            if with_host(|h| h.array_push(recv, args)).is_some() {
+                return Ok(recv.clone());
+            }
+        }
+        "length" | "size" if args.is_empty() && block.is_none() => {
+            if let Some(n) = with_host(|h| h.array_len(recv)) {
+                return Ok(Value::Int(n as i64));
+            }
+        }
+        _ => {}
+    }
     let arr = with_host(|h| h.as_array(recv).unwrap_or_default());
     match name {
         // `arr.hash` — an order-sensitive digest of the elements, so two arrays
@@ -9211,12 +9239,7 @@ fn dispatch_array(
                     .filter(|v| !others.iter().any(|o| set_member(o, v)))
                     .cloned()
                     .collect(),
-                _ => dedup_keep(
-                    arr.iter()
-                        .chain(others.iter().flatten())
-                        .cloned()
-                        .collect(),
-                ),
+                _ => dedup_keep(arr.iter().chain(others.iter().flatten()).cloned().collect()),
             };
             Ok(new_arr(out))
         }
@@ -9413,8 +9436,11 @@ fn dispatch_array(
                         None => {
                             return Err(raise_exc(
                                 "IndexError",
-                                &format!("index {i} outside of array bounds: {}...{}",
-                                    -(arr.len() as i64), arr.len()),
+                                &format!(
+                                    "index {i} outside of array bounds: {}...{}",
+                                    -(arr.len() as i64),
+                                    arr.len()
+                                ),
                             ))
                         }
                     },
@@ -9607,7 +9633,10 @@ fn dispatch_array(
                         .map(|v| with_host(|h| h.truthy(&v)))
                         .unwrap_or(false),
                     (None, None) => {
-                        return Err(raise_exc("ArgumentError", "wrong number of arguments (given 0, expected 1)"))
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            "wrong number of arguments (given 0, expected 1)",
+                        ))
                     }
                 };
                 if hit && before && !cur.is_empty() {
@@ -10893,7 +10922,11 @@ fn sort_by_family(
             // `[1, 1]`.
             let descending = name == "max_by";
             keyed.sort_by(|a, c| {
-                let (l, r) = if descending { (&c.0, &a.0) } else { (&a.0, &c.0) };
+                let (l, r) = if descending {
+                    (&c.0, &a.0)
+                } else {
+                    (&a.0, &c.0)
+                };
                 match cmp_values(l, r) {
                     Some(o) => o,
                     None => {
@@ -15243,7 +15276,10 @@ fn dispatch_range(
         // inclusive end, and neither is empty.
         "overlap?" => {
             let Some((olo, ohi, oexcl)) = with_host(|h| h.as_range(&args[0])) else {
-                return Err(raise_exc("TypeError", "wrong argument type (expected Range)"));
+                return Err(raise_exc(
+                    "TypeError",
+                    "wrong argument type (expected Range)",
+                ));
             };
             let smax = if excl { hi - 1 } else { hi };
             let omax = if oexcl { ohi - 1 } else { ohi };
