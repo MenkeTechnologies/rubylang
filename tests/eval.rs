@@ -3508,7 +3508,15 @@ fn math_gamma_and_erf_are_exact() {
     // is the full inspect form and any drift fails.
     eq("Math.gamma(5)", "24.0");
     eq("Math.gamma(10)", "362880.0");
-    eq("Math.erf(1.0)", "0.8427007929497148");
+    // Apple's libm and glibc differ by one ulp on erf(1.0) — 0.8427007929497148
+    // against 0.8427007929497149 — and each is the platform's own libm answer,
+    // which is exactly what MRI prints there. The pin accepts either; it still
+    // rejects a series approximation, which is wrong from the seventh digit.
+    let erf1 = ev("Math.erf(1.0)").expect("Math.erf(1.0) evaluates");
+    assert!(
+        matches!(erf1.as_str(), "0.8427007929497148" | "0.8427007929497149"),
+        "Math.erf(1.0) = {erf1}, which is neither platform libm's answer"
+    );
     eq("Math.erfc(1.0)", "0.15729920705028516");
     // `erfc` is its own libm entry, not `1 - erf(x)`: that subtraction cancels
     // catastrophically once erf(x) approaches 1.
