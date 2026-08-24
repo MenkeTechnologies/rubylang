@@ -474,8 +474,7 @@ fn the_oracle_refuses_a_rubylang_that_no_path_check_could_catch() {
     let decoy = dir.join("ruby");
     std::fs::copy(&me, &decoy).expect("copy the binary");
     let why = rubylang::oracle::verify(&decoy)
-        .err()
-        .expect("a rubylang must never verify as the reference interpreter");
+        .expect_err("a rubylang must never verify as the reference interpreter");
     assert!(
         why.contains("build marker"),
         "expected the CONTENT proof to reject it (the path proof cannot see \

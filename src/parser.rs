@@ -3095,6 +3095,10 @@ impl Parser {
 /// A plain `begin … end` (no `rescue`/`ensure`) unwraps to its statement list.
 /// A `begin … rescue/ensure … end` is kept whole as a single body statement so
 /// its exception handling still fires each iteration.
+// The `Err` payload is the caller's own expression handed back untouched, not
+// an error value — nothing propagates it with `?` and nothing stores it, so its
+// size costs a single move on the fallback path.
+#[allow(clippy::result_large_err)]
 fn do_while_body(e: Expr) -> Result<Vec<Stmt>, Expr> {
     match e {
         Expr::Begin {

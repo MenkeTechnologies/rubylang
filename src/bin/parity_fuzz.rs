@@ -1364,9 +1364,7 @@ fn gen_blockflow(seed: u64) -> Vec<String> {
             "def m\n  [1, 2, 3].each {{ |x| return x + {} if x == 2 }}\n  :fell\nend\np m",
             r.range(0, 9)
         ),
-        16 => format!(
-            "def m2\n  [1, 2].each {{ |a| [3, 4].each {{ |b| return [a, b] if b == 4 }} }}\n  :none\nend\np m2"
-        ),
+        16 => "def m2\n  [1, 2].each { |a| [3, 4].each { |b| return [a, b] if b == 4 } }\n  :none\nend\np m2".to_string(),
         // proc vs lambda `return` differ; verify rather than assume.
         17 => format!(
             "def pr\n  q = Proc.new {{ return {v} }}\n  q.call\n  :after\nend\np pr"
@@ -1376,9 +1374,7 @@ fn gen_blockflow(seed: u64) -> Vec<String> {
         ),
         19 => format!("l = lambda {{ break {v} }}\np l.call"),
         // ensure must still run, and must not eat the value.
-        20 => format!(
-            "def e\n  o = []\n  [1, 2, 3].each {{ |i| begin; o << i; break if i == 2; ensure; o << :E; end }}\n  o\nend\np e"
-        ),
+        20 => "def e\n  o = []\n  [1, 2, 3].each { |i| begin; o << i; break if i == 2; ensure; o << :E; end }\n  o\nend\np e".to_string(),
         21 => format!(
             "def e2\n  begin\n    [1, 2].each {{ |i| return {v} if i == 2 }}\n  ensure\n    nil\n  end\n  :no\nend\np e2"
         ),

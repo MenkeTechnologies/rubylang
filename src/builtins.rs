@@ -5669,7 +5669,7 @@ fn dispatch_bigint(
             None => match &args[0] {
                 Value::Float(f) if f.is_nan() => Value::Undef,
                 Value::Float(f) if f.is_infinite() => Value::Int(if *f > 0.0 { -1 } else { 1 }),
-                Value::Float(f) => Value::Int(ord_to_i(cmp_bigint_float(&b, *f))),
+                Value::Float(f) => Value::Int(ord_to_i(cmp_bigint_float(b, *f))),
                 other => match with_host(|h| h.as_rational(other)) {
                     Some(o) => {
                         Value::Int(ord_to_i(num_rational::BigRational::from(b.clone()).cmp(&o)))
@@ -5681,7 +5681,7 @@ fn dispatch_bigint(
         // `Integer#coerce` promotes SELF to the argument's kind when that is a
         // Float, and the argument to an Integer otherwise.
         "coerce" => match &args[0] {
-            Value::Float(_) => new_arr(vec![args[0].clone(), Value::Float(bigint_to_f64(&b))]),
+            Value::Float(_) => new_arr(vec![args[0].clone(), Value::Float(bigint_to_f64(b))]),
             _ => new_arr(vec![args[0].clone(), big(b.clone())]),
         },
         _ => return Ok(None),
@@ -7508,9 +7508,7 @@ fn dispatch_string(
                         .map(|m| m.start())
                         .collect();
                     if from_end {
-                        hits.into_iter()
-                            .filter(|&i| i as i64 <= start.max(0))
-                            .next_back()
+                        hits.into_iter().rfind(|&i| i as i64 <= start.max(0))
                     } else {
                         hits.into_iter().find(|&i| i as i64 >= start)
                     }
@@ -16098,34 +16096,32 @@ fn regex_named_groups(source: &str) -> Vec<(String, i64)> {
             }
             b'[' if !in_class => in_class = true,
             b']' if in_class => in_class = false,
-            b'(' if !in_class => {
-                if b.get(i + 1) == Some(&b'?') {
-                    // `(?<name>` / `(?'name'` is a named capture; `(?<=`/`(?<!`
-                    // are lookbehind (no capture); `(?:`/`(?=`/`(?!`/`(?>` no capture.
-                    let after = b.get(i + 2).copied();
-                    let named = (after == Some(b'<')
-                        && !matches!(b.get(i + 3), Some(b'=') | Some(b'!')))
-                        || after == Some(b'\'');
-                    if named {
-                        group_index += 1;
-                        let close = if after == Some(b'\'') { b'\'' } else { b'>' };
-                        let start = i + 3;
-                        let mut j = start;
-                        while j < b.len() && b[j] != close {
-                            j += 1;
-                        }
-                        if let Ok(nm) = std::str::from_utf8(&b[start..j]) {
-                            out.push((nm.to_string(), group_index));
-                        }
-                        i = j + 1;
-                        continue;
+            b'(' if !in_class && b.get(i + 1) == Some(&b'?') => {
+                // `(?<name>` / `(?'name'` is a named capture; `(?<=`/`(?<!`
+                // are lookbehind (no capture); `(?:`/`(?=`/`(?!`/`(?>` no capture.
+                let after = b.get(i + 2).copied();
+                let named = (after == Some(b'<')
+                    && !matches!(b.get(i + 3), Some(b'=') | Some(b'!')))
+                    || after == Some(b'\'');
+                if named {
+                    group_index += 1;
+                    let close = if after == Some(b'\'') { b'\'' } else { b'>' };
+                    let start = i + 3;
+                    let mut j = start;
+                    while j < b.len() && b[j] != close {
+                        j += 1;
                     }
-                    // Any other `(?…)` is a non-capturing construct.
+                    if let Ok(nm) = std::str::from_utf8(&b[start..j]) {
+                        out.push((nm.to_string(), group_index));
+                    }
+                    i = j + 1;
+                    continue;
                 }
-                // A plain `(…)` deliberately does NOT advance `group_index`:
-                // reaching here at all means the pattern may hold a named
-                // group, and Onigmo gives unnamed groups no number in that case.
+                // Any other `(?…)` is a non-capturing construct.
             }
+            // A plain `(…)` deliberately does NOT advance `group_index`:
+            // reaching here at all means the pattern may hold a named
+            // group, and Onigmo gives unnamed groups no number in that case.
             _ => {}
         }
         i += 1;

@@ -264,7 +264,7 @@ fn pattern_literals(body: &str) -> Vec<(usize, String)> {
 #[test]
 fn embedded_stdlib_names_are_unique() {
     let body = fn_body(BUILTINS_RS, "pub(crate) fn embedded_stdlib(");
-    let dups = duplicates(pattern_literals(&body).into_iter().map(|(l, n)| (n, l)));
+    let dups = duplicates(pattern_literals(body).into_iter().map(|(l, n)| (n, l)));
     assert!(
         dups.is_empty(),
         "duplicate require name in `embedded_stdlib` — only the first arm is \
@@ -283,7 +283,7 @@ fn embedded_stdlib_names_are_unique() {
 #[test]
 fn builtin_lib_names_are_unique_and_disjoint_from_embedded_stdlib() {
     let no_op = fn_body(BUILTINS_RS, "pub(crate) fn is_builtin_lib(");
-    let no_op_names = pattern_literals(&no_op);
+    let no_op_names = pattern_literals(no_op);
 
     let dups = duplicates(no_op_names.iter().map(|(l, n)| (n.clone(), *l)));
     assert!(
@@ -293,7 +293,7 @@ fn builtin_lib_names_are_unique_and_disjoint_from_embedded_stdlib() {
     );
 
     let embedded = fn_body(BUILTINS_RS, "pub(crate) fn embedded_stdlib(");
-    let embedded_names: std::collections::BTreeSet<String> = pattern_literals(&embedded)
+    let embedded_names: std::collections::BTreeSet<String> = pattern_literals(embedded)
         .into_iter()
         .map(|(_, n)| n)
         .collect();
