@@ -8638,3 +8638,52 @@ fn proc_parameters_reports_the_written_shape() {
     eq("->(a, b){}.curry.parameters", "[[:rest]]");
     eq("(->(a){} >> ->(b){}).parameters", "[[:rest]]");
 }
+
+/// The compiled-regex cache must not leak one pattern's engine into another's
+/// evaluation. A regex literal is compiled at every evaluation, so the engine is
+/// memoised per pattern; each assertion here fails against a specific way of
+/// getting that memo wrong, which is why they are separate lines rather than one
+/// round-trip.
+#[test]
+fn the_regex_cache_keys_on_the_pattern_and_its_flags() {
+    // FLAGS are part of the key. Dropping them shares one engine between `/x/`
+    // and `/x/i`, and whichever was evaluated FIRST wins — so the pair is
+    // asserted in both orders, since either order alone passes on the other
+    // being broken.
+    eq(r#"[("X" =~ /x/), ("X" =~ /x/i)]"#, "[nil, 0]");
+    eq(r#"[("X" =~ /x/i), ("X" =~ /x/)]"#, "[0, nil]");
+    // `x` (extended) changes what the same text MEANS, not just how it matches.
+    eq(r#"[("a b" =~ /a b/x), ("ab" =~ /a b/x)]"#, "[nil, 0]");
+    eq(r#"[("a b" =~ /a b/), ("ab" =~ /a b/)]"#, "[0, nil]");
+
+    // An interpolated literal is a DIFFERENT pattern each time the interpolation
+    // produces different text, so the key has to be the interpolated result. Key
+    // on the source as written and both iterations share `/a#{i}/`'s first
+    // engine, and the second answers nil.
+    eq(
+        "r = []; 2.times { |i| r << (\"a1\" =~ /a#{i}/) }; r",
+        "[nil, 0]",
+    );
+
+    // The same pattern text really is reused rather than recompiled into a
+    // different meaning: repeated evaluation keeps answering the same thing.
+    eq(r#"r = []; 3.times { r << ("aXb" =~ /X/) }; r"#, "[1, 1, 1]");
+}
+
+/// An invalid pattern must raise on EVERY evaluation, not just the first.
+///
+/// Compiling a regex is memoised, and the shape of that memo decides whether a
+/// bad pattern keeps failing: an implementation that treats "not in the cache"
+/// as "nothing to report" answers the second call with a hole rather than the
+/// diagnostic. What is asserted here is the OBSERVABLE requirement — three
+/// evaluations, three raises — rather than where the diagnostic is stored, since
+/// storing it beside the engine and recompiling on every miss are both correct
+/// and only one of them is fast.
+#[test]
+fn an_invalid_regex_raises_every_time_it_is_evaluated() {
+    eq(
+        "r = []; 3.times { begin; Regexp.new(\"[\"); r << :no_raise; \
+         rescue Exception; r << :raised; end }; r",
+        "[:raised, :raised, :raised]",
+    );
+}

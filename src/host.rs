@@ -744,11 +744,34 @@ fn compiled_regex(
     const MAX_CACHED: usize = 1024;
     type Entry = Result<std::sync::Arc<fancy_regex::Regex>, String>;
     thread_local! {
-        static CACHE: std::cell::RefCell<std::collections::HashMap<(String, String), Entry>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
+        /// Keyed by a HASH of (source, flags), with the pattern text kept in the
+        /// value and re-checked on every hit.
+        ///
+        /// Keying on `(String, String)` instead means two String allocations per
+        /// lookup, on a path that runs once per regex evaluation — the profile
+        /// of a 200 K-iteration match loop showed those allocations plus SipHash
+        /// over them. The hash here is FxHash, and a hit compares the stored
+        /// text: a collision between two different patterns is caught by that
+        /// comparison and simply recompiles, so the shortcut costs nothing in
+        /// correctness.
+        static CACHE: std::cell::RefCell<rustc_hash::FxHashMap<u64, (String, String, Entry)>> =
+            std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     }
-    let key = (source.to_string(), flags.to_string());
-    if let Some(hit) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+    // The FLAGS are part of the key, not just the source: `/a/` and `/a/i` are
+    // different engines built from the same text.
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        source.hash(&mut h);
+        flags.hash(&mut h);
+        h.finish()
+    };
+    if let Some(hit) = CACHE.with(|c| {
+        c.borrow()
+            .get(&key)
+            .filter(|(s, f, _)| s == source && f == flags)
+            .map(|(_, _, e)| e.clone())
+    }) {
         return hit;
     }
     let body = ruby_regex_to_fancy(source, flags.contains('x'));
@@ -761,7 +784,7 @@ fn compiled_regex(
         if m.len() >= MAX_CACHED {
             m.clear();
         }
-        m.insert(key, entry.clone());
+        m.insert(key, (source.to_string(), flags.to_string(), entry.clone()));
     });
     entry
 }
