@@ -265,15 +265,21 @@ smaller thread stack and prove nothing about `ruby -e`.
   `#reason`, but the `break` signal from a stored proc never reaches it. The
   other `LocalJumpError` shape (`def m; yield; end; m`) does raise, with
   `#reason == :noreason`, and is pinned.
-- **A bare undefined identifier answers nil instead of raising.** `p nope` is
-  `nil` where MRI raises `NameError: undefined local variable or method 'nope'`,
-  and `p Nope` likewise. Only the CALL form raises (`nope()` is a
-  `NoMethodError`). This is broader than the "some unimplemented constants
-  answer nil" note at the top of this file — it is every bareword — and it makes
-  a typo in a variable name silently produce nil rather than stopping the
-  program. Not fixed here: the read path lowers a bareword to a load that
-  defaults to `Value::Undef`, so closing it is a compiler change, not a builtin
-  one.
+- **A bare undefined CONSTANT answers nil instead of raising.** `p Nope` is
+  `nil` where MRI raises `NameError`. This is the constant half of the "some
+  unimplemented constants answer nil" note at the top of this file, and it stays
+  open on purpose: the nil is what lets a program name a library constant
+  rubylang does not model (`FileUtils`, `Socket`, `Errno::*`) without stopping.
+  The lowercase half is CLOSED — `p nope` now raises
+  `NameError: undefined local variable or method 'nope' for main`, with `#name`
+  and `#receiver` set. Closing it needed the compiler, as predicted here: a name
+  the scope assigns at or before the read is a local (Ruby hoists it to nil from
+  that parse position, so `y = (y || 0) + 1` and a name assigned only inside an
+  `if` that did not run both read nil) and lowers to `GETLOCAL_DECLARED`, while
+  every other bareword lowers to `GETLOCAL` and raises when nothing answers it.
+  One MRI strictness remains unmatched at the top level, where locals are
+  slot-lowered: `p y; y = 1` reads nil there rather than raising, since the slot
+  exists for the whole scope.
 - **`p obj` does not dispatch a user-defined `#inspect`**, and `Array#join` does
   not dispatch a user-defined `#to_s`. `Class.new { def inspect; "Y"; end }.new`
   inspects as `#<#<Class:1>>` rather than `Y`; `[obj].join(",")` stringifies the

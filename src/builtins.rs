@@ -22,6 +22,7 @@ use unicode_segmentation::UnicodeSegmentation;
 /// Register every rubylang builtin on `vm`.
 pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::GETLOCAL, b_getlocal);
+    vm.register_builtin(ops::GETLOCAL_DECLARED, b_getlocal_declared);
     vm.register_builtin(ops::SETLOCAL, b_setlocal);
     vm.register_builtin(ops::GETIVAR, b_getivar);
     vm.register_builtin(ops::SETIVAR, b_setivar);
@@ -431,6 +432,20 @@ fn name_of(v: &Value) -> String {
 
 // ---- variable builtins ----------------------------------------------------
 
+/// Read a name the compiler proved is a local in this scope.
+///
+/// Ruby makes an identifier a local variable from the parse position of its
+/// first assignment, whether or not the assignment runs, and an unset one reads
+/// nil. That is a compile-time fact the runtime cannot recover: `local_defined`
+/// is false for a local that has not been assigned yet, so `b_getlocal` would
+/// go looking for a method of that name and — since nothing answers — raise
+/// NameError. `y = (y || 0) + 1` is the shape that depends on this; so is a
+/// name assigned only inside an `if` that did not run.
+fn b_getlocal_declared(vm: &mut VM, _: u8) -> Value {
+    let name = name_of(&vm.pop());
+    with_host(|h| h.get_local(&name))
+}
+
 fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     let name = name_of(&vm.pop());
     let (defined, v) = with_host(|h| (h.local_defined(&name), h.get_local(&name)));
@@ -567,6 +582,16 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
         }
         return Value::Undef;
     }
+    // A bare `private` / `protected` / `public` in a class body. The compiler
+    // already switches the mode for the STATEMENT form (see the `Expr::Var`
+    // arm in `compile_class_body`); this is the same directive reached as an
+    // expression — `$r = private` — where only its value matters. MRI answers
+    // nil, and it must not read as an undefined name.
+    if visibility_directive(&name).is_some()
+        && with_host(|h| h.classref_name(&h.current_self())).is_some()
+    {
+        return Value::Undef;
+    }
     if with_host(|h| h.responds_to(&name)) {
         return match dispatch_call(&name, &[], None) {
             Ok(v) => propagate(vm, v),
@@ -575,13 +600,27 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     }
     match kernel(&name, &[], None) {
         Ok(v) => propagate(vm, v),
-        // Swallow only the *soft* "this bareword isn't a method" signal (no
-        // exception pending) — a bare identifier that resolves to nothing reads
-        // as nil. A genuine raise sets a pending exception, and a re-raised
-        // NoMethodError's *message* also starts with "undefined method"; those
-        // must propagate (bare `raise` re-raising `$!` inside a rescue).
+        // The *soft* "this bareword isn't a method" signal (no exception
+        // pending) means nothing in scope answers to the name, which is MRI's
+        // NameError — reading it as nil turned every typo into a silent nil and
+        // made `p xyz_undefined` print `nil` where MRI raises. A genuine raise
+        // sets a pending exception, and a re-raised NoMethodError's *message*
+        // also starts with "undefined method"; those propagate unchanged (bare
+        // `raise` re-raising `$!` inside a rescue).
         Err(e) if e.starts_with("undefined method") && !with_host(|h| h.has_pending_exc()) => {
-            Value::Undef
+            let this = with_host(|h| h.current_self());
+            let sym = with_host(|h| h.new_symbol(&name));
+            abort(
+                vm,
+                raise_exc_with(
+                    "NameError",
+                    &format!(
+                        "undefined local variable or method '{name}' for {}",
+                        receiver_phrase(&this)
+                    ),
+                    &[("name", sym), ("receiver", this.clone())],
+                ),
+            )
         }
         Err(e) => abort(vm, e),
     }
@@ -21029,9 +21068,14 @@ const HASH_MUTATORS: &[&str] = &[
 /// `for nil` / `for true` / `for false`, `for class C` when the receiver is a
 /// class/module reference, or `for an instance of C` for every other value.
 fn no_method_error(recv: &Value, name: &str) -> String {
-    raise_exc(
+    // `NameError#receiver` answers the object the call was made on, and a
+    // rescue handler that reports or retries on it needs the real value — it
+    // was answering nil for every receiver, so `"a".zzz` rescued to a
+    // NoMethodError whose `receiver` was nil rather than `"a"`.
+    raise_exc_with(
         "NoMethodError",
         &format!("undefined method '{name}' for {}", receiver_phrase(recv)),
+        &[("receiver", recv.clone())],
     )
 }
 

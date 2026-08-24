@@ -771,9 +771,15 @@ pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
     };
     let mut b = ChunkBuilder::new();
     // The top-level script is a scope with no parameters; slot-lower its locals.
+    // It needs a `scope_locals` frame of its own as well: a top-level local that
+    // a nested closure captures gets no slot, so its bare reads take the host
+    // path, where being a KNOWN local is what stops them being retried as a
+    // method call.
+    c.scope_locals.push(std::collections::HashSet::new());
     c.enter_slot_scope(&std::collections::HashSet::new(), stmts);
     c.compile_seq(&mut b, stmts)?;
     c.exit_slot_scope();
+    c.scope_locals.pop();
     Ok(Program {
         main: b.build(),
         methods: c.methods,
@@ -1728,6 +1734,12 @@ impl Compiler {
             }
         }
         let op = match kind {
+            // A name this scope assigns somewhere at or before here is a LOCAL,
+            // full stop — Ruby hoists it to nil from that position, and a bare
+            // read of it is never a method call.
+            VarKind::Local if self.scope_locals.last().is_some_and(|s| s.contains(name)) => {
+                ops::GETLOCAL_DECLARED
+            }
             VarKind::Local => ops::GETLOCAL,
             VarKind::Instance => ops::GETIVAR,
             VarKind::Class => ops::GETCVAR,
@@ -2534,7 +2546,18 @@ impl Compiler {
             req: params.len().saturating_sub(splat.is_some() as usize) as u16,
             ..Default::default()
         });
-        let chunk = self.compile_body_chunk(body)?;
+        // A block sees the enclosing scope's locals (it closes over them) plus
+        // its own parameters, and a name first assigned INSIDE it is block-local
+        // — so the frame is seeded from the enclosing one and discarded after.
+        // Without a frame at all, an assignment in a block was recorded nowhere
+        // and `[10].each { |x| y = (y || 0) + 1 }` read `y` as an undefined name
+        // instead of the nil Ruby hoists it to.
+        let mut frame = self.scope_locals.last().cloned().unwrap_or_default();
+        frame.extend(params.iter().cloned());
+        self.scope_locals.push(frame);
+        let chunk = self.compile_body_chunk(body);
+        self.scope_locals.pop();
+        let chunk = chunk?;
         let id = self.procs.len();
         self.procs.push(ProcDef {
             params: params.to_vec(),
