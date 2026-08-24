@@ -9715,6 +9715,13 @@ fn dispatch_array(
                 Some(bl) => sort_with_block(arr, bl)?,
                 None => sort_values(&arr, CmpOrder::Source, false)?,
             };
+            // A `break` in the comparator makes its operand the value of the
+            // `sort` call (supplied by `finish_block_call`) and leaves the
+            // receiver as it was — MRI's `[3,1,2].sort! { break 8 }` answers 8
+            // and the array is still [3, 1, 2].
+            if has_pending_signal() {
+                return Ok(Value::Undef);
+            }
             // `sort!` sorts in place and returns the receiver.
             if name == "sort!" {
                 with_host(|h| h.set_array(recv, a));
@@ -9727,6 +9734,12 @@ fn dispatch_array(
         // already models by answering the receiver.
         "sort_by!" => {
             let sorted = sort_by_family(recv, "sort_by", &arr, &block, args)?;
+            // A `break` in the key block cut the sort short, so there is nothing
+            // to write back — MRI leaves the receiver untouched and answers the
+            // break operand.
+            if has_pending_signal() {
+                return Ok(Value::Undef);
+            }
             if block.is_some() {
                 let a = with_host(|h| h.as_array(&sorted).unwrap_or_default());
                 with_host(|h| h.set_array(recv, a));
@@ -9783,6 +9796,10 @@ fn dispatch_array(
                     // the two in source order, which is the operand MRI leads
                     // with here.
                     Some(bl) => match call_proc(bl, &[x.clone(), y.clone()])? {
+                        // Under a pending `break` this Undef is the signal, not
+                        // an unrankable pair; ranking stops and the scan below
+                        // sees a 0 rather than raising.
+                        Value::Undef if has_pending_signal() => Ok(0),
                         Value::Undef => Err(cmp_error(y, x)),
                         v => Ok(as_i(&v)),
                     },
@@ -9798,6 +9815,9 @@ fn dispatch_array(
                 }
                 if cmp(x, &hi)? > 0 {
                     hi = x.clone();
+                }
+                if has_pending_signal() {
+                    return Ok(Value::Undef);
                 }
             }
             Ok(new_arr(vec![lo, hi]))
@@ -9838,6 +9858,11 @@ fn dispatch_array(
                         // ascending sort would flip the tied elements too.
                         let (l, r) = if want_max { (c, a) } else { (a, c) };
                         match call_proc(bl, &[l.clone(), r.clone()]) {
+                            // A `break` in the comparator: the Undef is the
+                            // signal, and the caller answers with its operand.
+                            Ok(Value::Undef) if has_pending_signal() => {
+                                std::cmp::Ordering::Equal
+                            }
                             Ok(Value::Undef) => {
                                 err = Some(cmp_error(l, r));
                                 std::cmp::Ordering::Equal
@@ -9851,6 +9876,9 @@ fn dispatch_array(
                     });
                     if let Some(e) = err {
                         return Err(e);
+                    }
+                    if has_pending_signal() {
+                        return Ok(Value::Undef);
                     }
                     return Ok(new_arr(sorted.into_iter().take(k).collect()));
                 }
@@ -9867,6 +9895,10 @@ fn dispatch_array(
             for x in &arr[1..] {
                 let c = match &block {
                     Some(bl) => match call_proc(bl, &[x.clone(), best.clone()])? {
+                        // A `break` in the comparator: the Undef is the pending
+                        // signal, not an unrankable pair, and the break operand
+                        // becomes the value of the `min`/`max` call.
+                        Value::Undef if has_pending_signal() => return Ok(Value::Undef),
                         Value::Undef => return Err(cmp_error(x, &best)),
                         v => as_i(&v),
                     },
@@ -10879,6 +10911,11 @@ fn dispatch_array(
                     Some(b) => call_proc(b, std::slice::from_ref(x))?,
                     None => x.clone(),
                 };
+                // A `break` in the block ends the call before its Undef can be
+                // rejected as a non-pair element.
+                if has_pending_signal() {
+                    return Ok(Value::Undef);
+                }
                 // An element that is not a pair is REFUSED, naming its position.
                 // Skipping it silently made `[1].to_h` answer `{}`.
                 let pair = with_host(|h| h.as_array(&elem));
@@ -10998,6 +11035,14 @@ fn sort_by_family(
     let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(arr.len());
     for x in arr {
         let k = call_proc(b, std::slice::from_ref(x))?;
+        // A `break` in the key block ends the call right here. `call_proc`
+        // answered `Value::Undef` with the signal still pending, and ranking that
+        // against a real key raised "comparison of Integer with nil failed" where
+        // MRI answers the break operand — which `finish_block_call` supplies once
+        // this returns.
+        if has_pending_signal() {
+            return Ok(Value::Undef);
+        }
         keyed.push((k, x.clone()));
     }
     // The keys in SOURCE order: a failure names its pair from this, and the sort
@@ -21979,9 +22024,16 @@ fn sort_with_block(mut arr: Vec<Value>, bl: &Value) -> Result<Vec<Value>, String
     for i in 1..arr.len() {
         let mut j = i;
         while j > 0 {
+            let r = call_proc(bl, &[arr[j - 1].clone(), arr[j].clone()])?;
+            // A `break` in the comparator ends the sort. Its `Value::Undef` is
+            // the signal, not an unrankable pair, so it must be tested before
+            // the nil check below turns it into an ArgumentError.
+            if has_pending_signal() {
+                return Ok(arr);
+            }
             // A nil from the block is Ruby's "these cannot be ranked", and the
             // sort raises rather than treating it as 0 and keeping the order.
-            let c = match call_proc(bl, &[arr[j - 1].clone(), arr[j].clone()])? {
+            let c = match r {
                 Value::Undef => return Err(cmp_error(&arr[j - 1], &arr[j])),
                 v => as_i(&v),
             };
