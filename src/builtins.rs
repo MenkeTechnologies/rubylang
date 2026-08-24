@@ -2235,6 +2235,13 @@ pub(crate) fn dispatch(
                         None,
                     );
                 }
+                // A method a BUILT-IN mixin provides is not in the class's own
+                // table, so nothing above finds it — `include Comparable` made
+                // `obj < other` work while `obj.respond_to?(:<)` answered false,
+                // which is the wrong way round for duck typing.
+                if mixin_provides(&cls, &m) {
+                    return Ok(Value::Bool(true));
+                }
                 // Struct instances respond to the deconstruction protocol even
                 // though those methods are Struct-provided, not user-defined; the
                 // pattern-match gate depends on this being true.
@@ -3977,6 +3984,11 @@ fn dispatch_classref(
         | "private_method_defined?"
         | "protected_method_defined?" => {
             let m = name_of(&args[0]);
+            if mixin_provides(cls, &m) {
+                // Built-in mixin methods are public, so only the private query
+                // answers false for one.
+                return Ok(Value::Bool(name != "private_method_defined?"));
+            }
             Ok(Value::Bool(with_host(|h| {
                 if !h.is_method_defined(cls, &m) {
                     return false;
@@ -4926,30 +4938,31 @@ fn comparable_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<
     }
 }
 
-/// Materialize a user `Enumerable`'s elements by driving its own `each` with a
-/// native collector block, exactly how real Ruby's `Enumerable` derives every
-/// method from `each`. Returns the yielded values in iteration order.
-fn enum_to_vec(recv: &Value) -> Result<Vec<Value>, String> {
-    let sink = with_host(|h| h.new_enum_sink());
-    dispatch(recv, "each", &[], Some(sink))?;
-    Ok(with_host(|h| h.take_enum_sink()))
+/// Whether `class` gets `method` from a built-in mixin — `Comparable`'s
+/// `<=>`-derived operators or `Enumerable`'s `each`-derived methods.
+///
+/// These are dispatched natively rather than stored in the class's method
+/// table, so every reflection query has to ask here as well as there.
+fn mixin_provides(class: &str, method: &str) -> bool {
+    let anc = with_host(|h| h.class_ancestry(class));
+    (anc.iter().any(|a| a == "Comparable") && COMPARABLE_METHODS.contains(&method))
+        || (anc.iter().any(|a| a == "Enumerable") && ENUMERABLE_METHODS.contains(&method))
 }
 
-/// Enumerable's derived instance methods (`map select reject reduce to_a find
-/// count min max sort include? first`, plus their standard aliases), each built
-/// on the class's own `each`: the elements are materialized once and the request
-/// is delegated to the eager `Array` implementation so the block, symbol-proc,
-/// and argument handling all match Ruby. Returns `Ok(None)` when `name` is not an
-/// Enumerable method (so the caller raises `NoMethodError`).
-fn enumerable_method(
-    recv: &Value,
-    name: &str,
-    args: &[Value],
-    block: Option<Value>,
-) -> Result<Option<Value>, String> {
-    // Only names Enumerable actually provides (and that `dispatch_array`
-    // implements) are derived; anything else falls through to `NoMethodError`.
-    const ENUM_METHODS: &[&str] = &[
+/// The methods `Comparable` gives a class that defines `<=>`. This is MRI's
+/// whole list, and it is shared by the dispatcher in `comparable_method` and by
+/// the reflection surface — `respond_to?`, `method_defined?` and
+/// `instance_methods` all have to agree with what dispatch will accept, and
+/// they did not: `C.new.respond_to?(:<)` answered false on a class that
+/// `include Comparable` while `C.new < other` worked.
+pub(crate) const COMPARABLE_METHODS: &[&str] =
+    &["<", "<=", "==", ">", ">=", "between?", "clamp"];
+
+/// The methods `Enumerable` derives from a class's `each`, for the same two
+/// consumers. Unlike Comparable this is NOT all of MRI's `Enumerable` — it is
+/// the subset `enumerable_method` implements, and reflection reports exactly
+/// that subset so a `respond_to?` answer and a real call never disagree.
+pub(crate) const ENUMERABLE_METHODS: &[&str] = &[
         "map",
         "collect",
         "flat_map",
@@ -5002,8 +5015,32 @@ fn enumerable_method(
         "slice_when",
         "reverse_each",
         "to_h",
-    ];
-    if !ENUM_METHODS.contains(&name) {
+];
+
+/// Materialize a user `Enumerable`'s elements by driving its own `each` with a
+/// native collector block, exactly how real Ruby's `Enumerable` derives every
+/// method from `each`. Returns the yielded values in iteration order.
+fn enum_to_vec(recv: &Value) -> Result<Vec<Value>, String> {
+    let sink = with_host(|h| h.new_enum_sink());
+    dispatch(recv, "each", &[], Some(sink))?;
+    Ok(with_host(|h| h.take_enum_sink()))
+}
+
+/// Enumerable's derived instance methods (`map select reject reduce to_a find
+/// count min max sort include? first`, plus their standard aliases), each built
+/// on the class's own `each`: the elements are materialized once and the request
+/// is delegated to the eager `Array` implementation so the block, symbol-proc,
+/// and argument handling all match Ruby. Returns `Ok(None)` when `name` is not an
+/// Enumerable method (so the caller raises `NoMethodError`).
+fn enumerable_method(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Option<Value>, String> {
+    // Only names Enumerable actually provides (and that `dispatch_array`
+    // implements) are derived; anything else falls through to `NoMethodError`.
+    if !ENUMERABLE_METHODS.contains(&name) {
         return Ok(None);
     }
     let elems = enum_to_vec(recv)?;

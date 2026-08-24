@@ -5704,6 +5704,18 @@ impl RubyHost {
             if let Some(dm) = self.define_methods.get(n) {
                 take(Box::new(dm.keys()), &mut out);
             }
+            // `Comparable` and `Enumerable` have no entry in `classes` — their
+            // methods are dispatched natively — so walking the tables alone
+            // reported `Comparable.instance_methods` as empty and left every
+            // mixin method out of an including class's list.
+            let builtin: &[&str] = match n.as_str() {
+                "Comparable" => crate::builtins::COMPARABLE_METHODS,
+                "Enumerable" => crate::builtins::ENUMERABLE_METHODS,
+                _ => &[],
+            };
+            if want.contains(&Visibility::Public) {
+                out.extend(builtin.iter().map(|k| (*k).to_string()));
+            }
         }
         dedup_keep_first(out)
     }
