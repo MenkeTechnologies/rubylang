@@ -27,7 +27,7 @@
 //!    can. See the erosion note below: this is the proof that does not decay.
 //! 3. **MRI-shaped `--version`.** MRI prints
 //!    `ruby 4.0.6 (2026-07-14 revision 03b6d3f889) +PRISM [arm64-darwin25]`.
-//!    rubylang prints `ruby 3.4.0 (rubylang 0.1.4) [aarch64-macos]`.
+//!    rubylang prints `ruby 3.4.0 (rubylang 0.1.5) [aarch64-macos]`.
 //! 4. **`RUBY_ENGINE`.** MRI prints `ruby`; anything that cannot answer the
 //!    question the same way is not the reference.
 //!
@@ -47,7 +47,7 @@
 //! $ /opt/homebrew/opt/ruby/bin/ruby --version
 //! ruby 4.0.6 (2026-07-14 revision 03b6d3f889) +PRISM [arm64-darwin25]
 //! $ target/debug/ruby --version
-//! ruby 3.4.0 (rubylang 0.1.4) [aarch64-macos]
+//! ruby 3.4.0 (rubylang 0.1.5) [aarch64-macos]
 //! ```
 //!
 //! Proof 4 is one line from being defeated the same way: `RUBY_ENGINE` answers
