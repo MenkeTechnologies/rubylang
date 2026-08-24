@@ -2225,7 +2225,7 @@ impl RubyHost {
             origin,
         })
     }
-    /// As [`new_lazy`], for a receiver that had to be materialized: `origin` is
+    /// As [`Self::new_lazy`], for a receiver that had to be materialized: `origin` is
     /// what `.lazy` was called on, `source` what the pipeline pulls from.
     pub fn new_lazy_of(&mut self, source: Value, ops: Vec<LazyOp>, origin: Value) -> Value {
         self.alloc(RObj::Lazy {
@@ -2282,7 +2282,7 @@ impl RubyHost {
             source: None,
         })
     }
-    /// As [`new_enumerator`], recording the object being iterated.
+    /// As [`Self::new_enumerator`], recording the object being iterated.
     pub fn new_enumerator_of(&mut self, buf: Vec<Value>, method: &str, source: Value) -> Value {
         self.alloc(RObj::Enumerator {
             buf,
@@ -7640,8 +7640,10 @@ impl RubyHost {
     /// VALUE, and only then asks `==`. The two differ on exactly one value: a
     /// NaN is not `==` itself, but it IS itself, so MRI answers
     ///
-    ///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [Float::NAN].include?(Float::NAN)'
-    ///   true
+    /// ```text
+    /// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [Float::NAN].include?(Float::NAN)'
+    /// true
+    /// ```
     ///
     /// while `Float::NAN == Float::NAN` stays false. Identity here is bit
     /// equality on the `Value`, which is what MRI's flonum comparison amounts to;
