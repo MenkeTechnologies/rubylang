@@ -912,6 +912,14 @@ Honest limitations of this surface:
   `` "pre=#$` post=#$'" ``.) Backed by `fancy-regex`, a backtracking engine, so
   the Onigmo constructs the `regex` crate rejects DO work: backreferences within
   the pattern (`/(ab)\1/`) and lookaround (`/foo(?=bar)/`, `/(?<=foo)bar/`).
+  Ruby's flag spellings differ from fancy-regex's Perl ones and are translated
+  before compiling: `^`/`$` are LINE anchors unconditionally (`\A`/`\z` are the
+  string anchors), and an inline `(?m)`/`(?im:…)`/`(?-mix:…)` keeps Ruby's
+  meaning of `m` — dot-matches-newline — rather than Perl's line-anchor switch.
+  Matching also follows MRI's `rb_reg_search` stepping, where a zero-width match
+  landing on the previous match's end is a match rather than being skipped, so
+  `"aaa".gsub(/a*/, "X")` is `"XX"` and `"abc".split(//)` is one field per
+  character.
   A Regexp is also a VALUE, not just a matcher: `==`/`eql?`/`hash` compare its
   source and its normalized option bitmask, so `/a/ == /a/` and
   `/a/im == /a/mi` are true while `/a/ == /a/i` is false, and a Regexp works as

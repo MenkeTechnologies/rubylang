@@ -7837,7 +7837,7 @@ fn dispatch_string(
             } else {
                 let sep = arg_str(&args[0]);
                 if sep.is_empty() {
-                    s.chars().map(|c| c.to_string()).collect()
+                    split_chars(&s, limit)
                 } else {
                     string_split(&s, &sep, limit)
                 }
@@ -8495,22 +8495,59 @@ fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value,
 
 /// `String#scan(re)`: every match. With capture groups, each element is an array
 /// of the captured groups; otherwise each element is the whole matched string.
+/// Every match of `re` in `s`, in MRI's `rb_reg_search` order.
+///
+/// This exists because the fancy-regex (and `regex`) iterators apply a rule MRI
+/// does not: an empty match that lands exactly where the previous match ended is
+/// SKIPPED, so the iterator never yields two adjacent zero-width matches. MRI
+/// yields it and then advances one CHARACTER — `str_scan`'s loop is literally
+/// `if (BEG(0) == END(0)) start = end + mbclen; else start = end;`.
+///
+/// The difference is not academic; it is visible from any pattern that can match
+/// empty:
+///
+/// | expression                  | MRI                        | iterator rule |
+/// |-----------------------------|----------------------------|---------------|
+/// | `"aaa".gsub(/a*/, "X")`     | `"XX"`                     | `"X"`         |
+/// | `"aXbXXc".scan(/X*/)`       | `["", "X", "", "XX", "", ""]` | `["", "X", "XX", ""]` |
+/// | `"abc".gsub(/b*/) { ... }`  | `"<>a<b><>c<>"`            | `"<>a<b>c<>"` |
+///
+/// Collecting rather than yielding keeps the borrow simple: every caller wants
+/// the captures, and a lending iterator over `Captures<'t>` would need a
+/// callback at each site.
+fn ruby_matches<'t>(re: &fancy_regex::Regex, s: &'t str) -> Vec<fancy_regex::Captures<'t>> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start <= s.len() {
+        let Ok(Some(caps)) = re.captures_from_pos(s, start) else {
+            break;
+        };
+        let m = caps.get(0).expect("group 0 always matched");
+        // A non-empty match always moves `start` forward on its own; an empty one
+        // has to be stepped past by hand, and past the end of the string there is
+        // no character left to step over.
+        start = if m.start() == m.end() {
+            if m.end() == s.len() {
+                m.end() + 1
+            } else {
+                next_char_boundary(s, m.end())
+            }
+        } else {
+            m.end()
+        };
+        out.push(caps);
+    }
+    out
+}
+
 fn scan_regex(re: &fancy_regex::Regex, s: &str) -> Value {
     let ngroups = re.captures_len(); // includes the whole-match group 0
-    if ngroups <= 1 {
-        // fancy-regex iterators yield `Result` (backtracking can error); a match
-        // error ends the scan, so drop errored items with `filter_map(Result::ok)`.
-        let out: Vec<Value> = re
-            .find_iter(s)
-            .filter_map(Result::ok)
-            .map(|m| new_str(m.as_str().to_string()))
-            .collect();
-        new_arr(out)
-    } else {
-        let out: Vec<Value> = re
-            .captures_iter(s)
-            .filter_map(Result::ok)
-            .map(|c| {
+    let out: Vec<Value> = ruby_matches(re, s)
+        .iter()
+        .map(|c| {
+            if ngroups <= 1 {
+                new_str(c.get(0).expect("group 0 always matched").as_str().to_string())
+            } else {
                 let groups: Vec<Value> = (1..ngroups)
                     .map(|i| {
                         c.get(i)
@@ -8519,10 +8556,10 @@ fn scan_regex(re: &fancy_regex::Regex, s: &str) -> Value {
                     })
                     .collect();
                 new_arr(groups)
-            })
-            .collect();
-        new_arr(out)
-    }
+            }
+        })
+        .collect();
+    new_arr(out)
 }
 
 /// Awk-mode split keeping at most `limit` fields (the last holds the remainder,
@@ -8558,44 +8595,128 @@ fn string_split(s: &str, sep: &str, limit: i64) -> Vec<String> {
         s.split(sep).map(str::to_string).collect()
     };
     if limit == 0 {
-        while parts.last().is_some_and(|p| p.is_empty()) {
-            parts.pop();
-        }
+        drop_trailing_empty(&mut parts);
     }
     parts
 }
 
+/// Advance `i` past exactly one character, the way MRI's `rb_enc_fast_mbclen`
+/// does. Splitting on a zero-width match consumes one CHARACTER, not one byte.
+fn next_char_boundary(s: &str, i: usize) -> usize {
+    s[i..].chars().next().map_or(i, |c| i + c.len_utf8())
+}
+
+/// Drop the trailing empty fields MRI's deferred-`empty_count` scheme never
+/// emits. Interior empties are kept; only the run at the end goes.
+fn drop_trailing_empty(parts: &mut Vec<String>) {
+    while parts.last().is_some_and(|p| p.is_empty()) {
+        parts.pop();
+    }
+}
+
+/// `"abc".split("")` — MRI's `SPLIT_TYPE_CHARS`. One field per character, and
+/// the limit stops the scan mid-string so the remainder becomes the last field
+/// (`"abc".split("", 2)` => `["a", "bc"]`). Routing this through the plain
+/// string splitter instead ignored the limit entirely.
+fn split_chars(s: &str, limit: i64) -> Vec<String> {
+    if limit == 1 {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut beg = 0;
+    // MRI's field counter starts at 1 when a limit argument was given.
+    let mut fields = 1i64;
+    for (i, c) in s.char_indices() {
+        out.push(c.to_string());
+        beg = i + c.len_utf8();
+        fields += 1;
+        if limit > 1 && limit <= fields {
+            break;
+        }
+    }
+    if !s.is_empty() && (limit > 1 || s.len() > beg || limit < 0) {
+        out.push(s[beg..].to_string());
+    }
+    if limit == 0 {
+        drop_trailing_empty(&mut out);
+    }
+    out
+}
+
 /// Split `s` on a regex. Capture groups in the pattern are interleaved into the
 /// result (Ruby behavior). `limit` follows the same rules as `string_split`.
+///
+/// This is a port of MRI's `SPLIT_TYPE_REGEXP` loop in `rb_str_split_m`, and the
+/// part that has to be ported rather than approximated is the ZERO-WIDTH match.
+/// Skipping such a match (the previous behavior) makes every pattern that can
+/// match empty collapse to a single field: `"abc".split(//)` answered
+/// `["abc"]` where MRI answers `["a", "b", "c"]`, and `"hello".split(/l*/)`
+/// answered `["he", "o"]` where MRI answers `["h", "e", "o"]`.
+///
+/// MRI's trick is the `last_null` flag. The first zero-width match at the
+/// search position is not a field boundary — the position is simply advanced by
+/// one character and the flag set. The next one closes a field holding the ONE
+/// character that was stepped over. That two-step is why an empty pattern walks
+/// the string a character at a time instead of spinning in place.
 fn regex_split(re: &fancy_regex::Regex, s: &str, limit: i64) -> Vec<String> {
     if s.is_empty() {
         return Vec::new();
     }
-    let mut out = Vec::new();
-    let mut last = 0;
+    if limit == 1 {
+        return vec![s.to_string()];
+    }
     let ngroups = re.captures_len();
-    for caps in re.captures_iter(s).filter_map(Result::ok) {
-        if limit > 0 && out.len() as i64 >= limit - 1 {
+    let len = s.len();
+    let mut out: Vec<String> = Vec::new();
+    // `beg` starts the field being accumulated; `start` is where the next search
+    // begins. They diverge only across a skipped zero-width match.
+    let mut beg = 0usize;
+    let mut start = 0usize;
+    let mut last_null = false;
+    let mut fields = 1i64;
+    while start <= len {
+        let Ok(Some(caps)) = re.captures_from_pos(s, start) else {
             break;
-        }
+        };
         let m = caps.get(0).unwrap();
-        // A zero-width match would loop forever; skip it.
-        if m.start() == m.end() {
-            continue;
+        if start == m.start() && m.start() == m.end() {
+            if last_null {
+                out.push(s[beg..next_char_boundary(s, beg)].to_string());
+                beg = start;
+            } else {
+                // Past the end of the string there is no character to step over,
+                // so step one byte to end the loop.
+                start = if start == len {
+                    start + 1
+                } else {
+                    next_char_boundary(s, start)
+                };
+                last_null = true;
+                continue;
+            }
+        } else {
+            out.push(s[beg..m.start()].to_string());
+            beg = m.end();
+            start = m.end();
         }
-        out.push(s[last..m.start()].to_string());
+        last_null = false;
         for i in 1..ngroups {
             if let Some(g) = caps.get(i) {
                 out.push(g.as_str().to_string());
             }
         }
-        last = m.end();
-    }
-    out.push(s[last..].to_string());
-    if limit == 0 {
-        while out.last().is_some_and(|p| p.is_empty()) {
-            out.pop();
+        fields += 1;
+        if limit > 1 && limit <= fields {
+            break;
         }
+    }
+    // The remainder becomes the last field unless the scan consumed the whole
+    // string with no limit — the case where MRI omits it rather than pushing "".
+    if len > 0 && (limit > 1 || len > beg || limit < 0) {
+        out.push(s[beg..].to_string());
+    }
+    if limit == 0 {
+        drop_trailing_empty(&mut out);
     }
     out
 }
@@ -8604,7 +8725,7 @@ fn regex_split(re: &fancy_regex::Regex, s: &str, limit: i64) -> Vec<String> {
 /// match for an ungrouped pattern or the capture-group array for a grouped one.
 fn scan_each(re: &fancy_regex::Regex, s: &str, bl: &Value, re_val: &Value) -> Result<(), String> {
     let ngroups = re.captures_len();
-    for caps in re.captures_iter(s).filter_map(Result::ok) {
+    for caps in ruby_matches(re, s) {
         set_match_globals(Some((&caps, s)), re, re_val);
         let arg = if ngroups <= 1 {
             new_str(caps.get(0).unwrap().as_str().to_string())
@@ -8635,7 +8756,7 @@ fn regex_replace(
 ) -> Result<Value, String> {
     let mut out = String::new();
     let mut last = 0;
-    for (count, caps) in re.captures_iter(s).filter_map(Result::ok).enumerate() {
+    for (count, caps) in ruby_matches(re, s).into_iter().enumerate() {
         if !all && count >= 1 {
             break;
         }
@@ -8683,7 +8804,7 @@ fn regex_replace(
 /// The numbered forms answer the EMPTY string — not the group text — whenever
 /// the pattern contains a named capture, which is the replacement-side face of
 /// the same Onigmo rule that stops unnamed groups from capturing (see
-/// `suppress_unnamed_groups` in host.rs). It holds even when every group is
+/// `ruby_regex_to_fancy` in host.rs). It holds even when every group is
 /// named and the number would have resolved:
 /// `"bc".sub(/(?<a>b)(?<d>c)/, '<\1|\2>')` is `"<|>"`, though `md[1]` is `"b"`.
 ///
@@ -16077,7 +16198,7 @@ fn regex_escape(s: &str) -> String {
 /// Only NAMED groups advance the index. That is not a simplification: this
 /// function returns nothing unless the pattern has a named group, and a pattern
 /// with a named group is exactly the case where Onigmo stops numbering the
-/// unnamed ones (see `suppress_unnamed_groups` in host.rs). So a plain `(…)`
+/// unnamed ones (see `ruby_regex_to_fancy` in host.rs). So a plain `(…)`
 /// never contributes a number to any pair reported here, and counting it made
 /// `/(?<a>b)(c)(?<d>e)/.named_captures` answer `{"a" => [1], "d" => [3]}` where
 /// the reference answers `{"a" => [1], "d" => [2]}`. `(?:…)`, lookarounds, and
