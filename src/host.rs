@@ -371,7 +371,7 @@ pub enum RObj {
     Regexp {
         source: String,
         /// Shared with every other Regexp built from the same source+flags —
-        /// see [`compiled_regex`]. A Regexp VALUE is still its own object; only
+        /// see `compiled_regex`. A Regexp VALUE is still its own object; only
         /// the compiled engine, which is immutable and holds no match state, is
         /// shared.
         re: std::sync::Arc<fancy_regex::Regex>,
@@ -1121,7 +1121,7 @@ pub struct MethodDef {
     pub opt: u16,
     pub kwreq: Vec<String>,
     pub chunk: Chunk,
-    /// Identifies this definition's chunk for VM reuse — see [`ChunkId`]. Minted
+    /// Identifies this definition's chunk for VM reuse — see `ChunkId`. Minted
     /// at construction, never serialized: a `MethodDef` read back from the
     /// bytecode cache mints a fresh one, so an id from a previous process can
     /// never collide with one from this one.

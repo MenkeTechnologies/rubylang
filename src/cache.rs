@@ -181,7 +181,7 @@ fn build_stamp() -> u64 {
     }
 }
 
-/// [`build_stamp`] for a named executable. Split out so the invalidation test
+/// `build_stamp` for a named executable. Split out so the invalidation test
 /// can prove two builds get different stamps without touching the binary it is
 /// itself running from.
 pub fn exe_stamp(path: &std::path::Path) -> u64 {
