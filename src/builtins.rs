@@ -13062,15 +13062,21 @@ fn drive_generator_value(gblock: &Value, limit: usize) -> Result<(Vec<Value>, Va
 /// `join` returns the thread.
 fn dispatch_thread(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
-        // `thread[:key]` / `thread[:key] = value` — thread-local storage, backed
-        // by the same process-global store as `Fiber[]` (single-thread-boot scope).
-        "[]" => {
-            let store = with_host(fiber_store);
-            dispatch(&store, "[]", args, None)
-        }
-        "[]=" => {
-            let store = with_host(fiber_store);
-            dispatch(&store, "[]=", args, None)
+        // `thread[:key]` / `thread[:key] = value` — storage belonging to THAT
+        // thread, held in the Thread object's own ivar table.
+        //
+        // It used to be one process-global hash shared by every thread, so the
+        // values leaked in both directions: a child saw the main thread's keys,
+        // and a key the child set was visible from main afterwards. Isolation is
+        // the entire point of the API, and `Thread.current` already answers a
+        // distinct object per OS thread, so keying on the receiver gives it.
+        "[]" | "[]=" | "key?" | "keys" | "fetch" => {
+            let store = thread_store(recv);
+            match name {
+                "keys" => dispatch(&store, "keys", args, None),
+                "key?" => dispatch(&store, "key?", args, None),
+                other => dispatch(&store, other, args, None),
+            }
         }
         "join" => {
             crate::host::thread_join(recv)?;
@@ -13109,8 +13115,22 @@ fn dispatch_thread(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
     }
 }
 
-/// The process-global store backing `Fiber[]`/`Thread#[]` (a lazily-created
-/// Hash). Not per-fiber/per-thread — sufficient for a single-fiber boot.
+/// The storage hash belonging to one Thread, created on first use and held in
+/// that Thread object's ivar table — so it is isolated per thread, which is what
+/// `Thread#[]` exists for.
+fn thread_store(thread: &Value) -> Value {
+    match with_host(|h| h.ivar_of(thread, "__thread_locals__")) {
+        Value::Undef => with_host(|h| {
+            let hh = h.new_hash(IndexMap::new());
+            h.set_ivar_of(thread, "__thread_locals__", hh.clone());
+            hh
+        }),
+        v => v,
+    }
+}
+
+/// The process-global store backing `Fiber[]` (a lazily-created Hash). Not
+/// per-fiber — sufficient for a single-fiber boot.
 fn fiber_store(h: &mut crate::host::RubyHost) -> Value {
     match h.get_global("__fiber_storage__") {
         Value::Undef => {

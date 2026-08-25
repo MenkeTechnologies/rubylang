@@ -4294,3 +4294,18 @@ ParDRt = Data.define(:a)
 par_d = ParDRt.new(a: 1)
 p par_d.respond_to?(:a), par_d.respond_to?(:to_h), par_d.respond_to?(:with)
 p par_d.respond_to?(:a=), par_d.respond_to?(:each), par_d.respond_to?(:nope)
+#==#
+# `Thread#[]` storage belongs to THAT thread — it does not leak from parent to
+# child, nor from child back to parent.
+Thread.current[:tv] = 1
+p Thread.current[:tv]
+p Thread.new { Thread.current[:tv] }.value
+p Thread.new { Thread.current[:tw] = 9; Thread.current[:tw] }.value
+p Thread.current[:tw]
+p Thread.current.keys
+p Thread.new { Thread.current.keys }.value
+p Thread.current.key?(:tv), Thread.current.key?(:never_set_anywhere)
+par_a = Thread.new { Thread.current[:x] = :a; Thread.current[:x] }
+par_b = Thread.new { Thread.current[:x] = :b; Thread.current[:x] }
+p par_a.value, par_b.value
+p Thread.current[:x]

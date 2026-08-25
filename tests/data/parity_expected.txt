@@ -2723,3 +2723,15 @@ true
 false
 false
 false
+#==#
+1
+nil
+9
+nil
+[:tv]
+[]
+true
+false
+:a
+:b
+nil

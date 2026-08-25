@@ -9561,3 +9561,50 @@ fn enumerator_produce_and_the_generated_struct_surface() {
     eq(&format!("{dt} d.respond_to?(:each)"), "false");
     eq(&format!("{dt} d.respond_to?(:nope)"), "false");
 }
+
+/// `Thread#[]` storage belongs to THAT thread.
+///
+/// It was one process-global hash shared by every thread, so the values leaked
+/// in both directions — a child saw the main thread's keys, and a key the child
+/// set stayed visible from main afterwards. Isolation is the entire point of the
+/// API, and code that uses it (per-request state, i18n locale) is broken in a
+/// way that only shows under concurrency:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'Thread.current[:v] = 1; p Thread.new { Thread.current[:v] }.value'
+/// nil
+/// ```
+///
+/// rubylang answered `1`.
+#[test]
+fn thread_local_storage_is_per_thread() {
+    eq("Thread.current[:tv] = 1; Thread.current[:tv]", "1");
+    // A child does not see the parent's keys...
+    eq(
+        "Thread.current[:tv2] = 1; Thread.new { Thread.current[:tv2] }.value.inspect",
+        r#""nil""#,
+    );
+    // ...and what the child sets does not escape to the parent.
+    eq(
+        "Thread.new { Thread.current[:tw] = 9; Thread.current[:tw] }.value",
+        "9",
+    );
+    eq(
+        "Thread.new { Thread.current[:tw2] = 9 }.join; Thread.current[:tw2].inspect",
+        r#""nil""#,
+    );
+    // `keys` and `key?` read the same per-thread store.
+    eq("Thread.current[:tk] = 1; Thread.current.keys", "[:tk]");
+    eq(
+        "Thread.current[:tk2] = 1; Thread.new { Thread.current.keys }.value",
+        "[]",
+    );
+    eq("Thread.current[:tq] = 1; Thread.current.key?(:tq)", "true");
+    eq("Thread.current.key?(:never_set_anywhere)", "false");
+    // Two children are isolated from each other.
+    eq(
+        "a = Thread.new { Thread.current[:x] = :a; Thread.current[:x] }; \
+         b = Thread.new { Thread.current[:x] = :b; Thread.current[:x] }; [a.value, b.value]",
+        "[:a, :b]",
+    );
+}
