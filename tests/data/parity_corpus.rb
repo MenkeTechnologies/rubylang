@@ -4193,3 +4193,26 @@ p((1..4).sum, (1..4).sum(10), (1..4).sum(10) { |x| x }, (1..0).sum)
 p((1..3).sum(0.5))
 p({ a: 0.1, b: 0.2 }.sum { |_k, v| v })
 p (1..3).map { |i| i / 10.0 }.sum
+#==#
+# A metaclass chain interleaves each `#<Class:X>` with the modules X was
+# EXTENDED with, walks the superclass chain of metaclasses, and closes with
+# `Class, Module, Object, Kernel, BasicObject`. A module has no superclass, so
+# its metaclass closes straight into `Module`.
+module ParE1; end
+module ParE2; end
+class ParA; extend ParE1; end
+class ParB < ParA; extend ParE2; end
+class ParPlain; end
+module ParM; extend ParE1; end
+p ParA.singleton_class.ancestors
+p ParB.singleton_class.ancestors
+p ParPlain.singleton_class.ancestors
+p ParM.singleton_class.ancestors
+p Object.singleton_class.ancestors
+p BasicObject.singleton_class.ancestors
+p ParA.singleton_class.include?(ParE1), ParB.singleton_class.include?(ParE1)
+p ParPlain.singleton_class.include?(ParE1)
+p ParA.singleton_class.ancestors.include?(ParE1)
+module ParHi; def hello; :hi; end; end
+class ParC; extend ParHi; end
+p ParC.hello

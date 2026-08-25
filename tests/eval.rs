@@ -9256,3 +9256,67 @@ fn sum_compensates_and_range_sum_honours_its_block() {
     eq("(1..0).sum", "0");
     eq("(1..3).sum(0.5)", "6.5");
 }
+
+/// A metaclass chain lists the modules the class was EXTENDED with.
+///
+/// `C.singleton_class.ancestors` stopped at the common root, so the modules
+/// `extend` had mixed in were nowhere in it and `C.singleton_class.include?(M)`
+/// was false — even though the extended methods themselves worked. MRI's chain
+/// interleaves each `#<Class:X>` with X's extends and walks the SUPERCLASS
+/// chain of metaclasses before closing:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'module E; end; class A; extend E; end; p A.singleton_class.ancestors'
+/// [#<Class:A>, E, #<Class:Object>, #<Class:BasicObject>, Class, Module, Object, Kernel, BasicObject]
+/// ```
+#[test]
+fn a_metaclass_chain_lists_the_extended_modules() {
+    let setup = "module McE1; end; module McE2; end; \
+                 class McA; extend McE1; end; class McB < McA; extend McE2; end; \
+                 class McPlain; end; module McM; extend McE1; end; ";
+    eq(
+        &format!("{setup} McA.singleton_class.ancestors"),
+        "[#<Class:McA>, McE1, #<Class:Object>, #<Class:BasicObject>, Class, Module, Object, Kernel, BasicObject]",
+    );
+    // A subclass interleaves its own extends before its superclass's metaclass.
+    eq(
+        &format!("{setup} McB.singleton_class.ancestors"),
+        "[#<Class:McB>, McE2, #<Class:McA>, McE1, #<Class:Object>, #<Class:BasicObject>, Class, Module, Object, Kernel, BasicObject]",
+    );
+    // No extends: the metaclass chain alone.
+    eq(
+        &format!("{setup} McPlain.singleton_class.ancestors"),
+        "[#<Class:McPlain>, #<Class:Object>, #<Class:BasicObject>, Class, Module, Object, Kernel, BasicObject]",
+    );
+    // A MODULE has no superclass, so its metaclass closes straight into Module.
+    eq(
+        &format!("{setup} McM.singleton_class.ancestors"),
+        "[#<Class:McM>, McE1, Module, Object, Kernel, BasicObject]",
+    );
+    eq(
+        "Object.singleton_class.ancestors",
+        "[#<Class:Object>, #<Class:BasicObject>, Class, Module, Object, Kernel, BasicObject]",
+    );
+    eq(
+        "BasicObject.singleton_class.ancestors",
+        "[#<Class:BasicObject>, Class, Module, Object, Kernel, BasicObject]",
+    );
+    // The predicate that was false.
+    eq(
+        &format!("{setup} McA.singleton_class.include?(McE1)"),
+        "true",
+    );
+    eq(
+        &format!("{setup} McB.singleton_class.include?(McE1)"),
+        "true",
+    );
+    eq(
+        &format!("{setup} McPlain.singleton_class.include?(McE1)"),
+        "false",
+    );
+    // The extended methods themselves keep working.
+    eq(
+        "module McX; def hello; :hi; end; end; class McC; extend McX; end; McC.hello",
+        ":hi",
+    );
+}

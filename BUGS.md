@@ -651,6 +651,17 @@ Implemented and verified against the reference `ruby`:
     all, so they raise `undefined method` rather than the `NameError` (or the
     `Method`) MRI answers. `method` and `Module#instance_method` /
     `#public_instance_method` are the implemented spellings.
+  - **`Object#singleton_class` — on a plain object only.** A CLASS or module
+    answers its metaclass, and that chain is exact: it interleaves each
+    `#<Class:X>` with the modules X was `extend`ed with, walks the superclass
+    chain of metaclasses, and closes with `Class, Module, Object, Kernel,
+    BasicObject`, so `C.singleton_class.include?(M)` and `.ancestors` both agree
+    with MRI. A non-class receiver still raises `undefined method`. Modelling it
+    needs a per-object metaclass IDENTITY — MRI names one
+    `#<Class:#<Foo:0x000000010488>>`, so two objects of the same class have
+    DIFFERENT singleton classes, and a name built without the address would
+    collide them into one. `obj.extend(M)` and `def obj.m` themselves work: both
+    register in the object's singleton table, which is what dispatch reads.
   - `main`'s singleton methods (`include`, `private`, `public`, `define_method`,
     `using`, `ruby2_keywords`) are not modeled, so `self.method(:include)` at the
     top level raises. The object itself now exists and names itself: top-level

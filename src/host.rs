@@ -5598,6 +5598,63 @@ impl RubyHost {
             v.extend(self.ancestry_tail(name));
             v
         };
+        // A METACLASS (`C.singleton_class`). Its chain mirrors the class chain:
+        // each `#<Class:X>` is followed by the modules X was EXTENDED with, then
+        // the metaclass of X's superclass, bottoming out at `#<Class:BasicObject>`
+        // and closing with `Class, Module, Object, Kernel, BasicObject`. A module
+        // has no superclass, so its metaclass closes straight into `Module`.
+        // Without this the extended modules were nowhere in the chain and
+        // `C.singleton_class.include?(Ext)` was false.
+        if let Some(inner) = name
+            .strip_prefix("#<Class:")
+            .and_then(|r| r.strip_suffix('>'))
+        {
+            let mut out = vec![name.to_string()];
+            let mut cur = inner.to_string();
+            let mut first = true;
+            // Bounded: the superclass walk ends at `BasicObject`, and the bound
+            // keeps a malformed `superclass` cycle from spinning here.
+            for _ in 0..256 {
+                if !first {
+                    out.push(format!("#<Class:{cur}>"));
+                }
+                first = false;
+                if let Some(def) = self.classes.get(&cur) {
+                    for m in def.extends.iter().rev() {
+                        let r = self.resolve_module_name(m, &cur);
+                        if !out.contains(&r) {
+                            out.push(r);
+                        }
+                    }
+                    if def.is_module {
+                        break;
+                    }
+                }
+                if cur == "BasicObject" {
+                    out.push("Class".to_string());
+                    break;
+                }
+                let next = self
+                    .classes
+                    .get(&cur)
+                    .and_then(|d| d.superclass.clone())
+                    .map(|s| self.resolve_class_alias(&s, &cur))
+                    .unwrap_or_else(|| {
+                        if cur == "Object" {
+                            "BasicObject".to_string()
+                        } else {
+                            "Object".to_string()
+                        }
+                    });
+                cur = next;
+            }
+            out.extend(
+                ["Module", "Object", "Kernel", "BasicObject"]
+                    .iter()
+                    .map(|s| s.to_string()),
+            );
+            return dedup_keep_first(out);
+        }
         match name {
             "BasicObject" => vec!["BasicObject".into()],
             "Object" => vec!["Object".into(), "Kernel".into(), "BasicObject".into()],

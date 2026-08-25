@@ -2621,3 +2621,15 @@ true
 6.5
 0.30000000000000004
 0.6
+#==#
+[#<Class:ParA>, ParE1, #<Class:Object>, #<Class:BasicObject>, Class, Module, Object, Kernel, BasicObject]
+[#<Class:ParB>, ParE2, #<Class:ParA>, ParE1, #<Class:Object>, #<Class:BasicObject>, Class, Module, Object, Kernel, BasicObject]
+[#<Class:ParPlain>, #<Class:Object>, #<Class:BasicObject>, Class, Module, Object, Kernel, BasicObject]
+[#<Class:ParM>, ParE1, Module, Object, Kernel, BasicObject]
+[#<Class:Object>, #<Class:BasicObject>, Class, Module, Object, Kernel, BasicObject]
+[#<Class:BasicObject>, Class, Module, Object, Kernel, BasicObject]
+true
+true
+false
+true
+:hi
