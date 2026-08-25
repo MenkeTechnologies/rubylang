@@ -1951,9 +1951,17 @@ pub fn eval_erb_with_locals(src: &str, locals: Vec<(String, Value)>) -> Result<V
 /// host (its proc/begin templates appended at the right offset) and run its main
 /// chunk in the current frame. Definitions persist; returns the last value.
 pub fn eval_in_place(src: &str) -> Result<Value, String> {
-    let stmts = crate::parser::parse(src)?;
+    // Source that does not PARSE is a `SyntaxError`, not a `RuntimeError`. The
+    // distinction is not cosmetic: `SyntaxError` is a `ScriptError`, so it is
+    // deliberately outside `StandardError` and a bare `rescue` does NOT catch
+    // it — code that means to handle bad input writes `rescue SyntaxError`, and
+    // against a RuntimeError that clause never fired while a bare `rescue`
+    // swallowed it instead. `require`'s compile path already raised the right
+    // class; the `eval` family did not.
+    let syntax = |e: String| crate::builtins::raise_exc("SyntaxError", &e);
+    let stmts = crate::parser::parse(src).map_err(syntax)?;
     let (proc_base, begin_base) = with_host(|h| (h.procs.len(), h.begins.len()));
-    let prog = crate::compiler::compile_at(&stmts, proc_base, begin_base)?;
+    let prog = crate::compiler::compile_at(&stmts, proc_base, begin_base).map_err(syntax)?;
     let main = prog.main;
     // A `def` at the top level of the eval'd source belongs to the active eval
     // target — `C.class_eval("def m; … end")` defines `m` on C, not as a global

@@ -4255,3 +4255,13 @@ p "1.5+2i".to_c, "3".to_r
 p Complex("1+2i") + Complex("2-1i")
 p Complex("1+2i") * 2
 p Complex("1+2i").real, Complex("1+2i").imaginary
+#==#
+# Source that does not parse is a SyntaxError — a ScriptError, so deliberately
+# outside StandardError, which is why a bare `rescue` must NOT catch it.
+begin; eval("1+"); rescue SyntaxError; p :caught; end
+begin; Object.class_eval("1+"); rescue SyntaxError; p :caught; end
+begin; "".instance_eval("1+"); rescue SyntaxError; p :caught; end
+p SyntaxError.superclass, SyntaxError.ancestors.include?(StandardError)
+p eval("1+1"), eval("[1,2].map { |x| x * 2 }")
+begin; 42.zzz_undefined; rescue NoMethodError => e; p e.message; end
+begin; "a".zzz_undefined; rescue NoMethodError => e; p e.receiver, e.name; end

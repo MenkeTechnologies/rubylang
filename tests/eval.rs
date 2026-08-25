@@ -9439,3 +9439,45 @@ fn complex_parses_its_string_form() {
     eq(r#""5".to_c"#, "(5+0i)");
     eq(r#""-i".to_c"#, "(0-1i)");
 }
+
+/// Source that does not parse is a `SyntaxError`, not a `RuntimeError`.
+///
+/// Both were reported as the wrong thing, and in both cases the wrong thing sent
+/// a reader somewhere useless. `eval("1+")` raised a `RuntimeError`, so
+/// `rescue SyntaxError` — the clause code actually writes for bad input — never
+/// fired, while a bare `rescue` swallowed it; `SyntaxError` is a `ScriptError`
+/// and deliberately outside `StandardError`. And `42.m` on a top-level `def m`
+/// said "undefined method", though the method exists on every object and `send`
+/// reaches it:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'def m; 1; end; 42.m'
+/// -e:1:in '<main>': private method 'm' called for an instance of Integer (NoMethodError)
+/// ```
+#[test]
+fn a_parse_failure_raises_a_syntax_error() {
+    eq(
+        r#"begin; eval("1+"); rescue SyntaxError; :caught; end"#,
+        ":caught",
+    );
+    eq(
+        r#"begin; Object.class_eval("1+"); rescue SyntaxError; :caught; end"#,
+        ":caught",
+    );
+    eq(
+        r#"begin; "".instance_eval("1+"); rescue SyntaxError; :caught; end"#,
+        ":caught",
+    );
+    // It is a ScriptError, so it sits OUTSIDE StandardError — that is the whole
+    // reason the class matters rather than just the message.
+    eq("SyntaxError.superclass", "ScriptError");
+    eq("SyntaxError.ancestors.include?(StandardError)", "false");
+    // Valid source still evaluates.
+    eq(r#"eval("1+1")"#, "2");
+    // A name that is undefined still says so.
+    raises(
+        "42.zzz_undefined",
+        "NoMethodError",
+        "undefined method 'zzz_undefined' for an instance of Integer",
+    );
+}

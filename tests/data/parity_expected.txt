@@ -2679,3 +2679,14 @@ false
 (2+4i)
 1
 2
+#==#
+:caught
+:caught
+:caught
+ScriptError
+false
+2
+[2, 4]
+"undefined method 'zzz_undefined' for an instance of Integer"
+"a"
+:zzz_undefined
