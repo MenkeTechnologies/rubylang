@@ -251,19 +251,22 @@ pub fn build_native(file: &str) -> Result<String, String> {
     // stay at 0.
     let mut next_id = 1u32;
     for (_, m) in &mut prog.methods {
-        m.chunk.native_id = next_id;
-        m.chunk.aot_seeded_slots = m.slot_params;
+        let c = std::sync::Arc::make_mut(&mut m.chunk);
+        c.native_id = next_id;
+        c.aot_seeded_slots = m.slot_params;
         next_id += 1;
     }
     for (_, c) in &mut prog.classes {
         for (_, m) in &mut c.methods {
-            m.chunk.native_id = next_id;
-            m.chunk.aot_seeded_slots = m.slot_params;
+            let c = std::sync::Arc::make_mut(&mut m.chunk);
+            c.native_id = next_id;
+            c.aot_seeded_slots = m.slot_params;
             next_id += 1;
         }
         for (_, m) in &mut c.class_methods {
-            m.chunk.native_id = next_id;
-            m.chunk.aot_seeded_slots = m.slot_params;
+            let c = std::sync::Arc::make_mut(&mut m.chunk);
+            c.native_id = next_id;
+            c.aot_seeded_slots = m.slot_params;
             next_id += 1;
         }
     }

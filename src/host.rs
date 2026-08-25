@@ -1120,7 +1120,15 @@ pub struct MethodDef {
     pub req: u16,
     pub opt: u16,
     pub kwreq: Vec<String>,
-    pub chunk: Chunk,
+    /// The compiled body, SHARED. Every method lookup (`find_method_owner` and
+    /// the six resolvers around it) hands back an owned `MethodDef`, so a bare
+    /// `Chunk` here made each lookup copy the whole body — a cost proportional to
+    /// the method's SIZE, paid on every call whether or not the body ran. An
+    /// `Arc` makes that clone a refcount bump; the body is immutable once
+    /// compiled, and the two places that do rewrite it (`rebase_program` and the
+    /// AOT `native_id` tagging) hold the only reference and go through
+    /// `Arc::make_mut`.
+    pub chunk: Arc<Chunk>,
     /// Identifies this definition's chunk for VM reuse — see `ChunkId`. Minted
     /// at construction, never serialized: a `MethodDef` read back from the
     /// bytecode cache mints a fresh one, so an id from a previous process can
@@ -8631,7 +8639,9 @@ fn run_method_chunk(def: &MethodDef, args: &[Value]) -> Result<Value, String> {
     let seed: Vec<Value> = (0..n)
         .map(|i| args.get(i).cloned().unwrap_or(Value::Undef))
         .collect();
-    run_chunk_pooled(ChunkId::Method(def.chunk_id), &seed, || def.chunk.clone())
+    run_chunk_pooled(ChunkId::Method(def.chunk_id), &seed, || {
+        (*def.chunk).clone()
+    })
 }
 
 /// Build the VM for `chunk`, seed its leading frame slots with `slot_seed`

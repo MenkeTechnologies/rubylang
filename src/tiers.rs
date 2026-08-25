@@ -150,14 +150,14 @@ pub fn report(src: &str) -> Result<Report, String> {
 fn program_chunks(prog: &crate::compiler::Program) -> Vec<(String, Chunk)> {
     let mut out = vec![("main".to_string(), prog.main.clone())];
     for (name, m) in &prog.methods {
-        out.push((format!("def {name}"), m.chunk.clone()));
+        out.push((format!("def {name}"), (*m.chunk).clone()));
     }
     for (cname, c) in &prog.classes {
         for (mname, m) in &c.methods {
-            out.push((format!("def {cname}#{mname}"), m.chunk.clone()));
+            out.push((format!("def {cname}#{mname}"), (*m.chunk).clone()));
         }
         for (mname, m) in &c.class_methods {
-            out.push((format!("def {cname}.{mname}"), m.chunk.clone()));
+            out.push((format!("def {cname}.{mname}"), (*m.chunk).clone()));
         }
     }
     // `begin`/`rescue`/`ensure` bodies are compiled as procs, so they are

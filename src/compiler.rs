@@ -803,14 +803,14 @@ pub fn rebase_program(prog: &mut Program, proc_off: usize, begin_off: usize) {
     }
     rebase_chunk(&mut prog.main, proc_off, begin_off);
     for (_, m) in &mut prog.methods {
-        rebase_chunk(&mut m.chunk, proc_off, begin_off);
+        rebase_chunk(Arc::make_mut(&mut m.chunk), proc_off, begin_off);
     }
     for (_, c) in &mut prog.classes {
         for (_, m) in &mut c.methods {
-            rebase_chunk(&mut m.chunk, proc_off, begin_off);
+            rebase_chunk(Arc::make_mut(&mut m.chunk), proc_off, begin_off);
         }
         for (_, m) in &mut c.class_methods {
-            rebase_chunk(&mut m.chunk, proc_off, begin_off);
+            rebase_chunk(Arc::make_mut(&mut m.chunk), proc_off, begin_off);
         }
     }
     for p in &mut prog.procs {
@@ -1123,7 +1123,7 @@ impl Compiler {
             req,
             opt,
             kwreq,
-            chunk: b.build(),
+            chunk: Arc::new(b.build()),
             slot_params: n_slot_params,
         })
     }
@@ -3029,7 +3029,7 @@ impl Compiler {
             req: 0,
             opt: 0,
             kwreq: vec![],
-            chunk: b.build(),
+            chunk: Arc::new(b.build()),
             slot_params: 0,
         }
     }
@@ -3053,7 +3053,7 @@ impl Compiler {
             req: 1,
             opt: 0,
             kwreq: vec![],
-            chunk: b.build(),
+            chunk: Arc::new(b.build()),
             slot_params: 0,
         }
     }

@@ -346,7 +346,7 @@ fn m_to(name: &str, m: &MethodDef) -> CMethod {
         m.req,
         m.opt,
         m.kwreq.clone(),
-        m.chunk.clone(),
+        (*m.chunk).clone(),
         m.slot_params,
     )
 }
@@ -365,7 +365,7 @@ fn m_from(
             req,
             opt,
             kwreq,
-            chunk,
+            chunk: std::sync::Arc::new(chunk),
             slot_params,
         },
     )
