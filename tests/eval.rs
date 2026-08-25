@@ -9377,3 +9377,65 @@ fn reopening_a_class_invalidates_the_ancestry_memo() {
         ":yes",
     );
 }
+
+/// `Complex()` and `String#to_c` PARSE a Complex literal.
+///
+/// The string went through unparsed as the real part, so `Complex("1+2i")`
+/// answered a Complex whose real component was the String `"1+2i"` —
+/// `("1+2i"+0i)` — which then poisoned any arithmetic on it. MRI accepts a real
+/// alone, a bare imaginary, and a signed pair, each component Integer / Float /
+/// Rational:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p Complex("1+2i"), Complex("1/2+3i"), Complex("i"), "abc".to_c'
+/// (1+2i)
+/// ((1/2)+3i)
+/// (0+1i)
+/// (0+0i)
+/// ```
+#[test]
+fn complex_parses_its_string_form() {
+    eq(r#"Complex("1+2i")"#, "(1+2i)");
+    eq(r#"Complex("1-2i")"#, "(1-2i)");
+    eq(r#"Complex("3")"#, "(3+0i)");
+    eq(r#"Complex("-3")"#, "(-3+0i)");
+    eq(r#"Complex("+5")"#, "(5+0i)");
+    eq(r#"Complex("2i")"#, "(0+2i)");
+    eq(r#"Complex("-2i")"#, "(0-2i)");
+    eq(r#"Complex("i")"#, "(0+1i)");
+    // `j` is accepted for `i`, underscores are ignored, and so is surrounding
+    // whitespace.
+    eq(r#"Complex("1+2j")"#, "(1+2i)");
+    eq(r#"Complex("1_000+2i")"#, "(1000+2i)");
+    eq(r#"Complex(" 1+2i ")"#, "(1+2i)");
+    // Each component may be Rational or Float, exponent included.
+    eq(r#"Complex("1/2+3i")"#, "((1/2)+3i)");
+    eq(r#"Complex("1.5+2.5i")"#, "(1.5+2.5i)");
+    eq(r#"Complex("1e2+1i")"#, "(100.0+1i)");
+    // A second argument still contributes to the imaginary part.
+    eq(r#"Complex("1+2i", 3)"#, "(1+5i)");
+    eq(r#"Complex("3", "4")"#, "(3+4i)");
+    // The non-string forms are untouched.
+    eq("Complex(1, 2)", "(1+2i)");
+    eq("Complex(3)", "(3+0i)");
+    eq("5.to_c", "(5+0i)");
+    eq("1.5.to_c", "(1.5+0i)");
+    eq("Rational(1, 2).to_c", "((1/2)+0i)");
+    // `Complex()` RAISES on junk; `String#to_c` is the lenient spelling.
+    raises(
+        r#"Complex("abc")"#,
+        "ArgumentError",
+        r#"invalid value for convert(): "abc""#,
+    );
+    raises(
+        r#"Complex("")"#,
+        "ArgumentError",
+        r#"invalid value for convert(): """#,
+    );
+    eq(r#""abc".to_c"#, "(0+0i)");
+    eq(r#""".to_c"#, "(0+0i)");
+    eq(r#""1+2i".to_c"#, "(1+2i)");
+    eq(r#""1/2".to_c"#, "((1/2)+0i)");
+    eq(r#""5".to_c"#, "(5+0i)");
+    eq(r#""-i".to_c"#, "(0-1i)");
+}

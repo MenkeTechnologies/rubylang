@@ -5629,6 +5629,73 @@ fn parse_decimal_exact(s: &str, allow_sign: bool) -> Option<num_rational::BigRat
 /// One `Kernel#Rational` argument, converted the way MRI converts it. Every
 /// rejection below was measured against the reference interpreter: the class
 /// differs per rejected type, and only the String case names the value.
+/// Parse Ruby's Complex STRING form into its real and imaginary parts.
+///
+/// `Complex("1+2i")` was not parsed at all — the string went through as the real
+/// part, so it answered `("1+2i"+0i)`, a Complex whose real component is a
+/// String. MRI accepts a real on its own, a bare imaginary, and a signed pair,
+/// with each component any of Integer / Float / Rational, plus `j` for `i`,
+/// underscores, and surrounding whitespace:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p Complex("1+2i"), Complex("1/2+3i"), Complex("i"), Complex("-2i")'
+/// (1+2i)
+/// ((1/2)+3i)
+/// (0+1i)
+/// (0-2i)
+/// ```
+///
+/// `None` is "not a Complex literal", which the two callers treat differently:
+/// `Complex()` raises `ArgumentError`, `String#to_c` answers `(0+0i)`.
+fn parse_complex_str(raw: &str) -> Option<(Value, Value)> {
+    let t: String = raw.chars().filter(|c| *c != '_').collect();
+    let t = t.trim();
+    if t.is_empty() {
+        return None;
+    }
+    // One numeric component: Rational (`1/2`), else Float when it looks like one,
+    // else Integer. `parse_rational_strict` already covers the first two forms.
+    let num = |part: &str| -> Option<Value> {
+        let part = part.trim();
+        if part.is_empty() || part == "+" {
+            return Some(Value::Int(1));
+        }
+        if part == "-" {
+            return Some(Value::Int(-1));
+        }
+        if let Ok(n) = part.parse::<i64>() {
+            return Some(Value::Int(n));
+        }
+        if part.contains('/') {
+            return match parse_rational_strict(part) {
+                RatParse::Ok(r) => Some(with_host(|h| h.new_rational(r))),
+                _ => None,
+            };
+        }
+        part.parse::<f64>().ok().map(Value::Float)
+    };
+    // Split at the sign that separates the two components — the last `+`/`-`
+    // that is neither leading nor part of an exponent (`1e-2`).
+    let b = t.as_bytes();
+    let is_imag = |c: u8| c == b'i' || c == b'j' || c == b'I' || c == b'J';
+    let split = (1..b.len())
+        .rev()
+        .find(|&k| (b[k] == b'+' || b[k] == b'-') && !matches!(b[k - 1], b'e' | b'E'));
+    match split {
+        // `A+Bi` — the tail must be the imaginary one.
+        Some(k) if is_imag(*b.last()?) => {
+            let re = num(&t[..k])?;
+            let im = num(&t[k..t.len() - 1])?;
+            Some((re, im))
+        }
+        // A signed pair whose tail is NOT imaginary is not a Complex literal.
+        Some(_) => None,
+        // A single component: `2i` / `i` imaginary, else purely real.
+        None if is_imag(*b.last()?) => Some((Value::Int(0), num(&t[..t.len() - 1])?)),
+        None => Some((num(t)?, Value::Int(0))),
+    }
+}
+
 fn rational_arg(v: &Value) -> Result<num_rational::BigRational, String> {
     // `as_rational` already covers both Integer flavours and Rational itself.
     if let Some(r) = with_host(|h| h.as_rational(v)) {
@@ -8037,6 +8104,12 @@ fn dispatch_string(
         // `String#to_r` parses a leading rational: `"3/4"` → `3/4`, `"3.14"` →
         // `157/50` (exact decimal), other leading text → `0/1`.
         "to_r" => Ok(with_host(|h| h.new_rational(string_to_rational(&s)))),
+        // The LENIENT Complex conversion: anything unparseable is `(0+0i)`,
+        // where `Complex(str)` raises `ArgumentError` on the same input.
+        "to_c" => {
+            let (re, im) = parse_complex_str(&s).unwrap_or((Value::Int(0), Value::Int(0)));
+            Ok(with_host(|h| h.new_complex(re, im)))
+        }
         "to_s" | "to_str" => Ok(recv.clone()),
         "to_sym" | "intern" => Ok(with_host(|h| h.new_symbol(&s))),
         "include?" => Ok(Value::Bool(s.contains(&arg_str(&args[0])))),
@@ -11776,6 +11849,7 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
         },
         "hash" => Ok(Value::Int(r.to_i64().unwrap_or(0))),
         "integer?" => Ok(Value::Bool(r.is_integer())),
+        "to_c" => Ok(with_host(|h| h.new_complex(recv.clone(), Value::Int(0)))),
         // Rational takes `between?`/`clamp` from Comparable like every other
         // number, through the one shared implementation. Neither existed here
         // at all: `Rational(1, 2).between?(0, 1)` raised NoMethodError.
@@ -17681,8 +17755,36 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             Ok(with_host(|h| h.new_rational(num / den)))
         }
         "Complex" => {
-            let re = args.first().cloned().unwrap_or(Value::Int(0));
-            let im = args.get(1).cloned().unwrap_or(Value::Int(0));
+            // A String argument is PARSED, on either side. `Complex("1+2i", 3)`
+            // adds the second argument to the parsed imaginary part, as MRI does.
+            let conv = |v: &Value| -> Result<(Value, Value), String> {
+                match with_host(|h| h.as_str(v)) {
+                    Some(s) => parse_complex_str(&s).ok_or_else(|| {
+                        raise_exc(
+                            "ArgumentError",
+                            &format!(
+                                "invalid value for convert(): {}",
+                                crate::host::inspect_string(&s)
+                            ),
+                        )
+                    }),
+                    None => Ok((v.clone(), Value::Int(0))),
+                }
+            };
+            let (mut re, mut im) = match args.first() {
+                Some(v) => conv(v)?,
+                None => (Value::Int(0), Value::Int(0)),
+            };
+            if let Some(v) = args.get(1) {
+                let (r2, i2) = conv(v)?;
+                // The second argument contributes its real part to the imaginary
+                // component (`Complex("3", "4")` is `(3+4i)`) and its own
+                // imaginary part to the real one, negated — MRI's `a + b*i`.
+                im = add_values(&im, &r2)?;
+                if !matches!(i2, Value::Int(0)) {
+                    re = with_host(|h| h.num_op(fusevm::NumOp::Sub, &re, &i2))?;
+                }
+            }
             Ok(with_host(|h| h.new_complex(re, im)))
         }
         "String" => Ok(with_host(|h| {

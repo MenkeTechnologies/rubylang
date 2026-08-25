@@ -4239,3 +4239,19 @@ p memo_d.frozen?
 class MemoPD; def only_now; :yes; end; end
 p memo_d.only_now
 p MemoPD.instance_methods(false)
+#==#
+# `Complex()` and `String#to_c` parse a Complex literal: a real alone, a bare
+# imaginary, or a signed pair, each component Integer / Float / Rational.
+p Complex("1+2i"), Complex("1-2i"), Complex("3"), Complex("-3"), Complex("+5")
+p Complex("2i"), Complex("-2i"), Complex("i")
+p Complex("1+2j"), Complex("1_000+2i"), Complex(" 1+2i ")
+p Complex("1/2+3i"), Complex("1.5+2.5i"), Complex("1e2+1i")
+p Complex("1+2i", 3), Complex("3", "4")
+p Complex(1, 2), Complex(3), 5.to_c, 1.5.to_c, Rational(1, 2).to_c
+begin; Complex("abc"); rescue ArgumentError => e; p e.message; end
+begin; Complex(""); rescue ArgumentError => e; p e.message; end
+p "1+2i".to_c, "abc".to_c, "".to_c, "1/2".to_c, "5".to_c, "-i".to_c
+p "1.5+2i".to_c, "3".to_r
+p Complex("1+2i") + Complex("2-1i")
+p Complex("1+2i") * 2
+p Complex("1+2i").real, Complex("1+2i").imaginary
