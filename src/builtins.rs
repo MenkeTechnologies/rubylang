@@ -10137,47 +10137,50 @@ fn dispatch_array(
                 // be honoured only WITHOUT a block, so the block form fell
                 // through to the single-extreme scan below and answered a
                 // scalar: `[3,1,2,4].min(3) { |a,b| (a%2)<=>(b%2) }` was `2`.
+                // Both forms run MRI's own `nmin_run` (the quickselect, not a
+                // whole sort), so the order among elements that rank EQUAL but
+                // differ — `1`, `1.0`, `1r` — is the permutation MRI produces.
+                // `min(n) { |a, b| … }` ranks with the block as the comparator.
+                let mut identity = |v: &Value| Ok(v.clone());
                 if let Some(bl) = &block {
-                    let mut sorted = arr.clone();
-                    let mut err: Option<String> = None;
-                    sorted.sort_by(|a, c| {
-                        if err.is_some() {
-                            return std::cmp::Ordering::Equal;
-                        }
-                        // `max` sorts descending outright: reversing an
-                        // ascending sort would flip the tied elements too.
-                        let (l, r) = if want_max { (c, a) } else { (a, c) };
-                        match call_proc(bl, &[l.clone(), r.clone()]) {
+                    let mut broke = false;
+                    let mut blk_cmp = |a: &Value, b: &Value| -> Result<i64, String> {
+                        match call_proc(bl, &[a.clone(), b.clone()])? {
                             // A `break` in the comparator: the Undef is the
                             // signal, and the caller answers with its operand.
-                            Ok(Value::Undef) if has_pending_signal() => std::cmp::Ordering::Equal,
-                            Ok(Value::Undef) => {
-                                err = Some(cmp_error(l, r));
-                                std::cmp::Ordering::Equal
+                            Value::Undef if has_pending_signal() => {
+                                broke = true;
+                                Ok(0)
                             }
-                            Ok(v) => as_i(&v).cmp(&0),
-                            Err(e) => {
-                                err = Some(e);
-                                std::cmp::Ordering::Equal
-                            }
+                            Value::Undef => Err(cmp_error(a, b)),
+                            v => Ok(as_i(&v)),
                         }
-                    });
-                    if let Some(e) = err {
-                        return Err(e);
-                    }
-                    if has_pending_signal() {
+                    };
+                    let out = nmin_run(&arr, k, want_max, &mut identity, &mut blk_cmp)?;
+                    if broke || has_pending_signal() {
                         return Ok(Value::Undef);
                     }
-                    return Ok(new_arr(sorted.into_iter().take(k).collect()));
+                    return Ok(new_arr(out));
                 }
-                let sorted = if want_max && k >= arr.len() {
-                    let mut s = sort_values(&arr, CmpOrder::Reversed, false)?;
-                    s.reverse();
-                    s
-                } else {
-                    sort_values(&arr, CmpOrder::Reversed, want_max)?
+                // An unrankable pair is reported IN THE ORDER THE ALGORITHM
+                // COMPARED IT, which is why the message depends on the count:
+                // `[1, "a"].min(1)` reaches `nmin_filter` and compares
+                // ("a", 1), while `min(2)` skips it (the buffer already fits)
+                // and the final sort compares (1, "a"). MRI raises at the first
+                // failed comparison, so raising from here reproduces both.
+                let mut def_cmp = |a: &Value, b: &Value| -> Result<i64, String> {
+                    match cmp_values(a, b) {
+                        Some(o) => Ok(ord_to_i(o)),
+                        None => Err(cmp_error(a, b)),
+                    }
                 };
-                return Ok(new_arr(sorted.into_iter().take(k).collect()));
+                return Ok(new_arr(nmin_run(
+                    &arr,
+                    k,
+                    want_max,
+                    &mut identity,
+                    &mut def_cmp,
+                )?));
             }
             let mut best = arr[0].clone();
             for x in &arr[1..] {
@@ -16132,6 +16135,20 @@ fn dispatch_range(
             let start = end.saturating_sub(n as i64).max(lo);
             Ok(new_arr((start..end).map(Value::Int).collect()))
         }
+        // `min`/`max` with a COUNT or a COMPARATOR are the Enumerable forms and
+        // belong to the element list, not to the endpoints: `(1..10).min(3)` is
+        // `[1, 2, 3]` and `(1..10).min { |a, b| b <=> a }` is `10`, where
+        // answering from the endpoint gave `1` for both.
+        "min" | "max" if !args.is_empty() || block.is_some() => remap_array_delegate(
+            dispatch_array(
+                &new_arr((lo..end).map(Value::Int).collect()),
+                name,
+                args,
+                block,
+            ),
+            recv,
+            name,
+        ),
         "min" | "first" | "begin" => Ok(Value::Int(lo)),
         "max" | "last" | "end" if name != "end" => Ok(Value::Int(if excl { hi - 1 } else { hi })),
         "end" => Ok(Value::Int(hi)),
@@ -22465,6 +22482,196 @@ fn add_values(a: &Value, b: &Value) -> Result<Value, String> {
         // dispatch so `sum`/`reduce(:+)` stay exact and type-correct.
         _ => with_host(|h| h.num_op(fusevm::NumOp::Add, a, b)),
     }
+}
+
+/// Port of MRI `enum.c` `nmin_filter` — the quickselect `min(n)`/`max(n)` run
+/// to keep only the `n` extreme elements of `buf`.
+///
+/// This is a FAITHFUL transcription, not a selection algorithm of our own,
+/// because the surviving elements' ORDER is observable whenever two of them are
+/// equal but distinguishable (`1`, `1.0` and `1r` all rank equal and all
+/// `inspect` differently). Sorting the whole array and taking the first `n` —
+/// what this used to do — is a different permutation of the same multiset:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [1, 1r, 2.5].min(2)'
+/// [(1/1), 1]
+/// ```
+///
+/// `buf` holds `(key, element)` pairs so the `_by` forms — which rank by the
+/// block's value and answer with the element — share the one implementation,
+/// exactly as MRI's `eltsize` of 2 does. Returns `store_index`, the index whose
+/// element becomes the next `limit`.
+fn nmin_filter(
+    buf: &mut [(Value, Value)],
+    n: usize,
+    rev: bool,
+    cmp: &mut dyn FnMut(&Value, &Value) -> Result<i64, String>,
+) -> Result<usize, String> {
+    if buf.len() <= n {
+        return Ok(0);
+    }
+    // SIGNED indices throughout, because MRI's are `long` and the arithmetic
+    // genuinely goes negative: with every element tied, `num_pivots` grows past
+    // `right`, and both `right - num_pivots` guards are then negative. On
+    // `usize` that underflows — `[1, 1, 1].min(2)` aborted instead of answering.
+    let n = n as i64;
+    let mut left = 0i64;
+    let mut right = buf.len() as i64 - 1;
+    let mut store_index;
+    let sw = |b: &mut [(Value, Value)], x: i64, y: i64| b.swap(x as usize, y as usize);
+    loop {
+        let mut pivot_index = left + (right - left) / 2;
+        let mut num_pivots = 1i64;
+        sw(buf, pivot_index, right);
+        pivot_index = right;
+
+        store_index = left;
+        let mut i = left;
+        while i <= right - num_pivots {
+            let mut c = cmp(&buf[i as usize].0, &buf[pivot_index as usize].0)?;
+            if rev {
+                c = -c;
+            }
+            if c == 0 {
+                sw(buf, i, right - num_pivots);
+                num_pivots += 1;
+                continue;
+            }
+            if c < 0 {
+                sw(buf, i, store_index);
+                store_index += 1;
+            }
+            i += 1;
+        }
+        let mut j = store_index;
+        let mut i = right;
+        while right - num_pivots < i {
+            if i <= j {
+                break;
+            }
+            sw(buf, j, i);
+            j += 1;
+            i -= 1;
+        }
+
+        if store_index <= n && n <= store_index + num_pivots {
+            break;
+        }
+        if n < store_index {
+            right = store_index - 1;
+        } else {
+            left = store_index + num_pivots;
+        }
+    }
+    Ok(store_index as usize)
+}
+
+/// Port of MRI `enum.c` `rb_nmin_run` — `min(n)` / `max(n)` / `min_by(n)` /
+/// `max_by(n)`.
+///
+/// Elements stream into a buffer of `4 * n`, are pruned by [`nmin_filter`]
+/// whenever it fills, and the survivors are sorted at the end. MRI finishes with
+/// `ruby_qsort`, which on this platform IS the C library's `qsort_r`
+/// (`HAVE_BSD_QSORT_R` in the oracle's own `config.h`) rather than MRI's
+/// bundled `mm.c`. Measured over 62,770 tie-heavy cases against MRI 4.0.6, that
+/// sort reorders NOTHING while at most 7 elements survive — libc's insertion
+/// -sort cutoff, which is stable — so a stable sort here is exact for `n <= 7`.
+/// From `n >= 8` it enters an unstable quicksort whose permutation is a property
+/// of the platform's libc, not of Ruby; see BUGS.md.
+fn nmin_run(
+    items: &[Value],
+    n: usize,
+    rev: bool,
+    key_of: &mut dyn FnMut(&Value) -> Result<Value, String>,
+    cmp: &mut dyn FnMut(&Value, &Value) -> Result<i64, String>,
+) -> Result<Vec<Value>, String> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let bufmax = n.saturating_mul(4);
+    let mut buf: Vec<(Value, Value)> = Vec::with_capacity(bufmax.min(items.len()));
+    let mut limit: Option<Value> = None;
+    for v in items {
+        let k = key_of(v)?;
+        // An element no better than the last pivot cannot make the cut, so it is
+        // never buffered — this is what bounds the buffer to `4 * n`.
+        if let Some(lim) = &limit {
+            let mut c = cmp(&k, lim)?;
+            if rev {
+                c = -c;
+            }
+            if c >= 0 {
+                continue;
+            }
+        }
+        buf.push((k, v.clone()));
+        if buf.len() == bufmax {
+            let store_index = nmin_filter(&mut buf, n, rev, cmp)?;
+            limit = Some(buf[store_index].0.clone());
+            buf.truncate(n);
+        }
+    }
+    nmin_filter(&mut buf, n, rev, cmp)?;
+    buf.truncate(n);
+
+    // The final sort, ASCENDING regardless of `rev` and reversed afterwards —
+    // MRI's `nmin_cmp` deliberately does not apply `data->rev`, and the
+    // difference shows: sorting descending and reversing would put a TIE back
+    // in buffer order where MRI leaves it reversed.
+    //
+    // Written out rather than handed to `slice::sort_by` because the ORDER the
+    // comparator is called in is observable. An unrankable pair is reported as
+    // `comparison of <a> with <b> failed` naming the operands in the order they
+    // were compared, and `sort_by` calls its comparator with the LATER element
+    // first on a two-element slice — which reported `[1, "a"].min(2)` as
+    // `comparison of String with 1 failed` where MRI says
+    // `comparison of Integer with String failed`. A bottom-up merge keeps the
+    // comparison in index order, and is stable, which is what preserves the
+    // buffer's tie order.
+    let n_buf = buf.len();
+    let mut idx: Vec<usize> = (0..n_buf).collect();
+    let mut scratch: Vec<usize> = vec![0; n_buf];
+    let mut width = 1usize;
+    while width < n_buf {
+        let mut lo = 0usize;
+        while lo < n_buf {
+            let mid = (lo + width).min(n_buf);
+            let hi = (lo + 2 * width).min(n_buf);
+            let (mut i, mut j, mut k) = (lo, mid, lo);
+            while i < mid && j < hi {
+                // `<= 0` keeps the LEFT run's element on a tie: that is what
+                // makes the merge stable.
+                let c = cmp(&buf[idx[i]].0, &buf[idx[j]].0)?;
+                if c <= 0 {
+                    scratch[k] = idx[i];
+                    i += 1;
+                } else {
+                    scratch[k] = idx[j];
+                    j += 1;
+                }
+                k += 1;
+            }
+            while i < mid {
+                scratch[k] = idx[i];
+                i += 1;
+                k += 1;
+            }
+            while j < hi {
+                scratch[k] = idx[j];
+                j += 1;
+                k += 1;
+            }
+            lo = hi;
+        }
+        idx.copy_from_slice(&scratch);
+        width *= 2;
+    }
+    let mut out: Vec<Value> = idx.into_iter().map(|i| buf[i].1.clone()).collect();
+    if rev {
+        out.reverse();
+    }
+    Ok(out)
 }
 
 /// Rank two values the way Ruby's `<=>` does. `None` IS `<=>`'s nil answer: the

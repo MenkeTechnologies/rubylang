@@ -9122,3 +9122,81 @@ fn decimal_rational_and_imaginary_literals_lex() {
     eq("range = 7; range", "7");
     eq("[1.5].inject { |a, b| a }", "1.5");
 }
+
+/// `min(n)` / `max(n)` run MRI's own `nmin_run` selection, not a whole sort.
+///
+/// The two produce different permutations of the same elements whenever two of
+/// them rank EQUAL but differ — `1`, `1.0` and `1r` all compare equal and all
+/// `inspect` differently — and rubylang used to sort the array and take the
+/// first `n`:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [1, 1r, 2.5].min(2), [1, 1.0, 1r].min(2)'
+/// [(1/1), 1]
+/// [1.0, 1]
+/// ```
+///
+/// Exact while at most seven elements survive; past that the order among equals
+/// is the host C library's, not Ruby's — see BUGS.md.
+#[test]
+fn min_n_and_max_n_use_mris_selection() {
+    eq("[1, 1r, 2.5].min(2)", "[(1/1), 1]");
+    eq("[1r, 1, 2.5].min(2)", "[1, (1/1)]");
+    eq("[1, 1r, 2.5].max(2)", "[2.5, (1/1)]");
+    eq("[1, 1.0, 1r].min(2)", "[1.0, 1]");
+    eq("[1, 1r, 2.5, 2.5r].min(3)", "[(1/1), 1, (5/2)]");
+    eq("[1, 1r, 1.0, 2.5, 2.5r].min(3)", "[1.0, 1, (1/1)]");
+    // Every element tied: `num_pivots` grows past `right`, which MRI's `long`
+    // indices take negative. On unsigned ones that underflowed and aborted.
+    eq("[1, 1, 1].min(2)", "[1, 1]");
+    eq("[1, 1, 1, 1, 1].min(3)", "[1, 1, 1]");
+    // Asking for the whole array, and for more than there is.
+    eq("[1, 1r, 2.5].min(3)", "[1, (1/1), 2.5]");
+    eq("[1, 1r, 2.5].max(3)", "[2.5, (1/1), 1]");
+    eq("[3, 1, 2].max(5)", "[3, 2, 1]");
+    eq("[5].min(3)", "[5]");
+    eq("[].min(2)", "[]");
+    eq("[3, 1, 2].min(0)", "[]");
+    // The ordinary cases, and the block comparator.
+    eq("[3, 1, 2].min(2)", "[1, 2]");
+    eq("[3, 1, 2].max(2)", "[3, 2]");
+    eq(
+        "[3, 1, 2, 4].min(3) { |a, b| (a % 2) <=> (b % 2) }",
+        "[2, 4, 1]",
+    );
+    eq("[1, 2, 3].min(2) { |a, b| b <=> a }", "[3, 2]");
+    raises("[1, 2, 3].min(-1)", "ArgumentError", "negative size (-1)");
+    // A Range with a count or a comparator is the Enumerable form, not the
+    // endpoint — both used to answer from the endpoint.
+    eq("(1..10).min(3)", "[1, 2, 3]");
+    eq("(1..10).max(3)", "[10, 9, 8]");
+    eq("(1..10).min { |a, b| b <=> a }", "10");
+    eq("(1..10).max { |a, b| b <=> a }", "1");
+    eq("(1..10).min(3) { |a, b| b <=> a }", "[10, 9, 8]");
+    eq("(1..10).min", "1");
+    eq("(1..10).max", "10");
+    eq("(1...10).max", "9");
+    // An unrankable pair names its operands IN THE ORDER COMPARED, which is why
+    // the message depends on the count: `min(1)` reaches the selection and
+    // compares ("a", 1); `min(2)` skips it and the final sort compares (1, "a").
+    raises(
+        r#"[1, "a"].min(1)"#,
+        "ArgumentError",
+        "comparison of String with 1 failed",
+    );
+    raises(
+        r#"[1, "a"].min(2)"#,
+        "ArgumentError",
+        "comparison of Integer with String failed",
+    );
+    raises(
+        r#"["a", 1].min(1)"#,
+        "ArgumentError",
+        "comparison of Integer with String failed",
+    );
+    raises(
+        r#"[1, 2, "a"].min(2)"#,
+        "ArgumentError",
+        "comparison of String with 2 failed",
+    );
+}

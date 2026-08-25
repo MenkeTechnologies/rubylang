@@ -1627,6 +1627,60 @@ Honest limitations of this surface:
   `deconstruct_keys` honours a requested-key filter (returning only the named
   members, in the requested order) or all members when passed `nil`.
 
+## `min(n)` / `max(n)` tie order past 7 survivors
+
+`Enumerable#min(n)`, `#max(n)`, `#min_by(n)` and `#max_by(n)` answer the right
+`n` elements always. The ORDER among elements that rank EQUAL but are
+distinguishable — `1`, `1.0` and `1r` all compare equal and all `inspect`
+differently — matches MRI exactly while at most **seven** elements survive the
+selection, and is not guaranteed to match beyond that.
+
+MRI runs `enum.c`'s `rb_nmin_run`: elements stream into a buffer of `4 * n`,
+`nmin_filter` quickselects it down whenever it fills, and the survivors are
+sorted at the end by `ruby_qsort`. `nmin_filter` is deterministic and portable,
+and rubylang ports it faithfully — that is what decides the tie order for the
+sizes that matter, and it is why sorting the whole array and taking the first
+`n` (which is what rubylang used to do) was a different permutation of the same
+elements:
+
+```console
+$ /opt/homebrew/opt/ruby/bin/ruby -e 'p [1, 1r, 2.5].min(2)'
+[(1/1), 1]
+```
+
+`ruby_qsort` is the part that does not port. On this platform it is not MRI's
+code at all — the oracle's own
+`include/ruby-4.0.0/arm64-darwin25/ruby/config.h` defines
+`HAVE_BSD_QSORT_R 1`, so `util.c` compiles `ruby_qsort` to a direct call to the
+C library's `qsort_r`. MRI's bundled `mm.c` quicksort runs only on a platform
+that has neither `qsort_r` nor `qsort_s`, and a glibc build calls glibc's
+`qsort_r` — a third algorithm again. The final tie order is therefore a property
+of the host C library, not of Ruby, and the same program orders ties differently
+on macOS and on Linux.
+
+Measured against MRI 4.0.6, over tie-heavy inputs drawn from
+`[1, 1.0, 1r, 2, 2.0, 2r, 3, 3.0, 3r]`:
+
+| survivors `n` | cases | reordered by `ruby_qsort` |
+| --- | --- | --- |
+| 1–7 | 62,770 | 0 |
+| 8 | 3,990 | 2,961 |
+| 9 | 3,124 | 2,425 |
+| 12 | 1,814 | 1,590 |
+| 16 | 296 | 294 |
+
+Zero below eight, because libc's quicksort finishes runs of seven or fewer with
+insertion sort, which is stable. From eight it enters the unstable partitioning,
+and 2,500 randomly generated `min(n)`/`max(n)` calls with `n <= 7` are
+byte-identical between rubylang and MRI while 1,498 of 2,000 with `n >= 8`
+differ — in every one of those 1,498 by ORDER only, never by which elements were
+selected.
+
+Chasing the rest would mean hard-coding one C library's permutation of output
+Ruby documents no order for, and it would then be wrong on the other platforms
+rubylang targets. It is left alone deliberately rather than approximated: a
+stable sort would agree with neither libc for `n >= 8`.
+
 ## Stdlib modules (SecureRandom / Digest / Base64 / OpenStruct)
 
 Dependency-free, verified against the reference `ruby`.

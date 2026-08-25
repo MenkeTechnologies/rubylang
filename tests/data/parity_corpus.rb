@@ -4146,3 +4146,31 @@ p lz.with_index(3).inspect
 p lz.each_with_index.inspect
 p lz.with_object([]).inspect
 p lz.each_with_object([]).inspect
+#==#
+# `min(n)` / `max(n)` run MRI's `nmin_run` SELECTION, not a whole sort: the two
+# are different permutations of the same elements whenever two of them rank
+# equal but differ. Bounded to seven survivors, past which the order among
+# equals is the host C library's — see BUGS.md.
+p [1, 1r, 2.5].min(2), [1r, 1, 2.5].min(2), [1, 1r, 2.5].max(2)
+p [1, 1.0, 1r].min(2), [1, 1.0, 1r].max(2)
+p [1, 1r, 2.5, 2.5r].min(3), [1, 1r, 1.0, 2.5, 2.5r].min(3)
+p [1, 1, 1].min(2), [1, 1, 1, 1, 1].min(3)
+p [1, 1r, 2.5].min(3), [1, 1r, 2.5].max(3)
+p [3, 1, 2].min(2), [3, 1, 2].max(2), [3, 1, 2].max(5), [5].min(3)
+p [].min(2), [3, 1, 2].min(0)
+p [3, 1, 2, 4].min(3) { |a, b| (a % 2) <=> (b % 2) }
+p [1, 2, 3].min(2) { |a, b| b <=> a }
+p [2.5, 1, 1r].max(2), [1r, 2.5, 1].max(2)
+p((1..10).min(3), (1..10).max(3))
+p((1..10).min { |a, b| b <=> a }, (1..10).max { |a, b| b <=> a })
+p((1..10).min(3) { |a, b| b <=> a })
+p((1..10).min, (1..10).max, (1...10).max)
+p %w[pear fig apple].min(2), %w[pear fig apple].max(2)
+begin; [1, 2, 3].min(-1); rescue ArgumentError => e; p e.message; end
+# An unrankable pair names its operands IN THE ORDER COMPARED, so the message
+# depends on the count: `min(1)` reaches the selection, `min(2)` does not.
+begin; [1, "a"].min(1); rescue ArgumentError => e; p e.message; end
+begin; [1, "a"].min(2); rescue ArgumentError => e; p e.message; end
+begin; ["a", 1].min(1); rescue ArgumentError => e; p e.message; end
+begin; [1, 2, "a"].min(2); rescue ArgumentError => e; p e.message; end
+begin; [1, "a"].max(2); rescue ArgumentError => e; p e.message; end
