@@ -9082,3 +9082,43 @@ fn lazy_keeps_its_lazy_stages_lazy() {
         "#<Enumerator::Lazy: #<Enumerator::Lazy: 1..10>:each_with_index>",
     );
 }
+
+/// The `r` / `i` / `ri` numeric-literal suffixes on a DECIMAL.
+///
+/// Only the integer forms were lexed: `0.5r` failed to parse at all
+/// (`unexpected 'r'`), and `2ri` — an imaginary part that is itself a Rational —
+/// was not recognized in any form. The decimal rational is EXACT, built from the
+/// digits rather than through an f64, which is what makes `0.1r` the number MRI
+/// prints rather than the nearest double:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p 0.1r, 0.5ri, 2ri'
+/// (1/10)
+/// (0+(1/2)*i)
+/// (0+(2/1)*i)
+/// ```
+#[test]
+fn decimal_rational_and_imaginary_literals_lex() {
+    eq("0.5r", "(1/2)");
+    eq("1.5r", "(3/2)");
+    eq("0.1r", "(1/10)");
+    eq("1.25r", "(5/4)");
+    eq("3.0r", "(3/1)");
+    eq("1_000.5r", "(2001/2)");
+    eq("-0.5r", "(-1/2)");
+    eq("0.5r.class", "Rational");
+    eq("1.5r + 1", "(5/2)");
+    // Imaginary, and the combined `ri`.
+    eq("1.5i", "(0+1.5i)");
+    eq("1.5i.class", "Complex");
+    eq("2ri", "(0+(2/1)*i)");
+    eq("0.5ri", "(0+(1/2)*i)");
+    // The integer forms and plain numbers are untouched.
+    eq("100r", "(100/1)");
+    eq("2i", "(0+2i)");
+    eq("[1.5, 2.5, 1e2, 1.5e3]", "[1.5, 2.5, 100.0, 1500.0]");
+    eq("1.5.round", "2");
+    // A suffix letter that starts an identifier is NOT a suffix.
+    eq("range = 7; range", "7");
+    eq("[1.5].inject { |a, b| a }", "1.5");
+}

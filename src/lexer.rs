@@ -402,7 +402,79 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     }
                 }
                 let raw: String = src[start..i].chars().filter(|c| *c != '_').collect();
+                // A `r` / `i` / `ri` suffix on a NUMBER (not the start of an
+                // identifier). `4r` is `Rational(4)`, `3i` is `Complex(0, 3)`,
+                // and `2ri` is both. On a decimal the rational is EXACT — MRI's
+                // `0.1r` is `(1/10)`, not the nearest double — so it is built
+                // from the digits rather than through an f64.
+                let num_suffix = |at: usize| -> Option<(&'static str, usize)> {
+                    let two = b.get(at) == Some(&b'r') && b.get(at + 1) == Some(&b'i');
+                    let (tag, len): (&'static str, usize) = if two {
+                        ("ri", 2)
+                    } else if b.get(at) == Some(&b'r') {
+                        ("r", 1)
+                    } else if b.get(at) == Some(&b'i') {
+                        ("i", 1)
+                    } else {
+                        return None;
+                    };
+                    if b.get(at + len)
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                    {
+                        return None;
+                    }
+                    Some((tag, len))
+                };
                 if is_float {
+                    // An exponent form takes no suffix (`1e2r` is a SyntaxError
+                    // in MRI), so only a plain decimal converts exactly.
+                    let plain = !raw.contains(['e', 'E']);
+                    if let Some((tag, len)) = num_suffix(i).filter(|_| plain) {
+                        {
+                            let (int_part, frac) = raw.split_once('.').unwrap_or((&raw, ""));
+                            let den = 10i64.pow(frac.len() as u32);
+                            let digits = format!("{int_part}{frac}");
+                            let num: i64 = digits
+                                .parse()
+                                .map_err(|_| format!("bad rational literal: {raw}"))?;
+                            i += len;
+                            let this_sp = core::mem::take(&mut sp);
+                            let mut synth = vec![
+                                Tok::Ident("Rational".into()),
+                                Tok::Op("(".into()),
+                                Tok::Int(num),
+                                Tok::Op(",".into()),
+                                Tok::Int(den),
+                                Tok::Op(")".into()),
+                            ];
+                            if tag != "r" {
+                                // `0.5i` is `Complex(0, 0.5)`; `0.5ri` is
+                                // `Complex(0, Rational(1, 2))`.
+                                if tag == "i" {
+                                    synth = vec![Tok::Float(
+                                        raw.parse().map_err(|_| format!("bad float: {raw}"))?,
+                                    )];
+                                }
+                                let mut wrapped = vec![
+                                    Tok::Ident("Complex".into()),
+                                    Tok::Op("(".into()),
+                                    Tok::Int(0),
+                                    Tok::Op(",".into()),
+                                ];
+                                wrapped.extend(synth);
+                                wrapped.push(Tok::Op(")".into()));
+                                synth = wrapped;
+                            }
+                            for (k, kind) in synth.into_iter().enumerate() {
+                                out.push(Token {
+                                    kind,
+                                    line,
+                                    space: if k == 0 { this_sp } else { false },
+                                });
+                            }
+                            continue;
+                        }
+                    }
                     let x: f64 = raw.parse().map_err(|_| format!("bad float: {raw}"))?;
                     out.push(Token {
                         kind: Tok::Float(x),
@@ -414,29 +486,33 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     // A trailing `r`/`i` (not part of an identifier) makes a
                     // Rational (`4r` → `Rational(4)`) or imaginary Complex
                     // (`3i` → `Complex(0, 3)`) literal, desugared into a call.
-                    let suffix = b
-                        .get(i)
-                        .filter(|c| {
-                            (**c == b'r' || **c == b'i')
-                                && !b
-                                    .get(i + 1)
-                                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
-                        })
-                        .copied();
+                    let suffix = num_suffix(i);
                     let this_sp = core::mem::take(&mut sp);
-                    let synth: Vec<Tok> = match (suffix, n_res) {
-                        (Some(b'r'), Ok(n)) => vec![
+                    let synth: Vec<Tok> = match (suffix.map(|(t, _)| t), n_res) {
+                        (Some("r"), Ok(n)) => vec![
                             Tok::Ident("Rational".into()),
                             Tok::Op("(".into()),
                             Tok::Int(n),
                             Tok::Op(")".into()),
                         ],
-                        (Some(b'i'), Ok(n)) => vec![
+                        (Some("i"), Ok(n)) => vec![
                             Tok::Ident("Complex".into()),
                             Tok::Op("(".into()),
                             Tok::Int(0),
                             Tok::Op(",".into()),
                             Tok::Int(n),
+                            Tok::Op(")".into()),
+                        ],
+                        // `2ri` — an imaginary part that is itself a Rational.
+                        (Some("ri"), Ok(n)) => vec![
+                            Tok::Ident("Complex".into()),
+                            Tok::Op("(".into()),
+                            Tok::Int(0),
+                            Tok::Op(",".into()),
+                            Tok::Ident("Rational".into()),
+                            Tok::Op("(".into()),
+                            Tok::Int(n),
+                            Tok::Op(")".into()),
                             Tok::Op(")".into()),
                         ],
                         (_, Ok(n)) => vec![Tok::Int(n)],
@@ -451,8 +527,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                             Tok::Op(")".into()),
                         ],
                     };
-                    if suffix.is_some() {
-                        i += 1;
+                    if let Some((_, len)) = suffix {
+                        i += len;
                     }
                     for (k, kind) in synth.into_iter().enumerate() {
                         out.push(Token {
