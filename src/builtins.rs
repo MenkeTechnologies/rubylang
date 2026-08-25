@@ -1935,8 +1935,19 @@ pub(crate) fn dispatch(
             }
             if let Some((lo, hi, excl)) = with_host(|h| h.as_range(recv)) {
                 let n = as_i(&args[0]);
-                let end = if excl { hi } else { hi + 1 };
-                return Ok(Value::Bool(n >= lo && n < end));
+                // An ENDLESS range stores its open end as `i64::MAX`, and the
+                // inclusive `hi + 1` overflowed it — a PANIC that took the whole
+                // interpreter down on `case n when (4..)` and on the `in 4..`
+                // pattern, where MRI just answers true. There is no bound to step
+                // past, so there is nothing to compute.
+                let below = if hi == crate::host::RANGE_ENDLESS {
+                    true
+                } else if excl {
+                    n < hi
+                } else {
+                    n <= hi
+                };
+                return Ok(Value::Bool(n >= lo && below));
             }
             if let Some((lo, hi, excl)) = with_host(|h| h.as_float_range(recv)) {
                 let x = as_f(&args[0]);

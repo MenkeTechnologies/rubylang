@@ -8781,3 +8781,31 @@ fn an_open_range_side_renders_as_nothing() {
     eq("({ (1..) => 1 })", "{1.. => 1}");
     eq("({ (..10) => 1 }).keys.first", "..10");
 }
+
+/// `===` against an ENDLESS Range must not overflow the sentinel its open end
+/// is stored as.
+///
+/// The inclusive upper bound was computed as `hi + 1`, and an endless range's
+/// `hi` is `i64::MAX` — so the two most ordinary ways to ask the question,
+/// `case n when (4..)` and the `in 4..` pattern, PANICKED the interpreter with
+/// `attempt to add with overflow` rather than raising anything catchable.
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p((4..) === 5); case 5; in 4.. then p :hi; end'
+/// true
+/// :hi
+/// ```
+#[test]
+fn case_equality_against_an_endless_range_does_not_overflow() {
+    eq("(4..) === 5", "true");
+    eq("(4..) === 3", "false");
+    eq("(4...) === 4", "true");
+    eq("(..4) === 3", "true");
+    eq("(..4) === 5", "false");
+    eq("case 5; when (4..) then :yes; else :no; end", ":yes");
+    eq("case 5; in 4.. then :hi; end", ":hi");
+    eq("[1, 9].grep(4..)", "[9]");
+    // The finite forms the overflow never reached still answer as before.
+    eq("(1..4) === 4", "true");
+    eq("(1...4) === 4", "false");
+}
