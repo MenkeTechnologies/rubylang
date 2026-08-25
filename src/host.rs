@@ -288,6 +288,16 @@ pub struct ArithSeq {
     pub inner: Value,
 }
 
+/// The generation the memo was filled at, and the chains themselves — see
+/// [`RubyHost::ancestry_cache`]. Cleared wholesale when the generation moves,
+/// which is cheaper and far easier to get right than tracking which classes an
+/// edit could have affected.
+#[derive(Default)]
+struct AncestryCache {
+    gen: u64,
+    chains: std::collections::HashMap<(String, bool), Arc<Vec<String>>>,
+}
+
 #[derive(Debug, Clone)]
 pub enum RObj {
     Str(String),
@@ -1349,6 +1359,26 @@ pub struct RubyHost {
     /// (see `multi_yield_consume`). Object ids are never reused, so an id here
     /// always names the same pack.
     multi_yield_packs: HashSet<u32>,
+    /// Bumped by [`RubyHost::classes_mut`] whenever the class table is opened for
+    /// writing, which is what makes [`RubyHost::ancestry_cache`] safe to trust.
+    /// Over-invalidating (a method-only edit bumps it too) costs one rebuild;
+    /// MISSING a bump would serve a stale ancestor chain, so every mutable path
+    /// goes through the one accessor rather than being enumerated by hand.
+    class_gen: u64,
+    /// Memo for [`RubyHost::builtin_chain`], keyed by the receiver's dispatch
+    /// class and whether the lookup is unbound.
+    ///
+    /// `check_builtin_arity` runs on EVERY builtin method call and walks
+    /// `builtin_owner` -> `builtin_chain` -> `expanded_ancestry`, which builds a
+    /// fresh `Vec<String>` ancestry and then de-duplicates it through a
+    /// `HashSet<String>` — allocating and hashing a string per ancestor, per
+    /// call, for a chain that only changes when a class does. A `sample` of a
+    /// 6M-iteration `"x".upcase` loop put 2276 of 2410 `dispatch` samples inside
+    /// `check_builtin_arity`, over half of them in that dedup alone.
+    ///
+    /// `RefCell` because the lookups are `&self`; the host is owned by one
+    /// thread at a time (the GVL), so there is no contention to lose.
+    ancestry_cache: std::cell::RefCell<AncestryCache>,
     /// Hashes that were written as a call's KEYWORD arguments, by object id.
     ///
     /// Ruby 3 separated keywords from positionals, and after parsing the two are
@@ -2086,6 +2116,8 @@ impl RubyHost {
             enum_sinks: Vec::new(),
             rendering: Vec::new(),
             multi_yield_packs: HashSet::new(),
+            class_gen: 0,
+            ancestry_cache: std::cell::RefCell::new(AncestryCache::default()),
             kwargs_hashes: HashSet::new(),
             around_stack: Vec::new(),
             threads: Vec::new(),
@@ -3697,14 +3729,14 @@ impl RubyHost {
     /// key both `src/arity_table.rs` argument-shape tables are looked up by, so a
     /// call-time arity check resolves the method exactly as reflection does.
     pub fn builtin_owner(&self, recv: &Value, name: &str) -> Option<&'static str> {
-        self.builtin_chain(recv, false)
+        self.builtin_chain_cached(recv, false)
             .iter()
             .find_map(|owner| crate::arity_table::lookup(owner, name).map(|(owner, _, _)| owner))
     }
     /// The built-in row describing `name` for `recv`: the first module in the
     /// receiver's ancestor chain that the reference interpreter defines it on.
     fn builtin_shape(&self, recv: &Value, name: &str, unbound: bool) -> Option<MethodShape> {
-        let chain = self.builtin_chain(recv, unbound);
+        let chain = self.builtin_chain_cached(recv, unbound);
         chain.iter().find_map(|owner| {
             crate::arity_table::lookup(owner, name).map(|(owner, arity, params)| {
                 MethodShape::Builtin {
@@ -3715,6 +3747,40 @@ impl RubyHost {
             })
         })
     }
+    /// The class table, opened for WRITING. Every mutable path goes through
+    /// here so [`RubyHost::class_gen`] cannot be left behind by one that was
+    /// overlooked — see the field's note.
+    fn classes_mut(&mut self) -> &mut IndexMap<String, ClassDef> {
+        self.class_gen += 1;
+        &mut self.classes
+    }
+
+    /// [`RubyHost::builtin_chain`], memoized — see [`RubyHost::ancestry_cache`].
+    /// The chain depends only on the receiver's dispatch class (and whether the
+    /// lookup is unbound), so it is recomputed only when a class changes.
+    fn builtin_chain_cached(&self, recv: &Value, unbound: bool) -> Arc<Vec<String>> {
+        let key = match self.classref_name(recv) {
+            Some(cls) => (format!("c\u{1}{cls}"), unbound),
+            None => (self.dispatch_class(recv), unbound),
+        };
+        {
+            let cache = self.ancestry_cache.borrow();
+            if cache.gen == self.class_gen {
+                if let Some(hit) = cache.chains.get(&key) {
+                    return hit.clone();
+                }
+            }
+        }
+        let chain = Arc::new(self.builtin_chain(recv, unbound));
+        let mut cache = self.ancestry_cache.borrow_mut();
+        if cache.gen != self.class_gen {
+            cache.chains.clear();
+            cache.gen = self.class_gen;
+        }
+        cache.chains.insert(key, chain.clone());
+        chain
+    }
+
     /// The ancestor chain a built-in lookup for `recv` walks.
     fn builtin_chain(&self, recv: &Value, unbound: bool) -> Vec<String> {
         match self.classref_name(recv) {
@@ -4475,7 +4541,7 @@ impl RubyHost {
     /// module, its registration). Returns the previous value.
     pub fn remove_const(&mut self, name: &str) -> Value {
         let old = self.consts.shift_remove(name).unwrap_or(Value::Undef);
-        self.classes.shift_remove(name);
+        self.classes_mut().shift_remove(name);
         old
     }
     /// The names of user-defined constants in the flat store (`Module#constants`).
@@ -4565,7 +4631,7 @@ impl RubyHost {
     }
     /// Register a user class.
     pub fn add_class(&mut self, name: String, def: ClassDef) {
-        self.classes.insert(name, def);
+        self.classes_mut().insert(name, def);
     }
     /// Register a runtime attribute accessor `field` on `class` (a reader and/or
     /// a writer), checked natively in dispatch as an `@field` get/set.
@@ -4607,7 +4673,7 @@ impl RubyHost {
     /// mixin list (deduped), creating the ClassDef if needed. `kind` is
     /// `"include"`, `"prepend"`, or `"extend"`.
     pub fn class_mixin(&mut self, class: &str, module: &str, kind: &str) {
-        let def = self.classes.entry(class.to_string()).or_default();
+        let def = self.classes_mut().entry(class.to_string()).or_default();
         let list = match kind {
             "prepend" => &mut def.prepends,
             "extend" => &mut def.extends,
@@ -4641,7 +4707,7 @@ impl RubyHost {
             .iter()
             .map(|e| e != module && self.resolve_module_name(e, class) != target)
             .collect();
-        if let Some(def) = self.classes.get_mut(class) {
+        if let Some(def) = self.classes_mut().get_mut(class) {
             let list = match kind {
                 "prepend" => &mut def.prepends,
                 "extend" => &mut def.extends,
@@ -4663,7 +4729,7 @@ impl RubyHost {
     /// install a shadowing tombstone; removing the own method is enough for the
     /// load-time uses gems make of it).
     pub fn remove_instance_method(&mut self, cls: &str, name: &str) {
-        if let Some(def) = self.classes.get_mut(cls) {
+        if let Some(def) = self.classes_mut().get_mut(cls) {
             def.methods.shift_remove(name);
         }
     }
@@ -4672,7 +4738,7 @@ impl RubyHost {
     /// but rubylang stores them separately with the `def self.m` taking dispatch
     /// precedence (ActiveSupport's `redefine_singleton_method`).
     pub fn remove_class_method(&mut self, cls: &str, name: &str) {
-        if let Some(def) = self.classes.get_mut(cls) {
+        if let Some(def) = self.classes_mut().get_mut(cls) {
             def.class_methods.shift_remove(name);
         }
     }
@@ -4683,7 +4749,7 @@ impl RubyHost {
         self.struct_counter += 1;
         let kind = if is_module { "Module" } else { "Class" };
         let name = format!("#<{kind}:{}>", self.struct_counter);
-        self.classes.insert(
+        self.classes_mut().insert(
             name.clone(),
             ClassDef {
                 superclass,
@@ -5292,8 +5358,8 @@ impl RubyHost {
         name.starts_with("#<Class:") && self.classes.contains_key(name)
     }
     pub fn rename_class(&mut self, old: &str, new: &str) {
-        if let Some(def) = self.classes.shift_remove(old) {
-            self.classes.insert(new.to_string(), def);
+        if let Some(def) = self.classes_mut().shift_remove(old) {
+            self.classes_mut().insert(new.to_string(), def);
         }
         if let Some(v) = self.class_vars.shift_remove(old) {
             self.class_vars.insert(new.to_string(), v);
@@ -6223,7 +6289,7 @@ impl RubyHost {
     /// Record `vis` for `class`'s entry `method` (`private :m`, `public :m`, and
     /// the class-body modifier the compiler resolves).
     pub fn set_method_visibility(&mut self, class: &str, method: &str, vis: Visibility) {
-        let def = self.classes.entry(class.to_string()).or_default();
+        let def = self.classes_mut().entry(class.to_string()).or_default();
         if vis == Visibility::Public {
             def.visibility.shift_remove(method);
         } else {
@@ -6234,7 +6300,7 @@ impl RubyHost {
     /// Record `vis` for `class`'s CLASS method `method` —
     /// `private_class_method :m` / `public_class_method :m`.
     pub fn set_class_method_visibility(&mut self, class: &str, method: &str, vis: Visibility) {
-        let def = self.classes.entry(class.to_string()).or_default();
+        let def = self.classes_mut().entry(class.to_string()).or_default();
         if vis == Visibility::Public {
             def.class_visibility.shift_remove(method);
         } else {

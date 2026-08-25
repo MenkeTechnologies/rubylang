@@ -4216,3 +4216,26 @@ p ParA.singleton_class.ancestors.include?(ParE1)
 module ParHi; def hello; :hi; end; end
 class ParC; extend ParHi; end
 p ParC.hello
+#==#
+# The built-in ancestor chain a method call resolves against is memoized, so
+# reopening a class after a dispatch has captured it must invalidate the memo.
+# Every line below depends on the chain AFTER the reopen.
+class MemoPA < Array; end
+memo_a = MemoPA.new
+memo_a.push(1)
+p memo_a.size
+module MemoPM; def tag; :tagged; end; end
+class MemoPA; include MemoPM; end
+p memo_a.tag
+begin; memo_a.tag(1); rescue ArgumentError => e; p e.message; end
+p "s".upcase
+module MemoPS; def shout3; upcase; end; end
+class String; include MemoPS; end
+p "t".shout3
+begin; "t".shout3(1); rescue ArgumentError => e; p e.message; end
+class MemoPD; end
+memo_d = MemoPD.new
+p memo_d.frozen?
+class MemoPD; def only_now; :yes; end; end
+p memo_d.only_now
+p MemoPD.instance_methods(false)

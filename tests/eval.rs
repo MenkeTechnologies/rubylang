@@ -9320,3 +9320,60 @@ fn a_metaclass_chain_lists_the_extended_modules() {
         ":hi",
     );
 }
+
+/// Reopening a class is seen by the built-in ancestor-chain memo.
+///
+/// `check_builtin_arity` runs on EVERY built-in method call and walks
+/// `builtin_owner` -> `builtin_chain` -> `expanded_ancestry`, which allocates a
+/// `Vec<String>` ancestry and de-duplicates it through a `HashSet<String>` — a
+/// string allocated and hashed per ancestor, per call, for a chain that only
+/// changes when a class does. That result is memoized, which is only correct if
+/// every edit to the class table invalidates it.
+///
+/// What this pins is the ORDER a stale memo would get wrong: dispatch on a
+/// receiver FIRST, so its chain is captured, THEN reopen the class, then depend
+/// on the new chain. Each assertion below is one a memo that missed the
+/// invalidation answers from the chain it captured before the reopen.
+#[test]
+fn reopening_a_class_invalidates_the_ancestry_memo() {
+    // A user subclass of a builtin: dispatch, then gain a module.
+    eq(
+        "class MemoA < Array; end; a = MemoA.new; a.push(1); a.size",
+        "1",
+    );
+    eq(
+        "class MemoB < Array; end; b = MemoB.new; b.push(1); b.size; \
+         module MemoM; def tag; :tagged; end; end; class MemoB; include MemoM; end; b.tag",
+        ":tagged",
+    );
+    // The ARITY check is the path that reads the memo, so a stale chain shows up
+    // as the wrong diagnostic (or none at all) for the newly mixed-in method.
+    raises(
+        "class MemoC < Array; end; c = MemoC.new; c.push(1); c.size; \
+         module MemoM2; def tag; :tagged; end; end; class MemoC; include MemoM2; end; c.tag(1)",
+        "ArgumentError",
+        "wrong number of arguments (given 1, expected 0)",
+    );
+    // The same for a reopened BUILTIN class, dispatched on first.
+    eq(
+        concat!(
+            r#""s".upcase; module MemoS; def shout3; upcase; end; end; "#,
+            r#"class String; include MemoS; end; "t".shout3"#
+        ),
+        r#""T""#,
+    );
+    raises(
+        concat!(
+            r#""s".upcase; module MemoS2; def shout4; upcase; end; end; "#,
+            r#"class String; include MemoS2; end; "t".shout4(1)"#
+        ),
+        "ArgumentError",
+        "wrong number of arguments (given 1, expected 0)",
+    );
+    // A plain user class dispatched on before it has the method at all.
+    eq(
+        "class MemoD; end; d = MemoD.new; d.frozen?; \
+         class MemoD; def only_now; :yes; end; end; d.only_now",
+        ":yes",
+    );
+}

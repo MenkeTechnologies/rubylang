@@ -2633,3 +2633,13 @@ true
 false
 true
 :hi
+#==#
+1
+:tagged
+"wrong number of arguments (given 1, expected 0)"
+"S"
+"T"
+"wrong number of arguments (given 1, expected 0)"
+false
+:yes
+[:only_now]
