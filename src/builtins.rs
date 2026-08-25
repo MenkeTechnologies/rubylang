@@ -11852,7 +11852,50 @@ fn dispatch_lazy(
         // `uniq` takes an OPTIONAL block, so unlike map/select it must not
         // demand one.
         "uniq" => Ok(extend(LazyOp::Uniq(block.clone()))),
+        "compact" => Ok(extend(LazyOp::Compact)),
+        "grep" => Ok(extend(LazyOp::Grep(args[0].clone(), false))),
+        "grep_v" => Ok(extend(LazyOp::Grep(args[0].clone(), true))),
+        // `with_index` takes an optional offset and inspects with it;
+        // `each_with_index` takes none. Both stay lazy in MRI.
+        "with_index" if block.is_none() => Ok(extend(LazyOp::WithIndex(Some(
+            args.first().map(as_i).unwrap_or(0),
+        )))),
+        "each_with_index" if block.is_none() && args.is_empty() => {
+            Ok(extend(LazyOp::WithIndex(None)))
+        }
+        "with_object" | "each_with_object" if block.is_none() && !args.is_empty() => Ok(extend(
+            LazyOp::WithObject(args[0].clone(), name == "each_with_object"),
+        )),
+        "each_slice" => Ok(extend(LazyOp::EachSlice(as_i(&args[0]).max(1) as usize))),
+        "each_cons" => Ok(extend(LazyOp::EachCons(as_i(&args[0]).max(1) as usize))),
+        "chunk_while" => Ok(extend(LazyOp::ChunkWhile(blk()?, false))),
+        "slice_when" => Ok(extend(LazyOp::ChunkWhile(blk()?, true))),
+        // Block-less `each_entry` re-yields the element sequence unchanged.
+        "each_entry" if block.is_none() => Ok(recv.clone()),
         "lazy" => Ok(recv.clone()),
+        // `eager` leaves the lazy world: a concrete Enumerator over what the
+        // pipeline produces.
+        "eager" => {
+            let out = lazy_pull(&source, &ops, usize::MAX)?;
+            Ok(with_host(|h| h.new_enumerator(out, "each")))
+        }
+        // `include?` SHORT-CIRCUITS, which matters on an endless source: MRI
+        // answers `(1..Float::INFINITY).lazy.include?(3)` rather than hanging.
+        // Each pull restarts the pipeline, so the window doubles until the value
+        // is found or the source is exhausted.
+        "member?" | "include?" => {
+            let mut want = 64usize;
+            loop {
+                let out = lazy_pull(&source, &ops, want)?;
+                if out.iter().any(|v| with_host(|h| h.eq_values(v, &args[0]))) {
+                    return Ok(Value::Bool(true));
+                }
+                if out.len() < want {
+                    return Ok(Value::Bool(false));
+                }
+                want = want.saturating_mul(2);
+            }
+        }
         "first" => {
             let out = lazy_pull(
                 &source,
@@ -11872,7 +11915,15 @@ fn dispatch_lazy(
             }
             Ok(recv.clone())
         }
-        _ => Err(no_method_error(recv, name)),
+        // Every remaining Enumerable method is a TERMINAL one — `sum`, `reduce`,
+        // `min`, `count`, `sort`, `group_by`, … — which MRI answers by running
+        // the pipeline to the end and applying the ordinary Enumerable
+        // implementation. Forcing here does exactly that; a stage that had to
+        // stay lazy is one of the arms above.
+        _ => {
+            let forced = new_arr(lazy_pull(&source, &ops, usize::MAX)?);
+            dispatch_array(&forced, name, args, block)
+        }
     }
 }
 
@@ -11886,6 +11937,12 @@ enum LazyState {
     /// `uniq`'s seen keys for this pull, by the same `hash`/`eql?` key Array#uniq
     /// and Hash keys use, so `1` and `1.0` stay distinct.
     Uniq(std::collections::HashSet<crate::host::RKey>),
+    /// `with_index`'s running index for this pull.
+    Counter(i64),
+    /// The partial group `each_slice` / `each_cons` / `chunk_while` /
+    /// `slice_when` has accumulated so far. `lazy_flush` emits what is left when
+    /// the source runs out.
+    Buffer(Vec<Value>),
     None,
 }
 
@@ -12002,6 +12059,85 @@ fn lazy_feed(
                 lazy_feed(ops, state, i + 1, elem, out, limit)
             }
         }
+        LazyOp::Compact => {
+            if matches!(elem, Value::Undef) {
+                Ok(true)
+            } else {
+                lazy_feed(ops, state, i + 1, elem, out, limit)
+            }
+        }
+        LazyOp::Grep(pat, inverted) => {
+            let hit = dispatch(pat, "===", std::slice::from_ref(&elem), None)?;
+            if with_host(|h| h.truthy(&hit)) != *inverted {
+                lazy_feed(ops, state, i + 1, elem, out, limit)
+            } else {
+                Ok(true)
+            }
+        }
+        LazyOp::WithIndex(_) => {
+            let LazyState::Counter(n) = &mut state[i] else {
+                return Ok(false);
+            };
+            let idx = *n;
+            *n += 1;
+            let paired = new_arr(vec![elem, Value::Int(idx)]);
+            lazy_feed(ops, state, i + 1, paired, out, limit)
+        }
+        LazyOp::WithObject(obj, _) => {
+            let paired = new_arr(vec![elem, obj.clone()]);
+            lazy_feed(ops, state, i + 1, paired, out, limit)
+        }
+        // Emits only on a FULL group; the short final one is `lazy_flush`'s.
+        LazyOp::EachSlice(n) => {
+            let LazyState::Buffer(buf) = &mut state[i] else {
+                return Ok(false);
+            };
+            buf.push(elem);
+            if buf.len() < *n {
+                return Ok(true);
+            }
+            let group = new_arr(std::mem::take(buf));
+            lazy_feed(ops, state, i + 1, group, out, limit)
+        }
+        // A sliding window emits once the buffer is full and then keeps the last
+        // `n - 1` elements, so it has nothing left to flush.
+        LazyOp::EachCons(n) => {
+            let LazyState::Buffer(buf) = &mut state[i] else {
+                return Ok(false);
+            };
+            buf.push(elem);
+            if buf.len() < *n {
+                return Ok(true);
+            }
+            let window = new_arr(buf.clone());
+            buf.remove(0);
+            lazy_feed(ops, state, i + 1, window, out, limit)
+        }
+        LazyOp::ChunkWhile(p, sliced) => {
+            let prev = match &state[i] {
+                LazyState::Buffer(buf) => buf.last().cloned(),
+                _ => None,
+            };
+            // The first element starts the group; every later one asks the block
+            // about the PAIR (previous, current). `chunk_while` continues the
+            // group when the block is true, `slice_when` when it is false.
+            let boundary = match prev {
+                None => false,
+                Some(prev) => {
+                    let r = call_lazy_call(p, &[prev, elem.clone()])?;
+                    with_host(|h| h.truthy(&r)) == *sliced
+                }
+            };
+            let LazyState::Buffer(buf) = &mut state[i] else {
+                return Ok(false);
+            };
+            if !boundary {
+                buf.push(elem);
+                return Ok(true);
+            }
+            let group = new_arr(std::mem::replace(buf, vec![elem]));
+            lazy_feed(ops, state, i + 1, group, out, limit)
+        }
         LazyOp::Zip(others) => {
             let LazyState::Zip(idx) = &mut state[i] else {
                 return Ok(false);
@@ -12019,6 +12155,35 @@ fn lazy_feed(
     }
 }
 
+/// Emit what the buffering stages are still holding, once the SOURCE has run
+/// out. `each_slice`'s short final group and `chunk_while`/`slice_when`'s last
+/// group only exist at this point — there is no further element to trigger
+/// them. Called only on exhaustion: a pull that stopped early (`first(2)`) has
+/// not reached the end of the source, so there is nothing to close.
+fn lazy_flush(
+    ops: &[crate::host::LazyOp],
+    state: &mut [LazyState],
+    i: usize,
+    out: &mut Vec<Value>,
+    limit: usize,
+) -> Result<(), String> {
+    use crate::host::LazyOp;
+    if i == ops.len() || out.len() >= limit {
+        return Ok(());
+    }
+    let pending = match (&ops[i], &mut state[i]) {
+        (LazyOp::EachSlice(_) | LazyOp::ChunkWhile(_, _), LazyState::Buffer(buf))
+            if !buf.is_empty() =>
+        {
+            Some(new_arr(std::mem::take(buf)))
+        }
+        _ => None,
+    };
+    if let Some(group) = pending {
+        lazy_feed(ops, state, i + 1, group, out, limit)?;
+    }
+    lazy_flush(ops, state, i + 1, out, limit)
+}
 /// Pull up to `limit` values through the lazy pipeline over `source` (an array
 /// or a possibly-endless range).
 fn lazy_pull(
@@ -12036,31 +12201,45 @@ fn lazy_pull(
             LazyOp::DropWhile(_) => LazyState::Dropping(true),
             LazyOp::Zip(_) => LazyState::Zip(0),
             LazyOp::Uniq(_) => LazyState::Uniq(std::collections::HashSet::new()),
+            LazyOp::WithIndex(off) => LazyState::Counter(off.unwrap_or(0)),
+            LazyOp::EachSlice(_) | LazyOp::EachCons(_) | LazyOp::ChunkWhile(_, _) => {
+                LazyState::Buffer(Vec::new())
+            }
             _ => LazyState::None,
         })
         .collect();
 
     if let Some(items) = with_host(|h| h.as_array(source)) {
+        let mut exhausted = true;
         for elem in items {
             if !lazy_feed(ops, &mut state, 0, elem, &mut out, limit)? {
+                exhausted = false;
                 break;
             }
+        }
+        if exhausted {
+            lazy_flush(ops, &mut state, 0, &mut out, limit)?;
         }
     } else if let Some((lo, hi, excl)) = with_host(|h| h.as_range(source)) {
         let endless = hi == crate::host::RANGE_ENDLESS;
         let mut n = lo;
+        let mut exhausted = false;
         loop {
             if endless {
                 if out.len() >= limit {
                     break;
                 }
             } else if (excl && n >= hi) || (!excl && n > hi) {
+                exhausted = true;
                 break;
             }
             if !lazy_feed(ops, &mut state, 0, Value::Int(n), &mut out, limit)? {
                 break;
             }
             n += 1;
+        }
+        if exhausted {
+            lazy_flush(ops, &mut state, 0, &mut out, limit)?;
         }
     } else if let Some(gblock) = with_host(|h| h.generator_block(source)) {
         // A generator source: drive it in growing raw-value batches, feeding
@@ -12081,6 +12260,10 @@ fn lazy_pull(
                     // generator from the start, so a seen-set carried over from
                     // the previous, shorter drive would suppress every element.
                     LazyOp::Uniq(_) => LazyState::Uniq(std::collections::HashSet::new()),
+                    LazyOp::WithIndex(off) => LazyState::Counter(off.unwrap_or(0)),
+                    LazyOp::EachSlice(_) | LazyOp::EachCons(_) | LazyOp::ChunkWhile(_, _) => {
+                        LazyState::Buffer(Vec::new())
+                    }
                     _ => LazyState::None,
                 };
             }
@@ -12092,6 +12275,9 @@ fn lazy_pull(
                     stopped = true;
                     break;
                 }
+            }
+            if produced < raw_bound && !stopped {
+                lazy_flush(ops, &mut state, 0, &mut out, limit)?;
             }
             if out.len() >= limit || produced < raw_bound || stopped {
                 break;

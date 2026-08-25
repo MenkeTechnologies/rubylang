@@ -9005,3 +9005,80 @@ fn struct_each_pair_and_keyword_init() {
         "[1, 2]",
     );
 }
+
+/// The `Enumerator::Lazy` stages that stay LAZY, and the terminals that force.
+///
+/// Sixteen Enumerable methods raised `NoMethodError` on a lazy enumerator.
+/// MRI keeps `each_slice`/`each_cons`/`chunk_while`/`slice_when`/`with_index`/
+/// `compact`/`grep`/`grep_v` lazy — which is what makes them usable on an
+/// endless source at all — and answers the terminals (`sum`, `reduce`,
+/// `include?`, …) by running the pipeline out:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p (1..Float::INFINITY).lazy.each_slice(2).first(2)'
+/// [[1, 2], [3, 4]]
+/// ```
+#[test]
+fn lazy_keeps_its_lazy_stages_lazy() {
+    // Buffering stages, including the short final group only the end of the
+    // source can produce.
+    eq(
+        "(1..10).lazy.each_slice(3).to_a",
+        "[[1, 2, 3], [4, 5, 6], [7, 8, 9], [10]]",
+    );
+    eq(
+        "(1..10).lazy.each_cons(3).first(2)",
+        "[[1, 2, 3], [2, 3, 4]]",
+    );
+    eq(
+        "[1, 2, 4, 5, 7].lazy.chunk_while { |x, y| y == x + 1 }.to_a",
+        "[[1, 2], [4, 5], [7]]",
+    );
+    eq(
+        "[1, 2, 4, 5, 7].lazy.slice_when { |x, y| y != x + 1 }.to_a",
+        "[[1, 2], [4, 5], [7]]",
+    );
+    // Elementwise stages.
+    eq("[1, nil, 2].lazy.compact.to_a", "[1, 2]");
+    eq("(1..10).lazy.grep(2..4).to_a", "[2, 3, 4]");
+    eq("(1..10).lazy.grep_v(2..9).to_a", "[1, 10]");
+    eq("(1..10).lazy.with_index.first(2)", "[[1, 0], [2, 1]]");
+    eq("(1..10).lazy.with_index(3).first(2)", "[[1, 3], [2, 4]]");
+    eq("(1..10).lazy.each_with_index.first(2)", "[[1, 0], [2, 1]]");
+    eq("(1..10).lazy.with_object([]).first(1)", "[[1, []]]");
+    // Still lazy: an endless source must not be materialized.
+    eq(
+        "(1..Float::INFINITY).lazy.each_slice(2).first(2)",
+        "[[1, 2], [3, 4]]",
+    );
+    eq(
+        "(1..Float::INFINITY).lazy.map { |x| x * 2 }.each_slice(2).first(2)",
+        "[[2, 4], [6, 8]]",
+    );
+    eq("(1..Float::INFINITY).lazy.compact.first(2)", "[1, 2]");
+    // `include?` short-circuits, so it answers on an endless source.
+    eq("(1..Float::INFINITY).lazy.include?(3)", "true");
+    eq("(1..10).lazy.include?(99)", "false");
+    // Terminals force the pipeline and answer as Enumerable does.
+    eq("(1..10).lazy.sum", "55");
+    eq("(1..10).lazy.reduce(:+)", "55");
+    eq("(1..10).lazy.eager.class", "Enumerator");
+    eq("[3, 1, 2].lazy.min", "1");
+    // The stage names `inspect` shows.
+    eq(
+        "(1..10).lazy.each_slice(2)",
+        "#<Enumerator::Lazy: #<Enumerator::Lazy: 1..10>:each_slice(2)>",
+    );
+    eq(
+        "(1..10).lazy.grep(1..2)",
+        "#<Enumerator::Lazy: #<Enumerator::Lazy: 1..10>:grep(1..2)>",
+    );
+    eq(
+        "(1..10).lazy.with_index(3)",
+        "#<Enumerator::Lazy: #<Enumerator::Lazy: 1..10>:with_index(3)>",
+    );
+    eq(
+        "(1..10).lazy.each_with_index",
+        "#<Enumerator::Lazy: #<Enumerator::Lazy: 1..10>:each_with_index>",
+    );
+}

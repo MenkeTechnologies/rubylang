@@ -4115,3 +4115,34 @@ p Struct.new(:x, keyword_init: true).keyword_init?
 p Struct.new(:x, keyword_init: false).keyword_init?
 ParK = Struct.new(:a, :b, keyword_init: true)
 p ParK.new(a: 1, b: 2).to_a
+#==#
+# Enumerator::Lazy — the stages that stay lazy (so they work on an endless
+# source) and the terminals that run the pipeline out.
+lz = (1..10).lazy
+p lz.each_slice(3).to_a, lz.each_slice(3).first(2)
+p lz.each_cons(3).first(2), lz.each_cons(3).to_a.size
+p [1, 2, 4, 5, 7].lazy.chunk_while { |x, y| y == x + 1 }.to_a
+p [1, 2, 4, 5, 7].lazy.slice_when { |x, y| y != x + 1 }.to_a
+p [1, nil, 2].lazy.compact.to_a
+p lz.grep(2..4).to_a, lz.grep_v(2..9).to_a
+p lz.with_index.first(2), lz.with_index(3).first(2)
+p lz.each_with_index.first(2), lz.with_object([]).first(1)
+p lz.each_with_object([]).first(1)
+p lz.uniq.first(2), lz.each_entry.first(2)
+inf = (1..Float::INFINITY).lazy
+p inf.each_slice(2).first(2)
+p inf.map { |x| x * 2 }.each_slice(2).first(2)
+p inf.compact.first(2), inf.with_index.first(2)
+p inf.include?(3), lz.include?(99)
+p lz.sum, lz.reduce(:+), lz.min, lz.count
+p lz.eager.class, [3, 1, 2].lazy.sort
+p lz.each_slice(2).inspect
+p lz.each_cons(2).inspect
+p lz.compact.inspect
+p lz.grep(1..2).inspect
+p lz.grep_v(1..2).inspect
+p lz.with_index.inspect
+p lz.with_index(3).inspect
+p lz.each_with_index.inspect
+p lz.with_object([]).inspect
+p lz.each_with_object([]).inspect

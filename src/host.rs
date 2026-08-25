@@ -206,6 +206,31 @@ pub enum LazyOp {
     /// than in the op itself: the op is shared by every pull of the pipeline and
     /// must not accumulate between them.
     Uniq(Option<Value>),
+    /// `compact` — drops nil elements.
+    Compact,
+    /// `grep(pat)` / `grep_v(pat)` — keeps (or drops) the elements `pat === x`
+    /// selects. The `bool` is true for `grep_v`.
+    Grep(Value, bool),
+    /// `with_index(offset)` / `each_with_index` — `[element, index]` pairs.
+    /// `None` is the `each_with_index` spelling, which takes no offset and
+    /// inspects without one. The running index lives in `LazyState::Counter`,
+    /// not in the op, since one op is shared by every pull of the pipeline.
+    WithIndex(Option<i64>),
+    /// `with_object(obj)` / `each_with_object(obj)` — `[element, obj]` pairs.
+    /// The `bool` is the `each_with_object` spelling, which inspects under that
+    /// name.
+    WithObject(Value, bool),
+    /// `each_slice(n)` — consecutive groups of `n`, the last one short.
+    /// `each_cons(n)` — every sliding window of `n`. Both buffer, so both live
+    /// in `LazyState::Buffer` and the slice's short final group is emitted by
+    /// `lazy_flush` once the source runs out.
+    EachSlice(usize),
+    EachCons(usize),
+    /// `chunk_while { |a, b| }` / `slice_when { |a, b| }` — accumulate while the
+    /// block agrees, emitting a group at each boundary and a final one at the
+    /// end. The two are exact opposites: `slice_when` cuts where `chunk_while`
+    /// would keep going, which the `bool` selects.
+    ChunkWhile(Value, bool),
 }
 
 /// How a derived generator reshapes the values its source yields. This is what
@@ -2485,6 +2510,37 @@ impl RubyHost {
             // MRI tags it `uniq` whether or not a key block was given — the
             // block is not shown, so both forms inspect identically.
             LazyOp::Uniq(_) => "uniq".to_string(),
+            LazyOp::Compact => "compact".to_string(),
+            LazyOp::Grep(pat, inverted) => {
+                let pat = self.inspect(&pat.clone());
+                format!("{}({pat})", if *inverted { "grep_v" } else { "grep" })
+            }
+            // `each_with_index` shows no offset; `with_index` always shows one,
+            // even the default 0 — the two spellings are distinguishable here.
+            LazyOp::WithIndex(n) => match n {
+                None => "each_with_index".to_string(),
+                Some(n) => format!("with_index({n})"),
+            },
+            LazyOp::WithObject(obj, spelled_each) => {
+                let obj = self.inspect(&obj.clone());
+                format!(
+                    "{}({obj})",
+                    if *spelled_each {
+                        "each_with_object"
+                    } else {
+                        "with_object"
+                    }
+                )
+            }
+            LazyOp::EachSlice(n) => format!("each_slice({n})"),
+            LazyOp::EachCons(n) => format!("each_cons({n})"),
+            // MRI implements both by wrapping the source in a Generator, so the
+            // stage carries no tag of its own and the origin it shows is that
+            // generator. Reproducing that renaming is not worth a fake origin;
+            // the honest tag is the method's own name.
+            LazyOp::ChunkWhile(_, sliced) => {
+                if *sliced { "slice_when" } else { "chunk_while" }.to_string()
+            }
         }
     }
     /// The `(source, ops)` of a lazy enumerator, if `v` is one.
