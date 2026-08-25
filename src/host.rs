@@ -237,6 +237,28 @@ pub struct GenExt {
     pub peeked: Option<Value>,
 }
 
+/// The payload of an [`RObj::ArithSeq`].
+///
+/// `begin`/`end`/`step` are the values MRI's readers of the same names answer —
+/// `end` is `nil` for an endless sequence, `begin` is `nil` for a beginless one,
+/// and `step` defaults to 1 for a bare `Range#step`.
+#[derive(Debug, Clone)]
+pub struct ArithSeq {
+    /// What `#inspect` prints. MRI reproduces the CALL, not the values —
+    /// `((1..10).step(3))` for `Range#step`, `((1..10).%(3))` for `Range#%`,
+    /// `(1.step(10, 3))` for `Numeric#step` — so the three spellings are
+    /// distinguishable in output even though they compare `==`. Rendered once at
+    /// construction, where the receiver and the argument form are still known.
+    pub desc: String,
+    pub begin: Value,
+    pub end: Value,
+    pub step: Value,
+    pub exclude_end: bool,
+    /// The Enumerator (finite) or Generator (endless) that actually holds the
+    /// elements. Every method not answered here is forwarded to it.
+    pub inner: Value,
+}
+
 #[derive(Debug, Clone)]
 pub enum RObj {
     Str(String),
@@ -428,6 +450,17 @@ pub enum RObj {
         /// reconstruct — `each_cons` windows overlap.
         source: Option<Value>,
     },
+    /// An `Enumerator::ArithmeticSequence` — what `Range#step`, `Range#%` and
+    /// `Numeric#step` answer with, and NOT a plain Enumerator: MRI gives it its
+    /// own class with `begin`/`end`/`step`/`exclude_end?` readers and an
+    /// `inspect` that reproduces the call that built it (`((1..10).step(3))`),
+    /// while a bare Enumerator has none of those.
+    ///
+    /// The whole Enumerable/external-iteration surface is delegated to the
+    /// `inner` Enumerator (or, for an endless sequence, Generator) holding the
+    /// elements, so `map`/`select`/`next`/`lazy`/… behave exactly as they
+    /// already did and only the sequence-specific methods are answered here.
+    ArithSeq(Box<ArithSeq>),
     /// A block-based generator (`Enumerator.new { |y| ... }`): the user block
     /// that drives it by sending `<<`/`yield` to a yielder. Bulk operations
     /// (`to_a`/`first`/`take`/`lazy`) re-run the block from the start each time
@@ -1088,6 +1121,11 @@ pub enum RKey {
     /// A Regexp, keyed by `(source, options)` — the same pair `==` compares —
     /// so `/a/` and `/a/` are one Hash key and collapse under `uniq`.
     Regexp(String, u8),
+    /// An `Enumerator::ArithmeticSequence`, keyed by the same four readers its
+    /// `==` compares (`begin`/`end`/`step`/`exclude_end?`), so `hash` and `eql?`
+    /// stay consistent. Its own variant rather than an [`RKey::Array`] of the
+    /// four, so a sequence never collides with the plain Array of its parts.
+    ArithSeq(Vec<RKey>),
     /// An identity key: the heap-object index of a `Value::Obj`, used when a Hash
     /// is in `compare_by_identity` mode so distinct-but-equal objects (two `[1]`
     /// arrays, two `"ab"` strings) hash as separate keys.
@@ -2454,6 +2492,82 @@ impl RubyHost {
             method: method.to_string(),
             source: None,
         })
+    }
+    /// Build an `Enumerator::ArithmeticSequence` over `inner`.
+    pub fn new_arith_seq(&mut self, seq: ArithSeq) -> Value {
+        self.alloc(RObj::ArithSeq(Box::new(seq)))
+    }
+    /// Rebuild an `Enumerator::ArithmeticSequence` from the four values that
+    /// define it — what a Hash key round-trips through, since a Hash stores the
+    /// [`RKey`] rather than the object. The elements are re-derived and the
+    /// description is written in the canonical `Range#step` spelling.
+    pub fn arith_seq_from_parts(
+        &mut self,
+        begin: Value,
+        end: Value,
+        step: Value,
+        exclude_end: bool,
+    ) -> Value {
+        let dots = if exclude_end { "..." } else { ".." };
+        let e_txt = match end {
+            Value::Undef => String::new(),
+            ref v => self.inspect(&v.clone()),
+        };
+        let desc = format!(
+            "(({}{dots}{e_txt}).step({}))",
+            self.inspect(&begin.clone()),
+            self.inspect(&step.clone())
+        );
+        let vals = Self::arith_seq_values(&begin, &end, &step, exclude_end);
+        let inner = self.new_enumerator(vals, "each");
+        self.new_arith_seq(ArithSeq {
+            desc,
+            begin,
+            end,
+            step,
+            exclude_end,
+            inner,
+        })
+    }
+    /// The elements of an arithmetic sequence over Integers or Floats. An open
+    /// or non-numeric end has no finite element list, so it yields none.
+    fn arith_seq_values(begin: &Value, end: &Value, step: &Value, exclude_end: bool) -> Vec<Value> {
+        let float = matches!(begin, Value::Float(_))
+            || matches!(end, Value::Float(_))
+            || matches!(step, Value::Float(_));
+        let num = |v: &Value| match v {
+            Value::Int(n) => Some(*n as f64),
+            Value::Float(f) => Some(*f),
+            _ => None,
+        };
+        let (Some(b), Some(e), Some(st)) = (num(begin), num(end), num(step)) else {
+            return Vec::new();
+        };
+        if st <= 0.0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut i = 0.0f64;
+        loop {
+            let v = b + i * st;
+            if v > e || (exclude_end && v == e) {
+                break;
+            }
+            out.push(if float {
+                Value::Float(v)
+            } else {
+                Value::Int(v as i64)
+            });
+            i += 1.0;
+        }
+        out
+    }
+    /// The sequence description, if `v` is an `Enumerator::ArithmeticSequence`.
+    pub fn arith_seq(&self, v: &Value) -> Option<ArithSeq> {
+        match self.obj(v) {
+            Some(RObj::ArithSeq(s)) => Some((**s).clone()),
+            _ => None,
+        }
     }
     /// As [`Self::new_enumerator`], recording the object being iterated.
     pub fn new_enumerator_of(&mut self, buf: Vec<Value>, method: &str, source: Value) -> Value {
@@ -5285,7 +5399,27 @@ impl RubyHost {
         if class == "Comparable" && matches!(actual.as_str(), "Integer" | "Float" | "String") {
             return true;
         }
-        if class == "Enumerable" && matches!(actual.as_str(), "Array" | "Hash" | "Range") {
+        if class == "Enumerable"
+            && matches!(
+                actual.as_str(),
+                "Array"
+                    | "Hash"
+                    | "Range"
+                    | "Set"
+                    | "Enumerator"
+                    | "Enumerator::Lazy"
+                    | "Enumerator::ArithmeticSequence"
+            )
+        {
+            return true;
+        }
+        // An Enumerator subclass IS an Enumerator (`(1..10).step(3).is_a?(Enumerator)`).
+        if class == "Enumerator"
+            && matches!(
+                actual.as_str(),
+                "Enumerator::Lazy" | "Enumerator::ArithmeticSequence"
+            )
+        {
             return true;
         }
         if actual == "DateTime" && matches!(class, "Date" | "Comparable") {
@@ -5394,7 +5528,13 @@ impl RubyHost {
             "Complex" => own(&["Numeric"]),
             "String" | "Symbol" | "Time" | "Date" => own(&["Comparable"]),
             "DateTime" => own(&["Date", "Comparable"]),
-            "Array" | "Hash" | "Range" | "Set" | "Struct" => own(&["Enumerable"]),
+            "Array" | "Hash" | "Range" | "Set" | "Struct" | "Enumerator" => own(&["Enumerable"]),
+            // `Enumerator::Lazy` and `Enumerator::ArithmeticSequence` are
+            // Enumerator SUBCLASSES in MRI, so both carry Enumerator (and
+            // through it Enumerable) in their chain.
+            "Enumerator::Lazy" | "Enumerator::ArithmeticSequence" => {
+                own(&["Enumerator", "Enumerable"])
+            }
             // A user-defined `module M`: prepends, itself, then its includes.
             // A module has no superclass, so the `Object`/`Kernel`/`BasicObject`
             // tail a class carries must not appear — `module B; include A; end`
@@ -6689,6 +6829,7 @@ impl RubyHost {
                     };
                     format!("#<Enumerator: {recv}:{method}>")
                 }
+                Some(RObj::ArithSeq(s)) => s.desc.clone(),
                 Some(RObj::Generator { .. }) => {
                     "#<Enumerator: #<Enumerator::Generator>:each>".to_string()
                 }
@@ -6705,7 +6846,20 @@ impl RubyHost {
                     format!("#<Thread:{id:#x} {}>", if alive { "run" } else { "dead" })
                 }
                 Some(RObj::IoHandle { id }) => self.io_inspect_str(id),
+                // An endless/beginless Range stores its open side as an i64
+                // sentinel, and MRI renders that side as NOTHING (`1..`, `..10`)
+                // — printing the sentinel leaked `1..9223372036854775807`.
                 Some(RObj::Range { lo, hi, exclusive }) => {
+                    let lo = if lo == RANGE_BEGINLESS {
+                        String::new()
+                    } else {
+                        lo.to_string()
+                    };
+                    let hi = if hi == RANGE_ENDLESS {
+                        String::new()
+                    } else {
+                        hi.to_string()
+                    };
                     format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
                 }
                 Some(RObj::FloatRange { lo, hi, exclusive }) => format!(
@@ -6999,6 +7153,25 @@ impl RubyHost {
                 let parts: Vec<String> = ks.clone().iter().map(|k| self.key_inspect(k)).collect();
                 format!("[{}]", parts.join(", "))
             }
+            // Rendered in the canonical `Range#step` spelling. A Hash stores only
+            // the KEY, not the object it was built from, so the `%` / `Numeric#step`
+            // spellings a sequence may have inspected as are not recoverable here.
+            RKey::ArithSeq(ks) => {
+                let ks = ks.clone();
+                let mut part = |i: usize| {
+                    ks.get(i)
+                        .map(|k| self.key_inspect(&k.clone()))
+                        .unwrap_or_default()
+                };
+                let (b, e, st) = (part(0), part(1), part(2));
+                let e = if e == "nil" { String::new() } else { e };
+                let dots = if matches!(ks.get(3), Some(RKey::Bool(true))) {
+                    "..."
+                } else {
+                    ".."
+                };
+                format!("(({b}{dots}{e}).step({st}))")
+            }
             // `mix` order, matching `Regexp#inspect`.
             RKey::Regexp(source, bits) => {
                 let flags: String = [(4, 'm'), (1, 'i'), (2, 'x')]
@@ -7008,7 +7181,21 @@ impl RubyHost {
                     .collect();
                 format!("/{source}/{flags}")
             }
-            RKey::Range(lo, hi, excl) => format!("{lo}{}{hi}", if *excl { "..." } else { ".." }),
+            // Same open-side rendering the Range itself gets: an endless or
+            // beginless side prints as nothing, never as the i64 sentinel.
+            RKey::Range(lo, hi, excl) => {
+                let lo = if *lo == RANGE_BEGINLESS {
+                    String::new()
+                } else {
+                    lo.to_string()
+                };
+                let hi = if *hi == RANGE_ENDLESS {
+                    String::new()
+                } else {
+                    hi.to_string()
+                };
+                format!("{lo}{}{hi}", if *excl { "..." } else { ".." })
+            }
             RKey::StrRange(lo, hi, excl) => {
                 format!("{lo:?}{}{hi:?}", if *excl { "..." } else { ".." })
             }
@@ -7050,6 +7237,7 @@ impl RubyHost {
                 Some(RObj::Complex { .. }) => "Complex",
                 Some(RObj::Lazy { .. }) => "Enumerator::Lazy",
                 Some(RObj::Enumerator { .. }) => "Enumerator",
+                Some(RObj::ArithSeq(_)) => "Enumerator::ArithmeticSequence",
                 Some(RObj::Generator { .. }) => "Enumerator",
                 Some(RObj::Yielder { .. }) | Some(RObj::FiberYielder) => "Enumerator::Yielder",
                 Some(RObj::Fiber { .. }) => "Fiber",
@@ -7186,6 +7374,20 @@ impl RubyHost {
                         Box::new(self.to_key_seen(&im, seen)),
                     )
                 }
+                Some(RObj::ArithSeq(q)) => {
+                    let (b, e, st, x) = (
+                        q.begin.clone(),
+                        q.end.clone(),
+                        q.step.clone(),
+                        q.exclude_end,
+                    );
+                    RKey::ArithSeq(vec![
+                        self.to_key_seen(&b, seen),
+                        self.to_key_seen(&e, seen),
+                        self.to_key_seen(&st, seen),
+                        RKey::Bool(x),
+                    ])
+                }
                 Some(RObj::Range { lo, hi, exclusive }) => RKey::Range(*lo, *hi, *exclusive),
                 Some(RObj::StrRange { lo, hi, exclusive }) => {
                     RKey::StrRange(lo.clone(), hi.clone(), *exclusive)
@@ -7223,6 +7425,16 @@ impl RubyHost {
             RKey::Array(ks) => {
                 let items: Vec<Value> = ks.clone().iter().map(|k| self.key_to_value(k)).collect();
                 self.new_array(items)
+            }
+            RKey::ArithSeq(ks) => {
+                let parts: Vec<Value> = ks.clone().iter().map(|k| self.key_to_value(k)).collect();
+                let at = |i: usize| parts.get(i).cloned().unwrap_or(Value::Undef);
+                self.arith_seq_from_parts(
+                    at(0),
+                    at(1),
+                    at(2),
+                    matches!(ks.get(3), Some(RKey::Bool(true))),
+                )
             }
             RKey::Hash(pairs) => {
                 let map: IndexMap<RKey, Value> = pairs
@@ -8102,6 +8314,15 @@ impl RubyHost {
                             (Some(x), Some(y)) => self.eq_values(x, y),
                             _ => false,
                         }
+                    }
+                    // Two arithmetic sequences are equal when their four
+                    // readers are — so `(1..10).step(3) == (1..10) % 3`, which
+                    // MRI answers true even though the two `inspect` alike.
+                    (Some(RObj::ArithSeq(x)), Some(RObj::ArithSeq(y))) => {
+                        self.eq_values(&x.begin, &y.begin)
+                            && self.eq_values(&x.end, &y.end)
+                            && self.eq_values(&x.step, &y.step)
+                            && x.exclude_end == y.exclude_end
                     }
                     // Two Ranges are equal when their endpoints and exclusivity
                     // match (integer, float, and string ranges each compare

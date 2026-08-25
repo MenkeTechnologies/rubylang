@@ -8687,3 +8687,97 @@ fn an_invalid_regex_raises_every_time_it_is_evaluated() {
         "[:raised, :raised, :raised]",
     );
 }
+
+/// `Range#step` / `Range#%` / `Numeric#step` answer an
+/// `Enumerator::ArithmeticSequence`, not an Array.
+///
+/// The distinction is not cosmetic. The class carries four readers no Array or
+/// Enumerator has, and an `inspect` that reproduces the CALL rather than the
+/// values — so a program that prints one, or asks it for its `step`, sees
+/// something an Array cannot answer:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'a = (1..10).step(3); p a, a.class, a.step, a.begin'
+/// ((1..10).step(3))
+/// Enumerator::ArithmeticSequence
+/// 3
+/// 1
+/// ```
+///
+/// What is pinned here is that surface plus the two properties an Array answer
+/// silently got wrong: `Range#%` existed at all, and the endless form stayed
+/// unmaterialized instead of raising `cannot convert endless range to an array`.
+#[test]
+fn range_step_answers_an_arithmetic_sequence() {
+    eq("(1..10).step(3)", "((1..10).step(3))");
+    eq("(1..10).step(3).class", "Enumerator::ArithmeticSequence");
+    eq("((1..10) % 3)", "((1..10).%(3))");
+    eq("(1.step(10, 3))", "(1.step(10, 3))");
+    eq("1.step(by: 3, to: 10)", "(1.step(by: 3, to: 10))");
+    // The four readers, including the bare `step` that defaults to 1.
+    eq(
+        "a = (1...10).step(3); [a.begin, a.end, a.step, a.exclude_end?]",
+        "[1, 10, 3, true]",
+    );
+    eq("(1..10).step.step", "1");
+    // Equal by VALUE across the three spellings, so `hash`/`eql?` agree and a
+    // Hash keyed on one finds the other.
+    eq("(1..10).step(3) == (1..10) % 3", "true");
+    eq("(1..10).step(3).hash == ((1..10) % 3).hash", "true");
+    eq("{ (1..10).step(3) => :hit }[(1..10) % 3]", ":hit");
+    eq("(1..10).step(3) == (1..10).step(4)", "false");
+    // An Enumerator subclass: the whole Enumerable + external-iteration surface
+    // still works, and `each` answers with the SEQUENCE, not the enumerator.
+    eq("(1..10).step(3).is_a?(Enumerator)", "true");
+    eq("(1..10).step(3).instance_of?(Enumerator)", "false");
+    eq("(1..10).step(3).to_a", "[1, 4, 7, 10]");
+    eq("(1..10).step(3).map { |x| x * 2 }", "[2, 8, 14, 20]");
+    eq("e = (1..10).step(3); e.next; e.next", "4");
+    eq(
+        "(1..10).step(3).each { |x| }.class",
+        "Enumerator::ArithmeticSequence",
+    );
+    // The endless form is the one an Array answer could not represent at all.
+    eq("(1..).step(3).first(4)", "[1, 4, 7, 10]");
+    eq("(1..).step(3).end", "nil");
+    eq("(1..).step(3).size", "Infinity");
+    eq("(1..).step(3).lazy.first(3)", "[1, 4, 7]");
+    raises(
+        "(1..).step(3).last",
+        "RangeError",
+        "cannot get the last element of endless arithmetic sequence",
+    );
+    raises("(1..10).step(0)", "ArgumentError", "step can't be 0");
+    // Beginless: it BUILDS, and only fails when asked for an element.
+    eq("(..10).step(3)", "((..10).step(3))");
+    eq("(..10).step(3).begin", "nil");
+    raises(
+        "(..10).step(3).to_a",
+        "TypeError",
+        "nil can't be coerced into Integer",
+    );
+}
+
+/// An endless or beginless Range renders its open side as NOTHING.
+///
+/// Both are stored as an `i64` sentinel, and every rendering path has to know
+/// that — the Range itself, and the separate one a Range used as a Hash KEY goes
+/// through. Printing the sentinel is not a near-miss; it is a 19-digit integer
+/// where MRI writes an empty string.
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p (1..), (..10), { (1..) => 1 }'
+/// 1..
+/// ..10
+/// {1.. => 1}
+/// ```
+#[test]
+fn an_open_range_side_renders_as_nothing() {
+    eq("(1..)", "1..");
+    eq("(..10)", "..10");
+    eq("(1...)", "1...");
+    eq("(...10)", "...10");
+    eq("[(1..), (..10)]", "[1.., ..10]");
+    eq("({ (1..) => 1 })", "{1.. => 1}");
+    eq("({ (..10) => 1 }).keys.first", "..10");
+}

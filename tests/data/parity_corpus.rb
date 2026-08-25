@@ -3960,3 +3960,71 @@ begin
 rescue NoMethodError => e
   p e.class, e.receiver, e.name
 end
+#==#
+# `Range#step` / `Range#%` / `Numeric#step` answer an
+# Enumerator::ArithmeticSequence, not an Array: it carries its own class, the
+# four readers, and an `inspect` that reproduces the call that built it.
+a = (1..10).step(3)
+p a, a.class, a.to_a, a.size
+p a.begin, a.end, a.step, a.exclude_end?
+p (1...10).step(3).exclude_end?, (1...10).step(3).to_a, (1...10).step(3).size
+p (1..10) % 3
+p ((1..10) % 3).class, ((1..10) % 3).to_a
+p a == (1..10) % 3, a.eql?((1..10) % 3), a.hash == ((1..10) % 3).hash
+p a == (1..10).step(4), a == [1, 4, 7, 10]
+p a === 4
+p (1..10).step, (1..10).step.to_a
+p a.is_a?(Enumerator), a.instance_of?(Enumerator), a.is_a?(Enumerable)
+p Enumerator.ancestors
+p a.first, a.first(2), a.last, a.last(2), a.min, a.max, a.sum
+p a.map { |x| x * 2 }, a.select { |x| x > 3 }, a.include?(4), a.include?(5)
+p a.each_slice(2).to_a, a.reverse_each.to_a, a.each_with_index.to_a
+p a.lazy, a.lazy.map { |x| x * 2 }.first(2)
+p a.next, a.next
+p a.each { |x| }.class
+b = []
+(1..10).step(3) { |x| b << x }
+p b, ((1..10).step(3) { |x| })
+h = { (1..10).step(3) => :hit }
+p h[(1..10) % 3], h.keys.first
+p [(1..10).step(3), (1..10) % 3].uniq.size
+#==#
+# The same for the Float, endless and beginless forms, and for `Numeric#step`.
+p (1.0..2.0).step(0.5), (1.0..2.0).step(0.5).to_a, (1.0..2.0).step(0.5).size
+p (1.0..2.0).step(0.5).begin, (1.0..2.0).step(0.5).step
+p (1..10).step(2.5), (1..10).step(2.5).to_a, (1..10).step(2.5).class
+p (1..10).step(-1).to_a, (10..1).step(3).to_a
+begin
+  (1..10).step(0)
+rescue ArgumentError => e
+  p e.class, e.message
+end
+e = (1..).step(3)
+p e, e.class, e.begin, e.end, e.exclude_end?, e.size
+p e.first(4), (1..).step(2).take(3), (1..).step(2.5).first(3)
+p (1..).step(3).each_slice(2).first(2), (1..).step(3).lazy.first(3)
+begin
+  (1..).step(3).last
+rescue RangeError => e2
+  p e2.class, e2.message
+end
+f = (..10).step(3)
+p f, f.begin, f.end, f.step, f.exclude_end?, f.first
+begin
+  f.to_a
+rescue TypeError => e3
+  p e3.class, e3.message
+end
+p 1.step(10, 3), 1.step(10, 3).class, 1.step(10, 3).to_a, 1.step(10, 3).size
+p 1.step(10, 3).begin, 1.step(10, 3).end, 1.step(10, 3).step
+p 1.step(by: 3, to: 10), 1.step(by: 3, to: 10).to_a
+p 1.step(by: 3), 1.step(by: 3).first(4), 1.step.size
+p 1.0.step(2.0, 0.5), 1.0.step(2.0, 0.5).to_a
+p 1.step(Float::INFINITY, 3).first(4), 1.step(-Float::INFINITY, 3).first(3)
+#==#
+# An endless / beginless Range renders its open side as NOTHING, not as the
+# i64 sentinel the implementation stores it as.
+p (1..), (..10), (1...), (...10)
+p (1..).inspect, (..10).to_s
+p [(1..), (..10)]
+p({ (1..) => 1 })

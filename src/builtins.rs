@@ -1697,6 +1697,7 @@ pub(crate) fn dispatch_by_type(
         "Date" => dispatch_date(recv, name, args),
         "DateTime" => dispatch_datetime(recv, name, args),
         "Enumerator" => dispatch_enumerator(recv, name, args, block),
+        "Enumerator::ArithmeticSequence" => dispatch_arith_seq(recv, name, args, block),
         "Fiber" => dispatch_fiber(recv, name, args),
         "Thread" => dispatch_thread(recv, name, args),
         "IO" | "File" => dispatch_io(recv, name, args, block),
@@ -2158,7 +2159,20 @@ pub(crate) fn dispatch(
         // `.lazy` wraps an enumerable in a lazy pipeline. A range (possibly
         // endless) stays a range source; anything else materializes to an array.
         "lazy" if with_host(|h| h.lazy_parts(recv)).is_none() => {
-            let source = if with_host(|h| {
+            // An `Enumerator::ArithmeticSequence` is lazy over the enumerator (or,
+            // when endless, the generator) it wraps. Materializing the sequence
+            // itself is what the `else` branch below would do, and for an endless
+            // one that never returns.
+            let source = if let Some(seq) = with_host(|h| h.arith_seq(recv)) {
+                if with_host(|h| h.generator_block(&seq.inner).is_some()) {
+                    seq.inner
+                } else {
+                    // A finite sequence's inner IS an Enumerator, which the
+                    // `else` branch's own comment explains cannot be read as an
+                    // array — so materialize it the same way.
+                    dispatch(&seq.inner, "to_a", &[], None)?
+                }
+            } else if with_host(|h| {
                 h.as_range(recv).is_some()
                     || h.as_array(recv).is_some()
                     || h.generator_block(recv).is_some()
@@ -6005,9 +6019,8 @@ fn dispatch_number(
                 // A Float anywhere switches to `ruby_float_step`'s `i·by + from`.
                 let float = matches!(recv, Value::Float(_)) || matches!(by_val, Value::Float(_));
                 let Some(bl) = &block else {
-                    return Ok(with_host(|h| {
-                        h.new_step_enumerator(recv.clone(), by_val, float)
-                    }));
+                    let desc = arith_call_desc(&with_host(|h| h.inspect(recv)), "step", args);
+                    return Ok(make_endless_arith_seq(desc, recv.clone(), by_val, float));
                 };
                 if float {
                     let (base, unit) = (as_f(recv), as_f(&by_val));
@@ -6059,7 +6072,15 @@ fn dispatch_number(
                         vals.push(Value::Int(i));
                         i += by;
                     }
-                    return Ok(with_host(|h| h.new_enumerator(vals, "each")));
+                    let desc = arith_call_desc(&with_host(|h| h.inspect(recv)), "step", args);
+                    return Ok(make_arith_seq(
+                        desc,
+                        recv.clone(),
+                        to.clone(),
+                        Value::Int(by),
+                        false,
+                        vals,
+                    ));
                 }
             } else {
                 let from = as_f(recv);
@@ -6072,13 +6093,28 @@ fn dispatch_number(
                     if (by > 0.0) != (to > 0.0) {
                         return match &block {
                             Some(_) => Ok(recv.clone()),
-                            None => Ok(with_host(|h| h.new_enumerator(Vec::new(), "each"))),
+                            None => {
+                                let desc =
+                                    arith_call_desc(&with_host(|h| h.inspect(recv)), "step", args);
+                                Ok(make_arith_seq(
+                                    desc,
+                                    recv.clone(),
+                                    Value::Float(to),
+                                    Value::Float(by),
+                                    false,
+                                    Vec::new(),
+                                ))
+                            }
                         };
                     }
                     let Some(bl) = &block else {
-                        return Ok(with_host(|h| {
-                            h.new_step_enumerator(Value::Float(from), Value::Float(by), true)
-                        }));
+                        let desc = arith_call_desc(&with_host(|h| h.inspect(recv)), "step", args);
+                        return Ok(make_endless_arith_seq(
+                            desc,
+                            Value::Float(from),
+                            Value::Float(by),
+                            true,
+                        ));
                     };
                     let mut i = 0.0f64;
                     loop {
@@ -6130,7 +6166,15 @@ fn dispatch_number(
                         vals.push(Value::Float(clamp(i)));
                         i += 1.0;
                     }
-                    return Ok(with_host(|h| h.new_enumerator(vals, "each")));
+                    let desc = arith_call_desc(&with_host(|h| h.inspect(recv)), "step", args);
+                    return Ok(make_arith_seq(
+                        desc,
+                        Value::Float(from),
+                        Value::Float(to),
+                        Value::Float(by),
+                        false,
+                        vals,
+                    ));
                 }
             }
             Ok(recv.clone())
@@ -11941,6 +11985,162 @@ fn lazy_pull(
 /// a cursor; every other message is delegated to that buffer as an Array, so
 /// the full Enumerable surface (`map`, `to_a`, `with_index`, `select`, …) keeps
 /// working just as it did when these calls returned a bare array.
+/// How MRI renders the call that produced an `Enumerator::ArithmeticSequence`,
+/// which is what `#inspect` prints: `((1..10).step(3))`, `((1..10).%(3))`,
+/// `(1.step(10, 3))`, `(1.step(by: 3, to: 10))`.
+///
+/// `recv` is the already-rendered receiver — parenthesized for a Range, bare for
+/// a Numeric, exactly as MRI writes them. A keyword Hash argument renders as
+/// bare `k: v` pairs, without the braces `Hash#inspect` would add.
+fn arith_call_desc(recv: &str, meth: &str, args: &[Value]) -> String {
+    if args.is_empty() {
+        return format!("({recv}.{meth})");
+    }
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|a| {
+            with_host(|h| match h.as_hash(a) {
+                Some(kw) => kw
+                    .iter()
+                    .map(|(k, v)| {
+                        let key = h.key_value(k);
+                        format!("{}: {}", h.to_s(&key), h.inspect(&v.clone()))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                None => h.inspect(a),
+            })
+        })
+        .collect();
+    format!("({recv}.{meth}({}))", rendered.join(", "))
+}
+
+/// [`arith_call_desc`] for a Range receiver, which MRI parenthesizes:
+/// `((1..10).step(3))`, `((1..10).%(3))`.
+fn range_arith_desc(recv: &Value, meth: &str, args: &[Value]) -> String {
+    let r = with_host(|h| h.inspect(recv));
+    arith_call_desc(&format!("({r})"), meth, args)
+}
+
+/// Build the `Enumerator::ArithmeticSequence` that `Range#step`, `Range#%` and
+/// `Numeric#step` answer with, over an already-materialized element list.
+///
+/// `desc` is what `#inspect` prints — see [`crate::host::ArithSeq::desc`].
+fn make_arith_seq(
+    desc: String,
+    begin: Value,
+    end: Value,
+    step: Value,
+    exclude_end: bool,
+    vals: Vec<Value>,
+) -> Value {
+    with_host(|h| {
+        let inner = h.new_enumerator(vals, "each");
+        h.new_arith_seq(crate::host::ArithSeq {
+            desc,
+            begin,
+            end,
+            step,
+            exclude_end,
+            inner,
+        })
+    })
+}
+
+/// The same, over an endless element source (`(1..).step(3)`): `inner` is the
+/// limitless step Generator, so a consumer only materializes what it pulls.
+fn make_endless_arith_seq(desc: String, begin: Value, step: Value, float: bool) -> Value {
+    with_host(|h| {
+        let inner = h.new_step_enumerator(begin.clone(), step.clone(), float);
+        h.new_arith_seq(crate::host::ArithSeq {
+            desc,
+            begin,
+            end: Value::Undef,
+            step,
+            exclude_end: false,
+            inner,
+        })
+    })
+}
+
+/// `Enumerator::ArithmeticSequence`. Answers the sequence-specific surface MRI
+/// gives the class — `begin`/`end`/`step`/`exclude_end?`/`inspect` and the
+/// value-based `==`/`eql?`/`hash` — and forwards everything else to the
+/// Enumerator (or Generator) holding the elements, which already implements the
+/// whole Enumerable + external-iteration surface.
+fn dispatch_arith_seq(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    let Some(seq) = with_host(|h| h.arith_seq(recv)) else {
+        return Err(no_method_error(recv, name));
+    };
+    // The four readers are a value tuple, so two sequences built by different
+    // spellings (`(1..10).step(3)` and `(1..10) % 3`) compare equal even though
+    // their `inspect` differs — which is what MRI does.
+    let key = || {
+        new_arr(vec![
+            seq.begin.clone(),
+            seq.end.clone(),
+            seq.step.clone(),
+            Value::Bool(seq.exclude_end),
+        ])
+    };
+    match name {
+        "begin" if args.is_empty() => Ok(seq.begin.clone()),
+        "end" if args.is_empty() => Ok(seq.end.clone()),
+        "step" if args.is_empty() => Ok(seq.step.clone()),
+        "exclude_end?" => Ok(Value::Bool(seq.exclude_end)),
+        "inspect" | "to_s" if args.is_empty() => Ok(new_str(seq.desc.clone())),
+        // `===` is Object's on this class, not membership: MRI answers `false`
+        // for `(1..10).step(3) === 4`.
+        "==" | "eql?" | "===" => {
+            let Some(other) = with_host(|h| h.arith_seq(&args[0])) else {
+                return Ok(Value::Bool(false));
+            };
+            let same = with_host(|h| {
+                h.eq_values(&seq.begin, &other.begin)
+                    && h.eq_values(&seq.end, &other.end)
+                    && h.eq_values(&seq.step, &other.step)
+            });
+            Ok(Value::Bool(same && seq.exclude_end == other.exclude_end))
+        }
+        "hash" if args.is_empty() => dispatch_array(&key(), "hash", &[], None),
+        // `each` with a block answers with the SEQUENCE, not the elements — the
+        // Enumerator underneath would answer with itself, which is not the
+        // object the caller holds.
+        "each" if block.is_some() => {
+            dispatch(&seq.inner, "each", args, block)?;
+            Ok(recv.clone())
+        }
+        // An endless sequence has no size to count and no last element.
+        "size" | "length" if args.is_empty() && matches!(seq.end, Value::Undef) => {
+            Ok(Value::Float(f64::INFINITY))
+        }
+        "last" if matches!(seq.end, Value::Undef) => Err(raise_exc(
+            "RangeError",
+            "cannot get the last element of endless arithmetic sequence",
+        )),
+        // `first` with no count is the one element query a beginless sequence
+        // answers rather than failing — MRI gives nil.
+        "first" if args.is_empty() && matches!(seq.begin, Value::Undef) => Ok(Value::Undef),
+        // Otherwise a beginless sequence cannot be walked: MRI fails coercing the
+        // nil start the moment anything asks for an element.
+        _ if matches!(seq.begin, Value::Undef) => {
+            Err(raise_exc("TypeError", "nil can't be coerced into Integer"))
+        }
+        // Everything else is the Enumerator's. A method that answers with the
+        // enumerator itself (`each` with a block) must answer with THIS object,
+        // since that is the receiver the caller passed.
+        _ => {
+            let r = dispatch(&seq.inner, name, args, block)?;
+            Ok(if r == seq.inner { recv.clone() } else { r })
+        }
+    }
+}
+
 fn dispatch_enumerator(
     recv: &Value,
     name: &str,
@@ -15555,6 +15755,19 @@ fn dispatch_range(
                 }
                 return Ok(recv.clone());
             }
+            // A block-less `step`/`%` answers with an ENDLESS
+            // `Enumerator::ArithmeticSequence`: its elements are pulled from the
+            // limitless step generator, so `(1..).step(3).first(4)` is bounded by
+            // the consumer rather than by materializing the range.
+            "step" | "%" if block.is_none() => {
+                let by = args.first().cloned().unwrap_or(Value::Int(1));
+                if with_host(|h| h.eq_values(&by, &Value::Int(0))) {
+                    return Err(raise_exc("ArgumentError", "step can't be 0"));
+                }
+                let float = matches!(by, Value::Float(_));
+                let desc = range_arith_desc(recv, name, args);
+                return Ok(make_endless_arith_seq(desc, Value::Int(lo), by, float));
+            }
             // A block-less enumerator method answers with a lazy Enumerator over
             // `lo, lo+1, …` — `(1..).each_slice(2).first(2)` must not try to
             // materialize the range.
@@ -15578,6 +15791,21 @@ fn dispatch_range(
                 return Ok(Value::Bool(if excl { n < hi } else { n <= hi }));
             }
             "end" | "last" | "max" => return Ok(Value::Int(if excl { hi - 1 } else { hi })),
+            // `(..10).step(3)` BUILDS: MRI answers an
+            // `Enumerator::ArithmeticSequence` whose `begin` is nil, and only
+            // fails when something asks it for an element.
+            "step" | "%" if block.is_none() => {
+                let by = args.first().cloned().unwrap_or(Value::Int(1));
+                let desc = range_arith_desc(recv, name, args);
+                return Ok(make_arith_seq(
+                    desc,
+                    Value::Undef,
+                    Value::Int(hi),
+                    by,
+                    excl,
+                    Vec::new(),
+                ));
+            }
             _ => return Err(raise_exc("TypeError", "can't iterate from NilClass")),
         }
     }
@@ -15638,7 +15866,7 @@ fn dispatch_range(
             let n = as_i(&args[0]);
             Ok(Value::Bool(n >= lo && n < end))
         }
-        "step" => {
+        "step" | "%" => {
             // A Float step over an Integer range steps in Float space, matching
             // Ruby (`(1..2).step(0.5)` → `[1.0, 1.5, 2.0]`).
             if matches!(args.first(), Some(Value::Float(_))) {
@@ -15657,10 +15885,18 @@ fn dispatch_range(
                         }
                         Ok(recv.clone())
                     }
-                    None => Ok(with_host(|h| h.new_enumerator(vals, "each"))),
+                    None => Ok(make_arith_seq(
+                        range_arith_desc(recv, name, args),
+                        Value::Int(lo),
+                        Value::Int(hi),
+                        Value::Float(by),
+                        excl,
+                        vals,
+                    )),
                 };
             }
-            let n = as_i(&args[0]);
+            // A bare `(1..10).step` steps by 1.
+            let n = args.first().map(as_i).unwrap_or(1);
             // Only a ZERO step is refused. A negative step over an ascending
             // range simply produces nothing — the older `step can't be negative`
             // wording was applied to both, so `step(0)` reported the wrong
@@ -15682,7 +15918,14 @@ fn dispatch_range(
                 }
                 Ok(recv.clone())
             } else {
-                Ok(new_arr(vals))
+                Ok(make_arith_seq(
+                    range_arith_desc(recv, name, args),
+                    Value::Int(lo),
+                    Value::Int(hi),
+                    Value::Int(n),
+                    excl,
+                    vals,
+                ))
             }
         }
         "each" => {
@@ -15827,7 +16070,14 @@ fn dispatch_float_range(
                     }
                     Ok(recv.clone())
                 }
-                None => Ok(with_host(|h| h.new_enumerator(vals, "each"))),
+                None => Ok(make_arith_seq(
+                    range_arith_desc(recv, name, args),
+                    Value::Float(lo),
+                    Value::Float(hi),
+                    args.first().cloned().unwrap_or(Value::Int(1)),
+                    excl,
+                    vals,
+                )),
             }
         }
         "to_s" | "inspect" => Ok(new_str(with_host(|h| h.to_s(recv)))),
