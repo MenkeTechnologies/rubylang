@@ -170,6 +170,10 @@ pub mod ops {
                                         // as a zero-arg method call — which is what separates it from `GETLOCAL`,
                                         // whose name might still turn out to be a method.
     pub const GETLOCAL_DECLARED: u16 = 57; // [name] -> value or nil
+                                           // Tag the Hash on top of the stack as a call's KEYWORD arguments and leave
+                                           // it there. See `Expr::KwArgs`: it is what tells `bind_params` this hash may
+                                           // bind to keyword parameters, which a positionally-written Hash may not.
+    pub const MARK_KWARGS: u16 = 58; // [hash] -> the same hash
 }
 
 /// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried
@@ -1320,6 +1324,14 @@ pub struct RubyHost {
     /// (see `multi_yield_consume`). Object ids are never reused, so an id here
     /// always names the same pack.
     multi_yield_packs: HashSet<u32>,
+    /// Hashes that were written as a call's KEYWORD arguments, by object id.
+    ///
+    /// Ruby 3 separated keywords from positionals, and after parsing the two are
+    /// the same Hash — so which one was written has to be recorded. Only a hash
+    /// listed here may bind to a callee's keyword parameters; a Hash passed
+    /// positionally stays the last positional argument, and the callee's arity
+    /// judges it as one. See `Expr::KwArgs` and `bind_params`.
+    kwargs_hashes: HashSet<u32>,
     /// A LIFO stack of pending around-advice weaves (see `AroundCall`). A native
     /// `ProcKind::Around(idx)` block references `around_stack[idx]`; entries are
     /// valid only for the duration of the top-level around weave that pushed them.
@@ -2049,6 +2061,7 @@ impl RubyHost {
             enum_sinks: Vec::new(),
             rendering: Vec::new(),
             multi_yield_packs: HashSet::new(),
+            kwargs_hashes: HashSet::new(),
             around_stack: Vec::new(),
             threads: Vec::new(),
             queues: Vec::new(),
@@ -3237,6 +3250,16 @@ impl RubyHost {
     /// Whether `v` is such a pack.
     pub fn is_multi_yield(&self, v: &Value) -> bool {
         matches!(v, Value::Obj(id) if self.multi_yield_packs.contains(id))
+    }
+    /// Record that `v` is a call's keyword-argument hash — see `kwargs_hashes`.
+    pub fn mark_kwargs(&mut self, v: &Value) {
+        if let Value::Obj(id) = v {
+            self.kwargs_hashes.insert(*id);
+        }
+    }
+    /// Whether `v` is one, i.e. whether it may bind to keyword parameters.
+    pub fn is_kwargs(&self, v: &Value) -> bool {
+        matches!(v, Value::Obj(id) if self.kwargs_hashes.contains(id))
     }
     /// Open a fresh element buffer and return a native collector `Proc` bound to
     /// it. Passing this block to a user `Enumerable`'s `each` appends every
@@ -6427,7 +6450,10 @@ impl RubyHost {
         let wants_kw = !kwparams.is_empty() || kwsplat.is_some();
         let (positional, kwhash): (&[Value], Option<IndexMap<RKey, Value>>) = if wants_kw {
             match args.last() {
-                Some(v) if matches!(self.obj(v), Some(RObj::Hash { .. })) => {
+                // Only a hash WRITTEN in keyword syntax binds here. Ruby 3
+                // separated the two, so `m(1, {b: 3})` passes two positionals
+                // even when `m` declares `b:` — see `kwargs_hashes`.
+                Some(v) if self.is_kwargs(v) && matches!(self.obj(v), Some(RObj::Hash { .. })) => {
                     (&args[..args.len() - 1], self.as_hash(v))
                 }
                 _ => (args, None),
@@ -9225,7 +9251,11 @@ fn check_call_arity(def: &ArityFacts, args: &[Value]) -> Result<(), String> {
     // not count as positional (`bind_params` splits it the same way).
     let (positional, kwhash) = if wants_kw {
         match args.last() {
-            Some(v) if with_host(|h| h.as_hash(v)).is_some() => {
+            // Only a hash written in KEYWORD syntax is the keyword hash. One
+            // passed positionally is the last positional argument and is counted
+            // as one, which is what makes `m(1, {b: 3})` on `def m(a, b:)` the
+            // ArgumentError MRI raises rather than a silent keyword bind.
+            Some(v) if with_host(|h| h.is_kwargs(v) && h.as_hash(v).is_some()) => {
                 (args.len() - 1, with_host(|h| h.as_hash(v)))
             }
             _ => (args.len(), None),
@@ -9264,6 +9294,29 @@ fn check_call_arity(def: &ArityFacts, args: &[Value]) -> Result<(), String> {
     if !wants_kw {
         return Ok(());
     }
+    // MISSING is reported before UNKNOWN: `def k(x:)` called as `k(a: 1)` is
+    // "missing keyword: :x" in MRI, not "unknown keyword: :a".
+    let missing: Vec<String> = def
+        .kwreq
+        .iter()
+        .filter(|k| {
+            !kwhash
+                .as_ref()
+                .is_some_and(|m| m.contains_key(&RKey::Sym((*k).clone())))
+        })
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        let label = if missing.len() == 1 {
+            "missing keyword"
+        } else {
+            "missing keywords"
+        };
+        return Err(crate::builtins::raise_exc(
+            "ArgumentError",
+            &format!("{label}: {}", kw_list(&missing)),
+        ));
+    }
     // A `**opts` collector absorbs every unlisted keyword, so only a signature
     // without one can have an unknown keyword.
     if !def.has_kwrest {
@@ -9286,27 +9339,6 @@ fn check_call_arity(def: &ArityFacts, args: &[Value]) -> Result<(), String> {
                 &format!("{label}: {}", kw_list(&unknown)),
             ));
         }
-    }
-    let missing: Vec<String> = def
-        .kwreq
-        .iter()
-        .filter(|k| {
-            !kwhash
-                .as_ref()
-                .is_some_and(|m| m.contains_key(&RKey::Sym((*k).clone())))
-        })
-        .cloned()
-        .collect();
-    if !missing.is_empty() {
-        let label = if missing.len() == 1 {
-            "missing keyword"
-        } else {
-            "missing keywords"
-        };
-        return Err(crate::builtins::raise_exc(
-            "ArgumentError",
-            &format!("{label}: {}", kw_list(&missing)),
-        ));
     }
     Ok(())
 }

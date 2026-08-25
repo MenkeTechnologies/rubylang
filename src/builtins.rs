@@ -23,6 +23,7 @@ use unicode_segmentation::UnicodeSegmentation;
 pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::GETLOCAL, b_getlocal);
     vm.register_builtin(ops::GETLOCAL_DECLARED, b_getlocal_declared);
+    vm.register_builtin(ops::MARK_KWARGS, b_mark_kwargs);
     vm.register_builtin(ops::SETLOCAL, b_setlocal);
     vm.register_builtin(ops::GETIVAR, b_getivar);
     vm.register_builtin(ops::SETIVAR, b_setivar);
@@ -441,6 +442,16 @@ fn name_of(v: &Value) -> String {
 /// go looking for a method of that name and — since nothing answers — raise
 /// NameError. `y = (y || 0) + 1` is the shape that depends on this; so is a
 /// name assigned only inside an `if` that did not run.
+/// Tag the Hash on top of the stack as a call's keyword arguments — see
+/// `Expr::KwArgs`. The value is unchanged and handed straight back; only the
+/// fact that it was WRITTEN in keyword syntax is recorded, which is what lets
+/// `bind_params` refuse to bind a positionally-written Hash to keyword params.
+fn b_mark_kwargs(vm: &mut VM, _: u8) -> Value {
+    let v = vm.pop();
+    with_host(|h| h.mark_kwargs(&v));
+    v
+}
+
 fn b_getlocal_declared(vm: &mut VM, _: u8) -> Value {
     let name = name_of(&vm.pop());
     with_host(|h| h.get_local(&name))

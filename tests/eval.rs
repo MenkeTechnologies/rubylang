@@ -8809,3 +8809,87 @@ fn case_equality_against_an_endless_range_does_not_overflow() {
     eq("(1..4) === 4", "true");
     eq("(1...4) === 4", "false");
 }
+
+/// Ruby 3 separated keyword arguments from positional ones: a Hash written
+/// POSITIONALLY stays positional, even when the callee declares keywords.
+///
+/// Before Ruby 3 the two were interchangeable, and rubylang still bound any
+/// trailing Hash to the keyword params — so a call MRI rejects ran, and one
+/// whose Hash belongs in a `*rest` lost it to `**opts`:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'def k(a, b: 2); end; k(1, {b: 3})'
+/// -e:1:in 'Object#k': wrong number of arguments (given 2, expected 1) (ArgumentError)
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'def s(*a, **k); p [a, k]; end; s(1, {a: 2})'
+/// [[1, {a: 2}], {}]
+/// ```
+#[test]
+fn a_positionally_written_hash_is_not_keyword_arguments() {
+    // Keyword syntax and `**` splat still bind to keyword params.
+    eq("def k(a, b: 2, **o); [a, b, o]; end; k(1)", "[1, 2, {}]");
+    eq(
+        "def k(a, b: 2, **o); [a, b, o]; end; k(1, b: 3)",
+        "[1, 3, {}]",
+    );
+    eq(
+        "def k(a, b: 2, **o); [a, b, o]; end; k(1, b: 3, c: 4)",
+        "[1, 3, {c: 4}]",
+    );
+    eq(
+        "def k(a, b: 2, **o); [a, b, o]; end; h = {b: 5, c: 6}; k(1, **h)",
+        "[1, 5, {c: 6}]",
+    );
+    // A Hash written positionally is the last POSITIONAL argument.
+    eq(
+        "def s(*a, **k); [a, k]; end; s(1, {a: 2})",
+        "[[1, {a: 2}], {}]",
+    );
+    eq("def s(*a, **k); [a, k]; end; s(1, a: 2)", "[[1], {a: 2}]");
+    // …and the callee's ARITY judges it as one.
+    raises(
+        "def k(a, b: 2); end; k(1, {b: 3})",
+        "ArgumentError",
+        "wrong number of arguments (given 2, expected 1)",
+    );
+    raises(
+        "def m(**k); end; m({a: 1})",
+        "ArgumentError",
+        "wrong number of arguments (given 1, expected 0)",
+    );
+    // A trailing optional Hash param takes either spelling, since neither is
+    // keywords when the signature declares none.
+    eq(
+        "def o(h = {}); h; end; [o(a: 1), o({a: 1}), o]",
+        "[{a: 1}, {a: 1}, {}]",
+    );
+    eq(
+        "def m3(a, o = {}); [a, o]; end; [m3(1, b: 2), m3(1, {b: 2})]",
+        "[[1, {b: 2}], [1, {b: 2}]]",
+    );
+    // The same separation on blocks, lambdas and `...` forwarding.
+    eq("->(a, b: 1) { [a, b] }.call(1, b: 2)", "[1, 2]");
+    eq(
+        "def b(&f); f.call(1, x: 2); end; b { |a, x:| [a, x] }",
+        "[1, 2]",
+    );
+    eq(
+        "def k(a, b: 2); [a, b]; end; def f(...) = k(...); f(1, b: 9)",
+        "[1, 9]",
+    );
+    // A MISSING required keyword is reported ahead of an unknown one.
+    raises(
+        "def k(x:); end; k(a: 1)",
+        "ArgumentError",
+        "missing keyword: :x",
+    );
+    raises(
+        "def k(x:, y:); end; k(a: 1)",
+        "ArgumentError",
+        "missing keywords: :x, :y",
+    );
+    raises(
+        "def k(x:); end; k(x: 1, a: 2)",
+        "ArgumentError",
+        "unknown keyword: :a",
+    );
+}

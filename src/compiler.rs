@@ -251,6 +251,7 @@ fn slot_scan_expr(
                 slot_scan_expr(v, caps, disq, in_closure);
             }
         }
+        Expr::KwArgs(inner) => slot_scan_expr(inner, caps, disq, in_closure),
         Expr::Range { lo, hi, .. } => {
             if let Some(x) = lo {
                 slot_scan_expr(x, caps, disq, in_closure);
@@ -608,6 +609,7 @@ fn for_locals_expr(e: &Expr, out: &mut Vec<String>) {
                 for_locals_expr(v, out);
             }
         }
+        Expr::KwArgs(inner) => for_locals_expr(inner, out),
         Expr::Range { lo, hi, .. } => {
             if let Some(x) = lo {
                 for_locals_expr(x, out);
@@ -666,6 +668,7 @@ fn collect_plain_assigns(e: &Expr, out: &mut Vec<String>) {
             collect_plain_assigns(k, out);
             collect_plain_assigns(v, out);
         }),
+        Expr::KwArgs(inner) => collect_plain_assigns(inner, out),
         Expr::Range { lo, hi, .. } => {
             if let Some(x) = lo {
                 collect_plain_assigns(x, out);
@@ -1256,6 +1259,12 @@ impl Compiler {
                 }
                 self.kstr(b, flags);
                 b.emit(Op::CallBuiltin(ops::MKREGEX, 2), 0);
+            }
+            // The trailing keyword hash of a call: build it, then TAG it, so
+            // `bind_params` can tell it from a Hash written positionally.
+            Expr::KwArgs(inner) => {
+                self.compile_expr(b, inner)?;
+                b.emit(Op::CallBuiltin(ops::MARK_KWARGS, 1), 0);
             }
             Expr::Hash(pairs) => {
                 if pairs.len() * 2 <= 255 {

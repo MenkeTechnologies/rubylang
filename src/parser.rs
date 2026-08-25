@@ -977,7 +977,7 @@ impl Parser {
                 block: None,
             };
         }
-        args.push(trailing);
+        args.push(Expr::KwArgs(Box::new(trailing)));
     }
 
     /// Parse one call argument, recognizing a `key: value` keyword argument, a

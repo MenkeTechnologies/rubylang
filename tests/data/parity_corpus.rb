@@ -4028,3 +4028,41 @@ p (1..), (..10), (1...), (...10)
 p (1..).inspect, (..10).to_s
 p [(1..), (..10)]
 p({ (1..) => 1 })
+#==#
+# Ruby 3 keyword/positional separation: only a hash written in KEYWORD syntax
+# (`k: v`, `**h`) binds to keyword parameters. One written positionally is the
+# last positional argument, and the callee's arity judges it as one.
+def sep_kw(a, b: 2, **opts); [a, b, opts]; end
+p sep_kw(1), sep_kw(1, b: 3), sep_kw(1, b: 3, c: 4)
+sep_h = { b: 5, c: 6 }
+p sep_kw(1, **sep_h)
+begin
+  sep_kw(1, { b: 3 })
+rescue ArgumentError => e
+  p e.class, e.message
+end
+def sep_splat(*a, **k); [a, k]; end
+p sep_splat(1, { a: 2 }), sep_splat(1, a: 2), sep_splat({ a: 2 })
+def sep_kwrest(**k); k; end
+p sep_kwrest(a: 1), sep_kwrest
+begin
+  sep_kwrest({ a: 1 })
+rescue ArgumentError => e
+  p e.message
+end
+def sep_opt(h = {}); h; end
+p sep_opt(a: 1), sep_opt({ a: 1 }), sep_opt
+def sep_mixed(a, b = 1, *rest, c:, d: 4, **o); [a, b, rest, c, d, o]; end
+p sep_mixed(1, c: 3), sep_mixed(1, 2, 3, 4, c: 5, e: 6)
+p ->(a, b: 1) { [a, b] }.call(1, b: 2)
+def sep_blk(&f); f.call(1, x: 2); end
+p sep_blk { |a, x:| [a, x] }
+def sep_fwd(...) = sep_kw(...)
+p sep_fwd(1, b: 9)
+p method(:sep_kw).parameters
+def sep_req(x:); x; end
+begin; sep_req(a: 1); rescue ArgumentError => e; p e.message; end
+begin; sep_req(x: 1, a: 2); rescue ArgumentError => e; p e.message; end
+def sep_req2(x:, y:); [x, y]; end
+begin; sep_req2(a: 1); rescue ArgumentError => e; p e.message; end
+begin; sep_req2; rescue ArgumentError => e; p e.message; end

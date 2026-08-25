@@ -105,6 +105,17 @@ pub enum Expr {
     Array(Vec<Expr>),
     /// key/value pairs; `k => v` and `k: v` both land here.
     Hash(Vec<(Expr, Expr)>),
+    /// The trailing KEYWORD hash of a call — the `k: v` arguments and the `**h`
+    /// splats, already merged into the inner expression.
+    ///
+    /// Ruby 3 separated keywords from positionals: only a hash written in
+    /// keyword syntax at the CALL SITE binds to keyword parameters, while a
+    /// literal Hash passed positionally stays positional even when the callee
+    /// declares keywords. The two are indistinguishable once the parser has
+    /// desugared them to the same `Hash` node, so this wrapper preserves which
+    /// one was written; the compiler lowers it to the hash plus the mark
+    /// `bind_params` reads.
+    KwArgs(Box<Expr>),
     /// `lo..hi` (exclusive=false) / `lo...hi` (exclusive=true).
     /// `lo..hi`. Either bound may be absent for a beginless (`..hi`) or endless
     /// (`lo..`) range.
