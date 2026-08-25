@@ -8893,3 +8893,115 @@ fn a_positionally_written_hash_is_not_keyword_arguments() {
         "unknown keyword: :a",
     );
 }
+
+/// `send` reaches a top-level `def`.
+///
+/// MRI makes a top-level `def` a PRIVATE method on `Object`, so `send` runs it
+/// from any receiver while a plain call does not. rubylang keeps top-level defs
+/// in a flat table that the class lookup never consults, so even `send(:m)` on
+/// `main` reported the method undefined:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'def m; 1; end; p send(:m), 42.send(:m)'
+/// 1
+/// 1
+/// ```
+#[test]
+fn send_reaches_a_top_level_def() {
+    eq("def tl_m; 1; end; send(:tl_m)", "1");
+    eq("def tl_m; 1; end; 42.send(:tl_m)", "1");
+    eq("def tl_m; 1; end; [].__send__(:tl_m)", "1");
+    eq(
+        "def tl_k(a, b:); [a, b]; end; send(:tl_k, 1, b: 2)",
+        "[1, 2]",
+    );
+    eq("def tl_m; 1; end; method(:tl_m).call", "1");
+    // A method the receiver really has still wins — `send` must not shadow it
+    // with a same-named top-level def.
+    eq(
+        "def tl_s; :top; end; class TLS; def tl_s; :own; end; end; TLS.new.send(:tl_s)",
+        ":own",
+    );
+    eq("1.send(:+, 2)", "3");
+}
+
+/// `dup`/`clone` fire the copy hook, and a frozen object refuses ivar writes.
+///
+/// `initialize_copy` is the documented place to deep-copy a class's mutable
+/// state; without it being called, `dup` handed back a copy still SHARING the
+/// original's arrays whatever the class said. And freezing a plain object
+/// freezes its instance variables, which an `attr_writer` was ignoring.
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'class C; attr_accessor :v; def initialize_copy(o); @v = o.v.dup; end; end; c = C.new; c.v = [1]; p c.dup.v.equal?(c.v)'
+/// false
+/// ```
+#[test]
+fn copy_hooks_run_and_a_frozen_object_refuses_writes() {
+    let cls = "class CpH; attr_accessor :v; def initialize_copy(o); @v = o.v.dup; end; end; \
+               c = CpH.new; c.v = [1]; ";
+    eq(&format!("{cls} c.dup.v.equal?(c.v)"), "false");
+    eq(&format!("{cls} c.clone.v.equal?(c.v)"), "false");
+    eq(&format!("{cls} c.dup.v"), "[1]");
+    // No hook defined: the shallow copy still shares, as MRI's default does.
+    eq(
+        "class CpN; attr_accessor :v; end; c = CpN.new; c.v = [1]; c.dup.v.equal?(c.v)",
+        "true",
+    );
+    // The specific hook wins over `initialize_copy` and suppresses it.
+    eq(
+        "class CpS; attr_accessor :v; def initialize_dup(o); @v = :dup; end; \
+         def initialize_copy(o); @v = :copy; end; end; \
+         c = CpS.new; [c.dup.v, c.clone.v]",
+        "[:dup, :copy]",
+    );
+    // `super` from a copy hook reaches Object's, which has nothing left to do.
+    eq(
+        "class CpU; def initialize_copy(o); super; end; end; CpU.new.dup.class",
+        "CpU",
+    );
+    // Freezing an object freezes its ivars.
+    eq(
+        "class Fz; attr_accessor :v; end; f = Fz.new; f.v = 1; f.freeze; \
+         begin; f.v = 2; :no_raise; rescue FrozenError; :raised; end",
+        ":raised",
+    );
+    eq(
+        "class Fz2; attr_accessor :v; end; f = Fz2.new; f.v = 1; f.freeze; f.v",
+        "1",
+    );
+}
+
+/// `Struct#each_pair` without a block, and `Struct#keyword_init?`.
+///
+/// `keyword_init?` is TRI-state in MRI — `nil` when the definition never wrote
+/// `keyword_init:`, which is what distinguishes it from an explicit `false`:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p Struct.new(:x).keyword_init?, Struct.new(:x, keyword_init: false).keyword_init?'
+/// nil
+/// false
+/// ```
+#[test]
+fn struct_each_pair_and_keyword_init() {
+    eq(
+        "S1 = Struct.new(:a, :b); S1.new(1, 2).each_pair.to_a",
+        "[[:a, 1], [:b, 2]]",
+    );
+    eq(
+        "S2 = Struct.new(:a, :b); S2.new(1, 2).each_pair.map { |k, v| [k, v] }",
+        "[[:a, 1], [:b, 2]]",
+    );
+    eq(
+        "S3 = Struct.new(:a, :b); r = []; S3.new(1, 2).each_pair { |k, v| r << [k, v] }; r",
+        "[[:a, 1], [:b, 2]]",
+    );
+    eq("Struct.new(:x).keyword_init?", "nil");
+    eq("Struct.new(:x, keyword_init: true).keyword_init?", "true");
+    eq("Struct.new(:x, keyword_init: false).keyword_init?", "false");
+    // A `keyword_init: true` struct still constructs from keywords.
+    eq(
+        "S4 = Struct.new(:a, :b, keyword_init: true); S4.new(a: 1, b: 2).to_a",
+        "[1, 2]",
+    );
+}

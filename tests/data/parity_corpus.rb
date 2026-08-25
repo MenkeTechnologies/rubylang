@@ -4066,3 +4066,52 @@ begin; sep_req(x: 1, a: 2); rescue ArgumentError => e; p e.message; end
 def sep_req2(x:, y:); [x, y]; end
 begin; sep_req2(a: 1); rescue ArgumentError => e; p e.message; end
 begin; sep_req2; rescue ArgumentError => e; p e.message; end
+#==#
+# A top-level `def` is a private method on Object, so `send` reaches it from any
+# receiver; `dup`/`clone` fire the copy hook; freezing an object freezes its
+# instance variables; and the Struct surface answers `each_pair` without a block
+# and the tri-state `keyword_init?`.
+def par_top; :top; end
+p send(:par_top), 42.send(:par_top), [].__send__(:par_top), method(:par_top).call
+def par_kw(a, b:); [a, b]; end
+p send(:par_kw, 1, b: 2)
+class ParOwn; def par_top; :own; end; end
+p ParOwn.new.send(:par_top)
+class ParCopy
+  attr_accessor :v
+  def initialize_copy(o); @v = o.v.dup; end
+end
+pc = ParCopy.new
+pc.v = [1]
+p pc.dup.v, pc.dup.v.equal?(pc.v), pc.clone.v.equal?(pc.v)
+class ParShare; attr_accessor :v; end
+ps = ParShare.new
+ps.v = [1]
+p ps.dup.v.equal?(ps.v)
+class ParBoth
+  attr_accessor :v
+  def initialize_dup(o); @v = :dup; end
+  def initialize_copy(o); @v = :copy; end
+end
+p ParBoth.new.dup.v, ParBoth.new.clone.v
+class ParSuper; def initialize_copy(o); super; end; end
+p ParSuper.new.dup.class
+class ParFrozen; attr_accessor :v; end
+pf = ParFrozen.new
+pf.v = 1
+pf.freeze
+p pf.v, pf.frozen?
+begin
+  pf.v = 2
+  p :no_raise
+rescue FrozenError => e
+  p e.class
+end
+ParS = Struct.new(:a, :b)
+p ParS.new(1, 2).each_pair.to_a
+p ParS.new(1, 2).each_pair.map { |k, v| [k, v] }
+p ParS.keyword_init?
+p Struct.new(:x, keyword_init: true).keyword_init?
+p Struct.new(:x, keyword_init: false).keyword_init?
+ParK = Struct.new(:a, :b, keyword_init: true)
+p ParK.new(a: 1, b: 2).to_a

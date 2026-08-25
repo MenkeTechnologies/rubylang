@@ -683,6 +683,21 @@ fn b_getivar(vm: &mut VM, _: u8) -> Value {
 fn b_setivar(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let name = name_of(&vm.pop());
+    // Freezing an object freezes its INSTANCE VARIABLES — that is what freezing
+    // a plain Ruby object means, and without the check a frozen object's
+    // `attr_writer` silently mutated it where MRI raises.
+    let this = with_host(|h| h.current_self());
+    if with_host(|h| h.is_frozen(&this) && h.object_class(&this).is_some()) {
+        let (cls, insp) = with_host(|h| (h.class_of(&this).to_string(), h.inspect(&this)));
+        return abort(
+            vm,
+            raise_exc_with(
+                "FrozenError",
+                &format!("can't modify frozen {cls}: {insp}"),
+                &[("receiver", this)],
+            ),
+        );
+    }
     with_host(|h| h.set_ivar(&name, val.clone()));
     val
 }
@@ -1825,6 +1840,59 @@ fn check_builtin_arity(
     ))
 }
 
+/// Run the copy hook a `dup`/`clone` of a USER object fires: `specific`
+/// (`initialize_dup` / `initialize_clone`) when the class defines one, else
+/// `initialize_copy`.
+///
+/// MRI's `initialize_dup`/`initialize_clone` default to calling
+/// `initialize_copy`, which is the hook a class overrides to deep-copy its
+/// mutable state — without it, `dup` handed back a copy sharing the original's
+/// arrays and hashes whatever the class said. A class that overrides the
+/// specific hook and does not call `super` deliberately bypasses
+/// `initialize_copy`, so only one of the two ever runs.
+fn run_copy_hook(copy: &Value, orig: &Value, specific: &str) -> Result<(), String> {
+    let Some(cls) = with_host(|h| h.object_class(copy)) else {
+        return Ok(());
+    };
+    let defined = |m: &str| {
+        with_host(|h| {
+            h.find_method_owner(&cls, m).is_some() || h.find_define_method(&cls, m).is_some()
+        })
+    };
+    let hook = if defined(specific) {
+        specific
+    } else if defined("initialize_copy") {
+        "initialize_copy"
+    } else {
+        return Ok(());
+    };
+    dispatch(copy, hook, std::slice::from_ref(orig), None).map(|_| ())
+}
+
+/// The top-level `def` named `m`, when ordinary dispatch on `recv` would not
+/// find a method by that name.
+///
+/// MRI makes a top-level `def` a PRIVATE method on `Object`, so `send` reaches
+/// it from any receiver (`42.send(:m)` runs it) while a plain `42.m` does not.
+/// rubylang keeps top-level defs in a flat table that a class lookup never
+/// consults, so `send` — including `send` on `main` itself — reported the method
+/// as undefined.
+fn top_level_method_for(recv: &Value, m: &str) -> Option<crate::host::MethodDef> {
+    let visible = with_host(|h| {
+        if h.find_singleton_method(recv, m).is_some()
+            || h.find_singleton_define_method(recv, m).is_some()
+        {
+            return true;
+        }
+        let cls = h.object_class(recv).unwrap_or_else(|| h.class_of(recv));
+        h.find_method_owner(&cls, m).is_some() || h.find_define_method(&cls, m).is_some()
+    });
+    if visible {
+        return None;
+    }
+    with_host(|h| h.method_def(m))
+}
+
 pub(crate) fn dispatch(
     recv: &Value,
     name: &str,
@@ -2017,7 +2085,11 @@ pub(crate) fn dispatch(
         // `dup` makes a fresh shallow copy so mutating the copy does not leak back
         // to the original; the copy is never frozen. `clone` also shallow-copies
         // but preserves the frozen state of the original.
-        "dup" => return Ok(with_host(|h| h.dup_value(recv))),
+        "dup" => {
+            let copy = with_host(|h| h.dup_value(recv));
+            run_copy_hook(&copy, recv, "initialize_dup")?;
+            return Ok(copy);
+        }
         // Unary plus (`+@`): on a String, a mutable copy when the receiver is
         // frozen (`buf = +""` under frozen_string_literal), else the receiver
         // itself; a no-op returning self for every other type (numbers included).
@@ -2053,13 +2125,15 @@ pub(crate) fn dispatch(
                 Some(v) => with_host(|h| h.truthy(v)),
                 None => with_host(|h| h.is_frozen(recv)),
             };
-            return Ok(with_host(|h| {
-                let copy = h.dup_value(recv);
-                if freeze {
-                    h.freeze_value(&copy);
-                }
-                copy
-            }));
+            let copy = with_host(|h| h.dup_value(recv));
+            // The hook runs BEFORE the frozen flag is carried over: MRI copies
+            // into a still-mutable object and freezes it afterwards, so a
+            // `initialize_copy` that writes ivars works on a frozen original.
+            run_copy_hook(&copy, recv, "initialize_clone")?;
+            if freeze {
+                with_host(|h| h.freeze_value(&copy));
+            }
+            return Ok(copy);
         }
         // Immediates (Integer/Float/true/false/nil) and Symbols are always frozen
         // in Ruby; a mutable reference type reports frozen only after `freeze`.
@@ -2259,6 +2333,9 @@ pub(crate) fn dispatch(
         // private method when the receiver IS `self`, `public_send` never does.
         "send" | "__send__" => {
             let m = name_of(&args[0]);
+            if let Some(def) = top_level_method_for(recv, &m) {
+                return crate::host::run_top_method(&def, recv.clone(), &m, &args[1..], block);
+            }
             return dispatch(recv, &m, &args[1..], block);
         }
         "public_send" => {
@@ -2982,15 +3059,17 @@ fn dispatch_classref(
     // returns a reference to it (usually assigned to a constant).
     if cls == "Struct" && name == "new" {
         let mut members = Vec::new();
-        let mut keyword_init = false;
+        // `None` until a `keyword_init:` is actually written: MRI's
+        // `keyword_init?` distinguishes "not specified" (nil) from an explicit
+        // `false`.
+        let mut keyword_init: Option<bool> = None;
         for a in args {
             if let Some(sym) = with_host(|h| h.as_symbol(a)) {
                 members.push(sym);
             } else if let Some(kw) = with_host(|h| h.as_hash(a)) {
-                keyword_init = kw
-                    .get(&RKey::Sym("keyword_init".into()))
-                    .map(|v| with_host(|h| h.truthy(v)))
-                    .unwrap_or(false);
+                if let Some(v) = kw.get(&RKey::Sym("keyword_init".into())) {
+                    keyword_init = Some(with_host(|h| h.truthy(v)));
+                }
             }
         }
         let struct_name = with_host(|h| h.define_struct(members, keyword_init));
@@ -3111,7 +3190,7 @@ fn dispatch_classref(
         }
         if name == "new" || name == "[]" {
             let obj = with_host(|h| h.new_object(cls));
-            if keyword_init {
+            if keyword_init == Some(true) {
                 let kw = args.first().and_then(|a| with_host(|h| h.as_hash(a)));
                 for m in &members {
                     let v = kw
@@ -3139,6 +3218,13 @@ fn dispatch_classref(
                 .map(|m| with_host(|h| h.new_symbol(m)))
                 .collect();
             return Ok(new_arr(syms));
+        }
+        // `Struct#keyword_init?` — nil when the definition never wrote one.
+        if name == "keyword_init?" && !with_host(|h| h.is_data_class(cls)) {
+            return Ok(match keyword_init {
+                Some(b) => Value::Bool(b),
+                None => Value::Undef,
+            });
         }
     }
     // `Enumerator.new { |y| ... }` — a block-based generator. The block drives
@@ -4621,6 +4707,20 @@ fn struct_method(
             }
             new_arr(out)
         }
+        // Blockless `each_pair` yields an Enumerator over the `[member, value]`
+        // pairs, matching `each` above — `struct.each_pair.to_a` is how the pairs
+        // are read without a block.
+        "each_pair" if block.is_none() => with_host(|h| {
+            let pairs: Vec<Value> = members
+                .iter()
+                .map(|m| {
+                    let sym = h.new_symbol(m);
+                    let v = h.ivar_of(recv, m);
+                    h.new_array(vec![sym, v])
+                })
+                .collect();
+            h.new_enumerator(pairs, "each")
+        }),
         "each_pair" if block.is_some() => {
             let bl = block.clone().unwrap();
             for (m, v) in members.iter().zip(values()) {

@@ -2488,3 +2488,26 @@ ArgumentError
 "unknown keyword: :a"
 "missing keywords: :x, :y"
 "missing keywords: :x, :y"
+#==#
+:top
+:top
+:top
+:top
+[1, 2]
+:own
+[1]
+false
+false
+true
+:dup
+:copy
+ParSuper
+1
+true
+FrozenError
+[[:a, 1], [:b, 2]]
+[[:a, 1], [:b, 2]]
+nil
+true
+false
+[1, 2]

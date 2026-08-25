@@ -1339,7 +1339,7 @@ pub struct RubyHost {
     /// `Struct.new(:a, :b)` definitions: class name → (member names, keyword_init).
     /// Anonymous structs start as `Struct:N` and are renamed when first assigned
     /// to a constant (`Point = Struct.new(...)`).
-    struct_defs: IndexMap<String, (Vec<String>, bool)>,
+    struct_defs: IndexMap<String, (Vec<String>, Option<bool>)>,
     /// Struct-def names that are actually `Data.define` value classes.
     data_classes: std::collections::HashSet<String>,
     /// `require` names of the stdlib bundled into the binary (`uri`, `csv`,
@@ -4639,7 +4639,7 @@ impl RubyHost {
     }
     /// Register a `Struct.new(...)` definition under a fresh anonymous name and
     /// return that name (used as the class of its instances until renamed).
-    pub fn define_struct(&mut self, members: Vec<String>, keyword_init: bool) -> String {
+    pub fn define_struct(&mut self, members: Vec<String>, keyword_init: Option<bool>) -> String {
         self.struct_counter += 1;
         let name = format!("Struct:{}", self.struct_counter);
         self.struct_defs
@@ -4647,7 +4647,11 @@ impl RubyHost {
         name
     }
     /// The `(members, keyword_init)` of a struct class, if `name` names one.
-    pub fn struct_def(&self, name: &str) -> Option<(Vec<String>, bool)> {
+    ///
+    /// `keyword_init` is MRI's tri-state: `Some(true)`/`Some(false)` when the
+    /// definition passed `keyword_init:`, `None` when it did not — which is
+    /// exactly what `Struct#keyword_init?` reports back.
+    pub fn struct_def(&self, name: &str) -> Option<(Vec<String>, Option<bool>)> {
         self.struct_defs.get(name).cloned()
     }
     /// `Data.define(:x, :y)` — an immutable value class. Reuses the struct member
@@ -4658,7 +4662,7 @@ impl RubyHost {
     pub fn define_data(&mut self, members: Vec<String>) -> String {
         self.struct_counter += 1;
         let name = format!("Struct:{}", self.struct_counter);
-        self.struct_defs.insert(name.clone(), (members, false));
+        self.struct_defs.insert(name.clone(), (members, None));
         self.data_classes.insert(name.clone());
         name
     }
@@ -9890,6 +9894,17 @@ pub fn call_super_blk(
             } else {
                 with_host(|h| h.ivar_of(&self_obj, &field))
             });
+        }
+        // `super` from a copy hook. `Object` really does define
+        // `initialize_copy`/`initialize_dup`/`initialize_clone` in MRI, and the
+        // copy is already made by the time the hook runs, so the base
+        // implementation has nothing left to do — but it must EXIST, since the
+        // documented way to write one is to call `super` first.
+        if matches!(
+            method.as_str(),
+            "initialize_copy" | "initialize_dup" | "initialize_clone"
+        ) {
+            return Ok(self_obj.clone());
         }
         return Err(format!("super: no superclass method '{method}'"));
     };
