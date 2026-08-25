@@ -1638,6 +1638,34 @@ Honest limitations of this surface:
   `deconstruct_keys` honours a requested-key filter (returning only the named
   members, in the requested order) or all members when passed `nil`.
 
+  **What a failed match REPORTS is thinner than MRI's.** The class is right
+  (`NoMatchingPatternError`) and so is the matchee, but the message is the
+  matchee alone where MRI appends the specific check that failed, and there is no
+  `NoMatchingPatternKeyError` subclass:
+
+  ```console
+  $ /opt/homebrew/opt/ruby/bin/ruby -e 'case 9; in String then 1; end'
+  9: String === 9 does not return true (NoMatchingPatternError)
+  $ /opt/homebrew/opt/ruby/bin/ruby -e '{a: 1} => {b:}'
+  {a: 1}: key not found: :b (NoMatchingPatternKeyError)
+  ```
+
+  rubylang reports `9` and `{a: 1}`. MRI's detail is one of six forms —
+  `<pat> === <val> does not return true`, `guard clause does not return true`,
+  `<val> length mismatch (given N, expected M)`, `does not respond to
+  #deconstruct`, `does not respond to #deconstruct_keys`, and `key not found:
+  :k` — and it appears ONLY when the `case` has a single `in` clause; with two or
+  more, MRI also reports the matchee alone.
+
+  This is not a message-formatting gap. `lower_pattern` compiles a pattern to a
+  boolean expression tree (`pcall(v, "===", [subj])` and friends) that the
+  compiler tests with `JumpIfFalse`, so at the point of failure nothing knows
+  WHICH sub-check said no — the information is not merely unformatted, it is
+  never produced. Reporting it means giving the lowering a failure-reason
+  channel, which also has to survive alternatives (`|`) and nesting. The same
+  channel is what `NoMatchingPatternKeyError` needs, since a missing key and a
+  present-but-non-matching value are the same `false` today.
+
 ## `min(n)` / `max(n)` tie order past 7 survivors
 
 `Enumerable#min(n)`, `#max(n)`, `#min_by(n)` and `#max_by(n)` answer the right

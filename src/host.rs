@@ -396,6 +396,15 @@ pub enum RObj {
     /// selects MRI's `ruby_float_step` formula instead — the i-th value is
     /// `i·by + from`, NOT the running sum, and the two disagree on accumulated
     /// error (`0.0.step(by: 0.1).first(7).last` is `0.6000000000000001`).
+    /// `Enumerator.produce(init) { |prev| … }` — the successor function of an
+    /// endless sequence. Not a yielder block: the user's block computes the NEXT
+    /// value from the previous one, so the generator body below is what turns it
+    /// into a stream. `init` absent is MRI's no-seed form, where the block is
+    /// called once with nil to produce the first value.
+    ProduceProc {
+        init: Option<Value>,
+        block: Value,
+    },
     StepProc {
         from: Value,
         by: Value,
@@ -1950,6 +1959,33 @@ pub fn eval_erb_with_locals(src: &str, locals: Vec<(String, Value)>) -> Result<V
 /// `eval("code")` at top level / current self: compile `src` into the running
 /// host (its proc/begin templates appended at the right offset) and run its main
 /// chunk in the current frame. Definitions persist; returns the last value.
+/// Whether the error now unwinding is a `StopIteration`, CONSUMING it when it
+/// is.
+///
+/// `Enumerator.produce` treats one raised inside its block as the end of the
+/// sequence rather than a failure, which is how a producer written against MRI
+/// terminates:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p Enumerator.produce(5) { |x| raise StopIteration if x > 7; x + 1 }.to_a'
+/// [5, 6, 7, 8]
+/// ```
+///
+/// The error channel is a plain `String`, so the CLASS has to come off the
+/// pending exception object rather than the message text.
+fn is_stop_iteration(_e: &str) -> bool {
+    with_host(|h| {
+        let Some(exc) = h.pending_exc.clone() else {
+            return false;
+        };
+        if !h.is_a(&exc, "StopIteration") {
+            return false;
+        }
+        h.pending_exc = None;
+        true
+    })
+}
+
 pub fn eval_in_place(src: &str) -> Result<Value, String> {
     // Source that does not PARSE is a `SyntaxError`, not a `RuntimeError`. The
     // distinction is not cosmetic: `SyntaxError` is a `ScriptError`, so it is
@@ -2771,6 +2807,12 @@ impl RubyHost {
     pub fn new_endless_range_enumerator(&mut self, lo: i64, kind: Derive) -> Value {
         let seq = self.alloc(RObj::SeqProc(lo));
         self.new_derived_enumerator(seq, kind)
+    }
+    /// The Enumerator `Enumerator.produce` answers with: `init`, then the block
+    /// applied to each previous value, forever.
+    pub fn new_produce_enumerator(&mut self, init: Option<Value>, block: Value) -> Value {
+        let seq = self.alloc(RObj::ProduceProc { init, block });
+        self.new_generator(seq)
     }
     /// The Enumerator a limitless `Numeric#step` answers with: `from`,
     /// `from + by`, … forever, materialized only as far as a consumer pulls.
@@ -4134,6 +4176,7 @@ impl RubyHost {
                 | Some(RObj::CycleProc(_))
                 | Some(RObj::SeqProc(_))
                 | Some(RObj::StepProc { .. })
+                | Some(RObj::ProduceProc { .. })
                 | Some(RObj::DeriveProc { .. })
         )
     }
@@ -7103,6 +7146,7 @@ impl RubyHost {
                 | Some(RObj::CycleProc(_))
                 | Some(RObj::SeqProc(_))
                 | Some(RObj::StepProc { .. })
+                | Some(RObj::ProduceProc { .. })
                 | Some(RObj::DeriveProc { .. }) => "#<Proc>".to_string(),
                 // MRI renders the DEFINING module, not the receiver's class, and
                 // tags an UnboundMethod as one. (MRI also appends the written
@@ -7484,6 +7528,7 @@ impl RubyHost {
                 | Some(RObj::CycleProc(_))
                 | Some(RObj::SeqProc(_))
                 | Some(RObj::StepProc { .. })
+                | Some(RObj::ProduceProc { .. })
                 | Some(RObj::DeriveProc { .. }) => "Proc",
                 // An UnboundMethod is its own class in MRI, with its own surface
                 // (`bind`/`bind_call` but no `call`/`receiver`), so it must not
@@ -11708,6 +11753,35 @@ pub fn call_proc_self_ctx(
                     return Ok(Value::Undef);
                 }
                 i += 1;
+            }
+        }
+        // The `Enumerator.produce` generator body: yield the seed, then the
+        // block's value for each previous one, forever — until the yielder's
+        // limit breaks out, or the block raises `StopIteration`, which MRI
+        // treats as the end of the sequence rather than an error.
+        Some(RObj::ProduceProc { init, block }) => {
+            let Some(yielder) = args.first().cloned() else {
+                return Err("no yielder is available".to_string());
+            };
+            // No seed: the block is called once with nil for the first value.
+            let mut cur = match init {
+                Some(v) => v,
+                None => match call_proc(&block, &[Value::Undef]) {
+                    Ok(v) => v,
+                    Err(e) if is_stop_iteration(&e) => return Ok(Value::Undef),
+                    Err(e) => return Err(e),
+                },
+            };
+            loop {
+                crate::builtins::dispatch(&yielder, "<<", std::slice::from_ref(&cur), None)?;
+                if has_pending_signal() {
+                    return Ok(Value::Undef);
+                }
+                cur = match call_proc(&block, std::slice::from_ref(&cur)) {
+                    Ok(v) => v,
+                    Err(e) if is_stop_iteration(&e) => return Ok(Value::Undef),
+                    Err(e) => return Err(e),
+                };
             }
         }
         // The limitless-`step` generator body: add `by` forever until the

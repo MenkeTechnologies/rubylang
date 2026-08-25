@@ -4265,3 +4265,32 @@ p SyntaxError.superclass, SyntaxError.ancestors.include?(StandardError)
 p eval("1+1"), eval("[1,2].map { |x| x * 2 }")
 begin; 42.zzz_undefined; rescue NoMethodError => e; p e.message; end
 begin; "a".zzz_undefined; rescue NoMethodError => e; p e.receiver, e.name; end
+#==#
+# `Enumerator.produce` — an endless enumerator whose block computes the NEXT
+# value from the previous one — and the generated surface a Struct / Data
+# instance reports itself as responding to.
+p Enumerator.produce(1) { |x| x * 2 }.first(5)
+p Enumerator.produce(1) { |x| x + 1 }.take(3)
+p Enumerator.produce(1) { |x| x * 3 }.first(4)
+p Enumerator.produce("a") { |s| s + "a" }.first(3)
+p Enumerator.produce { |_x| 3 }.first(2)
+p Enumerator.produce(5) { |x| raise StopIteration if x > 7; x + 1 }.to_a
+p Enumerator.produce(2) { |x| raise StopIteration if x > 20; x * x }.to_a
+p Enumerator.produce(1) { |x| x + 1 }.lazy.map { |v| v * 2 }.first(3)
+p Enumerator.produce(1) { |x| x + 1 }.lazy.select(&:even?).first(3)
+p Enumerator.produce(1) { |x| x + 1 }.each_slice(2).first(2)
+p Enumerator.produce(1) { |x| x + 1 }.each_cons(2).first(2)
+p Enumerator.produce([0, 1]) { |a, b| [b, a + b] }.first(3)
+p Enumerator.produce(1) { |x| x + 1 }.class
+par_e = Enumerator.produce(1) { |x| x + 1 }
+p par_e.next, par_e.next, par_e.next
+begin; Enumerator.produce; rescue ArgumentError => e; p e.message; end
+ParSRt = Struct.new(:x, :y)
+par_s = ParSRt.new(1, 2)
+p par_s.respond_to?(:each), par_s.respond_to?(:each_pair), par_s.respond_to?(:size)
+p par_s.respond_to?(:x), par_s.respond_to?(:x=), par_s.respond_to?(:nope)
+p par_s.respond_to?(:map), par_s.respond_to?(:to_h), par_s.respond_to?(:deconstruct)
+ParDRt = Data.define(:a)
+par_d = ParDRt.new(a: 1)
+p par_d.respond_to?(:a), par_d.respond_to?(:to_h), par_d.respond_to?(:with)
+p par_d.respond_to?(:a=), par_d.respond_to?(:each), par_d.respond_to?(:nope)

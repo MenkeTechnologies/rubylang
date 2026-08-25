@@ -9481,3 +9481,83 @@ fn a_parse_failure_raises_a_syntax_error() {
         "undefined method 'zzz_undefined' for an instance of Integer",
     );
 }
+
+/// `Enumerator.produce`, and the generated surface a Struct / Data instance
+/// reports itself as responding to.
+///
+/// `produce` did not exist. Its block is not a yielder block — it computes the
+/// NEXT value from the previous one — so it needs its own generator body, and it
+/// is endless, which is the point: the consumer bounds it.
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p Enumerator.produce(1) { |x| x * 2 }.first(5)'
+/// [1, 2, 4, 8, 16]
+/// ```
+///
+/// Separately, a Struct answered `respond_to?(:each)` FALSE while `each` itself
+/// worked — the wrong way round for duck typing, and what a `respond_to?` guard
+/// in library code branches on.
+#[test]
+fn enumerator_produce_and_the_generated_struct_surface() {
+    eq(
+        "Enumerator.produce(1) { |x| x * 2 }.first(5)",
+        "[1, 2, 4, 8, 16]",
+    );
+    eq("Enumerator.produce(1) { |x| x + 1 }.take(3)", "[1, 2, 3]");
+    eq(
+        "Enumerator.produce(1) { |x| x * 3 }.first(4)",
+        "[1, 3, 9, 27]",
+    );
+    eq(
+        r#"Enumerator.produce("a") { |s| s + "a" }.first(3)"#,
+        r#"["a", "aa", "aaa"]"#,
+    );
+    // No seed: the block is called once with nil for the first value.
+    eq("Enumerator.produce { |x| 3 }.first(2)", "[3, 3]");
+    // `StopIteration` inside the block ENDS the sequence rather than raising.
+    eq(
+        "Enumerator.produce(5) { |x| raise StopIteration if x > 7; x + 1 }.to_a",
+        "[5, 6, 7, 8]",
+    );
+    // It stays endless — every consumer below has to bound it itself.
+    eq(
+        "Enumerator.produce(1) { |x| x + 1 }.lazy.map { |v| v * 2 }.first(3)",
+        "[2, 4, 6]",
+    );
+    eq(
+        "Enumerator.produce(1) { |x| x + 1 }.lazy.select(&:even?).first(3)",
+        "[2, 4, 6]",
+    );
+    eq(
+        "Enumerator.produce(1) { |x| x + 1 }.each_slice(2).first(2)",
+        "[[1, 2], [3, 4]]",
+    );
+    eq(
+        "Enumerator.produce([0, 1]) { |a, b| [b, a + b] }.first(3)",
+        "[[0, 1], [1, 1], [1, 2]]",
+    );
+    eq("Enumerator.produce(1) { |x| x + 1 }.class", "Enumerator");
+    // External iteration.
+    eq(
+        "e = Enumerator.produce(1) { |x| x + 1 }; [e.next, e.next, e.next]",
+        "[1, 2, 3]",
+    );
+    raises("Enumerator.produce", "ArgumentError", "no block given");
+    // The generated Struct surface reports itself.
+    let st = "SRt = Struct.new(:x, :y); s = SRt.new(1, 2); ";
+    eq(&format!("{st} s.respond_to?(:each)"), "true");
+    eq(&format!("{st} s.respond_to?(:each_pair)"), "true");
+    eq(&format!("{st} s.respond_to?(:size)"), "true");
+    eq(&format!("{st} s.respond_to?(:x)"), "true");
+    eq(&format!("{st} s.respond_to?(:x=)"), "true");
+    eq(&format!("{st} s.respond_to?(:nope)"), "false");
+    // A Data instance is IMMUTABLE, so it has readers but no writers, and no
+    // `each` — it does not mix in Enumerable the way Struct does.
+    let dt = "DRt = Data.define(:a); d = DRt.new(a: 1); ";
+    eq(&format!("{dt} d.respond_to?(:a)"), "true");
+    eq(&format!("{dt} d.respond_to?(:to_h)"), "true");
+    eq(&format!("{dt} d.respond_to?(:with)"), "true");
+    eq(&format!("{dt} d.respond_to?(:a=)"), "false");
+    eq(&format!("{dt} d.respond_to?(:each)"), "false");
+    eq(&format!("{dt} d.respond_to?(:nope)"), "false");
+}

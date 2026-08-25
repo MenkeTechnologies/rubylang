@@ -2428,13 +2428,52 @@ pub(crate) fn dispatch(
                 if mixin_provides(&cls, &m) {
                     return Ok(Value::Bool(true));
                 }
-                // Struct instances respond to the deconstruction protocol even
-                // though those methods are Struct-provided, not user-defined; the
-                // pattern-match gate depends on this being true.
-                if with_host(|h| h.struct_def(&cls)).is_some()
-                    && matches!(m.as_str(), "deconstruct" | "deconstruct_keys")
-                {
-                    return Ok(Value::Bool(true));
+                // A Struct / Data instance responds to the whole GENERATED
+                // surface, none of which is user-defined and so none of which
+                // anything above finds: its members (and, for a Struct, their
+                // writers), the container methods, and the deconstruction
+                // protocol the pattern-match gate depends on. `respond_to?`
+                // answering false while the call itself works is the wrong way
+                // round for duck typing, and it is what a `respond_to?(:each)`
+                // guard in library code branches on.
+                if let Some((members, _)) = with_host(|h| h.struct_def(&cls)) {
+                    let is_data = with_host(|h| h.is_data_class(&cls));
+                    let member = m.strip_suffix('=').unwrap_or(&m);
+                    // A Data instance is immutable, so it has readers but no
+                    // writers.
+                    let is_member =
+                        members.iter().any(|x| x == member) && (!is_data || !m.ends_with('='));
+                    let generated: &[&str] = if is_data {
+                        &[
+                            "to_h",
+                            "with",
+                            "members",
+                            "deconstruct",
+                            "deconstruct_keys",
+                            "==",
+                        ]
+                    } else {
+                        &[
+                            "each",
+                            "each_pair",
+                            "to_a",
+                            "to_h",
+                            "values",
+                            "values_at",
+                            "members",
+                            "size",
+                            "length",
+                            "dig",
+                            "[]",
+                            "[]=",
+                            "deconstruct",
+                            "deconstruct_keys",
+                            "==",
+                        ]
+                    };
+                    if is_member || generated.contains(&m.as_str()) {
+                        return Ok(Value::Bool(true));
+                    }
                 }
                 // OpenStruct responds to a current attribute's reader and writer,
                 // plus the container methods. A writer for a not-yet-set field is
@@ -3263,6 +3302,15 @@ fn dispatch_classref(
     }
     // `Enumerator.new { |y| ... }` — a block-based generator. The block drives
     // the enumerator by sending `<<`/`yield` to the yielder it receives.
+    // `Enumerator.produce(init) { |prev| … }` — an ENDLESS enumerator whose
+    // block computes the next value from the previous one, rather than driving a
+    // yielder. Without an `init` the block is called once with nil for the first
+    // value. Raising `StopIteration` inside the block ends the sequence.
+    if cls == "Enumerator" && name == "produce" {
+        let b = block.ok_or_else(|| raise_exc("ArgumentError", "no block given"))?;
+        let init = args.first().cloned();
+        return Ok(with_host(|h| h.new_produce_enumerator(init, b)));
+    }
     if cls == "Enumerator" && name == "new" {
         let b = block.ok_or_else(|| {
             raise_exc(
