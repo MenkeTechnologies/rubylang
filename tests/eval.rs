@@ -9200,3 +9200,59 @@ fn min_n_and_max_n_use_mris_selection() {
         "comparison of String with 2 failed",
     );
 }
+
+/// `Enumerable#sum` is COMPENSATED summation, and `Range#sum` honours its block.
+///
+/// `sum` is not `inject(:+)`: once a Float joins the total MRI runs
+/// Kahan-Babuška balancing compensated summation, carrying the error each
+/// addition drops and adding it back at the end. Naive left-to-right addition
+/// answers a different number, and in the catastrophic case a wildly different
+/// one:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [0.1, 0.2, 0.3].sum, [1e100, 1.0, -1e100].sum, (1..10).sum { |x| x * 0.5 }'
+/// 0.6
+/// 1.0
+/// 27.5
+/// ```
+///
+/// rubylang answered `0.6000000000000001`, `0.0`, and — because `Range#sum` took
+/// the Gauss closed form unconditionally, ignoring the block AND the init — `55`.
+#[test]
+fn sum_compensates_and_range_sum_honours_its_block() {
+    eq("[0.1, 0.2, 0.3].sum", "0.6");
+    eq("([0.1] * 10).sum", "1.0");
+    eq("[0.1, 0.2, 0.3].sum(0.0)", "0.6");
+    eq("[0.1, 0.2, 0.3].sum(0)", "0.6");
+    eq("[0.1, 0.2, 0.3].sum { |x| x }", "0.6");
+    // Catastrophic cancellation: the compensation is the whole answer.
+    eq("[1e100, 1.0, -1e100].sum", "1.0");
+    eq("[1e100, 1.0, -1e100, -1.0].sum", "0.0");
+    eq("[1, 1e100, 1, -1e100].sum", "2.0");
+    // `inject(:+)` is NOT compensated, and must keep answering the naive total.
+    eq("[0.1, 0.2, 0.3].inject(:+)", "0.6000000000000001");
+    eq("[1, 2, 3].sum { |x| x * 0.1 }", "0.6000000000000001");
+    // Accumulation stays exact until a Float arrives.
+    eq("[1, 2].sum", "3");
+    eq("[1, 2].sum(0.0)", "3.0");
+    eq("[1r, 2r].sum", "(3/1)");
+    eq("[1r, 0.5].sum", "1.5");
+    eq("[1, 0.1].sum", "1.1");
+    // Non-numeric sums still go through `+`.
+    eq("[[1, 2], [3, 4]].sum([])", "[1, 2, 3, 4]");
+    eq(r#"["a", "b"].sum("")"#, r#""ab""#);
+    eq("[].sum", "0");
+    eq("[].sum(0.0)", "0.0");
+    // Infinities and NaN.
+    eq("[Float::INFINITY, 1.0].sum", "Infinity");
+    eq("[Float::INFINITY, -Float::INFINITY].sum.nan?", "true");
+    eq("[Float::NAN].sum.nan?", "true");
+    // Range#sum: the closed form only when it is actually the plain integer sum.
+    eq("(1..10).sum { |x| x * 0.5 }", "27.5");
+    eq("(1..10).sum { |x| x * 2 }", "110");
+    eq("(1..4).sum", "10");
+    eq("(1..4).sum(10)", "20");
+    eq("(1..4).sum(10) { |x| x }", "20");
+    eq("(1..0).sum", "0");
+    eq("(1..3).sum(0.5)", "6.5");
+}

@@ -10205,7 +10205,7 @@ fn dispatch_array(
             Ok(best)
         }
         "sum" => {
-            let mut acc = args.first().cloned().unwrap_or(Value::Int(0));
+            let mut acc = KahanSum::new(args.first().cloned().unwrap_or(Value::Int(0)));
             for x in &arr {
                 let v = match &block {
                     Some(bl) => call_proc(bl, std::slice::from_ref(x))?,
@@ -10217,9 +10217,9 @@ fn dispatch_array(
                 if has_pending_signal() {
                     break;
                 }
-                acc = add_values(&acc, &v)?;
+                acc.add(&v)?;
             }
-            Ok(acc)
+            Ok(acc.finish())
         }
         "uniq" => {
             // With a block, uniqueness is by the block's return value (the key);
@@ -16153,7 +16153,25 @@ fn dispatch_range(
         "max" | "last" | "end" if name != "end" => Ok(Value::Int(if excl { hi - 1 } else { hi })),
         "end" => Ok(Value::Int(hi)),
         "size" | "count" | "length" => Ok(Value::Int((end - lo).max(0))),
-        "sum" => Ok(Value::Int((lo..end).sum())),
+        // The Gauss closed form is only valid for the plain integer sum. MRI
+        // takes it under exactly those conditions (`int_range_sum`) and
+        // otherwise walks the elements — with a block, or an init that is not an
+        // Integer, rubylang answered the bare closed form and so IGNORED both:
+        // `(1..10).sum { |x| x * 0.5 }` was 55 and `(1..4).sum(10)` was 10.
+        "sum" if block.is_none() && matches!(args.first(), None | Some(Value::Int(_))) => {
+            let base = args.first().map(as_i).unwrap_or(0);
+            Ok(Value::Int(base + (lo..end).sum::<i64>()))
+        }
+        "sum" => remap_array_delegate(
+            dispatch_array(
+                &new_arr((lo..end).map(Value::Int).collect()),
+                name,
+                args,
+                block,
+            ),
+            recv,
+            name,
+        ),
         // `cover?` (only) accepts a Range argument (Ruby 2.6+): true when the
         // other range's span lies entirely within self. `include?`/`member?`/
         // `===` treat the argument as a single element, never a sub-range.
@@ -22465,6 +22483,132 @@ fn norm_idx(i: i64, len: usize) -> Option<usize> {
             Some(n as usize)
         } else {
             None
+        }
+    }
+}
+
+/// Port of MRI `enum.c`'s `sum_iter` / `sum_iter_Kahan_Babuska` — the
+/// compensated summation `Enumerable#sum` performs.
+///
+/// `sum` is NOT `inject(:+)`. Once a Float joins the running total MRI switches
+/// to Kahan-Babuška balancing compensated summation, carrying a second `c` term
+/// for the error each addition drops and adding it back at the end. That is
+/// observable in the ordinary case and dramatic in the catastrophic one:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [0.1, 0.2, 0.3].sum, [1e100, 1.0, -1e100].sum'
+/// 0.6
+/// 1.0
+/// ```
+///
+/// Naive left-to-right addition answers `0.6000000000000001` and `0.0`.
+/// Accumulation stays EXACT (Integer/Rational, through the host's own `+`)
+/// until the first Float arrives; only then does the accumulator normalize to a
+/// double and the compensation begin, which is what keeps `[1, 2].sum` an
+/// Integer and `[1r, 2r].sum` a Rational.
+struct KahanSum {
+    /// The exact accumulator, while no Float has been seen.
+    exact: Option<Value>,
+    /// The running double and its compensation, once one has.
+    f: f64,
+    c: f64,
+}
+
+impl KahanSum {
+    /// Start from `init` — `sum(init)`. A Float init begins in float mode, as
+    /// MRI's `memo.float_value = RB_FLOAT_TYPE_P(memo.v)` does.
+    fn new(init: Value) -> Self {
+        match init {
+            Value::Float(x) => KahanSum {
+                exact: None,
+                f: x,
+                c: 0.0,
+            },
+            v => KahanSum {
+                exact: Some(v),
+                f: 0.0,
+                c: 0.0,
+            },
+        }
+    }
+
+    /// The double `v` contributes to a compensated sum, or `None` when it is not
+    /// a number the float path handles (a String, an Array, a user object) — for
+    /// which MRI leaves the float path and resumes ordinary `+`.
+    fn as_double(v: &Value) -> Option<f64> {
+        match v {
+            Value::Int(n) => Some(*n as f64),
+            Value::Float(x) => Some(*x),
+            _ => with_host(|h| {
+                h.as_rational(v)
+                    .map(|r| rational_to_f64(&r))
+                    .or_else(|| h.as_f64(v).filter(|_| h.as_str(v).is_none()))
+            }),
+        }
+    }
+
+    fn add(&mut self, v: &Value) -> Result<(), String> {
+        // Still exact: keep adding through the host's `+` until a Float shows up.
+        if let Some(acc) = self.exact.take() {
+            if !matches!(v, Value::Float(_)) {
+                self.exact = Some(add_values(&acc, v)?);
+                return Ok(());
+            }
+            // First Float: normalize the exact total into `f` and switch.
+            let Some(base) = Self::as_double(&acc) else {
+                self.exact = Some(add_values(&acc, v)?);
+                return Ok(());
+            };
+            self.f = base;
+            self.c = 0.0;
+        }
+        let Some(x) = Self::as_double(v) else {
+            // Not a number: leave the float path, exactly as MRI's
+            // `sum_iter_some_value` fallback does.
+            let acc = Value::Float(self.f + self.c);
+            self.exact = Some(add_values(&acc, v)?);
+            self.f = 0.0;
+            self.c = 0.0;
+            return Ok(());
+        };
+        let f = self.f;
+        if f.is_nan() {
+            return Ok(());
+        }
+        if !x.is_finite() {
+            // Opposite infinities make the total NaN; otherwise the infinity
+            // swallows the sum.
+            self.f = if x.is_infinite()
+                && f.is_infinite()
+                && x.is_sign_negative() != f.is_sign_negative()
+            {
+                f64::NAN
+            } else {
+                x
+            };
+            return Ok(());
+        }
+        if f.is_infinite() {
+            return Ok(());
+        }
+        let t = f + x;
+        // Compensate with whichever operand is smaller in magnitude — that is
+        // the half whose low bits the addition dropped.
+        if f.abs() >= x.abs() {
+            self.c += (f - t) + x;
+        } else {
+            self.c += (x - t) + f;
+        }
+        self.f = t;
+        Ok(())
+    }
+
+    /// The total: the exact accumulator if no Float ever arrived, else the
+    /// compensated `f + c`.
+    fn finish(self) -> Value {
+        match self.exact {
+            Some(v) => v,
+            None => Value::Float(self.f + self.c),
         }
     }
 }

@@ -4174,3 +4174,22 @@ begin; [1, "a"].min(2); rescue ArgumentError => e; p e.message; end
 begin; ["a", 1].min(1); rescue ArgumentError => e; p e.message; end
 begin; [1, 2, "a"].min(2); rescue ArgumentError => e; p e.message; end
 begin; [1, "a"].max(2); rescue ArgumentError => e; p e.message; end
+#==#
+# `Enumerable#sum` is Kahan-Babuska COMPENSATED summation once a Float joins the
+# total — not `inject(:+)` — and `Range#sum` takes the Gauss closed form only
+# when it really is the plain integer sum.
+p [0.1, 0.2, 0.3].sum, ([0.1] * 10).sum
+p [0.1, 0.2, 0.3].sum(0.0), [0.1, 0.2, 0.3].sum(0)
+p [0.1, 0.2, 0.3].sum { |x| x }
+p [1e100, 1.0, -1e100].sum, [1e100, 1.0, -1e100, -1.0].sum, [1, 1e100, 1, -1e100].sum
+p [0.1, 0.2, 0.3].inject(:+), [1, 2, 3].sum { |x| x * 0.1 }
+p [1, 2].sum, [1, 2].sum(0.0), [1r, 2r].sum, [1r, 0.5].sum, [1, 0.1].sum
+p [[1, 2], [3, 4]].sum([]), ["a", "b"].sum("")
+p [].sum, [].sum(0.0), [].sum("")
+p [Float::INFINITY, 1.0].sum, [Float::INFINITY, -Float::INFINITY].sum.nan?
+p [Float::NAN].sum.nan?
+p((1..10).sum { |x| x * 0.5 }, (1..10).sum { |x| x * 2 })
+p((1..4).sum, (1..4).sum(10), (1..4).sum(10) { |x| x }, (1..0).sum)
+p((1..3).sum(0.5))
+p({ a: 0.1, b: 0.2 }.sum { |_k, v| v })
+p (1..3).map { |i| i / 10.0 }.sum
