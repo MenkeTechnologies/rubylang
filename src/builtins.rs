@@ -17647,7 +17647,7 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
         }
         "p" => {
             for a in args {
-                let s = with_host(|h| h.inspect(a));
+                let s = inspect_of(a)?;
                 crate::host::write_stdout(&format!("{s}\n"));
             }
             Ok(match args.len() {
@@ -22229,6 +22229,77 @@ fn remap_array_delegate(
             e
         }
     })
+}
+
+/// The inspect string of a value — a user object's own `inspect` if it defines
+/// one, otherwise the host's default, and recursively for the containers that
+/// can hold one.
+///
+/// The host cannot do this itself. Rendering runs inside a `with_host` borrow,
+/// and calling back into a user method needs that same borrow, so `p obj`
+/// printed the host's `#<A>` for every object however the class defined
+/// `inspect` — at the top level and at any depth inside an Array or Hash. This
+/// is the `inspect` twin of [`display`], which already resolves a user `to_s`
+/// the same way and for the same reason.
+///
+/// A value with no user `inspect` anywhere inside it is handed to the host
+/// whole. That is not just an optimization: the host owns the rendering of
+/// every other shape — the `name: value` shorthand for a symbol key, `[...]`
+/// for a cycle, Struct, Set, Range — and re-deriving any of it here would be a
+/// second implementation to keep in step.
+fn inspect_of(v: &Value) -> Result<String, String> {
+    if !reaches_user_inspect(v, 0) {
+        return Ok(with_host(|h| h.inspect(v)));
+    }
+    if let Some(cls) = with_host(|h| h.object_class(v)) {
+        if with_host(|h| h.find_method(&cls, "inspect")).is_some() {
+            // An `inspect` that raises propagates, as it does in MRI —
+            // swallowing it printed the default `#<A>` for an object whose
+            // rendering had in fact failed.
+            let s = dispatch(v, "inspect", &[], None)?;
+            return Ok(with_host(|h| h.as_str(&s).unwrap_or_default()));
+        }
+    }
+    if let Some(items) = with_host(|h| h.as_array(v)) {
+        let inner: Vec<String> = items.iter().map(inspect_of).collect::<Result<_, _>>()?;
+        return Ok(format!("[{}]", inner.join(", ")));
+    }
+    if let Some(map) = with_host(|h| h.as_hash(v)) {
+        // The same key prefix `PyHost::inspect_hash` writes — literally the
+        // same function — so a hash that happens to hold a user object still
+        // prints its other keys the way every other hash does.
+        let parts: Vec<String> = map
+            .iter()
+            .map(|(k, val)| {
+                let vs = inspect_of(val)?;
+                let prefix = with_host(|h| h.hash_entry_prefix(k));
+                Ok(format!("{prefix}{vs}"))
+            })
+            .collect::<Result<_, String>>()?;
+        return Ok(format!("{{{}}}", parts.join(", ")));
+    }
+    Ok(with_host(|h| h.inspect(v)))
+}
+
+/// Whether `v`, or anything an Array or Hash inside it holds, is an instance
+/// whose class defines `inspect`. Bounded depth so a self-referential container
+/// cannot spin: past it, the host's own cycle guard takes over.
+fn reaches_user_inspect(v: &Value, depth: u32) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    if let Some(cls) = with_host(|h| h.object_class(v)) {
+        if with_host(|h| h.find_method(&cls, "inspect")).is_some() {
+            return true;
+        }
+    }
+    if let Some(items) = with_host(|h| h.as_array(v)) {
+        return items.iter().any(|x| reaches_user_inspect(x, depth + 1));
+    }
+    if let Some(map) = with_host(|h| h.as_hash(v)) {
+        return map.values().any(|x| reaches_user_inspect(x, depth + 1));
+    }
+    false
 }
 
 /// The display string of a value — a user object's own `to_s` if it defines one,

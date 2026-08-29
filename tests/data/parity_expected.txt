@@ -2735,3 +2735,52 @@ false
 :a
 :b
 nil
+#==#
+"comparison of Float with 1 failed"
+"comparison of Integer with NaN failed"
+"comparison of Float with 1 failed"
+"comparison of Float with 1 failed"
+"comparison of Float with NaN failed"
+"comparison of Rational with NaN failed"
+"comparison of String with NaN failed"
+"comparison of Integer with nil failed"
+"comparison of NilClass with 1 failed"
+"comparison of TrueClass with 1 failed"
+"comparison of Float with 1 failed"
+"comparison of Float with 1 failed"
+"comparison of Integer with NaN failed"
+#==#
+[1, 1]
+[1, 1]
+[3, 2]
+[1, 2]
+[(1/1), 1]
+[2.5, (1/1)]
+[[0, :c], [1, :a], [1, :b]]
+[0, :c]
+[1, :a]
+#==#
+20
+99
+7
+8
+4
+6
+5
+3
+:first
+:first
+#==#
+Odd(1)
+[Odd(1), Odd(2)]
+{a: Odd(1), "k" => Odd(2), 1 => Odd(3)}
+[[Odd(1)]]
+{"q w" => Odd(4)}
+"boom"
+"boom"
+[1, "s", :sym, nil, true, 2.5, [1, 2], {a: 1}]
+{1 => 2, "k" => [3], s: {n: nil}}
+[1, [...]]
+{x: {...}}
+#<struct SP1 x=1>
+1..5

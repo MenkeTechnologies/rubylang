@@ -4309,3 +4309,95 @@ par_a = Thread.new { Thread.current[:x] = :a; Thread.current[:x] }
 par_b = Thread.new { Thread.current[:x] = :b; Thread.current[:x] }
 p par_a.value, par_b.value
 p Thread.current[:x]
+#==#
+# Which operand an unrankable comparison names is a property of the METHOD, not
+# just of the pair: `sort_by` ranks (key, value) pairs with the float as the
+# `<=>` receiver, so it disagrees with `sort` on an Integer-against-Float pair
+# and agrees with it on every other.
+def why(&b)
+  b.call
+  "no raise"
+rescue ArgumentError => e
+  e.message
+end
+p why { [1, Float::NAN].sort_by { |x| x } }
+p why { [1, Float::NAN].sort }
+p why { [Float::NAN, 1].sort_by { |x| x } }
+p why { [Float::NAN, 1].sort }
+p why { [1.5, Float::NAN].sort_by { |x| x } }
+p why { [1r, Float::NAN].sort_by { |x| x } }
+p why { ["a", Float::NAN].sort_by { |x| x } }
+p why { [1, nil].sort_by { |x| x } }
+p why { [nil, 1].sort_by { |x| x } }
+p why { [true, 1].sort_by { |x| x } }
+p why { [1, Float::NAN].min_by { |x| x } }
+p why { [1, Float::NAN].max_by { |x| x } }
+p why { [1, Float::NAN].minmax_by { |x| x } }
+#==#
+# A key tie keeps SOURCE order for every extreme-picking form, and `max_by(n)`
+# must sort descending outright rather than sort ascending and reverse — the
+# latter flips tied elements too.
+p [1, 1, 2].max_by(2) { 0 }
+p [1, 1, 2].min_by(2) { 0 }
+p [3, 1, 2].max_by(2) { |x| x }
+p [3, 1, 2].min_by(2) { |x| x }
+p [1, 1r, 2.5].min(2)
+p [1, 1r, 2.5].max(2)
+p [[1, :a], [1, :b], [0, :c]].sort_by { |k, _| k }
+p [[1, :a], [1, :b], [0, :c]].min_by { |k, _| k }
+p [[1, :a], [1, :b], [0, :c]].max_by { |k, _| k }
+#==#
+# `break` out of a block whose result the method uses as a SORT KEY ends the
+# call and becomes its value, exactly as it does for the methods that use the
+# result as a mapping or a predicate.
+p([1, 2, 3, 4].max_by { |x| break x * 10 if x == 2; x })
+p([1, 2, 3, 4].min_by { |x| break 99 if x == 2; x })
+p([1, 2, 3, 4].sort_by { |x| break 7 if x == 2; x })
+p([1, 2, 3, 4].map { |x| break 8 if x == 2; x })
+p([1, 2, 3, 4].select { |x| break 4 if x == 2; true })
+p([1, 2, 3, 4].find { |x| break 6 if x == 2; false })
+p([1, 2, 3, 4].group_by { |x| break 5 if x == 2; x })
+p([1, 2, 3, 4].each_with_object([]) { |x, a| break 3 if x == 2; a << x })
+# A break on the FIRST element leaves the accumulator empty, which is a
+# different path through the same machinery.
+p([1, 2, 3].max_by { |x| break :first })
+p([1, 2, 3].sort_by { |x| break :first })
+#==#
+# `p` renders a user object through the class's own `inspect`, at the top level
+# and at any depth inside a container — and an `inspect` that raises propagates
+# rather than falling back to the default rendering.
+class Odd
+  def initialize(n) = @n = n
+  def inspect = "Odd(#{@n})"
+end
+class Boom
+  def inspect = raise("boom")
+end
+p Odd.new(1)
+p [Odd.new(1), Odd.new(2)]
+p({ a: Odd.new(1), "k" => Odd.new(2), 1 => Odd.new(3) })
+p [[Odd.new(1)]]
+p({ "q w" => Odd.new(4) })
+begin
+  p Boom.new
+rescue RuntimeError => e
+  p e.message
+end
+begin
+  p [Boom.new]
+rescue RuntimeError => e
+  p e.message
+end
+# A value with no user `inspect` keeps every default rendering: the `name:`
+# shorthand for a symbol key, the cycle marker, Struct, Set, Range.
+p [1, "s", :sym, nil, true, 2.5, [1, 2], { a: 1 }]
+p({ 1 => 2, "k" => [3], :s => { n: nil } })
+cyc = [1]
+cyc << cyc
+p cyc
+h = {}
+h[:x] = h
+p h
+SP1 = Struct.new(:x)
+p SP1.new(1)
+p(1..5)

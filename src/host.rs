@@ -7444,20 +7444,31 @@ impl RubyHost {
             .iter()
             .map(|(k, v)| {
                 let vs = self.inspect(v);
-                // Ruby 3.4+ prints a symbol key as `name: value`; every other
-                // key type keeps the `key => value` form.
-                match k {
-                    RKey::Sym(s) if plain_symbol_name(s) => format!("{s}: {vs}"),
-                    // A symbol key that needs quoting keeps the `key:` shorthand
-                    // but quotes the name: `{"a b": 1}`, as MRI does.
-                    RKey::Sym(s) => format!("{}: {vs}", inspect_string(s)),
-                    _ => format!("{} => {vs}", self.key_inspect(k)),
-                }
+                format!("{}{vs}", self.hash_entry_prefix(k))
             })
             .collect();
         format!("{{{}}}", parts.join(", "))
     }
-    fn key_inspect(&mut self, k: &RKey) -> String {
+    /// What a hash entry writes BEFORE its value: `name: ` for a symbol key,
+    /// `key => ` for every other kind.
+    ///
+    /// Shared with `builtins::inspect_of`, which has to render a hash itself
+    /// when it holds an object whose class defines `inspect` — the key forms
+    /// are the same either way, and one of them being a second copy is how they
+    /// would drift.
+    pub fn hash_entry_prefix(&mut self, k: &RKey) -> String {
+        match k {
+            // Ruby 3.4+ prints a symbol key as `name: value`; every other key
+            // type keeps the `key => value` form.
+            RKey::Sym(s) if plain_symbol_name(s) => format!("{s}: "),
+            // A symbol key that needs quoting keeps the `key:` shorthand but
+            // quotes the name: `{"a b": 1}`, as MRI does.
+            RKey::Sym(s) => format!("{}: ", inspect_string(s)),
+            _ => format!("{} => ", self.key_inspect(k)),
+        }
+    }
+
+    pub fn key_inspect(&mut self, k: &RKey) -> String {
         match k {
             RKey::Int(n) => n.to_string(),
             RKey::Str(s) => inspect_string(s),
