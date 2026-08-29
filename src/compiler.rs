@@ -2051,7 +2051,11 @@ impl Compiler {
             self.compile_expr(b, l)?;
             self.kstr(b, name);
             self.compile_expr(b, r)?;
-            b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), 0);
+            // The line matters: an operator that raises reports it, and this is
+            // the one dispatch site that was emitting 0. `p 1/0` said
+            // `p.rb:0:in ...` where ruby says `p.rb:1`, and so did every other
+            // operator routed through here.
+            b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), self.cur_line);
             // `!~` is the negation of `=~`.
             if op == BinOp::NMatch {
                 b.emit(Op::RubyTruthy, 0);

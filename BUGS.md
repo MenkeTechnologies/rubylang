@@ -102,11 +102,20 @@ $ /opt/homebrew/opt/ruby/bin/ruby -e $'x=1\ny=2\n1/0'
 -e:3:in 'Integer#/': divided by 0 (ZeroDivisionError)
 ```
 
-It is 0, not a stale line — moving the error to line 3 does not change it — so
-any pin asserting a line number through this path is measuring a constant.
-`1/0`, `7 % 0`, `(2**70)/0`, `[].freeze << 1` and `"a".freeze << "b"` all take
-it. The line is lost inside fusevm's native arithmetic, which never reaches the
-host's `abort`, so the fix is upstream rather than here.
+**Fixed, and the diagnosis above was wrong.** Nothing was lost inside fusevm and
+no upstream change was needed. `**`, `/`, `%`, `<<`, `>>`, `<=>`, `===`, `=~`,
+`&`, `|` and `^` are Ruby METHODS, so `compile_binary` routes them through method
+dispatch instead of the native op — and that one dispatch site emitted its
+`CallBuiltin` with a literal `0` where every other call site in the compiler
+passes `self.cur_line`. Passing the line there fixes every case listed above:
+`1/0`, `7 % 0`, `(2**70)/0`, `[].freeze << 1` and `"a".freeze << "b"` each now
+report the line they are written on, at top level, inside a method and inside a
+block. Regression: `tests/uncaught.rs::an_operator_that_raises_reports_its_own_line`.
+
+The FRAME is still `<main>` where MRI names the builtin that raised
+(`in 'Integer#/'`, plus a `from` line for the caller). That is the separate
+frame-name gap listed further down, and it is why these cases still differ under
+`parity-fuzz --stderr` even though the line is now right.
 
 A SECOND, distinct defect lives next to it: an error raised by the native
 operator path returns a bare `Err(String)` and never sets a pending exception,
@@ -193,8 +202,8 @@ Four failure shapes turned up, and only the first is the obvious one:
   away.
 
 Remaining measured gaps in this family, all left deliberately: the frame name in
-a diagnostic (`in 'Kernel#require'` vs `in '<main>'`) and the line-0 bug, both
-already listed above; `ENV`'s address-bearing receiver phrase; `Module.new`'s
+a diagnostic (`in 'Kernel#require'` vs `in '<main>'`), already listed above --
+the line-0 bug beside it is now fixed; `ENV`'s address-bearing receiver phrase; `Module.new`'s
 `#<Module:0x…>` address; `NoMatchingPatternError` omitting which clause failed
 and why (`99: 1 === 99 does not return true`); MRI's `Socket::ResolutionError`
 class and its `getaddrinfo` wording; `Zlib::GzipFile::Error`; and MRI's

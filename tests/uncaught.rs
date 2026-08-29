@@ -171,3 +171,59 @@ fn a_block_frame_is_named_block_in_its_enclosing_context() {
         assert_eq!(got, want, "for {src}");
     }
 }
+
+/// An operator that raises reports the line it is written on.
+///
+/// `**`, `/`, `%`, `<<`, `>>`, `<=>`, `===`, `=~`, `&`, `|` and `^` are Ruby
+/// METHODS, so the compiler routes them through method dispatch rather than
+/// fusevm's native op — and that one dispatch site emitted its op with line `0`
+/// where every other call site passes the line being compiled. `p 1/0` reported
+/// `-e:0:in '<main>'` where MRI 4.0.6 reports line 1, and so did every other
+/// operator in that list. Nothing else about the message changed, which is why
+/// these pin the whole string: the line is what regressed and the rest is what
+/// must not move with it.
+///
+/// The frame is still `<main>` where MRI names the builtin that raised
+/// (`Integer#/`, and a `from` line for the caller). That gap is separate and is
+/// recorded in BUGS.md; a USER method's frame is already named, which
+/// `raise_inside_method_has_backtrace_from_line` pins and the last case here
+/// re-checks for the operator path.
+#[test]
+fn an_operator_that_raises_reports_its_own_line() {
+    let (stderr, ok) = run_e("p 1/0");
+    assert!(!ok);
+    assert_eq!(
+        stderr,
+        "-e:1:in '<main>': divided by 0 (ZeroDivisionError)\n"
+    );
+
+    let (stderr, ok) = run_e("# a\n# b\np 1/0");
+    assert!(!ok);
+    assert_eq!(
+        stderr,
+        "-e:3:in '<main>': divided by 0 (ZeroDivisionError)\n"
+    );
+
+    let (stderr, ok) = run_e("# a\np 1 % 0");
+    assert!(!ok);
+    assert_eq!(
+        stderr,
+        "-e:2:in '<main>': divided by 0 (ZeroDivisionError)\n"
+    );
+
+    let (stderr, ok) = run_e("# a\np 10 ** 10 ** 10");
+    assert!(!ok);
+    assert_eq!(
+        stderr,
+        "-e:2:in '<main>': exponent is too large (ArgumentError)\n"
+    );
+
+    // Inside a method the operator's line is the body's, and the `from` line is
+    // the call — the same shape a `raise` there produces.
+    let (stderr, ok) = run_e("# a\ndef f(x)\n  x/0\nend\nf(1)");
+    assert!(!ok);
+    assert_eq!(
+        stderr,
+        "-e:3:in 'Object#f': divided by 0 (ZeroDivisionError)\n\tfrom -e:5:in '<main>'\n"
+    );
+}
