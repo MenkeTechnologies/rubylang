@@ -2073,6 +2073,45 @@ fn break_from_a_stored_lazy_block_raises() {
     eq("[1, 2].lazy.map { |x| x * 2 }.first(1)", "[2]");
 }
 
+/// The same rule, reached the other way: a `break` in a proc whose home
+/// invocation has RETURNED raises rather than unwinding, and it raises at the
+/// call, so a `rescue` catches it and the program goes on.
+///
+/// Before, the signal escaped unclaimed and silently abandoned the rest of the
+/// statement — `p pr.call` printed nothing and the process exited 0.
+///
+/// The boundary is a property of the PROC, not of the stack: `[1].each { pr.call }`
+/// raises even though `each` owns a `break` of its own, so a count of owners on
+/// the stack cannot be the rule. Every case below was measured on ruby 4.0.6.
+#[test]
+fn break_from_a_proc_whose_home_has_returned_raises() {
+    // `Kernel#proc` returns the object, so the invocation the block was passed
+    // to is already gone by the time it is called.
+    let caught = "begin\n  %s\nrescue LocalJumpError => e\n  [e.class.name, e.reason]\nend";
+    for orphan in [
+        "pr = proc { break 1 }; pr.call",
+        "pr = proc { break 1 }; [1].each(&pr)",
+        // An owner on the stack is irrelevant when it is not this proc's.
+        "pr = proc { break 1 }; [1].each { pr.call }",
+        // A block captured with `&b` and returned outlives the call it was
+        // written on, exactly as a `proc` object does.
+        "def keep(&b) = b\nkeep { break 1 }.call",
+        "def gen = proc { break 7 }\ngen.call",
+    ] {
+        eq(
+            &caught.replace("%s", orphan),
+            "[\"LocalJumpError\", :break]",
+            );
+    }
+
+    // And the column that must NOT raise: a lambda's `break` is a return, and a
+    // block whose call is still on the stack breaks out of that call.
+    eq("lambda { break 1 }.call", "1");
+    eq("def run(&b) = b.call\nrun { break 1 }\n:after", ":after");
+    eq("def m(&b) = b.call\nm { break 2 }", "2");
+    eq("[1, 2].map { break 9 }", "9");
+}
+
 /// An Enumerator and a lazy pipeline name the object they were built from.
 #[test]
 fn enumerator_and_lazy_inspect_name_their_receiver() {

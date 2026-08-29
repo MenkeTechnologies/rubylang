@@ -245,7 +245,10 @@ fn b_call_arr_blk(vm: &mut VM, _: u8) -> Value {
     let arr = vm.pop();
     let name = name_of(&vm.pop());
     let args = with_host(|h| h.as_array(&arr).unwrap_or_default());
-    match dispatch_call(&name, &args, block) {
+    let home = owns.then(|| crate::host::enter_block_home(block.as_ref())).flatten();
+    let out = dispatch_call(&name, &args, block);
+    crate::host::leave_block_home(home);
+    match out {
         Ok(v) => finish_block_call(vm, owns, v),
         Err(e) => abort(vm, e),
     }
@@ -263,7 +266,10 @@ fn b_call_method_arr_blk(vm: &mut VM, _: u8) -> Value {
     if let Err(e) = check_visibility(&recv, &name) {
         return abort(vm, e);
     }
-    match dispatch(&recv, &name, &args, block) {
+    let home = owns.then(|| crate::host::enter_block_home(block.as_ref())).flatten();
+    let out = dispatch(&recv, &name, &args, block);
+    crate::host::leave_block_home(home);
+    match out {
         Ok(v) => finish_block_call(vm, owns, v),
         Err(e) => abort(vm, e),
     }
@@ -1036,7 +1042,10 @@ fn b_call_blk(vm: &mut VM, argc: u8) -> Value {
     let block = block_operand(vals.pop().unwrap_or(Value::Undef));
     let owns = crate::host::take_block_literal();
     let name = name_of(&vals.remove(0));
-    match dispatch_call(&name, &vals, block) {
+    let home = owns.then(|| crate::host::enter_block_home(block.as_ref())).flatten();
+    let out = dispatch_call(&name, &vals, block);
+    crate::host::leave_block_home(home);
+    match out {
         Ok(v) => finish_block_call(vm, owns, v),
         Err(e) => abort(vm, e),
     }
@@ -1062,7 +1071,10 @@ fn b_call_method_blk(vm: &mut VM, argc: u8) -> Value {
     if let Err(e) = check_visibility(&recv, &name) {
         return abort(vm, e);
     }
-    match dispatch(&recv, &name, &vals, block) {
+    let home = owns.then(|| crate::host::enter_block_home(block.as_ref())).flatten();
+    let out = dispatch(&recv, &name, &vals, block);
+    crate::host::leave_block_home(home);
+    match out {
         Ok(v) => finish_block_call(vm, owns, v),
         Err(e) => abort(vm, e),
     }
@@ -1239,6 +1251,8 @@ fn b_index_set(vm: &mut VM, argc: u8) -> Value {
 
 fn b_sig_break(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
+    // Only the KEYWORD's break can be an orphan; the yielder raises one too.
+    crate::host::mark_lexical_break();
     raise_signal_break(v);
     vm.ip = vm.chunk.ops.len();
     Value::Undef

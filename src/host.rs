@@ -376,6 +376,12 @@ pub enum RObj {
         scope: Scope,
         is_lambda: bool,
         kind: ProcKind,
+        /// The invocation this block was passed to, which is what its `break`
+        /// targets — see `enter_block_home`. `None` means "not adopted by any
+        /// call", which is deliberately NOT the same as "dead": only an id that
+        /// was minted and has since gone off the stack makes a `break` an
+        /// orphan, so a proc nothing stamped keeps behaving as it always did.
+        home: Option<u64>,
     },
     /// A native proc produced by `Symbol#to_proc` (`&:upcase`): calling it sends
     /// the named method to its first argument (`:upcase.to_proc.call(s)` == `s.upcase`).
@@ -1794,6 +1800,8 @@ pub fn reset_host() {
     // old one's code. Clearing the pool is what makes `eval_str` twice in one
     // process independent.
     VM_POOL.with(|p| p.borrow_mut().clear());
+    BLOCK_HOMES.with(|s| s.borrow_mut().clear());
+    LEXICAL_BREAK.with(|c| c.set(false));
     // Fibers moved off the host into a thread-local, so clear them explicitly.
     FIBERS.with(|f| f.borrow_mut().clear());
     CUR_FIBER.with(|c| c.set(None));
@@ -3259,6 +3267,7 @@ impl RubyHost {
             scope,
             is_lambda: false,
             kind: ProcKind::Normal,
+                    home: None,
         })
     }
     /// Create a lambda (same as `new_proc` but `lambda?` is `true`).
@@ -3269,6 +3278,7 @@ impl RubyHost {
             scope,
             is_lambda: true,
             kind: ProcKind::Normal,
+                    home: None,
         })
     }
     /// `true` if this proc was made by `->`/`lambda` (not a plain block).
@@ -3331,6 +3341,7 @@ impl RubyHost {
                 scope,
                 is_lambda,
                 kind,
+                home,
             }) => {
                 let arity = match kind {
                     ProcKind::Curried { arity, .. } => arity,
@@ -3348,6 +3359,9 @@ impl RubyHost {
                         arity,
                         collected: Vec::new(),
                     },
+                    // A curried view of a block is the same block: it breaks
+                    // out of whatever the original was passed to.
+                    home,
                 }))
             }
             _ => None,
@@ -3366,6 +3380,7 @@ impl RubyHost {
                 arity,
                 collected: Vec::new(),
             },
+            home: None,
         })
     }
     /// Build a composed proc `first` then `second` (both are `Proc` values).
@@ -3379,6 +3394,7 @@ impl RubyHost {
                 first: Box::new(first),
                 second: Box::new(second),
             },
+            home: None,
         })
     }
     pub fn new_symbol(&mut self, name: &str) -> Value {
@@ -3418,6 +3434,7 @@ impl RubyHost {
             scope,
             is_lambda: false,
             kind: ProcKind::Collect(idx),
+                    home: None,
         })
     }
     /// Reclaim the most recently opened collector buffer (LIFO with `new_enum_sink`).
@@ -3468,6 +3485,7 @@ impl RubyHost {
             scope,
             is_lambda: false,
             kind: ProcKind::Around(idx),
+                    home: None,
         })
     }
     /// Allocate the native proc backing `Symbol#to_proc`.
@@ -11714,13 +11732,14 @@ pub fn call_proc_self_ctx(
     // hole at the same 2000 activations the method guard uses, an order of
     // magnitude below where the native stack actually gives out.
     let _depth = ProcDepth::enter()?;
-    let (template, scope, kind, is_lambda) = match with_host(|h| h.obj(proc_val).cloned()) {
+    let (template, scope, kind, is_lambda, home) = match with_host(|h| h.obj(proc_val).cloned()) {
         Some(RObj::Proc {
             template,
             scope,
             kind,
             is_lambda,
-        }) => (template, scope, kind, is_lambda),
+            home,
+        }) => (template, scope, kind, is_lambda, home),
         // A bound `Method` used as a block/proc (`map(&obj.method(:m))`): re-dispatch
         // the stored method on its captured receiver, with the Kernel fallback so a
         // bound Kernel method (`method(:puts)`) works off the `main` object too.
@@ -11866,6 +11885,7 @@ pub fn call_proc_self_ctx(
                         scope: scope.clone(),
                         is_lambda,
                         kind: ProcKind::Normal,
+                        home,
                     })
                 });
                 return call_proc(&base, &all);
@@ -11880,6 +11900,7 @@ pub fn call_proc_self_ctx(
                         arity,
                         collected: all,
                     },
+                    home,
                 })
             }));
         }
@@ -11903,6 +11924,7 @@ pub fn call_proc_self_ctx(
                         arity,
                         collected: all,
                     },
+                    home,
                 })
             }));
         }
@@ -12038,6 +12060,19 @@ pub fn call_proc_self_ctx(
             with_host(|h| h.signal = Some(Signal::Return(v, Some(home_frame))));
             r
         }
+        // A `break` whose home invocation has already returned has nothing left
+        // to break out of, and MRI raises rather than unwinding — AT the call, so
+        // a `rescue` around `pr.call` catches it and the program continues. See
+        // `enter_block_home` for why this is a property of the proc and not of
+        // the stack. Letting the signal escape instead silently abandoned the
+        // rest of the statement and exited 0.
+        Some(Signal::Break(_)) if take_lexical_break() && !block_home_is_live(home) => {
+            Err(crate::builtins::raise_exc_with(
+                "LocalJumpError",
+                "break from proc-closure",
+                &[("reason", with_host(|h| h.new_symbol("break")))],
+            ))
+        }
         Some(other) => {
             with_host(|h| h.signal = Some(other));
             r
@@ -12126,6 +12161,98 @@ thread_local! {
 /// raises.
 pub fn mark_block_literal() {
     BLOCK_LITERAL_CALL.with(|c| c.set(true));
+}
+
+thread_local! {
+    /// The invocations currently on the stack that a block's `break` can target,
+    /// innermost last. An id is pushed when a call ADOPTS a block literal and
+    /// popped when that call returns, so "is this proc's home still running?" is
+    /// membership here. See `enter_block_home`.
+    static BLOCK_HOMES: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Adopt `block` for the call about to run, and return the id to hand back to
+/// [`leave_block_home`].
+///
+/// A block's `break` targets the method invocation the block was passed TO, and
+/// MRI raises `LocalJumpError: break from proc-closure` once that invocation has
+/// returned — `proc { break 1 }.call` and `keep { break 1 }.call` both, because
+/// `Kernel#proc` and `keep` are long gone by the time the proc is called. What
+/// makes it a property of the PROC and not of the stack is
+/// `[1].each { pr.call }`: `each` owns a `break` of its own and MRI still raises
+/// for `pr`, so a count of owners on the stack cannot be the rule.
+///
+/// Stamping at ADOPTION rather than at creation is what gets both columns right:
+/// the literal in `m { break 2 }` is stamped with `m`'s id and `m` is still
+/// running when `b.call` reaches the `break`, while the literal in
+/// `proc { break 1 }` is stamped with the `proc` call's id, which dies when
+/// `proc` returns the object.
+pub fn enter_block_home(block: Option<&Value>) -> Option<u64> {
+    let block = block?;
+    let id = NEXT_BLOCK_HOME.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    });
+    let stamped = with_host(|h| match h.obj_mut(block) {
+        Some(RObj::Proc { home, .. }) => {
+            *home = Some(id);
+            true
+        }
+        _ => false,
+    });
+    if !stamped {
+        return None;
+    }
+    BLOCK_HOMES.with(|s| s.borrow_mut().push(id));
+    Some(id)
+}
+
+/// The call that adopted a block has returned: its id leaves the stack, so a
+/// `break` reaching that block from now on is an orphan.
+pub fn leave_block_home(id: Option<u64>) {
+    if id.is_some() {
+        BLOCK_HOMES.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+thread_local! {
+    static NEXT_BLOCK_HOME: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+
+    /// Whether the pending `Signal::Break` came from the `break` KEYWORD.
+    ///
+    /// Not every break is a `break`: the generator yielder raises one to stop a
+    /// block early once `first(n)`/`take(n)` has enough
+    /// (`crate::builtins`'s `yielder_push`), and that is an internal mechanism
+    /// with no home to outlive — `Enumerator.new { |y| … }.first(2)` is an
+    /// ordinary answer in MRI, not a `LocalJumpError`. So the orphan check asks
+    /// for the mark rather than assuming it: an unmarked break behaves exactly
+    /// as it always did.
+    static LEXICAL_BREAK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record that the break now being raised is the `break` keyword's.
+pub fn mark_lexical_break() {
+    LEXICAL_BREAK.with(|c| c.set(true));
+}
+
+/// Read and clear the mark.
+fn take_lexical_break() -> bool {
+    LEXICAL_BREAK.with(|c| c.replace(false))
+}
+
+/// Whether a `break` from a proc whose home is `home` still has somewhere to go.
+///
+/// `None` means no call ever adopted it, which is NOT the same as dead: a proc
+/// this machinery never saw keeps behaving as it always did rather than becoming
+/// an error.
+fn block_home_is_live(home: Option<u64>) -> bool {
+    match home {
+        None => true,
+        Some(id) => BLOCK_HOMES.with(|s| s.borrow().contains(&id)),
+    }
 }
 
 /// Read and clear the block-literal marker. Called at the *entry* of a

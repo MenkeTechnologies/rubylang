@@ -317,50 +317,36 @@ exception (`KeyError.new("m")`) answers nil for them, as MRI's does.
   the receiver and the argument list are not. Converting those sites to
   `raise_exc_with` is the fix, and it touches every `undefined method` raise in
   the dispatcher.
-- **`break` in an ORPHANED proc is swallowed instead of raising
-  `LocalJumpError`.** A block's `break` targets the method invocation the block
-  was passed to; when that invocation has already returned, MRI raises
-  `LocalJumpError: break from proc-closure` AT THE CALL, so a `rescue` catches it
-  and the program continues. rubylang lets the break signal escape unclaimed,
-  which silently abandons the rest of the statement and exits 0 — a wrong answer
-  rather than an error, which is the worst shape a gap can take:
+- **`break` in an orphaned proc raises `LocalJumpError` — fixed.** A block's
+  `break` targets the method invocation the block was passed to; when that
+  invocation has already returned, MRI raises `LocalJumpError: break from
+  proc-closure` AT THE CALL, so a `rescue` catches it and the program continues.
+  The signal used to escape unclaimed, which silently abandoned the rest of the
+  statement and exited 0 — a wrong answer rather than an error.
 
-  ```console
-  $ ruby     -e 'pr = proc { break 1 }; p pr.call; puts "after"'
-  -e:1:in 'block in <main>': break from proc-closure (LocalJumpError)
-  $ rubylang -e 'pr = proc { break 1 }; p pr.call; puts "after"'
-  (prints nothing, exits 0)
-  ```
+  The boundary is a property of the PROC, not of the stack, which is why a count
+  of break-owners on the stack cannot be the rule: `[1].each { pr.call }` raises
+  even though `each` owns a `break` of its own. `RObj::Proc` therefore carries
+  the id of the invocation that ADOPTED it (`host::enter_block_home`, stamped by
+  the four block-carrying call ops), and `BLOCK_HOMES` holds the ids still on the
+  stack. Stamping at adoption rather than at creation is what gets both columns
+  right: the literal in `m { break 2 }` is stamped with `m`'s id and `m` is still
+  running when `b.call` reaches the break, while the literal in
+  `proc { break 1 }` is stamped with the `proc` call's id, which dies when
+  `proc` returns the object. A proc no call ever adopted keeps a `None` home and
+  behaves as it always did — `None` is "unknown", not "dead".
 
-  Measured against ruby 4.0.6, the boundary is a property of the PROC, not of
-  the stack — every one of these raises there and is silent here:
+  Only the `break` KEYWORD can be an orphan. The generator yielder raises a break
+  of its own to stop a block once `first(n)`/`take(n)` has enough, so
+  `b_sig_break` marks the lexical one and the check asks for the mark;
+  `Enumerator.new { |y| … }.first(2)` is an ordinary answer, as in MRI.
 
-  ```text
-  pr = proc { break 1 }; pr.call            # Kernel#proc has returned
-  pr = proc { break 1 }; [1].each(&pr)      # ... and & does not adopt it
-  pr = proc { break 1 }; [1].each { pr.call }   # an owner on the stack is
-                                                # irrelevant: it is not pr's
-  def keep(&b) = b; keep { break 1 }.call   # the block's own call returned
-  def gen = proc { break 7 }; gen.call
-  ```
+  Verified against ruby 4.0.6 on thirteen shapes — the five that raise
+  (`proc{}.call`, `each(&pr)`, `each { pr.call }`, a block captured with `&b` and
+  returned, a proc returned from a method), the four that must not (a lambda, a
+  block whose call is live, `map { break 9 }`, a lazy pipeline), and four
+  generator/enumerator drivers that must stay ordinary answers.
 
-  and every one of these is correct already:
-
-  ```text
-  lambda { break 1 }.call                   # a lambda's break is a return
-  def run(&b) = b.call; run { break 1 }     # run is still on the stack
-  [1, 2].map { break 9 }                    # the literal's own call owns it
-  (1..3).lazy.map { break 9 }.to_a          # call_lazy_call raises, correctly
-  ```
-
-  `Compiler`/`b_mkproc` marks a block literal so the call that follows owns its
-  break (`mark_block_literal` / `finish_block_call`), which is what makes the
-  correct column correct. Closing the wrong column needs the proc to carry the
-  IDENTITY of the invocation it was written for, and the break to check that
-  frame is still live — a counter of owners on the stack is provably not the
-  rule, per the `[1].each { pr.call }` line above. Found by `parity-fuzz`
-  (seed 77827) as `p((1..3).each_with_index.lazy.filter_map { break 9 }.to_a)`,
-  where the lazy path already raises and the eager one does not.
 - **A block frame is labelled `<main>` rather than `block in <main>`.** MRI names
   the frame a failure was raised in, and inside a block that is
   `block in <enclosing>`: `-e:1:in 'block in <main>'`, `-e:2:in 'block in
