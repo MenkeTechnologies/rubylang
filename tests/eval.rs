@@ -9647,3 +9647,50 @@ fn thread_local_storage_is_per_thread() {
         "[:a, :b]",
     );
 }
+
+/// `String#=~` switches on the ARGUMENT's type, and only a Regexp matches.
+///
+/// MRI's `rb_str_match` (string.c:5081-5093) raises `TypeError` for a String,
+/// matches a Regexp, and for anything else evaluates `other =~ self` — the
+/// receiver and argument swap and the other object decides. rubylang answered
+/// `nil` for everything that was not a Regexp, so `"a" =~ 1` and `"a" =~ "b"`
+/// quietly succeeded where MRI raises. Both halves are pinned because the nil
+/// answer satisfied neither.
+///
+/// `nil` still answers nil, but for MRI's reason rather than by accident: the
+/// delegation reaches `NilClass#=~`, which is what returns it. `Symbol#=~` is
+/// the same function in MRI (`string.c:12494` calls `rb_str_match` on the
+/// symbol's string), and is checked here so it cannot drift from the String arm.
+#[test]
+fn string_match_operator_dispatches_on_the_argument() {
+    // A Regexp matches and yields the character offset.
+    eq(r#""a" =~ /a/"#, "0");
+    eq(r#""abc" =~ /b/"#, "1");
+    eq(r#""abc" =~ /z/"#, "nil");
+    // A String is a type error, and the message names `String` literally.
+    raises(r#""a" =~ "b""#, "TypeError", "type mismatch: String given");
+    // Anything else delegates, so the ARGUMENT's class is what refuses.
+    raises(
+        r#""a" =~ 1"#,
+        "NoMethodError",
+        "undefined method '=~' for an instance of Integer",
+    );
+    raises(
+        r#""a" =~ 1.5"#,
+        "NoMethodError",
+        "undefined method '=~' for an instance of Float",
+    );
+    // `nil` answers nil through `NilClass#=~`, not by falling through.
+    eq(r#""a" =~ nil"#, "nil");
+    // The match globals are still set by the Regexp arm.
+    eq(r#"x = "hello" =~ /l(l)o/; [x, $1]"#, r#"[2, "l"]"#);
+    // Symbol shares the rule.
+    eq("(:abc =~ /b/)", "1");
+    raises(":abc =~ \"b\"", "TypeError", "type mismatch: String given");
+    raises(
+        ":abc =~ 1",
+        "NoMethodError",
+        "undefined method '=~' for an instance of Integer",
+    );
+    eq("(:abc =~ nil)", "nil");
+}

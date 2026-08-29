@@ -8213,7 +8213,19 @@ fn dispatch_string(
                     .map(|m| Value::Int(s[..m.start()].chars().count() as i64))
                     .unwrap_or(Value::Undef))
             }
-            None => Ok(Value::Undef),
+            // MRI's `rb_str_match` (string.c:5081-5093) switches on the
+            // ARGUMENT's type: a String is a `TypeError`, a Regexp matches, and
+            // anything else is `other =~ self` — the receiver and argument swap
+            // and the other object decides. Answering nil for everything that
+            // was not a Regexp made `"a" =~ 1` and `"a" =~ "b"` quietly succeed
+            // where MRI raises. `"a" =~ nil` stays nil, because the delegation
+            // reaches `NilClass#=~`, which is what returns it.
+            None => match with_host(|h| h.class_of(&args[0])).as_str() {
+                // The message names `String` literally, not the argument's
+                // class — there is no other type that reaches this arm.
+                "String" => Err(raise_exc("TypeError", "type mismatch: String given")),
+                _ => dispatch(&args[0], "=~", std::slice::from_ref(recv), None),
+            },
         },
         "match" => match str_regex(&args[0]) {
             Some(re) => Ok(match_data(&re, &s, &args[0])),
