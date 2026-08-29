@@ -5101,6 +5101,10 @@ fn dispatch_object(
         {
             Ok(with_host(|h| h.ivar_of(recv, name)))
         }
+        // `UncaughtThrowError#tag` / `#value`. Gated on the class rather than
+        // joined to the list above: `value` is a name any exception could
+        // plausibly define, and only this one answers it in MRI.
+        "tag" | "value" if cls == "UncaughtThrowError" => Ok(with_host(|h| h.ivar_of(recv, name))),
         // `NoMethodError#args` — the arguments the missing call was given. MRI
         // answers an empty Array, never nil, so a caller can splat it.
         "args" if with_host(|h| h.is_exception_class(cls)) => {
@@ -18017,7 +18021,13 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
                 None => with_host(|h| h.new_object("Object")),
             };
             let b = block.ok_or_else(|| raise_exc("LocalJumpError", "no block given (yield)"))?;
-            let r = call_proc(&b, std::slice::from_ref(&tag))?;
+            // Recorded for the whole block so a `throw` inside can see it has
+            // somewhere to land; popped however the block is left, including
+            // when it raises, or the tag would outlive its `catch`.
+            crate::host::push_catch_tag(tag.clone());
+            let r = call_proc(&b, std::slice::from_ref(&tag));
+            crate::host::pop_catch_tag();
+            let r = r?;
             // A `throw` for our tag stops here; a non-matching throw (or any other
             // pending signal) is left in place to keep unwinding.
             match take_throw(&tag) {
@@ -18030,6 +18040,17 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             // `catch(tag)`; a bare `throw tag` carries `nil`.
             let tag = args.first().cloned().unwrap_or(Value::Undef);
             let value = args.get(1).cloned().unwrap_or(Value::Undef);
+            // With no `catch` for this tag anywhere above, MRI does not unwind
+            // and report at the top — it raises `UncaughtThrowError` HERE, which
+            // is why an enclosing `rescue` catches it and an `ensure` still runs.
+            if !crate::host::catch_tag_active(&tag) {
+                let insp = with_host(|h| h.inspect(&tag));
+                return Err(raise_exc_with(
+                    "UncaughtThrowError",
+                    &format!("uncaught throw {insp}"),
+                    &[("tag", tag), ("value", value)],
+                ));
+            }
             raise_signal_throw(tag, value);
             Ok(Value::Undef)
         }

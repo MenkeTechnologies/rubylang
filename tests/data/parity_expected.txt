@@ -2784,3 +2784,27 @@ Odd(1)
 {x: {...}}
 #<struct SP1 x=1>
 1..5
+#==#
+3
+nil
+5
+1
+2
+#==#
+UncaughtThrowError
+"uncaught throw :nope"
+:nope
+nil
+:nope
+7
+UncaughtThrowError
+UncaughtThrowError
+:b
+ensured
+:gone
+#==#
+3
+ensure
+"else"
+ensure
+"rescue:boom"

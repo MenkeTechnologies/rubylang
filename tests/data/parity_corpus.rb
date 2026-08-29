@@ -4401,3 +4401,65 @@ p h
 SP1 = Struct.new(:x)
 p SP1.new(1)
 p(1..5)
+#==#
+# catch/throw: a non-local exit that is NOT an exception while a catch is open,
+# and is one — raised at the throw site — when none is.
+p(catch(:done) { 10.times { |i| throw :done, i if i == 3 }; :never })
+p(catch(:x) { throw :x })
+p(catch { |t| throw t, 5 })
+p(catch(:a) { catch(:b) { throw :a, 1 }; 2 })
+p(catch(:a) { catch(:b) { throw :b, 1 }; 2 })
+#==#
+# With no catch for the tag, throw raises UncaughtThrowError where it stands, so
+# an enclosing rescue sees it and an ensure above it still runs.
+begin
+  throw :nope
+rescue UncaughtThrowError => e
+  p e.class, e.message, e.tag, e.value
+end
+begin
+  throw :nope, 7
+rescue UncaughtThrowError => e
+  p e.tag, e.value
+end
+# It is an ArgumentError, so the broader rescues catch it too.
+begin; throw :nope; rescue ArgumentError => e; p e.class; end
+begin; throw :nope; rescue => e; p e.class; end
+# A throw for a tag no OPEN catch names is uncaught even inside another catch.
+begin
+  catch(:a) { throw :b }
+rescue UncaughtThrowError => e
+  p e.tag
+end
+# ensure still runs on the way out.
+def ensured
+  yield
+ensure
+  puts "ensured"
+end
+begin
+  ensured { throw :gone }
+rescue UncaughtThrowError => e
+  p e.tag
+end
+#==#
+# retry re-runs the begin body; ensure and else order around it.
+n = 0
+begin
+  n += 1
+  raise "again" if n < 3
+  p n
+rescue
+  retry
+end
+def order
+  yield
+rescue => e
+  "rescue:#{e.message}"
+else
+  "else"
+ensure
+  puts "ensure"
+end
+p(order { 1 })
+p(order { raise "boom" })

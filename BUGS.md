@@ -387,14 +387,39 @@ exception (`KeyError.new("m")`) answers nil for them, as MRI's does.
   `rescue`; rubylang's is caught by one. The class tree is right —
   `builtin_exception_parent` already puts `SyntaxError` under `ScriptError` —
   but the eval path does not raise it.
-- **`exit(3)` is not rescuable as `SystemExit`**, and an uncaught `throw` is not
-  rescuable as `UncaughtThrowError`. Both terminate instead of raising an object
-  a handler can inspect.
+- **`exit(3)` is not rescuable as `SystemExit`.** It terminates instead of
+  raising an object a handler can inspect, so `rescue SystemExit => e` never
+  runs and `e.status` is unreachable. An uncaught `throw` was the same shape of
+  gap and is now fixed — see below.
 - **MRI's `DidYouMean::Correctable` / `ErrorHighlight::CoreExt` do not appear in
   `ancestors`.** These are gems MRI injects into `NameError`/`KeyError`/
   `TypeError`. Deliberately absent — rubylang emits no "did you mean"
   suggestions at all — so the ancestor lists are one or two entries shorter than
   MRI's while the class itself and its real superclass chain match.
+
+## FIXED — an uncaught `throw` raises at the throw site
+
+`throw` set a control signal that unwound to a matching `catch`, and only the
+top of `run_main` turned a signal that reached it into an error. Nothing between
+the two could see it, so a `throw` with no `catch` for its tag walked straight
+past every `rescue`:
+
+```ruby
+begin; throw :nope; rescue UncaughtThrowError => e; p e.class; end
+# MRI:      UncaughtThrowError
+# rubylang: uncaught throw :nope (UncaughtThrowError)   # unrescuable, killed the run
+```
+
+MRI does not unwind and report at the top: it decides at the THROW, raising
+`UncaughtThrowError` there when no `catch` for the tag is open, which is why an
+enclosing `rescue` catches it and an `ensure` above it still runs. The host now
+keeps the open `catch` tags (`catch_tags`, pushed and popped around the block
+however it is left) and `throw` asks that question first — signalling when it
+has somewhere to land, raising a real exception when it does not. The tags are
+part of the fiber context, swapped with `signal` at every resume/suspend, so a
+fiber suspended inside a `catch` does not lend its tag to whoever resumes it.
+The raised object carries the `tag` and `value` readers MRI puts on it, gated on
+the class because `value` is a name any exception could plausibly define.
 
 ## A test that can pass having asserted nothing
 

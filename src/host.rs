@@ -1360,6 +1360,14 @@ pub struct RubyHost {
     /// without a representation change. Absent = UTF-8 (the default).
     binary_strings: HashSet<u32>,
     signal: Option<Signal>,
+    /// The tags of the `catch` blocks currently on the stack, innermost last.
+    ///
+    /// `throw` needs to know whether a matching `catch` exists BEFORE it
+    /// unwinds: Ruby raises `UncaughtThrowError` at the throw site when none
+    /// does, which is why `rescue` sees it and an `ensure` above it still runs.
+    /// Without this the throw could only be reported after unwinding past every
+    /// handler that should have caught it.
+    catch_tags: Vec<Value>,
     /// The scope local/`self`/block access targets. `None` = the top frame (a
     /// method body / top level); `Some(scope)` = a captured scope while a block
     /// or lambda that captured it is running.
@@ -1657,6 +1665,7 @@ struct FiberCell {
 struct FiberContext {
     active_scope: Option<Scope>,
     signal: Option<Signal>,
+    catch_tags: Vec<Value>,
     pending_exc: Option<Value>,
     error: Option<String>,
     frames: Vec<Frame>,
@@ -2177,6 +2186,7 @@ impl RubyHost {
             exc_backtraces: IndexMap::new(),
             binary_strings: HashSet::new(),
             signal: None,
+            catch_tags: Vec::new(),
             active_scope: None,
             frozen: HashSet::new(),
             enum_sinks: Vec::new(),
@@ -9300,8 +9310,10 @@ fn run_chunk_pooled(
 /// top-level `return` just halts the program).
 pub fn run_main(chunk: Chunk) -> Result<Value, String> {
     let r = run_chunk_on(chunk);
-    // A `throw` that escaped every `catch` is an error, mirroring Ruby's
-    // `uncaught throw :tag (UncaughtThrowError)`.
+    // A backstop. `throw` now raises `UncaughtThrowError` at the throw site when
+    // no `catch` for its tag is open, so a Throw signal reaching here means one
+    // whose `catch` went away while it was unwinding rather than the ordinary
+    // uncaught case.
     let uncaught = with_host(|h| match h.signal.take() {
         Some(Signal::Throw(tag, _)) => Some(h.inspect(&tag)),
         _ => None,
@@ -10478,6 +10490,7 @@ impl RubyHost {
     fn install_fiber_ctx(&mut self, mut c: FiberContext) -> FiberContext {
         std::mem::swap(&mut self.active_scope, &mut c.active_scope);
         std::mem::swap(&mut self.signal, &mut c.signal);
+        std::mem::swap(&mut self.catch_tags, &mut c.catch_tags);
         std::mem::swap(&mut self.pending_exc, &mut c.pending_exc);
         std::mem::swap(&mut self.error, &mut c.error);
         std::mem::swap(&mut self.frames, &mut c.frames);
@@ -12165,6 +12178,26 @@ pub fn raise_signal_redo() {
 /// `catch(tag)` above (see `take_throw`).
 pub fn raise_signal_throw(tag: Value, value: Value) {
     with_host(|h| h.signal = Some(Signal::Throw(tag, value)));
+}
+
+/// Record that a `catch(tag)` block is running, so a `throw` inside it can tell
+/// that it has somewhere to land.
+pub fn push_catch_tag(tag: Value) {
+    with_host(|h| h.catch_tags.push(tag));
+}
+
+/// Drop the innermost recorded `catch` tag, however the block was left.
+pub fn pop_catch_tag() {
+    with_host(|h| {
+        h.catch_tags.pop();
+    });
+}
+
+/// Whether a `catch` for `tag` is on the stack — the question `throw` asks
+/// before unwinding. Matching is by the same equality `take_throw` uses, so a
+/// tag that would be caught is exactly one that reports as active.
+pub fn catch_tag_active(tag: &Value) -> bool {
+    with_host(|h| h.catch_tags.iter().any(|t| t == tag))
 }
 /// If a pending `throw` signal carries a tag equal (by object identity, like
 /// Ruby) to `tag`, consume it and return its thrown value. A non-matching throw
