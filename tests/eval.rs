@@ -2101,7 +2101,7 @@ fn break_from_a_proc_whose_home_has_returned_raises() {
         eq(
             &caught.replace("%s", orphan),
             "[\"LocalJumpError\", :break]",
-            );
+        );
     }
 
     // And the column that must NOT raise: a lambda's `break` is a return, and a

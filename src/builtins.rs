@@ -245,7 +245,9 @@ fn b_call_arr_blk(vm: &mut VM, _: u8) -> Value {
     let arr = vm.pop();
     let name = name_of(&vm.pop());
     let args = with_host(|h| h.as_array(&arr).unwrap_or_default());
-    let home = owns.then(|| crate::host::enter_block_home(block.as_ref())).flatten();
+    let home = owns
+        .then(|| crate::host::enter_block_home(block.as_ref()))
+        .flatten();
     let out = dispatch_call(&name, &args, block);
     crate::host::leave_block_home(home);
     match out {
@@ -266,7 +268,9 @@ fn b_call_method_arr_blk(vm: &mut VM, _: u8) -> Value {
     if let Err(e) = check_visibility(&recv, &name) {
         return abort(vm, e);
     }
-    let home = owns.then(|| crate::host::enter_block_home(block.as_ref())).flatten();
+    let home = owns
+        .then(|| crate::host::enter_block_home(block.as_ref()))
+        .flatten();
     let out = dispatch(&recv, &name, &args, block);
     crate::host::leave_block_home(home);
     match out {
@@ -1042,7 +1046,9 @@ fn b_call_blk(vm: &mut VM, argc: u8) -> Value {
     let block = block_operand(vals.pop().unwrap_or(Value::Undef));
     let owns = crate::host::take_block_literal();
     let name = name_of(&vals.remove(0));
-    let home = owns.then(|| crate::host::enter_block_home(block.as_ref())).flatten();
+    let home = owns
+        .then(|| crate::host::enter_block_home(block.as_ref()))
+        .flatten();
     let out = dispatch_call(&name, &vals, block);
     crate::host::leave_block_home(home);
     match out {
@@ -1071,7 +1077,9 @@ fn b_call_method_blk(vm: &mut VM, argc: u8) -> Value {
     if let Err(e) = check_visibility(&recv, &name) {
         return abort(vm, e);
     }
-    let home = owns.then(|| crate::host::enter_block_home(block.as_ref())).flatten();
+    let home = owns
+        .then(|| crate::host::enter_block_home(block.as_ref()))
+        .flatten();
     let out = dispatch(&recv, &name, &vals, block);
     crate::host::leave_block_home(home);
     match out {

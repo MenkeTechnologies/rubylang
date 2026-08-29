@@ -71,8 +71,10 @@ fn capture_resets_between_runs() {
 /// written the way they are rather than as one-liners.
 #[test]
 fn a_second_runs_blocks_do_not_reuse_the_first_runs_bodies() {
-    let (first, out1) =
-        rubylang::eval_str_captured("f = lambda { |n| n < 2 ? n : f.call(n - 1) }\np f.call(10)", &[]);
+    let (first, out1) = rubylang::eval_str_captured(
+        "f = lambda { |n| n < 2 ? n : f.call(n - 1) }\np f.call(10)",
+        &[],
+    );
     assert!(first.is_ok(), "{first:?}");
     assert_eq!(out1, "1\n");
 

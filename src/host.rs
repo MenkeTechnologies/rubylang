@@ -3274,7 +3274,7 @@ impl RubyHost {
             scope,
             is_lambda: false,
             kind: ProcKind::Normal,
-                    home: None,
+            home: None,
         })
     }
     /// Create a lambda (same as `new_proc` but `lambda?` is `true`).
@@ -3285,7 +3285,7 @@ impl RubyHost {
             scope,
             is_lambda: true,
             kind: ProcKind::Normal,
-                    home: None,
+            home: None,
         })
     }
     /// `true` if this proc was made by `->`/`lambda` (not a plain block).
@@ -3441,7 +3441,7 @@ impl RubyHost {
             scope,
             is_lambda: false,
             kind: ProcKind::Collect(idx),
-                    home: None,
+            home: None,
         })
     }
     /// Reclaim the most recently opened collector buffer (LIFO with `new_enum_sink`).
@@ -3492,7 +3492,7 @@ impl RubyHost {
             scope,
             is_lambda: false,
             kind: ProcKind::Around(idx),
-                    home: None,
+            home: None,
         })
     }
     /// Allocate the native proc backing `Symbol#to_proc`.
