@@ -57,3 +57,27 @@ fn capture_resets_between_runs() {
     assert_eq!(first, "one\n");
     assert_eq!(second, "two\n");
 }
+
+/// A second run's blocks are its OWN. Block bodies are recycled through a
+/// thread-local VM pool keyed by `ChunkId::Proc(i)`, and `i` is an index into
+/// the host's proc table — which a fresh host restarts at 0. Without clearing
+/// that pool on reset, the second program's block reused the first program's
+/// pooled VM and ran the FIRST program's body: this exact pair answered
+/// `undefined method '<' for nil` (the recursive lambda's `n < 2`) instead of
+/// `[1, 2]`.
+///
+/// The first program must recurse deep enough to leave its block's VM in the
+/// pool, and the second must reach the same proc index, which is why both are
+/// written the way they are rather than as one-liners.
+#[test]
+fn a_second_runs_blocks_do_not_reuse_the_first_runs_bodies() {
+    let (first, out1) =
+        rubylang::eval_str_captured("f = lambda { |n| n < 2 ? n : f.call(n - 1) }\np f.call(10)", &[]);
+    assert!(first.is_ok(), "{first:?}");
+    assert_eq!(out1, "1\n");
+
+    let (second, out2) =
+        rubylang::eval_str_captured("p Enumerator.new { |y| y << 1; y << 2 }.to_a", &[]);
+    assert!(second.is_ok(), "{second:?}");
+    assert_eq!(out2, "[1, 2]\n");
+}

@@ -1787,6 +1787,13 @@ pub fn reset_host() {
     FILE_DIR_STACK.with(|s| s.borrow_mut().clear());
     FILE_PATH_STACK.with(|s| s.borrow_mut().clear());
     DEF_TARGET.with(|t| t.borrow_mut().clear());
+    // The VM pool is keyed by `ChunkId`, and `ChunkId::Proc(i)` is an index
+    // into THIS host's proc table. A fresh host restarts that table at 0, so a
+    // pooled VM left over from the previous run would answer `Proc(i)` with the
+    // PREVIOUS program's block body — the new program's block silently runs the
+    // old one's code. Clearing the pool is what makes `eval_str` twice in one
+    // process independent.
+    VM_POOL.with(|p| p.borrow_mut().clear());
     // Fibers moved off the host into a thread-local, so clear them explicitly.
     FIBERS.with(|f| f.borrow_mut().clear());
     CUR_FIBER.with(|c| c.set(None));
