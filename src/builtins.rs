@@ -11603,7 +11603,7 @@ fn sort_by_family(
                 }
             });
             if let Some((x, y)) = bad {
-                return Err(unrankable_error(&keys, CmpOrder::Source, &x, &y));
+                return Err(unrankable_error(&keys, CmpOrder::SortByKeys, &x, &y));
             }
             Ok(new_arr(keyed.into_iter().map(|p| p.1).collect()))
         }
@@ -23161,10 +23161,26 @@ fn first_unrankable(vals: &[Value]) -> Option<(Value, Value)> {
 /// reproducible outside MRI; two-element arrays match exactly.
 #[derive(Clone, Copy)]
 enum CmpOrder {
-    /// `sort`, `sort_by`, `minmax`, `minmax_by`: source order.
+    /// `sort`, `minmax`, `minmax_by`: source order.
     Source,
     /// `min_by`, `max_by`, `min(n)`, `max(n)`: the later operand first.
     Reversed,
+    /// `sort_by`: source order, except that an Integer key ranked against a
+    /// Float one names the FLOAT first.
+    ///
+    /// `sort_by` builds `(key, value)` pairs and ranks the keys with the float
+    /// as the `<=>` receiver, so it disagrees with `sort` on exactly one pair
+    /// kind — verified against ruby 4.0.6, where every other combination
+    /// answers identically for both methods:
+    ///
+    /// ```text
+    ///   [1, Float::NAN]     sort_by: Float with 1      sort: Integer with NaN
+    ///   [Float::NAN, 1]     sort_by: Float with 1      sort: Float with 1
+    ///   [1.5, Float::NAN]   sort_by: Float with NaN    sort: Float with NaN
+    ///   [1r, Float::NAN]    sort_by: Rational with NaN sort: Rational with NaN
+    ///   [1, nil]            sort_by: Integer with nil  sort: Integer with nil
+    /// ```
+    SortByKeys,
 }
 
 /// The ArgumentError an unrankable pair earns, naming the first pair `vals`
@@ -23176,6 +23192,11 @@ fn unrankable_error(vals: &[Value], order: CmpOrder, x: &Value, y: &Value) -> St
     match order {
         CmpOrder::Source => cmp_error(&p, &q),
         CmpOrder::Reversed => cmp_error(&q, &p),
+        // Only the Integer-then-Float pair swaps; see `CmpOrder::SortByKeys`.
+        CmpOrder::SortByKeys if matches!(p, Value::Int(_)) && matches!(q, Value::Float(_)) => {
+            cmp_error(&q, &p)
+        }
+        CmpOrder::SortByKeys => cmp_error(&p, &q),
     }
 }
 

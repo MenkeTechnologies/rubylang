@@ -25,13 +25,24 @@ fn ruby(src: &str) -> String {
 /// 8x, between the two and far from both.
 #[test]
 fn push_is_linear_not_quadratic() {
+    // CPU time, not wall clock, and a warm-up pass before the measured pair.
+    //
+    // Wall clock made the ratio a measure of the machine as much as of the
+    // append: on a host running hundreds of other jobs the two samples get
+    // scheduled unequally, and the ratio ranged 2.49 to 21.15 over six runs
+    // with the append perfectly linear. CPU time removes the preemption, and
+    // the warm-up removes the other asymmetry — the FIRST `bench` call pays
+    // for JIT compilation the second one inherits, which flatters whichever
+    // sample runs second. Warmed CPU time held 2.08 to 4.98 over eight runs.
     let out = ruby(
         "def bench(n)\n\
-         \x20 t = Process.clock_gettime(Process::CLOCK_MONOTONIC)\n\
+         \x20 t = Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID)\n\
          \x20 a = []\n\
          \x20 n.times { |i| a << i }\n\
-         \x20 [Process.clock_gettime(Process::CLOCK_MONOTONIC) - t, a.size]\n\
+         \x20 [Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID) - t, a.size]\n\
          end\n\
+         bench(50_000)\n\
+         bench(200_000)\n\
          small, small_n = bench(50_000)\n\
          large, large_n = bench(200_000)\n\
          puts small_n, large_n, (large / [small, 1e-6].max).round(2)\n",

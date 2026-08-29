@@ -9694,3 +9694,61 @@ fn string_match_operator_dispatches_on_the_argument() {
     );
     eq("(:abc =~ nil)", "nil");
 }
+
+/// `sort_by` ranks `(key, value)` pairs with the float as the `<=>` receiver,
+/// so it disagrees with `sort` about which operand a failure names — on exactly
+/// one pair kind, an Integer key against a Float one. Every expectation below
+/// is ruby 4.0.6's own message. The differential run that found this had
+/// `sort_by` answering `comparison of Integer with NaN failed` where MRI says
+/// `comparison of Float with 1 failed`.
+#[test]
+fn unrankable_sort_by_names_the_float_first_only_for_an_integer_pair() {
+    // The one pair where `sort_by` and `sort` part company.
+    raises(
+        "[1, Float::NAN].sort_by { |x| x }",
+        "ArgumentError",
+        "comparison of Float with 1 failed",
+    );
+    raises(
+        "[1, Float::NAN].sort",
+        "ArgumentError",
+        "comparison of Integer with NaN failed",
+    );
+
+    // Reversed operands: both agree, the float already leads in source order.
+    raises(
+        "[Float::NAN, 1].sort_by { |x| x }",
+        "ArgumentError",
+        "comparison of Float with 1 failed",
+    );
+    raises(
+        "[Float::NAN, 1].sort",
+        "ArgumentError",
+        "comparison of Float with 1 failed",
+    );
+
+    // Every other kind keeps source order under `sort_by`, so the swap is not
+    // a blanket "name the float first" rule.
+    for (src, want) in [
+        ("[1.5, Float::NAN]", "comparison of Float with NaN failed"),
+        ("[1r, Float::NAN]", "comparison of Rational with NaN failed"),
+        (
+            "[\"a\", Float::NAN]",
+            "comparison of String with NaN failed",
+        ),
+        ("[1, nil]", "comparison of Integer with nil failed"),
+        ("[nil, 1]", "comparison of NilClass with 1 failed"),
+        ("[true, 1]", "comparison of TrueClass with 1 failed"),
+    ] {
+        raises(&format!("{src}.sort_by {{ |x| x }}"), "ArgumentError", want);
+    }
+
+    // `min_by`/`max_by` were already right and must stay so.
+    for m in ["min_by", "max_by"] {
+        raises(
+            &format!("[1, Float::NAN].{m} {{ |x| x }}"),
+            "ArgumentError",
+            "comparison of Float with 1 failed",
+        );
+    }
+}
