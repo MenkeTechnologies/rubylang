@@ -18,7 +18,11 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 /// Bump on any incompatible change to `CProg` / the lowering.
-const SCHEMA: u64 = 9;
+///
+/// 9 -> 10: a `ProcDef` carries `block_depth`, the lexical block nesting MRI's
+/// `block (N levels) in X` frame label counts. A shard written by 9 has no such
+/// field, and reading one as 10 would name every block frame `block in X`.
+const SCHEMA: u64 = 10;
 
 /// The outer, rkyv-archived shard: the [`build_stamp`] of the binary that wrote
 /// it, then a flat list of (key, bincode-blob) entries.
@@ -86,6 +90,9 @@ type CProc = (
     Vec<String>,
     Option<String>,
     Option<String>,
+    // `ProcDef::block_depth` — the lexical block nesting MRI's
+    // `block (N levels) in X` frame label counts.
+    u32,
 );
 
 /// The inner, serde/bincode form of a compiled program. Tuples keep the shape
@@ -424,6 +431,7 @@ fn to_cprog(prog: &Program) -> CProg {
                     p.arity.kwreq.clone(),
                     p.arity.kwsplat.clone(),
                     p.arity.blockparam.clone(),
+                    p.block_depth,
                 )
             })
             .collect(),
@@ -501,7 +509,18 @@ fn from_cprog(cp: CProg) -> Program {
             .procs
             .into_iter()
             .map(
-                |(params, splat, chunk, req, opt, kwnames, kwreq, kwsplat, blockparam)| ProcDef {
+                |(
+                    params,
+                    splat,
+                    chunk,
+                    req,
+                    opt,
+                    kwnames,
+                    kwreq,
+                    kwsplat,
+                    blockparam,
+                    block_depth,
+                )| ProcDef {
                     params,
                     splat,
                     chunk,
@@ -513,6 +532,7 @@ fn from_cprog(cp: CProg) -> Program {
                         kwsplat,
                         blockparam,
                     },
+                    block_depth,
                 },
             )
             .collect(),

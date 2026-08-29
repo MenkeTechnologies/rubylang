@@ -110,3 +110,64 @@ fn no_ruby_prefix_on_uncaught_exception() {
     // line must be, so removing the prefix by removing the printer is caught.
     assert_eq!(stderr, "-e:1:in '<main>': boom (RuntimeError)\n");
 }
+
+/// A frame inside a BLOCK is named `block in X`, and one inside nested blocks
+/// `block (N levels) in X`, where N counts the block literals the code is
+/// written inside and X is the method the outermost of them was written in.
+///
+/// This is MRI's own naming and it is lexical: `pr` written at the top level and
+/// called from inside a method is still `block in <main>`. A method CALLED from
+/// inside a block is named for the method, not the block, which is why the label
+/// is pushed with the frame depth it was entered at.
+///
+/// Every expectation is the reference `ruby`'s, taken from `e.backtrace.first`
+/// on the same shapes (`ruby 4.0.6`); the uncaught printer puts the same label
+/// in its first line.
+#[test]
+fn a_block_frame_is_named_block_in_its_enclosing_context() {
+    for (src, want) in [
+        // No block at all.
+        (r#"raise "x""#, "'<main>'"),
+        // One, two, three deep.
+        (r#"[1].each { raise "x" }"#, "'block in <main>'"),
+        (
+            r#"[1].each { [2].each { raise "x" } }"#,
+            "'block (2 levels) in <main>'",
+        ),
+        (
+            r#"[1].each { [2].each { [3].each { raise "x" } } }"#,
+            "'block (3 levels) in <main>'",
+        ),
+        // The enclosing context is the method the block was written in — `#` for
+        // an instance method, `.` for a singleton one.
+        (
+            "class K\n  def m = [1].each { raise \"x\" }\nend\nK.new.m",
+            "'block in K#m'",
+        ),
+        (
+            "class K\n  def self.s = [1].each { raise \"x\" }\nend\nK.s",
+            "'block in K.s'",
+        ),
+        (
+            "class K\n  def d = [1].each { [2].each { raise \"x\" } }\nend\nK.new.d",
+            "'block (2 levels) in K#d'",
+        ),
+        // A method called FROM a block is named for the method: the block's
+        // label is not the innermost frame any more.
+        (
+            "def where = raise(\"x\")\n[1].each { where }",
+            "'Object#where'",
+        ),
+        // A lambda body is a block body too.
+        (r#"l = lambda { raise "x" }; l.call"#, "'block in <main>'"),
+    ] {
+        let (stderr, ok) = run_e(src);
+        assert!(!ok, "an uncaught raise must exit non-zero: {src}");
+        let got = stderr
+            .split_once(":in ")
+            .and_then(|(_, rest)| rest.split_once(':'))
+            .map(|(label, _)| label.to_string())
+            .unwrap_or_else(|| format!("(no label in {stderr:?})"));
+        assert_eq!(got, want, "for {src}");
+    }
+}

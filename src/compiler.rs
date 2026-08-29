@@ -104,6 +104,10 @@ pub struct Compiler {
     /// (Ruby's lexical constant lookup). Superclass/include names are resolved
     /// against it too.
     nesting: Vec<String>,
+    /// How many block literals the code being lowered is written inside. Stamped
+    /// on each `ProcDef` so a frame can be named `block (N levels) in X` the way
+    /// MRI names it.
+    block_depth: u32,
     /// The source line of the statement currently being compiled. Baked into the
     /// call/read ops that can raise (`CALL*`, `YIELD`, `SUPER*`, var reads,
     /// index) so `abort` can report an MRI-format backtrace line
@@ -913,6 +917,7 @@ fn dummy_proc() -> ProcDef {
         splat: None,
         chunk: ChunkBuilder::new().build(),
         arity: crate::ast::BlockArity::default(),
+        block_depth: 1,
     }
 }
 
@@ -2565,7 +2570,13 @@ impl Compiler {
         let mut frame = self.scope_locals.last().cloned().unwrap_or_default();
         frame.extend(params.iter().cloned());
         self.scope_locals.push(frame);
+        // How many block literals this one is written inside, counting itself —
+        // what MRI's `block (N levels) in X` counts. Incremented across the BODY
+        // so a block nested in this one sees one more.
+        self.block_depth += 1;
+        let block_depth = self.block_depth;
         let chunk = self.compile_body_chunk(body);
+        self.block_depth -= 1;
         self.scope_locals.pop();
         let chunk = chunk?;
         let id = self.procs.len();
@@ -2574,6 +2585,7 @@ impl Compiler {
             splat,
             chunk,
             arity,
+            block_depth,
         });
         Ok(id)
     }

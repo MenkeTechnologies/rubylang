@@ -347,11 +347,24 @@ exception (`KeyError.new("m")`) answers nil for them, as MRI's does.
   block whose call is live, `map { break 9 }`, a lazy pipeline), and four
   generator/enumerator drivers that must stay ordinary answers.
 
-- **A block frame is labelled `<main>` rather than `block in <main>`.** MRI names
-  the frame a failure was raised in, and inside a block that is
-  `block in <enclosing>`: `-e:1:in 'block in <main>'`, `-e:2:in 'block in
-  Object#gen'`. rubylang names the enclosing frame instead, so the message and
-  the class tag agree and the context does not.
+- **A block frame is named `block in X` — fixed.** MRI names the frame a failure
+  was raised in, and inside a block that is `block in <enclosing>`, with
+  `block (N levels) in <enclosing>` once blocks nest. N counts the block literals
+  the code is WRITTEN inside — it is lexical, not a call depth — and `<enclosing>`
+  is the method the outermost of them was written in (`K#m`, `K.s`, `<main>`).
+  A lambda body counts as a block. `ProcDef::block_depth` carries N from the
+  compiler, and the label is built from the proc's CAPTURED scope, so a proc
+  written at the top level and called from inside a method is still
+  `block in <main>`.
+
+  A method CALLED from inside a block is named for the method, not the block, so
+  the label is pushed together with `frames.len()` at entry and only wins while
+  no deeper frame exists — `[1].each { where }` is `Object#where`.
+
+  One residue: the `LocalJumpError` an orphaned `break` raises is built after the
+  block body has returned, so it still reports the enclosing frame
+  (`-e:1:in '<main>'` where MRI says `block in <main>`). The class, message,
+  `reason` and exit status all agree; only that label does not.
 - **`Exception#backtrace` is `[]`, never `nil` and never populated.** MRI
   answers `nil` for an exception that was never raised and a real frame list for
   one that was. rubylang retains no per-exception Ruby backtrace (see the line-0

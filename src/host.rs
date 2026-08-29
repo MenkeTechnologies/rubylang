@@ -1274,6 +1274,12 @@ pub struct ProcDef {
     /// `define_method` body — is arity-checked against it exactly like a `def`,
     /// and `Proc#arity` is computed from it for both.
     pub arity: crate::ast::BlockArity,
+    /// How many block literals this one is written inside, counting itself: 1
+    /// for `[1].each { … }`, 2 for the inner block of `a.each { b.each { … } }`.
+    /// MRI names the frame `block in X`, `block (2 levels) in X`, … from exactly
+    /// this LEXICAL count — it is where the block was written, not how deep the
+    /// call got.
+    pub block_depth: u32,
 }
 
 /// One method activation (or the top level): its captured scope plus the args it
@@ -1801,6 +1807,7 @@ pub fn reset_host() {
     // process independent.
     VM_POOL.with(|p| p.borrow_mut().clear());
     BLOCK_HOMES.with(|s| s.borrow_mut().clear());
+    BLOCK_CTX.with(|s| s.borrow_mut().clear());
     LEXICAL_BREAK.with(|c| c.set(false));
     // Fibers moved off the host into a thread-local, so clear them explicitly.
     FIBERS.with(|f| f.borrow_mut().clear());
@@ -6865,21 +6872,46 @@ impl RubyHost {
     /// and `'<DefClass>.<method>'` inside a class/singleton method (`def self.m`),
     /// matching MRI's `-e:1:in 'A.f'`.
     fn innermost_context(&self) -> String {
-        match self.frames.last() {
-            Some(f) => match &f.scope.method_name {
-                Some(m) => {
-                    let cls = f.scope.def_class.clone().unwrap_or_else(|| "Object".into());
-                    // A class/singleton method's `self` is the class ref itself.
-                    let sep = if matches!(self.obj(&f.scope.self_obj), Some(RObj::ClassRef(_))) {
-                        '.'
-                    } else {
-                        '#'
-                    };
-                    format!("{cls}{sep}{m}")
-                }
-                None => "<main>".into(),
-            },
+        // A block body is a frame MRI names, and it names it for where the block
+        // was WRITTEN — `pr` created at the top level and called from inside a
+        // method is still `block in <main>`. The label is pushed when the body is
+        // entered (see `enter_block_ctx`) together with the frame depth at that
+        // moment, so a method CALLED from inside the block, which does push a
+        // frame, is correctly the innermost one instead.
+        if let Some((depth, label)) = BLOCK_CTX.with(|s| s.borrow().last().cloned()) {
+            if depth >= self.frames.len() {
+                return label;
+            }
+        }
+        self.scope_context(self.frames.last().map(|f| &f.scope))
+    }
+
+    /// MRI's context label for one scope: `<main>` at the top level, `C#m` in an
+    /// instance method, `C.m` in a class/singleton method.
+    fn scope_context(&self, scope: Option<&Scope>) -> String {
+        match scope.and_then(|s| s.method_name.as_ref().map(|m| (s, m))) {
+            Some((s, m)) => {
+                let cls = s.def_class.clone().unwrap_or_else(|| "Object".into());
+                // A class/singleton method's `self` is the class ref itself.
+                let sep = if matches!(self.obj(&s.self_obj), Some(RObj::ClassRef(_))) {
+                    '.'
+                } else {
+                    '#'
+                };
+                format!("{cls}{sep}{m}")
+            }
             None => "<main>".into(),
+        }
+    }
+
+    /// The label MRI gives a block body written `depth` literals deep inside
+    /// `scope`: `block in <main>`, `block (2 levels) in K#m`.
+    fn block_context(&self, scope: &Scope, depth: u32) -> String {
+        let inner = self.scope_context(Some(scope));
+        if depth <= 1 {
+            format!("block in {inner}")
+        } else {
+            format!("block ({depth} levels) in {inner}")
         }
     }
     /// Append one MRI-format backtrace frame (`<src>:<line>:in '<ctx>'`) for the
@@ -12019,6 +12051,14 @@ pub fn call_proc_self_ctx(
     // The block's "home": the method activation it was defined in. A non-local
     // `return` from this block unwinds to that frame.
     let home_frame = scope.frame_id;
+    // This body is a frame MRI names `block in X` — see `innermost_context`. The
+    // label comes from the block's CAPTURED scope, because MRI names a block for
+    // where it was WRITTEN and not for where it was called from, and it is built
+    // here because `..scope` below moves that scope.
+    let block_ctx = with_host(|h| {
+        let label = h.block_context(&scope, h.procs[template].block_depth);
+        (h.frames.len(), label)
+    });
     let mut block_scope = Scope {
         locals: child,
         self_obj: self_override
@@ -12033,6 +12073,7 @@ pub fn call_proc_self_ctx(
         block_scope.def_class = Some(owner);
     }
     let prev_active = with_host(|h| h.active_scope.replace(block_scope));
+    BLOCK_CTX.with(|s| s.borrow_mut().push(block_ctx));
     // `redo` re-runs the body from the top with the SAME scope — the params keep
     // their bound values and any local the body already assigned survives (MRI
     // does not re-bind either), so the child env is deliberately not rebuilt.
@@ -12046,8 +12087,11 @@ pub fn call_proc_self_ctx(
         h.active_scope = prev_active;
     });
     // A `next` inside the block becomes the block's value; break/return propagate.
+    // The block's own frame label stays pushed across this, because the orphaned
+    // `break` below RAISES from inside the block and MRI names that frame the
+    // block's: `-e:1:in 'block in <main>': break from proc-closure`.
     let sig = with_host(|h| h.signal.take());
-    match sig {
+    let out = match sig {
         Some(Signal::Next(v)) => Ok(v),
         // In a lambda, `return` and `break` are local — they end the lambda and
         // become its value (MRI lambda semantics).
@@ -12078,7 +12122,11 @@ pub fn call_proc_self_ctx(
             r
         }
         None => r,
-    }
+    };
+    BLOCK_CTX.with(|s| {
+        s.borrow_mut().pop();
+    });
+    out
 }
 
 /// The block passed to the current method (for `yield`).
@@ -12219,6 +12267,12 @@ pub fn leave_block_home(id: Option<u64>) {
 }
 
 thread_local! {
+    /// The block bodies currently executing, innermost last: the MRI label for
+    /// each, paired with `frames.len()` when it was entered. The depth is what
+    /// tells a block apart from a METHOD it called — that method pushes a frame,
+    /// so `frames.len()` grows past the recorded one and the method is innermost.
+    static BLOCK_CTX: RefCell<Vec<(usize, String)>> = const { RefCell::new(Vec::new()) };
+
     static NEXT_BLOCK_HOME: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
 
     /// Whether the pending `Signal::Break` came from the `break` KEYWORD.
