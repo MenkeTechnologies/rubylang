@@ -387,15 +387,54 @@ exception (`KeyError.new("m")`) answers nil for them, as MRI's does.
   `rescue`; rubylang's is caught by one. The class tree is right —
   `builtin_exception_parent` already puts `SyntaxError` under `ScriptError` —
   but the eval path does not raise it.
-- **`exit(3)` is not rescuable as `SystemExit`.** It terminates instead of
-  raising an object a handler can inspect, so `rescue SystemExit => e` never
-  runs and `e.status` is unreachable. An uncaught `throw` was the same shape of
-  gap and is now fixed — see below.
+- **`at_exit` is not implemented.** `at_exit { … }` is
+  `undefined method 'at_exit' for main`, so a program cannot register a block to
+  run as the interpreter leaves. `exit` and `ensure` now behave (see the FIXED
+  entry below), which is most of what `at_exit` is reached for; what is missing
+  is the registry and the LIFO order MRI runs it in, plus running it after an
+  uncaught exception as well as after a normal end.
 - **MRI's `DidYouMean::Correctable` / `ErrorHighlight::CoreExt` do not appear in
   `ancestors`.** These are gems MRI injects into `NameError`/`KeyError`/
   `TypeError`. Deliberately absent — rubylang emits no "did you mean"
   suggestions at all — so the ancestor lists are one or two entries shorter than
   MRI's while the class itself and its real superclass chain match.
+
+## FIXED — `exit` raises `SystemExit` instead of leaving where it stands
+
+`exit` called the process's own exit directly, so nothing between it and the
+kernel ran: an `ensure` above it was skipped, and `rescue SystemExit` could
+never see it even though the class, its ancestry and its two readers were
+already in the tables.
+
+```ruby
+begin; exit(3); ensure; puts "ensure ran"; end
+# MRI:      ensure ran, then exit 3
+# rubylang: exit 3, and nothing printed
+
+begin; exit(3); rescue SystemExit => e; p e.status; end
+# MRI:      3      rubylang: exit 3, handler never ran
+```
+
+`exit` now raises `SystemExit` carrying the status, and reaching the top
+uncaught is what ends the process — with that status and no message. `exit!`
+still leaves immediately, which is the difference between the two. A bare
+`rescue` still does not catch it, because `SystemExit` descends from `Exception`
+rather than `StandardError`, and that was already right.
+
+`SystemExit.new` takes the STATUS first, unlike every other exception, whose
+first argument is its message: `SystemExit.new(7)` is status 7 with the default
+message, `SystemExit.new(2, "bye")` is both, and `SystemExit.new("bye")` is a
+message with status 0 — only a true/false or an Integer is read as the status.
+`#status` and `#success?` answer from it, and are gated on the class because
+`status` is also `Thread`'s.
+
+Both top levels ask one accessor, `RubyHost::pending_system_exit`. The
+interpreter asks it in `run_main`; a standalone `--build --native` binary never
+runs that function — it exits with what `fusevm_aot_run_embedded` returned — so
+its generated `main` asks through `aot::pending_exit_status`. That second half
+is not hypothetical: `tests/aot_native.rs` caught the standalone binary
+returning 0 where it had to return 5, which is exactly the case the first half
+of the change would otherwise have broken.
 
 ## FIXED — an uncaught `throw` raises at the throw site
 

@@ -6961,6 +6961,21 @@ impl RubyHost {
     /// `<src>:<line>:in '<ctx>': <msg> (<Class>)` followed by tab-indented
     /// `from <src>:<line>:in '<ctx>'` lines for the remaining frames. Returns
     /// `None` when no exception is pending. Consumes the pending exception.
+    /// The status a pending `SystemExit` carries, if that is what is pending.
+    ///
+    /// `exit` raises rather than leaving the process where it stands, so an
+    /// `ensure` above it runs and a `rescue SystemExit` can stop it; reaching
+    /// the top uncaught is what makes it an exit. Both top levels ask this —
+    /// [`run_main`] for the interpreter and `aot::pending_exit_status` for a
+    /// standalone binary, which never runs `run_main`.
+    pub fn pending_system_exit(&self) -> Option<i32> {
+        let exc = self.pending_exc.clone()?;
+        (self.class_of(&exc) == "SystemExit").then(|| match self.ivar_of(&exc, "status") {
+            Value::Int(n) => n as i32,
+            _ => 0,
+        })
+    }
+
     pub fn format_uncaught(&mut self) -> Option<String> {
         let exc = self.pending_exc.take()?;
         let class = self.class_of(&exc).to_string();
@@ -9320,6 +9335,19 @@ pub fn run_main(chunk: Chunk) -> Result<Value, String> {
     });
     if let Some(tag) = uncaught {
         return Err(format!("uncaught throw {tag} (UncaughtThrowError)"));
+    }
+    // A `SystemExit` that reached the top is what `exit` asked for: it ends the
+    // process with its status and prints NOTHING. It is an exception the whole
+    // way up — which is how an `ensure` above the `exit` runs and a
+    // `rescue SystemExit` stops it — and only arriving here makes it an exit.
+    if r.is_err() {
+        if let Some(code) = with_host(|h| h.pending_system_exit()) {
+            // Buffered output written before the `exit` has to reach the
+            // terminal: `process::exit` runs no destructors.
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code);
+        }
     }
     // An uncaught Ruby exception prints in MRI's shape (`<src>:<line>:in '<ctx>':
     // <msg> (<Class>)` + backtrace). `abort` captured each frame as the exception

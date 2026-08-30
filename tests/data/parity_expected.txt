@@ -2808,3 +2808,32 @@ ensure
 "else"
 ensure
 "rescue:boom"
+#==#
+SystemExit
+3
+false
+0
+true
+1
+false
+0
+true
+["outer", SystemExit, 2]
+ensure ran
+5
+swallowed
+still running
+#==#
+7
+false
+"SystemExit"
+2
+"bye"
+0
+"SystemExit"
+0
+"just a message"
+1
+false
+5
+"raised"

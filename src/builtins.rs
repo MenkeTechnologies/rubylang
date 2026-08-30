@@ -4081,6 +4081,23 @@ fn dispatch_classref(
                 let obj = with_host(|h| h.new_object(cls));
                 call_instance_method(obj.clone(), cls, "initialize", args, block)?;
                 Ok(obj)
+            } else if cls == "SystemExit" {
+                // `SystemExit.new(status = 0, message = nil)` — the status comes
+                // FIRST, unlike every other exception, and only a true/false or
+                // an Integer is one: `SystemExit.new("bye")` is a message with
+                // status 0. The default message is the class name, as elsewhere.
+                let (status, msg_arg) = match args.first() {
+                    Some(Value::Bool(b)) => (i64::from(!*b), args.get(1)),
+                    Some(v @ Value::Int(_)) => (as_i(v), args.get(1)),
+                    other => (0, other),
+                };
+                let msg = match msg_arg {
+                    Some(a) => with_host(|h| h.to_s(a)),
+                    None => cls.to_string(),
+                };
+                let exc = with_host(|h| h.new_exception(cls, &msg));
+                with_host(|h| h.set_ivar_of(&exc, "status", Value::Int(status)));
+                Ok(exc)
             } else if is_exception_class(cls) {
                 let msg = match args.first() {
                     Some(a) => with_host(|h| h.to_s(a)),
@@ -5124,6 +5141,20 @@ fn dispatch_object(
         // Exception backtrace surface. rubylang does not retain a per-exception
         // Ruby backtrace, so report an empty one (never nil, which callers splat
         // or `.first` on); `cause` is nil, `full_message` the message.
+        // `SystemExit#status` / `#success?` — the code `exit` was given, or the
+        // one `SystemExit.new(n)` was constructed with. Beside the other
+        // exception readers and gated on the class: `status` is `Thread`'s too.
+        "status" | "success?" if cls == "SystemExit" => {
+            let code = match with_host(|h| h.ivar_of(recv, "status")) {
+                Value::Undef => 0,
+                v => as_i(&v),
+            };
+            Ok(if name == "status" {
+                Value::Int(code)
+            } else {
+                Value::Bool(code == 0)
+            })
+        }
         "backtrace" | "backtrace_locations" if is_exception_class(cls) => Ok(new_arr(Vec::new())),
         "set_backtrace" if is_exception_class(cls) => {
             Ok(args.first().cloned().unwrap_or(Value::Undef))
@@ -18062,7 +18093,18 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
                 Some(Value::Bool(false)) => 1,
                 Some(v) => as_i(v) as i32,
             };
-            std::process::exit(code);
+            // `exit!` leaves immediately; `exit` RAISES `SystemExit`, which is
+            // what makes an `ensure` above it run and a `rescue SystemExit`
+            // catch it. Reaching the top uncaught is what actually ends the
+            // process, with this status — see `host::run_main`.
+            if name == "exit!" {
+                std::process::exit(code);
+            }
+            Err(raise_exc_with(
+                "SystemExit",
+                "exit",
+                &[("status", Value::Int(i64::from(code)))],
+            ))
         }
         "warn" => {
             // `warn(*msgs)` writes each message (with a trailing newline) to

@@ -128,6 +128,20 @@ pub fn build(file: &str) -> Result<String, String> {
 // Native standalone executable (`ruby --build --native`)
 // ────────────────────────────────────────────────────────────────────────────
 
+/// The exit status a `SystemExit` left pending, for the generated `main` to use
+/// in place of the VM's own return.
+///
+/// `exit` raises `SystemExit` rather than leaving the process where it stands,
+/// so that an `ensure` above it runs and a `rescue SystemExit` can stop it. The
+/// interpreter turns an uncaught one into the process status in
+/// `host::run_main`; a standalone AOT binary never goes through that function —
+/// it exits with what `fusevm_aot_run_embedded` returned — so it asks here
+/// instead. `None` when the run ended any other way, including a real error,
+/// whose status the VM's own return already carries.
+pub fn pending_exit_status() -> Option<i32> {
+    crate::host::with_host(|h| h.pending_system_exit())
+}
+
 /// The AOT frontend hook fusevm's [`fusevm::aot::fusevm_aot_run_embedded`] calls
 /// after it deserializes the embedded main chunk and builds the VM. Provided by
 /// the frontend per fusevm's contract; here it lives in the rubylang library so
@@ -336,7 +350,10 @@ pub fn build_native(file: &str) -> Result<String, String> {
          // Register every AOT-lowered method/block driver before the program runs.\n    \
          rubylang::aot::register_native_fns(vec![{fn_addrs}]);\n    \
          // SAFETY: resolved from the linked rubylang/fusevm runtime.\n    \
-         std::process::exit(unsafe {{ fusevm_aot_run_embedded() }} as i32);\n}}\n",
+         let rc = unsafe {{ fusevm_aot_run_embedded() }} as i32;\n    \
+         // `exit` raises SystemExit so an `ensure` runs; an uncaught one is what\n    \
+         // actually sets the status, and this binary never runs `host::run_main`.\n    \
+         std::process::exit(rubylang::aot::pending_exit_status().unwrap_or(rc));\n}}\n",
         len = blob.len(),
         blob = blob_path.to_string_lossy(),
     );

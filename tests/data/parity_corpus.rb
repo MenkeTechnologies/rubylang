@@ -4463,3 +4463,73 @@ ensure
 end
 p(order { 1 })
 p(order { raise "boom" })
+#==#
+# `exit` raises SystemExit rather than leaving the process where it stands, so
+# an `ensure` above it runs and a handler can stop it. It is under Exception,
+# NOT StandardError, so a bare `rescue` does not see it.
+begin
+  exit(3)
+rescue SystemExit => e
+  p e.class, e.status, e.success?
+end
+begin
+  exit
+rescue SystemExit => e
+  p e.status, e.success?
+end
+begin
+  exit(false)
+rescue SystemExit => e
+  p e.status, e.success?
+end
+begin
+  exit(true)
+rescue SystemExit => e
+  p e.status, e.success?
+end
+# A bare rescue must NOT catch it; `rescue Exception` must.
+begin
+  begin
+    exit(2)
+  rescue => e
+    puts "bare rescue caught"
+  end
+rescue Exception => e
+  p ["outer", e.class, e.status]
+end
+# `ensure` runs on the way out, and the handler above it still sees the exit.
+def exits
+  exit(5)
+ensure
+  puts "ensure ran"
+end
+begin
+  exits
+rescue SystemExit => e
+  p e.status
+end
+# Stopping it lets the program carry on.
+begin
+  exit(9)
+rescue SystemExit
+  puts "swallowed"
+end
+puts "still running"
+#==#
+# SystemExit.new takes the STATUS first — unlike every other exception, whose
+# first argument is the message — and only a true/false or an Integer is one.
+e = SystemExit.new(7)
+p e.status, e.success?, e.message
+e2 = SystemExit.new(2, "bye")
+p e2.status, e2.message
+e3 = SystemExit.new
+p e3.status, e3.message
+e4 = SystemExit.new("just a message")
+p e4.status, e4.message
+e5 = SystemExit.new(false)
+p e5.status, e5.success?
+begin
+  raise SystemExit.new(5, "raised")
+rescue SystemExit => e
+  p e.status, e.message
+end
