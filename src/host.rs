@@ -17,7 +17,7 @@
 use fusevm::{Chunk, NumOp, VMResult, Value, VM};
 use indexmap::IndexMap;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::intercepts::{self, Advice};
@@ -1354,11 +1354,14 @@ pub struct RubyHost {
     /// stable, so a `rescue`/re-raise still finds its trace. Cleared per run
     /// (`reset_host` rebuilds the host).
     exc_backtraces: IndexMap<u32, Vec<String>>,
-    /// Heap ids of String objects whose encoding is ASCII-8BIT/BINARY (from
-    /// `String#b` or `force_encoding("BINARY")`). We store only UTF-8 byte content;
-    /// this side table records the encoding tag so `#encoding` answers correctly
-    /// without a representation change. Absent = UTF-8 (the default).
-    binary_strings: HashSet<u32>,
+    /// Heap ids of String objects whose encoding is NOT UTF-8, mapped to that
+    /// encoding's canonical name (`"ASCII-8BIT"`, `"US-ASCII"`). Sources are
+    /// `String#b`, `force_encoding`, `Integer#chr` and `Array#pack`. We store only
+    /// UTF-8 byte content; this side table records the encoding tag so `#encoding`
+    /// answers correctly, and so `#inspect` knows to escape bytes as `\\xNN` the way
+    /// MRI does for a non-UTF-8 string, without a representation change.
+    /// Absent = UTF-8 (the default).
+    string_encodings: HashMap<u32, &'static str>,
     signal: Option<Signal>,
     /// The tags of the `catch` blocks currently on the stack, innermost last.
     ///
@@ -2184,7 +2187,7 @@ impl RubyHost {
             error: None,
             pending_exc: None,
             exc_backtraces: IndexMap::new(),
-            binary_strings: HashSet::new(),
+            string_encodings: HashMap::new(),
             signal: None,
             catch_tags: Vec::new(),
             active_scope: None,
@@ -2402,6 +2405,14 @@ impl RubyHost {
                 if let Value::Obj(oid) = v {
                     if let Some(cls) = self.class_overrides.get(oid).cloned() {
                         self.set_class_override(&new, &cls);
+                    }
+                    // A String's encoding is a side-table tag, not part of
+                    // `RObj::Str`, so it has to be copied explicitly — MRI's
+                    // `dup`/`clone` preserve it (`"a".b.dup.encoding` is
+                    // ASCII-8BIT), and without this the copy silently reverts to
+                    // the UTF-8 default.
+                    if let Some(enc) = self.string_encodings.get(oid).copied() {
+                        self.set_string_encoding(&new, enc);
                     }
                 }
                 new
@@ -6940,22 +6951,103 @@ impl RubyHost {
             .or_default()
             .push(format!("{src}:{line}:in '{ctx}'"));
     }
+    /// Tag a String heap object with a non-UTF-8 encoding name. `name` must be
+    /// canonical (`"ASCII-8BIT"`, `"US-ASCII"`); UTF-8 is the untagged default,
+    /// so tagging it is spelled [`RubyHost::clear_string_encoding`] instead.
+    pub fn set_string_encoding(&mut self, v: &Value, name: &'static str) {
+        if let Value::Obj(id) = v {
+            self.string_encodings.insert(*id, name);
+        }
+    }
+    /// Drop a String's encoding tag, returning it to the UTF-8 default.
+    pub fn clear_string_encoding(&mut self, v: &Value) {
+        if let Value::Obj(id) = v {
+            self.string_encodings.remove(id);
+        }
+    }
+    /// A String's recorded non-UTF-8 encoding name, or `None` for UTF-8.
+    pub fn string_encoding(&self, v: &Value) -> Option<&'static str> {
+        match v {
+            Value::Obj(id) => self.string_encodings.get(id).copied(),
+            _ => None,
+        }
+    }
     /// Tag a String heap object as ASCII-8BIT/BINARY (`String#b`,
     /// `force_encoding("BINARY")`).
     pub fn mark_binary_string(&mut self, v: &Value) {
-        if let Value::Obj(id) = v {
-            self.binary_strings.insert(*id);
-        }
+        self.set_string_encoding(v, "ASCII-8BIT");
     }
     /// Clear a String's BINARY tag (`force_encoding("UTF-8")` and friends).
     pub fn unmark_binary_string(&mut self, v: &Value) {
-        if let Value::Obj(id) = v {
-            self.binary_strings.remove(id);
-        }
+        self.clear_string_encoding(v);
     }
     /// Whether a String heap object is tagged ASCII-8BIT/BINARY.
     pub fn is_binary_string(&self, v: &Value) -> bool {
-        matches!(v, Value::Obj(id) if self.binary_strings.contains(id))
+        self.string_encoding(v) == Some("ASCII-8BIT")
+    }
+    /// Give the freshly built String `out` the encoding of the String `src` it
+    /// was derived from — the `String#+` / `String#*` half of the rule
+    /// `dispatch_string` applies to method results.
+    ///
+    /// `src_ascii` is whether `src`'s own content is 7-bit clean, which decides the
+    /// one case where MRI
+    /// does NOT inherit: an ASCII-only non-UTF-8 receiver combined with
+    /// non-ASCII text upgrades to UTF-8 (`"abc".b + "é"` is UTF-8, while
+    /// `[255].pack("C*") + "a"` stays ASCII-8BIT).
+    pub fn inherit_string_encoding(&mut self, out: &Value, src: &Value, src_ascii: bool) {
+        self.inherit_string_encoding_with(out, src, src_ascii, None)
+    }
+    /// [`RubyHost::inherit_string_encoding`] for a two-operand op, where `other`
+    /// is the operand being combined with `src`.
+    ///
+    /// MRI's `rb_enc_compatible` rule, measured on 4.0.6: the operand that
+    /// carries NON-ASCII content decides the result's encoding, and when neither
+    /// does the receiver decides. So
+    ///
+    /// ```text
+    /// 110.chr + 248.chr   # => ASCII-8BIT — the non-ASCII operand decides
+    /// "abc"   + 248.chr   # => ASCII-8BIT — even against a UTF-8 receiver
+    /// 110.chr + "abc".b   # => US-ASCII   — both ASCII-only, receiver decides
+    /// "abc"   + 110.chr   # => UTF-8      — likewise
+    /// ```
+    ///
+    /// Reading the RESULT's content instead (what `other: None` falls back to,
+    /// for the one-operand `String#*`) cannot make that distinction: it sees
+    /// non-ASCII in `110.chr + 248.chr` and cannot tell whether it came from
+    /// bytes or from text, which is the difference between `"n\xF8"` and `"nø"`.
+    ///
+    /// Not implemented: MRI RAISES `Encoding::CompatibilityError` when both
+    /// operands carry non-ASCII content in different encodings
+    /// (`248.chr + "é"`). That needs a real byte representation to detect
+    /// reliably; this picks the receiver's encoding instead of raising.
+    pub fn inherit_string_encoding_with(
+        &mut self,
+        out: &Value,
+        src: &Value,
+        src_ascii: bool,
+        other: Option<&Value>,
+    ) {
+        let decided = if !src_ascii {
+            self.string_encoding(src)
+        } else {
+            let other_decides = match other {
+                Some(o) => !self.as_str(o).map(|s| s.is_ascii()).unwrap_or(true),
+                None => !self.as_str(out).map(|s| s.is_ascii()).unwrap_or(true),
+            };
+            match (other_decides, other) {
+                (true, Some(o)) => self.string_encoding(o),
+                // Without the operand in hand, non-ASCII in the result is read
+                // as UTF-8 text — the `String#*` case, where the only source of
+                // content is the receiver, so this is reached only when the
+                // receiver was ASCII-only and the result is not.
+                (true, None) => None,
+                (false, _) => self.string_encoding(src),
+            }
+        };
+        match decided {
+            Some(enc) => self.set_string_encoding(out, enc),
+            None => self.clear_string_encoding(out),
+        }
     }
     /// Format the pending (uncaught) exception in MRI's shape:
     /// `<src>:<line>:in '<ctx>': <msg> (<Class>)` followed by tab-indented
@@ -7328,6 +7420,10 @@ impl RubyHost {
             Value::Undef => "nil".to_string(),
             Value::Str(s) => inspect_string(s),
             Value::Obj(_) => match self.obj(v).cloned() {
+                // A string tagged with a non-UTF-8 encoding escapes by byte
+                // (`"\xFF"`), not by codepoint (`"ÿ"`) — MRI picks the
+                // form from the encoding, so `#inspect` has to consult the tag.
+                Some(RObj::Str(s)) if self.string_encoding(v).is_some() => inspect_string_bytes(&s),
                 Some(RObj::Str(s)) => inspect_string(&s),
                 Some(RObj::Symbol(s)) => {
                     if plain_symbol_name(&s) {
@@ -8088,7 +8184,11 @@ impl RubyHost {
             (Some(RObj::Str(s)), Add) => {
                 let s = s.clone();
                 return match self.as_str(b) {
-                    Some(bs) => Ok(self.new_string(format!("{s}{bs}"))),
+                    Some(bs) => {
+                        let out = self.new_string(format!("{s}{bs}"));
+                        self.inherit_string_encoding_with(&out, a, s.is_ascii(), Some(b));
+                        Ok(out)
+                    }
                     None => Err(self.no_conversion(b, "String")),
                 };
             }
@@ -8104,7 +8204,9 @@ impl RubyHost {
                     ));
                 }
                 let n = raw as usize;
-                return Ok(self.new_string(s.repeat(n)));
+                let out = self.new_string(s.repeat(n));
+                self.inherit_string_encoding(&out, a, s.is_ascii());
+                return Ok(out);
             }
             (Some(RObj::Str(s)), Lt | Gt | Le | Ge) => {
                 if let Some(RObj::Str(bs)) = self.obj(b) {
@@ -8837,6 +8939,75 @@ pub fn inspect_string(s: &str) -> String {
                 out.push_str(&format!("\\u{:04X}", c as u32));
             }
             c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `String#inspect` for a string whose encoding is NOT UTF-8 (ASCII-8BIT or
+/// US-ASCII — see [`RubyHost::string_encoding`]).
+///
+/// MRI escapes such a string by BYTE, not by codepoint: everything outside
+/// printable ASCII that has no named escape comes out as `\xNN` in uppercase
+/// hex, where [`inspect_string`] would emit the `\uXXXX` form MRI reserves for
+/// UTF-8. Measured against MRI 4.0.6:
+///
+/// ```text
+/// p 1.chr        # => "\x01"     (US-ASCII)   vs  p "\x01"  # => "" (UTF-8)
+/// p 255.chr      # => "\xFF"     (ASCII-8BIT)
+/// p "\x7f".b     # => "\x7F"
+/// ```
+///
+/// The named escapes, the `"`/`\` pairs and the `#`-before-`{@$` guard are
+/// shared with the UTF-8 form, because MRI applies those identically in both.
+///
+/// # Which bytes
+///
+/// Binary strings are built by `Integer#chr` and `Array#pack` under the Latin-1
+/// convention this crate uses throughout for byte content (byte `NN` is stored
+/// as `U+00NN` — see the `Array#pack` notes in `builtins.rs`), so a char in
+/// `U+0000..=U+00FF` is emitted as the single byte it stands for. A char above
+/// that range cannot have come from that convention and is emitted as its real
+/// UTF-8 bytes, which is what MRI shows for text tagged binary
+/// (`"日".b` is `"\xE6\x97\xA5"`).
+///
+/// The one case the two readings collide on is `U+0080..=U+00FF` reached by
+/// tagging genuine text (`"È".b`: MRI says `"\xC3\x88"`, the Latin-1 reading
+/// says `"\xC8"`). That ambiguity is inherent to storing byte strings as UTF-8
+/// and is the same one already documented for `String#bytes` vs `Array#pack`;
+/// resolving it needs a real ASCII-8BIT representation, not a different escape.
+pub fn inspect_string_bytes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '#' => {
+                if matches!(chars.peek(), Some('{') | Some('@') | Some('$')) {
+                    out.push_str("\\#");
+                } else {
+                    out.push('#');
+                }
+            }
+            '\u{07}' => out.push_str("\\a"),
+            '\u{08}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{0b}' => out.push_str("\\v"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            '\u{1b}' => out.push_str("\\e"),
+            ' '..='~' => out.push(c),
+            c if (c as u32) <= 0xff => out.push_str(&format!("\\x{:02X}", c as u32)),
+            c => {
+                let mut buf = [0u8; 4];
+                for b in c.encode_utf8(&mut buf).as_bytes() {
+                    out.push_str(&format!("\\x{b:02X}"));
+                }
+            }
         }
     }
     out.push('"');

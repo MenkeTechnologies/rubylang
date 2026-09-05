@@ -1,0 +1,71 @@
+# Triaged parity-fuzz gaps.
+#
+#   ./target/debug/parity-fuzz --mode all --baseline tests/data/parity_fuzz_baseline.txt
+#
+# Each line is a gap SIGNATURE (the divergent program with its literals replaced
+# by `N`/`W` placeholders, so every instance of one bug collapses to one line).
+# A divergence whose signature is listed is reported as "known" and does not fail
+# the run; anything else is NEW and exits 1.
+#
+# This file is an admission of a gap, never a fix for one. A line belongs here
+# only when the divergence has been traced to a cause that is understood and
+# recorded below — not because a run was noisy. Delete the line when the cause is
+# fixed; a stale line silences a bug that has come back.
+#
+# ---------------------------------------------------------------------------
+#
+# `String#bytes` / `#bytesize` on a string built by `Array#pack` or `Integer#chr`
+# count the string's real UTF-8 bytes, while MRI counts the bytes that were
+# packed:
+#
+#   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [11, 169].pack("C*").bytes.size'
+#   2
+#   $ ./target/debug/ruby            -e 'p [11, 169].pack("C*").bytes.size'
+#   3
+#
+# Cause: `RObj::Str` is a Rust `String`, so it cannot hold the invalid UTF-8 that
+# a byte string generally is. Byte content is therefore stored with the Latin-1
+# convention documented in `builtins.rs` (byte `NN` is the char `U+00NN`), under
+# which byte 169 occupies two UTF-8 bytes. `pack`/`unpack`/`chr`/`ord` are
+# self-consistent in that convention and round-trip, and the encoding TAG now
+# makes `#encoding` and `#inspect` agree with MRI, but `#bytes` and `#bytesize`
+# read the underlying storage and so see the encoded form.
+#
+# Not fixable by changing `#bytes`: making it report Latin-1 low bytes would fix
+# every `pack`/`chr` string and break every `String#b` on genuine text
+# (`"é".b.bytes` is `[195, 169]` in MRI and would become `[233]`). The two
+# readings collide on `U+0080..=U+00FF` and only a real ASCII-8BIT
+# representation — a byte buffer rather than a `String` — separates them.
+p [N, N].pack(W).bytes.size
+#
+# ---------------------------------------------------------------------------
+#
+# The rendering of a non-String object is UTF-8 here and US-ASCII in MRI:
+#
+#   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p nil.to_s.encoding.to_s'
+#   "US-ASCII"
+#   $ ./target/debug/ruby            -e 'p nil.to_s.encoding.to_s'
+#   "UTF-8"
+#
+# Cause: DELIBERATE, on cost. MRI gives US-ASCII to every interpreter-produced
+# string with 7-bit content — `nil.to_s`, `1.to_s`, `:ab.to_s`, `[1, 2].to_s`,
+# `1.inspect`, `(1..2).to_s`. Recording that here means one hash insert per
+# `to_s`, which measured ~8% on a `to_s`-only loop (300k iterations, user CPU,
+# interleaved runs against the unmodified binary: 6.42/6.48/6.74s before,
+# 6.94/7.08/7.29s after).
+#
+# What it buys does not pay for that. The tag is observable ONLY through
+# `#encoding`: `#inspect` picks the byte escape form over the codepoint form for
+# a non-UTF-8 string, but the two forms are identical on the 7-bit content this
+# rule applies to, so nothing a program PRINTS changes either way. `to_s` is the
+# hottest conversion in the language and this is a rarely-asked question about
+# its result.
+#
+# The same tagging on a String receiver IS kept (`"a".b.to_s.encoding` is
+# ASCII-8BIT) — that path is already inside the encoding-aware branch and costs
+# nothing extra.
+# The second signature is the same gap reached through an out-of-range index:
+# `"a b".b[9]` is nil, so this is `nil.to_s.encoding` with a byte string only
+# incidentally in the expression.
+p nil.to_s.encoding.to_s
+p W.b[N].to_s.encoding.to_s

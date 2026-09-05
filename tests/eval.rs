@@ -7927,7 +7927,10 @@ fn out_of_domain_arguments_raise_rather_than_wrapping_or_answering_nan() {
         "[\"RangeError\", \"-1 out of char range\"]",
     );
     eq("65.chr", "\"A\"");
-    eq("0.chr", "\"\\u0000\"");
+    // `Integer#chr` is a BYTE, so MRI tags it US-ASCII (0..127) or ASCII-8BIT,
+    // and a non-UTF-8 string inspects by byte: `/opt/homebrew/opt/ruby/bin/ruby
+    // -e "p 0.chr"` prints `"\\x00"`, not the `\\u0000` codepoint form.
+    eq("0.chr", "\"\\x00\"");
     for (src, fname) in [
         ("Math.sqrt(-1)", "sqrt"),
         ("Math.log(-1)", "log"),

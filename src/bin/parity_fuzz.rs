@@ -704,6 +704,7 @@ enum Mode {
     Numwide,
     Typeerr,
     Timefmt,
+    Bytestr,
     /// Round-robin over every mode in `ALL_MODES`. Not itself a member of
     /// `ALL_MODES` (that would recurse), so adding a mode never changes any
     /// other mode's own seed→case mapping — but it DOES reshuffle which mode
@@ -759,6 +760,7 @@ const ALL_MODES: &[Mode] = &[
     Mode::Numwide,
     Mode::Typeerr,
     Mode::Timefmt,
+    Mode::Bytestr,
 ];
 
 fn gen_intmeth(seed: u64) -> Vec<String> {
@@ -1928,6 +1930,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Numwide => gen_numwide(seed),
         Mode::Typeerr => gen_typeerr(seed),
         Mode::Timefmt => gen_timefmt(seed),
+        Mode::Bytestr => gen_bytestr(seed),
         Mode::All => gen_case(seed, ALL_MODES[(seed as usize) % ALL_MODES.len()]),
     }
 }
@@ -2290,6 +2293,62 @@ fn gen_strenc(seed: u64) -> Vec<String> {
     })
 }
 
+/// Byte strings and the encoding TAG that rides along with them: `Integer#chr`,
+/// `Array#pack`, `String#b` and `force_encoding`, plus the derived strings
+/// (`dup`, `+`, `*`, `split`, `[]`, …) that have to carry the tag forward.
+///
+/// The tag is observable two ways and both are probed, because they fail
+/// independently: `#encoding.to_s` names it, and `#inspect` picks its escape
+/// form from it — MRI writes `\xNN` for a non-UTF-8 string where it writes
+/// `\uXXXX` for UTF-8, so `p 255.chr` is `"\xFF"` while `p "ÿ"` is `"ÿ"`.
+/// A mode that only printed `.encoding` would miss every inspect divergence,
+/// and one that only printed the string would miss a tag that is wrong but
+/// invisible on ASCII content.
+///
+/// Byte values span the three ranges MRI treats differently: 0..0x1f (control,
+/// some with named escapes), 0x20..0x7e (printed literally), and 0x7f..0xff
+/// (never printable, and the half that separates US-ASCII from ASCII-8BIT).
+fn gen_bytestr(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    // A byte from a range chosen first, so the low/printable/high classes each
+    // get sampled instead of high bytes dominating 8:1.
+    let byte = match r.below(3) {
+        0 => r.range(0, 0x1f),
+        1 => r.range(0x20, 0x7e),
+        _ => r.range(0x7f, 0xff),
+    };
+    let b2 = r.range(0, 255);
+    let enc = r.pick(&["BINARY", "ASCII-8BIT", "US-ASCII", "UTF-8"]);
+    let txt = r.pick(&["abc", "a b", "a,b", "hi", "Az"]);
+    let n = r.range(0, 3);
+    one(match r.below(24) {
+        0 => format!("p {byte}.chr"),
+        1 => format!("p {byte}.chr.encoding.to_s"),
+        2 => format!("p {byte}.chr.ord"),
+        3 => format!("p [{byte}, {b2}].pack(\"C*\")"),
+        4 => format!("p [{byte}, {b2}].pack(\"C*\").encoding.to_s"),
+        5 => format!("p [{byte}, {b2}].pack(\"C*\").unpack(\"C*\")"),
+        6 => format!("p [{byte}].pack(\"C*\").dup"),
+        7 => format!("p [{byte}].pack(\"C*\") * 2"),
+        8 => format!("p {byte}.chr + {b2}.chr"),
+        9 => format!("p {byte}.chr.dup.encoding.to_s"),
+        10 => format!("p \"{txt}\".b"),
+        11 => format!("p \"{txt}\".b.encoding.to_s"),
+        12 => format!("p \"{txt}\".force_encoding(\"{enc}\").encoding.to_s"),
+        13 => format!("p \"{txt}\".b.upcase.encoding.to_s"),
+        14 => format!("p \"{txt}\".b.reverse"),
+        15 => format!("p \"{txt}\".b[{n}].to_s.encoding.to_s"),
+        16 => format!("p \"{txt}\".b.split(\",\").map {{ |x| x.encoding.to_s }}"),
+        17 => format!("p \"{txt}\".b.chars.map {{ |x| x.encoding.to_s }}"),
+        18 => format!("p \"{txt}\".b.inspect.encoding.to_s"),
+        19 => format!("p ([{byte}].pack(\"C*\") + \"{txt}\").encoding.to_s"),
+        20 => format!("p [{byte}, {b2}].pack(\"C*\").bytes.size"),
+        21 => format!("p {byte}.chr.b"),
+        22 => format!("p \"{txt}\".b.sub(\"a\", \"z\")"),
+        _ => format!("p [{byte}].pack(\"C*\").length"),
+    })
+}
+
 /// `Complex` arithmetic and conversion, where the real/imaginary parts keep
 /// their own numeric types.
 fn gen_complexnum(seed: u64) -> Vec<String> {
@@ -2392,6 +2451,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Numwide => "numwide",
         Mode::Typeerr => "typeerr",
         Mode::Timefmt => "timefmt",
+        Mode::Bytestr => "bytestr",
         Mode::All => "all",
     }
 }
@@ -2629,6 +2689,63 @@ fn parse_args() -> Args {
     }
 }
 
+/// Warn when `bin` is older than the newest source file under `src/`.
+///
+/// A stale binary is the quietest way for a fuzz run to be meaningless: it
+/// exercises the LAST build, so a fix made since then shows up as a divergence
+/// that is already fixed, and a regression introduced since then does not show
+/// up at all. Neither looks like an error — the run completes and prints a
+/// number — so it is reported here rather than left to be noticed.
+///
+/// This warns rather than exits: running a deliberately older binary (bisecting
+/// a regression, comparing two builds) is legitimate. It is the SILENCE that is
+/// not.
+fn warn_if_stale(bin: &Path) {
+    let Ok(bin_time) = std::fs::metadata(bin).and_then(|m| m.modified()) else {
+        return;
+    };
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut stack = vec![src];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // `src/bin/` holds the dev harnesses (this file included), which
+                // are separate binaries: editing one does not make `ruby` stale,
+                // and warning about it would cry wolf on every harness change.
+                if path.file_name().map(|n| n != "bin").unwrap_or(true) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if path.extension().map(|e| e != "rs").unwrap_or(true) {
+                continue;
+            }
+            let Ok(t) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            if newest.as_ref().map(|(n, _)| t > *n).unwrap_or(true) {
+                newest = Some((t, path));
+            }
+        }
+    }
+    if let Some((t, path)) = newest {
+        if t > bin_time {
+            eprintln!(
+                "parity-fuzz: WARNING — {} is OLDER than {}.\n\
+                 parity-fuzz: this run measures the previous build; \
+                 `cargo build` first for results about the current source.",
+                bin.display(),
+                path.display()
+            );
+        }
+    }
+}
+
 fn main() {
     let args = parse_args();
     let bin = ours_bin();
@@ -2641,6 +2758,14 @@ fn main() {
         );
         std::process::exit(2);
     }
+    warn_if_stale(&bin);
+    // Resolved and PRINTED before any case runs, not just in the closing
+    // summary. The oracle is what every result means, so a run that resolved
+    // the wrong one — or cannot resolve one at all, which exits here — must say
+    // so at the point the run could still be stopped, rather than after the
+    // last case. `--once` prints it too, for the same reason.
+    eprintln!("parity-fuzz: oracle = {}", oracle_id());
+    eprintln!("parity-fuzz: under test = {}", bin.display());
 
     // --once: replay a single seed, minimize if it diverges, dump both sides.
     if args.once {
@@ -2651,6 +2776,7 @@ fn main() {
         let diverged = !o.timed_out && differs(&o, &r);
         println!("seed   : {}", args.base_seed);
         println!("mode   : {}", mode_name(args.mode));
+        println!("oracle : {}", oracle_id());
         let (show, o, r) = if diverged && stmts.len() > 1 {
             let m = minimize(stmts, &bin, timeout);
             let ms = build_program(&m);

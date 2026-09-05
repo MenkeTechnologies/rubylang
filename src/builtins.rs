@@ -2010,8 +2010,34 @@ pub(crate) fn dispatch(
         "to_s" if args.is_empty() => {
             return Ok(with_host(|h| {
                 let s = h.to_s(recv);
-                h.new_string(s)
-            }))
+                // Only a TAGGED receiver has an encoding to pass on, and almost
+                // nothing is tagged, so that lookup gates the rest: `is_ascii`
+                // scans the content and `dispatch_class` resolves a class name,
+                // and `to_s` is far too hot to spend either on the common case.
+                // For a String receiver `s` IS the receiver's content, so it
+                // answers `is_ascii` without the copy `as_str` would make.
+                let tagged = h.string_encoding(recv).is_some();
+                let ascii = tagged && s.is_ascii();
+                let from_string = tagged && h.dispatch_class(recv) == "String";
+                let out = h.new_string(s);
+                // `String#to_s` answers a string with the RECEIVER's encoding
+                // (MRI answers the receiver itself when the class is exactly
+                // String). Building a fresh untagged one silently downgrades a
+                // byte string to UTF-8: `"a".b.to_s.encoding` is ASCII-8BIT.
+                //
+                // Only a String receiver is handled. MRI ALSO answers US-ASCII
+                // for the rendering of every other object (`nil.to_s`, `1.to_s`,
+                // `[1, 2].to_s`), and tagging those was measured at ~8% on a
+                // `to_s`-only loop — a hash insert on the hottest conversion in
+                // the language to change an answer only `#encoding` can observe,
+                // since the byte and codepoint escape forms coincide on the
+                // 7-bit content this would apply to. The gap is recorded in
+                // `tests/data/parity_fuzz_baseline.txt` instead.
+                if from_string {
+                    h.inherit_string_encoding(&out, recv, ascii);
+                }
+                out
+            }));
         }
         "inspect" => {
             return Ok(with_host(|h| {
@@ -6727,7 +6753,15 @@ fn dispatch_number(
             if !(0..=255).contains(&n) {
                 return Err(raise_exc("RangeError", &format!("{n} out of char range")));
             }
-            Ok(with_host(|h| h.new_string((n as u8 as char).to_string())))
+            let s = with_host(|h| h.new_string((n as u8 as char).to_string()));
+            // The result is one BYTE, so it is never UTF-8: MRI answers
+            // US-ASCII for a 7-bit byte and ASCII-8BIT for the rest. The tag is
+            // what makes `#encoding` and `#inspect` agree with MRI —
+            // `p 255.chr` is `"\xFF"`, not the codepoint form `"ÿ"`.
+            with_host(|h| {
+                h.set_string_encoding(&s, if n < 128 { "US-ASCII" } else { "ASCII-8BIT" })
+            });
+            Ok(s)
         }
         // These require exactly one argument; Ruby raises ArgumentError rather
         // than crashing when it is omitted.
@@ -7720,7 +7754,96 @@ extern "C" {
 
 // ---- String ---------------------------------------------------------------
 
+/// String methods whose result does NOT inherit the receiver's encoding.
+///
+/// Everything else does, so this list is the exception set, measured against
+/// MRI 4.0.6:
+///
+/// * `inspect` always answers a UTF-8 string (`dump` does NOT — it inherits,
+///   which is why it is absent here).
+/// * `encode` transcodes, so its result is the TARGET encoding.
+/// * `b`, `force_encoding` and `encode!` set the tag themselves; re-applying the
+///   receiver's pre-call encoding afterwards would undo exactly the change they
+///   were called to make.
+/// * `encoding` answers an `Encoding`, not a String.
+const ENCODING_NOT_INHERITED: &[&str] = &[
+    "inspect",
+    "encode",
+    "encode!",
+    "force_encoding",
+    "b",
+    "encoding",
+];
+
+/// Give `v` the encoding `enc`, recursing one level into an Array so the pieces
+/// of a `split` / `chars` / `unpack` / `scan` result are tagged too.
+///
+/// `may_upgrade` is whether non-ASCII content in the RESULT should be read as
+/// evidence that the call produced UTF-8 text. MRI upgrades an ASCII-only
+/// non-UTF-8 receiver to UTF-8 when it is combined with UTF-8 text
+/// (`"abc".b.gsub("a", "é")` is UTF-8), but not when the non-ASCII content came
+/// from another byte string (`"a".b.send(:+, 248.chr)` stays ASCII-8BIT), so the
+/// caller clears this flag when a byte string was among the arguments.
+fn propagate_string_encoding(v: &Value, enc: &'static str, may_upgrade: bool, depth: u8) {
+    match with_host(|h| h.as_str(v)) {
+        Some(s) => {
+            if may_upgrade && !s.is_ascii() {
+                return;
+            }
+            with_host(|h| h.set_string_encoding(v, enc));
+        }
+        None => {
+            if depth == 0 {
+                return;
+            }
+            if let Some(items) = with_host(|h| h.as_array(v)) {
+                for item in &items {
+                    propagate_string_encoding(item, enc, may_upgrade, depth - 1);
+                }
+            }
+        }
+    }
+}
+
+/// `String#…` dispatch, plus MRI's rule that a String method's result carries
+/// the receiver's encoding.
+///
+/// The encoding lives in a side table keyed by heap id (see
+/// [`crate::host::RubyHost::string_encoding`]), so a method that builds a FRESH
+/// string — `dup`, `+`, `*`, `reverse`, `split`, `chars`, … — produces an
+/// untagged, therefore UTF-8, result unless the tag is copied across. Doing that
+/// here rather than at each of the hundreds of return sites keeps the rule in
+/// one place and applies it to every method at once.
 fn dispatch_string(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    // Almost every string is UTF-8, i.e. untagged, and has nothing to propagate.
+    // That path is settled with ONE hash lookup and then runs the method
+    // directly: the work below reads the receiver's content (a copy) and every
+    // argument's tag, which on a long string would cost more than the method.
+    let Some(enc) = with_host(|h| h.string_encoding(recv)) else {
+        return dispatch_string_body(recv, name, args, block);
+    };
+    if ENCODING_NOT_INHERITED.contains(&name) {
+        return dispatch_string_body(recv, name, args, block);
+    }
+    let (recv_ascii, byte_string_arg) = with_host(|h| {
+        (
+            h.as_str(recv).map(|s| s.is_ascii()).unwrap_or(true),
+            // A byte-string argument means any non-ASCII in the result is
+            // bytes, not text, so it must not be read as an upgrade to UTF-8.
+            args.iter().any(|a| h.string_encoding(a).is_some()),
+        )
+    });
+    let out = dispatch_string_body(recv, name, args, block)?;
+    propagate_string_encoding(&out, enc, recv_ascii && !byte_string_arg, 2);
+    Ok(out)
+}
+
+fn dispatch_string_body(
     recv: &Value,
     name: &str,
     args: &[Value],
@@ -8089,8 +8212,9 @@ fn dispatch_string(
                 nm => arg_str(&nm),
             };
             match normalize_encoding_name(&raw).as_deref() {
-                Some("ASCII-8BIT") => with_host(|h| h.mark_binary_string(recv)),
-                _ => with_host(|h| h.unmark_binary_string(recv)),
+                Some("ASCII-8BIT") => with_host(|h| h.set_string_encoding(recv, "ASCII-8BIT")),
+                Some("US-ASCII") => with_host(|h| h.set_string_encoding(recv, "US-ASCII")),
+                _ => with_host(|h| h.clear_string_encoding(recv)),
             }
             Ok(recv.clone())
         }
@@ -8106,13 +8230,9 @@ fn dispatch_string(
         // tagged ASCII-8BIT (`String#b` / `force_encoding("BINARY")`). The returned
         // Encoding object answers `name`/`to_s`/`inspect` (dispatched in
         // `dispatch_object` for the `Encoding` class).
-        "encoding" => {
-            if with_host(|h| h.is_binary_string(recv)) {
-                Ok(encoding_object("ASCII-8BIT"))
-            } else {
-                Ok(encoding_object("UTF-8"))
-            }
-        }
+        "encoding" => Ok(encoding_object(
+            with_host(|h| h.string_encoding(recv)).unwrap_or("UTF-8"),
+        )),
         "lines" => Ok(new_arr(split_lines(&s).into_iter().map(new_str).collect())),
         "each_line" => {
             // With a block, iterate the lines and return self; without one,
@@ -10222,7 +10342,12 @@ fn dispatch_array(
         "pack" => {
             let fmt = arg_str(&args[0]);
             let bytes = pack_bytes(&arr, &fmt)?;
-            Ok(new_str(bytes_to_binstr(&bytes)))
+            let s = new_str(bytes_to_binstr(&bytes));
+            // `pack` always answers an ASCII-8BIT string in MRI, whatever the
+            // template. Recording that is what makes `p [0,255].pack("C*")`
+            // escape by byte (`"\x00\xFF"`) instead of by codepoint.
+            with_host(|h| h.set_string_encoding(&s, "ASCII-8BIT"));
+            Ok(s)
         }
         "sort" | "sort!" => {
             let a = match &block {

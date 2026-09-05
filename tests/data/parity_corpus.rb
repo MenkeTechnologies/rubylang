@@ -4533,3 +4533,38 @@ begin
 rescue SystemExit => e
   p e.status, e.message
 end
+#==#
+# Integer#chr is a BYTE: US-ASCII below 128, ASCII-8BIT above, and a non-UTF-8
+# string inspects by byte (\xNN) rather than by codepoint (\uXXXX).
+p 0.chr, 1.chr, 65.chr, 127.chr, 128.chr, 200.chr, 255.chr
+p 0.chr.encoding.to_s, 127.chr.encoding.to_s, 128.chr.encoding.to_s
+p 10.chr, 9.chr, 27.chr, 34.chr, 92.chr
+#==#
+# Array#pack always answers ASCII-8BIT, whatever the template.
+p [65, 66].pack("C*"), [0, 255].pack("C*"), [1].pack("N")
+p [104, 105].pack("C*").encoding.to_s
+p [11, 169].pack("C*").unpack("C*")
+p 200.chr.ord, 255.chr.ord
+#==#
+# The encoding tag rides along to every derived string.
+b = "abc".b
+p b.encoding.to_s, b.dup.encoding.to_s, b.upcase.encoding.to_s
+p b.reverse.encoding.to_s, b[1].encoding.to_s, (b * 2).encoding.to_s
+p (b + b).encoding.to_s, b.to_s.encoding.to_s
+p "a,b".b.split(",").map { |x| x.encoding.to_s }
+p "abc".b.chars.map { |x| x.encoding.to_s }
+#==#
+# Two byte strings concatenate to a byte string however high their bytes go;
+# an ASCII-only byte string combined with UTF-8 TEXT upgrades to UTF-8.
+p 110.chr + 248.chr
+p (110.chr + 248.chr).encoding.to_s
+p ("abc".b + "é").encoding.to_s
+p ([255].pack("C*") + "a").encoding.to_s
+p "abc".b.gsub("a", "é").encoding.to_s
+#==#
+# force_encoding records the tag; String#inspect is UTF-8 even for a byte string.
+p "abc".force_encoding("US-ASCII").encoding.to_s
+p "abc".force_encoding("BINARY").encoding.to_s
+p "abc".b.force_encoding("UTF-8").encoding.to_s
+p "abc".b.inspect.encoding.to_s
+p "abc".encoding.to_s, "".encoding.to_s
