@@ -4184,6 +4184,20 @@ impl RubyHost {
             _ => None,
         }
     }
+    /// The String content of `v` BORROWED rather than copied. [`RubyHost::as_str`]
+    /// clones, because nearly every caller holds the content across a call back
+    /// into the interpreter and so cannot keep the host borrowed. A caller that
+    /// finishes inside the borrow — one that only measures or scans the receiver
+    /// — should use this and skip the copy.
+    pub fn str_ref<'a>(&'a self, v: &'a Value) -> Option<&'a str> {
+        match self.obj(v) {
+            Some(RObj::Str(s)) => Some(s),
+            _ => match v {
+                Value::Str(s) => Some(s),
+                _ => None,
+            },
+        }
+    }
     pub fn as_str(&self, v: &Value) -> Option<String> {
         match self.obj(v) {
             Some(RObj::Str(s)) => Some(s.clone()),
@@ -7016,10 +7030,41 @@ impl RubyHost {
     /// non-ASCII in `110.chr + 248.chr` and cannot tell whether it came from
     /// bytes or from text, which is the difference between `"n\xF8"` and `"nø"`.
     ///
-    /// Not implemented: MRI RAISES `Encoding::CompatibilityError` when both
-    /// operands carry non-ASCII content in different encodings
-    /// (`248.chr + "é"`). That needs a real byte representation to detect
-    /// reliably; this picks the receiver's encoding instead of raising.
+    /// Two operands that both carry non-ASCII content decide nothing when their
+    /// encodings differ; MRI raises rather than picking one. This is the
+    /// `rb_enc_compatible` failure case, and it is reachable only from `String#+`
+    /// — the one-operand ops have nothing to disagree with.
+    ///
+    /// ```text
+    /// 248.chr + "é"    # => Encoding::CompatibilityError
+    /// 248.chr + "a"    # => "\xF8a"  — the operand is ASCII, so it yields
+    /// "abc".b + "é"    # => "abcé"   — the receiver is ASCII, so it yields
+    /// ```
+    pub fn check_encoding_compatible(&mut self, a: &Value, b: &Value) -> Result<(), String> {
+        let a_wide = self.as_str(a).map(|s| !s.is_ascii()).unwrap_or(false);
+        let b_wide = self.as_str(b).map(|s| !s.is_ascii()).unwrap_or(false);
+        if !(a_wide && b_wide) {
+            return Ok(());
+        }
+        let (ae, be) = (self.string_encoding(a), self.string_encoding(b));
+        if ae == be {
+            return Ok(());
+        }
+        let name = |e: Option<&'static str>| match e {
+            // MRI spells ASCII-8BIT `BINARY (ASCII-8BIT)` in this message.
+            Some("ASCII-8BIT") => "BINARY (ASCII-8BIT)".to_string(),
+            Some(n) => n.to_string(),
+            None => "UTF-8".to_string(),
+        };
+        Err(crate::builtins::raise_exc(
+            "Encoding::CompatibilityError",
+            &format!(
+                "incompatible character encodings: {} and {}",
+                name(ae),
+                name(be)
+            ),
+        ))
+    }
     pub fn inherit_string_encoding_with(
         &mut self,
         out: &Value,
@@ -8185,6 +8230,7 @@ impl RubyHost {
                 let s = s.clone();
                 return match self.as_str(b) {
                     Some(bs) => {
+                        self.check_encoding_compatible(a, b)?;
                         let out = self.new_string(format!("{s}{bs}"));
                         self.inherit_string_encoding_with(&out, a, s.is_ascii(), Some(b));
                         Ok(out)
@@ -9266,6 +9312,9 @@ fn builtin_exception_parent(name: &str) -> Option<&'static str> {
         "FloatDomainError" => "RangeError",
         "FrozenError" => "RuntimeError",
         "NoMatchingPatternKeyError" => "NoMatchingPatternError",
+        // `Encoding`'s nested errors all derive from `EncodingError`, so
+        // `rescue EncodingError` catches an incompatible-concatenation raise.
+        n if n.starts_with("Encoding::") => "EncodingError",
         _ => "StandardError",
     })
 }

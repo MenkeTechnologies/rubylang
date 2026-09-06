@@ -1626,24 +1626,37 @@ Honest limitations of this surface:
   web/crypto directives — `C`/`c` (bytes), `a`/`A` (string, NUL/space pad), `N`/
   `n`/`V`/`v` (big/little-endian 16/32-bit ints), `H`/`h` (hex, high/low nibble
   first), the fixed-width integers `s`/`S`/`l`/`L`/`q`/`Q`/`i`/`I`/`j`/`J` (with
-  the `<`/`>` byte-order modifiers; an unsigned 64-bit value past `i64::MAX`
-  unpacks to a Bignum), the floats `D`/`d`/`E`/`G` (double) and `F`/`f`/`e`/`g`
-  (single), and the cursor moves `x`/`X`/`@`. Because strings are UTF-8 (`String`,
-  not a byte buffer), a binary string
-  is modeled with the Latin-1 convention: a "byte" is a code point in
-  `U+0000..=U+00FF` (its low 8 bits). `pack` produces such a string and `unpack`
-  reads it back the same way, so any `pack`-produced binary string round-trips
-  (`bytes.pack("C*").unpack("C*")`, `(0..255).to_a.pack("C*").unpack("C*")`), and
-  `Integer#chr` (`n → U+00nn`, and only for `0..255` — outside that MRI raises
-  `RangeError: N out of char range`, where masking with `& 0xff` used to answer
-  a wrapped character) round-trips through `unpack("C*")` too. Two
-  documented divergences remain from the lack of a true ASCII-8BIT type: (1)
-  `unpack` on a *genuine* multibyte-UTF-8 text string reads code points, not the
-  raw UTF-8 bytes MRI would — `"é".unpack("C*")` is `[233]` here vs `[195, 169]`
-  in MRI; (2) `String#bytes`/`#ord` keep real-UTF-8 semantics, so `255.chr.bytes`
-  is `[195, 191]` here vs `[255]` in MRI, and `255.chr.inspect` is the `U+00FF`
-  code point rather than MRI's `"\xFF"`. For ASCII and every `pack`-produced
-  binary string the two models coincide.
+   the `<`/`>` byte-order modifiers; an unsigned 64-bit value past `i64::MAX`
+   unpacks to a Bignum), the floats `D`/`d`/`E`/`G` (double) and `F`/`f`/`e`/`g`
+   (single), `Z` (NUL-terminated string), `m` (base64, `m0` unbroken), `B`/`b`
+   (bit strings, MSB/LSB first), `w` (BER-compressed integers), `M`
+   (quoted-printable), `u` (uuencode), and the cursor moves `x`/`X`/`@`. A
+   template that asks for more elements than the array holds is `ArgumentError:
+   too few arguments`, and an element of the wrong kind raises the same
+   `TypeError` MRI raises (`["a"].pack("C")`, `[1].pack("a")`). Because strings
+   are UTF-8 (`String`, not a byte buffer), a byte string is stored one
+   character per byte — byte `NN` is `U+00NN` — and carries an encoding tag
+   saying so. Every byte-oriented method reads that byte view rather than the
+   storage, so `#bytes`, `#bytesize`, `#length`, `#[]`, `#getbyte`, `#setbyte`
+   and `#inspect` answer MRI's byte-oriented result: `255.chr.bytes` is `[255]`,
+   `"é".b.bytes` is `[195, 169]`, and `"é".unpack("C*")` is `[195, 169]`.
+   `pack`/`unpack` round-trip (`bytes.pack("C*").unpack("C*")`,
+   `(0..255).to_a.pack("C*").unpack("C*")`), as does `Integer#chr` (`n →
+   U+00nn`, and only for `0..255` — outside that MRI raises `RangeError: N out
+   of char range`). Combining two strings negotiates their encodings as
+   `rb_enc_compatible` does, for `+`, `<<` and `concat` alike: an ASCII-only
+   operand yields to the other one (`"abc".b.concat("é")` is UTF-8 text, tag
+   and storage both), and two non-ASCII operands in different encodings raise
+   `Encoding::CompatibilityError` rather than picking one. `encode` is a real
+   transcode rather than `force_encoding`'s relabel: ASCII-only content converts
+   between all three encodings, non-ASCII content converts only to the encoding
+   it already has, and anything else raises
+   `Encoding::UndefinedConversionError` (or `Encoding::InvalidByteSequenceError`
+   for a byte the SOURCE cannot read) unless `undef:`/`invalid:` asks for the
+   unit to be replaced instead. The one divergence left is a string MRI labels UTF-8 while
+   holding bytes that are not UTF-8 — a `"\xff"` literal, or
+   `force_encoding("UTF-8")` on arbitrary bytes — which a Rust `String` cannot
+   represent at all; see `tests/data/parity_fuzz_baseline.txt`.
 - **`defined?`.** The `defined?(expr)` / `defined? expr` operator returns the
   Ruby description string (`"local-variable"`, `"instance-variable"`,
   `"global-variable"`, `"constant"`, `"method"`, `"assignment"`, `"expression"`,

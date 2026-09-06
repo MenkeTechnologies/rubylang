@@ -5801,6 +5801,409 @@ fn string_binary_encoding() {
     );
 }
 
+/// The byte-string representation invariant: a String tagged with a non-UTF-8
+/// encoding stores ONE CHARACTER PER BYTE, so its character sequence IS its byte
+/// sequence — which is what MRI's binary strings are.
+///
+/// The whole point is the collision on `U+0080..=U+00FF`, where the two readings
+/// of the same storage disagree and only the tag separates them: `"é".b` is the
+/// TWO bytes of the UTF-8 text, `233.chr` is the ONE byte 233. Every assertion
+/// here was taken from `/opt/homebrew/opt/ruby/bin/ruby` (4.0.6).
+#[test]
+fn a_byte_string_stores_one_character_per_byte() {
+    // `#b` transcodes: the copy holds the receiver's UTF-8 BYTES as characters.
+    eq(
+        "\"héllo\".b.bytes.inspect",
+        "\"[104, 195, 169, 108, 108, 111]\"",
+    );
+    eq("\"héllo\".b.bytesize", "6");
+    eq("\"héllo\".b.length", "6");
+    // ... while a byte that was never text stays one byte.
+    eq("233.chr.bytes.inspect", "\"[233]\"");
+    eq("233.chr.bytesize", "1");
+    eq("[11, 169].pack(\"C*\").bytes.inspect", "\"[11, 169]\"");
+    eq("[11, 169].pack(\"C*\").length", "2");
+
+    // Character-oriented methods therefore answer byte-wise for free, which is
+    // how MRI answers them on a binary string.
+    eq("\"héllo\".b.inspect", "\"\\\"h\\\\xC3\\\\xA9llo\\\"\"");
+    eq("\"héllo\".b[1]", "\"\\xC3\"");
+    eq("\"héllo\".b.index(\"l\")", "3");
+    eq(
+        "\"héllo\".b.reverse.bytes.inspect",
+        "\"[111, 108, 108, 169, 195, 104]\"",
+    );
+    eq("\"héllo\".b.chars.length", "6");
+    // A byte string and the text it came from are NOT equal, because their
+    // contents are not the same sequence.
+    eq("\"héllo\".b == \"héllo\"", "false");
+    eq("\"abc\".b == \"abc\"", "true");
+
+    // The trip is reversible while the bytes remain valid UTF-8.
+    eq("\"héllo\".b.force_encoding(\"UTF-8\")", "\"héllo\"");
+    eq("\"héllo\".force_encoding(\"BINARY\").bytes.length", "6");
+    // `#b` on a receiver that is already a byte string is idempotent, not a
+    // second round of transcoding.
+    eq(
+        "\"héllo\".b.b.bytes.inspect",
+        "\"[104, 195, 169, 108, 108, 111]\"",
+    );
+
+    // `setbyte` writes a byte, and on a byte string it lands exactly.
+    eq(
+        "s = \"abc\".b; s.setbyte(0, 233); [s.bytes, s.bytesize].inspect",
+        "\"[[233, 98, 99], 3]\"",
+    );
+}
+
+/// `rb_enc_compatible` has a failure case: two operands that BOTH carry
+/// non-ASCII content in different encodings decide nothing, and MRI raises
+/// rather than picking one. Reachable only from `String#+`.
+#[test]
+fn concatenating_incompatible_encodings_raises() {
+    let caught = |src: &str| {
+        format!(
+            "begin; {src}; rescue Exception => e; [e.class.to_s, e.message]; else; :no_raise; end"
+        )
+    };
+    eq(
+        &caught("248.chr + \"é\""),
+        "[\"Encoding::CompatibilityError\", \"incompatible character encodings: BINARY (ASCII-8BIT) and UTF-8\"]",
+    );
+    // One ASCII-only side is always compatible: the other one decides.
+    eq("(248.chr + \"a\").bytes.inspect", "\"[248, 97]\"");
+    eq("\"abc\".b + \"é\"", "\"abcé\"");
+    eq("(\"abc\".b + \"é\").encoding.name", "\"UTF-8\"");
+    // The error class sits under EncodingError, so a bare rescue catches it.
+    eq(
+        "begin; 248.chr + \"é\"; rescue EncodingError; \"caught\"; end",
+        "\"caught\"",
+    );
+}
+
+/// An append negotiates encodings the same way `+` does, so it can raise — and
+/// it can go the way the RECEIVER does not: an ASCII-only byte string handed
+/// UTF-8 text becomes UTF-8, which is a tag coming OFF the receiver.
+#[test]
+fn appending_negotiates_the_receivers_encoding() {
+    let caught = |src: &str| {
+        format!(
+            "begin; {src}; rescue Exception => e; [e.class.to_s, e.message]; else; :no_raise; end"
+        )
+    };
+    let incompatible =
+        "[\"Encoding::CompatibilityError\", \"incompatible character encodings: BINARY (ASCII-8BIT) and UTF-8\"]";
+    eq(&caught("248.chr.dup << \"é\""), incompatible);
+    eq(&caught("248.chr.dup.concat(\"é\")"), incompatible);
+    // The check runs per argument, so a later one still raises.
+    eq(&caught("248.chr.dup.concat(\"a\", \"é\")"), incompatible);
+    // An ASCII-only byte receiver yields to the text instead.
+    eq("\"abc\".b.concat(\"é\", \"é\")", "\"abcéé\"");
+    eq("\"abc\".b.concat(\"é\").encoding.name", "\"UTF-8\"");
+    eq(
+        "(\"abc\".b.dup << \"é\").bytes.inspect",
+        "\"[97, 98, 99, 195, 169]\"",
+    );
+    // …and a non-ASCII byte receiver keeps its own, including for an Integer
+    // operand, which has no encoding to offer.
+    eq("(248.chr.dup << 233).bytes.inspect", "\"[248, 233]\"");
+    eq("(248.chr.dup << 233).encoding.name", "\"ASCII-8BIT\"");
+    eq("(248.chr.dup << \"a\").encoding.name", "\"ASCII-8BIT\"");
+}
+
+/// `String#encode` is a real transcode, not `force_encoding`'s relabel: it keeps
+/// the characters and changes the bytes, and refuses when the target cannot
+/// spell them. Every expectation here is MRI 4.0.6's, including the three
+/// different sentences it uses for the three failure shapes.
+#[test]
+fn encode_transcodes_or_refuses() {
+    let caught = |src: &str| {
+        format!(
+            "begin; {src}; rescue Exception => e; [e.class.to_s, e.message]; else; :no_raise; end"
+        )
+    };
+    // No argument is no conversion, so the receiver's encoding survives.
+    eq("\"é\".b.encode.encoding.name", "\"ASCII-8BIT\"");
+    eq("\"é\".b.encode.bytes.inspect", "\"[195, 169]\"");
+    eq("\"é\".b.dup.encode!.encoding.name", "\"ASCII-8BIT\"");
+    // ASCII-only content converts between all of them.
+    eq("\"abc\".b.encode(\"UTF-8\").encoding.name", "\"UTF-8\"");
+    eq(
+        "\"abc\".b.encode(\"US-ASCII\").encoding.name",
+        "\"US-ASCII\"",
+    );
+    eq("\"abc\".encode(\"US-ASCII\")", "\"abc\"");
+    // A non-ASCII string converts only to the encoding it already has.
+    eq("\"é\".b.encode(\"BINARY\").bytes.inspect", "\"[195, 169]\"");
+    eq("\"é\".encode(\"UTF-8\")", "\"é\"");
+    // …and every other pair raises, each with its own sentence.
+    eq(
+        &caught("\"é\".b.encode(\"UTF-8\")"),
+        "[\"Encoding::UndefinedConversionError\", \"\\\"\\\\xC3\\\" from ASCII-8BIT to UTF-8\"]",
+    );
+    eq(
+        &caught("\"é\".encode(\"US-ASCII\")"),
+        "[\"Encoding::UndefinedConversionError\", \"U+00E9 from UTF-8 to US-ASCII\"]",
+    );
+    eq(
+        &caught("\"日\".encode(\"US-ASCII\")"),
+        "[\"Encoding::UndefinedConversionError\", \"U+65E5 from UTF-8 to US-ASCII\"]",
+    );
+    eq(
+        &caught("\"é\".force_encoding(\"US-ASCII\").encode(\"UTF-8\")"),
+        "[\"Encoding::InvalidByteSequenceError\", \"\\\"\\\\xC3\\\" on US-ASCII\"]",
+    );
+    eq(
+        &caught("\"é\".b.encode(\"US-ASCII\")"),
+        "[\"Encoding::UndefinedConversionError\", \"\\\"\\\\xC3\\\" to UTF-8 in conversion from ASCII-8BIT to UTF-8 to US-ASCII\"]",
+    );
+    // Only the option that names the failure waives it, and the unit is then
+    // replaced rather than the call refused. `invalid:` does NOT waive an
+    // unconvertible character.
+    eq("\"é\".b.encode(\"UTF-8\", undef: :replace)", "\"��\"");
+    eq("\"é\".encode(\"US-ASCII\", undef: :replace)", "\"?\"");
+    eq(
+        "\"é\".b.encode(\"UTF-8\", undef: :replace).encoding.name",
+        "\"UTF-8\"",
+    );
+    eq(
+        &caught("\"é\".b.encode(\"UTF-8\", invalid: :replace)"),
+        "[\"Encoding::UndefinedConversionError\", \"\\\"\\\\xC3\\\" from ASCII-8BIT to UTF-8\"]",
+    );
+}
+
+/// `valid_encoding?` is not a constant: storage is always valid UTF-8 and every
+/// byte sequence is valid ASCII-8BIT, but a US-ASCII LABEL is violated by any
+/// byte past 0x7f.
+#[test]
+fn valid_encoding_reads_the_label_not_the_storage() {
+    eq(
+        "\"é\".force_encoding(\"US-ASCII\").valid_encoding?",
+        "false",
+    );
+    eq(
+        "[200].pack(\"C*\").force_encoding(\"US-ASCII\").valid_encoding?",
+        "false",
+    );
+    eq(
+        "\"abc\".force_encoding(\"US-ASCII\").valid_encoding?",
+        "true",
+    );
+    eq("\"é\".b.valid_encoding?", "true");
+    eq("\"é\".valid_encoding?", "true");
+}
+
+/// Each character of a byte string is a byte and carries the receiver's
+/// encoding. `chars` gets that from the Array-aware propagation step; neither
+/// `each_char` shape is an Array, so it has to tag at the source.
+#[test]
+fn each_char_of_a_byte_string_yields_bytes() {
+    eq(
+        "\"é\".b.each_char.to_a.inspect",
+        "\"[\\\"\\\\xC3\\\", \\\"\\\\xA9\\\"]\"",
+    );
+    eq(
+        "\"é\".b.each_char.to_a.map { |c| c.encoding.to_s }.inspect",
+        "\"[\\\"ASCII-8BIT\\\", \\\"ASCII-8BIT\\\"]\"",
+    );
+    eq(
+        "a = []; \"é\".b.each_char { |c| a << c }; a.inspect",
+        "\"[\\\"\\\\xC3\\\", \\\"\\\\xA9\\\"]\"",
+    );
+    // A UTF-8 receiver is untouched by this: its characters are characters.
+    eq("\"é\".each_char.to_a.inspect", "\"[\\\"é\\\"]\"");
+    eq("\"abc\".b.each_char.to_a.length", "3");
+}
+
+/// `Array#pack` / `String#unpack` beyond the byte and integer directives. Every
+/// expectation is MRI 4.0.6's; the odd ones (`B`'s NUL-grow, `M`'s wrap column,
+/// `H`'s acceptance of non-hex characters) are ports of `pack.c`, not guesses.
+#[test]
+fn pack_text_directives_match_mri() {
+    // Base64: `m0` unbroken, `m` wrapped at 60 with a trailing newline.
+    eq("[\"abc\"].pack(\"m0\")", "\"YWJj\"");
+    eq("[\"ab\"].pack(\"m0\")", "\"YWI=\"");
+    eq("[\"abc\"].pack(\"m\")", "\"YWJj\\n\"");
+    eq("\"YWJj\".unpack1(\"m0\")", "\"abc\"");
+    // A template of only text directives is US-ASCII; mixing loses that.
+    eq("[\"abc\"].pack(\"m0\").encoding.name", "\"US-ASCII\"");
+    eq("[\"abc\", 65].pack(\"mC\").encoding.name", "\"ASCII-8BIT\"");
+
+    // `Z*` appends a terminator; `Z<n>` does not reserve room for one.
+    eq("[\"ab\"].pack(\"Z*\").bytes.inspect", "\"[97, 98, 0]\"");
+    eq(
+        "[\"abcde\"].pack(\"Z5\").bytes.inspect",
+        "\"[97, 98, 99, 100, 101]\"",
+    );
+    eq(
+        "\"ab\\0cd\\0\".unpack(\"Z*Z*\").inspect",
+        "\"[\\\"ab\\\", \\\"cd\\\"]\"",
+    );
+
+    // Bit strings read each character's LOW BIT, so "ab" is the bits 1, 0.
+    eq("[\"ab\"].pack(\"B2\").bytes.inspect", "\"[128]\"");
+    eq(
+        "\"ab\".unpack(\"B*\").inspect",
+        "\"[\\\"0110000101100010\\\"]\"",
+    );
+    // A count past the end NUL-grows by pack.c's `(len - plen + 1) / 2`, which
+    // is neither `count / 8` nor zero.
+    eq("[\"1\"].pack(\"B4\").bytes.inspect", "\"[128, 0, 0]\"");
+    // `H`'s own grow formula is different again, and comes to `(count + 1) / 2`
+    // bytes in total.
+    eq("[\"1\"].pack(\"H4\").bytes.inspect", "\"[16, 0]\"");
+    // `H` accepts any character: a letter is `((c & 15) + 9) & 15`.
+    eq("[\"hi\"].pack(\"H2\").bytes.inspect", "\"[18]\"");
+
+    // BER-compressed integers.
+    eq(
+        "[0, 127, 128, 300].pack(\"w*\").bytes.inspect",
+        "\"[0, 127, 129, 0, 130, 44]\"",
+    );
+    eq("[130, 44].pack(\"C*\").unpack(\"w*\").inspect", "\"[300]\"");
+
+    // Quoted-printable wraps at count + 1 characters and never splits an escape.
+    eq("[\"ab=cd\"].pack(\"M2\")", "\"ab=3D=\\ncd=\\n\"");
+    eq("[\"\"].pack(\"M\")", "\"\"");
+    eq("\"a=20b=\\ne\".unpack1(\"M\")", "\"a be\"");
+
+    // uuencode: the count is a line length rounded down to a 3-byte group.
+    eq("[\"abcdef\"].pack(\"u3\")", "\"#86)C\\n#9&5F\\n\"");
+    eq("\"#86)C\\n\".unpack1(\"u\")", "\"abc\"");
+    // Decoding stops at a line whose leading character is not a length.
+    eq("\"abc\".unpack(\"u*\").inspect", "\"[\\\"\\\"]\"");
+
+    // The DIRECTIVE names an unpack result's encoding, not the receiver.
+    eq(
+        "[97].pack(\"C\").unpack(\"B*\")[0].encoding.name",
+        "\"US-ASCII\"",
+    );
+    eq(
+        "[97].pack(\"C\").unpack(\"a*\")[0].encoding.name",
+        "\"ASCII-8BIT\"",
+    );
+}
+
+/// The bang variants disagree about what "did something" means, and a content
+/// comparison answers the wrong one for the pattern-based four: `sub!`, `gsub!`,
+/// `tr!` and `tr_s!` answer self whenever the pattern MATCHED, even when the
+/// replacement leaves the string identical.
+#[test]
+fn pattern_bang_variants_answer_self_on_a_match_not_a_change() {
+    // Matched, unchanged — self, not nil.
+    eq("\"abc\".dup.gsub!(\"a\", \"a\")", "\"abc\"");
+    eq("\"abc\".dup.sub!(\"a\", \"a\")", "\"abc\"");
+    eq("\"abc\".dup.tr!(\"a\", \"a\")", "\"abc\"");
+    eq("\"AaBbCc\".dup.tr!(\"A-Z\", \"A-Z\")", "\"AaBbCc\"");
+    eq("\"abc\".dup.tr_s!(\"a\", \"a\")", "\"abc\"");
+    // A Regexp pattern reads the same way, and used to answer nil even for a
+    // gsub! that genuinely changed the string.
+    eq(
+        "s = \"abc\".dup; [s.sub!(/a/) { \"a\" }, s].inspect",
+        "\"[\\\"abc\\\", \\\"abc\\\"]\"",
+    );
+    eq(
+        "s = \"aXbXc\".dup; [s.gsub!(/X/, \"\"), s].inspect",
+        "\"[\\\"abc\\\", \\\"abc\\\"]\"",
+    );
+    eq(
+        "s = \"abc\".dup; [s.gsub!(/(b)/) { $1.upcase }, s].inspect",
+        "\"[\\\"aBc\\\", \\\"aBc\\\"]\"",
+    );
+    eq(
+        "s = \"abc\".dup; [s.gsub!(/x*/, \"-\"), s].inspect",
+        "\"[\\\"-a-b-c-\\\", \\\"-a-b-c-\\\"]\"",
+    );
+    eq(
+        "s = \"abc\".dup; [s.gsub!(/b/, \"b\" => \"b\"), s].inspect",
+        "\"[\\\"abc\\\", \\\"abc\\\"]\"",
+    );
+    // No match — nil, including a negated `tr` set that catches nothing.
+    eq("\"abc\".dup.gsub!(\"x\", \"y\").inspect", "\"nil\"");
+    eq("\"abc\".dup.tr!(\"x\", \"y\").inspect", "\"nil\"");
+    eq("\"abc\".dup.tr!(\"^abc\", \"z\").inspect", "\"nil\"");
+    // The content-based ones are unaffected: no change is still nil.
+    eq("\"ABC\".dup.upcase!.inspect", "\"nil\"");
+    eq("\"abc\".dup.squeeze!(\"a\").inspect", "\"nil\"");
+    eq("\"abc\".dup.delete!(\"x\").inspect", "\"nil\"");
+    // …and a real change still answers self.
+    eq("\"abc\".dup.upcase!", "\"ABC\"");
+    eq("\"aabb\".dup.tr_s!(\"a\", \"a\")", "\"abb\"");
+}
+
+/// `String#index`/`rindex` take a Regexp as well as a String, and a Regexp is
+/// not a substring of its own source: reading the argument as text searched for
+/// the pattern's spelling, which never occurs, so every regexp search answered
+/// nil. That also silently broke `sub!`/`gsub!`, which ask `index` whether the
+/// pattern matched.
+#[test]
+fn index_and_rindex_take_a_regexp() {
+    eq("\"abcabc\".index(/b/)", "1");
+    eq("\"abcabc\".index(/b/, 2)", "4");
+    eq("\"abcabc\".index(/b/, -2)", "4");
+    eq("\"abcabc\".index(/z/).inspect", "\"nil\"");
+    eq("\"abcabc\".index(/b/, 100).inspect", "\"nil\"");
+    eq("\"abc\".index(/(?=b)/)", "1");
+    eq("\"\".index(/x*/)", "0");
+    // Offsets are in CHARACTERS, not bytes.
+    eq("\"h\u{e9}llo\".index(/l/)", "2");
+    eq("\"h\u{e9}llo\".rindex(/l/)", "3");
+    // `rindex` answers the last position a match can BEGIN at, which is not the
+    // last match of a forward scan: one forward match of /a+/ begins at 0.
+    eq("\"aaa\".rindex(/a+/)", "2");
+    eq("\"abcabc\".rindex(/b/)", "4");
+    eq("\"abcabc\".rindex(/b/, 3)", "1");
+    eq("\"abcabc\".rindex(/b/, -1)", "4");
+    eq("\"abcabc\".rindex(/b/, 0).inspect", "\"nil\"");
+    eq("\"abc\".rindex(/x*/)", "3");
+    // The match globals name the match that was REPORTED, and are cleared when
+    // there was none.
+    eq(
+        "\"abcabc\".index(/b/, 2); [$~[0], $~.begin(0)].inspect",
+        "\"[\\\"b\\\", 4]\"",
+    );
+    eq(
+        "\"abcabc\".rindex(/b/, 3); [$~[0], $~.begin(0)].inspect",
+        "\"[\\\"b\\\", 1]\"",
+    );
+    eq("\"abc\".index(/z/); $~.inspect", "\"nil\"");
+}
+
+/// A `pack` template that outruns its array, or is handed the wrong kind of
+/// element, refuses the call — where substituting `0`/`""` had silently made up
+/// bytes MRI never emits.
+#[test]
+fn pack_refuses_missing_and_mistyped_elements() {
+    let caught = |src: &str| {
+        format!(
+            "begin; {src}; rescue Exception => e; [e.class.to_s, e.message]; else; :no_raise; end"
+        )
+    };
+    for src in [
+        "[1].pack(\"NN\")",
+        "[].pack(\"a\")",
+        "[\"abc\"].pack(\"aa\")",
+    ] {
+        eq(&caught(src), "[\"ArgumentError\", \"too few arguments\"]");
+    }
+    eq(
+        &caught("[\"abc\"].pack(\"CC\")"),
+        "[\"TypeError\", \"no implicit conversion of String into Integer\"]",
+    );
+    eq(
+        &caught("[1].pack(\"a\")"),
+        "[\"TypeError\", \"no implicit conversion of Integer into String\"]",
+    );
+    // A `*` count over an empty array asks for nothing and is fine.
+    eq("[].pack(\"C*\").bytes.inspect", "\"[]\"");
+    // nil is an empty string for a string directive, but not an Integer.
+    eq("[nil].pack(\"a\").bytes.inspect", "\"[0]\"");
+    eq(
+        &caught("[nil].pack(\"C\")"),
+        "[\"TypeError\", \"no implicit conversion of nil into Integer\"]",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Round-3 discovery-sweep parity fixes (byte-verified against MRI 4.0.6).
 // ---------------------------------------------------------------------------

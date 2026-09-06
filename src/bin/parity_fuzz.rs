@@ -705,6 +705,8 @@ enum Mode {
     Typeerr,
     Timefmt,
     Bytestr,
+    Packfmt,
+    Trsets,
     /// Round-robin over every mode in `ALL_MODES`. Not itself a member of
     /// `ALL_MODES` (that would recurse), so adding a mode never changes any
     /// other mode's own seed→case mapping — but it DOES reshuffle which mode
@@ -761,6 +763,8 @@ const ALL_MODES: &[Mode] = &[
     Mode::Typeerr,
     Mode::Timefmt,
     Mode::Bytestr,
+    Mode::Packfmt,
+    Mode::Trsets,
 ];
 
 fn gen_intmeth(seed: u64) -> Vec<String> {
@@ -1931,6 +1935,8 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Typeerr => gen_typeerr(seed),
         Mode::Timefmt => gen_timefmt(seed),
         Mode::Bytestr => gen_bytestr(seed),
+        Mode::Packfmt => gen_packfmt(seed),
+        Mode::Trsets => gen_trsets(seed),
         Mode::All => gen_case(seed, ALL_MODES[(seed as usize) % ALL_MODES.len()]),
     }
 }
@@ -2319,9 +2325,17 @@ fn gen_bytestr(seed: u64) -> Vec<String> {
     };
     let b2 = r.range(0, 255);
     let enc = r.pick(&["BINARY", "ASCII-8BIT", "US-ASCII", "UTF-8"]);
-    let txt = r.pick(&["abc", "a b", "a,b", "hi", "Az"]);
+    // NON-ASCII text is the point of half these cases. An ASCII-only `txt` makes
+    // the two readings of a byte string agree, so it can never catch the bug the
+    // byte-string representation invariant exists to prevent: `"é".b` must count
+    // 2 bytes (`[195, 169]`) while `233.chr` counts 1 (`[233]`), and both are
+    // `U+00E9`-adjacent. The first grammar sampled only `abc`-shaped words and so
+    // reported a saturated mode over a surface it never reached.
+    let txt = r.pick(&[
+        "abc", "a b", "a,b", "hi", "Az", "héllo", "é", "aé,b", "日本",
+    ]);
     let n = r.range(0, 3);
-    one(match r.below(24) {
+    one(match r.below(36) {
         0 => format!("p {byte}.chr"),
         1 => format!("p {byte}.chr.encoding.to_s"),
         2 => format!("p {byte}.chr.ord"),
@@ -2345,7 +2359,98 @@ fn gen_bytestr(seed: u64) -> Vec<String> {
         20 => format!("p [{byte}, {b2}].pack(\"C*\").bytes.size"),
         21 => format!("p {byte}.chr.b"),
         22 => format!("p \"{txt}\".b.sub(\"a\", \"z\")"),
-        _ => format!("p [{byte}].pack(\"C*\").length"),
+        23 => format!("p [{byte}].pack(\"C*\").length"),
+        // The byte readers. Each one reads the byte VIEW rather than the
+        // storage, and they disagree with the storage exactly on the non-ASCII
+        // `txt` values above.
+        24 => format!("p \"{txt}\".b.bytes"),
+        25 => format!("p [\"{txt}\".b.bytesize, \"{txt}\".bytesize]"),
+        26 => format!("p [\"{txt}\".b.length, \"{txt}\".b.size]"),
+        27 => format!("p \"{txt}\".b.each_byte.to_a"),
+        28 => format!("p \"{txt}\".b.getbyte({n})"),
+        29 => format!("p \"{txt}\".b.unpack(\"C*\")"),
+        30 => format!("p \"{txt}\".b.byteslice({n}, 2)"),
+        // Round trips: the storage must survive a tag it did not start with.
+        31 => format!("p \"{txt}\".force_encoding(\"{enc}\").bytes"),
+        32 => format!("p \"{txt}\".b.force_encoding(\"UTF-8\")"),
+        // Character-oriented methods, which a byte string answers byte-wise.
+        33 => format!("p [\"{txt}\".b == \"{txt}\", \"{txt}\".b.index(\"b\")]"),
+        34 => format!("s = \"{txt}\".b\ns.setbyte(0, {byte})\np [s, s.bytes]"),
+        // `rb_enc_compatible`'s failure case: two non-ASCII operands whose
+        // encodings differ is a raise, not a negotiated answer.
+        _ => format!("p(({byte}.chr + \"{txt}\") rescue $!.class.to_s)"),
+    })
+}
+
+/// `Array#pack` / `String#unpack` across the DIRECTIVE surface, not just `C*`.
+/// Each directive has its own width, endianness, padding and truncation rules,
+/// and the string-valued ones (`a`/`A`/`Z`/`m`/`H`) are where a byte string
+/// crosses back into text.
+fn gen_packfmt(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (a, b) = (r.range(0, 255), r.range(0, 65535));
+    let big = r.range(0, 1 << 30);
+    let neg = r.range(-128, 128);
+    let w = r.pick(&["abc", "hi", "a", "abcdef", ""]);
+    let count = r.pick(&["", "*", "2", "3"]);
+    let intdir = r.pick(&[
+        "C", "c", "S", "s", "L", "l", "Q", "q", "N", "n", "V", "v", "w",
+    ]);
+    let strdir = r.pick(&["a", "A", "Z", "H", "h", "B", "b", "m", "M", "u"]);
+    one(match r.below(16) {
+        0 => format!("p [{a}, {b}].pack(\"{intdir}{count}\").bytes"),
+        1 => format!("p [{a}, {b}].pack(\"{intdir}{count}\").unpack(\"{intdir}{count}\")"),
+        2 => format!("p [{neg}].pack(\"{intdir}\").bytes rescue p $!.class.to_s"),
+        3 => format!("p [\"{w}\"].pack(\"{strdir}{count}\").bytes"),
+        4 => format!("p [\"{w}\"].pack(\"{strdir}{count}\").unpack(\"{strdir}{count}\")"),
+        5 => format!("p [{a}, {b}].pack(\"CN\").bytes"),
+        6 => format!("p [{big}].pack(\"N\").unpack1(\"N\")"),
+        7 => format!("p [{big}].pack(\"V\").bytes"),
+        8 => format!("p [{a}].pack(\"C\").encoding.to_s"),
+        9 => format!("p [\"{w}\"].pack(\"m0\")"),
+        10 => format!("p [\"{w}\"].pack(\"m0\").unpack1(\"m0\")"),
+        11 => format!("p [{a}, {b}].pack(\"x{intdir}\").bytes"),
+        12 => format!("p [{big}].pack(\"{intdir}\").bytes rescue p $!.class.to_s"),
+        13 => format!("p \"{w}\".unpack(\"{strdir}{count}\")"),
+        14 => format!("p \"{w}\".unpack(\"C*\")"),
+        _ => format!("p [{a}].pack(\"{intdir}\") * 2"),
+    })
+}
+
+/// The `tr`/`delete`/`squeeze`/`count` family, whose argument is a character SET
+/// with its own mini-language: `a-z` ranges, a leading `^` negation, `\\`
+/// escapes, and a replacement string that is padded with its own last character
+/// when it is shorter than the search set.
+fn gen_trsets(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let w = r.pick(&[
+        "hello",
+        "aabbcc",
+        "Mississippi",
+        "a-b-c",
+        "abc123",
+        "AaBbCc",
+        "  x  ",
+        "^abc",
+    ]);
+    let from = r.pick(&[
+        "a-y", "abc", "^abc", "a-z", "^a-z", "l", "aeiou", "A-Z", "-",
+    ]);
+    let to = r.pick(&["b-z", "*", "xyz", "ABC", "", "A-Z"]);
+    let set = r.pick(&["a-z", "^a-z", "lo", "abc", "A-Za-z", "^ ", "s"]);
+    one(match r.below(12) {
+        0 => format!("p \"{w}\".tr(\"{from}\", \"{to}\")"),
+        1 => format!("p \"{w}\".tr_s(\"{from}\", \"{to}\")"),
+        2 => format!("p \"{w}\".delete(\"{set}\")"),
+        3 => format!("p \"{w}\".squeeze"),
+        4 => format!("p \"{w}\".squeeze(\"{set}\")"),
+        5 => format!("p \"{w}\".count(\"{set}\")"),
+        6 => format!("p \"{w}\".count(\"{set}\", \"{from}\")"),
+        7 => format!("p \"{w}\".delete(\"{set}\", \"{from}\")"),
+        8 => format!("s = \"{w}\".dup\np [s.tr!(\"{from}\", \"{to}\"), s]"),
+        9 => format!("s = \"{w}\".dup\np [s.squeeze!, s]"),
+        10 => format!("s = \"{w}\".dup\np [s.delete!(\"{set}\"), s]"),
+        _ => format!("p \"{w}\".tr(\"{from}\", \"{to}\").tr(\"{to}\", \"{from}\")"),
     })
 }
 
@@ -2452,6 +2557,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Typeerr => "typeerr",
         Mode::Timefmt => "timefmt",
         Mode::Bytestr => "bytestr",
+        Mode::Packfmt => "packfmt",
+        Mode::Trsets => "trsets",
         Mode::All => "all",
     }
 }

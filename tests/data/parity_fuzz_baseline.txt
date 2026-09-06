@@ -14,29 +14,32 @@
 #
 # ---------------------------------------------------------------------------
 #
-# `String#bytes` / `#bytesize` on a string built by `Array#pack` or `Integer#chr`
-# count the string's real UTF-8 bytes, while MRI counts the bytes that were
-# packed:
+# A byte string whose bytes are not valid UTF-8 loses them on the way back to a
+# UTF-8 label, and a `"\xNN"` literal never had them in the first place:
 #
-#   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [11, 169].pack("C*").bytes.size'
-#   2
-#   $ ./target/debug/ruby            -e 'p [11, 169].pack("C*").bytes.size'
-#   3
+#   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [11, 169].pack("C*").force_encoding("UTF-8")'
+#   "\v\xA9"
+#   $ ./target/debug/ruby            -e 'p [11, 169].pack("C*").force_encoding("UTF-8")'
+#   "\v�"
 #
-# Cause: `RObj::Str` is a Rust `String`, so it cannot hold the invalid UTF-8 that
-# a byte string generally is. Byte content is therefore stored with the Latin-1
-# convention documented in `builtins.rs` (byte `NN` is the char `U+00NN`), under
-# which byte 169 occupies two UTF-8 bytes. `pack`/`unpack`/`chr`/`ord` are
-# self-consistent in that convention and round-trip, and the encoding TAG now
-# makes `#encoding` and `#inspect` agree with MRI, but `#bytes` and `#bytesize`
-# read the underlying storage and so see the encoded form.
+#   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["\xff".bytes, "\xff".valid_encoding?]'
+#   [[255], false]
+#   $ ./target/debug/ruby            -e 'p ["\xff".bytes, "\xff".valid_encoding?]'
+#   [[195, 191], true]
 #
-# Not fixable by changing `#bytes`: making it report Latin-1 low bytes would fix
-# every `pack`/`chr` string and break every `String#b` on genuine text
-# (`"é".b.bytes` is `[195, 169]` in MRI and would become `[233]`). The two
-# readings collide on `U+0080..=U+00FF` and only a real ASCII-8BIT
-# representation — a byte buffer rather than a `String` — separates them.
-p [N, N].pack(W).bytes.size
+# Cause: `RObj::Str` is a Rust `String`, so it cannot hold invalid UTF-8 at all.
+# The byte-string representation invariant (see `builtins.rs`) buys back every
+# byte string that stays LABELLED as one — its storage is one character per byte,
+# so `#bytes`, `#bytesize`, `#length`, `#[]`, `#inspect` and the `pack`/`unpack`
+# round trip all answer MRI's byte-oriented result. What it cannot buy back is a
+# string that MRI labels UTF-8 while holding bytes that are not UTF-8: there is
+# no representation for it here, and the conversion is lossy.
+#
+# This is the whole of the residual gap, and it is bounded by that description.
+# Closing it needs `RObj::Str` to become a byte buffer with a separate encoding
+# field — MRI's own representation — which is a change to the object model, not
+# to any String method.
+p [N, N].pack(W).force_encoding(W)
 #
 # ---------------------------------------------------------------------------
 #

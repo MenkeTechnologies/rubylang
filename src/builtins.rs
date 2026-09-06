@@ -3463,6 +3463,18 @@ fn dispatch_classref(
         if let Some(en) = enc_name {
             return Ok(encoding_object(en));
         }
+        // `Encoding`'s nested exception classes, so `rescue
+        // Encoding::CompatibilityError` resolves the constant rather than
+        // dispatching `CompatibilityError` on the class.
+        if matches!(
+            name,
+            "CompatibilityError"
+                | "UndefinedConversionError"
+                | "InvalidByteSequenceError"
+                | "ConverterNotFoundError"
+        ) {
+            return Ok(with_host(|h| h.class_ref(&format!("Encoding::{name}"))));
+        }
         if name == "default_external" || name == "default_internal" {
             return Ok(encoding_object("UTF-8"));
         }
@@ -7767,6 +7779,11 @@ extern "C" {
 ///   were called to make.
 /// * `encoding` answers an `Encoding`, not a String.
 const ENCODING_NOT_INHERITED: &[&str] = &[
+    // `unpack` tags each element from its own DIRECTIVE (`unpack_str`), which
+    // the receiver's tag must not then overwrite: `"abc".b.unpack("B*")` is
+    // US-ASCII in MRI, not the receiver's ASCII-8BIT.
+    "unpack",
+    "unpack1",
     "inspect",
     "encode",
     "encode!",
@@ -7843,12 +7860,61 @@ fn dispatch_string(
     Ok(out)
 }
 
+/// The String methods that can be answered from a BORROW of the receiver rather
+/// than a copy of it.
+///
+/// [`dispatch_string_body`] opens by cloning the receiver's content — one full
+/// string copy on every String method call — because nearly every arm holds a
+/// `&str` across a call back into the interpreter (a block, a comparison method,
+/// a `to_str` coercion) and so cannot keep the host borrowed. These arms need
+/// neither: they measure or scan the content once and answer an immediate, so
+/// they run inside the host lock and never allocate. They are answered here
+/// INSTEAD of in the big match, not as well — a second implementation would be
+/// free to drift from the first.
+///
+/// The set is deliberately small. Anything that builds a String, calls a block,
+/// coerces an argument or raises has to re-enter the host and therefore belongs
+/// on the copying path; `"".ord` is the shape of the exclusion.
+fn dispatch_string_borrowed(recv: &Value, name: &str, args: &[Value]) -> Option<Value> {
+    if !args.is_empty() {
+        return None;
+    }
+    // None of these are in `STRING_MUTATORS`, so skipping the frozen check on
+    // this path cannot change an answer.
+    match name {
+        "length" | "size" | "bytesize" | "empty?" | "ascii_only?" => {}
+        _ => return None,
+    }
+    with_host(|h| {
+        // A non-String receiver reaches `dispatch_string_body` only through a
+        // path that reads it as empty; matching that keeps this total for the
+        // names above, which is what lets them leave the big match.
+        let s = h.str_ref(recv).unwrap_or("");
+        Some(match name {
+            "length" | "size" => Value::Int(s.chars().count() as i64),
+            // A byte string counts its characters (one per byte); see the
+            // byte-string representation invariant.
+            "bytesize" => Value::Int(if h.string_encoding(recv).is_some() {
+                s.chars().count() as i64
+            } else {
+                s.len() as i64
+            }),
+            "empty?" => Value::Bool(s.is_empty()),
+            "ascii_only?" => Value::Bool(s.is_ascii()),
+            _ => return None,
+        })
+    })
+}
+
 fn dispatch_string_body(
     recv: &Value,
     name: &str,
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    if let Some(v) = dispatch_string_borrowed(recv, name, args) {
+        return Ok(v);
+    }
     frozen_guard(recv, name, STRING_MUTATORS)?;
     let s = with_host(|h| h.as_str(recv).unwrap_or_default());
     match name {
@@ -7861,11 +7927,30 @@ fn dispatch_string_body(
             let base = name.strip_suffix('!').unwrap();
             let result = dispatch_string(recv, base, args, block)?;
             let new = with_host(|h| h.as_str(&result).unwrap_or_default());
-            let changed = new != s;
+            // MRI's bang variants disagree about what "did something" means, and
+            // comparing content answers the wrong one for four of them: `sub!`,
+            // `gsub!`, `tr!` and `tr_s!` answer self whenever the pattern
+            // MATCHED, even when the replacement is identical.
+            //
+            //   $ ruby -e 'p ["abc".dup.gsub!("a", "a"), "abc".dup.tr!("a", "a")]'
+            //   ["abc", "abc"]
+            //   $ ruby -e 'p ["ABC".dup.upcase!, "abc".dup.gsub!("x", "y")]'
+            //   [nil, nil]
+            let changed = match (name, args.first()) {
+                // `index` reads a String pattern literally and a Regexp as a
+                // pattern, which is exactly how `sub`/`gsub` read theirs.
+                ("sub!" | "gsub!", Some(_)) => {
+                    dispatch_string(recv, "index", &args[..1], None)? != Value::Undef
+                }
+                ("tr!" | "tr_s!", Some(_)) => {
+                    let m = char_matcher(&args[..1]);
+                    s.chars().any(m)
+                }
+                _ => new != s,
+            };
             with_host(|h| h.set_str(recv, new));
             Ok(if changed { recv.clone() } else { Value::Undef })
         }
-        "length" | "size" => Ok(Value::Int(s.chars().count() as i64)),
         // The `:ascii` option restricts case conversion to the ASCII letters,
         // leaving non-ASCII code points (ß, ü, …) untouched.
         "upcase" => Ok(new_str(if is_ascii_case_opt(args) {
@@ -8005,7 +8090,12 @@ fn dispatch_string_body(
             };
             Ok(Value::Bool(normalized == s))
         }
-        "bytes" => Ok(new_arr(s.bytes().map(|b| Value::Int(b as i64)).collect())),
+        "bytes" => Ok(new_arr(
+            string_byte_view(recv, &s)
+                .into_iter()
+                .map(|b| Value::Int(b as i64))
+                .collect(),
+        )),
         // Unicode codepoints (one per character), unlike `bytes`.
         "codepoints" => Ok(new_arr(s.chars().map(|c| Value::Int(c as i64)).collect())),
         "each_codepoint" => {
@@ -8025,20 +8115,18 @@ fn dispatch_string_body(
         // codepoint's low byte), so a `pack`-produced binary string round-trips.
         "unpack" => {
             let fmt = arg_str(&args[0]);
-            Ok(new_arr(unpack_bytes(&binstr_to_bytes(&s), &fmt)?))
+            Ok(new_arr(unpack_bytes(&string_byte_view(recv, &s), &fmt)?))
         }
         "unpack1" => {
             let fmt = arg_str(&args[0]);
-            let out = unpack_bytes(&binstr_to_bytes(&s), &fmt)?;
+            let out = unpack_bytes(&string_byte_view(recv, &s), &fmt)?;
             Ok(out.into_iter().next().unwrap_or(Value::Undef))
         }
-        // Number of bytes in the UTF-8 encoding (not the character count).
-        "bytesize" => Ok(Value::Int(s.len() as i64)),
         // With a block, yield each byte and return self; without a block, yield
         // the bytes array so `.each_byte.to_a` works without a real Enumerator.
         "each_byte" => match &block {
             Some(bl) => {
-                for b in s.bytes() {
+                for b in string_byte_view(recv, &s) {
                     call_proc(bl, &[Value::Int(b as i64)])?;
                     if has_pending_signal() {
                         break;
@@ -8046,10 +8134,13 @@ fn dispatch_string_body(
                 }
                 Ok(recv.clone())
             }
-            None => Ok(with_host(|h| {
-                let bytes: Vec<Value> = s.bytes().map(|b| Value::Int(b as i64)).collect();
-                h.new_enumerator(bytes, "each")
-            })),
+            None => {
+                let bytes: Vec<Value> = string_byte_view(recv, &s)
+                    .into_iter()
+                    .map(|b| Value::Int(b as i64))
+                    .collect();
+                Ok(with_host(|h| h.new_enumerator(bytes, "each")))
+            }
         },
         // Byte at index `i` (supports negatives); nil when out of range.
         // `byteindex`/`byterindex` are `index`/`rindex` reporting a BYTE offset
@@ -8119,7 +8210,8 @@ fn dispatch_string_body(
         // that was written, not the receiver.
         "setbyte" => {
             let raw = as_i(&args[0]);
-            let mut b = s.into_bytes();
+            let binary = with_host(|h| h.string_encoding(recv)).is_some();
+            let mut b = string_byte_view(recv, &s);
             let idx = if raw < 0 { raw + b.len() as i64 } else { raw };
             if idx < 0 || idx >= b.len() as i64 {
                 return Err(raise_exc(
@@ -8129,7 +8221,14 @@ fn dispatch_string_body(
             }
             let byte = as_i(&args[1]);
             b[idx as usize] = (byte & 0xff) as u8;
-            let new = String::from_utf8_lossy(&b).into_owned();
+            // A byte string's storage is the byte sequence itself, so the write
+            // lands exactly; only a UTF-8 receiver can be left invalid by it, and
+            // there the lossy read is the best a Rust `String` can hold.
+            let new = if binary {
+                bytes_to_binstr(&b)
+            } else {
+                String::from_utf8_lossy(&b).into_owned()
+            };
             with_host(|h| h.set_str(recv, new));
             Ok(Value::Int(byte))
         }
@@ -8154,7 +8253,8 @@ fn dispatch_string_body(
         // nothing to replace and the faithful answer is the text unchanged.
         "scrub" => Ok(new_str(s)),
         "getbyte" => {
-            let bytes = s.as_bytes();
+            let view = string_byte_view(recv, &s);
+            let bytes = &view[..];
             let raw = as_i(&args[0]);
             let idx = if raw < 0 {
                 raw + bytes.len() as i64
@@ -8171,7 +8271,9 @@ fn dispatch_string_body(
         // offset (not character), used by ActionDispatch::Journey's scanner. A
         // negative start counts from the end; out-of-range start returns nil.
         "byteslice" => {
-            let bytes = s.as_bytes();
+            let view = string_byte_view(recv, &s);
+            let binary = with_host(|h| h.string_encoding(recv)).is_some();
+            let bytes = &view[..];
             let blen = bytes.len() as i64;
             let (start, end) = if let Some((lo, hi, excl)) = with_host(|h| h.as_range(&args[0])) {
                 match range_bounds(lo, hi, excl, bytes.len()) {
@@ -8188,22 +8290,43 @@ fn dispatch_string_body(
                 (st as usize, ((st + len).min(blen)) as usize)
             };
             let slice = &bytes[start..end];
-            Ok(new_str(String::from_utf8_lossy(slice).into_owned()))
+            Ok(new_str(if binary {
+                bytes_to_binstr(slice)
+            } else {
+                String::from_utf8_lossy(slice).into_owned()
+            }))
         }
-        // `b` returns a copy of the string tagged ASCII-8BIT. Byte content is
-        // unchanged (we store UTF-8 bytes); the BINARY encoding is recorded in a
-        // side table so `#encoding` on the copy answers ASCII-8BIT.
+        // `b` answers an ASCII-8BIT copy. Per the byte-string representation
+        // invariant the copy stores one character per byte, so the receiver's
+        // UTF-8 bytes are transcoded — `"é".b` stores `"\u{C3}\u{A9}"`, which is
+        // what makes its `#bytes` `[195, 169]` and its `#length` 2, as in MRI. A
+        // receiver that is already a byte string is already in that form.
         "b" => {
-            let copy = new_str(s.clone());
+            let already_binary = with_host(|h| h.string_encoding(recv)).is_some();
+            let copy = new_str(if already_binary {
+                s.clone()
+            } else {
+                text_to_byte_storage(&s)
+            });
             with_host(|h| h.mark_binary_string(&copy));
             Ok(copy)
         }
-        // True when every byte is 7-bit ASCII.
-        "ascii_only?" => Ok(Value::Bool(s.is_ascii())),
-        // We only carry valid UTF-8 Strings, so this is always true.
-        "valid_encoding?" => Ok(Value::Bool(true)),
-        // No real multi-encoding: `force_encoding` returns self but records/clears
-        // the ASCII-8BIT tag so `#encoding` tracks it; `encode` is a copy shim.
+        // Storage is always valid UTF-8 and every byte sequence is valid
+        // ASCII-8BIT, so the only label a String here can violate is US-ASCII —
+        // by a byte past 0x7f, which under the byte-string representation
+        // invariant is one of the receiver's own characters.
+        //
+        //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["é".force_encoding("US-ASCII").valid_encoding?,
+        //       "abc".force_encoding("US-ASCII").valid_encoding?, "é".b.valid_encoding?]'
+        //   [false, true, true]
+        "valid_encoding?" => Ok(Value::Bool(
+            with_host(|h| h.string_encoding(recv)) != Some("US-ASCII") || s.is_ascii(),
+        )),
+        // `force_encoding` relabels the receiver in place and returns self. The
+        // label is not free: crossing into or out of a byte encoding also moves
+        // the storage between the two representations (see the byte-string
+        // representation invariant), which is what makes `"é".force_encoding(
+        // "BINARY").bytes` answer `[195, 169]` and the reverse trip restore `"é"`.
         "force_encoding" => {
             // The argument is a name string or an `Encoding` object (whose `name`
             // ivar holds the canonical name).
@@ -8211,20 +8334,87 @@ fn dispatch_string_body(
                 Value::Undef => arg_str(&args[0]),
                 nm => arg_str(&nm),
             };
-            match normalize_encoding_name(&raw).as_deref() {
-                Some("ASCII-8BIT") => with_host(|h| h.set_string_encoding(recv, "ASCII-8BIT")),
-                Some("US-ASCII") => with_host(|h| h.set_string_encoding(recv, "US-ASCII")),
-                _ => with_host(|h| h.clear_string_encoding(recv)),
-            }
+            let target = match normalize_encoding_name(&raw).as_deref() {
+                Some("ASCII-8BIT") => Some("ASCII-8BIT"),
+                Some("US-ASCII") => Some("US-ASCII"),
+                _ => None,
+            };
+            retag_string(recv, &s, target);
             Ok(recv.clone())
         }
-        "encode" => Ok(new_str(s.clone())),
-        // In-place transcode: content is stored as UTF-8, so this is a no-op that
-        // clears any BINARY tag and returns the receiver. sinatra's force_encoding
-        // does `val.force_encoding(enc).encode!` on every captured route param.
-        "encode!" => {
-            with_host(|h| h.unmark_binary_string(recv));
-            Ok(recv.clone())
+        // A real transcode, not a relabel: unlike `force_encoding`, which keeps
+        // the bytes and changes the name, `encode` keeps the CHARACTERS and
+        // changes the bytes — and refuses when the target cannot spell them.
+        // `encode!` is the same conversion in place. Of the three encodings
+        // modelled here every pair converts freely for ASCII-only content and
+        // for no conversion at all; a non-ASCII string converts only to its own
+        // encoding, and every other pair raises. Measured on MRI 4.0.6:
+        //
+        //   "é".b.encode             # => "\xC3\xA9"  (no argument, no conversion)
+        //   "abc".b.encode("UTF-8")  # => "abc"       (ASCII-only, always fine)
+        //   "é".b.encode("BINARY")   # => "\xC3\xA9"  (already that encoding)
+        //   "é".b.encode("UTF-8")    # Encoding::UndefinedConversionError:
+        //                            #   "\xC3" from ASCII-8BIT to UTF-8
+        //   "é".encode("US-ASCII")   # Encoding::UndefinedConversionError:
+        //                            #   U+00E9 from UTF-8 to US-ASCII
+        //   "é".force_encoding("US-ASCII").encode("UTF-8")
+        //                            # Encoding::InvalidByteSequenceError:
+        //                            #   "\xC3" on US-ASCII
+        //
+        // The refusal is waived only by the option that names it — `undef:` for
+        // an unconvertible character, `invalid:` for a byte the SOURCE cannot
+        // read — and the unit is then replaced by the target's own replacement,
+        // U+FFFD for UTF-8 and `?` for the others:
+        //
+        //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["é".b.encode("UTF-8", undef: :replace),
+        //       "é".encode("US-ASCII", undef: :replace)]'
+        //   ["��", "?"]
+        "encode" | "encode!" => {
+            let from = with_host(|h| h.string_encoding(recv)).unwrap_or("UTF-8");
+            let to = encode_target(args).unwrap_or(from);
+            let target = (to != "UTF-8").then_some(to);
+            let mut replaced = None;
+            if !s.is_ascii() && to != from {
+                let waiver = if from == "US-ASCII" {
+                    "invalid"
+                } else {
+                    "undef"
+                };
+                if !encode_replaces(args, waiver) {
+                    return Err(encode_conversion_error(&s, from, to));
+                }
+                let repl = if to == "UTF-8" { '\u{FFFD}' } else { '?' };
+                // The source's characters ARE its bytes when it is byte-oriented,
+                // so this replaces per byte there and per codepoint in UTF-8 —
+                // which is the count MRI produces in each case.
+                replaced = Some(
+                    s.chars()
+                        .map(|c| if c.is_ascii() { c } else { repl })
+                        .collect::<String>(),
+                );
+            }
+            let dest = if name == "encode!" {
+                recv.clone()
+            } else {
+                let copy = new_str(s.clone());
+                if let Some(e) = with_host(|h| h.string_encoding(recv)) {
+                    with_host(|h| h.set_string_encoding(&copy, e));
+                }
+                copy
+            };
+            match replaced {
+                // Replacement already produced the target's own representation,
+                // so the label moves without the storage.
+                Some(content) => with_host(|h| {
+                    h.set_str(&dest, content);
+                    match target {
+                        Some(e) => h.set_string_encoding(&dest, e),
+                        None => h.clear_string_encoding(&dest),
+                    }
+                }),
+                None => retag_string(&dest, &s, target),
+            }
+            Ok(dest)
         }
         // We store UTF-8 byte content; `encoding` names UTF-8 unless the string was
         // tagged ASCII-8BIT (`String#b` / `force_encoding("BINARY")`). The returned
@@ -8310,7 +8500,6 @@ fn dispatch_string_body(
             }
             Ok(new_str(out))
         }
-        "empty?" => Ok(Value::Bool(s.is_empty())),
         "to_i" => {
             let base = args.first().map(to_int).transpose()?.unwrap_or(10);
             if base != 0 && !(2..=36).contains(&base) {
@@ -8465,19 +8654,31 @@ fn dispatch_string_body(
             Some(other) => Ok(new_str(format!("{s}{other}"))),
             None => Err(conv_error(&args[0], "String")),
         },
+        // Appending negotiates encodings exactly as `+` does, so the same
+        // `rb_enc_compatible` failure applies: two non-ASCII operands in
+        // different encodings raise rather than concatenating.
+        //
+        //   $ /opt/homebrew/opt/ruby/bin/ruby -e '"é".b.dup << "é"'
+        //   -e:1:in '<main>': incompatible character encodings: BINARY (ASCII-8BIT) and UTF-8
         "<<" => {
+            with_host(|h| h.check_encoding_compatible(recv, &args[0]))?;
             let other = str_append_operand(&args[0])?;
-            with_host(|h| h.set_str(recv, format!("{s}{other}")));
+            append_in_place(recv, &s, &other, args.first());
             Ok(recv.clone())
         }
         // `concat(*strs)` appends every argument in order, mutating and
         // returning the receiver: `"a".concat("b", "c")` => "abc".
         "concat" => {
             let mut joined = String::new();
+            let mut decider = None;
             for a in args {
+                with_host(|h| h.check_encoding_compatible(recv, a))?;
                 joined.push_str(&str_append_operand(a)?);
+                if decider.is_none() && with_host(|h| h.as_str(a)).is_some_and(|t| !t.is_ascii()) {
+                    decider = Some(a);
+                }
             }
-            with_host(|h| h.set_str(recv, format!("{s}{joined}")));
+            append_in_place(recv, &s, &joined, decider.or(args.first()));
             Ok(recv.clone())
         }
         "<=>" => match with_host(|h| h.as_str(&args[0])) {
@@ -8525,9 +8726,25 @@ fn dispatch_string_body(
             false,
         ))),
         "each_char" => {
+            // Each character of a byte string is a byte and carries the
+            // receiver's encoding. `chars` gets that from
+            // `propagate_string_encoding`, which reaches into an Array result —
+            // but neither of the shapes here IS an Array, so the tag is set at
+            // the source instead.
+            //
+            //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p "é".b.each_char.to_a'
+            //   ["\xC3", "\xA9"]
+            let enc = with_host(|h| h.string_encoding(recv));
+            let one = |c: char| {
+                let v = new_str(c.to_string());
+                if let Some(e) = enc {
+                    with_host(|h| h.set_string_encoding(&v, e));
+                }
+                v
+            };
             if let Some(b) = &block {
                 for c in s.chars() {
-                    call_proc(b, &[new_str(c.to_string())])?;
+                    call_proc(b, &[one(c)])?;
                     if has_pending_signal() {
                         break;
                     }
@@ -8536,7 +8753,7 @@ fn dispatch_string_body(
             } else {
                 // Block-less: an Enumerator over the characters, so external
                 // iteration (`next`) and chained Enumerable calls work.
-                let chars: Vec<Value> = s.chars().map(|c| new_str(c.to_string())).collect();
+                let chars: Vec<Value> = s.chars().map(one).collect();
                 Ok(with_host(|h| h.new_enumerator(chars, "each")))
             }
         }
@@ -8682,20 +8899,84 @@ fn dispatch_string_body(
             with_host(|h| h.set_str(recv, format!("{pre}{s}")));
             Ok(recv.clone())
         }
-        "index" => Ok(str_find(
-            &s,
-            &arg_str(&args[0]),
-            args.get(1).map(as_i),
-            false,
-        )),
-        "rindex" => Ok(str_find(
-            &s,
-            &arg_str(&args[0]),
-            args.get(1).map(as_i),
-            true,
-        )),
+        // The argument is a String OR a Regexp, and a Regexp is not a substring
+        // of its own source: reading it through `arg_str` searched for the
+        // pattern's TEXT, which never occurs, so every regexp search answered
+        // nil (`"abc".index(/b/)` was nil, not 1).
+        "index" | "rindex" => {
+            let rev = name == "rindex";
+            let pos = args.get(1).map(as_i);
+            match str_regex(&args[0]) {
+                Some(re) => Ok(str_find_regex(&s, &re, &args[0], pos, rev)),
+                None => Ok(str_find(&s, &arg_str(&args[0]), pos, rev)),
+            }
+        }
         "[]=" => str_index_set(recv, &s, args),
         _ => Err(no_method_error(recv, name)),
+    }
+}
+
+/// Ruby `String#index`/`rindex` with a REGEXP: the char offset the match begins
+/// at, or `nil`. Sets the match globals to the match it reports, exactly as MRI
+/// does — including clearing them when there is none.
+///
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e '"abcabc".rindex(/b/, 3); p [$~[0], $~.begin(0)]'
+///   ["b", 1]
+fn str_find_regex(
+    s: &str,
+    re: &fancy_regex::Regex,
+    re_val: &Value,
+    pos: Option<i64>,
+    rev: bool,
+) -> Value {
+    let len = s.chars().count() as i64;
+    let raw = pos.unwrap_or(if rev { len } else { 0 });
+    let at = if raw < 0 { len + raw } else { raw };
+    let byte_of = |c: i64| {
+        s.char_indices()
+            .nth(c as usize)
+            .map(|(b, _)| b)
+            .unwrap_or(s.len())
+    };
+    let start_at = |b: usize| re.captures_from_pos(s, b).ok().flatten();
+
+    let found = if at < 0 || at > len {
+        None
+    } else if !rev {
+        start_at(byte_of(at))
+            .and_then(|c| c.get(0))
+            .map(|m| m.start())
+    } else {
+        // `rindex` answers the last position a match can BEGIN at, which a
+        // forward scan does not report: `"aaa".rindex(/a+/)` is 2, though the
+        // only match a forward scan finds begins at 0. Restarting one CHARACTER
+        // past each start — rather than past each match — enumerates every
+        // distinct start, and the last one at or before the cap is the answer.
+        let cap = byte_of(at);
+        let (mut best, mut from) = (None, 0usize);
+        while from <= s.len() {
+            let Some(b) = start_at(from).and_then(|c| c.get(0)).map(|m| m.start()) else {
+                break;
+            };
+            if b > cap {
+                break;
+            }
+            best = Some(b);
+            from = b + s[b..].chars().next().map_or(1, char::len_utf8);
+        }
+        best
+    };
+
+    match found {
+        Some(b) => {
+            let caps = start_at(b);
+            set_match_globals(caps.as_ref().map(|c| (c, s)), re, re_val);
+            Value::Int(s[..b].chars().count() as i64)
+        }
+        None => {
+            set_match_globals(None, re, re_val);
+            Value::Undef
+        }
     }
 }
 
@@ -10343,10 +10624,21 @@ fn dispatch_array(
             let fmt = arg_str(&args[0]);
             let bytes = pack_bytes(&arr, &fmt)?;
             let s = new_str(bytes_to_binstr(&bytes));
-            // `pack` always answers an ASCII-8BIT string in MRI, whatever the
-            // template. Recording that is what makes `p [0,255].pack("C*")`
-            // escape by byte (`"\x00\xFF"`) instead of by codepoint.
-            with_host(|h| h.set_string_encoding(&s, "ASCII-8BIT"));
+            // `pack` answers a byte string, which is what makes `p
+            // [0,255].pack("C*")` escape by byte (`"\x00\xFF"`) rather than by
+            // codepoint. It is US-ASCII rather than ASCII-8BIT when EVERY
+            // directive is one of the text encodings — those can only emit 7-bit
+            // output — and mixing one with any other directive loses that:
+            //
+            //   $ ruby -e 'p [["abc"].pack("m0").encoding.to_s,
+            //               ["abc", 65].pack("mC").encoding.to_s]'
+            //   ["US-ASCII", "BINARY (ASCII-8BIT)"]
+            let text_only = !fmt.is_empty()
+                && fmt
+                    .chars()
+                    .all(|c| matches!(c, 'm' | 'M' | 'u') || c.is_ascii_digit() || c == '*');
+            let enc = if text_only { "US-ASCII" } else { "ASCII-8BIT" };
+            with_host(|h| h.set_string_encoding(&s, enc));
             Ok(s)
         }
         "sort" | "sort!" => {
@@ -21445,20 +21737,178 @@ fn do_require(args: &[Value], mode: ReqMode) -> Result<Value, String> {
     Ok(Value::Bool(true))
 }
 
-// ---- Array#pack / String#unpack -----------------------------------------
+// ---- Byte strings, Array#pack / String#unpack ----------------------------
 //
-// Ruby strings here are UTF-8-backed (`RObj::Str` is a Rust `String`), so a true
-// ASCII-8BIT/binary string is modeled with the Latin-1 convention: a "byte" is a
-// codepoint in `U+0000..=U+00FF` and its value is the char's low 8 bits. `pack`
-// turns bytes into such a string and `unpack` reads it back the same way, so any
-// `pack`-produced binary string round-trips (`bytes.pack("C*").unpack("C*")`),
-// and `Integer#chr` (which maps `n & 0xff` to `U+00nn`) round-trips through
-// `unpack("C*")` too. The documented divergence: `unpack` on a *genuine*
-// multibyte-UTF-8 text string reads codepoints (Latin-1), not the raw UTF-8
-// bytes MRI would — e.g. `"é".unpack("C*")` is `[233]` here vs `[195, 169]` in
-// MRI. `String#bytes`/`#ord` keep their real-UTF-8 semantics, so `255.chr.bytes`
-// is `[195, 191]` here vs `[255]` in MRI (a pack-free path). For ASCII and every
-// pack-produced binary string the two models coincide.
+// THE BYTE-STRING REPRESENTATION INVARIANT
+//
+// `RObj::Str` is a Rust `String`, so it cannot hold the invalid UTF-8 that a
+// byte string generally is. A String tagged with a non-UTF-8 encoding (see
+// [`RubyHost::string_encoding`]) therefore stores ONE CHARACTER PER BYTE: byte
+// `NN` is the char `U+00NN`, the Latin-1 convention. A UTF-8 (untagged) String
+// stores text and denotes its own UTF-8 bytes.
+//
+// The invariant is what makes the tag mean something rather than being a label:
+// under it a byte string's CHARACTER sequence IS its byte sequence, so every
+// character-oriented method — `length`, `[]`, `chars`, `reverse`, `index`,
+// `split`, `==`, `hash` — answers MRI's byte-oriented result for free, because
+// in MRI a binary string's characters are its bytes too.
+//
+// Every producer of a byte string establishes it and every consumer relies on
+// it, so the two must not drift apart:
+//
+//   producers  `Array#pack`, `Integer#chr`, `String#b`, `force_encoding` to a
+//              non-UTF-8 name — the last two TRANSCODE the receiver's UTF-8
+//              bytes into characters ([`text_to_byte_storage`])
+//   consumers  `#bytes`, `#bytesize`, `#each_byte`, `#getbyte`, `#setbyte`,
+//              `#byteslice`, `#unpack` — all read [`string_byte_view`], never
+//              the storage bytes directly
+//   exit       `force_encoding`/`encode!` back to UTF-8 reverses it
+//              ([`byte_storage_to_text`])
+//
+// Residual gap: a byte string whose bytes are not valid UTF-8 cannot survive
+// `force_encoding("UTF-8")`, because the result is not expressible as a Rust
+// `String`. MRI keeps the bytes and answers `valid_encoding? == false`; the
+// conversion here is lossy. See `tests/data/parity_fuzz_baseline.txt`.
+
+/// The UTF-8 text `s` re-stored as a byte string (each UTF-8 byte becomes one
+/// character). The entry point to the byte-string representation invariant.
+fn text_to_byte_storage(s: &str) -> String {
+    bytes_to_binstr(s.as_bytes())
+}
+
+/// A byte string's storage read back as UTF-8 text — the inverse of
+/// [`text_to_byte_storage`], lossy when the bytes are not valid UTF-8.
+fn byte_storage_to_text(s: &str) -> String {
+    String::from_utf8_lossy(&binstr_to_bytes(s)).into_owned()
+}
+
+/// The byte sequence the String `recv` denotes: its characters' low bytes when
+/// it is tagged non-UTF-8, its own UTF-8 bytes otherwise. Every byte-oriented
+/// String method reads this rather than the storage, which is what keeps
+/// `"é".b.bytes` (`[195, 169]`) and `233.chr.bytes` (`[233]`) both right —
+/// the two disagree on `U+0080..=U+00FF` and only the tag separates them.
+/// Relabel the String `recv` (whose current storage is `s`) to the encoding
+/// `target` (`None` for UTF-8), moving the storage between the text and byte
+/// representations when the label crosses between them. The byte sequence is
+/// what is preserved, exactly as MRI's `force_encoding` preserves it.
+fn retag_string(recv: &Value, s: &str, target: Option<&'static str>) {
+    let was_binary = with_host(|h| h.string_encoding(recv)).is_some();
+    match (was_binary, target) {
+        (false, Some(enc)) => {
+            let storage = text_to_byte_storage(s);
+            with_host(|h| {
+                h.set_str(recv, storage);
+                h.set_string_encoding(recv, enc);
+            });
+        }
+        (true, None) => {
+            let storage = byte_storage_to_text(s);
+            with_host(|h| {
+                h.set_str(recv, storage);
+                h.clear_string_encoding(recv);
+            });
+        }
+        // Both sides byte-oriented (ASCII-8BIT <-> US-ASCII) or both UTF-8: the
+        // storage already holds the right representation, only the name moves.
+        (true, Some(enc)) => with_host(|h| h.set_string_encoding(recv, enc)),
+        (false, None) => {}
+    }
+}
+
+/// Append `other` to the String `recv` (whose storage is `s`) and settle the
+/// encoding the result carries.
+///
+/// An append negotiates encodings exactly as `+` does, and the negotiation can
+/// go the way the receiver does not: an ASCII-only byte string that is handed
+/// UTF-8 text BECOMES UTF-8, storage and all.
+///
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["abc".b.concat("é", "é"),
+///       "abc".b.concat("é").encoding.to_s]'
+///   ["abcéé", "UTF-8"]
+///
+/// `propagate_string_encoding` cannot do this: it only ever SETS a tag, and the
+/// receiver here already carries the one that has to come off.
+fn append_in_place(recv: &Value, s: &str, other: &str, operand: Option<&Value>) {
+    let recv_ascii = s.is_ascii();
+    with_host(|h| {
+        h.set_str(recv, format!("{s}{other}"));
+        h.inherit_string_encoding_with(recv, recv, recv_ascii, operand);
+    });
+}
+
+/// The encoding `String#encode` was asked to convert TO, or `None` when the
+/// call named none (a bare `encode`, or one given only an options hash — both
+/// of which convert nothing).
+fn encode_target(args: &[Value]) -> Option<&'static str> {
+    let a = args.first()?;
+    let raw = match with_host(|h| h.ivar_of(a, "name")) {
+        Value::Undef => with_host(|h| h.as_str(a))?,
+        nm => arg_str(&nm),
+    };
+    match normalize_encoding_name(&raw).as_deref() {
+        Some("ASCII-8BIT") => Some("ASCII-8BIT"),
+        Some("US-ASCII") => Some("US-ASCII"),
+        _ => Some("UTF-8"),
+    }
+}
+
+/// Whether an `encode` call asked for `key:` (`undef` or `invalid`) to be
+/// repaired rather than refused. The two are NOT interchangeable — `invalid:`
+/// alone leaves an unconvertible character raising:
+///
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e '"é".b.encode("UTF-8", invalid: :replace)'
+///   -e:1:in 'String#encode': "\xC3" from ASCII-8BIT to UTF-8 (Encoding::UndefinedConversionError)
+fn encode_replaces(args: &[Value], key: &str) -> bool {
+    args.iter().any(|a| {
+        with_host(|h| h.as_hash(a))
+            .and_then(|hh| hh.get(&RKey::Sym(key.to_string())).cloned())
+            .is_some_and(|v| v != Value::Undef)
+    })
+}
+
+/// The exception `String#encode` raises for content the target cannot spell.
+/// MRI names the FIRST offending unit, which is a codepoint when the source is
+/// UTF-8 and a byte when it is byte-oriented, and spells all three cases
+/// differently — see the call site for the measured outputs.
+fn encode_conversion_error(s: &str, from: &str, to: &str) -> String {
+    if from == "UTF-8" {
+        let c = s.chars().find(|c| !c.is_ascii()).unwrap_or('\0');
+        return raise_exc(
+            "Encoding::UndefinedConversionError",
+            &format!("U+{:04X} from UTF-8 to {to}", c as u32),
+        );
+    }
+    let b = binstr_to_bytes(s)
+        .into_iter()
+        .find(|b| *b >= 0x80)
+        .unwrap_or(0);
+    match (from, to) {
+        // A byte that US-ASCII cannot even READ is a broken sequence, not an
+        // unconvertible character.
+        ("US-ASCII", _) => raise_exc(
+            "Encoding::InvalidByteSequenceError",
+            &format!("\"\\x{b:02X}\" on US-ASCII"),
+        ),
+        // ASCII-8BIT reaches US-ASCII only by way of UTF-8, and the message
+        // names the whole chain rather than the endpoints.
+        (_, "US-ASCII") => raise_exc(
+            "Encoding::UndefinedConversionError",
+            &format!("\"\\x{b:02X}\" to UTF-8 in conversion from ASCII-8BIT to UTF-8 to US-ASCII"),
+        ),
+        _ => raise_exc(
+            "Encoding::UndefinedConversionError",
+            &format!("\"\\x{b:02X}\" from ASCII-8BIT to {to}"),
+        ),
+    }
+}
+
+fn string_byte_view(recv: &Value, s: &str) -> Vec<u8> {
+    if with_host(|h| h.string_encoding(recv)).is_some() {
+        binstr_to_bytes(s)
+    } else {
+        s.as_bytes().to_vec()
+    }
+}
 
 /// Encode a byte slice as a Latin-1 binary string (`byte b` -> `char U+00xx`).
 fn bytes_to_binstr(bytes: &[u8]) -> String {
@@ -21543,6 +21993,36 @@ fn parse_pack_template(fmt: &str) -> Vec<PackDir> {
 }
 
 /// `Array#pack` core: consume `items` per the template, producing raw bytes.
+/// `ArgumentError: too few arguments` — what MRI raises when a `pack` template
+/// asks for an element the array does not have. Substituting `0`/`""` instead
+/// made `[1].pack("NN")` answer eight bytes where MRI refuses the call.
+fn pack_too_few() -> String {
+    raise_exc("ArgumentError", "too few arguments")
+}
+
+/// The element a numeric `pack` directive consumes. MRI runs it through
+/// `rb_to_int`, so an Integer or Float is taken (a Float truncates) and `nil`, a
+/// String or a Symbol is a TypeError rather than a silent zero.
+fn pack_int_arg(items: &[Value], idx: usize) -> Result<Value, String> {
+    let v = items.get(idx).ok_or_else(pack_too_few)?;
+    match v {
+        Value::Int(_) | Value::Float(_) => Ok(v.clone()),
+        _ if with_host(|h| h.as_bigint(v)).is_some() => Ok(v.clone()),
+        _ => Err(conv_error(v, "Integer")),
+    }
+}
+
+/// The element a string `pack` directive consumes, as its byte sequence. MRI
+/// takes a String or `nil` (an empty string) and refuses everything else.
+fn pack_str_arg(items: &[Value], idx: usize) -> Result<Vec<u8>, String> {
+    let v = items.get(idx).ok_or_else(pack_too_few)?;
+    match v {
+        Value::Undef => Ok(Vec::new()),
+        _ if with_host(|h| h.as_str(v)).is_some() => Ok(string_byte_view(v, &arg_str(v))),
+        _ => Err(conv_error(v, "String")),
+    }
+}
+
 fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut idx = 0usize; // next array element to consume
@@ -21553,27 +22033,173 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
             'C' | 'c' => {
                 let n = d.count.unwrap_or(items.len().saturating_sub(idx));
                 for _ in 0..n {
-                    let v = items.get(idx).map(as_i).unwrap_or(0);
+                    let v = as_i(&pack_int_arg(items, idx)?);
                     out.push((v & 0xff) as u8);
                     idx += 1;
                 }
             }
             // A string: `a` NUL-pads (and NUL is the truncation fill), `A` space-
-            // pads. `*` uses the full string; a count truncates/pads to width.
-            'a' | 'A' => {
-                let sbytes = items
-                    .get(idx)
-                    .map(|v| binstr_to_bytes(&arg_str(v)))
-                    .unwrap_or_default();
+            // pads, `Z` is `a` except that `*` appends a NUL terminator. `*` uses
+            // the full string; a count truncates/pads to width. (`Z5` does NOT
+            // reserve room for the terminator: `["abcde"].pack("Z5")` is
+            // `"abcde"`, exactly what `a5` gives.)
+            'a' | 'A' | 'Z' => {
+                let sbytes = pack_str_arg(items, idx)?;
                 idx += 1;
                 let pad = if d.kind == 'A' { b' ' } else { 0u8 };
                 match d.count {
-                    None => out.extend_from_slice(&sbytes),
+                    None => {
+                        out.extend_from_slice(&sbytes);
+                        if d.kind == 'Z' {
+                            out.push(0);
+                        }
+                    }
                     Some(n) => {
                         for i in 0..n {
                             out.push(sbytes.get(i).copied().unwrap_or(pad));
                         }
                     }
+                }
+            }
+            // Base64. `m0` is the unbroken form; any other count is a line
+            // length in INPUT bytes rounded down to a whole 3-byte group (so
+            // `m3`, `m4` and `m5` all encode 3 bytes per line), and a count
+            // under 3 — a bare `m` included — means the default 45.
+            'm' => {
+                let sbytes = pack_str_arg(items, idx)?;
+                idx += 1;
+                if d.count == Some(0) {
+                    out.extend_from_slice(base64_encode_bytes(&sbytes, B64_STD, true).as_bytes());
+                    continue;
+                }
+                let width = match d.count.unwrap_or(0) {
+                    n if n < 3 => 45,
+                    n => n - n % 3,
+                };
+                for line in sbytes.chunks(width) {
+                    out.extend_from_slice(base64_encode_bytes(line, B64_STD, true).as_bytes());
+                    out.push(b'\n');
+                }
+            }
+            // Bit strings: the element is a string of `0`/`1` characters, packed
+            // eight to a byte — `B` most-significant bit first, `b` least. A short
+            // final group is zero-filled.
+            'B' | 'b' => {
+                let bits = bytes_to_binstr(&pack_str_arg(items, idx)?);
+                idx += 1;
+                // MRI reads each character's LOW BIT, so `"ab"` is the bits
+                // `1, 0` — `"0"`/`"1"` is just the spelling that makes that
+                // read the way it looks.
+                let bits: Vec<u8> = bits.bytes().map(|c| c & 1).collect();
+                let want = d.count.unwrap_or(bits.len());
+                let take = want.min(bits.len());
+                for group in bits[..take].chunks(8) {
+                    let mut byte = 0u8;
+                    for (i, &bit) in group.iter().enumerate() {
+                        if bit == 1 {
+                            byte |= if d.kind == 'B' { 0x80 >> i } else { 1 << i };
+                        }
+                    }
+                    out.push(byte);
+                }
+                // A count past the end of the source NUL-fills, by pack.c's own
+                // (historical, and not `count / 8`) formula
+                // `j = (len - plen + 1) / 2`:
+                //
+                //   $ ruby -e 'p ["1"].pack("B4").bytes'
+                //   [128, 0, 0]
+                out.resize(out.len() + (want - take).div_ceil(2), 0);
+            }
+            // BER-compressed integers: base-128 big-endian, the continuation bit
+            // set on every byte but the last, so `128` is `[0x81, 0x00]`.
+            'w' => {
+                let n = d.count.unwrap_or(items.len().saturating_sub(idx));
+                for _ in 0..n {
+                    let v = as_i(&pack_int_arg(items, idx)?);
+                    idx += 1;
+                    if v < 0 {
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            "can't compress negative numbers",
+                        ));
+                    }
+                    let mut groups = vec![(v & 0x7f) as u8];
+                    let mut rest = v >> 7;
+                    while rest > 0 {
+                        groups.push((rest & 0x7f) as u8 | 0x80);
+                        rest >>= 7;
+                    }
+                    groups.reverse();
+                    out.extend_from_slice(&groups);
+                }
+            }
+            // Quoted-printable: printable ASCII passes through, everything else
+            // becomes `=XX`, and the result ends with a soft line break.
+            'M' => {
+                let sbytes = pack_str_arg(items, idx)?;
+                idx += 1;
+                // The count is one LESS than the characters per line (`M2` wraps
+                // at 3), and `M0`/`M1`/a bare `M` mean the default 72. Empty
+                // input answers an empty string, not a lone soft break.
+                if sbytes.is_empty() {
+                    continue;
+                }
+                let width = match d.count.unwrap_or(0) {
+                    n if n <= 1 => 72,
+                    n => n + 1,
+                };
+                let mut col = 0usize;
+                for &b in &sbytes {
+                    // The soft break is decided BEFORE the character, on the
+                    // column the previous one left behind — so a three-character
+                    // `=XX` escape is never split, and a line that ends exactly
+                    // at the width does not pick up a break it never needed.
+                    if col >= width {
+                        out.extend_from_slice(b"=\n");
+                        col = 0;
+                    }
+                    let piece = match b {
+                        b'\n' => {
+                            out.push(b'\n');
+                            col = 0;
+                            continue;
+                        }
+                        b'=' => "=3D".to_string(),
+                        0x20..=0x7e => (b as char).to_string(),
+                        _ => format!("={b:02X}"),
+                    };
+                    out.extend_from_slice(piece.as_bytes());
+                    col += piece.len();
+                }
+                out.extend_from_slice(b"=\n");
+            }
+            // uuencode: a length character (`32 + n`, `0` spelled as a backtick)
+            // then the 3-bytes-to-4-characters groups, per 45-byte line.
+            'u' => {
+                let sbytes = pack_str_arg(items, idx)?;
+                idx += 1;
+                let uu = |n: u8| if n == 0 { b'`' } else { n + 32 };
+                // The count is the LINE LENGTH in bytes, rounded down to a whole
+                // number of 3-byte groups; anything under 3 (a bare `u` included)
+                // means the default 45.
+                let width = match d.count.unwrap_or(0) {
+                    n if n < 3 => 45,
+                    n => n - n % 3,
+                };
+                for line in sbytes.chunks(width) {
+                    out.push(uu(line.len() as u8));
+                    for group in line.chunks(3) {
+                        let (b0, b1, b2) = (
+                            group[0] as u32,
+                            group.get(1).copied().unwrap_or(0) as u32,
+                            group.get(2).copied().unwrap_or(0) as u32,
+                        );
+                        let w = (b0 << 16) | (b1 << 8) | b2;
+                        for shift in [18, 12, 6, 0] {
+                            out.push(uu(((w >> shift) & 0x3f) as u8));
+                        }
+                    }
+                    out.push(b'\n');
                 }
             }
             // Fixed-width integers, big-endian (N/n) and little-endian (V/v).
@@ -21586,9 +22212,10 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
                     // (MRI truncates rather than raising), and a promoted BigInt
                     // has to go through `as_bigint` — `as_i` bottoms out at 0
                     // for anything past the i64 range.
-                    let v = match with_host(|h| items.get(idx).and_then(|it| h.as_bigint(it))) {
+                    let it = pack_int_arg(items, idx)?;
+                    let v = match with_host(|h| h.as_bigint(&it)) {
                         Some(b) => bigint_low_u64(&b),
-                        None => items.get(idx).map(as_i).unwrap_or(0) as u64,
+                        None => as_i(&it) as u64,
                     };
                     idx += 1;
                     let full = v.to_be_bytes();
@@ -21616,9 +22243,10 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
                     // (MRI truncates rather than raising), and a promoted BigInt
                     // has to go through `as_bigint` — `as_i` bottoms out at 0
                     // for anything past the i64 range.
-                    let v = match with_host(|h| items.get(idx).and_then(|it| h.as_bigint(it))) {
+                    let it = pack_int_arg(items, idx)?;
+                    let v = match with_host(|h| h.as_bigint(&it)) {
                         Some(b) => bigint_low_u64(&b),
-                        None => items.get(idx).map(as_i).unwrap_or(0) as u64,
+                        None => as_i(&it) as u64,
                     };
                     idx += 1;
                     if big {
@@ -21635,7 +22263,7 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
                 let big = matches!(d.kind, 'G' | 'g');
                 let n = d.count.unwrap_or(items.len().saturating_sub(idx));
                 for _ in 0..n {
-                    let f = items.get(idx).map(as_f).unwrap_or(0.0);
+                    let f = as_f(&pack_int_arg(items, idx)?);
                     idx += 1;
                     if double {
                         let b = if big {
@@ -21657,13 +22285,23 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
             // Hex strings: `H` high-nibble-first, `h` low-nibble-first. Consumes
             // one element; a count limits the nibbles taken (`*` = all).
             'H' | 'h' => {
-                let hex = items.get(idx).map(arg_str).unwrap_or_default();
+                let hex = bytes_to_binstr(&pack_str_arg(items, idx)?);
                 idx += 1;
+                // pack.c's own nibble read, which accepts ANY character: a
+                // letter contributes `((c & 15) + 9) & 15` (so `a`/`A` are both
+                // 10, and `h` is 1), anything else `c & 15`.
                 let nibbles: Vec<u8> = hex
-                    .chars()
-                    .map(|c| c.to_digit(16).unwrap_or(0) as u8)
+                    .bytes()
+                    .map(|c| {
+                        if c.is_ascii_alphabetic() {
+                            ((c & 15) + 9) & 15
+                        } else {
+                            c & 15
+                        }
+                    })
                     .collect();
-                let take = d.count.unwrap_or(nibbles.len()).min(nibbles.len());
+                let want = d.count.unwrap_or(nibbles.len());
+                let take = want.min(nibbles.len());
                 let mut i = 0;
                 while i < take {
                     let hi = nibbles[i];
@@ -21676,6 +22314,10 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
                     out.push(byte);
                     i += 2;
                 }
+                // As for `B`/`b`, but pack.c spells this grow differently:
+                // `j = (len + 1) / 2 - (plen + 1) / 2`, which comes to exactly
+                // `(count + 1) / 2` bytes in total.
+                out.resize(out.len() + want.div_ceil(2) - take.div_ceil(2), 0);
             }
             // `@N` moves to absolute byte position N (null-fill forward, truncate
             // back). Consumes no array element.
@@ -21707,6 +22349,19 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
         }
     }
     Ok(out)
+}
+
+/// A String element produced by `unpack`. Every one of them is a byte string —
+/// its storage is one character per byte — and the DIRECTIVE names the encoding,
+/// not the receiver: the byte-valued directives answer ASCII-8BIT, and the ones
+/// that can only emit digits (`B`/`b`/`H`/`h`) answer US-ASCII.
+///
+///   $ ruby -e 'p [97].pack("C").unpack("B*").map { |x| x.encoding.to_s }'
+///   ["US-ASCII"]
+fn unpack_str(s: String, enc: &'static str) -> Value {
+    let v = new_str(s);
+    with_host(|h| h.set_string_encoding(&v, enc));
+    v
 }
 
 /// `String#unpack` core: read `bytes` per the template into Ruby values.
@@ -21751,7 +22406,132 @@ fn unpack_bytes(bytes: &[u8], fmt: &str) -> Result<Vec<Value>, String> {
                 } else {
                     bytes_to_binstr(slice)
                 };
-                out.push(new_str(s));
+                out.push(unpack_str(s, "ASCII-8BIT"));
+            }
+            // `Z` reads a NUL-terminated string. With a count it consumes exactly
+            // that many bytes and keeps what precedes the first NUL; `Z*` consumes
+            // up to AND INCLUDING the terminator, so `"a\0b\0".unpack("Z*Z*")`
+            // answers both strings.
+            'Z' => {
+                let (slice, next) = match d.count {
+                    Some(n) => {
+                        let end = (pos + n).min(bytes.len());
+                        (&bytes[pos..end], end)
+                    }
+                    None => {
+                        let end = bytes[pos..]
+                            .iter()
+                            .position(|&b| b == 0)
+                            .map(|i| pos + i)
+                            .unwrap_or(bytes.len());
+                        (&bytes[pos..end], (end + 1).min(bytes.len()))
+                    }
+                };
+                pos = next;
+                let cut = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+                out.push(unpack_str(bytes_to_binstr(&slice[..cut]), "ASCII-8BIT"));
+            }
+            // Base64 — one string element, whatever the line-break spelling.
+            'm' => {
+                let text = String::from_utf8_lossy(&bytes[pos..]).into_owned();
+                pos = bytes.len();
+                out.push(unpack_str(
+                    bytes_to_binstr(&base64_decode_bytes(&text)),
+                    "ASCII-8BIT",
+                ));
+            }
+            // Bit strings, the inverse of the `B`/`b` pack directives. The count
+            // is a number of BITS (`*` = all of them).
+            'B' | 'b' => {
+                let avail = (bytes.len() - pos) * 8;
+                let take = d.count.unwrap_or(avail).min(avail);
+                let mut s = String::with_capacity(take);
+                for i in 0..take {
+                    let byte = bytes[pos + i / 8];
+                    let bit = if d.kind == 'B' {
+                        byte >> (7 - i % 8)
+                    } else {
+                        byte >> (i % 8)
+                    };
+                    s.push(if bit & 1 == 1 { '1' } else { '0' });
+                }
+                pos += take.div_ceil(8);
+                out.push(unpack_str(s, "US-ASCII"));
+            }
+            // BER-compressed integers: accumulate 7 bits per byte until one
+            // arrives with the continuation bit clear.
+            'w' => {
+                let n = d.count.unwrap_or(usize::MAX);
+                let mut produced = 0;
+                while produced < n && pos < bytes.len() {
+                    let mut v: i64 = 0;
+                    while pos < bytes.len() {
+                        let b = bytes[pos];
+                        pos += 1;
+                        v = (v << 7) | (b & 0x7f) as i64;
+                        if b & 0x80 == 0 {
+                            break;
+                        }
+                    }
+                    out.push(Value::Int(v));
+                    produced += 1;
+                }
+            }
+            // Quoted-printable: `=XX` is a byte, `=\n` is a soft break that
+            // vanishes, everything else is literal.
+            'M' => {
+                let src = &bytes[pos..];
+                pos = bytes.len();
+                let mut buf = Vec::with_capacity(src.len());
+                let mut i = 0;
+                while i < src.len() {
+                    if src[i] == b'=' && i + 1 < src.len() {
+                        if src[i + 1] == b'\n' {
+                            i += 2;
+                            continue;
+                        }
+                        let hex = |c: u8| (c as char).to_digit(16);
+                        if let (Some(hi), Some(lo)) =
+                            (hex(src[i + 1]), src.get(i + 2).copied().and_then(hex))
+                        {
+                            buf.push((hi * 16 + lo) as u8);
+                            i += 3;
+                            continue;
+                        }
+                    }
+                    buf.push(src[i]);
+                    i += 1;
+                }
+                out.push(unpack_str(bytes_to_binstr(&buf), "ASCII-8BIT"));
+            }
+            // uuencode, the inverse of the `u` pack directive: each line starts
+            // with its decoded length.
+            'u' => {
+                let src = &bytes[pos..];
+                pos = bytes.len();
+                let un = |c: u8| (c.wrapping_sub(32)) & 0x3f;
+                let mut buf = Vec::new();
+                for line in src.split(|&b| b == b'\n') {
+                    // pack.c reads lines only `while (*s > ' ' && *s < 'a')`, so
+                    // a leading character outside that range ends the decode
+                    // rather than being read as a length: `"abc".unpack("u*")`
+                    // is `[""]`, not a byte of `"bc"`.
+                    if line.first().map_or(true, |&c| c <= b' ' || c >= b'a') {
+                        break;
+                    }
+                    let len = un(line[0]) as usize;
+                    let mut got = Vec::new();
+                    for group in line[1..].chunks(4) {
+                        let mut w = 0u32;
+                        for i in 0..4 {
+                            w = (w << 6) | un(group.get(i).copied().unwrap_or(b'`')) as u32;
+                        }
+                        got.extend_from_slice(&[(w >> 16) as u8, (w >> 8) as u8, w as u8]);
+                    }
+                    got.truncate(len);
+                    buf.extend_from_slice(&got);
+                }
+                out.push(unpack_str(bytes_to_binstr(&buf), "ASCII-8BIT"));
             }
             'N' | 'n' | 'V' | 'v' => {
                 let width = if matches!(d.kind, 'N' | 'V') { 4 } else { 2 };
@@ -21890,7 +22670,7 @@ fn unpack_bytes(bytes: &[u8], fmt: &str) -> Result<Vec<Value>, String> {
                     s.push(std::char::from_digit(nib as u32, 16).unwrap());
                 }
                 pos += take.div_ceil(2);
-                out.push(new_str(s));
+                out.push(unpack_str(s, "US-ASCII"));
             }
             other => {
                 return Err(raise_exc(
