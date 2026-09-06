@@ -10158,3 +10158,251 @@ fn unrankable_sort_by_names_the_float_first_only_for_an_integer_pair() {
         );
     }
 }
+
+#[test]
+fn partition_and_rpartition_accept_a_regexp() {
+    // A Regexp separator is not a substring of its own source, so reading it
+    // through the string path searched for the PATTERN TEXT -- which never
+    // occurs -- and every regexp partition answered "no match", handing back the
+    // whole receiver. This is the same defect `index`/`rindex` carried.
+    eq(
+        "\"hello world\".partition(/o./)",
+        "[\"hell\", \"o \", \"world\"]",
+    );
+    eq(
+        "\"hello world\".rpartition(/o./)",
+        "[\"hello w\", \"or\", \"ld\"]",
+    );
+    // A zero-width pattern matches at the start, so the receiver moves ENTIRELY
+    // into the middle slot -- the answer a `find`-based implementation cannot give.
+    eq("\"aaa\".partition(/a*/)", "[\"\", \"aaa\", \"\"]");
+    // `rpartition` takes the LAST position a match can BEGIN at, which a forward
+    // scan never reports: the only forward match of /a+/ here begins at 0.
+    eq("\"aaa\".rpartition(/a+/)", "[\"aa\", \"a\", \"\"]");
+    // No match still puts the receiver on opposite sides for the two names.
+    eq("\"hello\".partition(/z/)", "[\"hello\", \"\", \"\"]");
+    eq("\"hello\".rpartition(/z/)", "[\"\", \"\", \"hello\"]");
+    // A regexp partition sets the match globals, so `$~` and `$1` read back.
+    eq(
+        "\"hello world\".partition(/o(.)/); [$~[0], $1]",
+        "[\"o \", \" \"]",
+    );
+    eq(
+        "\"hello world\".rpartition(/o(.)/); [$~[0], $1]",
+        "[\"or\", \"r\"]",
+    );
+    // A failed match CLEARS them rather than leaving the previous one standing.
+    eq("\"abc\" =~ /b/; \"abc\".partition(/z/); $~", "nil");
+    // The String separator path is unchanged.
+    eq("\"a-b-c\".partition(\"-\")", "[\"a\", \"-\", \"b-c\"]");
+    eq("\"a-b-c\".rpartition(\"-\")", "[\"a-b\", \"-\", \"c\"]");
+    eq("\"abc\".partition(\"\")", "[\"\", \"\", \"abc\"]");
+}
+
+#[test]
+fn casecmp_answers_nil_for_a_non_string() {
+    // `casecmp`/`casecmp?` compare against a String or answer nil -- they are not
+    // defined for anything else. Reading the argument through the generic
+    // stringifier compared against its `to_s` instead, so `"abc".casecmp(1)`
+    // ranked against "1" and `casecmp?(nil)` ranked against "".
+    eq("\"abc\".casecmp(1)", "nil");
+    eq("\"abc\".casecmp?(nil)", "nil");
+    eq("\"abc\".casecmp(:sym)", "nil");
+    eq("\"abc\".casecmp?(:abc)", "nil");
+    eq("\"abc\".casecmp([1])", "nil");
+    // A String argument still ranks, case-insensitively.
+    eq("\"abc\".casecmp(\"ABC\")", "0");
+    eq("\"abc\".casecmp(\"ABD\")", "-1");
+    eq("\"abd\".casecmp(\"ABC\")", "1");
+    eq("\"abc\".casecmp?(\"ABC\")", "true");
+    // This mirrors `<=>`, which is nil for the same argument.
+    eq("\"abc\" <=> 1", "nil");
+}
+
+#[test]
+fn lines_and_each_line_honour_their_separator() {
+    // The separator argument was dropped, so every form split on newlines.
+    eq("\"a,b,c\".lines(\",\")", "[\"a,\", \"b,\", \"c\"]");
+    eq("\"aXXbXXc\".lines(\"XX\")", "[\"aXX\", \"bXX\", \"c\"]");
+    // A trailing separator does NOT leave a final empty line.
+    eq("\"a,b,\".lines(\",\")", "[\"a,\", \"b,\"]");
+    // `nil` means no separator at all: one line, whatever it contains.
+    eq("\"a\\nb\\nc\".lines(nil)", "[\"a\\nb\\nc\"]");
+    // ...including when the receiver is empty, the one case where `lines(nil)`
+    // and bare `lines` part company.
+    eq("\"\".lines(nil)", "[\"\"]");
+    eq("\"\".lines", "[]");
+    // `""` is PARAGRAPH mode, not "split on the empty string": a chunk runs to
+    // the first "\n\n" inclusive and any further newlines in that run vanish.
+    eq(
+        "\"a\\n\\nb\\n\\nc\".lines(\"\")",
+        "[\"a\\n\\n\", \"b\\n\\n\", \"c\"]",
+    );
+    eq("\"a\\n\\n\\n\\nb\".lines(\"\")", "[\"a\\n\\n\", \"b\"]");
+    // A LEADING run still forms its own chunk, so the collapse above is not
+    // "skip blank lines".
+    eq(
+        "\"\\n\\na\\n\\nb\".lines(\"\")",
+        "[\"\\n\\n\", \"a\\n\\n\", \"b\"]",
+    );
+    // With no "\n\n" anywhere the receiver is one paragraph.
+    eq("\"a\\nb\".lines(\"\")", "[\"a\\nb\"]");
+    // `chomp:` strips the separator that ended the chunk -- in paragraph mode the
+    // whole trailing run of newlines.
+    eq(
+        "\"a,b,c\".lines(\",\", chomp: true)",
+        "[\"a\", \"b\", \"c\"]",
+    );
+    eq("\"a\\n\\n\\nb\".lines(\"\", chomp: true)", "[\"a\", \"b\"]");
+    eq("\"\\n\\n\\na\".lines(\"\", chomp: true)", "[\"\", \"a\"]");
+    eq("\"a\\r\\nb\\r\\n\".lines(chomp: true)", "[\"a\", \"b\"]");
+    // `each_line` splits identically, block or Enumerator.
+    eq("\"a,b,c\".each_line(\",\").to_a", "[\"a,\", \"b,\", \"c\"]");
+    eq(
+        "r = []; \"a,b,c\".each_line(\",\") { |l| r << l }; r",
+        "[\"a,\", \"b,\", \"c\"]",
+    );
+}
+
+#[test]
+fn rindex_caps_where_a_match_may_begin_not_where_it_ends() {
+    // `pos` bounds the position the match BEGINS at. Searching the prefix
+    // `s[..=pos]` instead required the whole needle to fit inside that prefix, so
+    // a match starting at `pos` and running past it was missed.
+    eq("\"abcd\".rindex(\"cd\", 2)", "2");
+    eq("\"abcabc\".rindex(\"abc\", 3)", "3");
+    // A needle that begins after `pos` is still excluded.
+    eq("\"abcd\".rindex(\"cd\", 1)", "nil");
+    eq("\"abcd\".rindex(\"d\", 2)", "nil");
+    // `pos` is measured in CHARACTERS, not bytes.
+    eq("\"héllo\".rindex(\"llo\", 2)", "2");
+    // A `pos` past the end CLAMPS for `rindex` -- this is where it parts company
+    // with `index`, which answers nil.
+    eq("\"abc\".rindex(\"b\", 8)", "1");
+    eq("\"abc\".rindex(/b/, 8)", "1");
+    eq("\"abc\".index(\"b\", 8)", "nil");
+    eq("\"abc\".index(/b/, 8)", "nil");
+    // An empty needle can begin at `pos` itself, including at the very end.
+    eq("\"abc\".rindex(\"\", 8)", "3");
+    eq("\"abc\".rindex(\"\", 2)", "2");
+    // A negative `pos` counts back from the end; below that it is nil.
+    eq("\"abc\".rindex(\"\", -1)", "2");
+    eq("\"abc\".rindex(\"\", -9)", "nil");
+    eq("\"abc\".rindex(\"b\", -9)", "nil");
+}
+
+#[test]
+fn values_at_pads_a_range_with_nil_instead_of_truncating() {
+    // A Range selects a FIXED number of slots -- `end - begin` of them -- and a
+    // slot past the end is nil. Clamping the end to the receiver's length
+    // silently dropped those trailing nils; this is `values_at` parting company
+    // with `Array#[]`, which really does truncate.
+    eq(
+        "[1, 2, 3].values_at(1..7)",
+        "[2, 3, nil, nil, nil, nil, nil]",
+    );
+    eq("[1, 2, 3].values_at(5..7)", "[nil, nil, nil]");
+    eq("[1, 2, 3].values_at(3..3)", "[nil]");
+    eq("[].values_at(0..2)", "[nil, nil, nil]");
+    // An empty range selects nothing.
+    eq("[1, 2, 3].values_at(4..3)", "[]");
+    // An OPEN bound is the receiver's own edge, not a huge integer -- an
+    // unresolved endless end makes the slot loop run away.
+    eq("[1, 2, 3].values_at(2..)", "[3]");
+    eq("[1, 2, 3].values_at(..1)", "[1, 2]");
+    // A begin that stays negative after normalizing is a RangeError, not empty.
+    eq(
+        "begin; [1].values_at(-4..2); rescue => e; [e.class.to_s, e.message]; end",
+        "[\"RangeError\", \"-4..2 out of range\"]",
+    );
+    eq(
+        "begin; [].values_at(-1..3); rescue => e; [e.class.to_s, e.message]; end",
+        "[\"RangeError\", \"-1..3 out of range\"]",
+    );
+    // An END that stays negative selects nothing; it does not clamp up to slot 0.
+    eq("[1].values_at(..-2)", "[]");
+    eq("[1, 2, 3].values_at(0..-9)", "[]");
+    // Negative bounds inside the array still count back from the end.
+    eq("[1, 2, 3].values_at(0..-1)", "[1, 2, 3]");
+    eq("[1, 2, 3].values_at(0...-1)", "[1, 2]");
+    eq("[1, 2, 3].values_at(-3..3)", "[1, 2, 3, nil]");
+    // Integer arguments are unaffected.
+    eq("[1, 2, 3].values_at(1, 5, -1)", "[2, nil, 3]");
+}
+
+#[test]
+fn transpose_refuses_an_element_that_is_not_an_array() {
+    // Every element must BE an Array. Reading a non-Array as an empty row made
+    // `[1,2,3].transpose` answer [] where MRI refuses the conversion outright.
+    eq(
+        "begin; [1, 2, 3].transpose; rescue => e; [e.class.to_s, e.message]; end",
+        "[\"TypeError\", \"no implicit conversion of Integer into Array\"]",
+    );
+    eq(
+        "begin; [\"a\"].transpose; rescue => e; [e.class.to_s, e.message]; end",
+        "[\"TypeError\", \"no implicit conversion of String into Array\"]",
+    );
+    eq(
+        "begin; [1, nil, 2].transpose; rescue => e; [e.class.to_s, e.message]; end",
+        "[\"TypeError\", \"no implicit conversion of Integer into Array\"]",
+    );
+    // A ragged nesting is a DIFFERENT error, so the two are not interchangeable.
+    eq(
+        "begin; [[1, 2], [3]].transpose; rescue => e; [e.class.to_s, e.message]; end",
+        "[\"IndexError\", \"element size differs (1 should be 2)\"]",
+    );
+    // Well-formed input is unaffected, and an empty receiver has no rows to check.
+    eq("[[1, 2], [3, 4]].transpose", "[[1, 3], [2, 4]]");
+    eq("[].transpose", "[]");
+}
+
+#[test]
+fn gcd_lcm_and_remainder_keep_arbitrary_precision() {
+    // These had no arbitrary-precision arm, so a promoted receiver reached the
+    // fixnum code, which TRUNCATES it to 64 bits before the arithmetic and
+    // answers from the wrong number entirely.
+    eq("(2**70).gcd(12)", "4");
+    eq("(2**70).lcm(1)", "1180591620717411303424");
+    eq("(2**70).gcd(2**35)", "34359738368");
+    eq("(2**70).gcdlcm(12)", "[4, 3541774862152233910272]");
+    // `remainder` instead reached the FLOAT arm, which changed the result TYPE:
+    // an Integer remainder is an Integer, not a Float.
+    eq("(2**70).remainder(18)", "16");
+    eq("(2**70).remainder(2**35)", "0");
+    // `remainder` truncates toward zero, so its sign follows the RECEIVER --
+    // unlike `%`, which follows the divisor.
+    eq("[(-(2**70)).remainder(18), (-(2**70)) % 18]", "[-16, 2]");
+    eq("[(-10).remainder(3), (-10) % 3]", "[-1, 2]");
+    // A zero divisor still raises, and a fixnum receiver is unchanged.
+    eq(
+        "begin; (2**70).remainder(0); rescue => e; e.class.to_s; end",
+        "\"ZeroDivisionError\"",
+    );
+    eq(
+        "[12.gcd(18), 12.lcm(18), 12.gcdlcm(18)]",
+        "[6, 36, [6, 36]]",
+    );
+}
+
+#[test]
+fn string_sum_and_array_member() {
+    // `String#sum` is the sum of the receiver's BYTES, masked to `bits` low bits
+    // (default 16). It was missing entirely.
+    eq("\"abc\".sum", "294");
+    eq("\"abc\".sum(8)", "38");
+    eq("\"abc\".sum(1)", "0");
+    eq("\"\".sum", "0");
+    // A non-positive width means NO mask, not a zero result.
+    eq("\"abc\".sum(0)", "294");
+    eq("\"abc\".sum(-1)", "294");
+    // It reads bytes, so multi-byte text sums more than its character count.
+    eq("\"héllo\".sum", "795");
+    // `member?` is Enumerable's spelling of `include?`; Array answered only the
+    // latter, though Hash and Range already accepted both.
+    eq("[1, 2, 3].member?(2)", "true");
+    eq("[1, 2, 3].member?(9)", "false");
+    eq("[nil].member?(nil)", "true");
+    eq("[].member?(nil)", "false");
+    // It compares with `==`, so an Integer finds an equal Float.
+    eq("[1.0].member?(1)", "true");
+}

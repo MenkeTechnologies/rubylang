@@ -6113,6 +6113,39 @@ fn dispatch_bigint(
             }
             _ => return Err(raise_exc("ZeroDivisionError", "divided by 0")),
         },
+        // `gcd`/`lcm`/`gcdlcm`/`remainder` had no arbitrary-precision arm, so a
+        // promoted receiver fell through to the fixnum code below, which reads
+        // it with `as_i` — truncating the bignum before the arithmetic and
+        // answering from the wrong number entirely:
+        //
+        //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [(2**70).gcd(12), (2**70).lcm(1)]'
+        //   [4, 1180591620717411303424]
+        //
+        // which answered [12, 0]. `remainder` instead reached the FLOAT arm and
+        // changed the result's type: MRI's `(2**70).remainder(18)` is 16, not
+        // 16.0. Unlike `%`, `remainder` truncates toward zero, so its sign
+        // follows the RECEIVER.
+        "gcd" | "lcm" | "gcdlcm" => match with_host(|h| h.as_bigint(&args[0])) {
+            Some(d) => {
+                let g = b.gcd(&d);
+                let l = if b.is_zero() || d.is_zero() {
+                    num_bigint::BigInt::from(0)
+                } else {
+                    b.lcm(&d).abs()
+                };
+                match name {
+                    "gcd" => big(g),
+                    "lcm" => big(l),
+                    _ => new_arr(vec![big(g), big(l)]),
+                }
+            }
+            None => return Ok(None),
+        },
+        "remainder" => match with_host(|h| h.as_bigint(&args[0])) {
+            Some(d) if !d.is_zero() => big(b % d),
+            Some(_) => return Err(raise_exc("ZeroDivisionError", "divided by 0")),
+            None => return Ok(None),
+        },
         // Against another Integer this is an exact BigInt compare; against a
         // Float it stays exact rather than promoting the Integer, so
         // `(2**64 + 1) <=> 2.0**64` is 1 and not 0. A Rational ranks too --
@@ -8423,13 +8456,21 @@ fn dispatch_string_body(
         "encoding" => Ok(encoding_object(
             with_host(|h| h.string_encoding(recv)).unwrap_or("UTF-8"),
         )),
-        "lines" => Ok(new_arr(split_lines(&s).into_iter().map(new_str).collect())),
-        "each_line" => {
+        // Both take an optional SEPARATOR and `chomp:`; the separator argument
+        // was dropped on the floor, so `"a,b,c".lines(",")` answered the whole
+        // string as one line instead of ["a,", "b,", "c"], paragraph mode
+        // (`""`) split on single newlines, and `nil` (no separator at all) still
+        // split on them. See `split_lines_sep` for the measured semantics.
+        "lines" | "each_line" => {
+            let lines = split_lines_sep(&s, args);
+            if name == "lines" {
+                return Ok(new_arr(lines.into_iter().map(new_str).collect()));
+            }
             // With a block, iterate the lines and return self; without one,
             // return an Enumerator over the lines (external iteration + chains).
             match &block {
                 Some(bl) => {
-                    for line in split_lines(&s) {
+                    for line in lines {
                         call_proc(bl, &[new_str(line)])?;
                         if has_pending_signal() {
                             break;
@@ -8438,7 +8479,7 @@ fn dispatch_string_body(
                     Ok(recv.clone())
                 }
                 None => {
-                    let lines: Vec<Value> = split_lines(&s).into_iter().map(new_str).collect();
+                    let lines: Vec<Value> = lines.into_iter().map(new_str).collect();
                     Ok(with_host(|h| h.new_enumerator(lines, "each")))
                 }
             }
@@ -8527,6 +8568,24 @@ fn dispatch_string_body(
         "to_s" | "to_str" => Ok(recv.clone()),
         "to_sym" | "intern" => Ok(with_host(|h| h.new_symbol(&s))),
         "include?" => Ok(Value::Bool(s.contains(&arg_str(&args[0])))),
+        // `String#sum(bits = 16)`: the sum of the receiver's BYTES, masked to
+        // `bits` low bits. A non-positive `bits` (and any width at or past the
+        // accumulator's) means no mask at all, not a zero result:
+        //
+        //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["abc".sum, "abc".sum(8), "abc".sum(1), "abc".sum(0)]'
+        //   [294, 38, 0, 294]
+        "sum" => {
+            let total: i64 = s.bytes().map(i64::from).sum();
+            let bits = match args.first() {
+                Some(a) => to_int(a)?,
+                None => 16,
+            };
+            Ok(Value::Int(if bits <= 0 || bits >= 63 {
+                total
+            } else {
+                total & ((1i64 << bits) - 1)
+            }))
+        }
         "start_with?" => Ok(Value::Bool(args.iter().any(|a| {
             match str_regex(a) {
                 // A Regexp prefix matches when it matches at the very start.
@@ -8782,46 +8841,74 @@ fn dispatch_string_body(
             s.chars().next().map(|c| c.to_string()).unwrap_or_default(),
         )),
         // `"a-b-c".partition("-")` => ["a", "-", "b-c"]; no match => [whole, "", ""].
-        "partition" => {
-            let sep = arg_str(&args[0]);
-            Ok(match s.find(&sep) {
-                Some(i) => new_arr(vec![
-                    new_str(s[..i].to_string()),
-                    new_str(sep.clone()),
-                    new_str(s[i + sep.len()..].to_string()),
-                ]),
-                None => new_arr(vec![
-                    new_str(s.clone()),
-                    new_str(String::new()),
-                    new_str(String::new()),
-                ]),
-            })
-        }
         // `rpartition` splits on the LAST occurrence; no match => ["", "", whole].
-        "rpartition" => {
-            let sep = arg_str(&args[0]);
-            Ok(match s.rfind(&sep) {
-                Some(i) => new_arr(vec![
+        //
+        // The separator is a String OR a Regexp, and reading a Regexp through
+        // `arg_str` searched for the pattern's TEXT — which never occurs — so
+        // EVERY regexp partition answered "no match" and handed back the whole
+        // string. This is the same defect `index`/`rindex` carried above.
+        //
+        //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p "hello world".partition(/o./)'
+        //   ["hell", "o ", "world"]
+        //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p "hello world".rpartition(/o./)'
+        //   ["hello w", "or", "ld"]
+        "partition" | "rpartition" => {
+            let rev = name == "rpartition";
+            let found = match str_regex(&args[0]) {
+                Some(re) => str_partition_regex(&s, &re, &args[0], rev),
+                None => {
+                    let sep = arg_str(&args[0]);
+                    // An empty separator matches at the very start, as MRI's
+                    // `"abc".partition("")` => ["", "", "abc"] shows; `rfind`
+                    // would answer the END for the same input, so the reverse
+                    // scan keeps its own `rfind`.
+                    let at = if rev { s.rfind(&sep) } else { s.find(&sep) };
+                    at.map(|i| (i, sep))
+                }
+            };
+            Ok(match found {
+                Some((i, m)) => new_arr(vec![
                     new_str(s[..i].to_string()),
-                    new_str(sep.clone()),
-                    new_str(s[i + sep.len()..].to_string()),
+                    new_str(m.clone()),
+                    new_str(s[i + m.len()..].to_string()),
                 ]),
-                None => new_arr(vec![
+                // The empty halves go on OPPOSITE sides for the two names:
+                // `partition` keeps the receiver first, `rpartition` last.
+                None if rev => new_arr(vec![
                     new_str(String::new()),
                     new_str(String::new()),
                     new_str(s.clone()),
+                ]),
+                None => new_arr(vec![
+                    new_str(s.clone()),
+                    new_str(String::new()),
+                    new_str(String::new()),
                 ]),
             })
         }
         // Case-insensitive compare: `casecmp` => -1/0/1, `casecmp?` => bool.
-        "casecmp" => {
-            let o = arg_str(&args[0]);
-            let ord = s.to_lowercase().cmp(&o.to_lowercase());
-            Ok(Value::Int(ord as i64))
-        }
-        "casecmp?" => {
-            let o = arg_str(&args[0]);
-            Ok(Value::Bool(s.to_lowercase() == o.to_lowercase()))
+        //
+        // Both answer nil — NOT a comparison — when the argument is not a
+        // String. `arg_str` stringifies anything, so `"abc".casecmp(1)` compared
+        // against "1" and answered 1, and `casecmp?(nil)` compared against ""
+        // and answered false. MRI treats a non-String as incomparable, exactly
+        // as `"abc" <=> 1` does:
+        //
+        //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["abc".casecmp(1), "abc".casecmp?(nil)]'
+        //   [nil, nil]
+        "casecmp" | "casecmp?" => {
+            // Strings live host-side, so "is it a String?" is `as_str`
+            // answering — NOT a `Value` variant test, and not `arg_str`, which
+            // stringifies symbols and everything else too.
+            let Some(o) = with_host(|h| h.as_str(&args[0])) else {
+                return Ok(Value::Undef);
+            };
+            let (a, b) = (s.to_lowercase(), o.to_lowercase());
+            Ok(if name == "casecmp?" {
+                Value::Bool(a == b)
+            } else {
+                Value::Int(a.cmp(&b) as i64)
+            })
         }
         // `tr_s`: translate like `tr`, then squeeze runs of chars that were
         // translated (adjacent duplicates produced by the translation collapse).
@@ -8940,7 +9027,12 @@ fn str_find_regex(
     };
     let start_at = |b: usize| re.captures_from_pos(s, b).ok().flatten();
 
-    let found = if at < 0 || at > len {
+    // A `pos` past the end is nil for `index` but CLAMPED for `rindex`, which
+    // is why the bound is tested before the clamp rather than after:
+    //
+    //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["abc".rindex(/b/, 8), "abc".index(/b/, 8)]'
+    //   [1, nil]
+    let found = if at < 0 || (!rev && at > len) {
         None
     } else if !rev {
         start_at(byte_of(at))
@@ -8952,7 +9044,7 @@ fn str_find_regex(
         // only match a forward scan finds begins at 0. Restarting one CHARACTER
         // past each start — rather than past each match — enumerates every
         // distinct start, and the last one at or before the cap is the answer.
-        let cap = byte_of(at);
+        let cap = byte_of(at.min(len));
         let (mut best, mut from) = (None, 0usize);
         while from <= s.len() {
             let Some(b) = start_at(from).and_then(|c| c.get(0)).map(|m| m.start()) else {
@@ -8980,6 +9072,53 @@ fn str_find_regex(
     }
 }
 
+/// Ruby `String#partition`/`rpartition` with a REGEXP: the BYTE offset the
+/// chosen match begins at plus the matched text, or `None` for no match. Sets
+/// the match globals to the match it reports, as MRI does — `$~` and `$1` are
+/// readable after a regexp partition:
+///
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e '"hello world".partition(/o(.)/); p [$~[0], $1]'
+///   ["o ", " "]
+///
+/// `rev` picks the LAST position a match can BEGIN at rather than the first —
+/// the same distinction `rindex` draws, and for the same reason: a forward scan
+/// reports only the earliest start, so `"aaa".rpartition(/a+/)` must restart one
+/// CHARACTER past each start to reach the final one.
+fn str_partition_regex(
+    s: &str,
+    re: &fancy_regex::Regex,
+    re_val: &Value,
+    rev: bool,
+) -> Option<(usize, String)> {
+    let start_at = |b: usize| re.captures_from_pos(s, b).ok().flatten();
+
+    let found = if !rev {
+        start_at(0)
+    } else {
+        let (mut best, mut from) = (None, 0usize);
+        while from <= s.len() {
+            let Some(c) = start_at(from) else { break };
+            let b = c.get(0)?.start();
+            best = Some(c);
+            from = b + s[b..].chars().next().map_or(1, char::len_utf8);
+        }
+        best
+    };
+
+    match found {
+        Some(caps) => {
+            let m = caps.get(0)?;
+            let (at, text) = (m.start(), m.as_str().to_string());
+            set_match_globals(Some((&caps, s)), re, re_val);
+            Some((at, text))
+        }
+        None => {
+            set_match_globals(None, re, re_val);
+            None
+        }
+    }
+}
+
 /// Ruby `String#index`/`rindex`: the char offset of substring `needle`, or `nil`.
 /// `pos` is an optional start (index) or end (rindex) char offset; `rev` picks
 /// the last match instead of the first.
@@ -8989,13 +9128,33 @@ fn str_find(s: &str, needle: &str, pos: Option<i64>, rev: bool) -> Value {
         match pos {
             Some(p) => {
                 let len = s.chars().count() as i64;
-                let end = if p < 0 { len + p } else { p };
-                if end < 0 {
+                let raw = if p < 0 { len + p } else { p };
+                if raw < 0 {
                     None
                 } else {
-                    // Search only the prefix up to (and including) char `end`.
-                    let cut: String = s.chars().take((end as usize) + 1).collect();
-                    cut.rfind(needle).map(byte_to_char)
+                    // `pos` caps where the match may BEGIN, not where it may
+                    // end. Searching the prefix `s[..=pos]` instead — which is
+                    // what this did — requires the whole needle to fit inside
+                    // that prefix, so a match starting at `pos` and running past
+                    // it was missed entirely:
+                    //
+                    //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["abcd".rindex("cd", 2), "abcabc".rindex("abc", 3)]'
+                    //   [2, 3]
+                    //
+                    // and this answered [nil, 0]. A `pos` past the end is
+                    // CLAMPED rather than rejected, which is where `rindex`
+                    // parts company with `index`:
+                    //
+                    //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["abc".rindex("b", 8), "abc".index("b", 8)]'
+                    //   [1, nil]
+                    let cap = raw.min(len) as usize;
+                    s.char_indices()
+                        .map(|(b, _)| b)
+                        .chain(std::iter::once(s.len()))
+                        .take(cap + 1)
+                        .filter(|&b| s[b..].starts_with(needle))
+                        .last()
+                        .map(byte_to_char)
                 }
             }
             None => s.rfind(needle).map(byte_to_char),
@@ -9792,6 +9951,106 @@ fn dig(recv: &Value, keys: &[Value]) -> Result<Value, String> {
 }
 
 /// Split a string into lines, keeping each trailing `\n` (Ruby `String#lines`).
+/// Ruby `String#lines`/`#each_line` splitting, honouring the optional separator
+/// argument and `chomp:`. The separator is kept at the END of each chunk, and a
+/// trailing separator does NOT produce a final empty chunk.
+///
+/// Three separator forms, all measured against MRI:
+///
+/// * **A string** — split after each occurrence.
+///
+///       $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["a,b,c".lines(","), "a,b,".lines(",")]'
+///       [["a,", "b,", "c"], ["a,", "b,"]]
+///
+/// * **`nil`** — no separator at all, so the whole receiver is one line.
+///
+///       $ /opt/homebrew/opt/ruby/bin/ruby -e 'p "a\nb\nc".lines(nil)'
+///       ["a\nb\nc"]
+///
+/// * **`""`** — PARAGRAPH mode, which is not "split on the empty string". A
+///   chunk runs to the first `"\n\n"` INCLUSIVE, and any further newlines in
+///   that run are then consumed without appearing anywhere. That is why four
+///   newlines collapse to two while a LEADING pair still forms its own chunk:
+///
+///       $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["a\n\n\n\nb".lines(""), "\n\na\n\nb".lines("")]'
+///       [["a\n\n", "b"], ["\n\n", "a\n\n", "b"]]
+///
+/// `chomp: true` strips the separator that terminates a chunk — in paragraph
+/// mode every trailing newline, since the chunk ends in a run of them:
+///
+///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["a\n\n\nb".lines("", chomp: true), "a,b".lines(",", chomp: true)]'
+///   [["a", "b"], ["a", "b"]]
+fn split_lines_sep(s: &str, args: &[Value]) -> Vec<String> {
+    let chomp = chomp_opt(args);
+    // The separator is the first POSITIONAL argument; a lone `chomp:` hash is
+    // not one, and an explicit `nil` is not the same as an absent argument.
+    let sep = match args.iter().find(|a| with_host(|h| h.as_hash(a)).is_none()) {
+        None => Some("\n".to_string()),
+        Some(Value::Undef) => None,
+        Some(a) => Some(arg_str(a)),
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    match sep.as_deref() {
+        // No separator: one line, whatever it contains — INCLUDING an empty
+        // receiver, which is the one case where `lines(nil)` and `lines` part
+        // company:
+        //
+        //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["".lines(nil), "".lines]'
+        //   [[""], []]
+        None => out.push(s.to_string()),
+        Some("") => {
+            let mut rest = s;
+            while !rest.is_empty() {
+                match rest.find("\n\n") {
+                    Some(i) => {
+                        let end = i + 2;
+                        out.push(rest[..end].to_string());
+                        // Swallow the remainder of the newline run.
+                        rest = rest[end..].trim_start_matches('\n');
+                    }
+                    None => {
+                        out.push(rest.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        Some(sep) => {
+            let mut rest = s;
+            while !rest.is_empty() {
+                match rest.find(sep) {
+                    Some(i) => {
+                        let end = i + sep.len();
+                        out.push(rest[..end].to_string());
+                        rest = &rest[end..];
+                    }
+                    None => {
+                        out.push(rest.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if chomp {
+        let strip = |l: &String| match sep.as_deref() {
+            None => l.clone(),
+            // Paragraph mode ends in a newline RUN, so one `strip_suffix` is
+            // not enough.
+            Some("") => l.trim_end_matches('\n').to_string(),
+            Some("\n") => {
+                let t = l.strip_suffix('\n').unwrap_or(l);
+                t.strip_suffix('\r').unwrap_or(t).to_string()
+            }
+            Some(sep) => l.strip_suffix(sep).unwrap_or(l).to_string(),
+        };
+        out = out.iter().map(strip).collect();
+    }
+    out
+}
+
 fn split_lines(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -10380,7 +10639,11 @@ fn dispatch_array(
             Ok(recv.clone())
         }
         "to_a" | "to_ary" | "dup" | "clone" | "deconstruct" => Ok(new_arr(arr)),
-        "include?" => {
+        // `member?` is Enumerable's spelling of `include?`, and Array answers
+        // both. Only `include?` was wired up, so `[1,2,3].member?(2)` raised
+        // NoMethodError where MRI answers true — even though Hash and Range
+        // here already accept both names.
+        "include?" | "member?" => {
             let Some(needle) = args.first() else {
                 return Err(raise_exc(
                     "ArgumentError",
@@ -10535,12 +10798,63 @@ fn dispatch_array(
             let mut out = Vec::new();
             for a in args {
                 if let Some((lo, hi, excl)) = with_host(|h| h.as_range(a)) {
-                    let s = norm_idx(lo, arr.len()).unwrap_or(arr.len());
-                    let mut e = norm_idx(hi, arr.len()).unwrap_or(arr.len());
-                    if !excl {
-                        e += 1;
-                    }
-                    let e = e.min(arr.len());
+                    // A Range selects a FIXED number of slots — `end - begin`
+                    // of them — and slots past the end are nil. Clamping the
+                    // end to the receiver's length instead, as this did,
+                    // silently dropped those trailing nils:
+                    //
+                    //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [1,2,3].values_at(1..7)'
+                    //   [2, 3, nil, nil, nil, nil, nil]
+                    //
+                    // and this answered [2, 3]. This is `values_at` parting
+                    // company with `Array#[]`, which really does truncate.
+                    //
+                    // A begin that stays negative after normalizing is a
+                    // RangeError, not an empty result:
+                    //
+                    //   $ /opt/homebrew/opt/ruby/bin/ruby -e '[1].values_at(-4..2)'
+                    //   -e:1:in 'Array#values_at': -4..2 out of range (RangeError)
+                    // An OPEN bound is the receiver's own edge, not a huge
+                    // integer: `values_at(2..)` selects through the last
+                    // element, so `RANGE_ENDLESS` must be resolved BEFORE the
+                    // slot count is taken from it — an unresolved `i64::MAX`
+                    // end makes this loop for the age of the universe pushing
+                    // nils.
+                    let beginless = lo == crate::host::RANGE_BEGINLESS;
+                    let endless = hi == crate::host::RANGE_ENDLESS;
+                    let s = if beginless {
+                        0
+                    } else {
+                        match norm_idx(lo, arr.len()) {
+                            Some(s) => s,
+                            None => {
+                                let dots = if excl { "..." } else { ".." };
+                                return Err(raise_exc(
+                                    "RangeError",
+                                    &format!("{lo}{dots}{hi} out of range"),
+                                ));
+                            }
+                        }
+                    };
+                    // An end that stays negative after normalizing selects
+                    // NOTHING — it does not clamp up to slot 0, which is what
+                    // treating it as `0` did:
+                    //
+                    //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [1].values_at(..-2)'
+                    //   []
+                    let e = if endless {
+                        arr.len()
+                    } else {
+                        match norm_idx(hi, arr.len()) {
+                            Some(mut e) => {
+                                if !excl {
+                                    e += 1;
+                                }
+                                e
+                            }
+                            None => s,
+                        }
+                    };
                     for k in s..e.max(s) {
                         out.push(arr.get(k).cloned().unwrap_or(Value::Undef));
                     }
@@ -11138,10 +11452,19 @@ fn dispatch_array(
         }
         // `transpose` turns an array of equal-length rows into columns.
         "transpose" => {
-            let rows: Vec<Vec<Value>> = arr
-                .iter()
-                .map(|r| with_host(|h| h.as_array(r).unwrap_or_default()))
-                .collect();
+            // Every element must BE an Array. `unwrap_or_default` turned a
+            // non-Array into an empty row, so `[1,2,3].transpose` answered []
+            // where MRI refuses the conversion outright:
+            //
+            //   $ /opt/homebrew/opt/ruby/bin/ruby -e '[1,2,3].transpose'
+            //   -e:1:in 'Array#transpose': no implicit conversion of Integer into Array (TypeError)
+            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(arr.len());
+            for r in &arr {
+                match with_host(|h| h.as_array(r)) {
+                    Some(row) => rows.push(row),
+                    None => return Err(conv_error(r, "Array")),
+                }
+            }
             let width = rows.first().map(|r| r.len()).unwrap_or(0);
             if let Some(bad) = rows.iter().position(|r| r.len() != width) {
                 return Err(raise_exc(

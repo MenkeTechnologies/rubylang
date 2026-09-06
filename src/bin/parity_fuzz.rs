@@ -653,6 +653,231 @@ fn gen_caseexpr(seed: u64) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+
+/// String CASE folding, trimming and padding — `downcase`/`upcase`/`capitalize`/
+/// `swapcase`/`casecmp`, `chomp`/`chop`, `delete_prefix`/`delete_suffix`,
+/// `succ`, and the three justifiers.
+///
+/// The word pool carries mixed case, a trailing `"\n"` and `"\r\n"`, an empty
+/// string, and the carry-propagating `succ` inputs (`"az"`, `"zz"`, `"a9"`,
+/// `"Zz"`) — without those last four the mode would exercise `succ` only on
+/// inputs that never carry, which is the whole of what `succ` gets wrong.
+/// `casecmp`'s argument pool includes NON-strings, because `casecmp(1)` is not
+/// a comparison at all: MRI answers nil.
+fn gen_strcase(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let w = r.pick(&[
+        "Hello World",
+        "hello",
+        "HELLO",
+        "hElLo",
+        "",
+        "a",
+        "az",
+        "zz",
+        "a9",
+        "Zz",
+        "abc\n",
+        "abc\r\n",
+        "  pad  ",
+        "ÉLan",
+        "élan",
+        "Mixed123",
+    ]);
+    let other = r.pick(&["hello", "HELLO", "Hello World", "zebra", "", "a"]);
+    // Deliberately not all Strings: `casecmp` must answer nil for the rest.
+    let cmparg = r.pick(&["\"HELLO\"", "\"hello\"", "1", "nil", ":sym", "[1]", "2.5"]);
+    let aff = r.pick(&["he", "lo", "", "Hello", "xx", "\\n"]);
+    let width = r.range(0, 12);
+    let pad = r.pick(&["\" \"", "\"*\"", "\"12\"", "\"ab\""]);
+    one(match r.below(18) {
+        0 => format!("p {w:?}.downcase"),
+        1 => format!("p {w:?}.upcase"),
+        2 => format!("p {w:?}.capitalize"),
+        3 => format!("p {w:?}.swapcase"),
+        4 => format!("p {w:?}.casecmp({cmparg})"),
+        5 => format!("p {w:?}.casecmp?({cmparg})"),
+        6 => format!("p {w:?}.casecmp({other:?})"),
+        7 => format!("p {w:?}.chomp"),
+        8 => format!("p {w:?}.chomp({aff:?})"),
+        9 => format!("p {w:?}.chop"),
+        10 => format!("p {w:?}.delete_prefix({aff:?})"),
+        11 => format!("p {w:?}.delete_suffix({aff:?})"),
+        12 => format!("p {w:?}.succ"),
+        13 => format!("p {w:?}.succ.succ"),
+        14 => format!("p {w:?}.center({width}, {pad})"),
+        15 => format!("p {w:?}.ljust({width}, {pad})"),
+        16 => format!("p {w:?}.rjust({width}, {pad})"),
+        _ => format!("p [{w:?}.start_with?({aff:?}), {w:?}.end_with?({aff:?})]"),
+    })
+}
+
+/// String SEARCH and SPLITTING, over separators that are Strings AND Regexps:
+/// `partition`/`rpartition`, `index`/`rindex`, `lines`/`each_line`.
+///
+/// The regexp half of the separator pool is the point of the mode. A separator
+/// pool of plain strings would run, report no divergence, and be structurally
+/// incapable of reaching the regexp path at all — which is exactly where both
+/// `index`/`rindex` and `partition`/`rpartition` were found broken. The pool
+/// therefore includes a zero-width pattern (`/a*/`), an anchored one, and one
+/// with capture groups, since a regexp partition must also set `$~`.
+///
+/// The `lines` separators include `""` (paragraph mode, which is NOT "split on
+/// the empty string"), an explicit `nil` (no separator: one line), and
+/// multi-character separators, plus `chomp:`.
+fn gen_strpart(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let w = r.pick(&[
+        "hello world",
+        "aaa",
+        "a-b-c",
+        "abcabc",
+        "",
+        "a\nb\nc",
+        "a\n\nb\n\nc",
+        "a,b,c",
+        "a,b,",
+        "aXXbXXc",
+        "\n\na\n\nb",
+        "one two  three",
+    ]);
+    let ssep = r.pick(&[
+        "\"o\"", "\"-\"", "\"\"", "\"b\"", "\"zz\"", "\"XX\"", "\",\"",
+    ]);
+    let rsep = r.pick(&[
+        "/o/", "/o./", "/a*/", "/[bc]/", "/(o)(.)/", "/z/", "/^a/", "/\\s+/", "/b|c/",
+    ]);
+    let sep = if r.below(2) == 0 { ssep } else { rsep };
+    let lsep = r.pick(&["\",\"", "\"\"", "nil", "\"XX\"", "\"\\n\""]);
+    let pos = r.range(-3, 8);
+    one(match r.below(14) {
+        0 => format!("p {w:?}.partition({sep})"),
+        1 => format!("p {w:?}.rpartition({sep})"),
+        2 => format!("p [{w:?}.partition({sep}), $~ && $~[0]]"),
+        3 => format!("p [{w:?}.rpartition({sep}), $~ && $~[0]]"),
+        4 => format!("p {w:?}.index({sep})"),
+        5 => format!("p {w:?}.rindex({sep})"),
+        6 => format!("p {w:?}.index({sep}, {pos})"),
+        7 => format!("p {w:?}.rindex({sep}, {pos})"),
+        8 => format!("p {w:?}.lines({lsep})"),
+        9 => format!("p {w:?}.lines({lsep}, chomp: true)"),
+        10 => format!("p {w:?}.each_line({lsep}).to_a"),
+        11 => format!("r = []\n{w:?}.each_line({lsep}) {{ |l| r << l }}\np r"),
+        12 => format!("p {w:?}.partition({sep}).join(\"|\")"),
+        _ => format!("p [{w:?}.lines({lsep}).size, {w:?}.lines({lsep}).join]"),
+    })
+}
+
+/// Array RESHAPING: `combination`, `permutation`, `product`, `transpose`,
+/// `values_at`, `assoc`/`rassoc`, `bsearch`, `rotate`, `flatten`, `compact`.
+///
+/// `values_at` and `rotate` are given OUT-OF-RANGE and NEGATIVE indices on
+/// purpose — in range they are uninteresting, and the answers differ (a
+/// `values_at` miss is nil, a `rotate` wraps). The pair arrays feed
+/// `assoc`/`rassoc`, and the ragged one makes `transpose` raise, which is a
+/// real answer rather than a skip.
+fn gen_arrreshape(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let a = r.pick(&[
+        "[1, 2, 3]",
+        "[1, 2, 3, 4, 5]",
+        "[]",
+        "[1]",
+        "[1, nil, 2, nil]",
+        "[[1, 2], [3, 4]]",
+        "[[1, 2], [3, 4, 5]]",
+        "[[1, :a], [2, :b], [3, :a]]",
+        "[[1, [2, 3]], [4]]",
+        "[3, 1, 2]",
+    ]);
+    let b = r.pick(&["[4, 5]", "[]", "[:x]", "[1, 2]"]);
+    let n = r.range(0, 4);
+    // Indices that MISS, and negative ones, not just valid ones.
+    let i1 = r.range(-4, 7);
+    let i2 = r.range(-4, 7);
+    let key = r.pick(&["1", "2", ":a", ":b", "9", "nil"]);
+    one(match r.below(19) {
+        0 => format!("p {a}.combination({n}).to_a"),
+        1 => format!("p {a}.permutation({n}).to_a"),
+        2 => format!("p {a}.combination({n}).size"),
+        3 => format!("p {a}.product({b})"),
+        4 => format!("begin\n  p {a}.transpose\nrescue => e\n  p e.class\nend"),
+        5 => format!("p {a}.values_at({i1}, {i2})"),
+        // OPEN-bounded ranges too. A pool of only closed ranges cannot reach
+        // the branch that resolves an absent bound — where an unresolved
+        // `i64::MAX` end is not a wrong answer but a hang.
+        6 => format!("p {a}.values_at({i1}..{i2})"),
+        7 => format!("p {a}.assoc({key})"),
+        8 => format!("p {a}.rassoc({key})"),
+        9 => format!("p {a}.rotate({i1})"),
+        10 => format!("p {a}.flatten"),
+        11 => format!("p {a}.flatten({n})"),
+        12 => format!("p {a}.compact"),
+        13 => format!("p {a}.sort.bsearch {{ |x| x >= {n} }}"),
+        14 => format!("p {a}.member?({key})"),
+        15 => format!("p {a}.values_at({i1}...{i2})"),
+        16 => format!("p {a}.values_at({i1}..)"),
+        17 => format!("p {a}.values_at(..{i2})"),
+        _ => format!("p [{a}.include?({key}), {a}.member?({key})]"),
+    })
+}
+
+/// Integer/Float ROUNDING at a precision, and the integer-theoretic methods:
+/// `round`/`ceil`/`floor`/`truncate` with a digit count, `divmod`/`remainder`/
+/// `%`, `digits`, `gcd`/`lcm`, `bit_length`, `allbits?`/`anybits?`/`nobits?`.
+///
+/// The precision pool reaches NEGATIVE digits, so the value pool has to reach
+/// past 100 for that to be observable at all: `7.round(-2)` is 0 whatever the
+/// rounding rule, so a mode whose values stopped below the boundary would run a
+/// `round(-2)` case that could not tell any implementation from any other. The
+/// pool therefore carries 1234, 1250 and 999 — 1250 specifically because
+/// half-way is where the rule itself is visible.
+fn gen_numprec(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let iv = r.pick(&[
+        "0", "7", "-7", "99", "100", "255", "999", "1234", "1250", "-1250", "12345", "2**70",
+    ]);
+    let fv = r.pick(&[
+        "3.567",
+        "-3.567",
+        "2.5",
+        "3.5",
+        "-2.5",
+        "0.125",
+        "1234.5678",
+        "1250.0",
+        "0.0",
+        "1e10",
+    ]);
+    // Reaches both signs, and 0, since `round(0)` and `round` differ in TYPE.
+    let prec = r.range(-3, 4);
+    let m = r.pick(&["3", "8", "12", "18", "1", "255"]);
+    let mask = r.pick(&["1", "2", "4", "5", "255", "0"]);
+    let base = r.pick(&["2", "8", "10", "16"]);
+    one(match r.below(18) {
+        0 => format!("p ({iv}).round({prec})"),
+        1 => format!("p ({fv}).round({prec})"),
+        2 => format!("p ({fv}).round"),
+        3 => format!("p ({iv}).ceil({prec})"),
+        4 => format!("p ({fv}).ceil({prec})"),
+        5 => format!("p ({iv}).floor({prec})"),
+        6 => format!("p ({fv}).floor({prec})"),
+        7 => format!("p ({fv}).truncate({prec})"),
+        8 => format!("p ({iv}).divmod({m})"),
+        9 => format!("p ({fv}).divmod({m})"),
+        10 => format!("p [({iv}).remainder({m}), ({iv}) % ({m})]"),
+        11 => format!("p ({iv}).digits"),
+        12 => format!("p ({iv}).abs.digits({base})"),
+        13 => format!("p [({iv}).gcd({m}), ({iv}).lcm({m})]"),
+        14 => format!("p ({iv}).bit_length"),
+        15 => {
+            format!("p [({iv}).allbits?({mask}), ({iv}).anybits?({mask}), ({iv}).nobits?({mask})]")
+        }
+        16 => format!("p ({iv}).abs.to_s({base})"),
+        _ => format!("p ({fv}).divmod({m}).map {{ |x| x.round(3) }}"),
+    })
+}
+
 // Mode plumbing.
 // ---------------------------------------------------------------------------
 
@@ -707,6 +932,10 @@ enum Mode {
     Bytestr,
     Packfmt,
     Trsets,
+    Strcase,
+    Strpart,
+    Arrreshape,
+    Numprec,
     /// Round-robin over every mode in `ALL_MODES`. Not itself a member of
     /// `ALL_MODES` (that would recurse), so adding a mode never changes any
     /// other mode's own seed→case mapping — but it DOES reshuffle which mode
@@ -765,6 +994,10 @@ const ALL_MODES: &[Mode] = &[
     Mode::Bytestr,
     Mode::Packfmt,
     Mode::Trsets,
+    Mode::Strcase,
+    Mode::Strpart,
+    Mode::Arrreshape,
+    Mode::Numprec,
 ];
 
 fn gen_intmeth(seed: u64) -> Vec<String> {
@@ -1937,6 +2170,10 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Bytestr => gen_bytestr(seed),
         Mode::Packfmt => gen_packfmt(seed),
         Mode::Trsets => gen_trsets(seed),
+        Mode::Strcase => gen_strcase(seed),
+        Mode::Strpart => gen_strpart(seed),
+        Mode::Arrreshape => gen_arrreshape(seed),
+        Mode::Numprec => gen_numprec(seed),
         Mode::All => gen_case(seed, ALL_MODES[(seed as usize) % ALL_MODES.len()]),
     }
 }
@@ -2559,6 +2796,10 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Bytestr => "bytestr",
         Mode::Packfmt => "packfmt",
         Mode::Trsets => "trsets",
+        Mode::Strcase => "strcase",
+        Mode::Strpart => "strpart",
+        Mode::Arrreshape => "arrreshape",
+        Mode::Numprec => "numprec",
         Mode::All => "all",
     }
 }
@@ -2651,6 +2892,7 @@ struct Args {
     count: u64,
     base_seed: u64,
     once: bool,
+    dump: bool,
     timeout_ms: u64,
     out_path: PathBuf,
     max_report: usize,
@@ -2664,6 +2906,7 @@ fn parse_args() -> Args {
     let mut count = 2000u64;
     let mut base_seed = 1u64;
     let mut once = false;
+    let mut dump = false;
     let mut timeout_ms = 5000u64;
     let mut max_report = 200usize;
     let mut mode = Mode::Arith;
@@ -2693,6 +2936,7 @@ fn parse_args() -> Args {
                     .unwrap_or(base_seed);
             }
             "--once" => once = true,
+            "--dump" => dump = true,
             "--timeout-ms" => {
                 i += 1;
                 timeout_ms = argv
@@ -2764,6 +3008,8 @@ fn parse_args() -> Args {
                      (each also accepted as a `--<mode>` shorthand)\n\
                      --stderr         also require the diagnostics to match\n\
                      --once           run a single case (seed) and print both outputs\n\
+                     --dump           print the generated programs and exit; runs\n\
+                     \u{20}                nothing, so it cannot affect any result\n\
                      --timeout-ms N   per-interpreter wall-clock timeout (default 5000)\n\
                      --out PATH       divergence corpus file\n\
                      --max-report N   stop after N divergences (default 200)\n\
@@ -2786,6 +3032,7 @@ fn parse_args() -> Args {
         count,
         base_seed,
         once,
+        dump,
         timeout_ms,
         out_path,
         max_report,
@@ -2873,6 +3120,26 @@ fn main() {
     // last case. `--once` prints it too, for the same reason.
     eprintln!("parity-fuzz: oracle = {}", oracle_id());
     eprintln!("parity-fuzz: under test = {}", bin.display());
+
+    // --dump: print what the generator PRODUCES, without running either
+    // interpreter. A mode can look busy while every program it emits raises the
+    // same error on both sides — which the differential loop scores as a pass,
+    // because the two sides do agree. Reading the corpus is the only way to see
+    // that, so this exists purely to be read. It spawns nothing and reports no
+    // divergence count, so it cannot flatter a result.
+    if args.dump {
+        for i in 0..args.count {
+            let seed = args.base_seed + i as u64;
+            let mode = if matches!(args.mode, Mode::All) {
+                ALL_MODES[(i as usize) % ALL_MODES.len()]
+            } else {
+                args.mode
+            };
+            println!("=== seed {seed} mode {} ===", mode_name(mode));
+            println!("{}", build_program(&gen_case(seed, mode)));
+        }
+        return;
+    }
 
     // --once: replay a single seed, minimize if it diverges, dump both sides.
     if args.once {
