@@ -8044,6 +8044,16 @@ fn dispatch_string(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    // The borrowed names answer from a BORROW and return an Int or a Bool, so
+    // nothing below can change their answer: `propagate_string_encoding` only
+    // tags a String, and none of them is a `STRING_MUTATORS` entry, so the
+    // frozen check cannot fire either. Answering them here instead of inside
+    // the body is what makes them cheap on an ENCODING-TAGGED receiver, which
+    // otherwise clones the entire content just to ask whether it is ASCII --
+    // and then discards the copy -- before reaching the same borrow.
+    if let Some(v) = dispatch_string_borrowed(recv, name, args) {
+        return Ok(v);
+    }
     // Almost every string is UTF-8, i.e. untagged, and has nothing to propagate.
     // That path is settled with ONE hash lookup and then runs the method
     // directly: the work below reads the receiver's content (a copy) and every
@@ -8078,6 +8088,10 @@ fn dispatch_string(
 /// they run inside the host lock and never allocate. They are answered here
 /// INSTEAD of in the big match, not as well — a second implementation would be
 /// free to drift from the first.
+///
+/// They are answered at the TOP of [`dispatch_string`], before the encoding
+/// lookup, so an encoding-tagged receiver does not clone its whole content to
+/// ask whether it is ASCII on the way to a borrow that never needed the copy.
 ///
 /// The set is deliberately small. Anything that builds a String, calls a block,
 /// coerces an argument or raises has to re-enter the host and therefore belongs
@@ -8119,9 +8133,6 @@ fn dispatch_string_body(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
-    if let Some(v) = dispatch_string_borrowed(recv, name, args) {
-        return Ok(v);
-    }
     frozen_guard(recv, name, STRING_MUTATORS)?;
     let s = with_host(|h| h.as_str(recv).unwrap_or_default());
     match name {
@@ -17094,8 +17105,7 @@ fn dispatch_hash(
         | "minmax_by" | "minmax" | "count" | "sum" | "any?" | "all?" | "none?" | "one?"
         | "filter_map" | "flat_map" | "collect_concat" | "find_index" | "take_while"
         | "drop_while" | "take" | "drop" | "min" | "max" | "sort" | "tally" | "zip"
-        | "reverse_each" | "each_entry" | "cycle" | "first" | "uniq" | "grep" | "grep_v"
-        | "entries" => {
+        | "reverse_each" | "each_entry" | "cycle" | "first" | "uniq" | "grep" | "grep_v" => {
             let rows: Vec<Value> = with_host(|h| {
                 map.iter()
                     .map(|(k, v)| {
