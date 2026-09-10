@@ -5031,7 +5031,32 @@ impl RubyHost {
             .insert(name.to_string(), proc);
     }
     /// A per-object `define_singleton_method` block for `name`, if `v` has one.
+    /// The synthetic name of `v`'s per-object metaclass, `#<Class:#<Cls:0xID>>`
+    /// — the same name [`crate::builtins::dispatch`] hands back from
+    /// `Object#singleton_class`, so anything registered THROUGH that class
+    /// (`class << obj; attr_accessor :q; end`) is found again from the object.
+    /// `None` for a value that cannot carry a singleton.
+    pub fn singleton_class_name(&self, v: &Value) -> Option<String> {
+        let Value::Obj(id) = v else {
+            return None;
+        };
+        if self.classref_name(v).is_some() {
+            return None;
+        }
+        let cls = self.class_of(v);
+        if matches!(cls.as_str(), "Symbol" | "Integer" | "Float") {
+            return None;
+        }
+        Some(format!("#<Class:#<{cls}:0x{id:016x}>>"))
+    }
     pub fn find_singleton_define_method(&self, v: &Value, name: &str) -> Option<Value> {
+        // `obj.singleton_class.define_method(:m)` registers on the metaclass
+        // classref, not in `singleton_define_methods`, so look there too.
+        if let Some(sc) = self.singleton_class_name(v) {
+            if let Some(p) = self.define_methods.get(&sc).and_then(|m| m.get(name)) {
+                return Some(p.clone());
+            }
+        }
         if self.singleton_define_methods.is_empty() {
             return None;
         }
@@ -5940,6 +5965,19 @@ impl RubyHost {
     pub fn class_superclass(&self, name: &str) -> Option<String> {
         if name == "BasicObject" {
             return None;
+        }
+        // A PER-OBJECT metaclass `#<Class:#<Cls:0xID>>` sits directly under the
+        // object's own class, unlike a class metaclass `#<Class:C>`, whose
+        // superclass is `#<Class:Object>`:
+        //   $ ruby -e "class C; end; p C.new.singleton_class.superclass"
+        //   C
+        if let Some(inner) = name
+            .strip_prefix("#<Class:#<")
+            .and_then(|s| s.strip_suffix(">>"))
+            .and_then(|s| s.split_once(":0x"))
+            .map(|(c, _)| c)
+        {
+            return Some(inner.to_string());
         }
         // User class with an explicit superclass.
         if let Some(sc) = self.superclass_of(name) {
@@ -12167,7 +12205,17 @@ pub fn call_proc_self_ctx(
                 None => Err("no receiver given".to_string()),
             };
         }
-        _ => return Err("not a proc".to_string()),
+        // `&obj` for anything that is not already a proc is `obj.to_proc` in
+        // Ruby, which is how a Hash reaches block position:
+        //   $ ruby -e "p [:a].map(&{a: 9})"   #=> [9]
+        // Converting once (and only to something DIFFERENT) keeps an object
+        // whose `to_proc` answers self from recursing.
+        Some(_) | None => {
+            let conv = crate::builtins::probe_dispatch(proc_val, "to_proc", &[])
+                .filter(|c| c != proc_val)
+                .ok_or_else(|| crate::builtins::conv_error(proc_val, "Proc"))?;
+            return crate::builtins::dispatch(&conv, "call", args, None);
+        }
     };
 
     // Derived procs (curry / composition) delegate rather than run a template.

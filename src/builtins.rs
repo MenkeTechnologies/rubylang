@@ -1688,6 +1688,7 @@ fn is_universal_object_method(name: &str) -> bool {
             | "clone"
             | "methods"
             | "singleton_methods"
+            | "singleton_class"
             | "enum_for"
             | "to_enum"
             | "instance_eval"
@@ -2395,6 +2396,41 @@ pub(crate) fn dispatch(
             }
             return Ok(new_arr(vec![]));
         }
+        // `Object#singleton_class` — the per-object metaclass. Immediates have
+        // no place to hang one and MRI refuses them; nil/true/false ARE their
+        // own singleton, so MRI answers the class itself:
+        //   $ ruby -e "p [nil.singleton_class, true.singleton_class]"
+        //   [NilClass, TrueClass]
+        //   $ ruby -e "5.singleton_class"
+        //   -e:1:in 'Kernel#singleton_class': can't define singleton (TypeError)
+        //
+        // For everything else it is a class named `#<Class:#<Cls:0xID>>` whose
+        // superclass is the receiver's class. The id is the heap handle, so the
+        // name is stable for the object's lifetime and unique between objects —
+        // which is what lets `class << obj` reopen the SAME metaclass twice.
+        "singleton_class" if args.is_empty() && with_host(|h| h.classref_name(recv)).is_none() => {
+            return match recv {
+                Value::Undef => Ok(with_host(|h| h.class_ref("NilClass"))),
+                Value::Bool(b) => Ok(with_host(|h| {
+                    h.class_ref(if *b { "TrueClass" } else { "FalseClass" })
+                })),
+                Value::Int(_) | Value::Float(_) => {
+                    Err(raise_exc("TypeError", "can't define singleton"))
+                }
+                Value::Obj(id) => {
+                    let cls = with_host(|h| h.class_of(recv));
+                    // A Symbol and a promoted bignum are heap objects here but
+                    // immediates in MRI, so they refuse like the rest.
+                    if matches!(cls.as_str(), "Symbol" | "Integer" | "Float") {
+                        return Err(raise_exc("TypeError", "can't define singleton"));
+                    }
+                    Ok(with_host(|h| {
+                        h.class_ref(&format!("#<Class:#<{cls}:0x{id:016x}>>"))
+                    }))
+                }
+                _ => Err(raise_exc("TypeError", "can't define singleton")),
+            };
+        }
         // `Object#singleton_methods` — the names defined on this object alone
         // (`def obj.m`, `class << obj`, `define_singleton_method`); on a class or
         // module, its class methods. Sorted, as MRI's are not, so callers sort;
@@ -2598,8 +2634,20 @@ pub(crate) fn dispatch(
             // for e.g. an Integer would make `case 5; in [a, b]` call a missing
             // method instead of falling through to the next clause.
             match name_of(&args[0]).as_str() {
-                "deconstruct" => return Ok(Value::Bool(with_host(|h| h.is_a(recv, "Array")))),
-                "deconstruct_keys" => return Ok(Value::Bool(with_host(|h| h.is_a(recv, "Hash")))),
+                // MatchData answers BOTH — that is how `case m; in {x:}` reaches
+                // its named captures:
+                //   $ ruby -e "p 'ab'.match(/a/).respond_to?(:deconstruct_keys)"
+                //   true
+                "deconstruct" => {
+                    return Ok(Value::Bool(with_host(|h| {
+                        h.is_a(recv, "Array") || h.is_a(recv, "MatchData")
+                    })))
+                }
+                "deconstruct_keys" => {
+                    return Ok(Value::Bool(with_host(|h| {
+                        h.is_a(recv, "Hash") || h.is_a(recv, "MatchData")
+                    })))
+                }
                 // The strict *implicit conversion* protocol: only the exact
                 // builtin type responds. Gems branch on these to tell a real
                 // String/Integer/Array/Hash from something merely coercible —
@@ -2827,7 +2875,16 @@ pub(crate) fn dispatch(
             // dispatch doesn't know about (activesupport reopens Thread with
             // `attr_accessor :active_support_execution_state`): read/write the
             // backing ivar on the instance.
-            if let Some((field, writer)) = with_host(|h| h.attr_access(&class, name)) {
+            // `class << obj; attr_accessor :q; end` registers the accessor on the
+            // object's METACLASS, which no class-keyed lookup reaches. Consult it
+            // before the reopened-class one, since it is the more specific owner.
+            let singleton_attr = with_host(|h| {
+                h.singleton_class_name(recv)
+                    .and_then(|sc| h.attr_access(&sc, name))
+            });
+            if let Some((field, writer)) =
+                singleton_attr.or_else(|| with_host(|h| h.attr_access(&class, name)))
+            {
                 with_host(|h| h.take_pending_exc());
                 if writer {
                     let val = args.first().cloned().unwrap_or(Value::Undef);
@@ -2918,7 +2975,7 @@ fn dispatch_bool(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
 /// records a pending exception on failure; a probe that swallows the Rust `Err`
 /// must clear it, else it surfaces at the next VM boundary as a spurious raise
 /// (this silently broke sinatra's `Array(sym)`/`Array(class)` conversions).
-fn probe_dispatch(recv: &Value, name: &str, args: &[Value]) -> Option<Value> {
+pub(crate) fn probe_dispatch(recv: &Value, name: &str, args: &[Value]) -> Option<Value> {
     match dispatch(recv, name, args, None) {
         Ok(v) => Some(v),
         Err(_) => {
@@ -5216,9 +5273,23 @@ fn dispatch_object(
             })
         }
         // A runtime-declared attribute accessor (`class_eval { attr_accessor :x }`)
-        // reads/writes the `@field` ivar natively, ahead of method_missing.
-        _ if with_host(|h| h.attr_access(cls, name)).is_some() => {
-            let (field, is_writer) = with_host(|h| h.attr_access(cls, name)).unwrap();
+        // reads/writes the `@field` ivar natively, ahead of method_missing. An
+        // accessor declared on the object's METACLASS (`class << obj;
+        // attr_accessor :q; end`) belongs to that object alone, and is the more
+        // specific owner, so it is consulted first.
+        _ if with_host(|h| {
+            h.singleton_class_name(recv)
+                .and_then(|sc| h.attr_access(&sc, name))
+                .or_else(|| h.attr_access(cls, name))
+        })
+        .is_some() =>
+        {
+            let (field, is_writer) = with_host(|h| {
+                h.singleton_class_name(recv)
+                    .and_then(|sc| h.attr_access(&sc, name))
+                    .or_else(|| h.attr_access(cls, name))
+            })
+            .unwrap();
             if is_writer {
                 let v = args.first().cloned().unwrap_or(Value::Undef);
                 with_host(|h| h.set_ivar_of(recv, &field, v.clone()));
@@ -5505,7 +5576,7 @@ fn int_operand(v: &Value) -> Result<i64, String> {
 /// MRI's `no implicit conversion of X into <target>` for an argument that must
 /// already be of a particular class — `String#+`, `Hash#merge` and friends,
 /// which require an operand of their own type rather than calling `to_int`.
-fn conv_error(v: &Value, target: &str) -> String {
+pub(crate) fn conv_error(v: &Value, target: &str) -> String {
     raise_exc(
         "TypeError",
         &format!(
@@ -6071,7 +6142,32 @@ fn dispatch_bigint(
         "to_f" => Value::Float(b.to_f64().unwrap_or(f64::INFINITY)),
         "abs" | "magnitude" => big(b.abs()),
         "-@" => big(-b.clone()),
-        "bit_length" => Value::Int(b.bits() as i64),
+        // Ruby defines a negative n's bit length as that of its complement
+        // ~n == -n-1, so it is the magnitude of |n|-1, not of |n|:
+        //   $ ruby -e "p [(-2**70).bit_length, (2**70).bit_length]"
+        //   [70, 71]
+        "bit_length" => Value::Int(if b.is_negative() {
+            (-b - 1u8).bits() as i64
+        } else {
+            b.bits() as i64
+        }),
+        // Bytes of the machine representation. A fixnum is one 8-byte word; a
+        // bignum is its MAGNITUDE rounded up to whole bytes, with the same
+        // 8-byte floor. Magnitude, not `bit_length`, is what MRI counts:
+        //   $ ruby -e "p [(-(2**64)).bit_length, (-(2**64)).size]"
+        //   [64, 9]
+        "size" => Value::Int((b.bits().div_ceil(8) as i64).max(8)),
+        // `to_r` is `n/1` and `rationalize` (no eps) is the same exact value.
+        // Both fall through to the Float-based generic arms otherwise, which
+        // round the magnitude through an f64 and lose the low bits.
+        "to_r" | "rationalize" if args.is_empty() => {
+            with_host(|h| h.new_rational(num_rational::BigRational::from(b.clone())))
+        }
+        // The square of the magnitude. The generic arm computes it in i128,
+        // which cannot hold a bignum, and returned the receiver unchanged.
+        "abs2" => big(b.abs() * b.abs()),
+        "numerator" => big(b.clone()),
+        "denominator" => Value::Int(1),
         "even?" => Value::Bool(b.is_even()),
         "odd?" => Value::Bool(b.is_odd()),
         "zero?" => Value::Bool(b.is_zero()),
@@ -6230,6 +6326,29 @@ fn dispatch_number(
                         "RangeError",
                         "Integer#pow() 1st argument cannot be negative when 2nd argument specified",
                     ));
+                }
+                // Any of the three being a bignum used to MISS this branch
+                // entirely and fall through to plain `**`, which discards the
+                // modulus and answers a number the size of base**exp:
+                //   $ ruby -e "p (2**70).pow(2, 1000003)"   #=> 394460
+                if let (Some(base), Some(exp), Some(m)) = with_host(|h| {
+                    (
+                        h.as_bigint(recv),
+                        h.as_bigint(&args[0]),
+                        h.as_bigint(&args[1]),
+                    )
+                }) {
+                    use num_traits::{Signed as _, Zero as _};
+                    if m.is_zero() {
+                        return Err(raise_exc("ZeroDivisionError", "divided by 0"));
+                    }
+                    if exp.is_negative() {
+                        return Err(raise_exc(
+                            "RangeError",
+                            "Integer#pow() 1st argument cannot be negative when 2nd argument specified",
+                        ));
+                    }
+                    return Ok(bigint_to_value(big_mod_pow(&base, &exp, &m)));
                 }
             }
             // |base| == 1 short-circuits at any exponent magnitude/type (Ruby):
@@ -6646,6 +6765,23 @@ fn dispatch_number(
             };
             let r = simplest_rational_within(f, eps);
             Ok(with_host(|h| h.new_rational(r)))
+        }
+        // `Integer#numerator` is self and its denominator 1; a Float goes
+        // through the EXACT rational its bits represent, exactly as `to_r`
+        // does — `2.5.numerator` is 5, not 2.
+        "numerator" | "denominator" => {
+            let want_num = name == "numerator";
+            match recv {
+                Value::Int(n) => Ok(if want_num {
+                    Value::Int(*n)
+                } else {
+                    Value::Int(1)
+                }),
+                _ => {
+                    let r = dispatch_number(recv, "to_r", &[], None)?;
+                    dispatch(&r, name, &[], None)
+                }
+            }
         }
         // `Numeric#to_c` is `(n+0i)`.
         "to_c" => Ok(with_host(|h| h.new_complex(recv.clone(), Value::Int(0)))),
@@ -7679,6 +7815,44 @@ fn gcd(mut a: i64, mut b: i64) -> i64 {
 /// Modular exponentiation `base**exp mod m` for `exp >= 0` (Ruby `Integer#pow`).
 /// Uses i128 intermediates and floored modulo, so the result carries the sign of
 /// `m` exactly as Ruby's floored `%` does.
+/// `mod_pow` for operands that do not fit in `i64`. Ruby's modulus is FLOORED,
+/// so the result takes the sign of `m` — the same rule [`mod_pow`] applies in
+/// `i128`:
+///
+/// ```text
+/// $ ruby -e "p [(-2**70).pow(3, 7), (2**70).pow(3, -7)]"
+/// [6, -6]
+/// ```
+fn big_mod_pow(
+    base: &num_bigint::BigInt,
+    exp: &num_bigint::BigInt,
+    m: &num_bigint::BigInt,
+) -> num_bigint::BigInt {
+    use num_traits::{One as _, Signed as _, Zero as _};
+    let fmod = |x: num_bigint::BigInt| {
+        let r = x % m;
+        if !r.is_zero() && (r.is_negative() != m.is_negative()) {
+            r + m
+        } else {
+            r
+        }
+    };
+    let mut b = fmod(base.clone());
+    let mut e = exp.clone();
+    let mut r = fmod(num_bigint::BigInt::one());
+    let two = num_bigint::BigInt::from(2);
+    while e.is_positive() {
+        if (&e % 2u8).is_one() {
+            r = fmod(r * &b);
+        }
+        e /= &two;
+        if e.is_positive() {
+            b = fmod(&b * &b);
+        }
+    }
+    r
+}
+
 fn mod_pow(base: i64, exp: i64, m: i64) -> i64 {
     let mm = m as i128;
     let fmod = |x: i128| {
@@ -8940,6 +9114,18 @@ fn dispatch_string_body(
             Ok(new_str(out))
         }
         "succ" | "next" => Ok(new_str(str_succ(&s))),
+        // Unlike the other in-place mutators, these always answer SELF — there
+        // is no "nothing changed" nil:
+        //   $ ruby -e "s = ''.dup; p [s.succ!, s]"   #=> ["", ""]
+        "succ!" | "next!" => {
+            with_host(|h| h.set_str(recv, str_succ(&s)));
+            Ok(recv.clone())
+        }
+        // `clear` truncates in place and answers self.
+        "clear" => {
+            with_host(|h| h.set_str(recv, String::new()));
+            Ok(recv.clone())
+        }
         // `str.upto(max, exclusive = false)` walks the same succession a String
         // range does — with a block it yields each value and returns self,
         // block-less it answers with an Enumerator.
@@ -9502,6 +9688,43 @@ fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value,
         "names" => Ok(new_arr(
             names.iter().map(|(n, _)| new_str(n.clone())).collect(),
         )),
+        // Pattern matching asks for named captures as SYMBOL keys, and only for
+        // the names it was given (nil means every name):
+        //   $ ruby -e "p 'abc'.match(/(?<q>b)/).deconstruct_keys([:q])"
+        //   {q: "b"}
+        // Pattern matching asks for named captures as SYMBOL keys, in the
+        // order REQUESTED, and only for the names it was given (nil means every
+        // name, in declaration order):
+        //   $ ruby -e "m = 'ab'.match(/(?<x>a)(?<y>b)/); p m.deconstruct_keys([:y, :x])"
+        //   {y: "b", x: "a"}
+        "deconstruct_keys" => {
+            let at = |n: &str| {
+                names
+                    .iter()
+                    .find(|(m, _)| m == n)
+                    .and_then(|(_, i)| groups.get(*i).map(strv))
+                    .unwrap_or(Value::Undef)
+            };
+            let mut map: IndexMap<RKey, Value> = IndexMap::new();
+            match args.first().and_then(|a| with_host(|h| h.as_array(a))) {
+                Some(req) => {
+                    for k in req {
+                        if let Some(m) = with_host(|h| h.as_symbol(&k)) {
+                            if names.iter().any(|(n, _)| *n == m) {
+                                let v = at(&m);
+                                map.insert(RKey::Sym(m), v);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    for (n, _) in &names {
+                        map.insert(RKey::Sym(n.clone()), at(n));
+                    }
+                }
+            }
+            Ok(with_host(|h| h.new_hash(map)))
+        }
         // `#named_captures` — a Hash mapping each named-capture name (String key,
         // per MRI) to its captured substring (nil when the group did not match).
         "named_captures" => {
@@ -9959,27 +10182,35 @@ fn dig(recv: &Value, keys: &[Value]) -> Result<Value, String> {
 ///
 /// * **A string** — split after each occurrence.
 ///
-///       $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["a,b,c".lines(","), "a,b,".lines(",")]'
-///       [["a,", "b,", "c"], ["a,", "b,"]]
+///     ```text
+///     $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["a,b,c".lines(","), "a,b,".lines(",")]'
+///     [["a,", "b,", "c"], ["a,", "b,"]]
+///     ```
 ///
 /// * **`nil`** — no separator at all, so the whole receiver is one line.
 ///
-///       $ /opt/homebrew/opt/ruby/bin/ruby -e 'p "a\nb\nc".lines(nil)'
-///       ["a\nb\nc"]
+///     ```text
+///     $ /opt/homebrew/opt/ruby/bin/ruby -e 'p "a\nb\nc".lines(nil)'
+///     ["a\nb\nc"]
+///     ```
 ///
 /// * **`""`** — PARAGRAPH mode, which is not "split on the empty string". A
 ///   chunk runs to the first `"\n\n"` INCLUSIVE, and any further newlines in
 ///   that run are then consumed without appearing anywhere. That is why four
 ///   newlines collapse to two while a LEADING pair still forms its own chunk:
 ///
-///       $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["a\n\n\n\nb".lines(""), "\n\na\n\nb".lines("")]'
-///       [["a\n\n", "b"], ["\n\n", "a\n\n", "b"]]
+///     ```text
+///     $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["a\n\n\n\nb".lines(""), "\n\na\n\nb".lines("")]'
+///     [["a\n\n", "b"], ["\n\n", "a\n\n", "b"]]
+///     ```
 ///
 /// `chomp: true` strips the separator that terminates a chunk — in paragraph
 /// mode every trailing newline, since the chunk ends in a run of them:
 ///
-///   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["a\n\n\nb".lines("", chomp: true), "a,b".lines(",", chomp: true)]'
-///   [["a", "b"], ["a", "b"]]
+/// ```text
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["a\n\n\nb".lines("", chomp: true), "a,b".lines(",", chomp: true)]'
+/// [["a", "b"], ["a", "b"]]
+/// ```
 fn split_lines_sep(s: &str, args: &[Value]) -> Vec<String> {
     let chomp = chomp_opt(args);
     // The separator is the first POSITIONAL argument; a lone `chomp:` hash is
@@ -10638,7 +10869,7 @@ fn dispatch_array(
             with_host(|h| h.set_array(recv, rev));
             Ok(recv.clone())
         }
-        "to_a" | "to_ary" | "dup" | "clone" | "deconstruct" => Ok(new_arr(arr)),
+        "to_a" | "to_ary" | "entries" | "dup" | "clone" | "deconstruct" => Ok(new_arr(arr)),
         // `member?` is Enumerable's spelling of `include?`, and Array answers
         // both. Only `include?` was wired up, so `[1,2,3].member?(2)` raised
         // NoMethodError where MRI answers true — even though Hash and Range
@@ -12535,6 +12766,29 @@ fn dispatch_complex(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
             let rr = sq(&re)?;
             let ii = sq(&im)?;
             with_host(|h| h.num_op(fusevm::NumOp::Add, &rr, &ii))
+        }
+        // `Complex#denominator` is the LCM of the two parts' denominators, and
+        // the numerator is each part scaled onto that common denominator:
+        //   $ ruby -e "p [Complex(0.5, 0.25).numerator, Complex(0.5, 0.25).denominator]"
+        //   [(2+1i), 4]
+        "numerator" | "denominator" => {
+            let den = |v: &Value| dispatch(v, "denominator", &[], None);
+            let d = with_host(|h| h.num_op(fusevm::NumOp::Mul, &den(&re)?, &den(&im)?)).and_then(
+                |prod| {
+                    let g = dispatch(&den(&re)?, "gcd", &[den(&im)?], None)?;
+                    with_host(|h| h.num_op(fusevm::NumOp::Div, &prod, &g))
+                },
+            )?;
+            if name == "denominator" {
+                return Ok(d);
+            }
+            let scaled = |v: &Value| -> Result<Value, String> {
+                let factor = with_host(|h| h.num_op(fusevm::NumOp::Div, &d, &den(v)?))?;
+                let n = dispatch(v, "numerator", &[], None)?;
+                with_host(|h| h.num_op(fusevm::NumOp::Mul, &n, &factor))
+            };
+            let (rn, in_) = (scaled(&re)?, scaled(&im)?);
+            Ok(with_host(|h| h.new_complex(rn, in_)))
         }
         "conjugate" | "conj" => {
             let neg_im = with_host(|h| h.num_op(fusevm::NumOp::Sub, &Value::Int(0), &im))?;
@@ -16305,7 +16559,7 @@ fn dispatch_set(
             }
             Ok(recv.clone())
         }
-        "to_a" | "to_ary" => Ok(new_arr(items)),
+        "to_a" | "to_ary" | "entries" => Ok(new_arr(items)),
         "to_set" | "dup" | "clone" => Ok(with_host(|h| h.new_set(items))),
         "merge" => {
             for v in other() {
@@ -16636,7 +16890,7 @@ fn dispatch_hash(
             with_host(|h| h.set_hash(recv, m));
             Ok(recv.clone())
         }
-        "to_a" => Ok(with_host(|h| {
+        "to_a" | "entries" => Ok(with_host(|h| {
             let rows: Vec<Value> = map
                 .iter()
                 .map(|(k, v)| {
@@ -16665,25 +16919,24 @@ fn dispatch_hash(
             }
             Ok(recv.clone())
         }
-        "each_value" => {
-            if let Some(b) = &block {
-                for v in map.values() {
-                    call_proc(b, std::slice::from_ref(v))?;
-                    if has_pending_signal() {
-                        break;
-                    }
-                }
-            }
-            Ok(recv.clone())
-        }
-        "each_key" => {
-            if let Some(b) = &block {
-                for k in map.keys() {
-                    let kv = with_host(|h| h.key_value(k));
-                    call_proc(b, &[kv])?;
-                    if has_pending_signal() {
-                        break;
-                    }
+        // Blockless, these are Enumerators over the KEYS / VALUES alone. They
+        // used to answer the receiver, so `h.each_key.to_a` walked the Hash and
+        // yielded `[k, v]` PAIRS:
+        //   $ ruby -e "p({a: 1}.each_key.to_a)"   #=> [:a]
+        "each_key" | "each_value" => {
+            let keys = name == "each_key";
+            let items: Vec<Value> = with_host(|h| {
+                map.iter()
+                    .map(|(k, v)| if keys { h.key_value(k) } else { v.clone() })
+                    .collect()
+            });
+            let Some(b) = &block else {
+                return Ok(with_host(|h| h.new_enumerator(items, "each")));
+            };
+            for it in items {
+                call_proc(b, &[it])?;
+                if has_pending_signal() {
+                    break;
                 }
             }
             Ok(recv.clone())
@@ -16875,6 +17128,37 @@ fn dispatch_hash(
                 }
             }
             Ok(Value::Undef)
+        }
+        // `Hash#to_proc` is a LAMBDA that looks the argument up — exactly the
+        // bound `[]` method, which already answers `lambda? == true`:
+        //   $ ruby -e "p [:a].map(&{a: 9})"   #=> [9]
+        "to_proc" if args.is_empty() => {
+            let sym = with_host(|h| h.new_symbol("[]"));
+            dispatch(recv, "method", &[sym], None)
+        }
+        // `key(value)` is `invert[value]` without building the inverted Hash:
+        // the FIRST key whose value == the argument, else nil.
+        "key" if !args.is_empty() => {
+            for (k, v) in &map {
+                if with_host(|h| h.eq_values(v, &args[0])) {
+                    return Ok(with_host(|h| h.key_value(k)));
+                }
+            }
+            Ok(Value::Undef)
+        }
+        // `compact!` drops the nil-valued pairs IN PLACE and answers nil when
+        // there were none — the Hash mutator convention `compact` does not use.
+        "compact!" => {
+            let kept: IndexMap<_, _> = map
+                .iter()
+                .filter(|(_, v)| !matches!(v, Value::Undef))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if kept.len() == map.len() {
+                return Ok(Value::Undef);
+            }
+            with_host(|h| h.set_hash(recv, kept));
+            Ok(recv.clone())
         }
         "invert" => {
             let mut out = IndexMap::new();
@@ -23233,6 +23517,8 @@ fn frozen_guard(recv: &Value, name: &str, mutators: &[&str]) -> Result<(), Strin
 
 /// Explicit (non-`!`) String mutators guarded against a frozen receiver.
 const STRING_MUTATORS: &[&str] = &[
+    "succ!",
+    "next!",
     "<<",
     "concat",
     "replace",

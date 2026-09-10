@@ -10406,3 +10406,164 @@ fn string_sum_and_array_member() {
     // It compares with `==`, so an Integer finds an equal Float.
     eq("[1.0].member?(1)", "true");
 }
+
+#[test]
+fn bignum_keeps_its_low_bits_through_pow_and_the_rational_conversions() {
+    // `pow(e, mod)` only recognised modular exponentiation when ALL THREE
+    // operands were fixnums. A bignum base missed the branch entirely and fell
+    // through to plain `**`, discarding the modulus and answering a number the
+    // size of base**exp.
+    eq("[(2**70).pow(2, 1000003), (2**70).pow(3, 7), (2**70).pow(3, -7), (2**70).pow(2**70, 13), (2**70).pow(3, 1)]", "[394460, 1, -6, 3, 0]");
+    eq(
+        "[(3**50).pow(2, 100), (10**30).pow(2, 97), 5.pow(3, 7), (-3).pow(3, 7), 3.pow(3, -7)]",
+        "[1, 47, 6, 1, -1]",
+    );
+
+    // Ruby's modulus is floored, so the result takes the sign of the modulus,
+    // and the zero/negative-exponent rejections apply at any width.
+    raises("(2**70).pow(3, 0)", "ZeroDivisionError", "divided by 0");
+    raises(
+        "(2**70).pow(-3, 7)",
+        "RangeError",
+        "Integer#pow() 1st argument cannot be negative when 2nd argument specified",
+    );
+
+    // `bit_length` counts the complement for a NEGATIVE receiver (~n == -n-1),
+    // which the magnitude-only bignum arm did not; `size` counts the bytes of
+    // the MAGNITUDE, with a one-word floor, and was pinned at 8 for every
+    // bignum.
+    eq("[(2**70).bit_length, (2**70+5).bit_length, (-(2**70)).bit_length, (-(2**70)-5).bit_length, (-(2**64)).bit_length]", "[71, 71, 70, 71, 64]");
+    eq("[(2**64).size, (-(2**64)).size, (2**70).size, (-(2**128)).size, (10**30).size, 5.size, 0.size]", "[9, 9, 9, 17, 13, 8, 8]");
+
+    // `to_r`, `rationalize` and `abs2` had no arbitrary-precision arm: the
+    // first two rounded through an f64 and the third computed in i128, which
+    // silently answered the receiver unchanged.
+    eq("[(2**70).to_r, (2**70).rationalize, (2**70).abs2, (2**70).numerator, (2**70).denominator]", "[(1180591620717411303424/1), (1180591620717411303424/1), 1393796574908163946345982392040522594123776, 1180591620717411303424, 1]");
+
+    // `numerator`/`denominator` existed on Rational alone. A Float goes through
+    // the EXACT rational its bits represent, so `2.5.numerator` is 5, not 2, and
+    // a Complex reduces both parts onto their common denominator.
+    eq("[5.numerator, 5.denominator, 2.5.numerator, 2.5.denominator, (-2.5).numerator, (-2.5).denominator]", "[5, 1, 5, 2, -5, 2]");
+    eq(
+        "[0.1.numerator, 0.1.denominator, Rational(3, 4).numerator, Rational(3, 4).denominator]",
+        "[3602879701896397, 36028797018963968, 3, 4]",
+    );
+    eq("[Complex(1, 2).numerator, Complex(1, 2).denominator, Complex(0.5, 0.25).numerator, Complex(0.5, 0.25).denominator]", "[(1+2i), 1, (2+1i), 4]");
+    eq("[Complex(Rational(1, 3), Rational(1, 4)).numerator, Complex(Rational(1, 3), Rational(1, 4)).denominator]", "[(4+3i), 12]");
+}
+
+#[test]
+fn the_in_place_string_and_hash_mutators_answer_what_mri_answers() {
+    // `succ!`/`next!`/`clear` did not exist. Unlike the other bang mutators they
+    // always answer SELF -- there is no "nothing changed" nil.
+    eq("s = \"abc\".dup; [s.succ!, s]", "[\"abd\", \"abd\"]");
+    eq("s = \"\".dup; [s.succ!, s]", "[\"\", \"\"]");
+    eq("s = \"az\".dup; [s.next!, s]", "[\"ba\", \"ba\"]");
+    eq(
+        "s = \"abc\".dup; [s.clear, s, s.frozen?]",
+        "[\"\", \"\", false]",
+    );
+
+    // `Hash#key` (the reverse lookup), `compact!` and `to_proc` were all
+    // missing. `compact!` follows the mutator convention `compact` does not:
+    // nil when there was nothing to drop.
+    eq(
+        "h = {a: 1, b: 1}; [h.key(1), h.key(9), h.invert]",
+        "[:a, nil, {1 => :b}]",
+    );
+    eq("h = {a: nil, b: 1}; [h.compact!, h]", "[{b: 1}, {b: 1}]");
+    eq("h = {a: 1}; [h.compact!, h]", "[nil, {a: 1}]");
+
+    // `to_proc` is what puts a Hash in block position, so `&hash` had to reach
+    // it; anything else in that position is a TypeError, not a bare failure.
+    eq("[:a, :b].map(&{a: 1, b: 2})", "[1, 2]");
+    eq(
+        "h = {a: 1}; [h.to_proc.call(:a), h.to_proc.lambda?, h.to_proc.call(:z)]",
+        "[1, true, nil]",
+    );
+    raises(
+        "[1].map(&5)",
+        "TypeError",
+        "no implicit conversion of Integer into Proc",
+    );
+    raises(
+        "[1].map(&\"x\")",
+        "TypeError",
+        "no implicit conversion of String into Proc",
+    );
+
+    // Blockless, `each_key`/`each_value` answered the RECEIVER, so `to_a` on the
+    // result walked the Hash and yielded `[k, v]` pairs instead of keys.
+    eq(
+        "h = {a: 1, b: 2}; [h.each_key.to_a, h.each_value.to_a]",
+        "[[:a, :b], [1, 2]]",
+    );
+    eq(
+        "h = {a: 1, b: 2}; r = []; h.each_key { |k| r << k }; h.each_value { |v| r << v }; r",
+        "[:a, :b, 1, 2]",
+    );
+
+    // `entries` is Enumerable's spelling of `to_a`; Range and lazy had it, the
+    // three most-used receivers did not.
+    eq(
+        "[[1, 2].entries, {a: 1}.entries, \"ab\".each_char.entries, [1, 2].each_slice(1).entries]",
+        "[[1, 2], [[:a, 1]], [\"a\", \"b\"], [[1], [2]]]",
+    );
+}
+
+#[test]
+fn matchdata_answers_the_pattern_matching_protocol() {
+    // `deconstruct_keys` did not exist, and `respond_to?` hard-coded Hash as the
+    // only builtin answering it -- so `case m; in {x:}` fell through to the next
+    // clause instead of matching the named captures.
+    eq("m = \"ab\".match(/(?<x>a)(?<y>b)/); [m.deconstruct_keys([:y, :x]), m.deconstruct_keys(nil), m.deconstruct_keys([:z]), m.deconstruct_keys([])]", "[{y: \"b\", x: \"a\"}, {x: \"a\", y: \"b\"}, {}, {}]");
+    eq("m = \"ab\".match(/(a)/); m.deconstruct_keys(nil)", "{}");
+    eq(
+        "m = \"ab\".match(/(?<x>a)(?<y>b)/); case m; in {x:, y:}; [x, y]; end",
+        "[\"a\", \"b\"]",
+    );
+    eq("[\"ab\".match(/a/).respond_to?(:deconstruct_keys), \"ab\".match(/a/).respond_to?(:deconstruct), 5.respond_to?(:deconstruct_keys)]", "[true, true, false]");
+}
+
+#[test]
+fn every_object_that_can_carry_a_singleton_answers_singleton_class() {
+    // `singleton_class` existed on classes alone. That was not only a reflection
+    // gap: `class << obj; attr_accessor :q; end` compiles to
+    // `obj.singleton_class.class_eval`, so the idiom raised NoMethodError for
+    // EVERY receiver.
+    eq(
+        "[nil.singleton_class, true.singleton_class, false.singleton_class]",
+        "[NilClass, TrueClass, FalseClass]",
+    );
+    eq("class C0; end; [C0.new.singleton_class.superclass, \"s\".singleton_class.superclass, [1].singleton_class.superclass, ({a: 1}).singleton_class.superclass]", "[C0, String, Array, Hash]");
+    eq(
+        "class C1; end; C1.singleton_class.superclass",
+        "#<Class:Object>",
+    );
+    eq(
+        "class C2; end; o = C2.new; class << o; attr_accessor :q; end; o.q = 5; o.q",
+        "5",
+    );
+    eq(
+        "s = \"x\".dup; class << s; attr_accessor :q; end; s.q = 1; [s.q, s]",
+        "[1, \"x\"]",
+    );
+    eq(
+        "class C3; end; o = C3.new; o.singleton_class.define_method(:w) { 9 }; o.w",
+        "9",
+    );
+    eq("class C4; end; o1 = C4.new; o2 = C4.new; class << o1; def z; 1; end; end; [o1.respond_to?(:z), o2.respond_to?(:z), o1.singleton_methods]", "[true, false, [:z]]");
+    eq("[\"s\".singleton_class.to_s.start_with?(\"#<Class:#<String:0x\"), \"s\".singleton_class.class]", "[true, Class]");
+
+    // Immediates have nowhere to hang a singleton and MRI refuses them. A Symbol
+    // and a promoted bignum are heap objects here but immediates in MRI, so they
+    // refuse too.
+    raises("5.singleton_class", "TypeError", "can't define singleton");
+    raises(
+        "(2**70).singleton_class",
+        "TypeError",
+        "can't define singleton",
+    );
+    raises("1.5.singleton_class", "TypeError", "can't define singleton");
+    raises(":s.singleton_class", "TypeError", "can't define singleton");
+}

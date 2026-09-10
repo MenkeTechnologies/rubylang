@@ -442,12 +442,12 @@ fn gen_hashmeth(seed: u64) -> Vec<String> {
     let r = &mut Rng::seed(seed);
     let h = hash_lit(r);
     one(match r.below(6) {
-        0 => format!("p {h}.keys"),
-        1 => format!("p {h}.values"),
-        2 => format!("p {h}.map {{ |k, v| [k, v + 1] }}"),
-        3 => format!("p {h}.select {{ |k, v| v > 0 }}"),
-        4 => format!("p {h}.to_a.sort"),
-        _ => format!("p {h}.each_pair.map {{ |k, v| \"#{{k}}=#{{v}}\" }}.sort"),
+        0 => format!("p({h}.keys)"),
+        1 => format!("p({h}.values)"),
+        2 => format!("p({h}.map {{ |k, v| [k, v + 1] }})"),
+        3 => format!("p({h}.select {{ |k, v| v > 0 }})"),
+        4 => format!("p({h}.to_a.sort)"),
+        _ => format!("p({h}.each_pair.map {{ |k, v| \"#{{k}}=#{{v}}\" }}.sort)"),
     })
 }
 
@@ -1212,23 +1212,23 @@ fn gen_hashenum(seed: u64) -> Vec<String> {
     one(match r.below(20) {
         0 => format!("r = []; {h}.each {{ |x| r << x }}; p r"),
         1 => format!("r = []; {h}.each_pair {{ |x| r << x }}; p r"),
-        2 => format!("p {h}.map {{ |x| x }}"),
-        3 => format!("p {h}.collect {{ |x| x }}"),
-        4 => format!("p {h}.find {{ |x| x.is_a?(Array) }}"),
-        5 => format!("p {h}.detect {{ |x| x[1] > 0 }}"),
-        6 => format!("p {h}.count {{ |x| x.is_a?(Array) }}"),
-        7 => format!("p {h}.count"),
-        8 => format!("p {h}.sum(0) {{ |x| x[1] }}"),
-        9 => format!("p {h}.flat_map {{ |x| x }}"),
-        10 => format!("p {h}.filter_map {{ |x| x[0] }}"),
+        2 => format!("p({h}.map {{ |x| x }})"),
+        3 => format!("p({h}.collect {{ |x| x }})"),
+        4 => format!("p({h}.find {{ |x| x.is_a?(Array) }})"),
+        5 => format!("p({h}.detect {{ |x| x[1] > 0 }})"),
+        6 => format!("p({h}.count {{ |x| x.is_a?(Array) }})"),
+        7 => format!("p({h}.count)"),
+        8 => format!("p({h}.sum(0) {{ |x| x[1] }})"),
+        9 => format!("p({h}.flat_map {{ |x| x }})"),
+        10 => format!("p({h}.filter_map {{ |x| x[0] }})"),
         11 => format!("p [{h}.any? {{ |x| x.is_a?(Array) }}, {h}.all? {{ |x| x.size == 2 }}, {h}.none? {{ |x| x.nil? }}]"),
-        12 => format!("p {h}.take_while {{ |x| x.is_a?(Array) }}"),
-        13 => format!("p {h}.drop_while {{ |x| x.is_a?(Array) }}"),
-        14 => format!("p {h}.find_index {{ |x| x[1] > 0 }}"),
-        15 => format!("p {h}.min_by {{ |x| x[1] }}"),
-        16 => format!("p {h}.sort_by {{ |x| x[0] }}"),
-        17 => format!("p {h}.to_h {{ |k, v| [k.to_s, v] }}"),
-        18 => format!("p {h}.each_with_object([]) {{ |x, a| a << x }}"),
+        12 => format!("p({h}.take_while {{ |x| x.is_a?(Array) }})"),
+        13 => format!("p({h}.drop_while {{ |x| x.is_a?(Array) }})"),
+        14 => format!("p({h}.find_index {{ |x| x[1] > 0 }})"),
+        15 => format!("p({h}.min_by {{ |x| x[1] }})"),
+        16 => format!("p({h}.sort_by {{ |x| x[0] }})"),
+        17 => format!("p({h}.to_h {{ |k, v| [k.to_s, v] }})"),
+        18 => format!("p({h}.each_with_object([]) {{ |x, a| a << x }})"),
         _ => format!("p [{h}.first, {h}.reverse_each.to_a, {h}.tally.size]"),
     })
 }
@@ -1243,15 +1243,15 @@ fn gen_enumext(seed: u64) -> Vec<String> {
     let n = r.range(1, 4);
     let m = r.range(2, 5);
     one(match r.below(14) {
-        0 => "e = Enumerator.new {{ |y| y << 1; y << 2; y << 3 }}; p [e.next, e.next, e.next]".to_string(),
-        1 => "e = Enumerator.new {{ |y| y << 1; y << 2 }}; p [e.next, e.peek, e.next]".to_string(),
-        2 => "log = []\ne = Enumerator.new {{ |y| log << :a; y << 1; log << :b; y << 2; log << :c }}\np log\np e.next\np log\np e.next\np log"
+        0 => "e = Enumerator.new { |y| y << 1; y << 2; y << 3 }; p [e.next, e.next, e.next]".to_string(),
+        1 => "e = Enumerator.new { |y| y << 1; y << 2 }; p [e.next, e.peek, e.next]".to_string(),
+        2 => "log = []\ne = Enumerator.new { |y| log << :a; y << 1; log << :b; y << 2; log << :c }\np log\np e.next\np log\np e.next\np log"
             .to_string(),
-        3 => "e = Enumerator.new {{ |y| y << 1; raise \"boom\" }}\np e.next\nbegin\n  e.next\nrescue => ex\n  p [ex.class, ex.message]\nend"
+        3 => "e = Enumerator.new { |y| y << 1; raise \"boom\" }\np e.next\nbegin\n  e.next\nrescue => ex\n  p [ex.class, ex.message]\nend"
             .to_string(),
-        4 => "e = Enumerator.new {{ |y| y << 1; raise ArgumentError, \"bad\" }}\np e.next\nbegin\n  e.next\nrescue ArgumentError => ex\n  p [ex.class, ex.is_a?(StandardError)]\nend"
+        4 => "e = Enumerator.new { |y| y << 1; raise ArgumentError, \"bad\" }\np e.next\nbegin\n  e.next\nrescue ArgumentError => ex\n  p [ex.class, ex.is_a?(StandardError)]\nend"
             .to_string(),
-        5 => "e = Enumerator.new {{ |y| i = 0; loop {{ y << i; i += 1 }} }}\np [e.next, e.next, e.next]"
+        5 => "e = Enumerator.new { |y| i = 0; loop { y << i; i += 1 } }\np [e.next, e.next, e.next]"
             .to_string(),
         6 => format!(
             "e = Enumerator.new {{ |y| i = 0; loop {{ y << i; i += 1 }} }}\np e.first({m})\np e.take({n})"
@@ -1262,9 +1262,9 @@ fn gen_enumext(seed: u64) -> Vec<String> {
         8 => format!(
             "e = Enumerator.new {{ |y| {n}.times {{ |i| y << i }} }}\nr = []\nloop {{ r << e.next }}\np r"
         ),
-        9 => "e = Enumerator.new {{ |y| y << 1; y << 2 }}\np e.next\ne.rewind\np e.next\np e.to_a"
+        9 => "e = Enumerator.new { |y| y << 1; y << 2 }\np e.next\ne.rewind\np e.next\np e.to_a"
             .to_string(),
-        10 => "e = Enumerator.new {{ |y| y << 1 }}\np e.next\nbegin\n  e.next\nrescue StopIteration => ex\n  p ex.class\nend"
+        10 => "e = Enumerator.new { |y| y << 1 }\np e.next\nbegin\n  e.next\nrescue StopIteration => ex\n  p ex.class\nend"
             .to_string(),
         11 => format!(
             "a = Enumerator.new {{ |y| {m}.times {{ |i| y << \"a#{{i}}\" }} }}\nb = Enumerator.new {{ |y| {m}.times {{ |i| y << \"b#{{i}}\" }} }}\np [a.next, b.next, a.next, b.next]"
@@ -2615,7 +2615,7 @@ fn gen_bytestr(seed: u64) -> Vec<String> {
         34 => format!("s = \"{txt}\".b\ns.setbyte(0, {byte})\np [s, s.bytes]"),
         // `rb_enc_compatible`'s failure case: two non-ASCII operands whose
         // encodings differ is a raise, not a negotiated answer.
-        _ => format!("p(({byte}.chr + \"{txt}\") rescue $!.class.to_s)"),
+        _ => format!("p(begin; ({byte}.chr + \"{txt}\"); rescue; $!.class.to_s; end)"),
     })
 }
 
