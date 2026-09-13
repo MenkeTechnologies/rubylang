@@ -5032,7 +5032,7 @@ impl RubyHost {
     }
     /// A per-object `define_singleton_method` block for `name`, if `v` has one.
     /// The synthetic name of `v`'s per-object metaclass, `#<Class:#<Cls:0xID>>`
-    /// — the same name [`crate::builtins::dispatch`] hands back from
+    /// — the same name `crate::builtins::dispatch` hands back from
     /// `Object#singleton_class`, so anything registered THROUGH that class
     /// (`class << obj; attr_accessor :q; end`) is found again from the object.
     /// `None` for a value that cannot carry a singleton.

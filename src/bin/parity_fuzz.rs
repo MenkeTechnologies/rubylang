@@ -3129,7 +3129,7 @@ fn main() {
     // divergence count, so it cannot flatter a result.
     if args.dump {
         for i in 0..args.count {
-            let seed = args.base_seed + i as u64;
+            let seed = args.base_seed + i;
             let mode = if matches!(args.mode, Mode::All) {
                 ALL_MODES[(i as usize) % ALL_MODES.len()]
             } else {
