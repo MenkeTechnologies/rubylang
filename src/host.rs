@@ -8549,6 +8549,15 @@ impl RubyHost {
             Value::Int(n) => Ok(*n),
             Value::Float(f) => Ok(*f as i64),
             Value::Undef => Err("no implicit conversion from nil to integer".to_string()),
+            // A bignum IS an Integer, so `no_conversion` produced "no implicit
+            // conversion of Integer into Integer" -- the wrong class and a
+            // sentence that says nothing. MRI rejects a too-wide integer by
+            // WIDTH:
+            //   $ ruby -e "'ab' * (2**70)"
+            //   -e:1:in '<main>': bignum too big to convert into 'long' (RangeError)
+            _ if as_int(v).is_none() && self.as_bigint(v).is_some() => Err(
+                crate::builtins::raise_exc("RangeError", "bignum too big to convert into 'long'"),
+            ),
             _ => as_int(v).ok_or_else(|| self.no_conversion(v, "Integer")),
         }
     }

@@ -5514,6 +5514,14 @@ fn to_int(v: &Value) -> Result<i64, String> {
         )),
         // A BigInt is a heap object but still an integer.
         _ => int_arg(v).ok_or_else(|| {
+            // A bignum IS an Integer, so "no implicit conversion of Integer
+            // into Integer" was both the wrong class and a sentence that says
+            // nothing. MRI rejects a too-wide integer by WIDTH, not by type:
+            //   $ ruby -e "[1, 2][2**70]"
+            //   -e:1:in '<main>': bignum too big to convert into 'long' (RangeError)
+            if with_host(|h| h.as_bigint(v)).is_some() {
+                return raise_exc("RangeError", "bignum too big to convert into 'long'");
+            }
             raise_exc(
                 "TypeError",
                 &format!(
@@ -17732,6 +17740,43 @@ fn dispatch_obj_range(
             other => Some(as_i(&other)),
         })
     };
+    // A Range whose endpoints are INTEGERS lands here whenever either of them
+    // is too wide for an i64, and the generic walk below is capped at a million
+    // `succ` steps -- so `(1..2**70).size` answered 1000000 rather than the
+    // count, and `(1..2**70).first(2)` walked a million elements to take two.
+    // Both are exact arithmetic on the endpoints.
+    let int_bounds = with_host(|h| match (h.as_bigint(&lo), h.as_bigint(&hi)) {
+        (Some(l), Some(g)) => Some((l, g)),
+        _ => None,
+    });
+    if let Some((l, g)) = &int_bounds {
+        use num_traits::Signed as _;
+        match name {
+            "size" | "count" | "length" if args.is_empty() && block.is_none() => {
+                let span: num_bigint::BigInt = g - l + if excl { 0u8 } else { 1u8 };
+                return Ok(bigint_to_value(if span.is_negative() {
+                    num_bigint::BigInt::from(0)
+                } else {
+                    span
+                }));
+            }
+            "first" | "take" if !args.is_empty() => {
+                let n = to_int(&args[0])?.max(0);
+                let mut out = Vec::new();
+                let mut cur = l.clone();
+                for _ in 0..n {
+                    if &cur > g || (excl && &cur == g) {
+                        break;
+                    }
+                    out.push(bigint_to_value(cur.clone()));
+                    cur += 1;
+                }
+                return Ok(new_arr(out));
+            }
+            "max" | "last" if args.is_empty() && !excl => return Ok(bigint_to_value(g.clone())),
+            _ => {}
+        }
+    }
     match name {
         "begin" | "first" if args.is_empty() => return Ok(lo),
         "end" | "last" if args.is_empty() => return Ok(hi),
