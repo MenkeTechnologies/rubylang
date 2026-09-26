@@ -2075,8 +2075,12 @@ pub(crate) fn dispatch(
                 Err(e) => Err(raise_exc("JSON::GeneratorError", &e)),
             };
         }
-        "==" => return Ok(Value::Bool(with_host(|h| h.eq_values(recv, &args[0])))),
-        "!=" => return Ok(Value::Bool(!with_host(|h| h.eq_values(recv, &args[0])))),
+        // No `==` of the receiver's own answered: `Comparable#==` from `<=>`,
+        // or `Object#==` — structural for a container, whose elements may
+        // still carry a user `==`. `!=` is `!(a == b)` through the receiver's
+        // real `==`.
+        "==" => return Ok(Value::Bool(eq_fallback(recv, &args[0])?)),
+        "!=" => return Ok(Value::Bool(!rb_equal_d(recv, &args[0])?)),
         // `eql?` is `==` plus MRI's numeric strictness, applied at EVERY depth:
         // `Numeric#eql?` demands the same class, so `1.eql?(1.0)` is false where
         // `1 == 1.0` is true, and a container inherits that from its elements —
@@ -2144,17 +2148,7 @@ pub(crate) fn dispatch(
         }
         // `equal?` is object identity: true only for the very same object (same
         // heap handle) or the same immediate value.
-        "equal?" => {
-            let same = match (recv, &args[0]) {
-                (Value::Obj(i), Value::Obj(j)) => i == j,
-                (Value::Int(i), Value::Int(j)) => i == j,
-                (Value::Float(i), Value::Float(j)) => i == j,
-                (Value::Bool(i), Value::Bool(j)) => i == j,
-                (Value::Undef, Value::Undef) => true,
-                _ => false,
-            };
-            return Ok(Value::Bool(same));
-        }
+        "equal?" => return Ok(Value::Bool(identical(recv, &args[0]))),
         // `object_id` / `__id__` — a stable per-object identity integer. Ruby
         // guarantees `Integer#object_id == 2n+1`; nil/false/true use their fixed
         // immediate ids; every heap object gets a distinct even id from its
@@ -11031,9 +11025,7 @@ fn dispatch_array(
                     "wrong number of arguments (given 0, expected 1)",
                 ));
             };
-            Ok(Value::Bool(
-                arr.iter().any(|x| with_host(|h| h.rb_equal(x, needle))),
-            ))
+            Ok(Value::Bool(position_eq(&arr, needle, false)?.is_some()))
         }
         "index" | "find_index" => {
             let pos = if let Some(bl) = &block {
@@ -11055,8 +11047,7 @@ fn dispatch_array(
                         h.new_enumerator_of(arr.clone(), name, recv.clone())
                     }));
                 };
-                arr.iter()
-                    .position(|x| with_host(|h| h.rb_equal(x, needle)))
+                position_eq(&arr, needle, false)?
             };
             Ok(pos.map(|p| Value::Int(p as i64)).unwrap_or(Value::Undef))
         }
@@ -11077,8 +11068,7 @@ fn dispatch_array(
                         h.new_enumerator_of(arr.clone(), name, recv.clone())
                     }));
                 };
-                arr.iter()
-                    .rposition(|x| with_host(|h| h.rb_equal(x, needle)))
+                position_eq(&arr, needle, true)?
             };
             Ok(pos.map(|p| Value::Int(p as i64)).unwrap_or(Value::Undef))
         }
@@ -11951,10 +11941,12 @@ fn dispatch_array(
                 Ok(Value::Int(n))
             } else if let Some(target) = args.first() {
                 // `count(obj)` counts elements equal to `obj`.
-                let n = arr
-                    .iter()
-                    .filter(|x| with_host(|h| h.rb_equal(x, target)))
-                    .count();
+                let mut n = 0;
+                for x in &arr {
+                    if rb_equal_d(x, target)? {
+                        n += 1;
+                    }
+                }
                 Ok(Value::Int(n as i64))
             } else {
                 Ok(Value::Int(arr.len() as i64))
@@ -12361,16 +12353,15 @@ fn dispatch_array(
         // argument, and `==` can match across classes, so `[1.0].delete(1)`
         // answers `1.0`), else the block's value (if given) or nil.
         "delete" => {
-            let mut a = arr;
+            let mut a = Vec::with_capacity(arr.len());
             let mut last: Option<Value> = None;
-            a.retain(|x| {
-                if with_host(|h| h.eq_values(x, &args[0])) {
-                    last = Some(x.clone());
-                    false
+            for x in arr {
+                if rb_equal_d(&x, &args[0])? {
+                    last = Some(x);
                 } else {
-                    true
+                    a.push(x);
                 }
-            });
+            }
             with_host(|h| h.set_array(recv, a));
             if let Some(v) = last {
                 Ok(v)
@@ -22217,10 +22208,22 @@ pub fn numeric_hook(op: fusevm::NumOp, a: &Value, b: &Value) -> Result<Value, St
         if !name.is_empty() && with_host(|h| h.find_method_owner(&cls, name)).is_some() {
             return call_instance_method(a.clone(), &cls, name, std::slice::from_ref(b), None);
         }
-        // Comparable: derive `< > <= >= == !=` from a `<=>` method.
+        // `!=` is `!(a == b)` through the receiver's own `==`.
+        if op == Ne && with_host(|h| h.find_method_owner(&cls, "==")).is_some() {
+            let r = call_instance_method(a.clone(), &cls, "==", std::slice::from_ref(b), None)?;
+            return Ok(Value::Bool(!with_host(|h| h.truthy(&r))));
+        }
+        // Comparable: derive `< > <= >= == !=` from a `<=>` method — only for
+        // an object that IS Comparable. A class that merely defines `<=>`
+        // keeps `Object#==` (identity) and has no `<`, as in MRI.
         if matches!(op, Lt | Gt | Le | Ge | Eq | Ne)
-            && with_host(|h| h.find_method_owner(&cls, "<=>")).is_some()
+            && with_host(|h| h.find_method_owner(&cls, "<=>").is_some() && h.is_a(a, "Comparable"))
         {
+            // `Comparable#==` answers true for the object itself without
+            // asking `<=>`.
+            if matches!(op, Eq | Ne) && identical(a, b) {
+                return Ok(Value::Bool(op == Eq));
+            }
             let cmp = call_instance_method(a.clone(), &cls, "<=>", std::slice::from_ref(b), None)?;
             // A nil `<=>` means the pair cannot be ranked. Comparable splits on
             // it: the four ORDERING operators raise ArgumentError, while `==`
@@ -22247,6 +22250,14 @@ pub fn numeric_hook(op: fusevm::NumOp, a: &Value, b: &Value) -> Result<Value, St
                 _ => false,
             }));
         }
+    }
+    // An Array or Hash whose elements carry a user `==` compares them through
+    // it; `rb_equal_d` falls back to the structural answer for the rest.
+    if matches!(op, Eq | Ne)
+        && with_host(|h| h.as_array(a).is_some() || h.as_hash(a).is_some())
+        && involves_user_eq(a, 0)
+    {
+        return Ok(Value::Bool(rb_equal_d(a, b)? == (op == Eq)));
     }
     // `Set#< <= > >=` are the proper-subset/subset/proper-superset/superset
     // predicates, not numeric ordering. `dispatch_set` already implements all
@@ -24259,6 +24270,120 @@ fn defines_own(v: &Value, name: &str) -> bool {
             || h.find_singleton_define_method(v, name).is_some()
             || h.object_class(v).is_some_and(|cls| h.find_method(&cls, name).is_some())
     })
+}
+
+/// `equal?` — whether `a` and `b` are the same object.
+fn identical(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Obj(i), Value::Obj(j)) => i == j,
+        (Value::Int(i), Value::Int(j)) => i == j,
+        (Value::Float(i), Value::Float(j)) => i == j,
+        (Value::Bool(i), Value::Bool(j)) => i == j,
+        (Value::Undef, Value::Undef) => true,
+        _ => false,
+    }
+}
+
+/// `==` for a receiver with no `==` of its own: `Comparable#==` (the object
+/// itself, or `<=>` answering 0) when it is Comparable, else structural
+/// equality through [`rb_equal_d`] for a container and the host's answer for
+/// anything else. Never dispatches `==` on `recv`, which is how it is reached.
+fn eq_fallback(recv: &Value, other: &Value) -> Result<bool, String> {
+    let comparable = with_host(|h| {
+        h.object_class(recv).is_some_and(|c| h.find_method_owner(&c, "<=>").is_some())
+            && h.is_a(recv, "Comparable")
+    });
+    if comparable {
+        if identical(recv, other) {
+            return Ok(true);
+        }
+        let c = dispatch(recv, "<=>", std::slice::from_ref(other), None)?;
+        return Ok(!matches!(c, Value::Undef) && as_i(&c) == 0);
+    }
+    if with_host(|h| h.as_array(recv).is_some() || h.as_hash(recv).is_some()) {
+        return rb_equal_d(recv, other);
+    }
+    Ok(with_host(|h| h.eq_values(recv, other)))
+}
+
+/// Whether comparing `v` with `==` can reach Ruby code: `v` is a plain user
+/// object with its own `==` or a `Comparable` one, or an Array/Hash holding
+/// such an object (at any depth, `depth` bounding a self-holding container).
+fn involves_user_eq(v: &Value, depth: u32) -> bool {
+    if depth > 64 {
+        return false;
+    }
+    if let Some(items) = with_host(|h| h.as_array(v)) {
+        return items.iter().any(|x| involves_user_eq(x, depth + 1));
+    }
+    if let Some(map) = with_host(|h| h.as_hash(v)) {
+        return map.values().any(|x| involves_user_eq(x, depth + 1));
+    }
+    let Some(cls) = with_host(|h| h.object_class(v)) else {
+        return false;
+    };
+    defines_own(v, "==")
+        || with_host(|h| h.is_a(v, "Comparable") && h.find_method_owner(&cls, "<=>").is_some())
+}
+
+/// MRI's `rb_equal(a, b)` as the containers run it: the same object, or `a == b`
+/// by `a`'s OWN `==` — a user method, or the one `Comparable` derives from
+/// `<=>` — including for an element reached inside an Array or a Hash value.
+/// Values with no user equality anywhere keep the host's structural answer.
+/// `Array#==`/`#include?`/`#index`/`#count`/`#delete` and `Hash#==` compare
+/// through here.
+/// The first (or, with `rev`, last) index whose element [`rb_equal_d`]s `needle`.
+fn position_eq(arr: &[Value], needle: &Value, rev: bool) -> Result<Option<usize>, String> {
+    let order: Box<dyn Iterator<Item = usize>> = if rev {
+        Box::new((0..arr.len()).rev())
+    } else {
+        Box::new(0..arr.len())
+    };
+    for i in order {
+        if rb_equal_d(&arr[i], needle)? {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn rb_equal_d(a: &Value, b: &Value) -> Result<bool, String> {
+    if identical(a, b) || with_host(|h| h.rb_equal(a, b)) {
+        return Ok(true);
+    }
+    if !involves_user_eq(a, 0) {
+        return Ok(false);
+    }
+    if let (Some(x), Some(y)) = (with_host(|h| h.as_array(a)), with_host(|h| h.as_array(b))) {
+        if x.len() != y.len() {
+            return Ok(false);
+        }
+        for (p, q) in x.iter().zip(&y) {
+            if !rb_equal_d(p, q)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    if let (Some(x), Some(y)) = (with_host(|h| h.as_hash(a)), with_host(|h| h.as_hash(b))) {
+        if x.len() != y.len() {
+            return Ok(false);
+        }
+        for (k, p) in &x {
+            let Some(q) = y.get(k) else {
+                return Ok(false);
+            };
+            if !rb_equal_d(p, q)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    if with_host(|h| h.as_array(a).is_some() || h.as_hash(a).is_some()) {
+        return Ok(false);
+    }
+    let r = dispatch(a, "==", std::slice::from_ref(b), None)?;
+    Ok(with_host(|h| h.truthy(&r)))
 }
 
 /// The value of keyword `name` in a trailing options Hash, if given.

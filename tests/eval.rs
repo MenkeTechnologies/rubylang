@@ -10860,3 +10860,31 @@ fn composition_accepts_any_callable() {
         "[11, true, 12, [4, 8]]",
     );
 }
+
+/// Equality is `rb_equal`: a user `==` — or the one `Comparable` derives from
+/// `<=>`, which answers true for the object itself without asking `<=>` —
+/// decides for an element inside an Array or a Hash value, for `include?`,
+/// `index`, `count` and `delete`, and `!=` negates the receiver's own `==`.
+/// A class that only defines `<=>` without `Comparable` keeps identity. All of
+/// these compared structurally or by identity. Expected values from ruby 4.0.7.
+#[test]
+fn equality_runs_the_elements_own_eq() {
+    eq(
+        "class T; include Comparable; attr_reader :d; def initialize(d) = @d = d; \
+         def <=>(o) = d <=> o.d; end; x = T.new(1); y = T.new(1); \
+         [[x].include?(y), [x].index(y), [x] == [y], [x].count(y), {k: x} == {k: y}, \
+         [x].delete(y).equal?(x), [[x]] != [[y]], x.==(y), x.send(:!=, y)]",
+        "[true, 0, true, 1, true, true, false, true, false]",
+    );
+    eq(
+        "class U; attr_reader :d; def initialize(d) = @d = d; \
+         def ==(o) = o.is_a?(U) && d == o.d; end; \
+         [[U.new(1)] == [U.new(1)], U.new(1) != U.new(1), [1, U.new(2)].include?(U.new(2)), [U.new(1)] == [1]]",
+        "[true, false, true, false]",
+    );
+    eq("class Z; def <=>(o) = 0; end; [Z.new == Z.new, Z.new != Z.new]", "[false, true]");
+    eq(
+        "class W; include Comparable; def <=>(o) = raise(\"no\"); end; w = W.new; [w == w, w.==(w)]",
+        "[true, true]",
+    );
+}
