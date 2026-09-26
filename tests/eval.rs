@@ -10909,3 +10909,21 @@ fn enumerable_derives_the_remaining_each_methods() {
         "[[[3], [1], [2]], [[3, 1], [2]]]",
     );
 }
+
+/// An anonymous class (`Class.new(StandardError)`) is named `#<Class:N>`,
+/// which the ancestry walk read as the METACLASS of a class called `N`, so
+/// its real superclass chain was lost: `rescue StandardError` (and a bare
+/// `rescue`) missed an instance of it. Expected values from ruby 4.0.7.
+#[test]
+fn an_anonymous_class_keeps_its_superclass_chain() {
+    eq(
+        "k = Class.new(StandardError) { def message = \"custom\" }; \
+         begin; raise k; rescue StandardError => e; [e.message, e.class.superclass]; end",
+        "[\"custom\", StandardError]",
+    );
+    eq(
+        "k = Class.new(StandardError); r = begin; raise k, \"m\"; rescue => e; e.message; end; \
+         [r, k.ancestors.include?(StandardError), k.singleton_class?, k.singleton_class.singleton_class?]",
+        "[\"m\", true, false, true]",
+    );
+}

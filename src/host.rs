@@ -4877,6 +4877,15 @@ impl RubyHost {
     /// Register an anonymous class/module (`Class.new`/`Module.new`) under a fresh
     /// name and return it. The optional superclass seeds the `ClassDef`; the block
     /// body (if any) is run afterwards as a `class_eval` by the caller.
+    /// The class a METACLASS name `#<Class:X>` is attached to, or `None` for any
+    /// other name. An anonymous class (`Class.new`) is named `#<Class:N>` with a
+    /// numeric counter and is NOT a metaclass: no class a program can name is
+    /// spelled with digits only.
+    pub fn metaclass_attached(name: &str) -> Option<&str> {
+        name.strip_prefix("#<Class:")
+            .and_then(|r| r.strip_suffix('>'))
+            .filter(|inner| !inner.is_empty() && !inner.bytes().all(|b| b.is_ascii_digit()))
+    }
     pub fn define_anon_class(&mut self, superclass: Option<String>, is_module: bool) -> String {
         self.struct_counter += 1;
         let kind = if is_module { "Module" } else { "Class" };
@@ -5840,10 +5849,7 @@ impl RubyHost {
         // has no superclass, so its metaclass closes straight into `Module`.
         // Without this the extended modules were nowhere in the chain and
         // `C.singleton_class.include?(Ext)` was false.
-        if let Some(inner) = name
-            .strip_prefix("#<Class:")
-            .and_then(|r| r.strip_suffix('>'))
-        {
+        if let Some(inner) = Self::metaclass_attached(name) {
             let mut out = vec![name.to_string()];
             let mut cur = inner.to_string();
             let mut first = true;

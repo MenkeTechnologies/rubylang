@@ -1357,10 +1357,7 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
             // `define_method` on a singleton class `#<Class:X>` redefines X's class
             // method: drop `def self.m` so this wins (ActiveSupport's
             // `redefine_singleton_method` → `singleton_class.define_method`).
-            if let Some(attached) = cls
-                .strip_prefix("#<Class:")
-                .and_then(|s| s.strip_suffix('>'))
-            {
+            if let Some(attached) = crate::host::RubyHost::metaclass_attached(&cls) {
                 let attached = attached.to_string();
                 with_host(|h| h.remove_class_method(&attached, &mname));
             }
@@ -4303,11 +4300,7 @@ fn dispatch_classref(
         // `#<Class:N>` with a numeric counter, so exclude a purely-numeric inner
         // part. activesupport's class_attribute branches on this.
         "singleton_class?" => Ok(Value::Bool(
-            cls.strip_prefix("#<Class:")
-                .and_then(|s| s.strip_suffix('>'))
-                .is_some_and(|inner| {
-                    !inner.is_empty() && !inner.bytes().all(|b| b.is_ascii_digit())
-                }),
+            crate::host::RubyHost::metaclass_attached(cls).is_some(),
         )),
         // `Module.nesting` — best-effort. The runtime does not track the lexical
         // nesting of the call site (class bodies are flattened at compile time),
@@ -4571,10 +4564,7 @@ fn dispatch_classref(
             // (re)definition on X: drop X's `def self.m` so this wins (they are the
             // same method in MRI). ActiveSupport's `redefine_singleton_method`
             // routes through `singleton_class.define_method`.
-            if let Some(attached) = cls
-                .strip_prefix("#<Class:")
-                .and_then(|s| s.strip_suffix('>'))
-            {
+            if let Some(attached) = crate::host::RubyHost::metaclass_attached(&cls) {
                 let attached = attached.to_string();
                 with_host(|h| h.remove_class_method(&attached, &mname));
             }
