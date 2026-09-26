@@ -227,3 +227,62 @@ fn an_operator_that_raises_reports_its_own_line() {
         "-e:3:in 'Object#f': divided by 0 (ZeroDivisionError)\n\tfrom -e:5:in '<main>'\n"
     );
 }
+
+/// Run `ruby -e <src>` and return (stdout, stderr, exit code).
+fn run_e_full(src: &str) -> (String, String, i32) {
+    let out = Command::new(env!("CARGO_BIN_EXE_ruby"))
+        .arg("-e")
+        .arg(src)
+        .output()
+        .expect("spawn ruby");
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+/// `at_exit` handlers run last-registered first as the program ends — after a
+/// normal end, an `exit`, or an uncaught exception (whose report still
+/// prints) — a handler may register another, a handler's `exit` decides the
+/// status, and `exit!` skips them. Expected output captured from ruby 4.0.7.
+#[test]
+fn at_exit_handlers_run_lifo_as_the_program_ends() {
+    let (out, err, rc) = run_e_full(
+        "at_exit { puts \"h1\" }; at_exit { at_exit { puts \"nested\" }; puts \"h2\" }; puts \"main\"",
+    );
+    assert_eq!((out.as_str(), err.as_str(), rc), ("main\nh2\nnested\nh1\n", "", 0));
+
+    let (out, _, rc) = run_e_full("at_exit { puts \"h1\" }; exit 5");
+    assert_eq!((out.as_str(), rc), ("h1\n", 5));
+
+    let (out, err, rc) = run_e_full("at_exit { puts \"h1\"; exit 3 }; raise \"x\"");
+    assert_eq!(
+        (out.as_str(), err.as_str(), rc),
+        ("h1\n", "-e:1:in '<main>': x (RuntimeError)\n", 3)
+    );
+
+    let (out, err, rc) = run_e_full("at_exit { raise \"boom\" }; at_exit { puts \"first\" }");
+    assert_eq!(
+        (out.as_str(), err.as_str(), rc),
+        ("first\n", "-e:1:in 'block in <main>': boom (RuntimeError)\n", 1)
+    );
+
+    let (out, _, rc) = run_e_full("at_exit { puts \"no\" }; exit! 4");
+    assert_eq!((out.as_str(), rc), ("", 4));
+}
+
+/// `abort` raises `SystemExit` (status 1, message the text or "exit") after
+/// writing its message, so `ensure` runs, `rescue SystemExit` stops it and
+/// `at_exit` handlers run. It used to end the process on the spot.
+#[test]
+fn abort_raises_system_exit() {
+    let (out, err, rc) = run_e_full(
+        "begin; abort \"x\"; rescue SystemExit => e; p e.message, e.status; end; \
+         at_exit { puts \"ae\" }; begin; abort; ensure; puts \"ens\"; end",
+    );
+    assert_eq!(
+        (out.as_str(), err.as_str(), rc),
+        ("\"x\"\n1\nens\nae\n", "x\n", 1)
+    );
+}

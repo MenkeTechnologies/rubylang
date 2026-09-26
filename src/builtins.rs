@@ -103,6 +103,7 @@ pub(crate) fn is_kernel_function(name: &str) -> bool {
             | "warn"
             | "exit"
             | "exit!"
+            | "at_exit"
             | "loop"
             | "lambda"
             | "proc"
@@ -19184,6 +19185,13 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             with_host(|h| h.set_global("_", line.clone()));
             Ok(line)
         }
+        // `at_exit { … }` registers the block to run as the program ends (see
+        // `host::run_at_exit_handlers`) and answers it as a Proc.
+        "at_exit" => {
+            let b = block.ok_or_else(|| raise_exc("ArgumentError", "called without a block"))?;
+            with_host(|h| h.register_at_exit(b.clone()));
+            Ok(b)
+        }
         "proc" => block.ok_or_else(|| "tried to create Proc object without a block".into()),
         "lambda" => {
             let b =
@@ -19305,12 +19313,19 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             Ok(Value::Undef)
         }
         "abort" => {
-            // `abort(msg)` writes `msg` to stderr; either form exits with 1.
-            if let Some(v) = args.first() {
-                let msg = with_host(|h| h.to_s(v));
-                eprintln!("{msg}");
-            }
-            std::process::exit(1);
+            // `abort(msg)` writes `msg` to stderr, then raises `SystemExit` with
+            // status 1 (its message `msg`, or "exit"), exactly as `exit(1)` would:
+            // an `ensure` above it runs, `rescue SystemExit` stops it, and the
+            // `at_exit` handlers run before the process ends.
+            let msg = match args.first() {
+                Some(v) => {
+                    let msg = with_host(|h| h.to_s(v));
+                    eprintln!("{msg}");
+                    msg
+                }
+                None => "exit".to_string(),
+            };
+            Err(raise_exc_with("SystemExit", &msg, &[("status", Value::Int(1))]))
         }
         // Bare `synchronize { … }` / `mon_synchronize { … }` — the MonitorMixin
         // surface called on an implicit self that includes it (concurrent-ruby's

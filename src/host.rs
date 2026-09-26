@@ -1348,6 +1348,9 @@ pub struct RubyHost {
     pub error: Option<String>,
     /// The exception object of the in-flight `raise`, if any (for `rescue`).
     pending_exc: Option<Value>,
+    /// Procs registered by `Kernel#at_exit`, in registration order; run LIFO
+    /// by [`run_at_exit_handlers`] as the program ends.
+    at_exit_procs: Vec<Value>,
     /// MRI-format backtrace frames per exception heap id, accumulated by `abort`
     /// as an exception unwinds (innermost first). Kept off the object itself so
     /// `e.instance_variables` / inspect are unchanged; the exception's heap id is
@@ -2186,6 +2189,7 @@ impl RubyHost {
             symbols: IndexMap::new(),
             error: None,
             pending_exc: None,
+            at_exit_procs: Vec::new(),
             exc_backtraces: IndexMap::new(),
             string_encodings: HashMap::new(),
             signal: None,
@@ -7151,6 +7155,11 @@ impl RubyHost {
         })
     }
 
+    /// Register a `Kernel#at_exit` proc.
+    pub fn register_at_exit(&mut self, p: Value) {
+        self.at_exit_procs.push(p);
+    }
+
     pub fn format_uncaught(&mut self) -> Option<String> {
         let exc = self.pending_exc.take()?;
         let class = self.class_of(&exc).to_string();
@@ -9617,6 +9626,8 @@ pub fn run_main(chunk: Chunk) -> Result<Value, String> {
     // `rescue SystemExit` stops it — and only arriving here makes it an exit.
     if r.is_err() {
         if let Some(code) = with_host(|h| h.pending_system_exit()) {
+            with_host(|h| h.pending_exc = None);
+            let code = run_at_exit_handlers().unwrap_or(code);
             // Buffered output written before the `exit` has to reach the
             // terminal: `process::exit` runs no destructors.
             use std::io::Write;
@@ -9633,6 +9644,33 @@ pub fn run_main(chunk: Chunk) -> Result<Value, String> {
         }
     }
     r
+}
+
+/// Run the `at_exit` handlers, last registered first, as the program ends —
+/// after a normal end, an uncaught exception or an `exit`, but not `exit!`. A
+/// handler may register another, which runs next. A handler that raises has
+/// its error printed and the rest still run, as MRI does. Answers the exit
+/// status a handler decided: the one a `SystemExit` carried, or 1 for any
+/// other exception; `None` when every handler returned normally.
+pub fn run_at_exit_handlers() -> Option<i32> {
+    let mut status = None;
+    while let Some(p) = with_host(|h| h.at_exit_procs.pop()) {
+        if let Err(e) = call_proc(&p, &[]) {
+            with_host(|h| {
+                h.signal = None;
+                h.error = None;
+            });
+            if let Some(code) = with_host(|h| h.pending_system_exit()) {
+                with_host(|h| h.pending_exc = None);
+                status = Some(code);
+            } else {
+                let msg = with_host(|h| h.format_uncaught()).unwrap_or(e);
+                eprintln!("{msg}");
+                status = Some(1);
+            }
+        }
+    }
+    status
 }
 
 /// Run a `require`/`load`d file's top-level chunk in its own fresh top-level

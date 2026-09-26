@@ -218,7 +218,7 @@ pub fn eval_str_cfg(src: &str, cfg: &RunConfig) -> Result<Value, String> {
         seed_verbosity(cfg);
         run_prelude()?;
         run_requires(&cfg.requires)?;
-        run_compiled(compile(src)?)
+        end_program(run_compiled(compile(src)?))
     })
 }
 
@@ -383,6 +383,22 @@ fn run_requires(requires: &[String]) -> Result<(), String> {
     run_compiled(compile(&src)?).map(|_| ())
 }
 
+/// The script has finished — normally or with an uncaught exception — so run
+/// its `at_exit` handlers before the caller reports the outcome. When a
+/// handler decided the exit status (`exit` inside it, or a raise), the process
+/// ends here with that status, after printing the script's own uncaught error.
+fn end_program(r: Result<Value, String>) -> Result<Value, String> {
+    let Some(code) = host::run_at_exit_handlers() else {
+        return r;
+    };
+    if let Err(e) = &r {
+        eprintln!("{e}");
+    }
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    std::process::exit(code);
+}
+
 /// Merge an already-compiled program onto the current host: rebase its
 /// proc/begin ids above what is already loaded (so ids never collide — see
 /// `compiler::rebase_program`), install its methods/classes/begins/procs, and
@@ -443,9 +459,9 @@ pub fn eval_file_cfg(path: &str, cfg: &RunConfig) -> Result<Value, String> {
         // disk. `cache::load` returns `None` (falls back to a fresh compile +
         // runtime `require`) on a miss or a changed bundled file.
         if let Some(prog) = cache::load_file(&abs.to_string_lossy(), &src) {
-            return run_compiled(prog);
+            return end_program(run_compiled(prog));
         }
-        run_compiled(compile(&src)?)
+        end_program(run_compiled(compile(&src)?))
     })
 }
 

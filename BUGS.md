@@ -386,12 +386,16 @@ exception (`KeyError.new("m")`) answers nil for them, as MRI's does.
   `rescue`; rubylang's is caught by one. The class tree is right —
   `builtin_exception_parent` already puts `SyntaxError` under `ScriptError` —
   but the eval path does not raise it.
-- **`at_exit` is not implemented.** `at_exit { … }` is
-  `undefined method 'at_exit' for main`, so a program cannot register a block to
-  run as the interpreter leaves. `exit` and `ensure` now behave (see the FIXED
-  entry below), which is most of what `at_exit` is reached for; what is missing
-  is the registry and the LIFO order MRI runs it in, plus running it after an
-  uncaught exception as well as after a normal end.
+- **`at_exit` — fixed.** Handlers run last-registered first as the program
+  ends: after a normal end, after `exit`, and after an uncaught exception (its
+  report prints after the handlers, as MRI orders it). A handler may register
+  another, a handler's `exit` sets the status, a handler that raises has its
+  error printed and exits 1 while the rest still run, and `exit!` skips them.
+  `abort` now raises `SystemExit` (status 1) instead of ending the process on
+  the spot, so `ensure` and the handlers run. Residue: an AOT-built standalone
+  binary (`--build --native`) does not run the handlers. Pinned by
+  `tests/uncaught.rs::at_exit_handlers_run_lifo_as_the_program_ends` and
+  `::abort_raises_system_exit`.
 - **MRI's `DidYouMean::Correctable` / `ErrorHighlight::CoreExt` do not appear in
   `ancestors`.** These are gems MRI injects into `NameError`/`KeyError`/
   `TypeError`. Deliberately absent — rubylang emits no "did you mean"
