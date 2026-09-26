@@ -1356,6 +1356,10 @@ pub struct RubyHost {
     /// stable, so a `rescue`/re-raise still finds its trace. Cleared per run
     /// (`reset_host` rebuilds the host).
     exc_backtraces: IndexMap<u32, Vec<String>>,
+    /// Exceptions whose backtrace is final: rescued once, or given one by
+    /// `set_backtrace`. Raising one again keeps its frames, as MRI does,
+    /// instead of appending the re-raise's unwind to them.
+    sealed_backtraces: HashSet<u32>,
     /// Heap ids of String objects whose encoding is NOT UTF-8, mapped to that
     /// encoding's canonical name (`"ASCII-8BIT"`, `"US-ASCII"`). Sources are
     /// `String#b`, `force_encoding`, `Integer#chr` and `Array#pack`. We store only
@@ -2190,6 +2194,7 @@ impl RubyHost {
             pending_exc: None,
             at_exit_procs: Vec::new(),
             exc_backtraces: IndexMap::new(),
+            sealed_backtraces: HashSet::new(),
             string_encodings: HashMap::new(),
             signal: None,
             catch_tags: Vec::new(),
@@ -6996,10 +7001,44 @@ impl RubyHost {
     /// order). Stored in a side table keyed by the exception's heap id (not on the
     /// object), so `e.instance_variables`/inspect are unaffected and a
     /// `rescue`/re-raise still finds the trace. No-op when no exception is pending.
+    /// The backtrace frames recorded for exception `exc` — by its raise and
+    /// unwind, or by `set_backtrace` — or `None` for one never raised.
+    pub fn exc_backtrace(&self, exc: &Value) -> Option<Vec<String>> {
+        match exc {
+            Value::Obj(id) => self.exc_backtraces.get(id).cloned(),
+            _ => None,
+        }
+    }
+    /// Freeze the backtrace exception `exc` has collected so far (it was just
+    /// rescued), so raising it again does not extend it.
+    pub fn seal_backtrace(&mut self, exc: &Value) {
+        if let Value::Obj(id) = exc {
+            self.sealed_backtraces.insert(*id);
+        }
+    }
+    /// Replace the backtrace of exception `exc` (`Exception#set_backtrace`);
+    /// `None` clears it, so `#backtrace` answers nil again.
+    pub fn set_exc_backtrace(&mut self, exc: &Value, frames: Option<Vec<String>>) {
+        if let Value::Obj(id) = exc {
+            match frames {
+                Some(f) => {
+                    self.exc_backtraces.insert(*id, f);
+                    self.sealed_backtraces.insert(*id);
+                }
+                None => {
+                    self.exc_backtraces.shift_remove(id);
+                    self.sealed_backtraces.remove(id);
+                }
+            }
+        }
+    }
     pub fn record_backtrace_frame(&mut self, src: &str, line: u32) {
         let Some(Value::Obj(id)) = self.pending_exc else {
             return;
         };
+        if self.sealed_backtraces.contains(&id) {
+            return;
+        }
         let ctx = self.innermost_context();
         self.exc_backtraces
             .entry(id)
@@ -10721,6 +10760,7 @@ pub fn run_begin(begin_id: usize) -> Result<Value, String> {
                 // `=> e`), then restores the prior value on exit — supporting
                 // nested begin/rescue.
                 let prev_bang = with_host(|h| h.get_global("!"));
+                with_host(|h| h.seal_backtrace(&excv));
                 with_host(|h| h.set_global("!", excv.clone()));
                 result = run_template(rd.body, &[]);
                 with_host(|h| h.set_global("!", prev_bang));

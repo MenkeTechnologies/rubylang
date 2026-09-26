@@ -286,3 +286,28 @@ fn abort_raises_system_exit() {
         ("\"x\"\n1\nens\nae\n", "x\n", 1)
     );
 }
+
+/// `Exception#backtrace` is the frames the raise unwound through, and raising
+/// a rescued (or `set_backtrace`) exception again keeps them rather than
+/// appending the second unwind. Captured from ruby 4.0.7.
+#[test]
+fn a_reraised_exception_keeps_its_first_backtrace() {
+    let (out, err, rc) = run_e_full(
+        "def f; raise \"in f\"; end\n\
+         begin; f; rescue => e; end\n\
+         p e.backtrace\n\
+         def g(x); raise x; end\n\
+         begin; g(e); rescue => e3; p e3.backtrace; end\n\
+         x = RuntimeError.new(\"s\"); x.set_backtrace([\"z:9\"]); begin; raise x; rescue => y; p y.backtrace; end",
+    );
+    assert_eq!(
+        (out.as_str(), err.as_str(), rc),
+        (
+            "[\"-e:1:in 'Object#f'\", \"-e:2:in '<main>'\"]\n\
+             [\"-e:1:in 'Object#f'\", \"-e:2:in '<main>'\"]\n\
+             [\"z:9\"]\n",
+            "",
+            0
+        )
+    );
+}

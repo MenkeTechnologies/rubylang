@@ -4193,16 +4193,16 @@ fn dispatch_classref(
                     other => (0, other),
                 };
                 let msg = match msg_arg {
-                    Some(a) => with_host(|h| h.to_s(a)),
-                    None => cls.to_string(),
+                    Some(a) if !matches!(a, Value::Undef) => with_host(|h| h.to_s(a)),
+                    _ => cls.to_string(),
                 };
                 let exc = with_host(|h| h.new_exception(cls, &msg));
                 with_host(|h| h.set_ivar_of(&exc, "status", Value::Int(status)));
                 Ok(exc)
             } else if is_exception_class(cls) {
                 let msg = match args.first() {
-                    Some(a) => with_host(|h| h.to_s(a)),
-                    None => cls.to_string(),
+                    Some(a) if !matches!(a, Value::Undef) => with_host(|h| h.to_s(a)),
+                    _ => cls.to_string(),
                 };
                 Ok(with_host(|h| h.new_exception(cls, &msg)))
             } else {
@@ -5239,9 +5239,6 @@ fn dispatch_object(
         "receiver" if with_host(|h| h.is_exception_class(cls)) => {
             Ok(with_host(|h| h.ivar_of(recv, "receiver")))
         }
-        // Exception backtrace surface. rubylang does not retain a per-exception
-        // Ruby backtrace, so report an empty one (never nil, which callers splat
-        // or `.first` on); `cause` is nil, `full_message` the message.
         // `SystemExit#status` / `#success?` — the code `exit` was given, or the
         // one `SystemExit.new(n)` was constructed with. Beside the other
         // exception readers and gated on the class: `status` is `Thread`'s too.
@@ -5256,27 +5253,113 @@ fn dispatch_object(
                 Value::Bool(code == 0)
             })
         }
-        "backtrace" | "backtrace_locations" if is_exception_class(cls) => Ok(new_arr(Vec::new())),
+        // `Exception#backtrace` — the frames recorded as the exception was raised
+        // and unwound (or given to `set_backtrace`); nil for one never raised.
+        "backtrace" if is_exception_class(cls) => Ok(match with_host(|h| h.exc_backtrace(recv)) {
+            Some(frames) => new_arr(frames.into_iter().map(new_str).collect()),
+            None => Value::Undef,
+        }),
+        // No `Thread::Backtrace::Location` objects exist, so the locations
+        // reader stays an empty Array rather than Strings posing as them.
+        "backtrace_locations" if is_exception_class(cls) => Ok(new_arr(Vec::new())),
+        // `set_backtrace(Array of String | String | nil)` — answers its argument.
         "set_backtrace" if is_exception_class(cls) => {
-            Ok(args.first().cloned().unwrap_or(Value::Undef))
+            let arg = args.first().cloned().unwrap_or(Value::Undef);
+            let frames = match with_host(|h| h.as_array(&arg)) {
+                Some(items) => {
+                    let strs: Option<Vec<String>> =
+                        items.iter().map(|v| with_host(|h| h.as_str(v))).collect();
+                    Some(strs.ok_or_else(backtrace_type_error)?)
+                }
+                None if matches!(arg, Value::Undef) => None,
+                None => Some(vec![
+                    with_host(|h| h.as_str(&arg)).ok_or_else(backtrace_type_error)?
+                ]),
+            };
+            // A single String is stored, and answered, as a one-frame Array.
+            match frames {
+                Some(frames) if with_host(|h| h.as_array(&arg)).is_none() => {
+                    with_host(|h| h.set_exc_backtrace(recv, Some(frames.clone())));
+                    Ok(new_arr(frames.into_iter().map(new_str).collect()))
+                }
+                Some(frames) => {
+                    with_host(|h| h.set_exc_backtrace(recv, Some(frames)));
+                    Ok(arg)
+                }
+                None => {
+                    with_host(|h| h.set_exc_backtrace(recv, None));
+                    Ok(arg)
+                }
+            }
         }
         // `Exception#cause` — the exception that was being handled when this one
         // was raised (recorded by `raise`), or nil.
         "cause" if is_exception_class(cls) => Ok(with_host(|h| h.ivar_of(recv, "cause"))),
-        // `detailed_message(highlight:, …)` (Ruby 3.2+) — the message with the
-        // class appended (`msg (ClassName)`), as `Exception#full_message` renders.
+        // `detailed_message(highlight: false)` — the message with the class
+        // after its first line (`msg (ClassName)`).
         "detailed_message" if is_exception_class(cls) => {
-            let m = with_host(|h| h.as_str(&h.ivar_of(recv, "message")))
-                .unwrap_or_else(|| cls.to_string());
-            Ok(new_str(format!("{m} ({cls})")))
+            let highlight = exc_highlight_opt(args, false)?;
+            Ok(new_str(exc_detailed_message(recv, cls, highlight)?))
         }
+        // `full_message(highlight:, order:)` — the report an uncaught exception
+        // prints: `<frame>: <detailed message>` and a `from` line per caller
+        // frame, or MRI's `Traceback` form for `order: :bottom`. `highlight`
+        // defaults to whether $stderr is a terminal, as MRI's does.
         "full_message" if is_exception_class(cls) => {
-            let m = with_host(|h| h.ivar_of(recv, "message"));
-            Ok(if matches!(m, Value::Undef) {
-                new_str(cls.to_string())
+            use std::io::IsTerminal;
+            let highlight = exc_highlight_opt(args, std::io::stderr().is_terminal())?;
+            let bottom = match kw_opt(args, "order") {
+                None | Some(Value::Undef) => false,
+                Some(v) => match with_host(|h| h.as_symbol(&v)).as_deref() {
+                    Some("top") => false,
+                    Some("bottom") => true,
+                    _ => {
+                        let insp = with_host(|h| h.inspect(&v));
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            &format!("expected :top or :bottom as order: {insp}"),
+                        ));
+                    }
+                },
+            };
+            let detailed = if defines_own(recv, "detailed_message") {
+                let kw = with_host(|h| {
+                    let mut m = IndexMap::new();
+                    m.insert(RKey::Sym("highlight".into()), Value::Bool(highlight));
+                    let v = h.new_hash(m);
+                    h.mark_kwargs(&v);
+                    v
+                });
+                let d = dispatch(recv, "detailed_message", &[kw], None)?;
+                with_host(|h| h.to_s(&d))
             } else {
-                m
-            })
+                exc_detailed_message(recv, cls, highlight)?
+            };
+            let frames = with_host(|h| h.exc_backtrace(recv)).unwrap_or_default();
+            let mut out = String::new();
+            let (head, callers) = match frames.split_first() {
+                Some((first, rest)) => (format!("{first}: "), rest),
+                None => (String::new(), &[][..]),
+            };
+            if bottom && !frames.is_empty() {
+                out.push_str(if highlight {
+                    "\x1b[1mTraceback\x1b[m (most recent call last):\n"
+                } else {
+                    "Traceback (most recent call last):\n"
+                });
+                for (i, f) in callers.iter().enumerate().rev() {
+                    out.push_str(&format!("\t{}: from {f}\n", i + 1));
+                }
+            }
+            out.push_str(&head);
+            out.push_str(&detailed);
+            out.push('\n');
+            if !bottom {
+                for f in callers {
+                    out.push_str(&format!("\tfrom {f}\n"));
+                }
+            }
+            Ok(new_str(out))
         }
         // A runtime-declared attribute accessor (`class_eval { attr_accessor :x }`)
         // reads/writes the `@field` ivar natively, ahead of method_missing. An
@@ -18878,8 +18961,8 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
                     dispatch_classref(cls, "new", ctor_args, None)
                 } else {
                     let message = match ctor_args.first() {
-                        Some(a) => with_host(|h| h.to_s(a)),
-                        None => cls.to_string(),
+                        Some(a) if !matches!(a, Value::Undef) => with_host(|h| h.to_s(a)),
+                        _ => cls.to_string(),
                     };
                     Ok(with_host(|h| h.new_exception(cls, &message)))
                 }
@@ -24165,6 +24248,87 @@ fn defines_own(v: &Value, name: &str) -> bool {
             || h.find_singleton_define_method(v, name).is_some()
             || h.object_class(v).is_some_and(|cls| h.find_method(&cls, name).is_some())
     })
+}
+
+/// The value of keyword `name` in a trailing options Hash, if given.
+fn kw_opt(args: &[Value], name: &str) -> Option<Value> {
+    let last = args.last()?;
+    with_host(|h| h.as_hash(last)).and_then(|m| m.get(&RKey::Sym(name.into())).cloned())
+}
+
+/// The `highlight:` keyword of `Exception#detailed_message`/`#full_message`:
+/// true, false, or absent/nil for `default`. MRI rejects anything else.
+fn exc_highlight_opt(args: &[Value], default: bool) -> Result<bool, String> {
+    match kw_opt(args, "highlight") {
+        None | Some(Value::Undef) => Ok(default),
+        Some(Value::Bool(b)) => Ok(b),
+        Some(v) => {
+            let insp = with_host(|h| h.inspect(&v));
+            Err(raise_exc(
+                "ArgumentError",
+                &format!("expected true or false as highlight: {insp}"),
+            ))
+        }
+    }
+}
+
+fn backtrace_type_error() -> String {
+    raise_exc(
+        "TypeError",
+        "backtrace must be an Array of String or an Array of Thread::Backtrace::Location",
+    )
+}
+
+/// `Exception#detailed_message`: the message (a user `#message` override
+/// wins) with ` (Class)` after its first line. An empty message is the class
+/// name alone, or `unhandled exception` for a RuntimeError. With `highlight`,
+/// MRI's bold/underline escapes wrap the parts.
+fn exc_detailed_message(recv: &Value, cls: &str, highlight: bool) -> Result<String, String> {
+    let msg = if defines_own(recv, "message") {
+        let m = dispatch(recv, "message", &[], None)?;
+        with_host(|h| h.to_s(&m))
+    } else {
+        match with_host(|h| h.ivar_of(recv, "message")) {
+            Value::Undef => cls.to_string(),
+            m => with_host(|h| h.to_s(&m)),
+        }
+    };
+    if msg.is_empty() {
+        let text = if cls == "RuntimeError" {
+            "unhandled exception"
+        } else {
+            cls
+        };
+        return Ok(if highlight {
+            format!("\x1b[1;4m{text}\x1b[m")
+        } else {
+            text.to_string()
+        });
+    }
+    let (first, tail) = match msg.split_once('\n') {
+        Some((f, t)) => (f, Some(t)),
+        None => (msg.as_str(), None),
+    };
+    let mut out = if highlight {
+        format!("\x1b[1m{first} (\x1b[1;4m{cls}\x1b[m\x1b[1m)\x1b[m")
+    } else {
+        format!("{first} ({cls})")
+    };
+    if let Some(tail) = tail.filter(|t| !t.is_empty()) {
+        out.push('\n');
+        if highlight {
+            for line in tail.split_inclusive('\n') {
+                let (text, nl) = match line.strip_suffix('\n') {
+                    Some(t) => (t, "\n"),
+                    None => (line, ""),
+                };
+                out.push_str(&format!("\x1b[1m{text}\x1b[m{nl}"));
+            }
+        } else {
+            out.push_str(tail);
+        }
+    }
+    Ok(out)
 }
 
 /// The display string of a value — a user object's own `to_s` if it defines one,

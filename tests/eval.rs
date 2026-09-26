@@ -10771,3 +10771,51 @@ fn a_rescue_binding_is_a_variable_of_the_enclosing_scope() {
     eq("e = nil; [1].each { begin; raise \"q\"; rescue => e; end }; e.message", "\"q\"");
     eq("[1].each { begin; raise \"q\"; rescue => zz; end }; defined?(zz)", "nil");
 }
+
+/// `Exception#full_message(highlight:, order:)` and `#detailed_message` render
+/// the report MRI prints for an uncaught exception from the exception's own
+/// backtrace; `#backtrace` is nil until one is raised or set, and a nil
+/// message defaults to the class name. `full_message(highlight: false)` was
+/// refused as one argument too many. Expected values from ruby 4.0.7.
+#[test]
+fn full_message_renders_the_uncaught_report() {
+    let set = "e = ArgumentError.new(\"\"); e.set_backtrace([\"a:1\", \"b:2\", \"c:3\"]); ";
+    eq(
+        &format!("{set}e.full_message(highlight: false)"),
+        "\"a:1: ArgumentError\\n\\tfrom b:2\\n\\tfrom c:3\\n\"",
+    );
+    eq(
+        &format!("{set}e.full_message(highlight: false, order: :bottom)"),
+        "\"Traceback (most recent call last):\\n\\t2: from c:3\\n\\t1: from b:2\\na:1: ArgumentError\\n\"",
+    );
+    eq(
+        &format!("{set}e.full_message(highlight: true)"),
+        "\"a:1: \\e[1;4mArgumentError\\e[m\\n\\tfrom b:2\\n\\tfrom c:3\\n\"",
+    );
+    eq(
+        "e = RuntimeError.new(\"l1\\nl2\"); e.set_backtrace([\"a:1\"]); e.full_message(highlight: false)",
+        "\"a:1: l1 (RuntimeError)\\nl2\\n\"",
+    );
+    eq(
+        "RuntimeError.new(\"l1\\nl2\").detailed_message(highlight: true)",
+        "\"\\e[1ml1 (\\e[1;4mRuntimeError\\e[m\\e[1m)\\e[m\\n\\e[1ml2\\e[m\"",
+    );
+    eq(
+        "[RuntimeError.new(nil).message, RuntimeError.new(\"\").detailed_message, RuntimeError.new(\"m\").backtrace]",
+        "[\"RuntimeError\", \"unhandled exception\", nil]",
+    );
+    eq(
+        "e = RuntimeError.new(\"q\"); [e.set_backtrace(\"one\"), e.backtrace, e.set_backtrace(nil), e.backtrace]",
+        "[[\"one\"], [\"one\"], nil, nil]",
+    );
+    raises(
+        "RuntimeError.new(\"m\").full_message(order: :x)",
+        "ArgumentError",
+        "expected :top or :bottom as order: :x",
+    );
+    raises(
+        "RuntimeError.new(\"m\").full_message(highlight: 1)",
+        "ArgumentError",
+        "expected true or false as highlight: 1",
+    );
+}
