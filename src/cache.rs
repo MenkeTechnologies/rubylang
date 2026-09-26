@@ -22,7 +22,10 @@ use std::path::PathBuf;
 /// 9 -> 10: a `ProcDef` carries `block_depth`, the lexical block nesting MRI's
 /// `block (N levels) in X` frame label counts. A shard written by 9 has no such
 /// field, and reading one as 10 would name every block frame `block in X`.
-const SCHEMA: u64 = 10;
+///
+/// 10 -> 11: a rescue clause carries no `binding`; `=> target` is lowered to an
+/// assignment from `$!` at the head of the clause body instead.
+const SCHEMA: u64 = 11;
 
 /// The outer, rkyv-archived shard: the [`build_stamp`] of the binary that wrote
 /// it, then a flat list of (key, bincode-blob) entries.
@@ -72,9 +75,9 @@ type CClass = (
     bool,
     Vec<(String, u8)>,
 );
-/// (rescue classes, splat proc id, binding, body proc id) — a serde-flat rescue
-/// clause. `splat` is the proc for a `rescue *expr` dynamic class list.
-type CRescue = (Vec<String>, Option<usize>, Option<String>, usize);
+/// (rescue classes, splat proc id, body proc id) — a serde-flat rescue clause.
+/// `splat` is the proc for a `rescue *expr` dynamic class list.
+type CRescue = (Vec<String>, Option<usize>, usize);
 /// (body proc id, rescues, ensure proc id) — a serde-flat begin block.
 type CBegin = (usize, Vec<CRescue>, Option<usize>);
 /// (params, splat index, chunk, req, opt, keyword names, required keywords,
@@ -412,7 +415,7 @@ fn to_cprog(prog: &Program) -> CProg {
                 let rescues = bd
                     .rescues
                     .iter()
-                    .map(|r| (r.classes.clone(), r.splat, r.binding.clone(), r.body))
+                    .map(|r| (r.classes.clone(), r.splat, r.body))
                     .collect();
                 (bd.body, rescues, bd.ensure)
             })
@@ -491,10 +494,9 @@ fn from_cprog(cp: CProg) -> Program {
             .map(|(body, rescues, ensure)| {
                 let rescues = rescues
                     .into_iter()
-                    .map(|(classes, splat, binding, body)| RescueDef {
+                    .map(|(classes, splat, body)| RescueDef {
                         classes,
                         splat,
-                        binding,
                         body,
                     })
                     .collect();

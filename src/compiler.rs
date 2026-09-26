@@ -588,10 +588,6 @@ fn for_locals_expr(e: &Expr, out: &mut Vec<String>) {
         } => {
             for_locals_body(body, out);
             for r in rescues {
-                // `rescue => e` binds `e` in the enclosing scope.
-                if let Some(n) = &r.binding {
-                    push_local(n, out);
-                }
                 for_locals_body(&r.body, out);
             }
             if let Some(b) = ensure {
@@ -3144,8 +3140,7 @@ impl Compiler {
         let body_id = self.compile_proc_body(body, &[], None)?;
         let mut rdefs = Vec::new();
         for r in rescues {
-            let params: Vec<String> = r.binding.iter().cloned().collect();
-            let rid = self.compile_proc_body(&r.body, &params, None)?;
+            let rid = self.compile_proc_body(&r.body, &[], None)?;
             // A `rescue *expr` splat compiles to a zero-arg proc returning the
             // class (or array of classes) to match at runtime.
             let splat = match &r.splat {
@@ -3159,7 +3154,6 @@ impl Compiler {
             rdefs.push(RescueDef {
                 classes: r.classes.clone(),
                 splat,
-                binding: r.binding.clone(),
                 body: rid,
             });
         }

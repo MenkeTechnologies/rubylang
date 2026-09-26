@@ -10757,3 +10757,17 @@ fn join_converts_elements_through_user_conversions() {
         "\"st-1-2-3\"",
     );
 }
+
+/// `rescue => target` assigns the exception to a variable of the ENCLOSING
+/// scope, so a local survives the `begin` — it used to be a block-local param
+/// of the clause and read as an undefined name afterwards — and an `@ivar`
+/// target parses. Expected values from ruby 4.0.7.
+#[test]
+fn a_rescue_binding_is_a_variable_of_the_enclosing_scope() {
+    eq("begin; raise \"x\"; rescue => e; end; e.message", "\"x\"");
+    eq("def m; begin; raise \"q\"; rescue => e; end; e.message; end; m", "\"q\"");
+    eq("e = 1; begin; raise \"x\"; rescue => e; end; e.class", "RuntimeError");
+    eq("begin; raise \"x\"; rescue => @err; end; @err.class", "RuntimeError");
+    eq("e = nil; [1].each { begin; raise \"q\"; rescue => e; end }; e.message", "\"q\"");
+    eq("[1].each { begin; raise \"q\"; rescue => zz; end }; defined?(zz)", "nil");
+}

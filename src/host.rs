@@ -792,7 +792,6 @@ pub struct RescueDef {
     /// Proc id of a `rescue *expr` splat body (evaluates to a class or array of
     /// classes), matched at runtime in addition to `classes`. `None` when absent.
     pub splat: Option<usize>,
-    pub binding: Option<String>,
     pub body: usize,
 }
 
@@ -10717,18 +10716,13 @@ pub fn run_begin(begin_id: usize) -> Result<Value, String> {
             };
             let matches = is_bare || static_match || splat_match;
             if matches {
-                let args = if rd.binding.is_some() {
-                    vec![excv.clone()]
-                } else {
-                    vec![]
-                };
                 // Ruby exposes the exception being handled as `$!` for the
                 // duration of the clause (whether or not it is bound via
                 // `=> e`), then restores the prior value on exit — supporting
                 // nested begin/rescue.
                 let prev_bang = with_host(|h| h.get_global("!"));
                 with_host(|h| h.set_global("!", excv.clone()));
-                result = run_template(rd.body, &args);
+                result = run_template(rd.body, &[]);
                 with_host(|h| h.set_global("!", prev_bang));
                 handled = true;
                 // A `retry` in the clause clears itself and restarts the body.

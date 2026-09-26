@@ -341,8 +341,6 @@ pub struct Rescue {
     /// A `rescue *expr` splat: an expression evaluating to a class or an array of
     /// classes to match, in addition to `classes`. Evaluated at match time.
     pub splat: Option<Expr>,
-    /// Optional `=> name` binding for the caught exception.
-    pub binding: Option<String>,
     pub body: Vec<Stmt>,
 }
 

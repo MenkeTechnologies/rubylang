@@ -408,7 +408,6 @@ impl Parser {
                     rescues: vec![Rescue {
                         classes: vec![],
                         splat: None,
-                        binding: None,
                         body: vec![handler.into()],
                     }],
                     ensure: None,
@@ -613,7 +612,6 @@ impl Parser {
                 rescues: vec![Rescue {
                     classes: vec![],
                     splat: None,
-                    binding: None,
                     body: vec![handler.into()],
                 }],
                 ensure: None,
@@ -2687,17 +2685,36 @@ impl Parser {
                     break;
                 }
             }
-            let binding = if self.eat_op("=>") {
-                Some(self.ident_name()?)
+            // `=> target` is an ASSIGNMENT of the exception being handled (`$!`)
+            // to a variable of the ENCLOSING scope — a local survives the
+            // `begin`, and an `@ivar`/`@@cvar`/`$global` target is allowed.
+            let target = if self.eat_op("=>") {
+                let kind = match self.advance() {
+                    Tok::Ident(s) => (VarKind::Local, s),
+                    Tok::IVar(s) => (VarKind::Instance, s),
+                    Tok::CVar(s) => (VarKind::Class, s),
+                    Tok::GVar(s) => (VarKind::Global, s),
+                    other => {
+                        return Err(format!(
+                            "line {}: expected identifier, found '{}'",
+                            self.line(),
+                            other
+                        ))
+                    }
+                };
+                Some(Expr::Var(kind.0, kind.1))
             } else {
                 None
             };
             self.eat_kw("then");
-            let body = self.body_until(&["rescue", "else", "ensure", "end"])?;
+            let mut body = self.body_until(&["rescue", "else", "ensure", "end"])?;
+            if let Some(t) = target {
+                let bang = Expr::Var(VarKind::Global, "!".into());
+                body.insert(0, Stmt::from(Expr::Assign(Box::new(t), Box::new(bang))));
+            }
             rescues.push(Rescue {
                 classes,
                 splat,
-                binding,
                 body,
             });
         }
