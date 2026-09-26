@@ -10704,3 +10704,26 @@ fn several_values_or_a_splat_assigned_to_one_target_pack_an_array() {
     eq("h = {}; h[:k] = 3, 4; h", "{k: [3, 4]}");
     eq("@pv = 1, 2; @pv", "[1, 2]");
 }
+
+/// `pack("U")`/`unpack("U")`: code points to and from UTF-8, pack.c's own
+/// one-to-six-byte form and its three decode refusals. Both directions raised
+/// `unknown pack directive 'U'`.
+#[test]
+fn pack_and_unpack_u_convert_code_points_and_utf8() {
+    eq("\"a\u{e9}\u{1F600}\".unpack(\"U*\")", "[97, 233, 128512]");
+    eq("[233, 97].pack(\"U*\")", "\"\u{e9}a\"");
+    eq("[233].pack(\"U\").encoding", "#<Encoding:UTF-8>");
+    eq("[0x7fffffff].pack(\"U\").bytesize", "6");
+    eq("[0xD800].pack(\"U\").bytes", "[237, 160, 128]");
+    eq("\"a\u{e9}\u{1F600}\".unpack(\"U2\")", "[97, 233]");
+    // Running out of input ends the directive: no trailing nil.
+    eq("\"ab\".unpack(\"U*U\")", "[97, 98]");
+    raises("[-1].pack(\"U\")", "RangeError", "pack(U): value out of range");
+    raises("[0xff].pack(\"C\").unpack(\"U\")", "ArgumentError", "malformed UTF-8 character");
+    raises(
+        "[0xc3].pack(\"C\").unpack(\"U\")",
+        "ArgumentError",
+        "malformed UTF-8 character (expected 2 bytes, given 1 bytes)",
+    );
+    raises("[0xC0, 0x80].pack(\"C*\").unpack(\"U\")", "ArgumentError", "redundant UTF-8 sequence");
+}

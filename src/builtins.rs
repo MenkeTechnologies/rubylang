@@ -11192,6 +11192,13 @@ fn dispatch_array(
         "pack" => {
             let fmt = arg_str(&args[0]);
             let bytes = pack_bytes(&arr, &fmt)?;
+            // A template that OPENS with `U` answers a UTF-8 string
+            // (`[233].pack("U")` is `"é"`), whatever follows it.
+            if fmt.trim_start().starts_with('U') {
+                if let Ok(text) = String::from_utf8(bytes.clone()) {
+                    return Ok(new_str(text));
+                }
+            }
             let s = new_str(bytes_to_binstr(&bytes));
             // `pack` answers a byte string, which is what makes `p
             // [0,255].pack("C*")` escape by byte (`"\x00\xFF"`) rather than by
@@ -22804,6 +22811,20 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
                 //   [128, 0, 0]
                 out.resize(out.len() + (want - take).div_ceil(2), 0);
             }
+            // `U`: each Integer as its UTF-8 sequence, pack.c's `rb_uv_to_utf8`
+            // — which runs to six bytes (up to 0x7fffffff) and does not refuse a
+            // surrogate, so this is not `char::encode_utf8`.
+            'U' => {
+                let n = d.count.unwrap_or(items.len().saturating_sub(idx));
+                for _ in 0..n {
+                    let v = as_i(&pack_int_arg(items, idx)?);
+                    idx += 1;
+                    if !(0..0x8000_0000).contains(&v) {
+                        return Err(raise_exc("RangeError", "pack(U): value out of range"));
+                    }
+                    out.extend_from_slice(&uv_to_utf8(v as u32));
+                }
+            }
             // BER-compressed integers: base-128 big-endian, the continuation bit
             // set on every byte but the last, so `128` is `[0x81, 0x00]`.
             'w' => {
@@ -23045,6 +23066,70 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// pack.c's `rb_uv_to_utf8`: the classic one-to-six-byte UTF-8 form.
+fn uv_to_utf8(uv: u32) -> Vec<u8> {
+    if uv < 0x80 {
+        return vec![uv as u8];
+    }
+    let (len, lead) = match uv {
+        0..=0x7ff => (2, 0xc0),
+        0x800..=0xffff => (3, 0xe0),
+        0x1_0000..=0x1f_ffff => (4, 0xf0),
+        0x20_0000..=0x3ff_ffff => (5, 0xf8),
+        _ => (6, 0xfc),
+    };
+    let mut out = vec![0u8; len];
+    let mut rest = uv;
+    for b in out[1..].iter_mut().rev() {
+        *b = 0x80 | (rest & 0x3f) as u8;
+        rest >>= 6;
+    }
+    out[0] = lead | rest as u8;
+    out
+}
+
+/// pack.c's `utf8_to_uv`: one character read off `bytes`, answering the code
+/// point and the bytes it took, with its three refusals verbatim.
+fn utf8_to_uv(bytes: &[u8]) -> Result<(u32, usize), String> {
+    let malformed = || raise_exc("ArgumentError", "malformed UTF-8 character");
+    let c = bytes[0] as u32;
+    if c < 0x80 {
+        return Ok((c, 1));
+    }
+    if c & 0x40 == 0 {
+        return Err(malformed());
+    }
+    let (n, mask) = match c {
+        _ if c & 0x20 == 0 => (2, 0x1f),
+        _ if c & 0x10 == 0 => (3, 0x0f),
+        _ if c & 0x08 == 0 => (4, 0x07),
+        _ if c & 0x04 == 0 => (5, 0x03),
+        _ if c & 0x02 == 0 => (6, 0x01),
+        _ => return Err(malformed()),
+    };
+    if n > bytes.len() {
+        return Err(raise_exc(
+            "ArgumentError",
+            &format!(
+                "malformed UTF-8 character (expected {n} bytes, given {} bytes)",
+                bytes.len()
+            ),
+        ));
+    }
+    let mut uv = c & mask;
+    for &b in &bytes[1..n] {
+        if b & 0xc0 != 0x80 {
+            return Err(malformed());
+        }
+        uv = (uv << 6) | (b & 0x3f) as u32;
+    }
+    const LIMITS: [u32; 6] = [0, 0x80, 0x800, 0x1_0000, 0x20_0000, 0x400_0000];
+    if uv < LIMITS[n - 1] {
+        return Err(raise_exc("ArgumentError", "redundant UTF-8 sequence"));
+    }
+    Ok((uv, n))
+}
+
 /// A String element produced by `unpack`. Every one of them is a byte string —
 /// its storage is one character per byte — and the DIRECTIVE names the encoding,
 /// not the receiver: the byte-valued directives answer ASCII-8BIT, and the ones
@@ -23064,6 +23149,17 @@ fn unpack_bytes(bytes: &[u8], fmt: &str) -> Result<Vec<Value>, String> {
     let mut pos = 0usize;
     for d in parse_pack_template(fmt) {
         match d.kind {
+            // `U`: UTF-8 characters to code points. Running out of input ends
+            // the directive quietly — no trailing nil, unlike `C`.
+            'U' => {
+                let mut n = d.count.unwrap_or(usize::MAX);
+                while n > 0 && pos < bytes.len() {
+                    let (uv, len) = utf8_to_uv(&bytes[pos..])?;
+                    out.push(Value::Int(uv as i64));
+                    pos += len;
+                    n -= 1;
+                }
+            }
             'C' | 'c' => {
                 let n = d.count.unwrap_or(bytes.len().saturating_sub(pos));
                 for _ in 0..n {
