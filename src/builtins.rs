@@ -18293,6 +18293,9 @@ fn dispatch_method(
     let unbound = with_host(|h| h.is_unbound_method(recv));
     match name {
         "call" | "()" | "[]" | "yield" | "===" => call_bound(&mrecv, &mname, args, block),
+        // `Method#>>` / `#<<` compose like `Proc#>>`, and always into a lambda.
+        ">>" => Ok(with_host(|h| h.new_composed(recv.clone(), args[0].clone(), true))),
+        "<<" => Ok(with_host(|h| h.new_composed(args[0].clone(), recv.clone(), true))),
         // UnboundMethod (or Method) rebinding: `bind(obj)` yields a Method bound
         // to `obj`; `bind_call(obj, *args)` binds and invokes in one step.
         "bind" => Ok(with_host(|h| h.new_method(args[0].clone(), &mname))),

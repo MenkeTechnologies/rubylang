@@ -12327,9 +12327,18 @@ pub fn call_proc_self_ctx(
 
     // Derived procs (curry / composition) delegate rather than run a template.
     match kind {
+        // Either half may be any callable — a Method, or an object with `call`
+        // — not only a Proc, as MRI composes through `#call`.
         ProcKind::Composed { first, second } => {
-            let mid = call_proc(&first, args)?;
-            return call_proc(&second, std::slice::from_ref(&mid));
+            let call = |f: &Value, a: &[Value]| {
+                if with_host(|h| h.is_proc(f)) {
+                    call_proc(f, a)
+                } else {
+                    crate::builtins::dispatch(f, "call", a, None)
+                }
+            };
+            let mid = call(&first, args)?;
+            return call(&second, std::slice::from_ref(&mid));
         }
         ProcKind::Curried { arity, collected } => {
             let mut all = collected.clone();

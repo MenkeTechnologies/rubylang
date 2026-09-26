@@ -10843,3 +10843,20 @@ fn extend_makes_the_object_an_instance_of_the_module() {
         "[true, 3]",
     );
 }
+
+/// Composition goes through `#call`, so either half may be a `Method` or any
+/// object with `call`, and `Method#>>`/`#<<` compose into a lambda. `Method`
+/// had neither operator, and a non-Proc half raised a TypeError. Expected
+/// values from ruby 4.0.7.
+#[test]
+fn composition_accepts_any_callable() {
+    eq(
+        "sq = ->(x) { x * x }; c = Object.new; def c.call(x) = x + 100; [(sq >> c).(2), (sq << c).(2)]",
+        "[104, 10404]",
+    );
+    eq(
+        "def dbl(x) = x * 2; m = method(:dbl); f = m >> ->(x) { x + 1 }; \
+         [f.(5), f.lambda?, (m << ->(x) { x + 1 }).(5), [1, 2].map(&(m >> m))]",
+        "[11, true, 12, [4, 8]]",
+    );
+}
