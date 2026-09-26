@@ -1069,6 +1069,11 @@ impl Parser {
             }
             return Ok(());
         }
+        // `"key": value` — a quoted label is a symbol key too.
+        if let Some(key) = self.string_label()? {
+            kwargs.push((key, self.arg()?));
+            return Ok(());
+        }
         // `key: value` keyword argument (symbol key). The label may be any
         // reserved word (`f(class: 1, if: 2)`).
         if let Some(key) = self.peek_label() {
@@ -3120,6 +3125,39 @@ impl Parser {
         Ok(chain.unwrap_or_else(|| Expr::Hash(Vec::new())))
     }
 
+    /// A quoted label — `"key": v`, `'key': v`, `"k#{i}": v` — which is a Symbol
+    /// key, recognized by a `:` written directly against the closing quote.
+    /// Only asked where a label may stand (a hash key, a call argument), so a
+    /// ternary's `c ? "a" : b` never reaches it.
+    fn string_label(&mut self) -> Result<Option<Expr>, String> {
+        let Tok::Str(s, dq) = self.peek().clone() else {
+            return Ok(None);
+        };
+        let colon = self.toks.get(self.pos + 1);
+        if !colon.is_some_and(|t| !t.space && matches!(&t.kind, Tok::Op(o) if o == ":")) {
+            return Ok(None);
+        }
+        self.advance();
+        self.advance();
+        let parts = if dq { scan_interp(&s)? } else { vec![StrPart::Lit(s)] };
+        if parts.iter().all(|p| matches!(p, StrPart::Lit(_))) {
+            let name: String = parts
+                .into_iter()
+                .map(|p| match p {
+                    StrPart::Lit(l) => l,
+                    _ => unreachable!(),
+                })
+                .collect();
+            return Ok(Some(Expr::Symbol(name)));
+        }
+        Ok(Some(Expr::Call {
+            recv: Some(Box::new(Expr::Str(parts))),
+            name: "to_sym".to_string(),
+            args: vec![],
+            block: None,
+        }))
+    }
+
     fn hash_pair(&mut self) -> Result<(Expr, Expr), String> {
         // `label: value` → symbol key; `key => value` → arbitrary key.
         // The label may be any reserved word (`{if: 1, class: 2}`).
@@ -3134,6 +3172,9 @@ impl Parser {
                 self.arg()?
             };
             return Ok((Expr::Symbol(name), v));
+        }
+        if let Some(key) = self.string_label()? {
+            return Ok((key, self.arg()?));
         }
         let k = self.arg()?;
         self.expect_op("=>")?;

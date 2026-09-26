@@ -10661,3 +10661,17 @@ fn a_single_value_is_destructured_only_through_to_ary() {
         "can't convert TC to Array (TC#to_ary gives Integer)",
     );
 }
+
+/// A quoted label — `"key": v`, `'key': v`, `"k#{i}": v` — is a Symbol key in
+/// a hash literal and a keyword in a call. It was a parse error in both
+/// (`expected '=>', found ':'`).
+#[test]
+fn a_quoted_label_is_a_symbol_key() {
+    eq("{\"b\": 1, \"c d\": 2, 'e': 3}", "{b: 1, \"c d\": 2, e: 3}");
+    eq("i = 3; {\"k#{i}\": 1}", "{k3: 1}");
+    eq("{\"a\" => 1, \"b\": 2}", "{\"a\" => 1, b: 2}");
+    eq("def ql(**o) = o; ql(a: 1, \"b\": 2)", "{a: 1, b: 2}");
+    eq("def qm(x:) = x; qm(\"x\": 5)", "5");
+    // A ternary's string branch is not a label.
+    eq("true ? \"a\" : \"b\"", "\"a\"");
+}
