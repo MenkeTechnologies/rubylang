@@ -10675,3 +10675,18 @@ fn a_quoted_label_is_a_symbol_key() {
     // A ternary's string branch is not a label.
     eq("true ? \"a\" : \"b\"", "\"a\"");
 }
+
+/// `*x` is `x.to_a`: `*nil` contributes nothing, a Hash its `[k, v]` pairs, a
+/// Struct its members, an object with its own `to_a` that answer. Each of
+/// these was spread as ONE element (`[*nil]` was `[nil]`).
+#[test]
+fn a_splat_expands_through_to_a() {
+    eq("[*nil, 1, *nil]", "[1]");
+    eq("[*{k: 1, j: 2}]", "[[:k, 1], [:j, 2]]");
+    eq("def sp(*a) = a; [sp(*nil), sp(*{k: 1})]", "[[], [[:k, 1]]]");
+    eq("SP = Struct.new(:a, :b); [*SP.new(1, 2)]", "[1, 2]");
+    eq("class SPT; def to_a = [:t]; end; [*SPT.new, 1]", "[:t, 1]");
+    // No `to_a` at all: the object itself, once.
+    eq("class SPU; end; [*SPU.new].size", "1");
+    eq("[*\"str\", *5]", "[\"str\", 5]");
+}

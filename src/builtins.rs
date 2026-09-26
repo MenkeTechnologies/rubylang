@@ -192,14 +192,18 @@ fn b_mkargs(vm: &mut VM, argc: u8) -> Value {
     for p in &pieces {
         match with_host(|h| h.as_array(p)) {
             Some(xs) => out.extend(xs),
+            // `*nil` is `nil.to_a`: nothing at all, not a nil element.
+            None if matches!(p, Value::Undef) => {}
             // A splat of a Range/Set/Enumerator (`*1..5`, `*set`) expands to its
             // elements via `to_a`; a plain scalar (`*5`) is a one-element run.
             None if with_host(|h| {
                 h.is_a(p, "Range")
+                    || h.is_a(p, "Hash")
+                    || h.is_a(p, "Struct")
                     || h.is_a(p, "Set")
                     || h.is_a(p, "Enumerator")
                     || h.is_a(p, "MatchData")
-            }) =>
+            }) || defines_own(p, "to_a") =>
             {
                 match dispatch(p, "to_a", &[], None)
                     .ok()
