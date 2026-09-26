@@ -7942,6 +7942,14 @@ impl RubyHost {
                 Some(RObj::Regexp { source, flags, .. }) => {
                     RKey::Regexp(source.clone(), regex_option_bits(flags))
                 }
+                // A plain object hashes by IDENTITY (`Object#hash`/`#eql?`), and
+                // its key must hand the object itself back: keyed as its debug
+                // string, `{obj => 1}.keys.first` answered the String "Obj(93)",
+                // `p` printed that string, and a same-spelled String key collided.
+                Some(RObj::Object { .. } | RObj::Proc { .. }) => match v {
+                    Value::Obj(id) => RKey::Identity(*id),
+                    _ => RKey::Nil,
+                },
                 _ => RKey::Str(format!("{v:?}")),
             },
             _ => RKey::Nil,

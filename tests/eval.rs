@@ -10567,3 +10567,21 @@ fn every_object_that_can_carry_a_singleton_answers_singleton_class() {
     raises("1.5.singleton_class", "TypeError", "can't define singleton");
     raises(":s.singleton_class", "TypeError", "can't define singleton");
 }
+
+/// A plain object used as a Hash key is that object: it comes back out of
+/// `keys`/`each`/`key`, and it hashes by identity. It was keyed as its debug
+/// spelling, so `keys.first` was the String `"Obj(93)"`.
+#[test]
+fn an_object_hash_key_is_the_object_itself() {
+    eq(
+        "class HK; end; a = HK.new; h = {a => 1}; [h.keys.first.class, h.keys.first.equal?(a), h[a]]",
+        "[HK, true, 1]",
+    );
+    eq(
+        "class HL; end; a = HL.new; b = HL.new; h = {a => 1, b => 2}; [h.size, h.key(2).equal?(b), h[HL.new]]",
+        "[2, true, nil]",
+    );
+    eq("class HM; end; a = HM.new; h = {a => 1}; h.each { |k, _| break k.equal?(a) }", "true");
+    eq("pr = proc { 7 }; h = {pr => :x}; [h[pr], h.keys.first.call]", "[:x, 7]");
+    eq("class HN; end; x = HN.new; [[x, x, HN.new].uniq.size, [x, x].tally.values]", "[2, [2]]");
+}
