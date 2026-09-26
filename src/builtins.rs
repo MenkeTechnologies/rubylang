@@ -5528,6 +5528,14 @@ pub(crate) const ENUMERABLE_METHODS: &[&str] = &[
     "slice_when",
     "reverse_each",
     "to_h",
+    "to_set",
+    "each_entry",
+    "compact",
+    "minmax_by",
+    "slice_after",
+    "slice_before",
+    "cycle",
+    "chain",
 ];
 
 /// Materialize a user `Enumerable`'s elements by driving its own `each` with a

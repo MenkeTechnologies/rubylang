@@ -10888,3 +10888,24 @@ fn equality_runs_the_elements_own_eq() {
         "[true, true]",
     );
 }
+
+/// Enumerable derives `to_set`, `each_entry`, `compact`, `minmax_by`,
+/// `slice_after`, `slice_before`, `cycle` and `chain` from a class's `each`
+/// too — all eight raised NoMethodError. Expected values from ruby 4.0.7.
+#[test]
+fn enumerable_derives_the_remaining_each_methods() {
+    let n = "class N; include Enumerable; def each; yield 3; yield nil; yield 1; yield 2; end; end; n = N.new; ";
+    eq(
+        &format!("{n}[n.to_set, n.each_entry.to_a, n.compact, n.compact.minmax_by {{ -_1 }}]"),
+        "[Set[3, nil, 1, 2], [3, nil, 1, 2], [3, 1, 2], [3, 1]]",
+    );
+    eq(
+        &format!("{n}[n.chain([9]).to_a, n.cycle.first(5), n.cycle(2).to_a.size, n.respond_to?(:to_set)]"),
+        "[[3, nil, 1, 2, 9], [3, nil, 1, 2, 3], 8, true]",
+    );
+    let m = "class M; include Enumerable; def each; yield 3; yield 1; yield 2; end; end; m = M.new; ";
+    eq(
+        &format!("{m}[m.slice_after(&:odd?).to_a, m.slice_before(&:even?).to_a]"),
+        "[[[3], [1], [2]], [[3, 1], [2]]]",
+    );
+}
