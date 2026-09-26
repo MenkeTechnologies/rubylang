@@ -10727,3 +10727,17 @@ fn pack_and_unpack_u_convert_code_points_and_utf8() {
     );
     raises("[0xC0, 0x80].pack(\"C*\").unpack(\"U\")", "ArgumentError", "redundant UTF-8 sequence");
 }
+
+/// `Integer#chr(enc)` is a character OF that encoding. With UTF-8 it reaches
+/// every scalar value — `0x1F600.chr("UTF-8")` raised `out of char range`,
+/// and `233.chr(Encoding::UTF_8)` answered the byte `"\xE9"`.
+#[test]
+fn integer_chr_with_an_encoding_answers_a_character_of_it() {
+    eq("0x1F600.chr(\"UTF-8\")", "\"\u{1F600}\"");
+    eq("[233.chr(Encoding::UTF_8), 233.chr(\"utf-8\").bytes]", "[\"\u{e9}\", [195, 169]]");
+    eq("65.chr(Encoding::UTF_8).encoding", "#<Encoding:UTF-8>");
+    eq("[65.chr(\"BINARY\").encoding, 65.chr(\"US-ASCII\").encoding]", "[#<Encoding:BINARY (ASCII-8BIT)>, #<Encoding:US-ASCII>]");
+    raises("0xD800.chr(\"UTF-8\")", "RangeError", "invalid codepoint 0xD800 in UTF-8");
+    raises("0x110000.chr(\"UTF-8\")", "RangeError", "1114112 out of char range");
+    raises("233.chr(\"US-ASCII\")", "RangeError", "invalid codepoint 0xE9 in US-ASCII");
+}

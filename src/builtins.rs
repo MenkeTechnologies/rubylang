@@ -6942,6 +6942,40 @@ fn dispatch_number(
         // `Integer#chr` is a BYTE, so only 0..255 is in range. Casting through
         // `as u8` wrapped instead: `256.chr` answered " " and `-1.chr`
         // answered "ÿ", both of which MRI refuses.
+        // `chr(enc)` is a CHARACTER of that encoding: `0x1F600.chr("UTF-8")` is
+        // the emoji, where the byte form refused everything past 255.
+        "chr" if !args.is_empty() => {
+            let n = as_i(recv);
+            let raw = match with_host(|h| h.ivar_of(&args[0], "name")) {
+                Value::Undef => arg_str(&args[0]),
+                nm => arg_str(&nm),
+            };
+            let enc = normalize_encoding_name(&raw).unwrap_or_default();
+            let limit = if enc == "UTF-8" { 0x10_ffff } else { 0xff };
+            if !(0..=limit).contains(&n) {
+                return Err(raise_exc("RangeError", &format!("{n} out of char range")));
+            }
+            let invalid = |e: &str| {
+                raise_exc("RangeError", &format!("invalid codepoint 0x{n:X} in {e}"))
+            };
+            let out = match enc.as_str() {
+                "UTF-8" => match char::from_u32(n as u32) {
+                    Some(c) => Ok(new_str(c.to_string())),
+                    None => Err(invalid("UTF-8")),
+                },
+                e @ ("US-ASCII" | "ASCII-8BIT") => {
+                    if e == "US-ASCII" && n > 0x7f {
+                        return Err(invalid("US-ASCII"));
+                    }
+                    let s = new_str((n as u8 as char).to_string());
+                    let tag = if e == "US-ASCII" { "US-ASCII" } else { "ASCII-8BIT" };
+                    with_host(|h| h.set_string_encoding(&s, tag));
+                    Ok(s)
+                }
+                _ => dispatch_number(recv, "chr", &[], None),
+            };
+            out
+        }
         "chr" => {
             let n = as_i(recv);
             if !(0..=255).contains(&n) {
