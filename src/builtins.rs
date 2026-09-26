@@ -4564,7 +4564,7 @@ fn dispatch_classref(
             // (re)definition on X: drop X's `def self.m` so this wins (they are the
             // same method in MRI). ActiveSupport's `redefine_singleton_method`
             // routes through `singleton_class.define_method`.
-            if let Some(attached) = crate::host::RubyHost::metaclass_attached(&cls) {
+            if let Some(attached) = crate::host::RubyHost::metaclass_attached(cls) {
                 let attached = attached.to_string();
                 with_host(|h| h.remove_class_method(&attached, &mname));
             }
