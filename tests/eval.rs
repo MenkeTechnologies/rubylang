@@ -10819,3 +10819,27 @@ fn full_message_renders_the_uncaught_report() {
         "expected true or false as highlight: 1",
     );
 }
+
+/// `obj.extend(M)` makes the object an `M` — `is_a?`, `kind_of?` and `M ===`
+/// answer true — and a builtin mixin reaches it: `extend(Enumerable)` gives
+/// an object with `each` the whole `map`/`sort` surface (and `respond_to?`
+/// agrees), `extend(Comparable)` the `<=>`-derived operators. It used to copy
+/// only a user module's own methods. Expected values from ruby 4.0.7.
+#[test]
+fn extend_makes_the_object_an_instance_of_the_module() {
+    eq(
+        "module M; def hi = 1; end; module N; include M; end; o = Object.new.extend(N); \
+         [o.hi, o.is_a?(N), o.kind_of?(M), N === o, Object.new.is_a?(N)]",
+        "[1, true, true, true, false]",
+    );
+    eq(
+        "class K; def each; yield 2; yield 1; end; end; o = K.new.extend(Enumerable); \
+         [o.map { _1 * 3 }, o.sort, o.respond_to?(:map), K.new.respond_to?(:map)]",
+        "[[6, 3], [1, 2], true, false]",
+    );
+    eq(
+        "class V; attr_reader :v; def initialize(v) = @v = v; def <=>(o) = v <=> o.v; end; \
+         a = V.new(1).extend(Comparable); [a < V.new(2), a.clamp(V.new(3), V.new(4)).v]",
+        "[true, 3]",
+    );
+}

@@ -1463,6 +1463,11 @@ pub struct RubyHost {
     /// Per-object singleton methods (`def obj.m`, `class << obj`, and bare `def`
     /// inside `obj.instance_eval`), keyed by the object's heap id → name → method.
     singleton_methods: IndexMap<u32, IndexMap<String, MethodDef>>,
+    /// The modules each object was `extend`ed with (and the modules those
+    /// include), per heap id — what makes `obj.is_a?(M)` true after
+    /// `obj.extend(M)`, and a builtin mixin (`Enumerable`, `Comparable`) reach
+    /// the object.
+    object_extends: HashMap<u32, Vec<String>>,
     /// `define_singleton_method`-created singletons: object heap id → name → block
     /// Proc. Proc-based (closes over its defining scope), parallel to
     /// `define_methods` but per-object rather than per-class.
@@ -2225,6 +2230,7 @@ impl RubyHost {
             attr_aliases: IndexMap::new(),
             define_methods: IndexMap::new(),
             singleton_methods: IndexMap::new(),
+            object_extends: HashMap::new(),
             singleton_define_methods: IndexMap::new(),
             class_define_methods: IndexMap::new(),
             obj_ivars: IndexMap::new(),
@@ -4970,6 +4976,12 @@ impl RubyHost {
             }
             i += 1;
         }
+        let recorded = self.object_extends.entry(id).or_default();
+        for m in &mods {
+            if !recorded.contains(m) {
+                recorded.push(m.clone());
+            }
+        }
         for mname in &mods {
             if let Some(cd) = self.classes.get(mname).cloned() {
                 for (n, def) in cd.methods {
@@ -5724,6 +5736,12 @@ impl RubyHost {
         }
         if actual == "DateTime" && matches!(class, "Date" | "Comparable") {
             return true;
+        }
+        // A module this object was `extend`ed with (`obj.extend(Enumerable)`).
+        if let Value::Obj(id) = v {
+            if self.object_extends.get(id).is_some_and(|m| m.iter().any(|n| n == class)) {
+                return true;
+            }
         }
         // Walk the ancestry of the value's class when that class is user-defined
         // — covers both a plain user object and a native-backed builtin subclass

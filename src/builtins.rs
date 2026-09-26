@@ -2518,6 +2518,14 @@ pub(crate) fn dispatch(
                 if mixin_provides(&cls, &m) {
                     return Ok(Value::Bool(true));
                 }
+                // The same for a mixin reaching THIS object through `extend`.
+                if (COMPARABLE_METHODS.contains(&m.as_str())
+                    && with_host(|h| h.is_a(recv, "Comparable")))
+                    || (ENUMERABLE_METHODS.contains(&m.as_str())
+                        && with_host(|h| h.is_a(recv, "Enumerable")))
+                {
+                    return Ok(Value::Bool(true));
+                }
                 // A Struct / Data instance responds to the whole GENERATED
                 // surface, none of which is user-defined and so none of which
                 // anything above finds: its members (and, for a Struct, their
