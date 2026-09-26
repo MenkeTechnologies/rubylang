@@ -322,6 +322,18 @@ impl Parser {
         // Parallel assignment is a statement-level form: `a, b = 1, 2`. A comma
         // after a bare lvalue (not consumed by a command call) starts the target
         // list. (Detecting this in `assign()` would misfire on array elements.)
+        // `a = 1, 2` / `a = 1, *rest` — several values assigned to ONE target
+        // pack into an Array. Only a bare `lhs = v` can be followed by a `,`
+        // here, and that was otherwise a parse error.
+        if let Expr::Assign(target, first) = &e {
+            if !leading_splat && !grouped && self.is_op(",") {
+                let mut items = vec![first.as_ref().clone()];
+                while self.eat_op(",") {
+                    items.push(self.multi_value()?);
+                }
+                e = Expr::Assign(target.clone(), Box::new(Expr::Array(items)));
+            }
+        }
         if leading_splat || grouped || self.is_op(",") {
             // A lone group (`(a, b) = …`) IS the target list, not its first
             // element: it destructures the right-hand side itself.
@@ -437,7 +449,18 @@ impl Parser {
             );
             if o == "=" {
                 self.advance();
-                let rhs = self.assign()?;
+                // `a = *x` / `a = *x, y` — a splatted right-hand side packs into
+                // an Array. MRI allows it only as a statement, where nothing else
+                // can own the commas, so they are taken here.
+                let rhs = if self.is_op("*") {
+                    let mut items = vec![self.multi_value()?];
+                    while self.eat_op(",") {
+                        items.push(self.multi_value()?);
+                    }
+                    Expr::Array(items)
+                } else {
+                    self.assign()?
+                };
                 let make = |t: Expr| Expr::Assign(Box::new(t), Box::new(rhs.clone()));
                 return Ok(Self::rebind_assign(lhs, &make));
             } else if compound {

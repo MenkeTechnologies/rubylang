@@ -10690,3 +10690,17 @@ fn a_splat_expands_through_to_a() {
     eq("class SPU; end; [*SPU.new].size", "1");
     eq("[*\"str\", *5]", "[\"str\", 5]");
 }
+
+/// Several values, or a splat, assigned to ONE target pack into an Array:
+/// `a = 1, 2`, `a = *x`, `a = *x, y`. Both forms were parse errors.
+#[test]
+fn several_values_or_a_splat_assigned_to_one_target_pack_an_array() {
+    eq("a = 1, 2; a", "[1, 2]");
+    eq("x = [5]; c = 1, *x; c", "[1, 5]");
+    eq("a = *1..3; a", "[1, 2, 3]");
+    eq("a = *[1, 2], 3; a", "[1, 2, 3]");
+    eq("a = *nil; a", "[]");
+    eq("e = *{k: 1}; e", "[[:k, 1]]");
+    eq("h = {}; h[:k] = 3, 4; h", "{k: [3, 4]}");
+    eq("@pv = 1, 2; @pv", "[1, 2]");
+}
