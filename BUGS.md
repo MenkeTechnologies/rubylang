@@ -626,8 +626,17 @@ keeps both.
   position (`p yield`, `puts yield`, `forwards yield`) — it is an expression and
   never a modifier or a binary operator, so it is unambiguous there; left out of
   the argument-start set the argument was silently dropped and the call printed
-  nothing at all. Still not parsed: nested destructuring targets in a parallel
-  assignment LHS (`(a, (b, c)), d = …`).
+  nothing at all.
+- **Nested destructuring and packed assignment.** A parallel-assignment LHS
+  takes nested groups (`(a, (b, c)), d = …`, `a, (b, *c), d = …`, a lone
+  `(a, b) = …`), each destructured from the element in its position. A single
+  right-hand value, and each nested element, is unpacked through `to_ary` alone
+  (MRI's `rb_check_array_type`), so a Hash, Range or Struct binds whole to the
+  first target (`a, b = {x: 1}` leaves `a == {x: 1}`); a `*x` value keeps
+  `to_a` semantics. Several values or a splat assigned to ONE target pack into
+  an Array (`a = 1, 2`, `a = *x, y`), and `*nil` contributes nothing while a
+  splatted Hash or Struct expands through `to_a`. A quoted label (`{"k": 1}`,
+  `f("k": 1)`, `{"k#{i}": 1}`) is a Symbol key.
 - **Numbered / `it` implicit block params.** Implemented. A block that declares
   no `|params|` records the highest `_1`.`_9` it mentions and synthesizes exactly
   that many required params when it closes; a bare `it` (Ruby 3.4) synthesizes
@@ -1015,8 +1024,8 @@ Honest limitations of this surface:
   `lambda:` keyword and the rule that a NON-lambda proc reports its required
   positionals as `:opt`; a destructuring parameter (`->(a, (b, c)) { }`) is a
   one-element entry, since it has no written name. A destructuring parameter in
-  a `def` list (`def m(a, (b, c))`) still does not parse — the block and lambda
-  forms do. An anonymous keyword collector in a block parameter list
+  a `def` list (`def m(a, (b, c))`) parses and binds like the block form; its
+  `parameters` entry carries the synthetic temp name where MRI's is unnamed. An anonymous keyword collector in a block parameter list
   (`{ |**| }`) does not parse; the named form (`{ |**rest| }`) does.
 - **Named captures suppress the unnamed ones.** A pattern holding ANY named
   group stops numbering its plain `(…)` groups: `/(?<a>b)(c)/.match("bc")` has
@@ -1628,7 +1637,9 @@ Honest limitations of this surface:
   first), the fixed-width integers `s`/`S`/`l`/`L`/`q`/`Q`/`i`/`I`/`j`/`J` (with
    the `<`/`>` byte-order modifiers; an unsigned 64-bit value past `i64::MAX`
    unpacks to a Bignum), the floats `D`/`d`/`E`/`G` (double) and `F`/`f`/`e`/`g`
-   (single), `Z` (NUL-terminated string), `m` (base64, `m0` unbroken), `B`/`b`
+   (single), `Z` (NUL-terminated string), `U` (UTF-8 code points, pack.c's
+   one-to-six-byte form, with `utf8_to_uv`'s three decode refusals; a template
+   opening with `U` answers a UTF-8 string), `m` (base64, `m0` unbroken), `B`/`b`
    (bit strings, MSB/LSB first), `w` (BER-compressed integers), `M`
    (quoted-printable), `u` (uuencode), and the cursor moves `x`/`X`/`@`. A
    template that asks for more elements than the array holds is `ArgumentError:
@@ -1643,7 +1654,9 @@ Honest limitations of this surface:
    `pack`/`unpack` round-trip (`bytes.pack("C*").unpack("C*")`,
    `(0..255).to_a.pack("C*").unpack("C*")`), as does `Integer#chr` (`n →
    U+00nn`, and only for `0..255` — outside that MRI raises `RangeError: N out
-   of char range`). Combining two strings negotiates their encodings as
+   of char range`). `Integer#chr(enc)` is a character of that encoding: UTF-8
+   reaches every scalar value (`0x1F600.chr("UTF-8")`), US-ASCII refuses past
+   `0x7f`, and a surrogate is `invalid codepoint 0xD800 in UTF-8`. Combining two strings negotiates their encodings as
    `rb_enc_compatible` does, for `+`, `<<` and `concat` alike: an ASCII-only
    operand yields to the other one (`"abc".b.concat("é")` is UTF-8 text, tag
    and storage both), and two non-ASCII operands in different encodings raise

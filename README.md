@@ -153,9 +153,10 @@ Implemented and checked against the reference `ruby`:
 - **Parameters & assignment** — splat parameters (`def f(a, *rest)`), block-pass
   by value (`&:sym`, `&proc`, `&method(:m)`, `&nil` = no block) and Ruby 3
   argument forwarding (`def m(...)` / `m(...)`), parallel assignment
-  (`a, b = 1, 2`, array destructuring, swap), block-parameter destructuring
-  (`map { |(a, b), i| … }`, nested and splat groups, `->((a, b)) { }`), default
-  arguments.
+  (`a, b = 1, 2`, array destructuring, swap, nested `(a, (b, c)), d = …` groups,
+  `a = *x, y`), block- and method-parameter destructuring
+  (`map { |(a, b), i| … }`, `def f((a, b), c)`, nested and splat groups,
+  `->((a, b)) { }`), default arguments.
 - **String interpolation** — double-quoted `#{}` interpolation, plus the sigil
   shorthand (`"count: #@n"`, `"path: #$0"`, `"#@@registry"`) in strings,
   heredocs, `:"…"` symbols, regex literals and `%W[]` / `%I[]` arrays.
