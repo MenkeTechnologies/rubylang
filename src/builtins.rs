@@ -110,6 +110,7 @@ pub(crate) fn is_kernel_function(name: &str) -> bool {
             | "format"
             | "sprintf"
             | "printf"
+            | "putc"
             | "sleep"
             | "rand"
             | "srand"
@@ -14668,6 +14669,23 @@ fn dispatch_io(
     block: Option<Value>,
 ) -> Result<Value, String> {
     match name {
+        // `IO#printf(fmt, *args)` — `write(format(fmt, *args))`, answering nil.
+        "printf" if !args.is_empty() => {
+            let out = io_printf_text(args)?;
+            crate::host::io_write_str(recv, &out).map_err(|e| io_err(&e))?;
+            Ok(Value::Undef)
+        }
+        "putc" if args.len() == 1 => {
+            let s = putc_text(&args[0])?;
+            crate::host::io_write_str(recv, &s).map_err(|e| io_err(&e))?;
+            Ok(args[0].clone())
+        }
+        "fileno" | "to_i" => Ok(Value::Int(
+            crate::host::io_fd_info(recv).map_err(|e| io_err(&e))?.0,
+        )),
+        "tty?" | "isatty" => Ok(Value::Bool(
+            crate::host::io_fd_info(recv).map_err(|e| io_err(&e))?.1,
+        )),
         "write" => {
             let mut total = 0usize;
             for a in args {
@@ -19257,20 +19275,19 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             }
             Ok(new_str(sprintf(&fmt, &args[1..], None)?))
         }
-        "printf" => {
+        "printf" if !args.is_empty() => {
             // `printf(fmt, *args)` writes the formatted string to stdout and
             // returns nil. A lone trailing Hash supplies `%<name>s` references.
-            let fmt = arg_str(&args[0]);
-            let out = if args.len() == 2 {
-                match with_host(|h| h.as_hash(&args[1])) {
-                    Some(map) => sprintf(&fmt, &args[1..], Some(&map))?,
-                    None => sprintf(&fmt, &args[1..], None)?,
-                }
-            } else {
-                sprintf(&fmt, &args[1..], None)?
-            };
+            let out = io_printf_text(args)?;
             crate::host::write_stdout(&out);
             Ok(Value::Undef)
+        }
+        // A bare `printf` prints nothing and answers nil.
+        "printf" => Ok(Value::Undef),
+        // `putc(obj)` is `$stdout.putc(obj)`.
+        "putc" if args.len() == 1 => {
+            crate::host::write_stdout(&putc_text(&args[0])?);
+            Ok(args[0].clone())
         }
         "gets" => {
             // MRI's `Kernel#gets` sets `$_` to the line just read (`nil` at EOF).
@@ -24392,6 +24409,30 @@ pub(crate) fn rb_equal_d(a: &Value, b: &Value) -> Result<bool, String> {
     }
     let r = dispatch(a, "==", std::slice::from_ref(b), None)?;
     Ok(with_host(|h| h.truthy(&r)))
+}
+
+/// The text `printf(fmt, *args)` writes: `format(fmt, *args)`, a lone trailing
+/// Hash supplying `%<name>s` references.
+fn io_printf_text(args: &[Value]) -> Result<String, String> {
+    let fmt = arg_str(&args[0]);
+    match args.get(1).filter(|_| args.len() == 2).and_then(|a| with_host(|h| h.as_hash(a))) {
+        Some(map) => sprintf(&fmt, &args[1..], Some(&map)),
+        None => sprintf(&fmt, &args[1..], None),
+    }
+}
+
+/// What `putc(obj)` writes: the first character of a String, or the low byte
+/// of an Integer (anything else through `to_int`).
+fn putc_text(v: &Value) -> Result<String, String> {
+    if let Some(s) = with_host(|h| h.as_str(v)) {
+        return Ok(s.chars().next().map(String::from).unwrap_or_default());
+    }
+    let byte = (to_int(v)? & 0xff) as u8;
+    Ok(if byte.is_ascii() {
+        (byte as char).to_string()
+    } else {
+        String::from_utf8_lossy(&[byte]).into_owned()
+    })
 }
 
 /// The value of keyword `name` in a trailing options Hash, if given.

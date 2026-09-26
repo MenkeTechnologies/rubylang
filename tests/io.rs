@@ -248,3 +248,28 @@ fn kernel_open_delegates_to_file_open() {
     std::fs::write(p, b"kernel").unwrap();
     eq(&format!("open({p:?}) {{ |f| f.read }}"), "\"kernel\"");
 }
+
+/// `IO#printf`, `IO#putc` (and `Kernel#putc`), `IO#fileno` and `IO#tty?`, all
+/// of which raised NoMethodError on a stream or a file. The text goes through
+/// a file so the assertion reads it back. Expected values from ruby 4.0.7.
+#[test]
+fn io_printf_putc_fileno_and_tty() {
+    let d = tmp();
+    let p = d.path().join("pf.txt");
+    let p = p.to_str().unwrap();
+    eq(
+        &format!(
+            "File.open({p:?}, \"w\") {{ |f| [f.printf(\"%05.1f|\", 3.14159), f.putc(65), f.putc(\"xyz\"), f.putc(256 + 66)] }}"
+        ),
+        "[nil, 65, \"xyz\", 322]",
+    );
+    eq(&format!("File.read({p:?})"), "\"003.1|AxB\"");
+    eq(
+        &format!("f = File.open({p:?}); r = [f.fileno.class, f.tty?, STDIN.fileno, STDERR.fileno]; f.close; r"),
+        "[Integer, false, 0, 2]",
+    );
+    eq(
+        &format!("f = File.open({p:?}); f.close; begin; f.fileno; rescue IOError => e; e.message; end"),
+        "\"closed stream\"",
+    );
+}

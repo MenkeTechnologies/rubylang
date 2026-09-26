@@ -11661,6 +11661,28 @@ fn io_id(v: &Value) -> Option<u32> {
     }
 }
 
+/// `IO#fileno` and `IO#tty?` for one handle: the OS descriptor and whether it
+/// is a terminal. A standard stream answers its fixed descriptor; a closed
+/// file is an error, as is a socket (which has no `fileno` here).
+pub fn io_fd_info(v: &Value) -> Result<(i64, bool), String> {
+    use std::io::IsTerminal;
+    let id = io_id(v).ok_or("not an IO")?;
+    with_host(|h| match h.io_handles.get(id as usize) {
+        Some(IoCell::Stdin) => Ok((0, std::io::stdin().is_terminal())),
+        Some(IoCell::Stdout) => Ok((1, std::io::stdout().is_terminal())),
+        Some(IoCell::Stderr) => Ok((2, std::io::stderr().is_terminal())),
+        Some(IoCell::File { file: Some(f), .. }) => {
+            #[cfg(unix)]
+            let fd = i64::from(std::os::unix::io::AsRawFd::as_raw_fd(f));
+            #[cfg(not(unix))]
+            let fd = -1;
+            Ok((fd, f.is_terminal()))
+        }
+        Some(IoCell::File { file: None, .. }) => Err("closed stream".to_string()),
+        _ => Err("not an IO".to_string()),
+    })
+}
+
 /// Whether this handle is closed (`File#closed?`). Standard streams never close.
 pub fn io_closed(v: &Value) -> bool {
     match io_id(v) {
