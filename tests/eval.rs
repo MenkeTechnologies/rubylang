@@ -10568,6 +10568,44 @@ fn every_object_that_can_carry_a_singleton_answers_singleton_class() {
     raises(":s.singleton_class", "TypeError", "can't define singleton");
 }
 
+/// A singleton `to_s`/`inspect` — `def obj.m`, `class << obj`, `extend`,
+/// `define_singleton_method` — is what interpolation, `puts` and `p` render
+/// with, exactly as a class-level one is. The renderers asked only the object's
+/// CLASS, so every singleton override printed the default `#<Object>`.
+#[test]
+fn a_singleton_to_s_or_inspect_is_what_renders_the_object() {
+    eq("o = Object.new; def o.to_s = \"sv\"; \"<#{o}>\"", "\"<sv>\"");
+    eq("o = Object.new; class << o; def to_s = \"cs\"; end; \"#{o}\"", "\"cs\"");
+    eq(
+        "module M; def to_s = \"m\"; end; o = Object.new.extend(M); \"#{o}\"",
+        "\"m\"",
+    );
+    eq(
+        "o = Object.new; o.define_singleton_method(:to_s) { \"d\" }; \"#{o}\"",
+        "\"d\"",
+    );
+    eq("o = Object.new; def o.inspect = \"I\"; [o.inspect, [o].inspect]", "[\"I\", \"[I]\"]");
+    // A singleton beats the class's own definition, and leaves siblings alone.
+    eq(
+        "class SA; def to_s = \"cls\"; end; a = SA.new; def a.to_s = \"one\"; \"#{a} #{SA.new}\"",
+        "\"one cls\"",
+    );
+}
+
+/// `Array#inspect`, `Array#to_s`, `Hash#inspect` and `Hash#to_s` render an
+/// element with its own `inspect`, as `p` already did — they went straight to
+/// the host's default and printed `[#<A>]`.
+#[test]
+fn container_inspect_and_to_s_use_each_elements_own_inspect() {
+    eq("class IA; def inspect = \"I\"; end; [IA.new].inspect", "\"[I]\"");
+    eq("class IB; def inspect = \"I\"; end; [1, [IB.new]].to_s", "\"[1, [I]]\"");
+    eq("class IC; def inspect = \"I\"; end; {a: IC.new}.inspect", "\"{a: I}\"");
+    eq("class ID; def inspect = \"I\"; end; \"#{[ID.new]}\"", "\"[I]\"");
+    // A key renders through its own `inspect` too, bare or inside an Array key.
+    eq("class IE; def inspect = \"K\"; end; {IE.new => 1}.to_s", "\"{K => 1}\"");
+    eq("class IF; def inspect = \"K\"; end; {[IF.new] => 1}.inspect", "\"{[K] => 1}\"");
+}
+
 /// A plain object used as a Hash key is that object: it comes back out of
 /// `keys`/`each`/`key`, and it hashes by identity. It was keyed as its debug
 /// spelling, so `keys.first` was the String `"Obj(93)"`.

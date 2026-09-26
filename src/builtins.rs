@@ -2008,6 +2008,10 @@ pub(crate) fn dispatch(
     match name {
         // Argless `to_s` is the universal default; `to_s(base)` etc. fall through
         // to the per-class dispatch (e.g. `Integer#to_s(2)`).
+        // `Array#to_s` and `Hash#to_s` ARE `inspect`, user elements included.
+        "to_s" if args.is_empty() && is_container(recv) && reaches_user_inspect(recv, 0) => {
+            return Ok(new_str(inspect_of(recv)?));
+        }
         "to_s" if args.is_empty() => {
             return Ok(with_host(|h| {
                 let s = h.to_s(recv);
@@ -2040,12 +2044,9 @@ pub(crate) fn dispatch(
                 out
             }));
         }
-        "inspect" => {
-            return Ok(with_host(|h| {
-                let s = h.inspect(recv);
-                h.new_string(s)
-            }))
-        }
+        // Through `inspect_of`, so an element with its own `inspect` renders
+        // with it: `[obj].inspect` printed `[#<A>]` where `p [obj]` got it right.
+        "inspect" => return Ok(new_str(inspect_of(recv)?)),
         "class" => {
             // `Object#class` returns the Class object (a class reference), not
             // its name — so `5.class == Integer`, `obj.class.name`, and
@@ -23883,14 +23884,12 @@ fn inspect_of(v: &Value) -> Result<String, String> {
     if !reaches_user_inspect(v, 0) {
         return Ok(with_host(|h| h.inspect(v)));
     }
-    if let Some(cls) = with_host(|h| h.object_class(v)) {
-        if with_host(|h| h.find_method(&cls, "inspect")).is_some() {
-            // An `inspect` that raises propagates, as it does in MRI —
-            // swallowing it printed the default `#<A>` for an object whose
-            // rendering had in fact failed.
-            let s = dispatch(v, "inspect", &[], None)?;
-            return Ok(with_host(|h| h.as_str(&s).unwrap_or_default()));
-        }
+    if defines_own(v, "inspect") {
+        // An `inspect` that raises propagates, as it does in MRI — swallowing
+        // it printed the default `#<A>` for an object whose rendering had in
+        // fact failed.
+        let s = dispatch(v, "inspect", &[], None)?;
+        return Ok(with_host(|h| h.as_str(&s).unwrap_or_default()));
     }
     if let Some(items) = with_host(|h| h.as_array(v)) {
         let inner: Vec<String> = items.iter().map(inspect_of).collect::<Result<_, _>>()?;
@@ -23904,7 +23903,10 @@ fn inspect_of(v: &Value) -> Result<String, String> {
             .iter()
             .map(|(k, val)| {
                 let vs = inspect_of(val)?;
-                let prefix = with_host(|h| h.hash_entry_prefix(k));
+                let prefix = match user_key(k, 0) {
+                    Some(key) => format!("{} => ", inspect_of(&key)?),
+                    None => with_host(|h| h.hash_entry_prefix(k)),
+                };
                 Ok(format!("{prefix}{vs}"))
             })
             .collect::<Result<_, String>>()?;
@@ -23920,28 +23922,65 @@ fn reaches_user_inspect(v: &Value, depth: u32) -> bool {
     if depth > 16 {
         return false;
     }
-    if let Some(cls) = with_host(|h| h.object_class(v)) {
-        if with_host(|h| h.find_method(&cls, "inspect")).is_some() {
-            return true;
-        }
+    if defines_own(v, "inspect") {
+        return true;
     }
     if let Some(items) = with_host(|h| h.as_array(v)) {
         return items.iter().any(|x| reaches_user_inspect(x, depth + 1));
     }
     if let Some(map) = with_host(|h| h.as_hash(v)) {
-        return map.values().any(|x| reaches_user_inspect(x, depth + 1));
+        return map.keys().any(|k| user_key(k, depth).is_some())
+            || map.values().any(|x| reaches_user_inspect(x, depth + 1));
     }
     false
+}
+
+/// The key `k` as a value, when it reaches an object with its own `inspect`.
+/// Only an identity-keyed object can, directly or inside an Array key, so every
+/// other key is answered without rebuilding a value for it.
+fn user_key(k: &RKey, depth: u32) -> Option<Value> {
+    fn holds_identity(k: &RKey) -> bool {
+        match k {
+            RKey::Identity(_) => true,
+            RKey::Array(ks) => ks.iter().any(holds_identity),
+            _ => false,
+        }
+    }
+    if !holds_identity(k) {
+        return None;
+    }
+    let key = with_host(|h| h.key_value(k));
+    reaches_user_inspect(&key, depth + 1).then_some(key)
+}
+
+/// An Array or a Hash — the two containers whose `to_s` is their `inspect`.
+fn is_container(v: &Value) -> bool {
+    with_host(|h| h.as_array(v).is_some() || h.as_hash(v).is_some())
+}
+
+/// Whether `v` answers `name` with a user-written method: a singleton
+/// (`def obj.m`, `class << obj`, `obj.extend(M)`, `define_singleton_method`)
+/// or an instance method of its user class. A singleton was missed here, so
+/// `def o.to_s` never reached `puts o` or `"#{o}"`, nor `def o.inspect` `p o`.
+fn defines_own(v: &Value, name: &str) -> bool {
+    with_host(|h| {
+        h.find_singleton_method(v, name).is_some()
+            || h.find_singleton_define_method(v, name).is_some()
+            || h.object_class(v).is_some_and(|cls| h.find_method(&cls, name).is_some())
+    })
 }
 
 /// The display string of a value — a user object's own `to_s` if it defines one,
 /// otherwise the host's default. Used by `puts`/`print`/interpolation.
 fn display(v: &Value) -> String {
-    if let Some(cls) = with_host(|h| h.object_class(v)) {
-        if with_host(|h| h.find_method(&cls, "to_s")).is_some() {
-            if let Ok(s) = dispatch(v, "to_s", &[], None) {
-                return with_host(|h| h.as_str(&s).unwrap_or_default());
-            }
+    if is_container(v) && reaches_user_inspect(v, 0) {
+        if let Ok(s) = inspect_of(v) {
+            return s;
+        }
+    }
+    if defines_own(v, "to_s") {
+        if let Ok(s) = dispatch(v, "to_s", &[], None) {
+            return with_host(|h| h.as_str(&s).unwrap_or_default());
         }
     }
     with_host(|h| h.to_s(v))
