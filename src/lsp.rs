@@ -410,20 +410,32 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     (
         "exit",
         "Kernel",
-        "exit process (true/nil->0, false->1, n->n)",
+        "raise SystemExit (true/nil->0, false->1, n->n); ensure blocks and at_exit handlers run",
         "exit   # terminates the process with status 0",
     ),
     (
         "exit!",
         "Kernel",
-        "exit process (true/nil->0, false->1, n->n)",
+        "leave at once with the status (true/nil->0, false->1, n->n); no ensure, no at_exit",
         "exit!(1)   # terminates the process with status 1",
     ),
     (
         "abort",
         "Kernel",
-        "write optional msg to stderr and exit 1",
+        "write optional msg to stderr, then raise SystemExit with status 1",
         "abort(\"fatal\")   # writes fatal to stderr, exits 1",
+    ),
+    (
+        "at_exit",
+        "Kernel",
+        "register a block to run as the program ends, last registered first; answers it",
+        "at_exit { puts \"bye\" }   # prints bye after the program's output",
+    ),
+    (
+        "putc",
+        "Kernel",
+        "write one character (first of a String, low byte of an Integer); answers the argument",
+        "putc 65   # writes A",
     ),
     // ── Object ──
     (
@@ -459,7 +471,7 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     (
         "==",
         "Object",
-        "host structural equality",
+        "identity; an Array or Hash compares its elements by their own ==",
         "(1 == 1)   # => true",
     ),
     ("!=", "Object", "negation of ==", "(1 != 2)   # => true"),

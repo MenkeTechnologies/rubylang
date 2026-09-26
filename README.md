@@ -395,7 +395,10 @@ alternation binding, the `deconstruct`/`deconstruct_keys` protocol on user
 objects) plus the one-line forms (`expr => pattern` rightward assignment and
 `expr in pattern` boolean match), reserved-word keyword labels
 (`def f(class:)`), `Date`/`Time`/
-`DateTime`, bare `%(…)` strings, and `__END__` are all implemented. See
+`DateTime`, bare `%(…)` strings, and `__END__` are all implemented. `at_exit`
+handlers run last-registered first as the program ends (after an uncaught
+exception too), and an exception carries the backtrace its raise unwound
+through, rendered by `full_message(highlight:, order:)` as MRI prints it. See
 [`BUGS.md`](BUGS.md) for the full known-gaps list.
 
 ---

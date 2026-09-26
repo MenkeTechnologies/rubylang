@@ -360,7 +360,9 @@ exception (`KeyError.new("m")`) answers nil for them, as MRI's does.
   `block (N levels) in <enclosing>` once blocks nest. N counts the block literals
   the code is WRITTEN inside — it is lexical, not a call depth — and `<enclosing>`
   is the method the outermost of them was written in (`K#m`, `K.s`, `<main>`).
-  A lambda body counts as a block. `ProcDef::block_depth` carries N from the
+  A lambda body counts as a block; a `begin`/`rescue`/`ensure` body does not,
+  though it is compiled into a proc too (it counted once, so a block inside
+  `begin` was `block (2 levels)`). `ProcDef::block_depth` carries N from the
   compiler, and the label is built from the proc's CAPTURED scope, so a proc
   written at the top level and called from inside a method is still
   `block in <main>`.
@@ -373,14 +375,21 @@ exception (`KeyError.new("m")`) answers nil for them, as MRI's does.
   block body has returned, so it still reports the enclosing frame
   (`-e:1:in '<main>'` where MRI says `block in <main>`). The class, message,
   `reason` and exit status all agree; only that label does not.
-- **`Exception#backtrace` is `[]`, never `nil` and never populated.** MRI
-  answers `nil` for an exception that was never raised and a real frame list for
-  one that was. rubylang retains no per-exception Ruby backtrace (see the line-0
-  note above), so both cases answer the same empty Array. Callers splat it or
-  call `.first` on it, so `[]` is the safer of the two wrong answers.
-- **`Exception#full_message` takes no keyword arguments.**
-  `full_message(highlight: false, order: :top)` raises
-  `ArgumentError: wrong number of arguments (given 1, expected 0)`.
+- **`Exception#backtrace`, `#set_backtrace`, `#full_message` and
+  `#detailed_message` — fixed.** `backtrace` answers the frames the raise
+  unwound through (nil until the exception is raised or given one), and a
+  rescued or `set_backtrace` exception keeps its frames when raised again.
+  `full_message(highlight:, order:)` renders the uncaught report in either
+  order with MRI's highlight escapes; the arity table had it taking no
+  keywords (see `tools/gen_arity_table.rb`, which now counts a method that
+  ignores an unknown keyword as taking keywords). Pinned by
+  `tests/eval.rs::full_message_renders_the_uncaught_report` and
+  `tests/uncaught.rs::a_reraised_exception_keeps_its_first_backtrace`.
+  Residue: the frames list only Ruby frames — MRI also lists the builtin a
+  block ran under (`from -e:1:in 'Array#each'`) and the frames above the
+  rescue; `backtrace_locations` is `[]` (no `Thread::Backtrace::Location`);
+  and ErrorHighlight's source snippet is never appended (see the
+  `ErrorHighlight` entry below).
 - **`eval` reports a syntax error as a `RuntimeError`.** MRI raises
   `SyntaxError`, which is a `ScriptError` and therefore NOT caught by a bare
   `rescue`; rubylang's is caught by one. The class tree is right —
@@ -590,6 +599,11 @@ keeps both.
 
 ## Language
 
+- **`rescue => target` — fixed.** The binding is an ASSIGNMENT from `$!` to a
+  variable of the ENCLOSING scope, so a local survives the `begin` (it was a
+  block-local parameter of the clause, and read as an undefined name after
+  it), and `@ivar`, `@@cvar` and `$global` targets parse. Pinned by
+  `tests/eval.rs::a_rescue_binding_is_a_variable_of_the_enclosing_scope`.
 - **`extend` / `prepend` / `class << self`.** `extend M` in a class/module body
   mixes `M`'s instance methods in as class methods; `prepend M` inserts `M`
   ahead of the class in the ancestor chain (so its methods override and `super`
@@ -727,6 +741,16 @@ keeps both.
 
 ## Metaprogramming / reflection / eval
 
+- **`obj.extend(M)`, anonymous classes and composition — fixed.** An extended
+  object IS an `M` (`is_a?`, `kind_of?`, `M ===`), and `extend(Enumerable)` /
+  `extend(Comparable)` give it the `each`- and `<=>`-derived surface.
+  `Class.new(StandardError)` keeps its superclass chain, so `rescue` catches
+  it (its `#<Class:N>` name was read as a METACLASS). `Method#>>`/`#<<` exist,
+  and either half of a composition may be any object with `call`. Still open:
+  `obj.singleton_class.ancestors`/`.include?(M)` and `obj.method(:m).owner` do
+  not reflect an `extend`; `singleton_class.instance_methods(false)` omits
+  `class << obj` methods; `Method#super_method` is not implemented.
+
 Implemented and verified against the reference `ruby`:
 
 - **Singleton methods.** `def obj.m` and `def Klass.m` parse and run: an object
@@ -777,8 +801,7 @@ Implemented and verified against the reference `ruby`:
   and raises `NoMethodError` for `#receiver`, while `#name`/`#arity`/`#owner`/
   `#parameters` describe the class it was looked up on. `#inspect` is
   `#<UnboundMethod: Owner#name>` — MRI also appends the written parameter list and
-  the definition's source location, neither of which rubylang retains (the same
-  reason `Exception#backtrace` is empty).
+  the definition's source location, neither of which rubylang retains.
   Still open:
   - `Object#public_method` and `Object#singleton_method` are not implemented at
     all, so they raise `undefined method` rather than the `NameError` (or the
@@ -973,6 +996,16 @@ Honest limitations of this surface:
   spaced-command-arg symbols (`:foo`, `p :bar`, `[:a, :b]`) are unaffected.
 
 ## Runtime / methods
+
+- **Equality runs the element's own `==` — fixed.** `Array#==`, `Hash#==`,
+  `include?`, `index`/`rindex`, `count` and `delete` compare through a user
+  `==` (or the one `Comparable` derives from `<=>`, which answers true for the
+  object itself without calling `<=>`), and `!=` negates the receiver's own
+  `==`. A class that defines `<=>` without including `Comparable` keeps
+  identity `==`, as in MRI. Residue: `1 == obj` does not retry as `obj == 1`.
+  `Enumerable` also derives `to_set`, `each_entry`, `compact`, `minmax_by`,
+  `slice_after`, `slice_before`, `cycle` and `chain`; `Array#join` converts
+  elements through `to_str`/`to_ary`/`to_s`.
 
 - **Argument counts on built-ins are checked once, from a measured table.** Every
   built-in dispatch arm reads its arguments positionally (`args[0]`), so a call
@@ -1909,6 +1942,14 @@ text is byte-exact. (2) The streaming `Digest` instance API
 class-level one-shot `hexdigest`/`digest`/`base64digest`.
 
 ## File / IO / Dir
+
+- **`puts`, `printf`, `putc`, `fileno`, `tty?` — fixed.** One renderer serves
+  every `puts` (Kernel, IO, TCPSocket, StringIO): an empty Array writes
+  nothing (MRI 4), a self-holding Array prints `[...]`, and `StringIO#puts`
+  flattens rather than writing the Array's inspect form. `IO#printf`,
+  `IO#putc`/`Kernel#putc`, `IO#fileno`/`#to_i` and `IO#tty?`/`#isatty` exist.
+  Residue: `putc` of a byte above 0x7F writes U+FFFD, since program output is
+  UTF-8 text.
 
 Backed by `std::fs`/`std::io`, verified method-by-method against the reference
 `ruby`. The `std::fs::File` is stored in a host side table (`io_handles`),
