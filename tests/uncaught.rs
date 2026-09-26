@@ -311,3 +311,23 @@ fn a_reraised_exception_keeps_its_first_backtrace() {
         )
     );
 }
+
+/// A `begin`/`rescue`/`ensure` body is not a block literal, so a block written
+/// inside one is still `block in <main>` — the begin body used to count as a
+/// level and name it `block (2 levels) in <main>`. Captured from ruby 4.0.7.
+#[test]
+fn a_begin_body_does_not_count_as_a_block_level() {
+    let (out, err, rc) = run_e_full(
+        "begin; [1].each { raise \"a\" }; rescue => e; puts e.backtrace.first; end\n\
+         [1].each { begin; [2].each { raise \"b\" }; rescue => e; puts e.backtrace.first; end }\n\
+         begin; x = 1; ensure; [3].each { begin; raise \"c\"; rescue => e; puts e.backtrace.first; end }; end",
+    );
+    assert_eq!(
+        (out.as_str(), err.as_str(), rc),
+        (
+            "-e:1:in 'block in <main>'\n-e:2:in 'block (2 levels) in <main>'\n-e:3:in 'block in <main>'\n",
+            "",
+            0
+        )
+    );
+}

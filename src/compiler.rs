@@ -2553,12 +2553,19 @@ impl Compiler {
         // through `compile_proc_body` is not — it only inherits the depth of
         // whatever encloses it), so track the nesting here.
         let saved_redo = std::mem::replace(&mut self.redo_ok, true);
+        // How many block literals this one is written inside, counting itself —
+        // what MRI's `block (N levels) in X` counts. Only a block LITERAL counts:
+        // a `begin`/`rescue`/`ensure` body is compiled into a proc too, but MRI
+        // does not name it as a block, so a block inside `begin` is still
+        // `block in <main>`.
+        self.block_depth += 1;
         let r = self.compile_proc_body_arity(
             &block.body,
             &block.params,
             block.splat,
             block.arity.clone(),
         );
+        self.block_depth -= 1;
         self.redo_ok = saved_redo;
         r
     }
@@ -2613,13 +2620,10 @@ impl Compiler {
         let mut frame = self.scope_locals.last().cloned().unwrap_or_default();
         frame.extend(params.iter().cloned());
         self.scope_locals.push(frame);
-        // How many block literals this one is written inside, counting itself —
-        // what MRI's `block (N levels) in X` counts. Incremented across the BODY
-        // so a block nested in this one sees one more.
-        self.block_depth += 1;
-        let block_depth = self.block_depth;
+        // The block nesting `compile_proc` counted (at least 1: a `begin` body at
+        // the top level is not a block, but its proc still carries a label depth).
+        let block_depth = self.block_depth.max(1);
         let chunk = self.compile_body_chunk(body);
-        self.block_depth -= 1;
         self.scope_locals.pop();
         let chunk = chunk?;
         let id = self.procs.len();
