@@ -465,6 +465,17 @@ fn push_local(name: &str, out: &mut Vec<String>) {
 
 /// Record the locals an assignment target binds (`a`, `*rest`, or a nested
 /// destructuring target list).
+/// `__masgn_ary(value)`: the array a parallel assignment destructures `value`
+/// as — an Array itself, a user `to_ary`'s answer, or else `[value]`.
+fn masgn_ary(value: Expr) -> Expr {
+    Expr::Call {
+        recv: None,
+        name: "__masgn_ary".into(),
+        args: vec![value],
+        block: None,
+    }
+}
+
 fn for_locals_target(t: &Expr, out: &mut Vec<String>) {
     match t {
         Expr::Var(VarKind::Local, n) => push_local(n, out),
@@ -985,10 +996,21 @@ impl Compiler {
             }
             Expr::MultiAssign { targets, values } => {
                 for t in targets {
-                    if let Expr::Var(VarKind::Local, n) = t {
-                        if !out.contains(n) {
-                            out.push(n.clone());
+                    match t {
+                        Expr::Var(VarKind::Local, n) => {
+                            if !out.contains(n) {
+                                out.push(n.clone());
+                            }
                         }
+                        // A nested `(b, c)` group declares its names too.
+                        Expr::Array(inner) => Self::collect_default_locals(
+                            &Expr::MultiAssign {
+                                targets: inner.clone(),
+                                values: Vec::new(),
+                            },
+                            out,
+                        ),
+                        _ => {}
                     }
                 }
                 for v in values {
@@ -1893,27 +1915,43 @@ impl Compiler {
         targets: &[Expr],
         values: &[Expr],
     ) -> Result<(), String> {
-        let tmp = "__massign__";
-        // rhs = a single Array or the coerced value list. A lone `*x` value
-        // (`a, b = *x`) is just `x` coerced to an array — unwrap the splat so it
-        // is not spread into `Array`'s own arguments.
-        let rhs = if values.len() == 1 {
-            let inner = match &values[0] {
-                Expr::Splat(e) => e.as_ref().clone(),
-                other => other.clone(),
-            };
-            Expr::Call {
+        // rhs = the coerced value list. A lone `*x` value (`a, b = *x`) is `x`
+        // splatted — `to_a` — so it goes through `Array`; any other lone value
+        // is destructured only if it is array-LIKE (`to_ary`), which a Hash, a
+        // Range or a Struct is not: `a, b = {x: 1}` binds the whole Hash to `a`.
+        let rhs = match values {
+            [Expr::Splat(e)] => Expr::Call {
                 recv: None,
                 name: "Array".into(),
-                args: vec![inner],
+                args: vec![e.as_ref().clone()],
                 block: None,
-            }
-        } else {
-            Expr::Array(values.to_vec())
+            },
+            [one] => masgn_ary(one.clone()),
+            _ => Expr::Array(values.to_vec()),
         };
-        self.compile_assign(b, &Expr::Var(VarKind::Local, tmp.into()), &rhs)?;
+        self.compile_destructure(b, targets, &rhs, 0)
+    }
+
+    /// Assign `targets` from the array `rhs` evaluates to, leaving that array on
+    /// the stack. A nested `(b, c)` target (an `Expr::Array` of targets)
+    /// destructures the element in its position the same way, one level deeper
+    /// — each level with its own synthetic local, so the inner walk cannot
+    /// clobber the array the outer one is still indexing.
+    fn compile_destructure(
+        &mut self,
+        b: &mut ChunkBuilder,
+        targets: &[Expr],
+        rhs: &Expr,
+        depth: usize,
+    ) -> Result<(), String> {
+        let tmp = if depth == 0 {
+            "__massign__".to_string()
+        } else {
+            format!("__massign{depth}__")
+        };
+        self.compile_assign(b, &Expr::Var(VarKind::Local, tmp.clone()), rhs)?;
         b.emit(Op::Pop, 0);
-        let tmp_var = || Expr::Var(VarKind::Local, tmp.into());
+        let tmp_var = || Expr::Var(VarKind::Local, tmp.clone());
         let splat_at = targets.iter().position(|t| matches!(t, Expr::Splat(_)));
         for (i, t) in targets.iter().enumerate() {
             // Value expression the target is assigned from.
@@ -1961,10 +1999,15 @@ impl Compiler {
                     Expr::Index(Box::new(tmp_var()), vec![Expr::Int(i as i64)]),
                 ),
             };
-            self.compile_assign(b, target, &value)?;
+            match target {
+                Expr::Array(inner) => {
+                    self.compile_destructure(b, inner, &masgn_ary(value), depth + 1)?
+                }
+                _ => self.compile_assign(b, target, &value)?,
+            }
             b.emit(Op::Pop, 0);
         }
-        self.compile_var_read(b, VarKind::Local, tmp);
+        self.compile_var_read(b, VarKind::Local, &tmp);
         Ok(())
     }
 

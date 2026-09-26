@@ -19008,6 +19008,33 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             let s = h.to_s(&args[0]);
             h.new_string(s)
         })),
+        // The array a parallel assignment or a destructuring param unpacks a
+        // single value as: MRI's `rb_check_array_type`, i.e. `to_ary` and
+        // nothing else. An Array is itself; an object with its own `to_ary` is
+        // what that answers; everything else — a Hash, a Range, a Struct, nil —
+        // is ONE value, so `a, b = {x: 1}` binds the whole Hash to `a`, where
+        // routing this through `Array()` split it into `[:x, 1]`.
+        "__masgn_ary" => {
+            let v = &args[0];
+            if let Some(a) = with_host(|h| h.as_array(v)) {
+                return Ok(new_arr(a));
+            }
+            if defines_own(v, "to_ary") {
+                let a = dispatch(v, "to_ary", &[], None)?;
+                if let Some(items) = with_host(|h| h.as_array(&a)) {
+                    return Ok(new_arr(items));
+                }
+                if !matches!(a, Value::Undef) {
+                    let cls = with_host(|h| h.class_of(v));
+                    let got = with_host(|h| h.class_of(&a));
+                    return Err(raise_exc(
+                        "TypeError",
+                        &format!("can't convert {cls} to Array ({cls}#to_ary gives {got})"),
+                    ));
+                }
+            }
+            Ok(new_arr(vec![v.clone()]))
+        }
         "Array" => Ok(match with_host(|h| h.as_array(&args[0])) {
             Some(a) => with_host(|h| h.new_array(a)),
             // A class/module has no `to_a`/`to_ary`, so wrap it as a one-element

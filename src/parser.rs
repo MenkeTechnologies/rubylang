@@ -264,34 +264,78 @@ impl Parser {
         Ok(lhs)
     }
 
+    /// One target of a parallel assignment: `*rest`, a nested `(a, (b, *c))`
+    /// group — kept as an `Expr::Array` of its own targets, which the compiler
+    /// destructures from the element in that position — or an ordinary lvalue.
+    fn masgn_target(&mut self) -> Result<Expr, String> {
+        if self.eat_op("*") {
+            return Ok(Expr::Splat(Box::new(self.ternary()?)));
+        }
+        if self.eat_op("(") {
+            let mut items = vec![self.masgn_target()?];
+            while self.eat_op(",") {
+                items.push(self.masgn_target()?);
+            }
+            self.expect_op(")")?;
+            return Ok(Expr::Array(items));
+        }
+        self.ternary()
+    }
+
+    /// A statement that opens with `(` is a nested destructuring group only when
+    /// the group parses as targets AND a `,` or `=` follows it: `(a, b), c = …`,
+    /// `(a, b) = …`. Anything else — `(x + 1) * 2`, `(a; b)` — rewinds, and the
+    /// statement is read as the parenthesized expression it is.
+    fn try_leading_group(&mut self) -> Option<Expr> {
+        let (pos, tmp) = (self.pos, self.tmp);
+        match self.masgn_target() {
+            Ok(g @ Expr::Array(_)) if self.is_op(",") || self.is_op("=") => Some(g),
+            _ => {
+                self.pos = pos;
+                self.tmp = tmp;
+                None
+            }
+        }
+    }
+
     /// A statement is an expression optionally followed by a trailing modifier
     /// (`expr if cond`, `expr while cond`, …).
     fn statement(&mut self) -> Result<Expr, String> {
         // A leading `*` begins a parallel assignment whose first target is a
         // splat (`*x, y = 1, 2, 3` or `*x = 1, 2`); `expr()` cannot start with `*`.
         let leading_splat = self.is_op("*");
+        // A leading `(a, b), c = …` group is a nested destructuring target.
+        let leading_group = if self.is_op("(") {
+            self.try_leading_group()
+        } else {
+            None
+        };
+        let grouped = leading_group.is_some();
         let mut e = if leading_splat {
             self.advance();
             Expr::Splat(Box::new(self.ternary()?))
+        } else if let Some(group) = leading_group {
+            group
         } else {
             self.expr()?
         };
         // Parallel assignment is a statement-level form: `a, b = 1, 2`. A comma
         // after a bare lvalue (not consumed by a command call) starts the target
         // list. (Detecting this in `assign()` would misfire on array elements.)
-        if leading_splat || self.is_op(",") {
-            let mut targets = vec![e];
+        if leading_splat || grouped || self.is_op(",") {
+            // A lone group (`(a, b) = …`) IS the target list, not its first
+            // element: it destructures the right-hand side itself.
+            let mut targets = match e {
+                Expr::Array(inner) if grouped && self.is_op("=") => inner,
+                e => vec![e],
+            };
             while self.eat_op(",") {
                 // A trailing comma with no further target (`x, = arr`) is a
                 // single-element destructure — bind the first element of the RHS.
                 if self.is_op("=") {
                     break;
                 }
-                if self.eat_op("*") {
-                    targets.push(Expr::Splat(Box::new(self.ternary()?)));
-                } else {
-                    targets.push(self.ternary()?);
-                }
+                targets.push(self.masgn_target()?);
             }
             self.expect_op("=")?;
             // A value may be a `*expr` splat (`a, b = *arr`, `a, b = 1, *rest`).
@@ -2704,28 +2748,29 @@ impl Parser {
             self.advance();
             name.push('=');
         }
+        let mut preludes = Vec::new();
         let mut params = Vec::new();
         if self.eat_op("(") {
             // Multi-line param lists: newlines inside the paren are insignificant.
             self.skip_nl();
             if !self.is_op(")") {
-                self.push_param(&mut params)?;
+                self.push_param(&mut params, &mut preludes)?;
                 self.skip_nl();
                 while self.eat_op(",") {
                     self.skip_nl();
                     if self.is_op(")") {
                         break;
                     }
-                    self.push_param(&mut params)?;
+                    self.push_param(&mut params, &mut preludes)?;
                     self.skip_nl();
                 }
             }
             self.expect_op(")")?;
         } else if !matches!(self.peek(), Tok::Newline | Tok::Semicolon) && !self.is_op("=") {
             // paren-less params (but `def name = expr` is an endless def, not a param)
-            self.push_param(&mut params)?;
+            self.push_param(&mut params, &mut preludes)?;
             while self.eat_op(",") {
-                self.push_param(&mut params)?;
+                self.push_param(&mut params, &mut preludes)?;
             }
         }
         // The def body (and an endless def's expression) is a fresh statement
@@ -2742,7 +2787,7 @@ impl Parser {
             return Ok(Expr::Def {
                 name,
                 params,
-                body: vec![Stmt { expr, line }],
+                body: self.prepend_preludes(preludes, vec![Stmt { expr, line }]),
                 singleton,
                 singleton_recv,
             });
@@ -2750,6 +2795,7 @@ impl Parser {
         let body = self.body_with_rescue()?;
         self.expect_kw("end")?;
         self.no_do_block = saved_no_do;
+        let body = self.prepend_preludes(preludes, body);
         Ok(Expr::Def {
             name,
             params,
@@ -2786,7 +2832,27 @@ impl Parser {
     /// Parse one parameter into `params`. Ruby 3's `...` forwarding parameter
     /// (`def m(...)`) expands to the three anonymous collectors a matching
     /// `m(...)` call forwards: a positional rest, a keyword rest, and a block.
-    fn push_param(&mut self, params: &mut Vec<Param>) -> Result<(), String> {
+    fn push_param(
+        &mut self,
+        params: &mut Vec<Param>,
+        preludes: &mut Vec<Expr>,
+    ) -> Result<(), String> {
+        // `def f((a, b), c)` — a destructuring group binds one positional
+        // argument to a fresh temp and unpacks it at the top of the body, the
+        // same desugaring a block's `|(a, b)|` gets.
+        if self.is_op("(") {
+            let (temp, assigns) = self.destructure_param()?;
+            preludes.extend(assigns);
+            params.push(Param {
+                name: temp,
+                default: None,
+                splat: false,
+                keyword: false,
+                kwsplat: false,
+                block: false,
+            });
+            return Ok(());
+        }
         if self.eat_op("...") {
             params.push(Param {
                 name: FWD_REST.into(),

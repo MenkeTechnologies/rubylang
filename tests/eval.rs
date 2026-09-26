@@ -10623,3 +10623,41 @@ fn an_object_hash_key_is_the_object_itself() {
     eq("pr = proc { 7 }; h = {pr => :x}; [h[pr], h.keys.first.call]", "[:x, 7]");
     eq("class HN; end; x = HN.new; [[x, x, HN.new].uniq.size, [x, x].tally.values]", "[2, [2]]");
 }
+
+/// A nested `(b, c)` group in a parallel-assignment LHS, a leading group, a
+/// lone group, and a destructuring `def` parameter — all rejected by the
+/// parser before (`expected '=', found ')'`, `expected identifier`).
+#[test]
+fn nested_destructuring_targets_and_def_params() {
+    eq("(a, (b, c)), d = [1, [2, 3]], 4; [a, b, c, d]", "[1, 2, 3, 4]");
+    eq("a, (b, *c), d = 1, [2, 3, 4], 5; [a, b, c, d]", "[1, 2, [3, 4], 5]");
+    eq("(a, b) = [3, 4]; [a, b]", "[3, 4]");
+    // A scalar in a group's position binds its first name; the rest are nil.
+    eq("a, (b, c) = 1, 5; [a, b, c]", "[1, 5, nil]");
+    eq("def dp1((a, b), c) = [a, b, c]; dp1([1, 2], 3)", "[1, 2, 3]");
+    eq("def dp2(x, (y, (z, w))); [x, y, z, w]; end; dp2(1, [2, [3, 4]])", "[1, 2, 3, 4]");
+    // A statement that merely starts with `(` is still an expression.
+    eq("x = 2; (x + 1) * 3", "9");
+    eq("(y = 4); y", "4");
+}
+
+/// A single right-hand value is destructured through `to_ary` alone, which a
+/// Hash, a Range and a Struct do not have: MRI binds the whole value to the
+/// first target. Going through `Array()` split a Hash into `[:x, 1]` — in a
+/// parallel assignment and in a block's `|(k, v)|` group alike.
+#[test]
+fn a_single_value_is_destructured_only_through_to_ary() {
+    eq("a, b = {x: 1}; [a, b]", "[{x: 1}, nil]");
+    eq("a, b = 1..3; [a, b]", "[1..3, nil]");
+    eq("S9 = Struct.new(:m, :n); a, b = S9.new(1, 2); [a.class, b]", "[S9, nil]");
+    eq("r = []; [[1, {y: 2}]].each { |q, (s, t)| r = [s, t] }; r", "[{y: 2}, nil]");
+    eq("class TA; def to_ary = [7, 8]; end; a, b = TA.new; [a, b]", "[7, 8]");
+    eq("class TB; def to_a = [7, 8]; end; a, b = TB.new; [a.class, b]", "[TB, nil]");
+    // A splat still means `to_a`.
+    eq("a, b = *(1..3); [a, b]", "[1, 2]");
+    raises(
+        "class TC; def to_ary = 5; end; a, b = TC.new",
+        "TypeError",
+        "can't convert TC to Array (TC#to_ary gives Integer)",
+    );
+}
