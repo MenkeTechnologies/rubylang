@@ -14941,20 +14941,9 @@ fn dispatch_tcp_socket(
 /// `TCPSocket#puts` for one argument: arrays flatten; scalars get a trailing
 /// `\n` only if their string form lacks one (mirrors `io_puts_arg`).
 fn tcp_puts_arg(recv: &Value, v: &Value) -> Result<(), String> {
-    if let Some(arr) = with_host(|h| h.as_array(v)) {
-        if arr.is_empty() {
-            crate::host::tcp_write(recv, "\n").map_err(|e| io_err(&e))?;
-        }
-        for e in &arr {
-            tcp_puts_arg(recv, e)?;
-        }
-    } else {
-        let mut s = display(v);
-        if !s.ends_with('\n') {
-            s.push('\n');
-        }
-        crate::host::tcp_write(recv, &s).map_err(|e| io_err(&e))?;
-    }
+    let mut s = String::new();
+    puts_text(v, &mut s, &mut Vec::new());
+    crate::host::tcp_write(recv, &s).map_err(|e| io_err(&e))?;
     Ok(())
 }
 
@@ -15572,22 +15561,12 @@ fn dispatch_fiddle_pointer(recv: &Value, name: &str, args: &[Value]) -> Result<V
 }
 
 /// `IO#puts` for one argument: arrays flatten (each element on its own line),
-/// scalars get a trailing `\n` only if their string form lacks one.
+/// scalars get a trailing `\n` only if their string form lacks one. An empty
+/// Array writes nothing: `puts []` is silent in MRI 4, where it was one newline.
 fn io_puts_arg(recv: &Value, v: &Value) -> Result<(), String> {
-    if let Some(arr) = with_host(|h| h.as_array(v)) {
-        if arr.is_empty() {
-            crate::host::io_write_str(recv, "\n").map_err(|e| io_err(&e))?;
-        }
-        for e in &arr {
-            io_puts_arg(recv, e)?;
-        }
-    } else {
-        let mut s = display(v);
-        if !s.ends_with('\n') {
-            s.push('\n');
-        }
-        crate::host::io_write_str(recv, &s).map_err(|e| io_err(&e))?;
-    }
+    let mut s = String::new();
+    puts_text(v, &mut s, &mut Vec::new());
+    crate::host::io_write_str(recv, &s).map_err(|e| io_err(&e))?;
     Ok(())
 }
 
@@ -19472,22 +19451,37 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
 }
 
 fn puts_one(v: &Value) {
+    let mut s = String::new();
+    puts_text(v, &mut s, &mut Vec::new());
+    crate::host::write_stdout(&s);
+}
+
+/// What `puts` writes for ONE argument — every `puts` (Kernel, IO, TCPSocket,
+/// StringIO) renders through here. An Array is flattened, one line per
+/// element, and writes nothing when empty (`puts []` is silent in MRI 4); an
+/// Array that holds itself renders the reentry as `[...]`. Anything else is its
+/// `to_s` plus a newline unless it already ends in one.
+fn puts_text(v: &Value, out: &mut String, seen: &mut Vec<u32>) {
     if let Some(arr) = with_host(|h| h.as_array(v)) {
-        if arr.is_empty() {
-            crate::host::write_stdout("\n");
+        if let Value::Obj(id) = v {
+            if seen.contains(id) {
+                out.push_str("[...]\n");
+                return;
+            }
+            seen.push(*id);
         }
         for e in &arr {
-            puts_one(e);
+            puts_text(e, out, seen);
         }
-    } else {
-        // Ruby's `puts` appends a newline only when the value's string form does
-        // not already end in one.
-        let s = display(v);
-        if s.ends_with('\n') {
-            crate::host::write_stdout(&s);
-        } else {
-            crate::host::write_stdout(&format!("{s}\n"));
+        if matches!(v, Value::Obj(_)) {
+            seen.pop();
         }
+        return;
+    }
+    let s = display(v);
+    out.push_str(&s);
+    if !s.ends_with('\n') {
+        out.push('\n');
     }
 }
 
@@ -23751,11 +23745,7 @@ fn stringio_method(
                 buf.push('\n');
             } else {
                 for a in args {
-                    let s = with_host(|h| h.to_s(a));
-                    buf.push_str(&s);
-                    if !s.ends_with('\n') {
-                        buf.push('\n');
-                    }
+                    puts_text(a, &mut buf, &mut Vec::new());
                 }
             }
             let end = buf.len();

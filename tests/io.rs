@@ -273,3 +273,23 @@ fn io_printf_putc_fileno_and_tty() {
         "\"closed stream\"",
     );
 }
+
+/// Every `puts` renders one way: an Array flattens one line per element, an
+/// empty Array writes nothing (MRI 4 — it used to be a newline), a self-holding
+/// Array prints `[...]`, and `StringIO#puts` flattens instead of writing the
+/// Array's inspect form. Expected values from ruby 4.0.7.
+#[test]
+fn puts_flattens_arrays_the_same_on_every_stream() {
+    eq(
+        "require \"stringio\"; io = StringIO.new; io.puts [1, [2, nil]], nil, \"a\\n\", []; \
+         a = [1]; a << a; io.puts a; io.puts; io.string",
+        "\"1\\n2\\n\\n\\na\\n1\\n[...]\\n\\n\"",
+    );
+    let d = tmp();
+    let p = d.path().join("puts.txt");
+    let p = p.to_str().unwrap();
+    eq(
+        &format!("File.open({p:?}, \"w\") {{ |f| f.puts []; f.puts 1, [], [[]] }}; File.read({p:?})"),
+        "\"1\\n\"",
+    );
+}
