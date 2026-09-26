@@ -10741,3 +10741,19 @@ fn integer_chr_with_an_encoding_answers_a_character_of_it() {
     raises("0x110000.chr(\"UTF-8\")", "RangeError", "1114112 out of char range");
     raises("233.chr(\"US-ASCII\")", "RangeError", "invalid codepoint 0xE9 in US-ASCII");
 }
+
+/// `Array#join` converts a non-Array element through the object's own
+/// `to_str`, then `to_ary` (joined recursively), then `to_s`. A user-defined
+/// `to_s` used to be ignored in favour of the default `#<Y>` spelling.
+#[test]
+fn join_converts_elements_through_user_conversions() {
+    eq(
+        "class Y; def to_s; \"ys\"; end; end; [Y.new, 1, [Y.new]].join(\",\")",
+        "\"ys,1,ys\"",
+    );
+    eq(
+        "class S; def to_str; \"st\"; end; def to_s; \"no\"; end; end; \
+         class A; def to_ary; [1, [2, 3]]; end; end; [S.new, A.new].join(\"-\")",
+        "\"st-1-2-3\"",
+    );
+}

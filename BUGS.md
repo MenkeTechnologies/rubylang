@@ -289,10 +289,9 @@ smaller thread stack and prove nothing about `ruby -e`.
   One MRI strictness remains unmatched at the top level, where locals are
   slot-lowered: `p y; y = 1` reads nil there rather than raising, since the slot
   exists for the whole scope.
-- **`p obj` does not dispatch a user-defined `#inspect`**, and `Array#join` does
-  not dispatch a user-defined `#to_s`. `Class.new { def inspect; "Y"; end }.new`
-  inspects as `#<#<Class:1>>` rather than `Y`; `[obj].join(",")` stringifies the
-  default form rather than calling the object's `to_s`.
+- **`p obj` dispatches a user-defined `#inspect`, and `Array#join` converts an
+  element through its own `to_str`, `to_ary` and `to_s` — fixed.** Pinned by
+  `tests/eval.rs::join_converts_elements_through_user_conversions`.
 
 ## Exception SHAPE, not exception wording
 

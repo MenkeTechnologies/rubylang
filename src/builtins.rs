@@ -12766,7 +12766,28 @@ fn join_into(
         }
         match with_host(|h| h.as_array(x)) {
             Some(inner) => join_into(x, &inner, sep, out, seen)?,
-            None => out.push_str(&with_host(|h| h.to_s(x))),
+            None => {
+                // MRI converts a non-Array element with `to_str`, then `to_ary`
+                // (joined recursively), then `to_s`, so a user-defined conversion
+                // is what lands in the joined string.
+                let conv = ["to_str", "to_ary", "to_s"]
+                    .into_iter()
+                    .find(|m| defines_own(x, m));
+                match conv {
+                    Some("to_ary") => {
+                        let a = dispatch(x, "to_ary", &[], None)?;
+                        match with_host(|h| h.as_array(&a)) {
+                            Some(inner) => join_into(&a, &inner, sep, out, seen)?,
+                            None => out.push_str(&with_host(|h| h.to_s(x))),
+                        }
+                    }
+                    Some(m) => {
+                        let s = dispatch(x, m, &[], None)?;
+                        out.push_str(&with_host(|h| h.to_s(&s)));
+                    }
+                    None => out.push_str(&with_host(|h| h.to_s(x))),
+                }
+            }
         }
     }
     if matches!(this, Value::Obj(_)) {
