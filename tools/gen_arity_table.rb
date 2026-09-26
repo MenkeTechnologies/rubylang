@@ -314,7 +314,7 @@ module Gen
   # ignores an unknown keyword with no positional and complains about it with one.
   def keywords?(recv, name, min, max)
     return false if max.negative?
-    [min, max].uniq.any? { |n| kw_refused?(recv, name, n) }
+    [min, max].uniq.any? { |n| kw_refused?(recv, name, n, n == max) }
   end
 
   # The values tried as positional FILLER, in order. `SENTINEL` is deliberately a
@@ -333,12 +333,16 @@ module Gen
   # a positional — so a wrong answer here costs coverage, never correctness.
   KW_FILLERS = [SENTINEL, 0].freeze
 
-  # Whether `n` positional arguments plus one unknown keyword is refused FOR THE
-  # KEYWORD. False for every other outcome, including the call being accepted:
-  # a count MRI accepts needs no leniency from the guard.
-  def kw_refused?(recv, name, n)
+  # Whether `n` positional arguments plus one unknown keyword show the method
+  # takes keywords: refused FOR THE KEYWORD, or — at the maximum count —
+  # ACCEPTED. A method that ignores unknown keywords (`Exception#full_message`,
+  # 0 positionals, `highlight:`/`order:`) raises nothing, and at the maximum the
+  # trailing Hash cannot have been one more positional, so it was taken as
+  # keywords. Below the maximum an accepted call proves nothing: the Hash may
+  # have filled a positional slot.
+  def kw_refused?(recv, name, n, at_max)
     KW_FILLERS.each do |filler|
-      answer = kw_refused_with?(recv, name, n, filler)
+      answer = kw_refused_with?(recv, name, n, filler, at_max)
       return true if answer == true
       # `nil` means the positional half was refused on TYPE, so the question was
       # never reached; anything else is a real answer and ends the search.
@@ -349,9 +353,9 @@ module Gen
 
   # One probe. `true`/`false` answer the question; `nil` means it was not reached
   # because the filler was the wrong type for a positional parameter.
-  def kw_refused_with?(recv, name, n, filler)
+  def kw_refused_with?(recv, name, n, filler, at_max)
     recv.__send__(name, *Array.new(n) { filler }, **{ KW_PROBE => 1 })
-    false
+    at_max
   rescue ArgumentError => e
     msg = (e.message rescue nil)
     !msg.nil? && msg.include?("keyword")
