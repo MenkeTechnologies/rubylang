@@ -760,9 +760,19 @@ keeps both.
   `Class.new(StandardError)` keeps its superclass chain, so `rescue` catches
   it (its `#<Class:N>` name was read as a METACLASS). `Method#>>`/`#<<` exist,
   and either half of a composition may be any object with `call`. Still open:
-  `obj.singleton_class.ancestors`/`.include?(M)` and `obj.method(:m).owner` do
-  not reflect an `extend`; `singleton_class.instance_methods(false)` omits
-  `class << obj` methods; `Method#super_method` is not implemented.
+  `Method#super_method` is not implemented.
+- **An object's singleton class reflects `extend` — fixed.**
+  `obj.singleton_class.ancestors` is the singleton class, the extended modules
+  (most recent first, each followed by its includes, skipping any already in
+  the chain) and then the class chain, so `.include?(M)` agrees with MRI.
+  `singleton_class.instance_methods(false)` lists the methods the object
+  defined itself, and `obj.method(:m).owner` / `#arity` / `#parameters` name
+  and read the singleton method — owned by the singleton class, or by the
+  module an `extend` brought it from. Precedence was wrong too: a later
+  `extend` did not win over an earlier one for a name both define, and an
+  `extend` overwrote a method the object had defined itself; both now resolve
+  as MRI's ancestry does. Pinned by
+  `tests/eval.rs::an_object_singleton_class_reflects_extend_and_own_defs`.
 
 Implemented and verified against the reference `ruby`:
 
@@ -772,11 +782,9 @@ Implemented and verified against the reference `ruby`:
   works the same way. Singleton methods take priority over the class's own
   instance methods in dispatch (matching `Module#ancestors` order). A bare
   self-call inside a singleton method (or inside a block whose `self` is a
-  receiver carrying singletons) resolves those singletons. `Object#singleton_class`
-  itself is NOT implemented — the singleton is a per-object method table, not a
-  reified anonymous `Class`, so `obj.singleton_class` raises `undefined method`
-  and `obj.singleton_class.instance_methods(false)` has no equivalent. Use
-  `obj.singleton_methods`, which is implemented.
+  receiver carrying singletons) resolves those singletons. `obj.singleton_class`
+  is a class named `#<Class:#<Foo:0x…>>` by the object's heap id, whose
+  superclass is the object's class (see the `extend` entry above).
 - **`Method#arity` / `#owner` / `#parameters` on builtins.** A builtin has no
   declared shape to read — the dispatch functions match on an `args` slice — so
   the three answers come out of `src/arity_table.rs`, a table of what the
@@ -816,21 +824,22 @@ Implemented and verified against the reference `ruby`:
   `#<UnboundMethod: Owner#name>` — MRI also appends the written parameter list and
   the definition's source location, neither of which rubylang retains.
   Still open:
-  - `Object#public_method` and `Object#singleton_method` are not implemented at
-    all, so they raise `undefined method` rather than the `NameError` (or the
-    `Method`) MRI answers. `method` and `Module#instance_method` /
-    `#public_instance_method` are the implemented spellings.
-  - **`Object#singleton_class` — on a plain object only.** A CLASS or module
+  - **`Object#public_method`, `Object#singleton_method` and
+    `Module#included_modules` — fixed.** They raised `undefined method`.
+    `public_method` raises MRI's `NameError` (`method 'x' for class 'C' is
+    private`) for a private or protected method; `singleton_method` reaches
+    the object's own singleton methods and its extended modules' (a class's
+    own class methods and extends, not a superclass's), else `undefined
+    singleton method 'x' for '<inspect>'`. Pinned by
+    `tests/eval.rs::public_method_singleton_method_and_included_modules`.
+  - **`Object#singleton_class` — on a class or module.** A CLASS or module
     answers its metaclass, and that chain is exact: it interleaves each
     `#<Class:X>` with the modules X was `extend`ed with, walks the superclass
     chain of metaclasses, and closes with `Class, Module, Object, Kernel,
     BasicObject`, so `C.singleton_class.include?(M)` and `.ancestors` both agree
-    with MRI. A non-class receiver still raises `undefined method`. Modelling it
-    needs a per-object metaclass IDENTITY — MRI names one
-    `#<Class:#<Foo:0x000000010488>>`, so two objects of the same class have
-    DIFFERENT singleton classes, and a name built without the address would
-    collide them into one. `obj.extend(M)` and `def obj.m` themselves work: both
-    register in the object's singleton table, which is what dispatch reads.
+    with MRI. An object's singleton class is named by its heap id
+    (`#<Class:#<Foo:0x…>>`), so two objects of the same class have different
+    ones; its address differs from MRI's.
   - `main`'s singleton methods (`include`, `private`, `public`, `define_method`,
     `using`, `ruby2_keywords`) are not modeled, so `self.method(:include)` at the
     top level raises. The object itself now exists and names itself: top-level

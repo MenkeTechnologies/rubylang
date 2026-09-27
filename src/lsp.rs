@@ -620,6 +620,18 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "5.method(:+).call(3)   # => 8",
     ),
     (
+        "public_method",
+        "Object",
+        "method, but a private or protected one raises NameError",
+        "5.public_method(:+).call(1)   # => 6",
+    ),
+    (
+        "singleton_method",
+        "Object",
+        "Method for a method on the object's own singleton class, else NameError",
+        "o = Object.new; def o.hi; :hi; end; o.singleton_method(:hi).call   # => :hi",
+    ),
+    (
         "respond_to?",
         "Object",
         "true if class/respond_to_missing? defines it; builtins permissive",
@@ -1157,6 +1169,12 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "Class",
         "ancestor chain as class refs",
         "Integer.ancestors   # => [Integer, Numeric, Comparable, Object, Kernel, BasicObject]",
+    ),
+    (
+        "included_modules",
+        "Class",
+        "the modules in the ancestor chain",
+        "Integer.included_modules   # => [Comparable, Kernel]",
     ),
     (
         "instance_methods",

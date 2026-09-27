@@ -1474,7 +1474,14 @@ pub struct RubyHost {
     /// include), per heap id — what makes `obj.is_a?(M)` true after
     /// `obj.extend(M)`, and a builtin mixin (`Enumerable`, `Comparable`) reach
     /// the object.
+    /// Stored in MRI's ancestry order: the most recent `extend` first, each
+    /// module followed by the modules it includes.
     object_extends: HashMap<u32, Vec<String>>,
+    /// The singleton-table entries each object received from an `extend`
+    /// rather than from `def obj.m` / `define_singleton_method` — the entries
+    /// its singleton class does not own (`instance_methods(false)`,
+    /// `Method#owner`), and which a later `extend` may replace.
+    extended_singletons: HashMap<u32, HashSet<String>>,
     /// `define_singleton_method`-created singletons: object heap id → name → block
     /// Proc. Proc-based (closes over its defining scope), parallel to
     /// `define_methods` but per-object rather than per-class.
@@ -2240,6 +2247,7 @@ impl RubyHost {
             define_methods: IndexMap::new(),
             singleton_methods: IndexMap::new(),
             object_extends: HashMap::new(),
+            extended_singletons: HashMap::new(),
             singleton_define_methods: IndexMap::new(),
             class_define_methods: IndexMap::new(),
             obj_ivars: IndexMap::new(),
@@ -3775,6 +3783,28 @@ impl RubyHost {
         name: &str,
         unbound: bool,
     ) -> Option<MethodShape> {
+        // A per-object singleton method is owned by the object's singleton
+        // class, or by the module an `extend` copied it from.
+        if let (false, Value::Obj(id), Some(def)) = (unbound, recv, self.find_singleton_method(recv, name)) {
+            let owner = if self.is_extended_singleton(*id, name) {
+                self.object_extends
+                    .get(id)
+                    .and_then(|mods| {
+                        mods.iter().find(|m| {
+                            self.classes.get(*m).is_some_and(|d| d.methods.contains_key(name))
+                        })
+                    })
+                    .cloned()
+            } else {
+                self.singleton_class_name(recv)
+            };
+            if let Some(owner) = owner {
+                return Some(MethodShape::Def {
+                    def: Box::new(def),
+                    owner,
+                });
+            }
+        }
         if let Some(cls) = self.object_class(recv) {
             if let Some((def, owner)) = self.find_method_owner(&cls, name) {
                 return Some(MethodShape::Def {
@@ -4976,46 +5006,105 @@ impl RubyHost {
     pub fn method_def(&self, name: &str) -> Option<MethodDef> {
         self.methods.get(name).cloned()
     }
-    /// `obj.extend(M)` — mix module `M`'s instance methods into `obj`'s singleton
-    /// method table so they answer on just this one object (MRI: extend inserts
-    /// the module into the object's singleton ancestry). Compiled `def`s and
-    /// `define_method` blocks are copied, following `M`'s own `include` chain.
+    /// `obj.extend(M)` — put module `M` (and the modules it includes) at the
+    /// front of `obj`'s singleton ancestry, skipping any already there or in
+    /// the object's class chain, as MRI does. The methods are then mixed into
+    /// `obj`'s singleton method table so they answer on just this one object:
+    /// the most recent extend wins, and a method the object defined itself
+    /// (`def obj.m`, `define_singleton_method`) wins over every extend.
     pub fn extend_object(&mut self, id: u32, module: &str) {
-        // Collect the module plus the modules it includes (shallow BFS).
-        let mut mods = vec![module.to_string()];
-        let mut i = 0;
-        while i < mods.len() {
-            if let Some(cd) = self.classes.get(&mods[i]) {
-                for inc in cd.includes.clone() {
-                    if !mods.contains(&inc) {
-                        mods.push(inc);
-                    }
-                }
+        let class_chain = self.class_ancestry(&self.class_of(&Value::Obj(id)));
+        let recorded = self.object_extends.get(&id).cloned().unwrap_or_default();
+        let mut chain: Vec<String> = self
+            .class_ancestry(module)
+            .into_iter()
+            .filter(|m| !recorded.contains(m) && !class_chain.contains(m))
+            .collect();
+        chain.extend(recorded);
+        self.object_extends.insert(id, chain.clone());
+        // Drop the previous extends' copies, then copy lowest precedence first
+        // so a later (higher) module overwrites an earlier one.
+        let previous = self.extended_singletons.remove(&id).unwrap_or_default();
+        for n in &previous {
+            if let Some(m) = self.singleton_methods.get_mut(&id) {
+                m.shift_remove(n);
             }
-            i += 1;
-        }
-        let recorded = self.object_extends.entry(id).or_default();
-        for m in &mods {
-            if !recorded.contains(m) {
-                recorded.push(m.clone());
+            if let Some(m) = self.singleton_define_methods.get_mut(&id) {
+                m.shift_remove(n);
             }
         }
-        for mname in &mods {
+        let own: HashSet<String> = self
+            .singleton_methods
+            .get(&id)
+            .into_iter()
+            .flat_map(|m| m.keys().cloned())
+            .chain(
+                self.singleton_define_methods
+                    .get(&id)
+                    .into_iter()
+                    .flat_map(|m| m.keys().cloned()),
+            )
+            .collect();
+        let mut copied = HashSet::new();
+        for mname in chain.iter().rev() {
             if let Some(cd) = self.classes.get(mname).cloned() {
                 for (n, def) in cd.methods {
-                    self.add_singleton_method(id, &n, def);
+                    if own.contains(&n) {
+                        continue;
+                    }
+                    if let Some(m) = self.singleton_define_methods.get_mut(&id) {
+                        m.shift_remove(&n);
+                    }
+                    self.singleton_methods.entry(id).or_default().insert(n.clone(), def);
+                    copied.insert(n);
                 }
             }
             if let Some(dm) = self.define_methods.get(mname).cloned() {
                 for (n, proc) in dm {
-                    self.add_singleton_define_method(id, &n, proc);
+                    if own.contains(&n) {
+                        continue;
+                    }
+                    if let Some(m) = self.singleton_methods.get_mut(&id) {
+                        m.shift_remove(&n);
+                    }
+                    self.singleton_define_methods.entry(id).or_default().insert(n.clone(), proc);
+                    copied.insert(n);
                 }
+            }
+        }
+        self.extended_singletons.insert(id, copied);
+    }
+
+    /// Forget that `obj`'s singleton entry `name` came from an `extend`: the
+    /// object is defining its own, which replaces the copied one.
+    fn claim_singleton(&mut self, id: u32, name: &str) {
+        if self.extended_singletons.get_mut(&id).is_some_and(|s| s.remove(name)) {
+            if let Some(m) = self.singleton_methods.get_mut(&id) {
+                m.shift_remove(name);
+            }
+            if let Some(m) = self.singleton_define_methods.get_mut(&id) {
+                m.shift_remove(name);
             }
         }
     }
 
+    /// Whether `obj`'s singleton entry `name` was copied in by an `extend`.
+    pub fn is_extended_singleton(&self, id: u32, name: &str) -> bool {
+        self.extended_singletons.get(&id).is_some_and(|s| s.contains(name))
+    }
+
+    /// The object a per-object singleton class name (`#<Class:#<K:0x…>>`) is
+    /// attached to: its class name and heap id.
+    pub fn object_singleton_parts(name: &str) -> Option<(&str, u32)> {
+        let inner = Self::metaclass_attached(name)?;
+        let body = inner.strip_prefix("#<")?.strip_suffix('>')?;
+        let (cls, hex) = body.rsplit_once(":0x")?;
+        Some((cls, u32::from_str_radix(hex, 16).ok()?))
+    }
+
     /// Register a per-object singleton method (`def obj.m`, `class << obj`).
     pub fn add_singleton_method(&mut self, id: u32, name: &str, def: MethodDef) {
+        self.claim_singleton(id, name);
         self.singleton_methods
             .entry(id)
             .or_default()
@@ -5061,8 +5150,22 @@ impl RubyHost {
         names.dedup();
         names
     }
+    /// Whether class `cls` itself has class method `name` — `def self.m`,
+    /// `define_singleton_method`, or a module it was extended with — not one
+    /// inherited from a superclass (`Kernel#singleton_method`'s reach).
+    pub fn has_own_class_method(&self, cls: &str, name: &str) -> bool {
+        let defines = |c: &str| {
+            self.classes.get(c).is_some_and(|d| d.methods.contains_key(name))
+                || self.define_methods.get(c).is_some_and(|m| m.contains_key(name))
+        };
+        self.classes.get(cls).is_some_and(|d| {
+            d.class_methods.contains_key(name)
+                || d.extends.iter().any(|m| defines(&self.resolve_module_name(m, cls)))
+        }) || self.class_define_methods.get(cls).is_some_and(|m| m.contains_key(name))
+    }
     /// Register a `define_singleton_method` (a block Proc) on a specific object.
     pub fn add_singleton_define_method(&mut self, id: u32, name: &str, proc: Value) {
+        self.claim_singleton(id, name);
         self.singleton_define_methods
             .entry(id)
             .or_default()
@@ -5858,6 +5961,14 @@ impl RubyHost {
         // has no superclass, so its metaclass closes straight into `Module`.
         // Without this the extended modules were nowhere in the chain and
         // `C.singleton_class.include?(Ext)` was false.
+        // An OBJECT's singleton class (`obj.singleton_class`): itself, the
+        // modules the object was extended with, then the object's class chain.
+        if let Some((cls, id)) = Self::object_singleton_parts(name) {
+            let mut out = vec![name.to_string()];
+            out.extend(self.object_extends.get(&id).cloned().unwrap_or_default());
+            out.extend(self.class_ancestry(cls));
+            return dedup_keep_first(out);
+        }
         if let Some(inner) = Self::metaclass_attached(name) {
             let mut out = vec![name.to_string()];
             let mut cur = inner.to_string();
@@ -6425,6 +6536,18 @@ impl RubyHost {
             }
             if let Some(dm) = self.define_methods.get(n) {
                 take(Box::new(dm.keys()), &mut out);
+            }
+            // An object's singleton class owns the methods the object defined
+            // itself; those an `extend` copied in belong to their module.
+            if let Some((_, id)) = Self::object_singleton_parts(n) {
+                let own = self
+                    .singleton_methods
+                    .get(&id)
+                    .into_iter()
+                    .flat_map(|m| m.keys())
+                    .chain(self.singleton_define_methods.get(&id).into_iter().flat_map(|m| m.keys()))
+                    .filter(|k| !self.is_extended_singleton(id, k));
+                take(Box::new(own), &mut out);
             }
             // `Comparable` and `Enumerable` have no entry in `classes` — their
             // methods are dispatched natively — so walking the tables alone

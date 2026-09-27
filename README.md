@@ -399,7 +399,11 @@ objects) plus the one-line forms (`expr => pattern` rightward assignment and
 handlers run last-registered first as the program ends (after an uncaught
 exception too), and an exception carries the backtrace its raise unwound
 through, rendered by `full_message(highlight:, order:)` as MRI prints it and
-read back as `Thread::Backtrace::Location`s by `backtrace_locations`. See
+read back as `Thread::Backtrace::Location`s by `backtrace_locations`. An
+object's `singleton_class` reflects what `extend` and `def obj.m` did to it
+(`ancestors`, `include?`, `instance_methods(false)`, `Method#owner`), and
+`Object#singleton_method`, `#public_method` and `Module#included_modules` are
+implemented. See
 [`BUGS.md`](BUGS.md) for the full known-gaps list.
 
 ---

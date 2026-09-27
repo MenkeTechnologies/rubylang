@@ -10927,3 +10927,86 @@ fn an_anonymous_class_keeps_its_superclass_chain() {
         "[\"m\", true, false, true]",
     );
 }
+
+/// An object's singleton class reflects what `extend` and `def obj.m` did to
+/// it: ancestry is the singleton class, the extended modules (most recent
+/// first, each followed by its includes, skipping any already in the chain),
+/// then the object's class chain. A later extend wins over an earlier one and
+/// a method the object defined itself wins over every extend. Expected values
+/// captured from ruby 4.0.7.
+#[test]
+fn an_object_singleton_class_reflects_extend_and_own_defs() {
+    let pre = "module N; def n = :n; end; module M; include N; def hi = :m; end; \
+               module P; include N; def hi = :p; end; class A; include Comparable; end; ";
+    eq(
+        &format!("{pre}a = A.new; a.extend(M); a.extend(P); a.singleton_class.ancestors.drop(1).first(4)"),
+        "[P, M, N, A]",
+    );
+    eq(
+        &format!("{pre}a = A.new; a.extend(M); a.extend(P); [a.hi, a.method(:hi).owner, a.method(:n).owner]"),
+        "[:p, P, N]",
+    );
+    eq(
+        &format!("{pre}a = A.new; a.extend(M); [a.singleton_class.include?(M), A.new.singleton_class.include?(M)]"),
+        "[true, false]",
+    );
+    eq(
+        &format!("{pre}b = A.new; b.extend(Comparable); b.singleton_class.ancestors.drop(1).first(3)"),
+        "[A, Comparable, Object]",
+    );
+    eq(
+        &format!("{pre}c = A.new; c.extend(M); c.extend(P); c.extend(M); [c.singleton_class.ancestors.drop(1).first(4), c.hi]"),
+        "[[P, M, N, A], :p]",
+    );
+    eq(
+        &format!("{pre}d = A.new; def d.hi = :own; d.extend(M); [d.hi, d.method(:hi).owner == d.singleton_class]"),
+        "[:own, true]",
+    );
+    eq(
+        &format!(
+            "{pre}e = A.new; e.extend(M); def e.hi(x, y = 1) = :own2; \
+             [e.hi(1), e.singleton_class.instance_methods(false), e.singleton_methods.sort, e.method(:hi).arity]"
+        ),
+        "[:own2, [:hi], [:hi, :n], -2]",
+    );
+    eq(
+        &format!("{pre}f = A.new; f.define_singleton_method(:hi) {{ :blk }}; f.extend(M); f.hi"),
+        ":blk",
+    );
+}
+
+/// `Object#public_method`, `Object#singleton_method` and
+/// `Module#included_modules`, with MRI's NameError messages. Expected values
+/// captured from ruby 4.0.7.
+#[test]
+fn public_method_singleton_method_and_included_modules() {
+    let k = "class K; def pub = 1; private def priv; end; protected def prot; end; \
+             def inspect = \"KI\"; def self.c = 3; end; ";
+    eq(&format!("{k}K.new.public_method(:pub).call"), "1");
+    raises(&format!("{k}K.new.public_method(:priv)"), "NameError", "method 'priv' for class 'K' is private");
+    raises(&format!("{k}K.new.public_method(:prot)"), "NameError", "method 'prot' for class 'K' is protected");
+    raises(&format!("{k}K.new.public_method(:nope)"), "NameError", "undefined method 'nope' for class 'K'");
+    raises(&format!("{k}K.new.singleton_method(:pub)"), "NameError", "undefined singleton method 'pub' for 'KI'");
+    eq(
+        &format!("{k}k = K.new; def k.s(a, b=1) = a; [k.singleton_method(:s).arity, k.singleton_method(:s).call(4)]"),
+        "[-2, 4]",
+    );
+    eq(
+        &format!("{k}module M; def mm = :mm; end; k = K.new; k.extend(M); [k.singleton_method(:mm).call, k.singleton_method(:mm).owner]"),
+        "[:mm, M]",
+    );
+    eq("o = Object.new; o.define_singleton_method(:q) { 2 }; o.singleton_method(:q).call", "2");
+    eq(&format!("{k}K.singleton_method(:c).call"), "3");
+    raises(&format!("{k}K.singleton_method(:new)"), "NameError", "undefined singleton method 'new' for 'K'");
+    raises(
+        "class A; def self.x = 1; end; class B < A; end; B.singleton_method(:x)",
+        "NameError",
+        "undefined singleton method 'x' for 'B'",
+    );
+    eq("module E; def e = 1; end; class A; extend E; end; A.singleton_method(:e).call", "1");
+    eq(
+        "module M; end; class Z; include M; include Comparable; end; \
+         [Z.included_modules, Comparable.included_modules, Integer.included_modules]",
+        "[[Comparable, M, Kernel], [], [Comparable, Kernel]]",
+    );
+}

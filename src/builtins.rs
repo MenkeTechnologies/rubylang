@@ -2465,6 +2465,47 @@ pub(crate) fn dispatch(
             method_object_or_name_error(recv, &m, false)?;
             return Ok(with_host(|h| h.new_method(recv.clone(), &m)));
         }
+        // `obj.public_method(:name)` — `method`, but a private or protected
+        // method is a NameError rather than a Method.
+        "public_method" if args.len() == 1 => {
+            let m = name_of(&args[0]);
+            method_object_or_name_error(recv, &m, false)?;
+            let vis = receiver_visibility(recv, &m);
+            if vis != crate::host::Visibility::Public {
+                let (lookup, word) = with_host(|h| {
+                    let lookup = h.method_lookup_class(recv, false);
+                    let word = h.class_or_module_word(&lookup);
+                    (lookup, word)
+                });
+                return Err(raise_exc(
+                    "NameError",
+                    &format!("method '{m}' for {word} '{lookup}' is {}", vis.word()),
+                ));
+            }
+            return Ok(with_host(|h| h.new_method(recv.clone(), &m)));
+        }
+        // `obj.singleton_method(:name)` — a Method for a method on the object's
+        // own singleton class or a module it was extended with; for a class,
+        // one of its own class methods. Anything else is a NameError.
+        "singleton_method" if args.len() == 1 => {
+            let m = name_of(&args[0]);
+            let found = with_host(|h| {
+                if let Some(cls) = h.classref_name(recv) {
+                    h.has_own_class_method(&cls, &m)
+                } else {
+                    h.find_singleton_method(recv, &m).is_some()
+                        || h.find_singleton_define_method(recv, &m).is_some()
+                }
+            });
+            if !found {
+                let shown = inspect_of(recv)?;
+                return Err(raise_exc(
+                    "NameError",
+                    &format!("undefined singleton method '{m}' for '{shown}'"),
+                ));
+            }
+            return Ok(with_host(|h| h.new_method(recv.clone(), &m)));
+        }
         "respond_to?" => {
             // For a user object, a method responds if the class (or an included/
             // prepended module or superclass) defines it as a normal method, a
@@ -4314,6 +4355,17 @@ fn dispatch_classref(
                 .iter()
                 .map(|n| h.class_ref(n))
                 .collect();
+            h.new_array(refs)
+        })),
+        // `Module#included_modules` — the modules in the ancestor chain, the
+        // receiver itself excluded.
+        "included_modules" if args.is_empty() => Ok(with_host(|h| {
+            let mods: Vec<String> = h
+                .class_ancestry(cls)
+                .into_iter()
+                .filter(|n| n.as_str() != cls && h.is_module_name(n))
+                .collect();
+            let refs: Vec<Value> = mods.iter().map(|n| h.class_ref(n)).collect();
             h.new_array(refs)
         })),
         // `Module#include?(mod)` — whether `mod` is one of the class's ancestors
@@ -24249,15 +24301,22 @@ fn check_class_method_visibility(cls: &str, recv: &Value, name: &str) -> Result<
 ///
 /// A name that is not defined at all is left alone: `public_send(:nope)` must
 /// report `undefined method`, which the dispatch itself raises.
+/// The visibility of `recv`'s method `name`: a class method's for a class, the
+/// instance method's for a user object, public for anything else.
+fn receiver_visibility(recv: &Value, name: &str) -> crate::host::Visibility {
+    with_host(|h| {
+        if let Some(cls) = h.classref_name(recv) {
+            h.class_method_visibility(&cls, name)
+        } else if let Some(cls) = h.object_class(recv) {
+            h.method_visibility(&cls, name)
+        } else {
+            crate::host::Visibility::Public
+        }
+    })
+}
+
 fn check_public_visibility(recv: &Value, name: &str) -> Result<(), String> {
-    let vis = if let Some(cls) = with_host(|h| h.classref_name(recv)) {
-        with_host(|h| h.class_method_visibility(&cls, name))
-    } else {
-        let Some(cls) = with_host(|h| h.object_class(recv)) else {
-            return Ok(());
-        };
-        with_host(|h| h.method_visibility(&cls, name))
-    };
+    let vis = receiver_visibility(recv, name);
     if vis == crate::host::Visibility::Public {
         return Ok(());
     }
