@@ -296,9 +296,9 @@ class Thread
       def lineno; @lineno; end
       def label; @label; end
       def base_label; @base_label || @label; end
-      def absolute_path; @absolute_path || @path; end
-      def to_s; @path.to_s + ":" + @lineno.to_s + ":in " + @label.to_s; end
-      def inspect; to_s; end
+      def absolute_path; @absolute_path; end
+      def to_s; @path.to_s + ":" + @lineno.to_s + ":in '" + @label.to_s + "'"; end
+      def inspect; to_s.inspect; end
     end
   end
 end

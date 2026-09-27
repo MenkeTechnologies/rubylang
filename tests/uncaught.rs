@@ -331,3 +331,60 @@ fn a_begin_body_does_not_count_as_a_block_level() {
         )
     );
 }
+
+/// `Exception#backtrace_locations` answers a `Thread::Backtrace::Location` per
+/// recorded frame — the same Array on each read — with MRI's `label`,
+/// `base_label` and `absolute_path` (nil for `-e`); nil for an exception never
+/// raised or given String frames; `set_backtrace` keeps the raise-time
+/// locations and accepts an Array of Locations. Expected output captured from
+/// ruby 4.0.7.
+#[test]
+fn backtrace_locations_answers_a_location_per_frame() {
+    let src = r#"class Foo; def bar; baz; end; def baz = raise("x"); def self.k = raise("k"); end
+begin; Foo.new.bar; rescue => e
+  e.backtrace_locations.each { |l| p [l.path, l.absolute_path, l.lineno, l.label, l.base_label]; p l }
+  p e.backtrace_locations.equal?(e.backtrace_locations), e.backtrace_locations[0].class
+  e.set_backtrace(["q:1"]); p e.backtrace, e.backtrace_locations.size
+end
+begin; Foo.k; rescue => e; p e.backtrace_locations.map(&:base_label); end
+p RuntimeError.new("y").backtrace_locations
+e = RuntimeError.new("z"); e.set_backtrace(["a:1"]); p e.backtrace_locations
+begin; raise e; rescue => f; p f.backtrace_locations; end
+begin; raise "a"; rescue => e; e2 = RuntimeError.new; e2.set_backtrace(e.backtrace_locations); p e2.backtrace; end"#;
+    let (stdout, stderr, code) = run_e_full(src);
+    assert_eq!((stderr.as_str(), code), ("", 0));
+    assert_eq!(
+        stdout,
+        r#"["-e", nil, 1, "Foo#baz", "baz"]
+"-e:1:in 'Foo#baz'"
+["-e", nil, 1, "Foo#bar", "bar"]
+"-e:1:in 'Foo#bar'"
+["-e", nil, 2, "<main>", "<main>"]
+"-e:2:in '<main>'"
+true
+Thread::Backtrace::Location
+["q:1"]
+3
+["k", "<main>"]
+nil
+nil
+nil
+["-e:11:in '<main>'"]
+"#
+    );
+}
+
+/// A class or module body's frame is `<class:C>` / `<module:M>` by the short
+/// name, and a block inside one is `block in <class:C>` — not the synthetic
+/// method the body runs as. Expected output captured from ruby 4.0.7.
+#[test]
+fn a_class_body_frame_is_named_class_or_module() {
+    let src = r#"module M; class N; begin; raise "n"; rescue => e; p e.backtrace[0]; end; [1].each { begin; raise "b"; rescue => e; p e.backtrace[0]; end }; end
+begin; raise "m"; rescue => e; p e.backtrace_locations[0].label; end; end"#;
+    let (stdout, stderr, code) = run_e_full(src);
+    assert_eq!((stderr.as_str(), code), ("", 0));
+    assert_eq!(
+        stdout,
+        "\"-e:1:in '<class:N>'\"\n\"-e:1:in 'block in <class:N>'\"\n\"<module:M>\"\n"
+    );
+}

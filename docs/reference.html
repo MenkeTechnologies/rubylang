@@ -3687,12 +3687,17 @@
       <section class="tutorial-section" id="ch-exception">
         <h2>Exception</h2>
         <article class="doc-entry" id="doc-exception-1">
-          <h3><a class="doc-anchor" href="#doc-exception-1">#</a> <code>message</code></h3>
+          <h3><a class="doc-anchor" href="#doc-exception-1">#</a> <code>backtrace_locations</code></h3>
+          <p>the backtrace as Thread::Backtrace::Location objects; nil if never raised</p>
+          <pre><code class="lang-ruby">begin; raise "x"; rescue =&gt; e; e.backtrace_locations.first.lineno; end   # =&gt; 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-exception-2">
+          <h3><a class="doc-anchor" href="#doc-exception-2">#</a> <code>message</code></h3>
           <p>the message ivar, or the class name if unset</p>
           <pre><code class="lang-ruby">begin; raise "boom"; rescue =&gt; e; e.message; end   # =&gt; "boom"</code></pre>
         </article>
-        <article class="doc-entry" id="doc-exception-2">
-          <h3><a class="doc-anchor" href="#doc-exception-2">#</a> <code>to_s</code></h3>
+        <article class="doc-entry" id="doc-exception-3">
+          <h3><a class="doc-anchor" href="#doc-exception-3">#</a> <code>to_s</code></h3>
           <p>the message ivar, or the class name if unset</p>
           <pre><code class="lang-ruby">begin; raise "boom"; rescue =&gt; e; e.to_s; end   # =&gt; "boom"</code></pre>
         </article>

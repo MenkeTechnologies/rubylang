@@ -5252,13 +5252,21 @@ fn dispatch_object(
             Some(frames) => new_arr(frames.into_iter().map(new_str).collect()),
             None => Value::Undef,
         }),
-        // No `Thread::Backtrace::Location` objects exist, so the locations
-        // reader stays an empty Array rather than Strings posing as them.
-        "backtrace_locations" if is_exception_class(cls) => Ok(new_arr(Vec::new())),
-        // `set_backtrace(Array of String | String | nil)` — answers its argument.
+        // `Exception#backtrace_locations` — a `Thread::Backtrace::Location` per
+        // recorded frame; nil for one never raised or given String frames.
+        "backtrace_locations" if is_exception_class(cls) => Ok(exc_backtrace_locations(recv)),
+        // `set_backtrace(Array of String | Array of Location | String | nil)` —
+        // answers its argument. Replacing the Strings keeps the raise-time
+        // locations, as MRI does, so they are built before the frames change.
         "set_backtrace" if is_exception_class(cls) => {
             let arg = args.first().cloned().unwrap_or(Value::Undef);
+            let raised_locs = exc_backtrace_locations(recv);
+            let mut from_locations = false;
             let frames = match with_host(|h| h.as_array(&arg)) {
+                Some(items) if !items.is_empty() && items.iter().all(is_backtrace_location) => {
+                    from_locations = true;
+                    Some(items.iter().map(location_frame).collect())
+                }
                 Some(items) => {
                     let strs: Option<Vec<String>> =
                         items.iter().map(|v| with_host(|h| h.as_str(v))).collect();
@@ -5269,6 +5277,17 @@ fn dispatch_object(
                     with_host(|h| h.as_str(&arg)).ok_or_else(backtrace_type_error)?
                 ]),
             };
+            with_host(|h| {
+                if from_locations {
+                    // Rebuilt from the new frames on the next read.
+                    h.set_exc_backtrace_locations(recv, None);
+                    h.set_string_backtrace(recv, false);
+                } else if !matches!(raised_locs, Value::Undef) {
+                    h.set_exc_backtrace_locations(recv, Some(raised_locs.clone()));
+                } else if frames.is_some() {
+                    h.set_string_backtrace(recv, true);
+                }
+            });
             // A single String is stored, and answered, as a one-frame Array.
             match frames {
                 Some(frames) if with_host(|h| h.as_array(&arg)).is_none() => {
@@ -18352,6 +18371,8 @@ fn normalize_encoding_name(raw: &str) -> Option<String> {
 /// live stack frames aren't tracked outside `--dap`; callers use it for
 /// `module_eval` backtrace attribution only.
 fn backtrace_location(path: &str, lineno: i64, label: &str) -> Value {
+    let absolute = location_absolute_path(path);
+    let base = location_base_label(label);
     with_host(|h| {
         let cls = "Thread::Backtrace::Location";
         if h.find_method(cls, "path").is_none() {
@@ -18361,14 +18382,120 @@ fn backtrace_location(path: &str, lineno: i64, label: &str) -> Value {
         }
         let obj = h.new_object(cls);
         let p = h.new_string(path.to_string());
-        h.set_ivar_of(&obj, "path", p.clone());
-        h.set_ivar_of(&obj, "absolute_path", p);
+        h.set_ivar_of(&obj, "path", p);
+        let abs = match absolute {
+            Some(a) => h.new_string(a),
+            None => Value::Undef,
+        };
+        h.set_ivar_of(&obj, "absolute_path", abs);
         h.set_ivar_of(&obj, "lineno", Value::Int(lineno));
         let l = h.new_string(label.to_string());
-        h.set_ivar_of(&obj, "label", l.clone());
-        h.set_ivar_of(&obj, "base_label", l);
+        h.set_ivar_of(&obj, "label", l);
+        let b = h.new_string(base.to_string());
+        h.set_ivar_of(&obj, "base_label", b);
         obj
     })
+}
+
+/// A Location's `absolute_path`: the real path of its file, or nil for a
+/// frame with no file behind it (`-e`, `(eval at -e:1)`).
+fn location_absolute_path(path: &str) -> Option<String> {
+    if path == "-e" || path == "-" || path.starts_with('(') {
+        return None;
+    }
+    let real = std::fs::canonicalize(path).or_else(|_| {
+        std::env::current_dir().map(|cwd| cwd.join(path))
+    });
+    real.ok().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// A Location's `base_label`: its label without the `block in` / `rescue in` /
+/// `ensure in` prefix and the owner qualifier — `block in Foo#bar` → `bar`,
+/// `C.k` → `k`; `<main>` and `<class:C>` are their own base.
+fn location_base_label(label: &str) -> &str {
+    let mut l = label;
+    loop {
+        let rest = ["block in ", "rescue in ", "ensure in "]
+            .iter()
+            .find_map(|p| l.strip_prefix(p))
+            .or_else(|| {
+                // `block (2 levels) in X`
+                let r = l.strip_prefix("block (")?;
+                r.split_once(" levels) in ").map(|(_, x)| x)
+            });
+        match rest {
+            Some(r) => l = r,
+            None => break,
+        }
+    }
+    if l.starts_with('<') {
+        return l;
+    }
+    match l.rfind(['#', '.']) {
+        Some(i) => &l[i + 1..],
+        None => l,
+    }
+}
+
+/// Split one backtrace frame, `path:lineno:in 'label'`, into its parts. A frame
+/// set by hand without a label keeps an empty one.
+fn parse_backtrace_frame(frame: &str) -> (String, i64, String) {
+    let (loc, label) = match frame.split_once(":in ") {
+        Some((loc, l)) => (loc, l.trim_matches(|c| c == '\'' || c == '`')),
+        None => (frame, ""),
+    };
+    match loc.rsplit_once(':') {
+        Some((path, n)) if n.parse::<i64>().is_ok() => {
+            (path.to_string(), n.parse().unwrap_or(0), label.to_string())
+        }
+        _ => (loc.to_string(), 0, label.to_string()),
+    }
+}
+
+/// `Exception#backtrace_locations`: one Location per recorded frame, the same
+/// Array on every read once the backtrace is final; nil for an exception never
+/// raised or one given String frames by `set_backtrace`.
+fn exc_backtrace_locations(exc: &Value) -> Value {
+    if let Some(cached) = with_host(|h| h.exc_backtrace_locations(exc)) {
+        return cached;
+    }
+    if with_host(|h| h.is_string_backtrace(exc)) {
+        return Value::Undef;
+    }
+    let Some(frames) = with_host(|h| h.exc_backtrace(exc)) else {
+        return Value::Undef;
+    };
+    let locs = frames
+        .iter()
+        .map(|f| {
+            let (path, lineno, label) = parse_backtrace_frame(f);
+            backtrace_location(&path, lineno, &label)
+        })
+        .collect();
+    let arr = new_arr(locs);
+    if with_host(|h| h.backtrace_sealed(exc)) {
+        with_host(|h| h.set_exc_backtrace_locations(exc, Some(arr.clone())));
+    }
+    arr
+}
+
+/// Whether `v` is a `Thread::Backtrace::Location`.
+fn is_backtrace_location(v: &Value) -> bool {
+    with_host(|h| h.object_class(v)).as_deref() == Some("Thread::Backtrace::Location")
+}
+
+/// The frame String a Location prints as (`Location#to_s`).
+fn location_frame(v: &Value) -> String {
+    let (path, lineno, label) = with_host(|h| {
+        (
+            h.ivar_of(v, "path"),
+            h.ivar_of(v, "lineno"),
+            h.ivar_of(v, "label"),
+        )
+    });
+    let path = with_host(|h| h.as_str(&path)).unwrap_or_default();
+    let label = with_host(|h| h.as_str(&label)).unwrap_or_default();
+    format!("{path}:{}:in '{label}'", as_i(&lineno))
 }
 
 /// `CGI.escape` — percent-encode for `application/x-www-form-urlencoded`: keep

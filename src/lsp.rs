@@ -4155,6 +4155,12 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     ),
     // ── Exception ──
     (
+        "backtrace_locations",
+        "Exception",
+        "the backtrace as Thread::Backtrace::Location objects; nil if never raised",
+        "begin; raise \"x\"; rescue => e; e.backtrace_locations.first.lineno; end   # => 1",
+    ),
+    (
         "message",
         "Exception",
         "the message ivar, or the class name if unset",

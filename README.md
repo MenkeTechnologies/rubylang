@@ -398,7 +398,8 @@ objects) plus the one-line forms (`expr => pattern` rightward assignment and
 `DateTime`, bare `%(…)` strings, and `__END__` are all implemented. `at_exit`
 handlers run last-registered first as the program ends (after an uncaught
 exception too), and an exception carries the backtrace its raise unwound
-through, rendered by `full_message(highlight:, order:)` as MRI prints it. See
+through, rendered by `full_message(highlight:, order:)` as MRI prints it and
+read back as `Thread::Backtrace::Location`s by `backtrace_locations`. See
 [`BUGS.md`](BUGS.md) for the full known-gaps list.
 
 ---

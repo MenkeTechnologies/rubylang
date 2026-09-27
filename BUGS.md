@@ -387,9 +387,22 @@ exception (`KeyError.new("m")`) answers nil for them, as MRI's does.
   `tests/uncaught.rs::a_reraised_exception_keeps_its_first_backtrace`.
   Residue: the frames list only Ruby frames — MRI also lists the builtin a
   block ran under (`from -e:1:in 'Array#each'`) and the frames above the
-  rescue; `backtrace_locations` is `[]` (no `Thread::Backtrace::Location`);
-  and ErrorHighlight's source snippet is never appended (see the
+  rescue; and ErrorHighlight's source snippet is never appended (see the
   `ErrorHighlight` entry below).
+- **`Exception#backtrace_locations` — fixed.** It was always `[]`. It answers a
+  `Thread::Backtrace::Location` per recorded frame, the same Array on each
+  read, with MRI's `label`, `base_label` (the method name inside a block or
+  qualified label), `absolute_path` (nil for `-e`), `to_s` and `inspect`; nil
+  for an exception never raised or one given String frames. `set_backtrace`
+  keeps the raise-time locations, as MRI does, and accepts an Array of
+  Locations instead of raising `TypeError`. The Locations mirror `backtrace`,
+  so they share its residue above. Pinned by
+  `tests/uncaught.rs::backtrace_locations_answers_a_location_per_frame`.
+- **A class or module body's frame — fixed.** It was labelled with the
+  synthetic method the body runs as (`M.__class_body__10`); it is
+  `<class:C>` / `<module:M>` by the short name, and a block inside one is
+  `block in <class:C>`. Pinned by
+  `tests/uncaught.rs::a_class_body_frame_is_named_class_or_module`.
 - **`eval` reports a syntax error as a `RuntimeError`.** MRI raises
   `SyntaxError`, which is a `ScriptError` and therefore NOT caught by a bare
   `rescue`; rubylang's is caught by one. The class tree is right —

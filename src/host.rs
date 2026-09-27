@@ -1360,6 +1360,13 @@ pub struct RubyHost {
     /// `set_backtrace`. Raising one again keeps its frames, as MRI does,
     /// instead of appending the re-raise's unwind to them.
     sealed_backtraces: HashSet<u32>,
+    /// `Exception#backtrace_locations`, built once the backtrace is sealed so
+    /// every read answers the same Array, and kept across `set_backtrace`
+    /// (MRI keeps the raise-time locations when the Strings are replaced).
+    exc_backtrace_locations: HashMap<u32, Value>,
+    /// Exceptions whose backtrace was given as Strings by `set_backtrace`; they
+    /// carry no locations, so `backtrace_locations` answers nil.
+    string_backtraces: HashSet<u32>,
     /// Heap ids of String objects whose encoding is NOT UTF-8, mapped to that
     /// encoding's canonical name (`"ASCII-8BIT"`, `"US-ASCII"`). Sources are
     /// `String#b`, `force_encoding`, `Integer#chr` and `Array#pack`. We store only
@@ -2200,6 +2207,8 @@ impl RubyHost {
             at_exit_procs: Vec::new(),
             exc_backtraces: IndexMap::new(),
             sealed_backtraces: HashSet::new(),
+            exc_backtrace_locations: HashMap::new(),
+            string_backtraces: HashSet::new(),
             string_encodings: HashMap::new(),
             signal: None,
             catch_tags: Vec::new(),
@@ -6995,6 +7004,14 @@ impl RubyHost {
     /// instance method, `C.m` in a class/singleton method.
     fn scope_context(&self, scope: Option<&Scope>) -> String {
         match scope.and_then(|s| s.method_name.as_ref().map(|m| (s, m))) {
+            // A class/module body runs as a synthetic method; MRI labels its
+            // frame `<class:C>` / `<module:M>` by the short name.
+            Some((s, m)) if m.starts_with("__class_body__") => {
+                let cls = s.def_class.as_deref().unwrap_or("Object");
+                let short = cls.rsplit("::").next().unwrap_or(cls);
+                let kind = if self.is_module_name(cls) { "module" } else { "class" };
+                format!("<{kind}:{short}>")
+            }
             Some((s, m)) => {
                 let cls = s.def_class.clone().unwrap_or_else(|| "Object".into());
                 // A class/singleton method's `self` is the class ref itself.
@@ -7042,6 +7059,44 @@ impl RubyHost {
     }
     /// Replace the backtrace of exception `exc` (`Exception#set_backtrace`);
     /// `None` clears it, so `#backtrace` answers nil again.
+    /// Whether exception `exc`'s backtrace is final (see `sealed_backtraces`).
+    pub fn backtrace_sealed(&self, exc: &Value) -> bool {
+        matches!(exc, Value::Obj(id) if self.sealed_backtraces.contains(id))
+    }
+    /// The `backtrace_locations` Array cached for `exc`, if one was built.
+    pub fn exc_backtrace_locations(&self, exc: &Value) -> Option<Value> {
+        match exc {
+            Value::Obj(id) => self.exc_backtrace_locations.get(id).cloned(),
+            _ => None,
+        }
+    }
+    /// Cache `locs` as `exc`'s `backtrace_locations`; `None` drops the cache.
+    pub fn set_exc_backtrace_locations(&mut self, exc: &Value, locs: Option<Value>) {
+        if let Value::Obj(id) = exc {
+            match locs {
+                Some(v) => {
+                    self.exc_backtrace_locations.insert(*id, v);
+                }
+                None => {
+                    self.exc_backtrace_locations.remove(id);
+                }
+            }
+        }
+    }
+    /// Whether `exc`'s backtrace was given as Strings by `set_backtrace`.
+    pub fn is_string_backtrace(&self, exc: &Value) -> bool {
+        matches!(exc, Value::Obj(id) if self.string_backtraces.contains(id))
+    }
+    /// Record whether `exc`'s backtrace came from `set_backtrace` Strings.
+    pub fn set_string_backtrace(&mut self, exc: &Value, strings: bool) {
+        if let Value::Obj(id) = exc {
+            if strings {
+                self.string_backtraces.insert(*id);
+            } else {
+                self.string_backtraces.remove(id);
+            }
+        }
+    }
     pub fn set_exc_backtrace(&mut self, exc: &Value, frames: Option<Vec<String>>) {
         if let Value::Obj(id) = exc {
             match frames {
