@@ -7385,7 +7385,7 @@ impl RubyHost {
     /// `exit` raises rather than leaving the process where it stands, so an
     /// `ensure` above it runs and a `rescue SystemExit` can stop it; reaching
     /// the top uncaught is what makes it an exit. Both top levels ask this —
-    /// [`run_main`] for the interpreter and `aot::pending_exit_status` for a
+    /// [`run_main`] for the interpreter and `aot::run_embedded` for a
     /// standalone binary, which never runs `run_main`.
     pub fn pending_system_exit(&self) -> Option<i32> {
         let exc = self.pending_exc.clone()?;

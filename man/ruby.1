@@ -69,6 +69,13 @@ Speak the Debug Adapter Protocol over stdio.
 .B \-\-build " " \fIFILE\fR
 Ahead-of-time compile the script's bytecode into the on-disk cache.
 .TP
+.B \-\-build \-\-native " " \fIFILE\fR
+Compile the app to a standalone native executable beside the script
+.RI ( app.rb " \(-> " app ),
+which runs with no interpreter and no sources; needs
+.B rustc
+and the build tree.
+.TP
 .B \-\-dump\-bytecode " " \fIFILE\fR
 Print the lowered fusevm bytecode and exit.
 .TP

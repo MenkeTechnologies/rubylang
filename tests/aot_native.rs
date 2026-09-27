@@ -234,3 +234,60 @@ fn native_binary_matches_mri_when_available() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A standalone binary seeds and ends its run as `ruby FILE` does: `ARGV`,
+/// `$0`, `__FILE__` and the prelude are in place; `at_exit` handlers run last
+/// registered first; an uncaught exception prints its report and exits 1; and
+/// a program whose last expression is an Integer exits 0, not with that value.
+/// Expected output captured from ruby 4.0.7 (`ruby run.rb a b`), whose report
+/// also appends ErrorHighlight's snippet, which rubylang does not print.
+#[test]
+fn native_binary_seeds_the_program_and_runs_at_exit_handlers() {
+    require_toolchain();
+
+    let dir = fresh_dir("atexit");
+    let app = write(
+        &dir,
+        "run.rb",
+        "at_exit { puts \"second\" }\n\
+         at_exit { puts \"first\" }\n\
+         p ARGV, $0, __FILE__\n\
+         p Thread::Backtrace::Location\n\
+         def f = raise(ArgumentError, \"bad\")\n\
+         f if ARGV.first == \"boom\"\n\
+         x = 5\n",
+    );
+    let (report, berr, _bc, bok) = run_ruby(&["--build", "--native"], &app);
+    assert!(bok, "native build failed: {berr}\n{report}");
+    std::fs::remove_file(&app).unwrap();
+
+    let run = |args: &[&str]| {
+        let out = Command::new(dir.join("run"))
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .expect("spawn binary");
+        (
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+            out.status.code().unwrap_or(-1),
+        )
+    };
+    let path = app.to_string_lossy().to_string();
+    let seeded = format!("[\"a\", \"b\"]\n{path:?}\n{path:?}\nThread::Backtrace::Location\n");
+    assert_eq!(
+        run(&["a", "b"]),
+        (format!("{seeded}first\nsecond\n"), String::new(), 0)
+    );
+    let boom = format!("[\"boom\"]\n{path:?}\n{path:?}\nThread::Backtrace::Location\n");
+    assert_eq!(
+        run(&["boom"]),
+        (
+            format!("{boom}first\nsecond\n"),
+            format!("{path}:5:in 'Object#f': bad (ArgumentError)\n\tfrom {path}:6:in '<main>'\n"),
+            1
+        )
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -25,18 +25,19 @@
 //!    a generated Rust frontend via `include_bytes!` — the `native_id` on each
 //!    chunk rides along in the blob, so at runtime `host::run_chunk_on` reads it
 //!    and dispatches the method/block to its native driver instead of interpreting.
-//! 4. The frontend defines the blob symbols the runtime hook reads, declares the
-//!    `fusevm_aot_fn_{i}` drivers, registers their addresses via
-//!    `register_native_fns`, and a `main` that calls
-//!    `fusevm::aot::fusevm_aot_run_embedded`. `rustc` compiles it against the
-//!    rubylang rlib (which statically links fusevm + the whole runtime) and links
-//!    in `app.o`, producing the executable.
+//! 4. The frontend defines the blob symbols, declares the `fusevm_aot_fn_{i}`
+//!    drivers and `fusevm_aot_entry`, registers their addresses (main's last)
+//!    via `register_native_fns`, and a `main` that calls [`run_embedded`].
+//!    `rustc` compiles it against the rubylang rlib (which statically links
+//!    fusevm + the whole runtime) and links in `app.o`, producing the executable.
 //!
-//! The runtime hook itself — [`fusevm_aot_register_builtins`] — lives here, in
-//! the rubylang library, so it is baked into the rlib the frontend links against.
-//! It installs the exact builtins + numeric hook a normal run uses
-//! (`host::run_chunk_on`) and loads the embedded program into the thread-local
-//! host, so method/block/const dispatch resolves identically to `ruby FILE`.
+//! [`run_embedded`] lives here, in the rubylang library, so it is baked into the
+//! rlib the frontend links against. It seeds the host as `ruby FILE` does, loads
+//! the embedded program, and runs the main chunk through `host::run_main`, so
+//! method/block/const dispatch, `exit`, uncaught exceptions and `at_exit`
+//! handlers behave identically to `ruby FILE`. fusevm's own
+//! `fusevm_aot_run_embedded` and its [`fusevm_aot_register_builtins`] hook stay
+//! linked but are not the entry point.
 
 // ────────────────────────────────────────────────────────────────────────────
 // Native method/block dispatch table (`--build --native` full lowering)
@@ -128,18 +129,80 @@ pub fn build(file: &str) -> Result<String, String> {
 // Native standalone executable (`ruby --build --native`)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// The exit status a `SystemExit` left pending, for the generated `main` to use
-/// in place of the VM's own return.
+/// The standalone binary's run: what the generated `main` calls instead of
+/// fusevm's `fusevm_aot_run_embedded`, whose return is the last expression's
+/// value rather than an exit status and which never reaches the interpreter's
+/// end of program.
 ///
-/// `exit` raises `SystemExit` rather than leaving the process where it stands,
-/// so that an `ensure` above it runs and a `rescue SystemExit` can stop it. The
-/// interpreter turns an uncaught one into the process status in
-/// `host::run_main`; a standalone AOT binary never goes through that function —
-/// it exits with what `fusevm_aot_run_embedded` returned — so it asks here
-/// instead. `None` when the run ended any other way, including a real error,
-/// whose status the VM's own return already carries.
-pub fn pending_exit_status() -> Option<i32> {
-    crate::host::with_host(|h| h.pending_system_exit())
+/// It seeds the host as `ruby FILE` does for `script` (the entry file as given
+/// to `--build`) — `ARGV` from the process arguments, `$0`, `__FILE__`,
+/// `$LOAD_PATH` rooted at the cwd, `$VERBOSE`/`$DEBUG`, the prelude — then
+/// runs the main chunk through `host::run_main` and `end_program`, so `exit`,
+/// an uncaught exception's report and status, and `at_exit` handlers behave
+/// exactly as they do interpreted. The main chunk still runs as machine code:
+/// the frontend registers `fusevm_aot_entry` as the LAST native driver, and the
+/// chunk is tagged with that slot, so `run_chunk_pooled` dispatches to it.
+///
+/// The embedded program is loaded before the prelude is compiled: its proc and
+/// begin ids were fixed at build time from base 0 and its native drivers were
+/// lowered against them, so it cannot be rebased; the prelude is rebased above
+/// it instead. `synth_base` is the build's synthetic-name counter, so nothing
+/// compiled here reuses a `__class_body__N` the program holds.
+pub fn run_embedded(script: &str, synth_base: u64) -> i32 {
+    let prog = embedded_program();
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    crate::host::reset_host();
+    let r = crate::host::with_gvl(|| {
+        seed_embedded_host();
+        crate::host::push_file_path(script.to_string());
+        crate::host::with_host(|h| h.set_program_args(&argv, script));
+        crate::seed_verbosity(&crate::RunConfig::default());
+        crate::compiler::advance_synth_ids(synth_base);
+        let crate::compiler::Program {
+            mut main,
+            methods,
+            classes,
+            begins,
+            procs,
+        } = prog;
+        crate::host::with_host(|h| h.load_program(methods, classes, begins, procs));
+        crate::run_prelude()?;
+        main.native_id = NATIVE_FNS.get().map_or(0, |f| f.len() as u32);
+        crate::end_program(crate::host::run_main(main))
+    });
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    match r {
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+/// The full program the generated frontend embeds, deserialized.
+fn embedded_program() -> crate::compiler::Program {
+    extern "C" {
+        static rubylang_aot_program_blob: u8;
+        static rubylang_aot_program_len: u64;
+    }
+    // SAFETY: the linked frontend defines both symbols; the blob is a fixed-size
+    // array of exactly `rubylang_aot_program_len` bytes.
+    let blob = unsafe {
+        let len = rubylang_aot_program_len as usize;
+        std::slice::from_raw_parts(&rubylang_aot_program_blob as *const u8, len)
+    };
+    crate::cache::program_from_blob(blob).unwrap_or_else(|e| panic!("aot: embedded program blob: {e}"))
+}
+
+/// Root `$LOAD_PATH`/`$LOADED_FEATURES` and the require file-dir stack at the
+/// cwd: a bundled binary needs no more, but a leftover dynamic `require` still
+/// resolves against where the binary runs.
+fn seed_embedded_host() {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    crate::host::with_host(|h| h.init_load_path(&cwd.to_string_lossy()));
+    crate::host::push_file_dir(cwd);
 }
 
 /// The AOT frontend hook fusevm's [`fusevm::aot::fusevm_aot_run_embedded`] calls
@@ -166,10 +229,6 @@ pub fn pending_exit_status() -> Option<i32> {
 /// are defined by the linked frontend object.
 #[no_mangle]
 pub unsafe extern "C" fn fusevm_aot_register_builtins(vm: *mut fusevm::VM) {
-    extern "C" {
-        static rubylang_aot_program_blob: u8;
-        static rubylang_aot_program_len: u64;
-    }
     let vm = &mut *vm;
     crate::builtins::install(vm);
     vm.set_numeric_hook(std::sync::Arc::new(|op, a, b| {
@@ -181,16 +240,8 @@ pub unsafe extern "C" fn fusevm_aot_register_builtins(vm: *mut fusevm::VM) {
     // cwd (a bundled binary needs no more, but a leftover dynamic `require` still
     // resolves against where the binary runs).
     crate::host::reset_host();
-    let cwd = std::env::current_dir().unwrap_or_default();
-    crate::host::with_host(|h| h.init_load_path(&cwd.to_string_lossy()));
-    crate::host::push_file_dir(cwd);
-
-    let blob = {
-        let len = rubylang_aot_program_len as usize;
-        std::slice::from_raw_parts(&rubylang_aot_program_blob as *const u8, len)
-    };
-    let prog = crate::cache::program_from_blob(blob)
-        .unwrap_or_else(|e| panic!("aot: embedded program blob: {e}"));
+    seed_embedded_host();
+    let prog = embedded_program();
     // Fresh host: proc/begin ids were compiled from base 0 and nothing is loaded
     // yet, so no rebasing is needed (see `compiler::rebase_program`).
     let crate::compiler::Program {
@@ -235,6 +286,9 @@ pub fn build_native(file: &str) -> Result<String, String> {
     // 1. bundle → Program (identical front half to `build`).
     let (stmts, report) = crate::bundle::bundle(Path::new(file))?;
     let mut prog = crate::compiler::compile(&stmts, false)?;
+    // Every synthetic name the program holds was minted below this; the binary
+    // starts its own counter here (see `run_embedded`).
+    let synth_base = crate::compiler::synth_ids_used();
     let (nmethods, nprocs, nops) = (prog.methods.len(), prog.procs.len(), prog.main.ops.len());
 
     // Output executable: strip the extension, place it beside the entrypoint.
@@ -330,11 +384,10 @@ pub fn build_native(file: &str) -> Result<String, String> {
     let mut fn_addrs = String::new();
     for i in 1..=n_native {
         fn_externs.push_str(&format!("    fn fusevm_aot_fn_{i}(vm: *mut u8) -> i64;\n"));
-        if i > 1 {
-            fn_addrs.push_str(", ");
-        }
-        fn_addrs.push_str(&format!("fusevm_aot_fn_{i} as usize"));
+        fn_addrs.push_str(&format!("fusevm_aot_fn_{i} as *const () as usize, "));
     }
+    // The main chunk's driver goes last: `run_embedded` tags main with that slot.
+    fn_addrs.push_str("fusevm_aot_entry as *const () as usize");
 
     let frontend = work.join("aot_main.rs");
     let frontend_src = format!(
@@ -345,17 +398,16 @@ pub fn build_native(file: &str) -> Result<String, String> {
          pub static rubylang_aot_program_blob: [u8; {len}] = *include_bytes!({blob:?});\n\
          #[no_mangle]\n\
          pub static rubylang_aot_program_len: u64 = {len};\n\n\
-         extern \"C\" {{\n    fn fusevm_aot_run_embedded() -> i64;\n{fn_externs}}}\n\n\
+         extern \"C\" {{\n    fn fusevm_aot_entry(vm: *mut u8) -> i64;\n{fn_externs}}}\n\n\
          fn main() {{\n    \
-         // Register every AOT-lowered method/block driver before the program runs.\n    \
+         // Register every AOT-lowered driver (main's last) before the program runs.\n    \
          rubylang::aot::register_native_fns(vec![{fn_addrs}]);\n    \
-         // SAFETY: resolved from the linked rubylang/fusevm runtime.\n    \
-         let rc = unsafe {{ fusevm_aot_run_embedded() }} as i32;\n    \
-         // `exit` raises SystemExit so an `ensure` runs; an uncaught one is what\n    \
-         // actually sets the status, and this binary never runs `host::run_main`.\n    \
-         std::process::exit(rubylang::aot::pending_exit_status().unwrap_or(rc));\n}}\n",
+         // Seed the host as `ruby FILE` does, run, and end through the\n    \
+         // interpreter's own path: exit status, uncaught report, at_exit.\n    \
+         std::process::exit(rubylang::aot::run_embedded({script:?}, {synth_base}));\n}}\n",
         len = blob.len(),
         blob = blob_path.to_string_lossy(),
+        script = file,
     );
     std::fs::write(&frontend, &frontend_src)
         .map_err(|e| format!("aot: write {}: {e}", frontend.display()))?;

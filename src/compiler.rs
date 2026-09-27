@@ -149,10 +149,24 @@ pub struct Compiler {
 /// only ever referenced within the same Program's own bytecode (call site uses
 /// the exact name it minted), so a global counter stays self-consistent and
 /// cache-safe.
+static SYNTH_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn next_synth_id() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SYNTH_CTR: AtomicU64 = AtomicU64::new(0);
-    SYNTH_CTR.fetch_add(1, Ordering::Relaxed)
+    SYNTH_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many synthetic ids this process has minted so far. `--build --native`
+/// records it so the standalone binary can start its own counter past every
+/// name baked into the embedded program.
+pub fn synth_ids_used() -> u64 {
+    SYNTH_CTR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Move the synthetic-id counter to at least `base`, so what this process
+/// compiles next (the prelude, a `require`) cannot reuse a name an embedded
+/// program already holds — the merge would clobber that program's body.
+pub fn advance_synth_ids(base: u64) {
+    SYNTH_CTR.fetch_max(base, std::sync::atomic::Ordering::Relaxed);
 }
 
 // ────────────────────────────────────────────────────────────────────────────

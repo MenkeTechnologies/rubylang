@@ -414,10 +414,11 @@ exception (`KeyError.new("m")`) answers nil for them, as MRI's does.
   another, a handler's `exit` sets the status, a handler that raises has its
   error printed and exits 1 while the rest still run, and `exit!` skips them.
   `abort` now raises `SystemExit` (status 1) instead of ending the process on
-  the spot, so `ensure` and the handlers run. Residue: an AOT-built standalone
-  binary (`--build --native`) does not run the handlers. Pinned by
-  `tests/uncaught.rs::at_exit_handlers_run_lifo_as_the_program_ends` and
-  `::abort_raises_system_exit`.
+  the spot, so `ensure` and the handlers run. A standalone `--build --native`
+  binary runs them the same way. Pinned by
+  `tests/uncaught.rs::at_exit_handlers_run_lifo_as_the_program_ends`,
+  `::abort_raises_system_exit` and
+  `tests/aot_native.rs::native_binary_seeds_the_program_and_runs_at_exit_handlers`.
 - **MRI's `DidYouMean::Correctable` / `ErrorHighlight::CoreExt` do not appear in
   `ancestors`.** These are gems MRI injects into `NameError`/`KeyError`/
   `TypeError`. Deliberately absent — rubylang emits no "did you mean"
@@ -453,13 +454,17 @@ message with status 0 — only a true/false or an Integer is read as the status.
 `#status` and `#success?` answer from it, and are gated on the class because
 `status` is also `Thread`'s.
 
-Both top levels ask one accessor, `RubyHost::pending_system_exit`. The
-interpreter asks it in `run_main`; a standalone `--build --native` binary never
-runs that function — it exits with what `fusevm_aot_run_embedded` returned — so
-its generated `main` asks through `aot::pending_exit_status`. That second half
-is not hypothetical: `tests/aot_native.rs` caught the standalone binary
-returning 0 where it had to return 5, which is exactly the case the first half
-of the change would otherwise have broken.
+Both top levels end through `host::run_main`, which asks
+`RubyHost::pending_system_exit`: the interpreter directly, and a standalone
+`--build --native` binary from `aot::run_embedded`, which its generated `main`
+calls instead of fusevm's `fusevm_aot_run_embedded`. That function's return is
+the last expression's value, not a status — a binary whose program ended in
+`x = 5` exited 5 — and it never reached `at_exit` handlers, the uncaught
+report (an uncaught exception exited 0 silently), `ARGV`, `$0`, `__FILE__` or
+the prelude. `run_embedded` seeds all of them as `ruby FILE` does and still
+runs the main chunk as native code, registered as the last driver.
+`tests/aot_native.rs` pins both: the binary returns 5 for `exit 5`, and 0 for
+a program whose last expression is `x = 5`.
 
 ## FIXED — an uncaught `throw` raises at the throw site
 

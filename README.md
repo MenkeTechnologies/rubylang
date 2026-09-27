@@ -285,7 +285,7 @@ rather than silently mis-running.
 | `--lsp` | Language Server Protocol over stdio. |
 | `--dap` | Debug Adapter Protocol over stdio: source-line and function breakpoints, stepping, and the call stack. The `variables` request reports a method frame's parameters only, and `evaluate` is not implemented — it answers `<cannot evaluate ...>` for every expression. |
 | `--build FILE` | AOT-bundle the whole app — the entrypoint plus every file it statically `require`s / `require_relative`s — into one program in the on-disk cache. A later `ruby FILE` runs it directly, needing none of the required sources on disk. |
-| `--build --native FILE` | Emit a **standalone native executable** next to the script (`app.rb` → `app`). It runs the whole app with no `ruby` interpreter and no `.rb` sources present. `fusevm`'s Cranelift AOT emitter compiles the main chunk to a native object; the full program (methods/classes/blocks/constants) is baked in and linked against the rubylang runtime (`rustc` + the crate rlib). Needs `rustc` and the build tree present. |
+| `--build --native FILE` | Emit a **standalone native executable** next to the script (`app.rb` → `app`). It runs the whole app with no `ruby` interpreter and no `.rb` sources present. `fusevm`'s Cranelift AOT emitter compiles the main chunk and every method and block body to one native object; the full program (methods/classes/blocks/constants) is baked in and linked against the rubylang runtime (`rustc` + the crate rlib). Needs `rustc` and the build tree present. |
 | `--dump-tokens FILE` | Print the lexer token stream and exit. |
 | `--dump-ast FILE` | Print the parsed AST and exit. |
 | `--dump-bytecode FILE` | Print the lowered fusevm chunk and exit. |
@@ -366,15 +366,16 @@ unaffected.
 
 `ruby --build --native FILE` compiles an app to a **standalone native
 executable** — no interpreter, no `.rb` sources at run time. `fusevm`'s Cranelift
-AOT emitter lowers the main chunk to a relocatable object exporting a native
-driver; the full program (methods/classes/blocks/constants) is serialized and
-baked into a generated frontend, which `rustc` links against the rubylang runtime
-(the crate rlib, itself statically linking fusevm) plus that object. At startup
-the frontend hook installs the same builtins + numeric hook a normal run uses and
-loads the embedded program into the host, so method dispatch, block yields, and
-namespaced-constant reads resolve exactly as under `ruby FILE`. Method/block
-bodies run through the interpreter from that host; only the top-level chunk is
-native today.
+AOT emitter lowers the main chunk and every method and block body into one
+relocatable object, one native driver per chunk; the full program
+(methods/classes/blocks/constants) is serialized and baked into a generated
+frontend, which `rustc` links against the rubylang runtime (the crate rlib,
+itself statically linking fusevm) plus that object. At startup the binary seeds
+the host as `ruby FILE` does — `ARGV`, `$0`, `__FILE__`, the prelude — loads the
+embedded program, and runs; a method or block call dispatches to its native
+driver. The run ends through the interpreter's own path, so `exit`, an uncaught
+exception's report and status, and `at_exit` handlers behave as under
+`ruby FILE`.
 
 The DAP debugger (`ruby --dap`) sets source-line and function breakpoints (break on method entry), steps (next/stepIn/stepOut), and inspects the call stack; markers are emitted only in --dap mode, so normal runs are unaffected. Two limits: `evaluate` is wired but answers `<cannot evaluate EXPR>` for every expression, and `variables` reports only a method frame's parameters — a top-level frame answers an empty list, and locals assigned in a method body are absent.
 Regex literals (`/pat/flags`), `=~`/`!~`, `String#{match,scan,match?,sub,gsub}`
