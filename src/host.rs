@@ -4463,6 +4463,13 @@ impl RubyHost {
             *map = m;
         }
     }
+    /// Whether `v` is a String-endpoint or object-endpoint Range.
+    pub fn is_str_or_obj_range(&self, v: &Value) -> bool {
+        matches!(
+            self.obj(v),
+            Some(RObj::StrRange { .. } | RObj::ObjRange { .. })
+        )
+    }
     pub fn as_range(&self, v: &Value) -> Option<(i64, i64, bool)> {
         match self.obj(v) {
             Some(RObj::Range { lo, hi, exclusive }) => Some((*lo, *hi, *exclusive)),
@@ -7850,6 +7857,13 @@ impl RubyHost {
                     format!("Set[{}]", inner.join(", "))
                 }
                 Some(RObj::Time(t)) => t.to_s(),
+                // `Range#to_s` is each endpoint's `to_s` (a nil one is empty).
+                Some(RObj::ObjRange { lo, hi, exclusive }) => format!(
+                    "{}{}{}",
+                    self.to_s(&lo),
+                    if exclusive { "..." } else { ".." },
+                    self.to_s(&hi)
+                ),
                 Some(RObj::Date { days }) => self.date_to_s(days),
                 Some(RObj::DateTime { secs }) => self.datetime_to_s(secs),
                 Some(RObj::Db { .. }) => "#<SQLite3::Database>".to_string(),
@@ -7928,14 +7942,6 @@ impl RubyHost {
                 ),
                 Some(RObj::StrRange { lo, hi, exclusive }) => {
                     format!("{lo}{}{hi}", if exclusive { "..." } else { ".." })
-                }
-                Some(RObj::ObjRange { lo, hi, exclusive }) => {
-                    format!(
-                        "{}{}{}",
-                        self.inspect(&lo),
-                        if exclusive { "..." } else { ".." },
-                        self.inspect(&hi)
-                    )
                 }
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash { map, .. }) => self.inspect_hash(&map),
@@ -8106,6 +8112,19 @@ impl RubyHost {
                 // A String range inspects its endpoints with quotes: `"a".."e"`.
                 Some(RObj::StrRange { lo, hi, exclusive }) => {
                     format!("{lo:?}{}{hi:?}", if exclusive { "..." } else { ".." })
+                }
+                // MRI `range_inspect`: a nil endpoint is left out, unless both are.
+                Some(RObj::ObjRange { lo, hi, exclusive }) => {
+                    let both_nil = matches!((&lo, &hi), (Value::Undef, Value::Undef));
+                    let lo_s = match lo {
+                        Value::Undef if !both_nil => String::new(),
+                        _ => self.inspect(&lo),
+                    };
+                    let hi_s = match hi {
+                        Value::Undef if !both_nil => String::new(),
+                        _ => self.inspect(&hi),
+                    };
+                    format!("{lo_s}{}{hi_s}", if exclusive { "..." } else { ".." })
                 }
                 // `#<MatchData "ll" 1:"l">` — whole match then numbered groups.
                 Some(RObj::MatchData { groups, .. }) => {

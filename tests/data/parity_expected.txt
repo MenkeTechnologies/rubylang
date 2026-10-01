@@ -3317,3 +3317,37 @@ nil
 9
 true
 [4, 0]
+#==#
+[:const, 1]
+{x: 1, y: 2}
+[1, 2]
+1
+#==#
+true
+false
+false
+true
+true
+false
+true
+1
+:yes
+"a"..
+true
+.."m"
+true
+nil
+nil..nil
+"a.."
+"..m"
+"\"a\".."
+["a"..]
+nil
+"can't iterate from NilClass"
+"can't iterate from Time"
+#==#
+{"a" => 2, "b" => 4}
+{1 => :x}
+[TypeError, "wrong element type Integer (expected array)"]
+[ArgumentError, "element has wrong array length (expected 2, was 1)"]
+[TypeError, "wrong element type nil (expected array)"]

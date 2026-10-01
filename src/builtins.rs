@@ -1179,6 +1179,18 @@ fn b_mkrange(vm: &mut VM, _: u8) -> Value {
 /// between the integer, float, string and generic-object range representations.
 /// Shared by the `..`/`...` literal op and `Range.new`.
 pub(crate) fn make_range(lo: &Value, hi: &Value, excl: bool) -> Result<Value, String> {
+    // A literal's absent bound arrives as the integer sentinel. Opposite a
+    // non-numeric endpoint (`"a"..`, `.."m"`) it is a nil endpoint of an
+    // object range, not an Integer.
+    let numeric = |v: &Value| matches!(v, Value::Int(_) | Value::Float(_));
+    let lo = &match lo {
+        Value::Int(crate::host::RANGE_BEGINLESS) if !numeric(hi) => Value::Undef,
+        _ => lo.clone(),
+    };
+    let hi = &match hi {
+        Value::Int(crate::host::RANGE_ENDLESS) if !numeric(lo) => Value::Undef,
+        _ => hi.clone(),
+    };
     // `1..Float::INFINITY` is an endless integer range; `-Float::INFINITY..n`
     // is beginless. Map either infinite float bound to the range sentinel.
     let bound = |v: &Value, endless_sentinel: i64| -> Option<i64> {
@@ -1210,12 +1222,8 @@ pub(crate) fn make_range(lo: &Value, hi: &Value, excl: bool) -> Result<Value, St
             match (ls, hs) {
                 (Some(a), Some(b)) => with_host(|h| h.new_str_range(a, b, excl)),
                 // Any other endpoints form a generic object-range over `<=>`-
-                // comparable values (IPAddr#to_range, custom Comparable). nil
-                // endpoints are the beginless/endless forms, handled above; a lone
-                // nil here is genuinely bad.
-                _ if matches!(lo, Value::Undef) && matches!(hi, Value::Undef) => {
-                    return Err(raise_exc("ArgumentError", "bad value for range"))
-                }
+                // comparable values (IPAddr#to_range, custom Comparable). A nil
+                // endpoint is the beginless/endless form (`nil..nil` included).
                 _ => with_host(|h| h.new_obj_range(lo.clone(), hi.clone(), excl)),
             }
         }
@@ -2200,6 +2208,11 @@ pub(crate) fn dispatch(
                 } else {
                     x >= lo && x <= hi
                 }));
+            }
+            // A String or object Range is `cover?` too (MRI `range_eqq`), so
+            // `case "c" when "a".."z"` and a Comparable endpoint range match.
+            if with_host(|h| h.is_str_or_obj_range(recv)) {
+                return dispatch(recv, "cover?", args, None);
             }
             return Ok(Value::Bool(with_host(|h| h.eq_values(recv, &args[0]))));
         }
@@ -5035,7 +5048,13 @@ fn struct_method(
             for (m, v) in members.iter().zip(values()) {
                 map.insert(RKey::Sym(m.clone()), v);
             }
-            with_host(|h| h.new_hash(map))
+            let hash = with_host(|h| h.new_hash(map));
+            // With a block, each `[member, value]` pair maps through it, as
+            // `Hash#to_h { }` maps a Hash's pairs.
+            match block {
+                Some(b) => dispatch(&hash, "to_h", &[], Some(b.clone()))?,
+                None => hash,
+            }
         }
         "deconstruct_keys" => {
             let mut map = IndexMap::new();
@@ -18399,12 +18418,25 @@ fn dispatch_hash(
             for (k, v) in &map {
                 let kv = with_host(|h| h.key_value(k));
                 let r = call_proc(b, &[kv, v.clone()])?;
-                let pair = with_host(|h| h.as_array(&r))
-                    .ok_or_else(|| "wrong element type (expected array)".to_string())?;
+                // MRI names nil/true/false by value here (`rb_builtin_class_name`).
+                let Some(pair) = with_host(|h| h.as_array(&r)) else {
+                    let what = match r {
+                        Value::Undef => "nil".to_string(),
+                        Value::Bool(b) => b.to_string(),
+                        _ => with_host(|h| h.class_of(&r)),
+                    };
+                    return Err(raise_exc(
+                        "TypeError",
+                        &format!("wrong element type {what} (expected array)"),
+                    ));
+                };
                 if pair.len() != 2 {
-                    return Err(format!(
-                        "element has wrong array length (expected 2, was {})",
-                        pair.len()
+                    return Err(raise_exc(
+                        "ArgumentError",
+                        &format!(
+                            "element has wrong array length (expected 2, was {})",
+                            pair.len()
+                        ),
                     ));
                 }
                 let nk = with_host(|h| h.value_to_key(&pair[0]));
@@ -18968,15 +19000,36 @@ fn dispatch_obj_range(
         }
     }
     match name {
+        // MRI `range_size`: nil for a discrete (`succ`-able) begin, else
+        // TypeError — a nil begin included.
+        "size" if args.is_empty() && int_bounds.is_none() => {
+            // `discrete_object_p`: the begin has a `succ` — a written one on a
+            // user object, else the reference interpreter's own table.
+            let discrete = with_host(|h| match h.object_class(&lo) {
+                Some(cls) => {
+                    h.find_method_owner(&cls, "succ").is_some()
+                        || h.find_define_method(&cls, "succ").is_some()
+                }
+                None => h.builtin_owner(&lo, "succ").is_some(),
+            });
+            if !discrete || matches!(lo, Value::Undef) {
+                let cls = with_host(|h| h.class_of(&lo));
+                return Err(raise_exc("TypeError", &format!("can't iterate from {cls}")));
+            }
+            return Ok(Value::Undef);
+        }
         "begin" | "first" if args.is_empty() => return Ok(lo),
         "end" | "last" if args.is_empty() => return Ok(hi),
         "exclude_end?" => return Ok(Value::Bool(excl)),
         "include?" | "member?" | "cover?" | "===" if !args.is_empty() => {
+            // A nil endpoint (`"a"..`, `.."m"`) leaves that side unbounded.
             let x = &args[0];
-            let above_lo = cmp(&lo, x)?.map(|c| c <= 0).unwrap_or(false);
-            let below_hi = cmp(x, &hi)?
-                .map(|c| if excl { c < 0 } else { c <= 0 })
-                .unwrap_or(false);
+            let above_lo =
+                matches!(lo, Value::Undef) || cmp(&lo, x)?.map(|c| c <= 0).unwrap_or(false);
+            let below_hi = matches!(hi, Value::Undef)
+                || cmp(x, &hi)?
+                    .map(|c| if excl { c < 0 } else { c <= 0 })
+                    .unwrap_or(false);
             return Ok(Value::Bool(above_lo && below_hi));
         }
         "==" if !args.is_empty() => {

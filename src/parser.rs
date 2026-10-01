@@ -2437,7 +2437,7 @@ impl Parser {
             }
             Tok::Op(o) if o == "{" => {
                 self.advance();
-                let (pairs, rest) = self.parse_hash_pattern()?;
+                let (pairs, rest) = self.parse_hash_pattern("}")?;
                 self.expect_op("}")?;
                 Ok(Pattern::Hash(pairs, rest))
             }
@@ -2458,18 +2458,25 @@ impl Parser {
             }
             Tok::Const(name) => {
                 self.advance();
-                // `Const[...]` / `Const(...)` deconstruction.
-                if self.eat_op("[") {
-                    let elems = self.parse_array_pattern("]")?;
-                    self.expect_op("]")?;
-                    Ok(Pattern::Const(name, Some(Box::new(Pattern::Array(elems)))))
+                // `Const[...]` / `Const(...)` deconstruction: an array pattern,
+                // or a hash pattern when it opens with a `key:` label or `**`
+                // (`in Point(x:, y: 2)`).
+                let close = if self.eat_op("[") {
+                    "]"
                 } else if self.eat_op("(") {
-                    let elems = self.parse_array_pattern(")")?;
-                    self.expect_op(")")?;
-                    Ok(Pattern::Const(name, Some(Box::new(Pattern::Array(elems)))))
+                    ")"
                 } else {
-                    Ok(Pattern::Const(name, None))
-                }
+                    return Ok(Pattern::Const(name, None));
+                };
+                self.skip_terms();
+                let inner = if self.peek_label().is_some() || self.is_op("**") {
+                    let (pairs, rest) = self.parse_hash_pattern(close)?;
+                    Pattern::Hash(pairs, rest)
+                } else {
+                    Pattern::Array(self.parse_array_pattern(close)?)
+                };
+                self.expect_op(close)?;
+                Ok(Pattern::Const(name, Some(Box::new(inner))))
             }
             Tok::Ident(n) => {
                 self.advance();
@@ -2498,13 +2505,17 @@ impl Parser {
         Ok(elems)
     }
 
-    /// `key:`, `key: subpattern`, and a trailing `**rest`/`**nil`, until `}`.
+    /// `key:`, `key: subpattern`, and a trailing `**rest`/`**nil`, until
+    /// `close` (`}`, or the `)`/`]` of a `Const(...)` deconstruction).
     #[allow(clippy::type_complexity)]
-    fn parse_hash_pattern(&mut self) -> Result<(Vec<(String, Option<Pattern>)>, HashRest), String> {
+    fn parse_hash_pattern(
+        &mut self,
+        close: &str,
+    ) -> Result<(Vec<(String, Option<Pattern>)>, HashRest), String> {
         let mut pairs = Vec::new();
         let mut rest = HashRest::None;
         self.skip_terms();
-        while !self.is_op("}") {
+        while !self.is_op(close) {
             if self.eat_op("**") {
                 // `**nil` forbids other keys; `**` / `**name` allows them.
                 if self.is_kw("nil") {
@@ -2529,7 +2540,7 @@ impl Parser {
                 };
                 self.expect_op(":")?;
                 // `key:` shorthand binds `key`; otherwise a subpattern follows.
-                let sub = if self.is_op(",") || self.is_op("}") {
+                let sub = if self.is_op(",") || self.is_op(close) {
                     None
                 } else {
                     Some(self.parse_pattern()?)

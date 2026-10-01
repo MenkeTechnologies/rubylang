@@ -3533,8 +3533,12 @@ fn lower_pattern(pat: &Pattern, subj: &Expr) -> (Expr, Vec<Expr>) {
                 "===",
                 vec![subj.clone()],
             );
-            let decon = pcall(subj.clone(), "deconstruct", vec![]);
-            let (t, binds) = lower_pattern(inner, &decon);
+            // A hash-form inner pattern (`Point(x:, y:)`) reads `deconstruct_keys`
+            // off the subject itself; an array form reads `deconstruct`.
+            let (t, binds) = match inner.as_ref() {
+                Pattern::Hash(..) => lower_pattern(inner, subj),
+                _ => lower_pattern(inner, &pcall(subj.clone(), "deconstruct", vec![])),
+            };
             (pand(type_test, t), binds)
         }
         // `pat => name` — bind the whole subject after the inner pattern matches.

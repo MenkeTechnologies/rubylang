@@ -4902,3 +4902,45 @@ p g[s], g["x"], g[:sym], g, g.size
 define_method(:tdm) { |a, k: 0| [a, k] }
 self.define_method(:tdm2) { 9 }
 p tdm(1, k: 2), tdm(1), tdm2, Object.public_method_defined?(:tdm), Object.new.tdm(4)
+#==#
+# `Const(key: …)` deconstructs through deconstruct_keys, like `{key: …}`.
+Pt = Struct.new(:x, :y)
+case Pt.new(1, 2)
+in Pt(x:, y: 2) then p [:const, x]
+end
+case Pt.new(1, 2)
+in Pt[x:, y: String] then p :no
+in Pt(**rest) then p rest
+end
+Dd = Data.define(:a, :b)
+case Dd.new(a: 1, b: 2)
+in Dd(a:, b: Integer => bb) then p [a, bb]
+end
+case {k: 1}
+in Hash(k:) then p k
+end
+#==#
+# Range#=== is cover? for String and object ranges too, nil ends included.
+class Tmp
+  include Comparable
+  attr_reader :d
+  def initialize(d) = @d = d
+  def <=>(o) = d <=> o.d
+end
+r = Tmp.new(1)..Tmp.new(4)
+p r === Tmp.new(3), r === Tmp.new(9), (Tmp.new(1)...Tmp.new(3)) === Tmp.new(3)
+p ("a".."z") === "c", ("a".."z") === "cc", ("a".."z") === 5, (Time.at(0)..Time.at(10)) === Time.at(5)
+p (case "c" when "a".."z" then 1 else 2 end), (case "zz" when ("y"..) then :yes else :no end)
+p Range.new("a", nil), ("a"..).cover?("zz"), (nil.."m"), (nil.."m") === "c", ("a"..).end, (nil..nil)
+p ("a"..).to_s, (.."m").to_s, ("a"..).inspect, [("a"..)], ("a"..).size
+p((nil..nil).size) rescue p $!.message
+p((Time.at(0)..Time.at(5)).size) rescue p $!.message
+#==#
+# Struct#to_h and Hash#to_h with a block map each pair; a non-pair raises.
+St = Struct.new(:a, :b)
+p St.new(1, 2).to_h { |k, v| [k.to_s, v * 2] }, Data.define(:x).new(x: 1).to_h { |k, v| [v, k] }
+[-> { St.new(1, 2).to_h { 5 } }, -> { {a: 1}.to_h { [1] } }, -> { {a: 1}.to_h { nil } }].each do |f|
+  f.call
+rescue TypeError, ArgumentError => e
+  p [e.class, e.message]
+end
