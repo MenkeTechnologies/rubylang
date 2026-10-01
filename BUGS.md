@@ -983,7 +983,8 @@ Honest limitations of this surface:
   UTF-8 name is rejected with `unexpected character`. Everything else below **is**
   lexed. Heredocs (`<<END`, `<<~SQL`, `<<-EOT`, `<<'RAW'`),
   `%w[]` / `%i[]` word/symbol arrays (and the `()`/`{}`/`<>` delimiter variants,
-  plus the interpolating `%W[]` / `%I[]` forms),
+  plus the interpolating `%W[]` / `%I[]` forms; `\ ` joins a word across a
+  space and an escaped delimiter is literal, as in MRI),
   double-quoted `#{}` interpolation, `?c` character literals, regex literals
   (`/pat/flags`, with `i`/`m`/`x` flags), radix integer literals
   (`0b1010` binary, `0o17`/`017` octal, `0xff` hex, `0d99` decimal, with `_`
@@ -1641,37 +1642,38 @@ Honest limitations of this surface:
 - **Gap — `String#to_c` is not implemented.** `"12".to_c` raises
   `NoMethodError`; MRI answers `(12+0i)`. `Integer#to_c` and `Float#to_c` are
   present, so this is the String half only.
-- **`Time` is UTC-only.** `Time.at`, `Time.utc`/`Time.gm`, and `Time.now`
-  construct times; the field readers (`year`/`month`/`day`/`hour`/`min`/`sec`/
-  `wday`/`yday`), `to_i`/`to_f`, `to_s`/`inspect`, `strftime` (every directive
-  MRI documents except a numeric field WIDTH such as `%6N`, including the
-  composites `%c`/`%x`/`%r`/`%v`, the week numbers `%U`/`%W`, the ISO-8601
-  week-based `%V`/`%G`/`%g`, `%N`, and the `-`/`_`/`0` padding flags),
-  arithmetic (`Time - Time → Float`,
-  `Time ± Numeric → Time`) and comparison/sort all work, with a dependency-free
-  proleptic-Gregorian calendar (valid for negative epochs too). The
-  local-timezone offset is **not** modeled — there is no tz database, so
-  `.utc`/`.getutc` are exact and `.localtime`/`Time.local` behave as UTC.
-  Timezone-aware `strftime` is not modeled (`%Z` always prints `UTC`, `%z` always
-  `+0000`).
-
-  **Divergence — `Time#to_s`/`#inspect` print UTC where MRI prints local.** With
-  `TZ=America/New_York`, MRI renders `Time.at(0)` as
-  `1969-12-31 19:00:00 -0500` and answers `false` to `utc?`; here it is
-  `1970-01-01 00:00:00 UTC` and `true`. This is NOT an `inspect`-local fix, and
-  that is why it is still open: `RObj::Time` stores a bare `secs: f64` with no
-  offset field, and the whole surface decomposes it through one UTC
-  `time_fields` — the field readers, `strftime`, `<=>`, `+`/`-`, and the
-  `Time.local`/`Time.mktime` constructors (which currently share the `Time.utc`
-  arm and so silently shift the instant by the local offset). Rendering local in
-  `inspect` alone would leave `t.hour` disagreeing with `t.inspect`, which is
-  worse than being consistently UTC. Closing it properly means giving
-  `RObj::Time` an offset, filling it from `localtime_r` (libc is already a
-  dependency, so no tz crate is needed), and threading it through every one of
-  those sites — plus pinning `TZ` in the fuzzer, since otherwise the mode's
-  output depends on the machine's zone. `Time#inspect` is also implemented
-  twice, in `dispatch_time` and in `Host::inspect`, and only the latter fires
-  (the universal `inspect` arm wins first), so both would have to move together.
+- **`Time`** (`src/rtime.rs`, ported from MRI's `time.c` and `strftime.c`). A
+  Time is an exact Rational number of epoch seconds plus the zone it is viewed
+  in — UTC, the process's local zone, or a fixed offset — as MRI's
+  `time_object` holds `timew` and a TZMODE. Exactness is observable:
+  `Time.at(1.1)` keeps the Float's binary value (`nsec` is `100000000`, and
+  `inspect` prints the full `225179981368525/2251799813685248` fraction), and
+  `Time.at(Rational(1, 3))` keeps a third of a second. The local zone is the C
+  library's (`localtime_r`/`mktime` after `tzset`), so `Time.now`, `Time.at`,
+  `Time.local`/`mktime` and `Time.new` are local as in MRI and follow a
+  runtime `ENV["TZ"] =`; a wall-clock time the fall-back transition repeats
+  resolves to the later instant, as MRI's `find_time_t` does.
+  Constructors: `Time.at(t, subsec, unit, in:)` (`:millisecond`/`:usec`/
+  `:nsec` and their long names), `Time.utc`/`gm`/`local`/`mktime` with MRI's
+  `time_arg` field rules (month names, string fields, the 7-argument usec and
+  10-argument forms, range errors), and `Time.new(y, m, d, h, mi, s, zone,
+  in:)` plus `Time.new(string, in:, precision:)` with `time_init_parse`'s
+  strict grammar and messages. Zones are `utc_offset_arg`'s: `"+HH:MM"`,
+  `"+HHMM"`, `"+HH:MM:SS"`, `"UTC"`, `"Z"`, military letters, or Integer
+  seconds. Readers include `usec`/`nsec`/`subsec`/`to_r`, `zone`/`utc_offset`/
+  `isdst`/`utc?`, `to_a`, `deconstruct_keys`, `iso8601`/`xmlschema(n)`,
+  `ctime`; `utc`/`gmtime`/`localtime(zone)` convert the receiver in place and
+  `getutc`/`getlocal(zone)` copy; `round`/`floor`/`ceil(n)` use MRI's half-up
+  rule. `strftime` is a port of `rb_strftime_with_timespec`: widths
+  (`%10Y`, `%3N`), the `-`/`_`/`0`/`^`/`#` flags, `%:z`/`%::z`/`%:::z`, `E`/`O`
+  modifiers, and `invalid format` for a directive cut off by the end of the
+  string. Arithmetic is exact (`Time + Rational`), `Time - Time` is a Float,
+  `Time + Time` and a non-numeric operand raise MRI's TypeError, and a Time
+  keys a Hash/Set/`uniq` by its instant. Remaining differences:
+  **a zone object** (a TZInfo-style `in:` argument with `utc_to_local`) is not
+  accepted — only offset strings and Integers are; **a local time before the
+  zone's first transition** (a negative year) takes the tz database's LMT
+  offset, where MRI substitutes the offset of a nearby representable year.
 - **`Date`** (available without `require "date"`, which is accepted as a no-op).
   `Date.new`/`civil`, `Date.today`, `Date.jd`, and `Date.parse` (ISO
   `YYYY-MM-DD` / `YYYY/MM/DD` only — MRI's lenient free-form parsing is not
@@ -1681,8 +1683,8 @@ Honest limitations of this surface:
   `next_month`/`prev_month`/`>>`/`<<` with last-day clamping), `Date - Date →
   Rational`, and comparison/sort all work over the same proleptic-Gregorian
   calendar as `Time`. `Date#>>` accepts a fractional argument
-  (`Date.new(2020,1,31) >> 1.5` is 2020-02-29, as in MRI). Locale-aware
-  formatting is not implemented — see the `strftime` note under Time.
+  (`Date.new(2020,1,31) >> 1.5` is 2020-02-29, as in MRI). Day and month
+  names are English whatever the locale, as in MRI (see Locale above).
 - **`DateTime`** (also available without `require "date"`; it is a `Date`
   subclass carrying a time of day). `DateTime.new`/`civil` (year through second),
   `DateTime.now` (UTC here), `DateTime.jd`, and `DateTime.parse` (ISO8601
@@ -1690,10 +1692,9 @@ Honest limitations of this surface:
   `sec` to the `Date` set; `to_s`/`iso8601`/`inspect` use the ISO8601 form
   (`2020-01-01T12:30:45+00:00`); `strftime`, day/month/year arithmetic (keeping
   the time of day), `DateTime - DateTime → Rational` (in days), `to_date`,
-  `to_time`, and comparison/sort all work over the same proleptic-Gregorian,
-  UTC-only calendar. Because the model is UTC-only, `DateTime#to_time.to_s`
-  renders the zone as `UTC` rather than MRI's `+0000`, and fractional-second /
-  `DateTime.now` sub-second values are not bit-for-bit faithful (f64 storage).
+  `to_time` (a Time at the fixed offset `+0000`, as MRI's), and comparison/sort
+  all work over the same proleptic-Gregorian, UTC-only calendar. Fractional-second
+  and `DateTime.now` sub-second values are not bit-for-bit faithful (f64 storage).
 - **`Array#pack` / `String#unpack` / `#unpack1`** are implemented for the common
   web/crypto directives — `C`/`c` (bytes), `a`/`A` (string, NUL/space pad), `N`/
   `n`/`V`/`v` (big/little-endian 16/32-bit ints), `H`/`h` (hex, high/low nibble

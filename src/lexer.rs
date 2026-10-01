@@ -857,6 +857,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 let start = i;
                 let mut depth = 1u32;
                 while i < b.len() {
+                    if b[i] == b'\\' && i + 1 < b.len() {
+                        // An escaped character never delimits or nests.
+                        if b[i + 1] == b'\n' {
+                            line += 1;
+                        }
+                        i += 2;
+                        continue;
+                    }
                     if b[i] == b'\n' {
                         line += 1;
                     }
@@ -872,7 +880,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 }
                 let body = &src[start..i.min(b.len())];
                 i += 1; // consume the closing delimiter
-                let words: Vec<&str> = body.split_whitespace().collect();
+                let words = percent_words(body, interp, open, close);
                 out.push(Token {
                     kind: Tok::Op("[".into()),
                     line,
@@ -887,9 +895,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         });
                     }
                     let kind = match (symbols, interp) {
-                        (true, false) => Tok::Symbol((*w).to_string()),
-                        (true, true) => Tok::DSymbol((*w).to_string()),
-                        (false, i) => Tok::Str((*w).to_string(), i),
+                        (true, false) => Tok::Symbol(w.clone()),
+                        (true, true) => Tok::DSymbol(w.clone()),
+                        (false, i) => Tok::Str(w.clone(), i),
                     };
                     out.push(Token {
                         kind,
@@ -1529,4 +1537,45 @@ fn utf8_len(b: u8) -> usize {
         0xE0..=0xEF => 3,
         _ => 4,
     }
+}
+
+/// Split a `%w`/`%i` (or, with `interp`, `%W`/`%I`) body into its words, as
+/// MRI's QWORDS string scanner does. Unescaped whitespace separates words;
+/// `\` before whitespace makes it part of the word. In the literal forms `\\`
+/// is one backslash; in every form `\` before a delimiter is that delimiter.
+/// Any other `\x` stays as written, which the interpolating forms then run
+/// through double-quoted escape processing.
+fn percent_words(body: &str, interp: bool, open: u8, close: u8) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            in_word = true;
+            match chars.next() {
+                Some(n) if n.is_whitespace() => cur.push(n),
+                Some(n) if n == open as char || n == close as char || (!interp && n == '\\') => {
+                    cur.push(n)
+                }
+                Some(n) => {
+                    cur.push('\\');
+                    cur.push(n);
+                }
+                None => cur.push('\\'),
+            }
+        } else if c.is_whitespace() {
+            if in_word {
+                words.push(std::mem::take(&mut cur));
+                in_word = false;
+            }
+        } else {
+            in_word = true;
+            cur.push(c);
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    words
 }

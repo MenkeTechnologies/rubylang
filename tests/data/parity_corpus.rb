@@ -4780,3 +4780,85 @@ def cm(a, b = 2) = a + b
 def cs(a, *r) = [a, r]
 p method(:cm).curry[1], method(:cs).curry[1], method(:cs).curry(3)[1][2][3]
 begin; method(:cm).curry(3); rescue ArgumentError => e; p e.message; end
+#==#
+# A Time keeps its exact Rational instant: a Float's own binary value, a third
+# of a second, nanoseconds from `Time.at(s, n, :nsec)`.
+t = Time.at(1700000000, 123456789, :nsec).utc
+p t, t.usec, t.nsec, t.subsec, t.to_r, t.to_i, t.round(3), t.floor(1), t.ceil(2)
+p Time.at(1.1).utc, Time.at(1.1).nsec, Time.at(1.5).utc, Time.at(Rational(1, 3)).utc
+p Time.at(1, 500, :millisecond).utc, Time.at(1, 5).utc.usec, Time.at(0).utc.subsec
+p Time.at(2.5).utc.round, Time.at(-1.5).utc.round, Time.utc(2000) + Rational(1, 3)
+p Time.utc(2000) - Time.utc(1999), (Time.utc(2000) + 1.5).usec
+begin; Time.at(1, 5, :foo); rescue ArgumentError => e; p e.message; end
+begin; Time.at(nil); rescue TypeError => e; p e.message; end
+begin; Time.utc(2000) + Time.utc(2000); rescue TypeError => e; p e.message; end
+begin; Time.utc(2000) - "x"; rescue TypeError => e; p e.message; end
+begin; Time.utc(2000) < 5; rescue ArgumentError => e; p e.message; end
+#==#
+# Fixed offsets and the zone-mode readers; `utc`/`localtime` convert in place.
+f = Time.new(2024, 1, 2, 3, 4, 5.5r, "+09:30")
+p f, f.to_s, f.utc_offset, f.zone, f.utc?, f.to_a, f.iso8601, f.xmlschema(2)
+p Time.at(0, in: "-03:00"), Time.at(0, in: "Z").utc?, Time.at(0, in: 3600), Time.at(0, in: "C")
+p Time.at(0).getlocal("+05:45").asctime, Time.utc(2000).localtime("-02:00"), f.getutc
+g = Time.new(2000, 1, 1, 0, 0, 0, "+01:00")
+g.utc
+p g, g.utc?, g.zone, Time.utc(2000).to_a, Time.utc(2000).deconstruct_keys([:year, :zone])
+p Time.utc(2000) == Time.new(2000, 1, 1, 9, 0, 0, "+09:00"), Time.utc(2000).eql?(Time.at(946684800).utc)
+p Time.utc(2000).hash == Time.at(946684800).hash, [Time.utc(2001), Time.utc(2000)].max
+begin; Time.at(0, in: "bad"); rescue ArgumentError => e; p e.message; end
+begin; Time.new(2000, 1, 1, 0, 0, 0, "+09:00", in: "Z"); rescue ArgumentError => e; p e.message; end
+#==#
+# Time.utc / Time.gm field arguments, as MRI's time_arg reads them.
+[[2024, "feb", 29, 1, 2, 3.25], [2024, 2, 30], [2024, 4, 31], [2024, 1, 1, 24], [2024, 1, 1, 0, 0, 60],
+ [2024, "3", 4], ["2024"], [2024, 1, 1, 0, 0, 0, 5], [2024, 1, 1, 0, 0, 1.5r],
+ [2024, 1, 0], [2024, 1, 32], [2024, 13], [2024, 1, 1, 24, 1], [2024, "xyz"], [2024, 1, 1, 0, 0, "1.5"]].each do |a|
+  p Time.utc(*a)
+rescue ArgumentError => e
+  p e.message
+end
+#==#
+# strftime, ported from MRI strftime.c: widths, flags, colons, %N digits.
+t = Time.at(1700000000, 123456789, :nsec).utc
+f = Time.new(2024, 1, 2, 3, 4, 5.5r, "-03:30")
+%w[%N %3N %12N %L %5L %z %:z %::z %:::z %Z %^a %#b %#p %^#p %10Y %-10Y %_5m %05d %^c %-I %s
+   %+ %-z %_z %010z %_10z %-10z %10:z %#Z %10Z %5% %E %Ey %Od %EQ %3:z %: %v %G %g %C %U %W %V].each do |d|
+  p [d, t.strftime(d), f.strftime(d)]
+end
+%w[abc% %- %5].each { |d| begin; t.strftime(d); rescue ArgumentError => e; p e.message; end }
+#==#
+# The local zone follows ENV["TZ"]; a repeated fall-back hour is the later one.
+ENV["TZ"] = "America/New_York"
+w = Time.local(2024, 1, 15, 12, 30)
+s = Time.local(2024, 7, 4, 9, 0, 0.25r)
+p w, s, w.zone, s.zone, w.utc_offset, s.isdst, s.to_a, Time.at(0), Time.new(2000, 6, 1)
+p Time.local(2024, 3, 10, 2, 30), Time.local(2024, 11, 3, 1, 30), Time.utc(2000, 6, 1).localtime
+p s.strftime("%Z %z %:z %s"), w.getutc
+#==#
+# `\` in a %w/%i body: escaped whitespace joins a word, an escaped delimiter
+# is the delimiter itself, and nothing escaped nests or closes.
+p %w[a\ b c\] d\\e f\ng h\[i], %W[a\ b x#{1}\ y z\]], %i[a\ b c], %w(a\(b), %w<a\>b>
+#==#
+# Time.new(string), as MRI's time_init_parse reads it; a zone in the string
+# overrides in:.
+ENV["TZ"] = "America/New_York"
+["2024-01-02 03:04:05", "2024-01-02T03:04:05.5 +09:00", "2024-01-02 03:04:05.123456789123", "2024",
+ "2024-01-02 03:04:05 UTC", " 2024", "abc", "24-01-01 00:00:00", "2024-1-02 00:00:00", "2024-01-02",
+ "2024-01-02 03:04", "2024-01-02 03.5", "2024-01-02 03:04:05.", "2024-01-02 03:04:05 +09:00 x",
+ "2024-16-02 00:00:00", "2024-01-02 03:04:05 EST", "2024-01-02 24:00:00", "2024-01-02x"].each do |s|
+  t = Time.new(s)
+  p [s, t, t.zone, t.subsec]
+rescue ArgumentError => e
+  p [s, e.message]
+end
+p Time.new("2024-01-02 03:04:05", in: "+01:00"), Time.new("2024-01-02 03:04:05 +02:00", in: "+01:00")
+p Time.new("2024-01-02 03:04:05.987654", precision: 3), Time.new("2024", in: "Z")
+#==#
+# A Time keys a Hash / Set / uniq by its instant, whatever zone it is viewed in.
+h = {Time.utc(2000) => 1}
+p h[Time.utc(2000)], h.key?(Time.at(946684800)), [Time.utc(2000), Time.at(946684800, in: "+01:00")].uniq
+p [Time.utc(2000), Time.utc(2000)].tally, {Time.utc(2000) => 1, Time.at(946684800, in: "Z") => 2}
+require "set"
+p Set[Time.utc(2000)].include?(Time.utc(2000)), (Set[Time.utc(2000)] | Set[Time.utc(2000)]).size
+require "date"
+dt = DateTime.new(2024, 1, 2, 3, 4, 5).to_time
+p dt, dt.utc?, dt.zone, dt.utc_offset

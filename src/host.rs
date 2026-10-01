@@ -568,14 +568,9 @@ pub enum RObj {
     IoHandle {
         id: u32,
     },
-    /// A `Time`, stored as seconds since the Unix epoch (a float, so
-    /// sub-second precision and `Time - Time` Float differences are faithful).
-    /// Always interpreted as UTC — the local-timezone offset is not modeled
-    /// (there is no tz database), so `.utc`/`Time.utc` are exact and
-    /// `.localtime` is a no-op.
-    Time {
-        secs: f64,
-    },
+    /// A `Time`: exact epoch seconds and the zone it is viewed in (UTC, the
+    /// process's local zone, or a fixed offset). See `crate::rtime`.
+    Time(crate::rtime::RTime),
     /// A `Date`, stored as whole days since the Unix epoch (1970-01-01 = 0).
     /// Uses the same proleptic-Gregorian calendar as `Time`.
     Date {
@@ -2541,6 +2536,8 @@ impl RubyHost {
     /// so keying it must consult that `hash` and `eql?` rather than identity.
     pub fn user_hash_candidate(&self, v: &Value) -> bool {
         match self.obj(v) {
+            // A Time keys by its instant (`Time#hash`/`#eql?`), not identity.
+            Some(RObj::Time(_)) => true,
             Some(RObj::Object { class, .. }) if !self.struct_defs.contains_key(class) => {
                 self.find_method_owner(class, "hash").is_some()
                     || self.find_define_method(class, "hash").is_some()
@@ -3122,15 +3119,36 @@ impl RubyHost {
             *cursor = 0;
         }
     }
-    /// Build a `Time` from seconds since the Unix epoch (UTC).
-    pub fn new_time(&mut self, secs: f64) -> Value {
-        self.alloc(RObj::Time { secs })
+    pub fn new_rtime(&mut self, t: crate::rtime::RTime) -> Value {
+        self.alloc(RObj::Time(t))
     }
-    /// The epoch seconds of a `Time`, if `v` is one.
-    pub fn time_secs(&self, v: &Value) -> Option<f64> {
+    /// The `Time` value of `v`, if it is one.
+    pub fn as_time(&self, v: &Value) -> Option<crate::rtime::RTime> {
         match self.obj(v) {
-            Some(RObj::Time { secs }) => Some(*secs),
+            Some(RObj::Time(t)) => Some(t.clone()),
             _ => None,
+        }
+    }
+    /// Re-view a `Time` in place in another zone (`#utc`, `#localtime`).
+    pub fn set_time_zone(&mut self, v: &Value, zone: crate::rtime::Zone) {
+        if let Some(RObj::Time(t)) = self.obj_mut(v) {
+            t.zone = zone;
+        }
+    }
+    /// The epoch seconds of a `Time` as a Float, if `v` is one.
+    pub fn time_secs(&self, v: &Value) -> Option<f64> {
+        use num_traits::ToPrimitive as _;
+        match self.obj(v) {
+            Some(RObj::Time(t)) => t.secs.to_f64(),
+            _ => None,
+        }
+    }
+    /// An exact view of a real number: Integer, Rational, or a Float's exact
+    /// binary value (MRI's `num_exact`, minus its error reporting).
+    pub fn exact_num(&self, v: &Value) -> Option<num_rational::BigRational> {
+        match v {
+            Value::Float(f) => num_rational::BigRational::from_float(*f),
+            _ => self.as_rational(v),
         }
     }
     /// The broken-down UTC fields of an epoch: `(year, month, day, hour, minute,
@@ -3204,21 +3222,6 @@ impl RubyHost {
             sod,
             nsec
         )
-    }
-    /// The canonical `Time#to_s` / `#inspect` text: `YYYY-MM-DD HH:MM:SS UTC`.
-    /// With `subsec`, a non-zero fractional second is appended (`.5`), matching
-    /// `Time#inspect`.
-    pub fn time_to_s(&self, secs: f64, subsec: bool) -> String {
-        let (y, m, d, hh, mm, ss, _, _, frac) = self.time_fields(secs);
-        let mut out = format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}");
-        if subsec && frac.abs() > f64::EPSILON {
-            // Trim to the significant fractional digits, dropping the leading 0.
-            let s = format!("{frac:.9}");
-            let trimmed = s.trim_start_matches('0').trim_end_matches('0');
-            out.push_str(trimmed);
-        }
-        out.push_str(" UTC");
-        out
     }
     /// The `(real, imaginary)` parts of a complex number, if `v` is one.
     pub fn complex_parts(&self, v: &Value) -> Option<(Value, Value)> {
@@ -7781,7 +7784,7 @@ impl RubyHost {
                     let inner: Vec<String> = items.iter().map(|v| self.inspect(v)).collect();
                     format!("Set[{}]", inner.join(", "))
                 }
-                Some(RObj::Time { secs }) => self.time_to_s(secs, false),
+                Some(RObj::Time(t)) => t.to_s(),
                 Some(RObj::Date { days }) => self.date_to_s(days),
                 Some(RObj::DateTime { secs }) => self.datetime_to_s(secs),
                 Some(RObj::Db { .. }) => "#<SQLite3::Database>".to_string(),
@@ -8022,7 +8025,7 @@ impl RubyHost {
                     format!("/{source}/{f}")
                 }
                 // `Time#inspect` shows a fractional second (unlike `#to_s`).
-                Some(RObj::Time { secs }) => self.time_to_s(secs, true),
+                Some(RObj::Time(t)) => t.inspect(),
                 Some(RObj::Date { days }) => self.date_inspect(days),
                 Some(RObj::DateTime { secs }) => self.datetime_inspect(secs),
                 Some(RObj::Db { .. }) => "#<SQLite3::Database>".to_string(),
@@ -8316,6 +8319,12 @@ impl RubyHost {
     pub fn value_hash(&self, v: &Value) -> i64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // A Time hashes by its exact instant, as `eql?` compares it.
+        if let Some(RObj::Time(t)) = self.obj(v) {
+            "Time".hash(&mut hasher);
+            t.secs.hash(&mut hasher);
+            return hasher.finish() as i64;
+        }
         self.to_key(v).hash(&mut hasher);
         hasher.finish() as i64
     }
@@ -8432,7 +8441,7 @@ impl RubyHost {
                 // its key must hand the object itself back: keyed as its debug
                 // string, `{obj => 1}.keys.first` answered the String "Obj(93)",
                 // `p` printed that string, and a same-spelled String key collided.
-                Some(RObj::Object { .. } | RObj::Proc { .. }) => match v {
+                Some(RObj::Object { .. } | RObj::Proc { .. } | RObj::Time(_)) => match v {
                     Value::Obj(id) => {
                         RKey::Identity(self.user_key_canon.get(id).copied().unwrap_or(*id))
                     }
@@ -8842,31 +8851,29 @@ impl RubyHost {
         // `Time` arithmetic and comparison. `Time - Time` is the Float number of
         // seconds between them; `Time ± Numeric` shifts by that many seconds and
         // stays a `Time`. Comparisons order two times by their epoch seconds.
-        if let Some(ta) = self.time_secs(a) {
-            let num_f = |v: &Value| -> Option<f64> {
-                match v {
-                    Value::Int(n) => Some(*n as f64),
-                    Value::Float(f) => Some(*f),
-                    _ => None,
-                }
-            };
+        if let Some(ta) = self.as_time(a) {
+            use num_traits::ToPrimitive as _;
             match op {
                 Sub => {
-                    if let Some(tb) = self.time_secs(b) {
-                        return Ok(Value::Float(ta - tb));
+                    if let Some(tb) = self.as_time(b) {
+                        let d = &ta.secs - &tb.secs;
+                        return Ok(Value::Float(d.to_f64().unwrap_or(0.0)));
                     }
-                    if let Some(n) = num_f(b) {
-                        return Ok(self.new_time(ta - n));
+                    if let Some(n) = self.exact_num(b) {
+                        return Ok(self.new_rtime(crate::rtime::RTime::new(&ta.secs - n, ta.zone)));
                     }
                 }
                 Add => {
-                    if let Some(n) = num_f(b) {
-                        return Ok(self.new_time(ta + n));
+                    if self.as_time(b).is_some() {
+                        return Err(crate::builtins::raise_exc("TypeError", "time + time?"));
+                    }
+                    if let Some(n) = self.exact_num(b) {
+                        return Ok(self.new_rtime(crate::rtime::RTime::new(&ta.secs + n, ta.zone)));
                     }
                 }
                 Lt | Gt | Le | Ge => {
-                    if let Some(tb) = self.time_secs(b) {
-                        return Ok(Value::Bool(cmp_ord(op, ta.total_cmp(&tb))));
+                    if let Some(tb) = self.as_time(b) {
+                        return Ok(Value::Bool(cmp_ord(op, ta.secs.cmp(&tb.secs))));
                     }
                 }
                 _ => {}
@@ -9422,7 +9429,7 @@ impl RubyHost {
                     // class (`5.class == Integer`, `Integer == Integer`).
                     (Some(RObj::ClassRef(x)), Some(RObj::ClassRef(y))) => x == y,
                     // Two Times are equal when they name the same instant.
-                    (Some(RObj::Time { secs: x }), Some(RObj::Time { secs: y })) => x == y,
+                    (Some(RObj::Time(x)), Some(RObj::Time(y))) => x.secs == y.secs,
                     // Two Dates are equal when they name the same day.
                     (Some(RObj::Date { days: x }), Some(RObj::Date { days: y })) => x == y,
                     // Two DateTimes are equal when they name the same instant.

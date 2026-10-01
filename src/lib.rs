@@ -24,6 +24,7 @@ pub mod oracle;
 pub mod parser;
 pub mod random;
 pub mod repl;
+pub mod rtime;
 pub mod rust_ffi;
 pub mod tiers;
 

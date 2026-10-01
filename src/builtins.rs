@@ -16,6 +16,7 @@ use crate::host::{
 };
 use fusevm::{Value, VM};
 use indexmap::IndexMap;
+use num_traits::{ToPrimitive as _, Zero as _};
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -3843,31 +3844,10 @@ fn dispatch_classref(
         }
         return Ok(obj);
     }
-    // `Time` constructors. All produce a UTC time (the local-timezone offset is
-    // not modeled). `Time.at(n)` wraps epoch seconds; `Time.utc`/`Time.gm`
-    // build from broken-down UTC fields; `Time.now` reads the system clock.
+    // `Time` constructors (`Time.at`, `.now`, `.utc`, `.local`, `.new`, …).
     if cls == "Time" {
-        match name {
-            "at" => {
-                let secs = args.first().map(as_f).unwrap_or(0.0);
-                return Ok(with_host(|h| h.new_time(secs)));
-            }
-            "utc" | "gm" | "new" | "local" | "mktime" => {
-                // Time.utc(year, month=1, day=1, hour=0, min=0, sec=0).
-                let g = |i: usize, dflt: i64| args.get(i).map(as_i).unwrap_or(dflt);
-                let (y, mo, d) = (g(0, 1970), g(1, 1), g(2, 1));
-                let (hh, mi) = (g(3, 0), g(4, 0));
-                let ss = args.get(5).map(as_f).unwrap_or(0.0);
-                // `Time.new` with no args is `Time.now`; with args it builds a date.
-                if name == "new" && args.is_empty() {
-                    return Ok(with_host(|h| h.new_time(now_epoch_secs())));
-                }
-                let days = crate::host::days_from_civil(y, mo, d);
-                let secs = days as f64 * 86_400.0 + (hh * 3600 + mi * 60) as f64 + ss;
-                return Ok(with_host(|h| h.new_time(secs)));
-            }
-            "now" => return Ok(with_host(|h| h.new_time(now_epoch_secs()))),
-            _ => {}
+        if let Some(r) = time_class_method(name, args) {
+            return r;
         }
     }
     // `Date` constructors (proleptic Gregorian). `Date.new(y, m, d)`,
@@ -16661,71 +16641,793 @@ fn time_strftime(
     out
 }
 
-/// `Time` instance methods (all UTC). Field readers come from `time_fields`;
-/// `strftime` formats; comparison/arithmetic operators also route here (with
-/// the native `+`/`-`/`<`/`>` forms handled in `Host::num_op`).
-fn dispatch_time(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
-    let secs = with_host(|h| h.time_secs(recv).unwrap_or(0.0));
-    let f = with_host(|h| h.time_fields(secs));
-    let (y, mo, d, hh, mi, ss, wday, yday, _frac) = f;
+/// MRI's `num_exact`: an Integer, Rational or (finite) Float as an exact
+/// Rational; anything else is a TypeError naming its class.
+fn time_num_exact(v: &Value) -> Result<num_rational::BigRational, String> {
+    if let Value::Float(f) = v {
+        if f.is_nan() {
+            return Err(raise_exc("FloatDomainError", "NaN"));
+        }
+        if f.is_infinite() {
+            let s = if *f > 0.0 { "Infinity" } else { "-Infinity" };
+            return Err(raise_exc("FloatDomainError", s));
+        }
+    }
+    with_host(|h| h.exact_num(v)).ok_or_else(|| {
+        let cls = with_host(|h| h.class_of(v));
+        raise_exc(
+            "TypeError",
+            &format!("can't convert {cls} into an exact number"),
+        )
+    })
+}
+
+/// `rb_str_to_inum(str, 10, TRUE)`: a strict base-10 Integer of a String.
+fn time_str_int(v: &Value) -> Option<Result<i64, String>> {
+    let s = with_host(|h| h.as_str(v))?;
+    let t = s.trim().replace('_', "");
+    Some(t.parse::<i64>().map_err(|_| {
+        raise_exc(
+            "ArgumentError",
+            &format!(
+                "invalid value for Integer(): {}",
+                with_host(|h| h.inspect(v))
+            ),
+        )
+    }))
+}
+
+/// MRI `obj2int`: a String parsed strictly, any other number truncated.
+fn time_obj2int(v: &Value) -> Result<i64, String> {
+    if let Some(r) = time_str_int(v) {
+        return r;
+    }
+    match v {
+        Value::Int(n) => Ok(*n),
+        Value::Float(f) => Ok(f.trunc() as i64),
+        _ => match with_host(|h| h.as_rational(v)) {
+            Some(r) => Ok(r.to_integer().to_i64().unwrap_or(i64::MAX)),
+            None => Err(raise_exc(
+                "TypeError",
+                &format!(
+                    "no implicit conversion of {} into Integer",
+                    with_host(|h| h.class_of(v))
+                ),
+            )),
+        },
+    }
+}
+
+/// MRI `obj2ubits`: an unsigned field that must fit in `bits` bits.
+fn time_obj2ubits(v: &Value, bits: u32) -> Result<i64, String> {
+    let n = time_obj2int(v)?;
+    if n < 0 || n >= (1 << bits) {
+        return Err(raise_exc("ArgumentError", "argument out of range"));
+    }
+    Ok(n)
+}
+
+/// MRI `month_arg`: 1..12, or a three-letter English month name.
+fn time_month_arg(v: &Value) -> Result<i64, String> {
+    if let Some(s) = with_host(|h| h.as_str(v)) {
+        const MONTHS: [&str; 12] = [
+            "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+        ];
+        if s.len() == 3 {
+            if let Some(i) = MONTHS.iter().position(|m| m.eq_ignore_ascii_case(&s)) {
+                return Ok(i as i64 + 1);
+            }
+        }
+    }
+    time_obj2ubits(v, 4)
+}
+
+/// MRI `obj2subsecx`: whole seconds (6 bits) and the exact fraction.
+fn time_sec_arg(v: &Value) -> Result<(i64, num_rational::BigRational), String> {
+    if let Some(r) = time_str_int(v) {
+        let n = r?;
+        if !(0..64).contains(&n) {
+            return Err(raise_exc("ArgumentError", "argument out of range"));
+        }
+        return Ok((n, num_rational::BigRational::zero()));
+    }
+    let x = time_num_exact(v)?;
+    let whole = x.floor();
+    let n = whole.to_integer().to_i64().unwrap_or(-1);
+    if !(0..64).contains(&n) {
+        return Err(raise_exc("ArgumentError", "argument out of range"));
+    }
+    Ok((n, x - whole))
+}
+
+/// Broken-down wall-clock fields of a `Time` constructor call.
+struct TimeArgs {
+    year: i64,
+    mon: i64,
+    mday: i64,
+    hour: i64,
+    min: i64,
+    sec: i64,
+    subsec: num_rational::BigRational,
+}
+
+impl TimeArgs {
+    /// MRI `validate_vtm`.
+    fn validate(&self) -> Result<(), String> {
+        let check = |ok: bool, what: &str| {
+            if ok {
+                Ok(())
+            } else {
+                Err(raise_exc("ArgumentError", &format!("{what} out of range")))
+            }
+        };
+        let h24 = self.hour == 24;
+        check((1..=12).contains(&self.mon), "mon")?;
+        check((1..=31).contains(&self.mday), "mday")?;
+        check((0..=24).contains(&self.hour), "hour")?;
+        check((0..=if h24 { 0 } else { 59 }).contains(&self.min), "min")?;
+        check((0..=if h24 { 0 } else { 60 }).contains(&self.sec), "sec")
+    }
+
+    /// The instant these fields name in `zone`.
+    fn to_time(&self, zone: crate::rtime::Zone) -> crate::rtime::RTime {
+        use crate::rtime::{local_epoch, utc_epoch, Zone};
+        let (y, mo, d, h, mi, s) = (
+            self.year, self.mon, self.mday, self.hour, self.min, self.sec,
+        );
+        let epoch = match zone {
+            Zone::Utc => utc_epoch(y, mo, d, h, mi, s),
+            Zone::Fixed(off) => utc_epoch(y, mo, d, h, mi, s) - off,
+            Zone::Local => local_epoch(y, mo, d, h, mi, s),
+        };
+        let secs = num_rational::BigRational::from_integer(epoch.into()) + &self.subsec;
+        crate::rtime::RTime::new(secs, zone)
+    }
+}
+
+/// MRI `time_arg`, behind `Time.utc`/`gm`/`local`/`mktime`: `(year, mon = 1,
+/// mday = 1, hour = 0, min = 0, sec = 0, usec = 0)`, or the ten-argument
+/// `(sec, min, hour, mday, mon, year, wday, yday, isdst, zone)` form.
+fn time_arg(args: &[Value]) -> Result<TimeArgs, String> {
+    if args.is_empty() || args.len() > 10 || (args.len() > 8 && args.len() != 10) {
+        let expected = "1..8";
+        return Err(raise_exc(
+            "ArgumentError",
+            &format!(
+                "wrong number of arguments (given {}, expected {expected})",
+                args.len()
+            ),
+        ));
+    }
+    let v: Vec<Value> = if args.len() == 10 {
+        vec![
+            args[5].clone(),
+            args[4].clone(),
+            args[3].clone(),
+            args[2].clone(),
+            args[1].clone(),
+            args[0].clone(),
+            Value::Undef,
+        ]
+    } else {
+        args.to_vec()
+    };
+    let at = |i: usize| v.get(i).filter(|x| !matches!(x, Value::Undef));
+    let year = match time_str_int(&v[0]) {
+        Some(r) => r?,
+        None => time_obj2int(&v[0])?,
+    };
+    let mon = at(1).map(time_month_arg).transpose()?.unwrap_or(1);
+    let mday = at(2)
+        .map(|x| time_obj2ubits(x, 5))
+        .transpose()?
+        .unwrap_or(1);
+    let hour = at(3)
+        .map(|x| time_obj2ubits(x, 5))
+        .transpose()?
+        .unwrap_or(0);
+    let min = at(4)
+        .map(|x| time_obj2ubits(x, 6))
+        .transpose()?
+        .unwrap_or(0);
+    let (sec, subsec) = if let (Some(usec), 7) = (at(6), args.len()) {
+        let sec = at(5)
+            .map(|x| time_obj2ubits(x, 6))
+            .transpose()?
+            .unwrap_or(0);
+        let usec = match time_str_int(usec) {
+            Some(r) => num_rational::BigRational::from_integer(r?.into()),
+            None => time_num_exact(usec)?,
+        };
+        (sec, usec / crate::rtime::pow10(6))
+    } else {
+        match at(5) {
+            Some(x) => time_sec_arg(x)?,
+            None => (0, num_rational::BigRational::zero()),
+        }
+    };
+    let t = TimeArgs {
+        year,
+        mon,
+        mday,
+        hour,
+        min,
+        sec,
+        subsec,
+    };
+    t.validate()?;
+    Ok(t)
+}
+
+/// A zone argument (`in:`, `Time.new`'s 7th, `localtime(zone)`), as MRI's
+/// `utc_offset_arg` reads it: a String offset or name, or Integer seconds.
+fn time_zone_arg(v: &Value) -> Result<crate::rtime::Zone, String> {
+    use crate::rtime::Zone;
+    let zone = if let Some(s) = with_host(|h| h.as_str(v)) {
+        crate::rtime::parse_utc_offset(&s).map_err(|m| raise_exc("ArgumentError", &m))?
+    } else {
+        let off = time_num_exact(v)?
+            .round()
+            .to_integer()
+            .to_i64()
+            .unwrap_or(i64::MAX);
+        Zone::Fixed(off)
+    };
+    if let Zone::Fixed(off) = zone {
+        crate::rtime::validate_offset(off).map_err(|m| raise_exc("ArgumentError", &m))?;
+    }
+    Ok(zone)
+}
+
+/// Split a trailing keyword Hash off `args`.
+fn time_split_kwargs(args: &[Value]) -> (&[Value], Option<Value>) {
+    match args.last() {
+        Some(last) if with_host(|h| h.is_kwargs(last)) => {
+            (&args[..args.len() - 1], Some(last.clone()))
+        }
+        _ => (args, None),
+    }
+}
+
+/// The `in:` keyword of a trailing keyword Hash, if given and non-nil.
+fn time_in_kw(kw: &Option<Value>) -> Option<Value> {
+    kw.as_ref()
+        .and_then(|k| kw_opt(std::slice::from_ref(k), "in"))
+        .filter(|v| !matches!(v, Value::Undef))
+}
+
+fn time_now(zone: crate::rtime::Zone) -> crate::rtime::RTime {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let secs = num_rational::BigRational::new(
+        num_bigint::BigInt::from(nanos),
+        num_bigint::BigInt::from(1_000_000_000u64),
+    );
+    crate::rtime::RTime::new(secs, zone)
+}
+
+/// `Time.at`/`now`/`utc`/`gm`/`local`/`mktime`/`new`. `None` for any other name.
+fn time_class_method(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    use crate::rtime::{RTime, Zone};
+    let new = |t: RTime| Ok(with_host(|h| h.new_rtime(t)));
+    let run = || -> Result<Value, String> {
+        let (pos, kw) = time_split_kwargs(args);
+        let in_zone = time_in_kw(&kw).map(|z| time_zone_arg(&z)).transpose()?;
+        match name {
+            "at" => {
+                let Some(first) = pos.first() else {
+                    return Err(raise_exc(
+                        "ArgumentError",
+                        "wrong number of arguments (given 0, expected 1..3)",
+                    ));
+                };
+                let mut t = if let Some(sub) = pos.get(1) {
+                    let scale = match pos.get(2).map(|u| with_host(|h| h.as_symbol(u))) {
+                        None => 6,
+                        Some(Some(u)) => match u.as_str() {
+                            "millisecond" => 3,
+                            "usec" | "microsecond" => 6,
+                            "nsec" | "nanosecond" => 9,
+                            _ => {
+                                return Err(raise_exc(
+                                    "ArgumentError",
+                                    &format!("unexpected unit: {u}"),
+                                ))
+                            }
+                        },
+                        Some(None) => {
+                            let u = with_host(|h| h.inspect(&pos[2]));
+                            return Err(raise_exc(
+                                "ArgumentError",
+                                &format!("unexpected unit: {u}"),
+                            ));
+                        }
+                    };
+                    let secs =
+                        time_num_exact(first)? + time_num_exact(sub)? / crate::rtime::pow10(scale);
+                    RTime::new(secs, Zone::Local)
+                } else if let Some(t) = with_host(|h| h.as_time(first)) {
+                    t
+                } else {
+                    RTime::new(time_num_exact(first)?, Zone::Local)
+                };
+                if let Some(z) = in_zone {
+                    t.zone = z;
+                }
+                new(t)
+            }
+            "now" => new(time_now(in_zone.unwrap_or(Zone::Local))),
+            "utc" | "gm" => new(time_arg(pos)?.to_time(Zone::Utc)),
+            "local" | "mktime" => new(time_arg(pos)?.to_time(Zone::Local)),
+            "new" => {
+                if pos.is_empty() {
+                    return new(time_now(in_zone.unwrap_or(Zone::Local)));
+                }
+                if pos.len() > 7 {
+                    return Err(raise_exc(
+                        "ArgumentError",
+                        &format!(
+                            "wrong number of arguments (given {}, expected 0..7)",
+                            pos.len()
+                        ),
+                    ));
+                }
+                // `Time.new("2024-01-02 03:04:05.5 +09:00", in:, precision:)`.
+                if pos.len() == 1 {
+                    if let Some(s) = with_host(|h| h.as_str(&pos[0])) {
+                        let precision = kw
+                            .as_ref()
+                            .and_then(|k| kw_opt(std::slice::from_ref(k), "precision"))
+                            .filter(|v| !matches!(v, Value::Undef))
+                            .map(|v| as_i(&v).max(0) as usize)
+                            .unwrap_or(9);
+                        return new(time_parse_new(&s, &pos[0], in_zone, precision)?);
+                    }
+                }
+                let positional_zone = pos.get(6).filter(|v| !matches!(v, Value::Undef));
+                if positional_zone.is_some() && in_zone.is_some() {
+                    return Err(raise_exc(
+                        "ArgumentError",
+                        "timezone argument given as positional and keyword arguments",
+                    ));
+                }
+                let zone = match positional_zone {
+                    // `:dst`/`:std` only hint the local zone's DST flag.
+                    Some(z) if with_host(|h| h.as_symbol(z)).is_some() => Zone::Local,
+                    Some(z) => time_zone_arg(z)?,
+                    None => in_zone.unwrap_or(Zone::Local),
+                };
+                let at = |i: usize| pos.get(i).filter(|x| !matches!(x, Value::Undef));
+                let year = match time_str_int(&pos[0]) {
+                    Some(r) => r?,
+                    None => time_obj2int(&pos[0])?,
+                };
+                let (sec, subsec) = match at(5) {
+                    Some(x) => time_sec_arg(x)?,
+                    None => (0, num_rational::BigRational::zero()),
+                };
+                let t = TimeArgs {
+                    year,
+                    mon: at(1).map(time_month_arg).transpose()?.unwrap_or(1),
+                    mday: at(2)
+                        .map(|x| time_obj2ubits(x, 5))
+                        .transpose()?
+                        .unwrap_or(1),
+                    hour: at(3)
+                        .map(|x| time_obj2ubits(x, 5))
+                        .transpose()?
+                        .unwrap_or(0),
+                    min: at(4)
+                        .map(|x| time_obj2ubits(x, 6))
+                        .transpose()?
+                        .unwrap_or(0),
+                    sec,
+                    subsec,
+                };
+                t.validate()?;
+                new(t.to_time(zone))
+            }
+            _ => unreachable!(),
+        }
+    };
     match name {
-        "year" => Ok(Value::Int(y)),
-        "month" | "mon" => Ok(Value::Int(mo)),
-        "day" | "mday" => Ok(Value::Int(d)),
-        "hour" => Ok(Value::Int(hh)),
-        "min" => Ok(Value::Int(mi)),
-        "sec" => Ok(Value::Int(ss)),
-        "wday" => Ok(Value::Int(wday)),
-        "yday" => Ok(Value::Int(yday)),
-        "to_i" | "tv_sec" => Ok(Value::Int(secs.floor() as i64)),
-        "to_f" => Ok(Value::Float(secs)),
-        "sunday?" => Ok(Value::Bool(wday == 0)),
-        "monday?" => Ok(Value::Bool(wday == 1)),
-        "tuesday?" => Ok(Value::Bool(wday == 2)),
-        "wednesday?" => Ok(Value::Bool(wday == 3)),
-        "thursday?" => Ok(Value::Bool(wday == 4)),
-        "friday?" => Ok(Value::Bool(wday == 5)),
-        "saturday?" => Ok(Value::Bool(wday == 6)),
-        // UTC-only model: these conversions are all no-ops that return an
-        // equivalent Time (or the flag). Local-timezone offset is not modeled.
-        "utc" | "getutc" | "gmtime" | "localtime" | "getlocal" => {
-            Ok(with_host(|h| h.new_time(secs)))
+        "at" | "now" | "utc" | "gm" | "local" | "mktime" | "new" => Some(run()),
+        _ => None,
+    }
+}
+
+/// `Time.new(string)`, ported from MRI `time_init_parse`: `YYYY[-MM[-DD[
+/// HH:MM:SS[.frac]]]] [zone]`, strictly — two-digit fields, no stray spaces.
+/// A zone written in the string overrides `in:`.
+fn time_parse_new(
+    s: &str,
+    orig: &Value,
+    in_zone: Option<crate::rtime::Zone>,
+    precision: usize,
+) -> Result<crate::rtime::RTime, String> {
+    use crate::rtime::Zone;
+    let arg_err = |m: String| raise_exc("ArgumentError", &m);
+    let b = s.as_bytes();
+    let end = b.len();
+    let cant_parse = || arg_err(format!("can't parse: {}", with_host(|h| h.inspect(orig))));
+    if end > 0 && (b[0].is_ascii_whitespace() || b[end - 1].is_ascii_whitespace()) {
+        return Err(cant_parse());
+    }
+    // The year: an optional sign and at least four digits.
+    let mut p = 0;
+    if p < end && (b[p] == b'+' || b[p] == b'-') {
+        p += 1;
+    }
+    let digits_at = p;
+    while p < end && b[p].is_ascii_digit() {
+        p += 1;
+    }
+    let ndigits = p - digits_at;
+    if ndigits == 0 {
+        return Err(cant_parse());
+    }
+    if ndigits < 4 {
+        return Err(arg_err(format!(
+            "year must be 4 or more digits: {}",
+            &s[digits_at..p]
+        )));
+    }
+    let year: i64 = s[..p]
+        .parse()
+        .map_err(|_| arg_err(format!("can't parse: {}", with_host(|h| h.inspect(orig)))))?;
+    let (mut mon, mut mday, mut hour, mut min, mut sec) = (-1i64, -1i64, -1i64, -1i64, -1i64);
+    let mut subsec: Option<num_rational::BigRational> = None;
+    let peek = |p: usize, c: u8| p < end && b[p] == c;
+    // `two_digits(ptr + 1, …)`: exactly two digits after the separator at `p`.
+    let two = |p: usize, name: &str, bits: u32| -> Result<i64, String> {
+        let at = p + 1;
+        let len = end.saturating_sub(at);
+        let ok = len >= 2
+            && b[at].is_ascii_digit()
+            && b[at + 1].is_ascii_digit()
+            && !(len > 2 && b[at + 2].is_ascii_digit());
+        if !ok {
+            let mut m = format!("two digits {name} is expected");
+            if b[p] == b'-' || b[p] == b':' {
+                m.push_str(&format!(" after '{}'", b[p] as char));
+            }
+            let take = (if len > 10 { 10 } else { len }) + 1;
+            m.push_str(&format!(": {}", &s[p..(p + take).min(end)]));
+            return Err(raise_exc("ArgumentError", &m));
         }
-        "utc?" | "gmt?" => Ok(Value::Bool(true)),
-        "to_s" | "inspect" => Ok(with_host(|h| {
-            let s = h.time_to_s(secs, name == "inspect");
-            h.new_string(s)
-        })),
-        "strftime" => {
-            let fmt = with_host(|h| h.as_str(&args[0]).unwrap_or_default());
-            Ok(with_host(|h| {
-                let s = time_strftime(&fmt, f, secs);
-                h.new_string(s)
-            }))
+        let n = ((b[at] - b'0') * 10 + (b[at + 1] - b'0')) as i64;
+        if n > (1 << bits) - 1 {
+            return Err(raise_exc("ArgumentError", &format!("{name} out of range")));
         }
-        "<=>" => {
-            if let Some(other) = with_host(|h| h.time_secs(&args[0])) {
-                Ok(Value::Int(match secs.total_cmp(&other) {
-                    std::cmp::Ordering::Less => -1,
-                    std::cmp::Ordering::Equal => 0,
-                    std::cmp::Ordering::Greater => 1,
-                }))
-            } else {
-                Ok(Value::Undef)
+        Ok(n)
+    };
+    if p < end {
+        'fields: {
+            if !peek(p, b'-') {
+                break 'fields;
+            }
+            mon = two(p, "mon", 4)?;
+            p += 3;
+            if !peek(p, b'-') {
+                break 'fields;
+            }
+            mday = two(p, "mday", 5)?;
+            p += 3;
+            if !peek(p, b' ') && !peek(p, b'T') {
+                break 'fields;
+            }
+            let time_part = p + 1;
+            if !(p + 1 < end && b[p + 1].is_ascii_digit()) {
+                break 'fields;
+            }
+            let upto = |p: usize| &s[time_part..(p + 1).min(end)];
+            hour = two(p, "hour", 5)?;
+            p += 3;
+            if peek(p, b'.') {
+                return Err(arg_err(format!(
+                    "fraction hour is not supported: {}",
+                    upto(p)
+                )));
+            }
+            if !peek(p, b':') {
+                return Err(arg_err(format!("missing min part: {}", upto(p))));
+            }
+            min = two(p, "min", 6)?;
+            p += 3;
+            if peek(p, b'.') {
+                return Err(arg_err(format!(
+                    "fraction min is not supported: {}",
+                    upto(p)
+                )));
+            }
+            if !peek(p, b':') {
+                return Err(arg_err(format!("missing sec part: {}", upto(p))));
+            }
+            sec = two(p, "sec", 6)?;
+            p += 3;
+            if peek(p, b'.') {
+                p += 1;
+                let mut n = 0;
+                while n < precision && p + n < end && b[p + n].is_ascii_digit() {
+                    n += 1;
+                }
+                if n == 0 {
+                    let clen = s[p..].chars().next().map_or(0, char::len_utf8);
+                    return Err(arg_err(format!(
+                        "subsecond expected after dot: {}",
+                        &s[time_part..p + clen]
+                    )));
+                }
+                let digits: num_bigint::BigInt = s[p..p + n].parse().unwrap_or_default();
+                subsec = Some(num_rational::BigRational::new(
+                    digits,
+                    num_bigint::BigInt::from(10).pow(n as u32),
+                ));
+                p += n;
+                while p < end && b[p].is_ascii_digit() {
+                    p += 1;
+                }
             }
         }
-        "==" => Ok(Value::Bool(
-            with_host(|h| h.time_secs(&args[0])) == Some(secs),
+        while p < end && b[p].is_ascii_whitespace() {
+            p += 1;
+        }
+        let zstart = p;
+        while p < end && !b[p].is_ascii_whitespace() {
+            p += 1;
+        }
+        let zend = p;
+        while p < end && b[p].is_ascii_whitespace() {
+            p += 1;
+        }
+        if p < end {
+            return Err(arg_err(format!("can't parse at: {}", &s[p..])));
+        }
+        let zone = if zend > zstart {
+            Some(time_zone_arg(&new_str(s[zstart..zend].to_string()))?)
+        } else if hour == -1 {
+            return Err(arg_err("no time information".to_string()));
+        } else {
+            in_zone
+        };
+        let t = TimeArgs {
+            year,
+            mon: if mon < 0 { 1 } else { mon },
+            mday: if mday < 0 { 1 } else { mday },
+            hour: hour.max(0),
+            min: min.max(0),
+            sec: sec.max(0),
+            subsec: subsec.unwrap_or_else(num_rational::BigRational::zero),
+        };
+        t.validate()?;
+        return Ok(t.to_time(zone.unwrap_or(Zone::Local)));
+    }
+    // A bare year.
+    let t = TimeArgs {
+        year,
+        mon: 1,
+        mday: 1,
+        hour: 0,
+        min: 0,
+        sec: 0,
+        subsec: num_rational::BigRational::zero(),
+    };
+    Ok(t.to_time(in_zone.unwrap_or(Zone::Local)))
+}
+
+/// An exact Rational as Ruby answers it from `subsec`: an Integer when whole.
+fn time_rational_value(r: num_rational::BigRational) -> Value {
+    if r.is_integer() {
+        with_host(|h| h.new_bigint(r.to_integer()))
+    } else {
+        with_host(|h| h.new_rational(r))
+    }
+}
+
+/// `Time` instance methods, after MRI's `time.c`.
+fn dispatch_time(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    use crate::rtime::{nanos_of, pow10, RTime, RoundMode, Zone};
+    let t = with_host(|h| h.as_time(recv)).expect("dispatch_time on a Time");
+    let v = t.vtm();
+    let int = Value::Int;
+    let zone_value = |t: &RTime, v: &crate::rtime::Vtm| -> Value {
+        match (&t.zone, &v.zone) {
+            (Zone::Fixed(_), _) | (_, None) => Value::Undef,
+            (_, Some(z)) => new_str(z.clone()),
+        }
+    };
+    let new_time = |t: RTime| with_host(|h| h.new_rtime(t));
+    match name {
+        "year" => Ok(int(v.year)),
+        "month" | "mon" => Ok(int(v.mon)),
+        "day" | "mday" => Ok(int(v.mday)),
+        "hour" => Ok(int(v.hour)),
+        "min" => Ok(int(v.min)),
+        "sec" => Ok(int(v.sec)),
+        "wday" => Ok(int(v.wday)),
+        "yday" => Ok(int(v.yday)),
+        "usec" | "tv_usec" => Ok(time_rational_value((&v.subsec * pow10(6)).floor())),
+        "nsec" | "tv_nsec" => Ok(with_host(|h| h.new_bigint(nanos_of(&v.subsec)))),
+        "subsec" => Ok(time_rational_value(v.subsec.clone())),
+        "to_i" | "tv_sec" => Ok(with_host(|h| h.new_bigint(t.floor_secs()))),
+        "to_f" => Ok(Value::Float(t.secs.to_f64().unwrap_or(0.0))),
+        "to_r" => Ok(with_host(|h| h.new_rational(t.secs.clone()))),
+        "zone" => Ok(zone_value(&t, &v)),
+        "utc_offset" | "gmt_offset" | "gmtoff" => Ok(int(v.utc_offset)),
+        "isdst" | "dst?" => Ok(Value::Bool(v.isdst)),
+        "utc?" | "gmt?" => Ok(Value::Bool(t.is_utc())),
+        "sunday?" | "monday?" | "tuesday?" | "wednesday?" | "thursday?" | "friday?"
+        | "saturday?" => {
+            const DAYS: [&str; 7] = [
+                "sunday?",
+                "monday?",
+                "tuesday?",
+                "wednesday?",
+                "thursday?",
+                "friday?",
+                "saturday?",
+            ];
+            Ok(Value::Bool(DAYS[v.wday as usize] == name))
+        }
+        // `utc`/`gmtime`/`localtime` re-view the receiver itself.
+        "utc" | "gmtime" => {
+            with_host(|h| h.set_time_zone(recv, Zone::Utc));
+            Ok(recv.clone())
+        }
+        "localtime" => {
+            let zone = match args.first().filter(|a| !matches!(a, Value::Undef)) {
+                Some(z) => time_zone_arg(z)?,
+                None => Zone::Local,
+            };
+            with_host(|h| h.set_time_zone(recv, zone));
+            Ok(recv.clone())
+        }
+        "getutc" | "getgm" => Ok(new_time(RTime::new(t.secs.clone(), Zone::Utc))),
+        "getlocal" => {
+            let zone = match args.first().filter(|a| !matches!(a, Value::Undef)) {
+                Some(z) => time_zone_arg(z)?,
+                None => Zone::Local,
+            };
+            Ok(new_time(RTime::new(t.secs.clone(), zone)))
+        }
+        "to_s" => Ok(new_str(t.to_s())),
+        "between?" => comparable_between(recv, args),
+        "clamp" => comparable_clamp(recv, args),
+        "inspect" => Ok(new_str(t.inspect())),
+        "ctime" | "asctime" => Ok(new_str(
+            crate::rtime::strftime("%a %b %e %H:%M:%S %Y", &v).unwrap_or_default(),
         )),
-        "+" => Ok(with_host(|h| h.new_time(secs + as_f(&args[0])))),
-        "-" => {
-            if let Some(other) = with_host(|h| h.time_secs(&args[0])) {
-                Ok(Value::Float(secs - other))
-            } else {
-                Ok(with_host(|h| h.new_time(secs - as_f(&args[0]))))
-            }
+        "strftime" => {
+            let Some(fmt) = args.first().and_then(|a| with_host(|h| h.as_str(a))) else {
+                let cls = args
+                    .first()
+                    .map_or("nil".to_string(), |a| with_host(|h| h.class_of(a)));
+                return Err(raise_exc(
+                    "TypeError",
+                    &format!("no implicit conversion of {cls} into String"),
+                ));
+            };
+            crate::rtime::strftime(&fmt, &v)
+                .map(new_str)
+                .map_err(|m| raise_exc("ArgumentError", &m))
         }
-        "hash" => Ok(Value::Int(secs.to_bits() as i64)),
+        "xmlschema" | "iso8601" => {
+            let digits = args.first().map(as_i).unwrap_or(0).max(0);
+            Ok(new_str(t.xmlschema(digits)))
+        }
+        "to_a" => Ok(new_arr(vec![
+            int(v.sec),
+            int(v.min),
+            int(v.hour),
+            int(v.mday),
+            int(v.mon),
+            int(v.year),
+            int(v.wday),
+            int(v.yday),
+            Value::Bool(v.isdst),
+            zone_value(&t, &v),
+        ])),
+        "deconstruct_keys" => {
+            const KEYS: [&str; 11] = [
+                "year", "month", "day", "yday", "wday", "hour", "min", "sec", "subsec", "dst",
+                "zone",
+            ];
+            let wanted: Vec<String> = match args.first() {
+                None | Some(Value::Undef) => KEYS.iter().map(|k| k.to_string()).collect(),
+                Some(a) => match with_host(|h| h.as_array(a)) {
+                    Some(xs) => xs
+                        .iter()
+                        .filter_map(|x| with_host(|h| h.as_symbol(x)))
+                        .collect(),
+                    None => {
+                        let cls = with_host(|h| h.class_of(a));
+                        return Err(raise_exc(
+                            "TypeError",
+                            &format!("wrong argument type {cls} (expected Array or nil)"),
+                        ));
+                    }
+                },
+            };
+            let mut map = IndexMap::new();
+            for k in wanted {
+                let val = match k.as_str() {
+                    "year" => int(v.year),
+                    "month" => int(v.mon),
+                    "day" => int(v.mday),
+                    "yday" => int(v.yday),
+                    "wday" => int(v.wday),
+                    "hour" => int(v.hour),
+                    "min" => int(v.min),
+                    "sec" => int(v.sec),
+                    "subsec" => time_rational_value(v.subsec.clone()),
+                    "dst" => Value::Bool(v.isdst),
+                    "zone" => zone_value(&t, &v),
+                    _ => continue,
+                };
+                map.insert(RKey::Sym(k.as_str().into()), val);
+            }
+            Ok(with_host(|h| h.new_hash(map)))
+        }
+        "round" | "floor" | "ceil" => {
+            let digits = match args.first().filter(|a| !matches!(a, Value::Undef)) {
+                Some(a) => to_int(a)?,
+                None => 0,
+            };
+            if digits < 0 {
+                return Err(raise_exc("ArgumentError", "negative ndigits given"));
+            }
+            let mode = match name {
+                "round" => RoundMode::Round,
+                "floor" => RoundMode::Floor,
+                _ => RoundMode::Ceil,
+            };
+            Ok(new_time(t.rounded(digits, mode)))
+        }
+        "<=>" => Ok(
+            match args.first().and_then(|a| with_host(|h| h.as_time(a))) {
+                Some(o) => int(t.secs.cmp(&o.secs) as i64),
+                None => Value::Undef,
+            },
+        ),
+        "==" => Ok(Value::Bool(
+            args.first()
+                .and_then(|a| with_host(|h| h.as_time(a)))
+                .is_some_and(|o| o.secs == t.secs),
+        )),
+        "eql?" => Ok(Value::Bool(
+            args.first()
+                .and_then(|a| with_host(|h| h.as_time(a)))
+                .is_some_and(|o| o.secs == t.secs),
+        )),
+        "<" | "<=" | ">" | ">=" => {
+            let op = match name {
+                "<" => fusevm::NumOp::Lt,
+                "<=" => fusevm::NumOp::Le,
+                ">" => fusevm::NumOp::Gt,
+                _ => fusevm::NumOp::Ge,
+            };
+            let arg = args.first().cloned().unwrap_or(Value::Undef);
+            if with_host(|h| h.as_time(&arg)).is_none() {
+                return Err(with_host(|h| h.cmp_failed(recv, &arg)));
+            }
+            with_host(|h| h.num_op(op, recv, &arg))
+        }
+        "+" | "-" => {
+            let op = if name == "+" {
+                fusevm::NumOp::Add
+            } else {
+                fusevm::NumOp::Sub
+            };
+            let arg = args.first().cloned().unwrap_or(Value::Undef);
+            if with_host(|h| h.exact_num(&arg)).is_none()
+                && with_host(|h| h.as_time(&arg)).is_none()
+            {
+                time_num_exact(&arg)?;
+            }
+            with_host(|h| h.num_op(op, recv, &arg))
+        }
         _ => Err(raise_exc(
             "NoMethodError",
             &format!("undefined method '{name}' for an instance of Time"),
@@ -16928,7 +17630,11 @@ fn dispatch_datetime(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
             }))
         }
         "to_date" => Ok(with_host(|h| h.new_date(day))),
-        "to_time" => Ok(with_host(|h| h.new_time(secs))),
+        // A DateTime keeps its offset (always +00:00 here) as a fixed one.
+        "to_time" => Ok(with_host(|h| {
+            let r = num_rational::BigRational::from_float(secs).unwrap_or_default();
+            h.new_rtime(crate::rtime::RTime::new(r, crate::rtime::Zone::Fixed(0)))
+        })),
         "next_day" | "succ" => Ok(with_host(|h| {
             h.new_datetime(secs + arg_i(0, 1) as f64 * 86_400.0)
         })),
@@ -22953,6 +23659,12 @@ pub fn numeric_hook(op: fusevm::NumOp, a: &Value, b: &Value) -> Result<Value, St
     if matches!(op, Lt | Gt | Le | Ge) && with_host(|h| h.as_set(a).is_some()) {
         return dispatch(a, num_op_method(op), std::slice::from_ref(b), None);
     }
+    // `Time ± x` and Time ordering go through `dispatch_time`, which raises
+    // MRI's TypeError / ArgumentError for an operand that is not a number or
+    // a Time instead of the generic undefined-method error.
+    if matches!(op, Add | Sub | Lt | Gt | Le | Ge) && with_host(|h| h.as_time(a).is_some()) {
+        return dispatch(a, num_op_method(op), std::slice::from_ref(b), None);
+    }
     with_host(|h| h.num_op(op, a, b))
 }
 
@@ -26020,8 +26732,8 @@ fn cmp_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         }
     }
     // Two Times order by their epoch seconds.
-    if let (Some(x), Some(y)) = with_host(|h| (h.time_secs(a), h.time_secs(b))) {
-        return Some(x.total_cmp(&y));
+    if let (Some(x), Some(y)) = with_host(|h| (h.as_time(a), h.as_time(b))) {
+        return Some(x.secs.cmp(&y.secs));
     }
     // Two Dates order by their day count.
     if let (Some(x), Some(y)) = with_host(|h| (h.date_days(a), h.date_days(b))) {
