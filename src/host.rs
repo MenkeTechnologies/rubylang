@@ -174,6 +174,11 @@ pub mod ops {
                                            // it there. See `Expr::KwArgs`: it is what tells `bind_params` this hash may
                                            // bind to keyword parameters, which a positionally-written Hash may not.
     pub const MARK_KWARGS: u16 = 58; // [hash] -> the same hash
+                                     // The argument run a keyword splat contributes when no literal `key: v`
+                                     // pair is written beside it (`f(**h)`, `f(...)`): an EMPTY hash passes no
+                                     // argument at all, as in MRI, rather than a positional `{}`.
+    pub const KWSPLAT_ARGS: u16 = 59; // [kwargs hash] -> [] or [hash]
+    pub const BITNOT: u16 = 60; // [v] -> ~v (native Int, else the `~` method)
 }
 
 /// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried
@@ -1432,6 +1437,15 @@ pub struct RubyHost {
     /// positionally stays the last positional argument, and the callee's arity
     /// judges it as one. See `Expr::KwArgs` and `bind_params`.
     kwargs_hashes: HashSet<u32>,
+    /// User objects whose class defines its own `hash`, mapped (by heap id) to
+    /// the first object seen that is `eql?` to them — see
+    /// `crate::builtins::canon_user_keys`. Hash/Set/`uniq` key such an object as
+    /// its representative's identity, so two value objects with equal
+    /// `hash`/`eql?` are one key, as in MRI. Heap ids are never reused, so an
+    /// entry never goes stale by aliasing a newer object.
+    user_key_canon: HashMap<u32, u32>,
+    /// The representatives registered under each user `hash` value.
+    user_key_reps: HashMap<i64, Vec<u32>>,
     /// A LIFO stack of pending around-advice weaves (see `AroundCall`). A native
     /// `ProcKind::Around(idx)` block references `around_stack[idx]`; entries are
     /// valid only for the duration of the top-level around weave that pushed them.
@@ -2227,6 +2241,8 @@ impl RubyHost {
             class_gen: 0,
             ancestry_cache: std::cell::RefCell::new(AncestryCache::default()),
             kwargs_hashes: HashSet::new(),
+            user_key_canon: HashMap::new(),
+            user_key_reps: HashMap::new(),
             around_stack: Vec::new(),
             threads: Vec::new(),
             queues: Vec::new(),
@@ -2520,6 +2536,80 @@ impl RubyHost {
                 ..
             })
         )
+    }
+    /// Whether `v` is a plain user object whose class defines its own `hash`,
+    /// so keying it must consult that `hash` and `eql?` rather than identity.
+    pub fn user_hash_candidate(&self, v: &Value) -> bool {
+        match self.obj(v) {
+            Some(RObj::Object { class, .. }) if !self.struct_defs.contains_key(class) => {
+                self.find_method_owner(class, "hash").is_some()
+                    || self.find_define_method(class, "hash").is_some()
+            }
+            _ => false,
+        }
+    }
+    /// The operands of `recv.name(*args)` that a Hash/Set/Array operation keys
+    /// by `hash`/`eql?` and that need `canon_user_keys` first: the arguments of
+    /// a Hash/Set lookup or insert, and the elements of the Array receiver and
+    /// Array arguments of the set-like Array operations. Empty (and cheap) for
+    /// every other call.
+    pub fn user_keyed_operands(&self, recv: &Value, name: &str, args: &[Value]) -> Vec<Value> {
+        let elems = |v: &Value| -> Vec<Value> {
+            match self.obj(v) {
+                Some(RObj::Array(xs)) => xs.clone(),
+                _ => Vec::new(),
+            }
+        };
+        let mut out: Vec<Value> = match self.obj(recv) {
+            Some(RObj::Hash {
+                by_identity: false, ..
+            }) => match name {
+                "[]" | "[]=" | "store" | "key?" | "has_key?" | "include?" | "member?" | "fetch"
+                | "delete" | "dig" | "assoc" | "fetch_values" | "values_at" => args.to_vec(),
+                _ => return Vec::new(),
+            },
+            Some(RObj::Set(_)) => match name {
+                "add" | "<<" | "add?" | "include?" | "member?" | "===" | "delete" | "delete?"
+                | "contain?" => args.to_vec(),
+                "merge" | "|" | "union" | "+" | "&" | "intersection" | "-" | "difference"
+                | "subtract" | "^" => args.iter().flat_map(elems).collect(),
+                _ => return Vec::new(),
+            },
+            Some(RObj::Array(xs)) => match name {
+                "uniq" | "uniq!" | "tally" | "to_set" => xs.clone(),
+                "-" | "&" | "|" | "difference" | "union" | "intersection" | "intersect?" => {
+                    let mut all = xs.clone();
+                    all.extend(args.iter().flat_map(elems));
+                    all
+                }
+                _ => return Vec::new(),
+            },
+            Some(RObj::ClassRef(c)) if c == "Set" && matches!(name, "new" | "[]") => {
+                if name == "new" {
+                    args.iter().flat_map(elems).collect()
+                } else {
+                    args.to_vec()
+                }
+            }
+            _ => return Vec::new(),
+        };
+        out.retain(|v| self.user_hash_candidate(v));
+        out
+    }
+    /// The representatives registered under user `hash` value `h`.
+    pub fn user_key_reps(&self, h: i64) -> Vec<u32> {
+        self.user_key_reps.get(&h).cloned().unwrap_or_default()
+    }
+    /// Key object `id` as representative `rep`; a new representative (`id ==
+    /// rep`) is also registered under its `hash` value `h`.
+    pub fn set_user_key_canon(&mut self, id: u32, rep: u32, h: i64) {
+        if id == rep {
+            let reps = self.user_key_reps.entry(h).or_default();
+            if !reps.contains(&id) {
+                reps.push(id);
+            }
+        }
+        self.user_key_canon.insert(id, rep);
     }
     /// Build a Hash key for `v` against the receiver hash's identity mode.
     pub fn hash_key(&self, recv: &Value, v: &Value) -> RKey {
@@ -4719,6 +4809,40 @@ impl RubyHost {
     pub fn const_names(&self) -> Vec<String> {
         self.consts.keys().cloned().collect()
     }
+    /// The constants `Mod.constants` lists for `module`: those defined directly
+    /// in it (`X = 1` / `const_set`, stored flat as `Mod::X`) and the classes
+    /// and modules nested one level inside it, then — with `inherit` — the same
+    /// for each ancestor short of `Object`. Names are unqualified, deduplicated.
+    pub fn module_constants(&self, module: &str, inherit: bool) -> Vec<String> {
+        let mut owners = vec![module.to_string()];
+        if inherit {
+            owners.extend(self.class_ancestry(module).into_iter().filter(|a| {
+                a != module && !matches!(a.as_str(), "Object" | "Kernel" | "BasicObject")
+            }));
+        }
+        let mut out: Vec<String> = Vec::new();
+        for owner in owners {
+            let prefix = format!("{owner}::");
+            let direct = |k: &String| -> Option<String> {
+                k.strip_prefix(&prefix)
+                    .filter(|rest| {
+                        !rest.is_empty() && !rest.contains("::") && !rest.starts_with('#')
+                    })
+                    .map(str::to_string)
+            };
+            for name in self
+                .consts
+                .keys()
+                .filter_map(direct)
+                .chain(self.classes.keys().filter_map(direct))
+            {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
     /// Register `autoload name, path`: a lazy `require path` fired the first time
     /// the fully-qualified constant `name` is read and found undefined.
     pub fn set_autoload(&mut self, name: &str, path: &str) {
@@ -4968,6 +5092,21 @@ impl RubyHost {
         self.data_classes.insert(name.clone());
         name
     }
+    /// The opening of a Struct/Data instance's inspect: `#<struct Point` /
+    /// `#<data D`. An instance of a class never bound to a constant (still
+    /// `Struct:N`) has no name to show, so MRI prints just `#<struct` / `#<data`.
+    pub fn struct_inspect_head(&self, class: &str) -> String {
+        let kind = if self.is_data_class(class) {
+            "data"
+        } else {
+            "struct"
+        };
+        if class.starts_with("Struct:") {
+            format!("#<{kind}")
+        } else {
+            format!("#<{kind} {class}")
+        }
+    }
     /// Whether `name` is a `Data.define`d class (vs a plain `Struct`).
     pub fn is_data_class(&self, name: &str) -> bool {
         self.data_classes.contains(name)
@@ -5136,6 +5275,23 @@ impl RubyHost {
             }
             if let Some(m) = self.singleton_define_methods.get(id) {
                 names.extend(m.keys().cloned());
+            }
+            // Methods registered THROUGH the metaclass: `class << obj;
+            // attr_accessor :q; end` and `obj.singleton_class.define_method`.
+            if let Some(sc) = self.singleton_class_name(v) {
+                if let Some(attrs) = self.attr_accessors.get(&sc) {
+                    for (field, (r, w)) in attrs {
+                        if *r {
+                            names.push(field.clone());
+                        }
+                        if *w {
+                            names.push(format!("{field}="));
+                        }
+                    }
+                }
+                if let Some(m) = self.define_methods.get(&sc) {
+                    names.extend(m.keys().cloned());
+                }
             }
         }
         if let Some(cls) = self.classref_name(v) {
@@ -5829,7 +5985,14 @@ impl RubyHost {
         if class == "Module" && actual == "Class" {
             return true;
         }
-        if class == "Comparable" && matches!(actual.as_str(), "Integer" | "Float" | "String") {
+        // MRI mixes Comparable into every built-in class whose `<=>` is an
+        // ordering: `Symbol.ancestors` is `[Symbol, Comparable, Object, …]`.
+        if class == "Comparable"
+            && matches!(
+                actual.as_str(),
+                "Integer" | "Float" | "String" | "Symbol" | "Rational" | "Complex" | "Time"
+            )
+        {
             return true;
         }
         if class == "Enumerable"
@@ -7732,13 +7895,7 @@ impl RubyHost {
                                 format!("{m}={}", self.inspect(&v))
                             })
                             .collect();
-                        // `Data.define`d instances print `#<data …>`; Structs `#<struct …>`.
-                        let kind = if self.is_data_class(&class) {
-                            "data"
-                        } else {
-                            "struct"
-                        };
-                        format!("#<{kind} {class} {}>", parts.join(", "))
+                        format!("{} {}>", self.struct_inspect_head(&class), parts.join(", "))
                     } else {
                         match ivars.get("message") {
                             Some(m) => self.to_s(&m.clone()),
@@ -8239,7 +8396,9 @@ impl RubyHost {
                 // string, `{obj => 1}.keys.first` answered the String "Obj(93)",
                 // `p` printed that string, and a same-spelled String key collided.
                 Some(RObj::Object { .. } | RObj::Proc { .. }) => match v {
-                    Value::Obj(id) => RKey::Identity(*id),
+                    Value::Obj(id) => {
+                        RKey::Identity(self.user_key_canon.get(id).copied().unwrap_or(*id))
+                    }
                     _ => RKey::Nil,
                 },
                 _ => RKey::Str(format!("{v:?}")),
@@ -8898,6 +9057,15 @@ impl RubyHost {
         let (ca, cb) = (self.class_of(a), self.class_of(b));
         if ca != cb && numeric(&ca) && numeric(&cb) {
             return false;
+        }
+        // Two user objects that `canon_user_keys` bound to one representative
+        // were found `eql?` by their own `hash`/`eql?`.
+        if let (Value::Obj(x), Value::Obj(y)) = (a, b) {
+            if let (Some(rx), Some(ry)) = (self.user_key_canon.get(x), self.user_key_canon.get(y)) {
+                if rx == ry {
+                    return true;
+                }
+            }
         }
         match (self.obj(a), self.obj(b)) {
             (Some(RObj::Array(x)), Some(RObj::Array(y))) => {

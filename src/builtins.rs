@@ -24,6 +24,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::GETLOCAL, b_getlocal);
     vm.register_builtin(ops::GETLOCAL_DECLARED, b_getlocal_declared);
     vm.register_builtin(ops::MARK_KWARGS, b_mark_kwargs);
+    vm.register_builtin(ops::KWSPLAT_ARGS, b_kwsplat_args);
+    vm.register_builtin(ops::BITNOT, b_bitnot);
     vm.register_builtin(ops::SETLOCAL, b_setlocal);
     vm.register_builtin(ops::GETIVAR, b_getivar);
     vm.register_builtin(ops::SETIVAR, b_setivar);
@@ -466,6 +468,26 @@ fn b_mark_kwargs(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
     with_host(|h| h.mark_kwargs(&v));
     v
+}
+
+/// `~x`: native for an `i64`, otherwise the receiver's `~` method (a Bignum's
+/// complement, or a user class's `def ~`).
+fn b_bitnot(vm: &mut VM, _: u8) -> Value {
+    match vm.pop() {
+        Value::Int(n) => Value::Int(!n),
+        v => match dispatch(&v, "~", &[], None) {
+            Ok(r) => r,
+            Err(e) => abort(vm, e),
+        },
+    }
+}
+
+fn b_kwsplat_args(vm: &mut VM, _: u8) -> Value {
+    let v = vm.pop();
+    with_host(|h| {
+        let empty = h.as_hash(&v).is_some_and(|m| m.is_empty());
+        h.new_array(if empty { vec![] } else { vec![v] })
+    })
 }
 
 fn b_getlocal_declared(vm: &mut VM, _: u8) -> Value {
@@ -1123,6 +1145,16 @@ fn b_mkarray(vm: &mut VM, argc: u8) -> Value {
 }
 fn b_mkhash(vm: &mut VM, argc: u8) -> Value {
     let vals = pop_n(vm, argc as usize);
+    let keys: Vec<Value> = vals
+        .chunks_exact(2)
+        .map(|p| p[0].clone())
+        .filter(|k| with_host(|h| h.user_hash_candidate(k)))
+        .collect();
+    if !keys.is_empty() {
+        if let Err(e) = canon_user_keys(&keys) {
+            return abort(vm, e);
+        }
+    }
     with_host(|h| {
         let mut m = IndexMap::new();
         for pair in vals.chunks_exact(2) {
@@ -1919,12 +1951,47 @@ fn top_level_method_for(recv: &Value, m: &str) -> Option<crate::host::MethodDef>
     with_host(|h| h.method_def(m))
 }
 
+/// Bind each user object in `vals` whose class defines its own `hash` to the
+/// first object seen with the same `hash` that it is `eql?` to, so the Hash /
+/// Set / `uniq` keying that follows (`RubyHost::to_key`) treats the two as one
+/// key — MRI's `hash`-then-`eql?` lookup, which the pure key derivation cannot
+/// perform itself because it cannot call back into Ruby.
+fn canon_user_keys(vals: &[Value]) -> Result<(), String> {
+    for v in vals {
+        let Value::Obj(id) = v else {
+            continue;
+        };
+        let hv = dispatch(v, "hash", &[], None)?;
+        let hk = match hv {
+            Value::Int(n) => n,
+            other => with_host(|h| h.value_hash(&other)),
+        };
+        let mut rep = *id;
+        for r in with_host(|h| h.user_key_reps(hk)) {
+            if r == *id {
+                break;
+            }
+            let same = dispatch(v, "eql?", &[Value::Obj(r)], None)?;
+            if with_host(|h| h.truthy(&same)) {
+                rep = r;
+                break;
+            }
+        }
+        with_host(|h| h.set_user_key_canon(*id, rep, hk));
+    }
+    Ok(())
+}
+
 pub(crate) fn dispatch(
     recv: &Value,
     name: &str,
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    let keyed = with_host(|h| h.user_keyed_operands(recv, name, args));
+    if !keyed.is_empty() {
+        canon_user_keys(&keyed)?;
+    }
     // A per-object singleton method (`def obj.m`, `class << obj`) has the highest
     // priority — ahead of the class's own instance methods and the universal
     // fallbacks.
@@ -2195,6 +2262,20 @@ pub(crate) fn dispatch(
                 copy
             }));
         }
+        // The operator methods behind `-x` / `~x` / `!x`, reached by name
+        // (`send(:-@)`, `map(&:-@)`). The operators themselves compile to native
+        // ops; these answer the same values when the method is called directly.
+        "-@" if args.is_empty() && matches!(recv, Value::Int(_) | Value::Float(_)) => {
+            return with_host(|h| h.num_op(fusevm::NumOp::Neg, recv, &Value::Undef));
+        }
+        "~" if args.is_empty() && matches!(recv, Value::Int(_)) => {
+            let Value::Int(n) = recv else { unreachable!() };
+            return Ok(Value::Int(!n));
+        }
+        // `BasicObject#!`: the negated truthiness of the receiver.
+        "!" if args.is_empty() => {
+            return Ok(Value::Bool(!with_host(|h| h.truthy(recv))));
+        }
         "clone" => {
             // `clone` carries the frozen flag over (unlike `dup`), unless
             // `freeze:` overrides it: `false` thaws, `true` freezes regardless.
@@ -2329,7 +2410,13 @@ pub(crate) fn dispatch(
                 }
             }
             let sink = with_host(|h| h.new_enum_sink());
-            dispatch(recv, &method, &rest, Some(sink))?;
+            // The method is invoked as `send` would: a top-level `def gen`
+            // (private on Object) enumerates through `to_enum(:gen)`.
+            if let Some(def) = top_level_method_for(recv, &method) {
+                crate::host::run_top_method(&def, recv.clone(), &method, &rest, Some(sink))?;
+            } else {
+                dispatch(recv, &method, &rest, Some(sink))?;
+            }
             let collected = with_host(|h| h.take_enum_sink());
             return Ok(with_host(|h| h.new_enumerator(collected, &method)));
         }
@@ -2532,6 +2619,22 @@ pub(crate) fn dispatch(
                     let private = with_host(|h| h.method_visibility(&cls, &m))
                         == crate::host::Visibility::Private;
                     return Ok(Value::Bool(include_private || !private));
+                }
+                // A `respond_to_missing?` on the object's own singleton
+                // (`def obj.respond_to_missing?`) is found first, as MRI's method
+                // lookup starts at the singleton class.
+                if let Some(def) =
+                    with_host(|h| h.find_singleton_method(recv, "respond_to_missing?"))
+                {
+                    let include_private = args.get(1).cloned().unwrap_or(Value::Bool(false));
+                    let sym = with_host(|h| h.new_symbol(&m));
+                    return crate::host::call_singleton(
+                        recv.clone(),
+                        &def,
+                        "respond_to_missing?",
+                        &[sym, include_private],
+                        None,
+                    );
                 }
                 if with_host(|h| h.find_method_owner(&cls, "respond_to_missing?")).is_some() {
                     let include_private = args.get(1).cloned().unwrap_or(Value::Bool(false));
@@ -4264,6 +4367,16 @@ fn dispatch_classref(
                 Ok(with_host(|h| h.new_object(cls)))
             }
         }
+        // A class or module never bound to a constant (`Class.new`,
+        // `Module.new`, `Struct.new(:a)`, a singleton class) has no name.
+        "name"
+            if cls.starts_with("#<")
+                || cls
+                    .strip_prefix("Struct:")
+                    .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            Ok(Value::Undef)
+        }
         "name" | "to_s" | "inspect" => Ok(new_str(cls.to_string())),
         // Runtime `Class#include`/`prepend`/`extend(Module, …)` — the same mixin
         // effect the compile-time class-body forms have, but for a conditional or
@@ -4607,9 +4720,20 @@ fn dispatch_classref(
             }
             Ok(with_host(|h| h.class_ref(cls)))
         }
-        // `Mod.constants` — the user-defined constant names (flat store), as
-        // symbols. Class names are not enumerated (matching neither MRI exactly
-        // nor hiding user constants set via assignment / const_set).
+        // `Mod.constants(inherit = true)` — the names defined in `Mod` (and,
+        // inheriting, its ancestors short of Object). `Object.constants` stays
+        // the whole flat store.
+        "constants" if cls != "Object" => {
+            let inherit = !matches!(args.first(), Some(a) if !with_host(|h| h.truthy(a)));
+            Ok(with_host(|h| {
+                let syms: Vec<Value> = h
+                    .module_constants(cls, inherit)
+                    .iter()
+                    .map(|n| h.new_symbol(n))
+                    .collect();
+                h.new_array(syms)
+            }))
+        }
         "constants" => Ok(with_host(|h| {
             let syms: Vec<Value> = h.const_names().iter().map(|n| h.new_symbol(n)).collect();
             h.new_array(syms)
@@ -5039,13 +5163,8 @@ fn struct_method(
                 .zip(values())
                 .map(|(m, v)| format!("{m}={}", with_host(|h| h.inspect(&v))))
                 .collect();
-            // `Data` instances inspect as `#<data Name x=…>`; Structs as `#<struct …>`.
-            let kind = if with_host(|h| h.is_data_class(cls)) {
-                "data"
-            } else {
-                "struct"
-            };
-            new_str(format!("#<{kind} {cls} {}>", parts.join(", ")))
+            let head = with_host(|h| h.struct_inspect_head(cls));
+            new_str(format!("{head} {}>", parts.join(", ")))
         }
         // `Data#with(**changes)` — a copy of the receiver with the named members
         // replaced (unknown keys raise ArgumentError, as in MRI). Result frozen.
@@ -5474,6 +5593,16 @@ fn dispatch_object(
         } else {
             Value::Undef
         }),
+        // A `def obj.method_missing` on the receiver's own singleton handles an
+        // otherwise-undefined method ahead of any class-level one, since MRI's
+        // lookup starts at the singleton class.
+        _ if with_host(|h| h.find_singleton_method(recv, "method_missing")).is_some() => {
+            let def = with_host(|h| h.find_singleton_method(recv, "method_missing")).unwrap();
+            let mut mm_args = Vec::with_capacity(args.len() + 1);
+            mm_args.push(with_host(|h| h.new_symbol(name)));
+            mm_args.extend_from_slice(args);
+            crate::host::call_singleton(recv.clone(), &def, "method_missing", &mm_args, block)
+        }
         // A class that defines `method_missing` handles any otherwise-undefined
         // method: `method_missing(:name, *args, &block)`.
         _ if with_host(|h| h.find_method_owner(cls, "method_missing")).is_some() => {
@@ -6325,6 +6454,8 @@ fn dispatch_bigint(
         "to_f" => Value::Float(b.to_f64().unwrap_or(f64::INFINITY)),
         "abs" | "magnitude" => big(b.abs()),
         "-@" => big(-b.clone()),
+        // `~n` is `-n - 1` for every Integer, Bignum included.
+        "~" => big(-b.clone() - 1),
         // Ruby defines a negative n's bit length as that of its complement
         // ~n == -n-1, so it is the magnitude of |n|-1, not of |n|:
         //   $ ruby -e "p [(-2**70).bit_length, (2**70).bit_length]"
@@ -14084,6 +14215,19 @@ fn dispatch_enumerator(
             }
             Ok(memo)
         }
+        // `with_object(memo)` without a block: an Enumerator of `[elem, memo]`
+        // pairs over this one, whose `each { |x, memo| }` answers the memo.
+        "with_object" | "each_with_object" if block.is_none() && args.len() == 1 => {
+            let memo = args[0].clone();
+            let pairs = buf
+                .iter()
+                .map(|x| new_arr(vec![x.clone(), memo.clone()]))
+                .collect();
+            let tag = with_host(|h| format!("{name}({})", h.inspect(&memo)));
+            Ok(with_host(|h| {
+                h.new_enumerator_of(pairs, &tag, recv.clone())
+            }))
+        }
         // `with_index` without a block yields `[elem, offset+index]` pairs.
         "with_index" if block.is_none() => {
             let offset = match args.first() {
@@ -14122,7 +14266,8 @@ fn dispatch_enumerator(
             // and every buffered pair carries it. With nothing buffered there is
             // no memo to read — and an empty source means the recorded receiver
             // is empty too, which is what MRI's memo prints as.
-            if with_host(|h| h.enum_method(recv)).is_some_and(|m| m.starts_with("each_with_object"))
+            if with_host(|h| h.enum_method(recv))
+                .is_some_and(|m| m.starts_with("each_with_object") || m.starts_with("with_object"))
             {
                 if let Some(memo) = buf
                     .first()
@@ -22704,6 +22849,10 @@ impl JsonParser {
 pub fn numeric_hook(op: fusevm::NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     use fusevm::NumOp::*;
     if let Some(cls) = with_host(|h| h.object_class(a)) {
+        // Unary minus is the argless `-@` (`def -@`), not a binary op on `b`.
+        if op == Neg && with_host(|h| h.find_method_owner(&cls, "-@")).is_some() {
+            return call_instance_method(a.clone(), &cls, "-@", &[], None);
+        }
         let name = num_op_method(op);
         if !name.is_empty() && with_host(|h| h.find_method_owner(&cls, name)).is_some() {
             return call_instance_method(a.clone(), &cls, name, std::slice::from_ref(b), None);

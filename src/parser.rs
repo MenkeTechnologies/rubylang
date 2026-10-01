@@ -279,12 +279,24 @@ impl Parser {
         Ok(lhs)
     }
 
+    /// The target after a `*` in a parallel assignment. A bare `*` with no name
+    /// (`first, *, last = arr`, `*, z = arr`) still absorbs the middle elements;
+    /// they are bound to a hidden local nothing reads.
+    fn splat_target(&mut self) -> Result<Expr, String> {
+        if self.is_op(",") || self.is_op("=") || self.is_op(")") {
+            self.tmp += 1;
+            let hidden = format!("__anonsplat{}__", self.tmp);
+            return Ok(Expr::Splat(Box::new(Expr::Var(VarKind::Local, hidden))));
+        }
+        Ok(Expr::Splat(Box::new(self.ternary()?)))
+    }
+
     /// One target of a parallel assignment: `*rest`, a nested `(a, (b, *c))`
     /// group — kept as an `Expr::Array` of its own targets, which the compiler
     /// destructures from the element in that position — or an ordinary lvalue.
     fn masgn_target(&mut self) -> Result<Expr, String> {
         if self.eat_op("*") {
-            return Ok(Expr::Splat(Box::new(self.ternary()?)));
+            return self.splat_target();
         }
         if self.eat_op("(") {
             let mut items = vec![self.masgn_target()?];
@@ -328,7 +340,7 @@ impl Parser {
         let grouped = leading_group.is_some();
         let mut e = if leading_splat {
             self.advance();
-            Expr::Splat(Box::new(self.ternary()?))
+            self.splat_target()?
         } else if let Some(group) = leading_group {
             group
         } else {
@@ -1048,6 +1060,7 @@ impl Parser {
         if kwargs.is_empty() && kwsplats.is_empty() {
             return;
         }
+        let literal_pairs = !kwargs.is_empty();
         let mut trailing = Expr::Hash(kwargs);
         for s in kwsplats {
             trailing = Expr::Call {
@@ -1057,7 +1070,15 @@ impl Parser {
                 block: None,
             };
         }
-        args.push(Expr::KwArgs(Box::new(trailing)));
+        let kw = Expr::KwArgs(Box::new(trailing));
+        // Only `**hash` splats, no literal pair: the hash may be empty, and an
+        // empty one passes nothing (MRI: `def f(*a) = a; f(**{})` is `[]`).
+        // The spread form lets the runtime drop it.
+        args.push(if literal_pairs {
+            kw
+        } else {
+            Expr::Splat(Box::new(kw))
+        });
     }
 
     /// Parse one call argument, recognizing a `key: value` keyword argument, a

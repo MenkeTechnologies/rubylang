@@ -4651,3 +4651,111 @@ p "abc".force_encoding("BINARY").encoding.to_s
 p "abc".b.force_encoding("UTF-8").encoding.to_s
 p "abc".b.inspect.encoding.to_s
 p "abc".encoding.to_s, "".encoding.to_s
+#==#
+# A bare `*` in a parallel assignment absorbs the middle without a name.
+first, *, last = [1, 2, 3, 4]
+p first, last
+*, z = 7, 8, 9
+p z
+(m, *), n = [1, 2], 3
+p m, n
+#==#
+# An empty keyword splat passes no argument at all, including through `...`
+# and anonymous `**` forwarding.
+h = {}
+def f(*a) = a
+p f(**h), f(1, **h), f(**{}, **h)
+def g(**) = f(**)
+p g, g(k: 1)
+def d(...) = f(...)
+p d(3, 4), d(1, z: 2)
+def q(a, b = 2) = [a, b]
+p q(1, **h)
+def kw(a:, **o) = [a, o]
+p kw(**{a: 1}), kw(**{a: 1, b: 2})
+#==#
+# An anonymous Struct / Data inspects without a class name.
+p Struct.new(:a, :b).new(1, 2), Struct.new(:a, keyword_init: true).new(a: 1).to_s
+p Data.define(:x).new(x: 1)
+S1 = Struct.new(:q)
+p S1.new(1)
+#==#
+# `method_missing` / `respond_to_missing?` defined on one object's singleton.
+o = Object.new
+def o.method_missing(n, *a) = n.to_s.start_with?("get_") ? n.to_s.sub("get_", "") : super
+def o.respond_to_missing?(n, p = false) = n.to_s.start_with?("get_") || super
+p o.get_x, o.respond_to?(:get_y), o.respond_to?(:zz)
+begin; o.zzz; rescue NoMethodError => e; p e.name; end
+#==#
+# `to_enum(:m)` drives a private top-level method, as `send` would.
+def gen
+  return to_enum(:gen) unless block_given?
+  yield 1
+  yield 2
+end
+p gen.map { _1 + 1 }, gen.to_a
+#==#
+# Methods registered through the metaclass are singleton methods.
+obj = Object.new
+class << obj
+  def greet = "hi"
+  attr_accessor :name
+end
+p obj.singleton_methods.sort
+#==#
+# Value objects with their own `hash`/`eql?` are one Hash key, one Set member,
+# and one element under `uniq` and the Array set operators.
+class VK
+  attr_reader :n
+  def initialize(n) = @n = n
+  def ==(o) = o.is_a?(VK) && n == o.n
+  alias eql? ==
+  def hash = n.hash
+  def inspect = "VK#{n}"
+end
+a, b, c = VK.new(1), VK.new(1), VK.new(2)
+p [a, b, c].uniq, [a, b, c].tally, {a => 1}[b], {a => 1}.key?(b)
+hh = {}
+hh[a] = :x
+hh[b] = :y
+p hh, [a, c] - [b], [a] & [b], [a] | [b, c]
+p Set[a, b, c].size, Set.new([a, b]).include?(VK.new(1)), [a, b].to_set.size
+p({VK.new(3) => 1, VK.new(3) => 2})
+class OnlyHash
+  def hash = 1
+end
+p [OnlyHash.new, OnlyHash.new].uniq.size
+#==#
+# Comparable is mixed into every built-in ordered class.
+p [:a, Rational(1, 2), Complex(1, 1), Time.at(0), 1, 1.0, "s"].map { _1.is_a?(Comparable) }
+p Comparable === :s, Numeric.is_a?(Comparable)
+#==#
+# Unary operator methods: user `-@`/`~`, and the built-ins reached by name.
+class UN
+  def -@ = :neg
+  def ~ = :inv
+end
+p(-UN.new, ~UN.new)
+p [1, 2].map(&:-@), 5.send(:~), 2.5.send(:-@), nil.send(:!), 3.send(:!)
+p ~(2**70), (2**70).send(:~), ~5, ~-1
+#==#
+# Enumerator#with_object without a block.
+e = [4, 5].each.with_object([])
+p e.to_a, e.each { |x, acc| acc << x }
+p [1, 2].map.with_object(:m).to_a
+#==#
+# Module#constants lists a module's own (and inherited) constants, unqualified.
+class CM; X = 1; Y = 2; class I; end; module J; end; end
+p CM.constants.sort
+class CN < CM; const_set(:Z, 3); end
+p CN.constants.sort, CN.constants(false), CN::Z
+module CQ; W = 1; end
+class CR; include CQ; end
+p CR.constants, CQ.constants, Class.new.constants
+#==#
+# A class or module never bound to a constant has no name.
+k = Class.new
+p k.name, Module.new.name, Struct.new(:a).name, k.new.class.name
+p Class.new(StandardError).name, String.singleton_class.name
+K2 = Class.new
+p K2.name

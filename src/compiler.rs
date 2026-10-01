@@ -2055,7 +2055,7 @@ impl Compiler {
                 b.emit(Op::LogNot, 0);
             }
             UnOp::BitNot => {
-                b.emit(Op::BitNot, 0);
+                b.emit(Op::CallBuiltin(ops::BITNOT, 1), self.cur_line);
             }
         }
         Ok(())
@@ -2613,6 +2613,12 @@ impl Compiler {
     fn compile_spread(&mut self, b: &mut ChunkBuilder, items: &[Expr]) -> Result<(), String> {
         for it in items {
             match it {
+                // A keyword-splat-only trailing hash: its run is empty when the
+                // merged hash is (`f(**{})` passes nothing).
+                Expr::Splat(e) if matches!(**e, Expr::KwArgs(_)) => {
+                    self.compile_expr(b, e)?;
+                    b.emit(Op::CallBuiltin(ops::KWSPLAT_ARGS, 1), 0);
+                }
                 Expr::Splat(e) => self.compile_expr(b, e)?,
                 other => {
                     self.compile_expr(b, other)?;
