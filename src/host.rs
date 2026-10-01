@@ -12305,12 +12305,40 @@ pub fn io_closed(v: &Value) -> bool {
 /// Write `s` as program output on stdout — the funnel `puts`/`print`/`p` and
 /// the other Kernel writers use, so an embedder's capture catches them all.
 pub fn write_stdout(s: &str) {
-    with_host(|h| h.write_out(s, false));
+    if !redirected_write("stdout", s) {
+        with_host(|h| h.write_out(s, false));
+    }
 }
 
 /// Write `s` as program output on stderr (`warn`, `$stderr.write`).
 pub fn write_stderr(s: &str) {
-    with_host(|h| h.write_out(s, true));
+    if !redirected_write("stderr", s) {
+        with_host(|h| h.write_out(s, true));
+    }
+}
+
+/// Kernel output goes to whatever `$stdout` / `$stderr` currently holds, as
+/// MRI's `rb_io_puts` on `rb_stdout` does: reassigned to a `StringIO` (the
+/// usual output-capture idiom) or any object with `write`, the text is sent
+/// there. Answers false when the global still holds a standard stream, which
+/// the caller then writes itself.
+fn redirected_write(global: &str, s: &str) -> bool {
+    let target = with_host(|h| h.get_global(global));
+    let standard = match io_id(&target) {
+        Some(id) => with_host(|h| {
+            matches!(
+                h.io_handles.get(id as usize),
+                Some(IoCell::Stdout) | Some(IoCell::Stderr)
+            )
+        }),
+        None => matches!(target, Value::Undef),
+    };
+    if standard {
+        return false;
+    }
+    let text = with_host(|h| h.new_string(s.to_string()));
+    let _ = crate::builtins::dispatch(&target, "write", &[text], None);
+    true
 }
 
 /// `IO#write` for one already-stringified chunk; returns the byte count written.

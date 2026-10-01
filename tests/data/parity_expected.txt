@@ -3407,3 +3407,23 @@ main
 [NoMatchingPatternError, "#<struct x=1>: String === 1 does not return true"]
 :pinrange
 :pinclass
+#==#
+"a\n1\n2\nbc\n5|xAB"
+14
+"ab\n"
+"cd"
+"end of file reached"
+"zz"
+2
+["h", "é", "l", "l", "o"]
+false
+true
+"Jello"
+"abc"
+"heXYo"
+4
+#==#
+"captured\nx1\n2\nZ"
+"w1\na\nb\nc\n"
+"in\n12"
+back

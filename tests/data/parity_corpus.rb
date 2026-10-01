@@ -5012,3 +5012,62 @@ end
 case 3
 in ^c then p :pinclass
 end
+#==#
+# StringIO writes at the cursor (overwriting), or at the end in "a" mode.
+require "stringio"
+io = StringIO.new
+io.puts "a", [1, [2]]
+io.print "b"
+io << "c\n"
+io.printf("%d|%s", 5, "x")
+io.putc "A"
+io.putc 66
+p io.string, io.pos
+r = StringIO.new("ab\ncd")
+p r.readline, r.readline
+begin
+  r.readline
+rescue EOFError => e
+  p e.message
+end
+r.string = "zz"
+p r.read, r.pos, StringIO.new("héllo").each_char.to_a, StringIO.new("x").closed?
+s = StringIO.new("q")
+s.close
+p s.closed?
+s2 = StringIO.new("hello")
+s2.write("J")
+s3 = StringIO.new("ab", "a")
+s3.write("c")
+s4 = StringIO.new("hello")
+s4.read(2)
+s4 << "XY"
+p s2.string, s3.string, s4.string, s4.pos
+#==#
+# Kernel output goes through $stdout / $stderr, so a StringIO captures it.
+require "stringio"
+$stdout = StringIO.new
+puts "captured"
+print "x"
+p 1
+printf("%d\n", 2)
+putc ?Z
+out = $stdout.string
+$stdout = STDOUT
+p out
+$stderr = StringIO.new
+warn "w1"
+warn "a", ["b", "c\n"]
+err = $stderr.string
+$stderr = STDERR
+p err
+def capture_out
+  old = $stdout
+  $stdout = StringIO.new
+  yield
+  $stdout.string
+ensure
+  $stdout = old
+end
+p capture_out { puts "in"; print 1, 2 }
+puts "back"

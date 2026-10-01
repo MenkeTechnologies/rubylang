@@ -3464,11 +3464,17 @@ fn dispatch_classref(
     // live in the `buf`/`pos` ivars (see `stringio_method`).
     if cls == "StringIO" && name == "new" {
         let init = args.first().map(arg_str).unwrap_or_default();
+        // An `"a"` mode string appends every write at the end.
+        let append = args
+            .get(1)
+            .and_then(|m| with_host(|h| h.as_str(m)))
+            .is_some_and(|m| m.starts_with('a'));
         return Ok(with_host(|h| {
             let obj = h.new_object("StringIO");
             let sv = h.new_string(init);
             h.set_ivar_of(&obj, "buf", sv);
             h.set_ivar_of(&obj, "pos", Value::Int(0));
+            h.set_ivar_of(&obj, "append", Value::Bool(append));
             obj
         }));
     }
@@ -20754,25 +20760,20 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             // `warn(*msgs)` writes each message (with a trailing newline) to
             // $stderr and returns nil. A message that already ends in a newline
             // is not doubled. Array args are flattened like `puts`.
-            for v in args {
-                if let Some(arr) = with_host(|h| h.as_array(v)) {
-                    for e in &arr {
-                        let s = with_host(|h| h.to_s(e));
-                        if s.ends_with('\n') {
-                            eprint!("{s}");
-                        } else {
-                            eprintln!("{s}");
-                        }
-                    }
-                } else {
-                    let s = with_host(|h| h.to_s(v));
-                    if s.ends_with('\n') {
-                        eprint!("{s}");
-                    } else {
-                        eprintln!("{s}");
+            // It goes through `$stderr`, so a reassigned one captures it, and
+            // the `uplevel:`/`category:` keyword hash is not a message.
+            let mut text = String::new();
+            for v in args.iter().filter(|v| !with_host(|h| h.is_kwargs(v))) {
+                let items = with_host(|h| h.as_array(v)).unwrap_or_else(|| vec![v.clone()]);
+                for e in &items {
+                    let s = with_host(|h| h.to_s(e));
+                    text.push_str(&s);
+                    if !s.ends_with('\n') {
+                        text.push('\n');
                     }
                 }
             }
+            crate::host::write_stderr(&text);
             Ok(Value::Undef)
         }
         "abort" => {
@@ -25309,6 +25310,24 @@ fn stringio_rest_lines(recv: &Value) -> Vec<Value> {
     split_lines(&rest).into_iter().map(new_str).collect()
 }
 
+/// Write `s` at the cursor, as MRI's `strio_write` does: it OVERWRITES the
+/// bytes already there (`StringIO.new("hello").write("J")` leaves `"Jello"`),
+/// extends past the end, and leaves the cursor after what it wrote. In append
+/// mode (`StringIO.new(s, "a")`) every write goes to the end.
+fn stringio_write(recv: &Value, s: &str) {
+    let (buf, pos) = stringio_state(recv);
+    let append = with_host(|h| h.truthy(&h.ivar_of(recv, "append")));
+    let mut bytes = buf.into_bytes();
+    let at = if append { bytes.len() } else { pos };
+    if at > bytes.len() {
+        bytes.resize(at, 0);
+    }
+    let end = (at + s.len()).min(bytes.len());
+    bytes.splice(at..end, s.bytes());
+    stringio_set_buf(recv, String::from_utf8_lossy(&bytes).into_owned());
+    stringio_set_pos(recv, at + s.len());
+}
+
 fn stringio_method(
     recv: &Value,
     name: &str,
@@ -25318,40 +25337,90 @@ fn stringio_method(
     match name {
         // The internal buffer String (the accumulated content).
         "string" => Ok(with_host(|h| h.ivar_of(recv, "buf"))),
-        // Append: `write` returns the byte count written, `<<` returns self.
+        // `string=` replaces the buffer and rewinds.
+        "string=" => {
+            let s = args.first().map(arg_str).unwrap_or_default();
+            stringio_set_buf(recv, s);
+            stringio_set_pos(recv, 0);
+            Ok(args.first().cloned().unwrap_or(Value::Undef))
+        }
+        // `write` returns the byte count written, `<<` self, `print` nil.
         "write" | "<<" | "print" => {
-            let (mut buf, _) = stringio_state(recv);
             let mut written = 0usize;
             for a in args {
                 let s = with_host(|h| h.to_s(a));
                 written += s.len();
-                buf.push_str(&s);
+                stringio_write(recv, &s);
             }
-            let end = buf.len();
-            stringio_set_buf(recv, buf);
-            stringio_set_pos(recv, end);
             match name {
                 "<<" => Ok(recv.clone()),
                 "print" => Ok(Value::Undef),
                 _ => Ok(Value::Int(written as i64)),
             }
         }
-        // `puts` appends each argument followed by a newline (unless it already
-        // ends in one); no arguments appends a bare newline.
-        "puts" => {
-            let (mut buf, _) = stringio_state(recv);
-            if args.is_empty() {
-                buf.push('\n');
-            } else {
-                for a in args {
-                    puts_text(a, &mut buf, &mut Vec::new());
-                }
-            }
-            let end = buf.len();
-            stringio_set_buf(recv, buf);
-            stringio_set_pos(recv, end);
+        // `printf(fmt, *args)` writes `format(fmt, *args)`.
+        "printf" => {
+            let s = kernel("format", args, None)?;
+            stringio_write(recv, &arg_str(&s));
             Ok(Value::Undef)
         }
+        // `putc` writes one character: an Integer's low byte, else the
+        // String's first character. It answers its argument.
+        "putc" => {
+            let a = args.first().cloned().unwrap_or(Value::Undef);
+            let s = match a {
+                Value::Int(n) => ((n & 0xff) as u8 as char).to_string(),
+                _ => arg_str(&a)
+                    .chars()
+                    .next()
+                    .map(String::from)
+                    .unwrap_or_default(),
+            };
+            stringio_write(recv, &s);
+            Ok(a)
+        }
+        // `puts` writes each argument followed by a newline (unless it already
+        // ends in one); no arguments writes a bare newline.
+        "puts" => {
+            let mut text = String::new();
+            if args.is_empty() {
+                text.push('\n');
+            } else {
+                for a in args {
+                    puts_text(a, &mut text, &mut Vec::new());
+                }
+            }
+            stringio_write(recv, &text);
+            Ok(Value::Undef)
+        }
+        // `readline` is `gets` that raises at end of file.
+        "readline" => match stringio_method(recv, "gets", args, None)? {
+            Value::Undef => Err(raise_exc("EOFError", "end of file reached")),
+            line => Ok(line),
+        },
+        // `each_char` — the remaining characters.
+        "each_char" | "chars" => {
+            let (buf, pos) = stringio_state(recv);
+            let rest = String::from_utf8_lossy(&buf.as_bytes()[pos.min(buf.len())..]).into_owned();
+            let chars: Vec<Value> = rest.chars().map(|c| new_str(c.to_string())).collect();
+            stringio_set_pos(recv, buf.len());
+            match block {
+                Some(b) => {
+                    for c in chars {
+                        call_proc(&b, &[c])?;
+                    }
+                    Ok(recv.clone())
+                }
+                None => Ok(with_host(|h| h.new_enumerator(chars, "each_char"))),
+            }
+        }
+        "close" => {
+            with_host(|h| h.set_ivar_of(recv, "closed", Value::Bool(true)));
+            Ok(Value::Undef)
+        }
+        "closed?" => Ok(Value::Bool(with_host(|h| {
+            h.truthy(&h.ivar_of(recv, "closed"))
+        }))),
         // `read([len])` — from the cursor. No arg reads the rest (as `""` at EOF);
         // a length reads that many bytes and returns nil once past the end.
         "read" => {
@@ -25443,7 +25512,7 @@ fn stringio_method(
             Ok(Value::Bool(pos >= buf.len()))
         }
         "size" | "length" => Ok(Value::Int(stringio_state(recv).0.len() as i64)),
-        "rewind!" | "close" | "flush" | "fsync" => Ok(Value::Undef),
+        "rewind!" | "flush" | "fsync" => Ok(Value::Undef),
         "to_s" => Ok(with_host(|h| h.ivar_of(recv, "buf"))),
         _ => Err(no_method_error(recv, name)),
     }

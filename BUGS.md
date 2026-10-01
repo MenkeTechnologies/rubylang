@@ -1815,11 +1815,16 @@ Honest limitations of this surface:
 - **`StringIO` (dependency-free).** `require "stringio"` is a no-op; the class is
   always available. `StringIO.new(initial = "")` is a String-backed IO: the
   buffer and read cursor live in the object's `buf`/`pos` ivars. `#string`
-  returns the accumulated buffer; `#write`/`#<<`/`#print`/`#puts` append (the
-  common output/log-sink and input-buffer patterns only ever append or read),
-  with `#write` returning the byte count and `#<<` returning self; `#read([len])`,
-  `#gets`, and `#each_line` read from the cursor; `#rewind`, `#pos`/`#pos=`,
-  `#tell`/`#seek`, `#eof?` track it. Used by Rack for input and log sinks.
+  returns the buffer and `#string=` replaces it; `#write`/`#<<`/`#print`/
+  `#puts`/`#printf`/`#putc` write AT THE CURSOR, overwriting what is there
+  (`StringIO.new("hello").write("J")` leaves `"Jello"`) or, in `"a"` mode,
+  at the end, with `#write` returning the byte count and `#<<` returning self;
+  `#read([len])`, `#gets`, `#readline` (EOFError at the end), `#each_line` and
+  `#each_char` read from the cursor; `#rewind`, `#pos`/`#pos=`, `#tell`/`#seek`,
+  `#eof?` track it; `#close`/`#closed?` record the closed state. Kernel output
+  (`puts`, `print`, `p`, `printf`, `putc`, `warn`) goes to whatever `$stdout` /
+  `$stderr` holds, so assigning a StringIO captures it, as in MRI. Used by Rack
+  for input and log sinks.
 - **`rand`.** Backed by a port of MRI's MT19937 (`src/random.rs`, from
   `random.c` + `missing/mt19937.c`): the Integer-seed initialisation, the
   masked rejection loop for bounded integers (word-at-a-time below the Fixnum
