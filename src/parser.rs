@@ -455,6 +455,12 @@ impl Parser {
 
     fn assign(&mut self) -> Result<Expr, String> {
         let lhs = self.rescue_mod()?;
+        self.assign_tail(lhs)
+    }
+
+    /// The `= rhs` / `op= rhs` that may follow an already-parsed left side;
+    /// `lhs` itself when no assignment operator follows.
+    fn assign_tail(&mut self, lhs: Expr) -> Result<Expr, String> {
         // op-assignment and plain assignment
         if let Tok::Op(o) = self.peek() {
             let o = o.clone();
@@ -650,9 +656,13 @@ impl Parser {
     fn ternary(&mut self) -> Result<Expr, String> {
         let cond = self.range()?;
         if self.eat_op("?") {
+            // Each branch is an `arg`, which includes assignment (MRI:
+            // `c ? @g = g : @g`, `c ? 1 : x = 2`).
             let then = self.ternary()?;
+            let then = self.assign_tail(then)?;
             self.expect_op(":")?;
             let els = self.ternary()?;
+            let els = self.assign_tail(els)?;
             return Ok(Expr::If {
                 cond: Box::new(cond),
                 then: vec![then.into()],

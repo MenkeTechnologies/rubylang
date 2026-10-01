@@ -18523,7 +18523,22 @@ fn dispatch_proc(
         "to_proc" => Ok(recv.clone()),
         // `Proc#===` invokes the proc, so a lambda works as a `case/when` guard.
         "===" => crate::host::call_proc_block(recv, args, block),
-        "curry" => with_host(|h| h.proc_curry(recv)).ok_or_else(|| no_method_error(recv, name)),
+        // `curry(n = min arity)`. A lambda refuses an `n` outside its own
+        // min..max, as MRI's `proc_curry` does through `rb_check_arity`.
+        "curry" => {
+            let requested = match args.first() {
+                Some(Value::Undef) | None => None,
+                Some(n) => Some(as_i(n)),
+            };
+            if let (Some(n), Some((min, max))) = (requested, with_host(|h| h.proc_min_max(recv))) {
+                if with_host(|h| h.proc_is_lambda(recv)) && (n < min || max.is_some_and(|m| n > m))
+                {
+                    return Err(curry_arity_error(n, min, max));
+                }
+            }
+            let requested = requested.map(|n| n.max(0) as usize);
+            with_host(|h| h.proc_curry(recv, requested)).ok_or_else(|| no_method_error(recv, name))
+        }
         // Composition: `(f >> g).call(x) == g.call(f.call(x))`.
         ">>" => {
             let g = args[0].clone();
@@ -18647,11 +18662,19 @@ fn dispatch_method(
         "to_proc" => Ok(recv.clone()),
         // `Method#to_proc` yields a lambda in MRI, so the derived proc is strict.
         "lambda?" => Ok(Value::Bool(true)),
-        // `curry` gathers the method's own arity before invoking it.
+        // `curry(n = min arity)` — `to_proc.curry`, and a Method's proc is a
+        // lambda, so an `n` outside the method's min..max raises.
         "curry" => {
+            let (min, max) = with_host(|h| h.method_min_max(&mrecv, &mname, unbound));
             let arity = match args.first() {
-                Some(n) => as_i(n),
-                None => with_host(|h| h.method_arity(&mrecv, &mname, unbound)),
+                Some(Value::Undef) | None => min,
+                Some(n) => {
+                    let n = as_i(n);
+                    if n < min || max.is_some_and(|m| n > m) {
+                        return Err(curry_arity_error(n, min, max));
+                    }
+                    n
+                }
             };
             Ok(with_host(|h| {
                 h.new_method_curry(recv.clone(), arity.max(0) as usize)
@@ -18659,6 +18682,20 @@ fn dispatch_method(
         }
         _ => Err(no_method_error(recv, name)),
     }
+}
+
+/// The ArgumentError `curry(n)` raises for an `n` outside the lambda's
+/// `min..max` argument counts (`max` `None` = unbounded).
+fn curry_arity_error(n: i64, min: i64, max: Option<i64>) -> String {
+    let expected = match max {
+        Some(m) if m == min => min.to_string(),
+        Some(m) => format!("{min}..{m}"),
+        None => format!("{min}+"),
+    };
+    raise_exc(
+        "ArgumentError",
+        &format!("wrong number of arguments (given {n}, expected {expected})"),
+    )
 }
 
 /// An `Encoding` object named `name` (`String#encoding`, `Encoding::UTF_8`, …).

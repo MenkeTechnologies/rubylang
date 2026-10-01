@@ -4759,3 +4759,24 @@ p k.name, Module.new.name, Struct.new(:a).name, k.new.class.name
 p Class.new(StandardError).name, String.singleton_class.name
 K2 = Class.new
 p K2.name
+#==#
+# Each ternary branch is an `arg`, so it may be an assignment.
+def memo_g(g = nil) = g ? @g = g : @g
+p memo_g(4), memo_g, memo_g(7)
+x = 3
+y = x > 2 ? z = 10 : 0
+w = x > 5 ? 1 : v = 2
+a = 0
+p y, z, w, v, (true ? a += 5 : 0), a
+#==#
+# `curry` waits for the MINIMUM arity; `curry(n)` overrides it, and a lambda
+# refuses an `n` outside its own min..max.
+p ->(a, b = 1) { a + b }.curry[1], ->(a, b = 1) { a + b }.curry(2)[1][5]
+p ->(*a) { a }.curry[], ->(*a) { a }.curry(3)[1][2][3], ->(a, b: 2) { [a, b] }.curry[1]
+p proc { |a, b| [a, b] }.curry[1][2], proc { |a, b| [a, b] }.curry(3)[1][2][3]
+begin; ->(a, b) {}.curry(3); rescue ArgumentError => e; p e.message; end
+begin; ->(a, b = 1) {}.curry(0); rescue ArgumentError => e; p e.message; end
+def cm(a, b = 2) = a + b
+def cs(a, *r) = [a, r]
+p method(:cm).curry[1], method(:cs).curry[1], method(:cs).curry(3)[1][2][3]
+begin; method(:cm).curry(3); rescue ArgumentError => e; p e.message; end

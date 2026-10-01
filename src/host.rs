@@ -3481,9 +3481,26 @@ impl RubyHost {
             _ => None,
         }
     }
+    /// A normal proc's minimum and maximum (`None` = unbounded) argument
+    /// counts — MRI's `rb_proc_min_max_arity`. `None` for any other kind.
+    pub fn proc_min_max(&self, v: &Value) -> Option<(i64, Option<i64>)> {
+        match self.obj(v) {
+            Some(RObj::Proc {
+                kind: ProcKind::Normal,
+                template,
+                ..
+            }) => {
+                let def = &self.procs[*template];
+                Some(ArityFacts::of_block(&def.arity, def.splat.is_some()).min_max())
+            }
+            _ => None,
+        }
+    }
     /// Build the curried view of a proc: shares the base template/scope but only
-    /// runs once `arity` args are gathered across successive calls.
-    pub fn proc_curry(&mut self, v: &Value) -> Option<Value> {
+    /// runs once `arity` args are gathered across successive calls. The count is
+    /// `requested` (`curry(n)`) or else the proc's MINIMUM arity, as MRI's
+    /// `proc_curry` does: optional and `*rest` parameters are not waited for.
+    pub fn proc_curry(&mut self, v: &Value, requested: Option<usize>) -> Option<Value> {
         match self.obj(v).cloned() {
             Some(RObj::Proc {
                 template,
@@ -3498,7 +3515,10 @@ impl RubyHost {
                     | ProcKind::Composed { .. }
                     | ProcKind::Collect(_)
                     | ProcKind::Around(_) => return Some(v.clone()),
-                    ProcKind::Normal => self.procs[template].params.len(),
+                    ProcKind::Normal => match requested {
+                        Some(n) => n,
+                        None => self.proc_min_max(v).map_or(0, |(min, _)| min as usize),
+                    },
                 };
                 Some(self.alloc(RObj::Proc {
                     template,
@@ -4215,6 +4235,23 @@ impl RubyHost {
             .arity_value(true),
             Some(MethodShape::Builtin { arity, .. }) => arity as i64,
             None => -1,
+        }
+    }
+    /// A method's minimum and maximum (`None` = unbounded) argument counts, as
+    /// MRI's `method_min_max_arity`. A builtin knows only its arity value.
+    pub fn method_min_max(&self, recv: &Value, name: &str, unbound: bool) -> (i64, Option<i64>) {
+        match self.resolve_method_shape(recv, name, unbound) {
+            Some(MethodShape::Def { def, .. }) => ArityFacts::of_method(&def).min_max(),
+            Some(MethodShape::Block { template, .. }) => ArityFacts::of_block(
+                &self.procs[template].arity,
+                self.procs[template].splat.is_some(),
+            )
+            .min_max(),
+            Some(MethodShape::Builtin { arity, .. }) if arity >= 0 => {
+                (arity as i64, Some(arity as i64))
+            }
+            Some(MethodShape::Builtin { arity, .. }) => (-(arity as i64) - 1, None),
+            None => (0, None),
         }
     }
 
@@ -10319,7 +10356,7 @@ impl<'a> ArityFacts<'a> {
     /// acceptable positional count (`None` = unlimited, i.e. a `*rest`). A
     /// keyword hash counts as one toward the maximum, and required keywords
     /// contribute exactly one to the minimum however many there are.
-    fn min_max(&self) -> (i64, Option<i64>) {
+    pub fn min_max(&self) -> (i64, Option<i64>) {
         let min = self.req as i64 + !self.kwreq.is_empty() as i64;
         let max = if self.has_rest {
             None
