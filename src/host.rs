@@ -6485,7 +6485,6 @@ impl RubyHost {
         "initialize_clone",
         "initialize_dup",
         "respond_to_missing?",
-        "method_missing",
     ];
 
     /// `Module#instance_methods` — the public AND protected names, which is what
@@ -7516,9 +7515,34 @@ impl RubyHost {
                     "struct"
                 }
             ),
+            // An object reached again from its own instance variables:
+            // `#<Node:0x… ...>`, as `rb_obj_inspect` answers under recursion.
+            RObj::Object { class, .. } if self.is_plain_object(class) => {
+                format!("#<{class}:{} ...>", self.object_address(v))
+            }
             _ => return None,
         };
         Some((*id, marker))
+    }
+
+    /// A user-defined (or bare `Object`) instance that inspects through
+    /// `Object#inspect` — not a Struct/Data, an exception, or one of the
+    /// natively rendered library objects (`Encoding`, `OpenStruct`).
+    fn is_plain_object(&self, class: &str) -> bool {
+        (class == "Object" || self.classes.contains_key(class))
+            && !self.struct_defs.contains_key(class)
+            && !self.is_exception_class(class)
+            && !matches!(class, "Encoding" | "OpenStruct")
+    }
+
+    /// The `0x…` that `Object#inspect` prints, 16 hex digits as on a 64-bit MRI,
+    /// derived from the heap slot so it is stable for the object's lifetime.
+    fn object_address(&self, v: &Value) -> String {
+        let id = match v {
+            Value::Obj(id) => *id as u64,
+            _ => 0,
+        };
+        format!("0x{:016x}", 0x1_0000_0000u64 + id * 0x28)
     }
 
     /// `to_s` — the human string form used by `puts`/interpolation. Renders the
@@ -7718,6 +7742,10 @@ impl RubyHost {
                     } else {
                         match ivars.get("message") {
                             Some(m) => self.to_s(&m.clone()),
+                            // `Kernel#to_s`: `#<Foo:0x…>`, never the ivars.
+                            None if self.is_plain_object(&class) => {
+                                format!("#<{class}:{}>", self.object_address(v))
+                            }
                             None => format!("#<{class}>"),
                         }
                     }
@@ -7881,6 +7909,21 @@ impl RubyHost {
                     } else {
                         format!("#<OpenStruct {}>", body.join(", "))
                     }
+                }
+                // `Object#inspect` (object.c `rb_obj_inspect`): the class, an
+                // address, then every instance variable inspected —
+                // `#<Point:0x000000010a1b2c38 @x=1, @y=2>`. It rendered the bare
+                // `#<Point>`, hiding the state `p obj` exists to show. The address
+                // is this object's heap slot, not MRI's pointer; no two runs of
+                // MRI agree on it either.
+                Some(RObj::Object { class, ivars }) if self.is_plain_object(&class) => {
+                    let mut out = format!("#<{class}:{}", self.object_address(v));
+                    for (i, (k, val)) in ivars.iter().enumerate() {
+                        out.push_str(if i == 0 { " " } else { ", " });
+                        out.push_str(&format!("@{k}={}", self.inspect(&val.clone())));
+                    }
+                    out.push('>');
+                    out
                 }
                 _ => self.uncycled_to_s(v),
             },

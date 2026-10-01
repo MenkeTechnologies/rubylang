@@ -121,6 +121,21 @@ impl Parser {
     fn peek(&self) -> &Tok {
         &self.toks[self.pos].kind
     }
+    /// Scan an interpolating literal's body, crediting the block being parsed
+    /// with any `_1`..`_9` / `it` its interpolations use: `{ "#{_1}" }` and
+    /// `{ "#{it}" }` raised NameError because the fragments are parsed apart.
+    fn interp(&mut self, raw: &str) -> Result<Vec<StrPart>, String> {
+        let (parts, seen) = scan_interp_implicit(raw)?;
+        if let Some(top) = self.nparam_stack.last_mut() {
+            *top = (*top).max(seen.max_numbered);
+        }
+        if seen.it {
+            if let Some(top) = self.it_stack.last_mut() {
+                *top = true;
+            }
+        }
+        Ok(parts)
+    }
     fn line(&self) -> u32 {
         self.toks[self.pos].line
     }
@@ -1641,7 +1656,7 @@ impl Parser {
             Tok::Str(s, dq) => {
                 self.advance();
                 let mut parts = if dq {
-                    scan_interp(&s)?
+                    self.interp(&s)?
                 } else {
                     vec![StrPart::Lit(s)]
                 };
@@ -1651,7 +1666,7 @@ impl Parser {
                 while let Tok::Str(s2, dq2) = self.peek().clone() {
                     self.advance();
                     let more = if dq2 {
-                        scan_interp(&s2)?
+                        self.interp(&s2)?
                     } else {
                         vec![StrPart::Lit(s2)]
                     };
@@ -1661,6 +1676,12 @@ impl Parser {
             }
             Tok::Regex(pat, flags) => {
                 self.advance();
+                // The compiler scans a regexp's interpolations itself; only the
+                // implicit block parameters they name are recorded here (an
+                // unscannable body is reported by the compiler, not twice).
+                if pat.contains("#{") {
+                    let _ = self.interp(&pat);
+                }
                 Ok(Expr::Regex(pat, flags))
             }
             Tok::Symbol(s) => {
@@ -1669,7 +1690,7 @@ impl Parser {
             }
             Tok::DSymbol(s) => {
                 self.advance();
-                let parts = scan_interp(&s)?;
+                let parts = self.interp(&s)?;
                 Ok(Expr::Call {
                     recv: Some(Box::new(Expr::Str(parts))),
                     name: "to_sym".to_string(),
@@ -1891,9 +1912,24 @@ impl Parser {
                 // operator, so `p yield` / `puts yield` is unambiguously a
                 // command call on its value. Without it the argument was dropped
                 // and the call printed nothing at all.
+                // `case`/`begin` blocks and `super` are values too, never
+                // modifiers: MRI parses `puts case x when 1 then "a" end`,
+                // `p begin 1 end` and `p super` as one-argument commands, where
+                // they used to be a syntax error (case/begin) or a dropped
+                // argument that printed nothing (super).
                 matches!(
                     k.as_str(),
-                    "nil" | "true" | "false" | "self" | "not" | "def" | "defined?" | "yield"
+                    "nil"
+                        | "true"
+                        | "false"
+                        | "self"
+                        | "not"
+                        | "def"
+                        | "defined?"
+                        | "yield"
+                        | "case"
+                        | "begin"
+                        | "super"
                 )
             }
             // A tight unary sign (`puts -7` — space before `-`, none after) is a
@@ -3179,7 +3215,7 @@ impl Parser {
         }
         self.advance();
         self.advance();
-        let parts = if dq { scan_interp(&s)? } else { vec![StrPart::Lit(s)] };
+        let parts = if dq { self.interp(&s)? } else { vec![StrPart::Lit(s)] };
         if parts.iter().all(|p| matches!(p, StrPart::Lit(_))) {
             let name: String = parts
                 .into_iter()
@@ -3320,6 +3356,61 @@ fn matchop(op: &str) -> BinOp {
 /// Scan a double-quoted string body for `#{ … }` interpolation, decoding the
 /// common backslash escapes in the literal segments.
 pub(crate) fn scan_interp(raw: &str) -> Result<Vec<StrPart>, String> {
+    scan_interp_implicit(raw).map(|(parts, _)| parts)
+}
+
+/// The implicit block parameters an interpolation references outside any block
+/// of its own: the highest `_1`..`_9`, and whether `it` appears.
+#[derive(Default, Clone, Copy)]
+struct ImplicitParams {
+    max_numbered: u32,
+    it: bool,
+}
+
+/// Parse one interpolated fragment with a pseudo block frame open, so a bare
+/// `_1`/`it` inside it is recorded rather than lost: `{ "#{_1}" }` must give the
+/// ENCLOSING block its parameter, exactly as `{ _1.to_s }` does. A fresh parser
+/// is used per fragment, so the frame is the only channel back to the block
+/// being parsed around the string.
+fn parse_interp_fragment(src: &str) -> Result<(Vec<Stmt>, ImplicitParams), String> {
+    let src = crate::rust_ffi::desugar(src);
+    let toks = lex(&src)?;
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        tmp: 0,
+        no_do_block: false,
+        no_pattern: false,
+        no_rescue_mod: false,
+        nparam_stack: vec![0],
+        it_stack: vec![false],
+    };
+    let stmts = p.program()?;
+    let seen = ImplicitParams {
+        max_numbered: p.nparam_stack.first().copied().unwrap_or(0),
+        it: p.it_stack.first().copied().unwrap_or(false),
+    };
+    Ok((stmts, seen))
+}
+
+/// [`scan_interp`], also answering the implicit parameters the interpolations
+/// reference (see [`parse_interp_fragment`]).
+fn scan_interp_implicit(raw: &str) -> Result<(Vec<StrPart>, ImplicitParams), String> {
+    let mut seen = ImplicitParams::default();
+    let mut parse = |src: &str| -> Result<Vec<Stmt>, String> {
+        let (stmts, s) = parse_interp_fragment(src)?;
+        seen.max_numbered = seen.max_numbered.max(s.max_numbered);
+        seen.it |= s.it;
+        Ok(stmts)
+    };
+    let parts = scan_interp_with(raw, &mut parse)?;
+    Ok((parts, seen))
+}
+
+fn scan_interp_with(
+    raw: &str,
+    parse: &mut dyn FnMut(&str) -> Result<Vec<Stmt>, String>,
+) -> Result<Vec<StrPart>, String> {
     let b = raw.as_bytes();
     let mut i = 0;
     let mut parts = Vec::new();

@@ -1809,10 +1809,17 @@ Honest limitations of this surface:
   with `#write` returning the byte count and `#<<` returning self; `#read([len])`,
   `#gets`, and `#each_line` read from the cursor; `#rewind`, `#pos`/`#pos=`,
   `#tell`/`#seek`, `#eof?` track it. Used by Rack for input and log sinks.
-- **`rand`.** Backed by a thread-local SplitMix64. `srand(seed)` reseeds it so
-  `rand`/`rand(n)` are reproducible within a run and returns the previous seed
-  (MRI semantics); the MRI-exact sequence and MRI's random startup seed are not
-  matched. `srand` with no argument reseeds from the system clock.
+- **`rand`.** Backed by a port of MRI's MT19937 (`src/random.rs`, from
+  `random.c` + `missing/mt19937.c`): the Integer-seed initialisation, the
+  masked rejection loop for bounded integers (word-at-a-time below the Fixnum
+  limit, `limited_big_rand` above it) and the two-word 53-bit Float are MRI's,
+  so a seeded `srand(n)` / `Random.new(n)` stream — and `shuffle`/`sample`,
+  which run MRI's own `rb_ary_shuffle_bang` / `ary_sample` over it, honouring
+  `random:` — answers exactly what `ruby` answers. Unseeded generators start
+  from a fresh 128-bit seed, as MRI's do. Not covered: a Range with Bignum or
+  non-numeric endpoints, `Random#bytes`, and a `random:` object that is not a
+  `Random` (MRI calls its `rand`; this uses the default stream). `SecureRandom`
+  still draws from a separate SplitMix64.
 - **Method surface.** The Enumerable/String/Hash/Range surface is broad but not
   exhaustive; an unimplemented method raises a `NoMethodError` whose message uses
   the Ruby-4.0 form — `undefined method '<name>' for an instance of <Class>` for

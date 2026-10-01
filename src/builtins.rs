@@ -3249,19 +3249,26 @@ fn dispatch_classref(
     // reproducible PRNG stream (see `random_advance`).
     if cls == "Random" {
         return match name {
-            "new" => Ok(with_host(|h| {
-                let seed = args.first().and_then(int_arg).unwrap_or(0x9E3779B9);
-                let o = h.new_object("Random");
-                h.set_ivar_of(&o, "state", Value::Int(seed));
-                h.set_ivar_of(&o, "seed", Value::Int(seed));
-                o
-            })),
-            "rand" => Ok(kernel_rand(args)),
-            "srand" => {
-                let seed = args.first().and_then(int_arg).unwrap_or(0);
-                Ok(Value::Int(rng_srand(seed)))
+            // `Random.new(seed = Random.new_seed)`: its own MT19937 stream,
+            // seeded exactly as MRI's `rand_init` seeds one.
+            "new" => {
+                let seed = match args.first() {
+                    Some(v) => random_int_arg(v)?,
+                    None => crate::random::new_seed(),
+                };
+                let o = with_host(|h| h.new_object("Random"));
+                if let Value::Obj(id) = o {
+                    crate::random::seed_instance(id, &seed);
+                }
+                with_host(|h| {
+                    let sv = h.new_bigint(seed);
+                    h.set_ivar_of(&o, "seed", sv);
+                });
+                Ok(o)
             }
-            "new_seed" => Ok(Value::Int((rng_next() >> 1) as i64)),
+            "rand" => random_rand(Gen::Default, args),
+            "srand" => random_srand(args),
+            "new_seed" => Ok(with_host(|h| h.new_bigint(crate::random::new_seed()))),
             _ => Err(raise_exc(
                 "NoMethodError",
                 &format!("undefined method '{name}' for class Random"),
@@ -3963,15 +3970,22 @@ fn dispatch_classref(
         }
         // `Integer.sqrt` lives on Integer, not Math, but shares the domain rule.
     }
+    // `Integer.sqrt` is MRI's exact `rb_int_isqrt`: the floor of the real root
+    // at any size. Rounding through an f64 overflowed on a Bignum argument
+    // (`Integer.sqrt(2**80)` raised RangeError) and drifts past 2**52
+    // (`Integer.sqrt(10**16 - 1)` answered 100000000, not 99999999).
     if cls == "Integer" && name == "sqrt" {
-        let n = to_int(&args[0])?;
-        if n < 0 {
+        let n = match with_host(|h| h.as_bigint(&args[0])) {
+            Some(b) => b,
+            None => num_bigint::BigInt::from(to_int(&args[0])?),
+        };
+        if n.sign() == num_bigint::Sign::Minus {
             return Err(raise_exc(
                 "Math::DomainError",
                 "Numerical argument is out of domain - \"isqrt\"",
             ));
         }
-        return Ok(Value::Int((n as f64).sqrt() as i64));
+        return Ok(with_host(|h| h.new_bigint(n.sqrt())));
     }
     // The `JSON` module (dependency-free, hand-written over the host value model).
     // `generate`/`dump` encode; `parse`/`load` decode; `pretty_generate` indents.
@@ -11312,18 +11326,10 @@ fn dispatch_array(
             Ok(new_arr(out))
         }
         "each_index" => {
-            if let Some(b) = &block {
-                for i in 0..arr.len() {
-                    call_proc(b, &[Value::Int(i as i64)])?;
-                    if has_pending_signal() {
-                        break;
-                    }
-                }
-                Ok(recv.clone())
-            } else {
-                // No Enumerator type yet: return the indices array so a subsequent
-                // `.to_a`/`.map`/`.each` chain still works.
-                Ok(new_arr((0..arr.len() as i64).map(Value::Int).collect()))
+            let indices: Vec<Value> = (0..arr.len() as i64).map(Value::Int).collect();
+            match &block {
+                Some(b) => array_yield_method(recv, name, &indices, b, None),
+                None => Ok(with_host(|h| h.new_enumerator_of(indices, name, recv.clone()))),
             }
         }
         "rotate!" => {
@@ -11423,10 +11429,12 @@ fn dispatch_array(
             Ok(new_arr(a))
         }
         // `sort_by!` is `sort_by` written back into the receiver, answering
-        // self. Without a block MRI answers an Enumerator, which `sort_by`
-        // already models by answering the receiver.
+        // self. Without a block MRI answers an Enumerator.
         "sort_by!" => {
-            let sorted = sort_by_family(recv, "sort_by", &arr, &block, args)?;
+            if block.is_none() {
+                return Ok(with_host(|h| h.new_enumerator_of(arr, name, recv.clone())));
+            }
+            let sorted = sort_by_family(recv, "sort_by", &arr, &block, args, None)?;
             // A `break` in the key block cut the sort short, so there is nothing
             // to write back — MRI leaves the receiver untouched and answers the
             // break operand.
@@ -11773,23 +11781,13 @@ fn dispatch_array(
         }
         // `map!`/`collect!` — replace each element with the block's result in place,
         // returning the mutated receiver.
-        "map!" | "collect!" => {
-            if block.is_none() {
-                return Ok(with_host(|h| h.new_enumerator_of(arr, "map", recv.clone())));
-            }
-            let mut out = Vec::with_capacity(arr.len());
-            if let Some(b) = &block {
-                for x in &arr {
-                    let r = call_proc(b, std::slice::from_ref(x))?;
-                    if has_pending_signal() {
-                        break;
-                    }
-                    out.push(r);
-                }
-            }
-            with_host(|h| h.set_array(recv, out));
-            Ok(recv.clone())
-        }
+        "map!" | "collect!" => match &block {
+            // The Enumerator keeps the bang name: MRI inspects it as
+            // `#<Enumerator: [1, 2]:map!>`, and re-attaching a block through it
+            // must still write back (see `array_bang_iterate`).
+            None => Ok(with_host(|h| h.new_enumerator_of(arr, name, recv.clone()))),
+            Some(b) => array_bang_iterate(recv, name, &arr, b, None),
+        },
         "map" | "collect" | "flat_map" | "collect_concat" => {
             if block.is_none() {
                 // Block-less `map`/`collect` yields the original elements as an
@@ -11867,36 +11865,18 @@ fn dispatch_array(
             let Some(b) = &block else {
                 return Ok(with_host(|h| h.new_enumerator_of(arr, name, recv.clone())));
             };
-            let mut kept = Vec::with_capacity(arr.len());
-            for x in &arr {
-                let r = call_proc(b, std::slice::from_ref(x))?;
-                if with_host(|h| h.truthy(&r)) {
-                    kept.push(x.clone());
-                }
-            }
-            let changed = kept.len() != arr.len();
-            with_host(|h| h.set_array(recv, kept));
-            if name.ends_with('!') && !changed {
-                Ok(Value::Undef)
-            } else {
-                Ok(recv.clone())
-            }
+            array_bang_iterate(recv, name, &arr, b, None)
         }
         // `filter_map` maps each element and keeps only the truthy results.
-        "filter_map" => {
-            let mut out = Vec::new();
-            if let Some(b) = &block {
-                for x in &arr {
-                    let r = call_proc(b, std::slice::from_ref(x))?;
-                    if has_pending_signal() {
-                        break;
-                    }
-                    if with_host(|h| h.truthy(&r)) {
-                        out.push(r);
-                    }
-                }
+        // `filter_map`, `find`/`detect`, `partition`, `group_by`, `take_while`
+        // and `drop_while` share one body with their `with_index` re-attachment;
+        // block-less, each answers an Enumerator.
+        "filter_map" | "find" | "detect" | "partition" | "group_by" | "take_while"
+        | "drop_while" => {
+            match &block {
+                Some(b) => array_yield_method(recv, name, &arr, b, None),
+                None => Ok(with_host(|h| h.new_enumerator_of(arr, name, recv.clone()))),
             }
-            Ok(new_arr(out))
         }
         // `transpose` turns an array of equal-length rows into columns.
         "transpose" => {
@@ -11927,17 +11907,6 @@ fn dispatch_array(
                 .map(|c| new_arr(rows.iter().map(|r| r[c].clone()).collect()))
                 .collect();
             Ok(new_arr(cols))
-        }
-        "find" | "detect" => {
-            if let Some(b) = &block {
-                for x in &arr {
-                    let r = call_proc(b, std::slice::from_ref(x))?;
-                    if with_host(|h| h.truthy(&r)) {
-                        return Ok(x.clone());
-                    }
-                }
-            }
-            Ok(Value::Undef)
         }
         "any?" => {
             if let Some(b) = &block {
@@ -12063,7 +12032,7 @@ fn dispatch_array(
             Ok(acc)
         }
         "min_by" | "max_by" | "sort_by" | "minmax_by" => {
-            sort_by_family(recv, name, &arr, &block, args)
+            sort_by_family(recv, name, &arr, &block, args, None)
         }
         "[]" => arr_index(&arr, args),
         "fetch" => {
@@ -12109,39 +12078,6 @@ fn dispatch_array(
                 .skip(checked_size(&args[0], 0, "attempt to drop negative size")?)
                 .collect(),
         )),
-        "partition" => {
-            let (mut yes, mut no) = (Vec::new(), Vec::new());
-            if let Some(bl) = &block {
-                for x in &arr {
-                    let r = call_proc(bl, std::slice::from_ref(x))?;
-                    if with_host(|h| h.truthy(&r)) {
-                        yes.push(x.clone());
-                    } else {
-                        no.push(x.clone());
-                    }
-                }
-            }
-            let y = new_arr(yes);
-            let n = new_arr(no);
-            Ok(new_arr(vec![y, n]))
-        }
-        "group_by" => {
-            let mut groups: IndexMap<RKey, Vec<Value>> = IndexMap::new();
-            if let Some(bl) = &block {
-                for x in &arr {
-                    let k = call_proc(bl, std::slice::from_ref(x))?;
-                    let key = with_host(|h| h.value_to_key(&k));
-                    groups.entry(key).or_default().push(x.clone());
-                }
-            }
-            Ok(with_host(|h| {
-                let m: IndexMap<RKey, Value> = groups
-                    .into_iter()
-                    .map(|(k, v)| (k, h.new_array(v)))
-                    .collect();
-                h.new_hash(m)
-            }))
-        }
         "tally" => {
             let mut counts: IndexMap<RKey, i64> = IndexMap::new();
             for x in &arr {
@@ -12299,30 +12235,25 @@ fn dispatch_array(
                 Ok(new_arr(out))
             }
         }
-        "shuffle" => Ok(new_arr(shuffled(&arr))),
-        "shuffle!" => {
-            let a = shuffled(&arr);
+        // `shuffle`/`shuffle!`/`sample` draw from the `random:` generator (the
+        // default stream when absent) with MRI's own algorithms, so a seeded
+        // `shuffle(random: Random.new(42))` is MRI's permutation.
+        "shuffle" | "shuffle!" => {
+            let (_, g) = random_kwarg(args);
+            let mut a = arr;
+            shuffle_in_place(&mut a, g);
+            if name == "shuffle" {
+                return Ok(new_arr(a));
+            }
             with_host(|h| h.set_array(recv, a));
             Ok(recv.clone())
         }
         // `sample` with no count is one random element (nil when empty);
         // `sample(n)` is up to `n` *distinct* elements in random order.
         "sample" => {
-            if args.is_empty() {
-                if arr.is_empty() {
-                    return Ok(Value::Undef);
-                }
-                let i = (rng_next() % arr.len() as u64) as usize;
-                return Ok(arr[i].clone());
-            }
-            let n = as_i(&args[0]);
-            if n < 0 {
-                return Err(raise_exc("ArgumentError", "negative sample number"));
-            }
-            let n = (n as usize).min(arr.len());
-            let mut a = shuffled(&arr);
-            a.truncate(n);
-            Ok(new_arr(a))
+            let (pos, g) = random_kwarg(args);
+            let n = pos.first().map(to_int).transpose()?;
+            sample_values(&arr, n, g)
         }
         "assoc" => {
             for x in &arr {
@@ -12495,58 +12426,11 @@ fn dispatch_array(
         // nil (MRI: `[1,2].reject! { false }` → nil, `[1,2].reject! { |x| x==1 }`
         // → `[2]`); `delete_if` always returns the array. This mirrors the
         // `select!`/`keep_if` pair above.
-        "delete_if" | "reject!" => {
-            let mut a = arr;
-            let before = a.len();
-            if let Some(bl) = &block {
-                let mut kept = Vec::with_capacity(a.len());
-                for x in a.drain(..) {
-                    let r = call_proc(bl, std::slice::from_ref(&x))?;
-                    if !with_host(|h| h.truthy(&r)) {
-                        kept.push(x);
-                    }
-                }
-                a = kept;
-            }
-            let changed = a.len() != before;
-            with_host(|h| h.set_array(recv, a));
-            if name.ends_with('!') && !changed {
-                Ok(Value::Undef)
-            } else {
-                Ok(recv.clone())
-            }
-        }
-        "take_while" => {
-            let mut out = Vec::new();
-            if let Some(bl) = &block {
-                for x in &arr {
-                    let r = call_proc(bl, std::slice::from_ref(x))?;
-                    if with_host(|h| h.truthy(&r)) {
-                        out.push(x.clone());
-                    } else {
-                        break;
-                    }
-                }
-            }
-            Ok(new_arr(out))
-        }
-        "drop_while" => {
-            let mut out = Vec::new();
-            let mut dropping = true;
-            if let Some(bl) = &block {
-                for x in &arr {
-                    if dropping {
-                        let r = call_proc(bl, std::slice::from_ref(x))?;
-                        if with_host(|h| h.truthy(&r)) {
-                            continue;
-                        }
-                        dropping = false;
-                    }
-                    out.push(x.clone());
-                }
-            }
-            Ok(new_arr(out))
-        }
+        "delete_if" | "reject!" => match &block {
+            // Block-less, both answer an Enumerator, like `select!`/`keep_if`.
+            None => Ok(with_host(|h| h.new_enumerator_of(arr, name, recv.clone()))),
+            Some(b) => array_bang_iterate(recv, name, &arr, b, None),
+        },
         "rotate" => {
             let n = args.first().map(to_int).transpose()?.unwrap_or(1);
             let len = arr.len() as i64;
@@ -12732,13 +12616,24 @@ fn sort_by_family(
     arr: &[Value],
     block: &Option<Value>,
     args: &[Value],
+    index: Option<i64>,
 ) -> Result<Value, String> {
+    // Block-less, each of these is an Enumerator (`#<Enumerator: [1, 2]:sort_by>`)
+    // that a later `with_index` re-runs with `index` set. Answering the receiver
+    // here made `a.sort_by.with_index { |x, i| … }` a NoMethodError.
     let Some(b) = block else {
-        return Ok(recv.clone());
+        let tag = match args.first() {
+            Some(n) => format!("{name}({})", with_host(|h| h.inspect(n))),
+            None => name.to_string(),
+        };
+        return Ok(with_host(|h| h.new_enumerator_of(arr.to_vec(), &tag, recv.clone())));
     };
     let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(arr.len());
-    for x in arr {
-        let k = call_proc(b, std::slice::from_ref(x))?;
+    for (i, x) in arr.iter().enumerate() {
+        let k = match index {
+            Some(off) => call_proc(b, &[x.clone(), Value::Int(off + i as i64)])?,
+            None => call_proc(b, std::slice::from_ref(x))?,
+        };
         // A `break` in the key block ends the call right here. `call_proc`
         // answered `Value::Undef` with the signal still pending, and ranking that
         // against a real key raised "comparison of Integer with nil failed" where
@@ -12781,33 +12676,31 @@ fn sort_by_family(
             if n < 0 {
                 return Err(raise_exc("ArgumentError", "negative size"));
             }
-            let mut bad: Option<(Value, Value)> = None;
-            // A stable sort keeps ties in SOURCE order, which is what decides
-            // which of two equal-keyed elements is reported. `max_by` therefore
-            // has to sort descending outright rather than sort ascending and
-            // reverse — reversing flips the tied elements too, so
-            // `[1,1,2].max_by(2) { 0 }` came back `[2, 1]` where MRI says
-            // `[1, 1]`.
-            let descending = name == "max_by";
-            keyed.sort_by(|a, c| {
-                let (l, r) = if descending {
-                    (&c.0, &a.0)
-                } else {
-                    (&a.0, &c.0)
-                };
-                match cmp_values(l, r) {
-                    Some(o) => o,
-                    None => {
-                        bad.get_or_insert_with(|| (a.0.clone(), c.0.clone()));
-                        std::cmp::Ordering::Equal
-                    }
+            // MRI's `min_by(n)`/`max_by(n)` are `rb_nmin_run(obj, num, 1, rev, 0)`
+            // — the same quickselect as `min(n)`, ranking by the block's key. A
+            // whole stable sort is a different permutation of the survivors
+            // whenever keys tie: `{"h"=>1,"e"=>1,"l"=>2,"o"=>1}.max_by(2) { _2 }`
+            // is `[["l", 2], ["e", 1]]` in MRI, not the source-order `["h", 1]`.
+            // The keys were computed above in source order, which is the order
+            // `nmin_run` asks for them.
+            let mut next_key = keys.iter();
+            let mut key_of = |_: &Value| -> Result<Value, String> {
+                Ok(next_key.next().cloned().unwrap_or(Value::Undef))
+            };
+            let mut def_cmp = |a: &Value, c: &Value| -> Result<i64, String> {
+                match cmp_values(a, c) {
+                    Some(o) => Ok(ord_to_i(o)),
+                    None => Err(cmp_error(a, c)),
                 }
-            });
-            if let Some((x, y)) = bad {
-                return Err(unrankable_error(&keys, CmpOrder::Reversed, &x, &y));
-            }
-            let n = (n as usize).min(keyed.len());
-            return Ok(new_arr(keyed[..n].iter().map(|p| p.1.clone()).collect()));
+            };
+            let k = (n as usize).min(keyed.len());
+            return Ok(new_arr(nmin_run(
+                arr,
+                k,
+                name == "max_by",
+                &mut key_of,
+                &mut def_cmp,
+            )?));
         }
     }
     match name {
@@ -13910,6 +13803,141 @@ fn dispatch_arith_seq(
     }
 }
 
+/// Array's in-place block methods, which a block-less call hands out as an
+/// Enumerator (`a.map!`, `a.select!.with_index`) that still writes back.
+const ARRAY_BANG_ITERATORS: &[&str] = &[
+    "map!",
+    "collect!",
+    "select!",
+    "filter!",
+    "keep_if",
+    "reject!",
+    "delete_if",
+];
+
+/// Run one of [`ARRAY_BANG_ITERATORS`] over `elems` and write the outcome into
+/// the Array `recv`. `index` is the offset a `with_index`/`each_with_index`
+/// re-attachment passes as the block's second argument.
+///
+/// A `break` stops the walk and leaves the elements not yet visited — the one
+/// whose block broke included — where they were, as MRI's `map!` per-element
+/// store and the `select!`/`reject!` ensure clauses do:
+/// `a = [1, 2, 3]; a.map! { |x| break if x == 2; x * 10 }` leaves `[10, 2, 3]`,
+/// where this used to truncate it to `[10]`.
+///
+/// The answer is the receiver, except that `select!`/`filter!`/`reject!` answer
+/// nil when nothing was removed.
+fn array_bang_iterate(
+    recv: &Value,
+    method: &str,
+    elems: &[Value],
+    block: &Value,
+    index: Option<i64>,
+) -> Result<Value, String> {
+    let map = matches!(method, "map!" | "collect!");
+    let keep_truthy = matches!(method, "select!" | "filter!" | "keep_if");
+    let mut out: Vec<Value> = Vec::with_capacity(elems.len());
+    let mut visited = 0;
+    for (i, x) in elems.iter().enumerate() {
+        let r = match index {
+            Some(off) => call_proc(block, &[x.clone(), Value::Int(off + i as i64)])?,
+            None => call_proc(block, std::slice::from_ref(x))?,
+        };
+        if has_pending_signal() {
+            break;
+        }
+        visited += 1;
+        if map {
+            out.push(r);
+        } else if with_host(|h| h.truthy(&r)) == keep_truthy {
+            out.push(x.clone());
+        }
+    }
+    out.extend_from_slice(&elems[visited..]);
+    let changed = out.len() != elems.len();
+    with_host(|h| h.set_array(recv, out));
+    if matches!(method, "select!" | "filter!" | "reject!") && !changed {
+        Ok(Value::Undef)
+    } else {
+        Ok(recv.clone())
+    }
+}
+
+/// Array methods that decide with the block and answer from the ELEMENTS (or,
+/// for `filter_map`, the block's truthy results), whose `with_index`
+/// re-attachment runs the same body with `index` set.
+const ARRAY_YIELD_METHODS: &[&str] = &[
+    "filter_map",
+    "find",
+    "detect",
+    "partition",
+    "group_by",
+    "take_while",
+    "drop_while",
+    "each_index",
+];
+
+/// The body of one of [`ARRAY_YIELD_METHODS`] over `elems`. `index` is the
+/// offset a `with_index`/`each_with_index` re-attachment passes as the block's
+/// second argument: `a.filter_map.with_index { |x, i| x * i if i.odd? }`.
+/// `each_index` is handed the indices as `elems` and answers the receiver.
+///
+/// A `break` answers nil with the signal still pending; the caller's block-call
+/// epilogue replaces it with the break operand.
+fn array_yield_method(
+    recv: &Value,
+    method: &str,
+    elems: &[Value],
+    block: &Value,
+    index: Option<i64>,
+) -> Result<Value, String> {
+    let mut kept: Vec<Value> = Vec::new();
+    let mut rest: Vec<Value> = Vec::new();
+    let mut groups: IndexMap<RKey, Vec<Value>> = IndexMap::new();
+    for (i, x) in elems.iter().enumerate() {
+        let r = match index {
+            Some(off) => call_proc(block, &[x.clone(), Value::Int(off + i as i64)])?,
+            None => call_proc(block, std::slice::from_ref(x))?,
+        };
+        if has_pending_signal() {
+            return Ok(Value::Undef);
+        }
+        let truthy = with_host(|h| h.truthy(&r));
+        match method {
+            "filter_map" if truthy => kept.push(r),
+            "find" | "detect" if truthy => return Ok(x.clone()),
+            "partition" if truthy => kept.push(x.clone()),
+            "partition" => rest.push(x.clone()),
+            "group_by" => {
+                let key = with_host(|h| h.value_to_key(&r));
+                groups.entry(key).or_default().push(x.clone());
+            }
+            "take_while" if truthy => kept.push(x.clone()),
+            "take_while" => break,
+            // The block stops running at the first falsy answer; everything
+            // from there on is kept unexamined.
+            "drop_while" if !truthy => {
+                kept.extend_from_slice(&elems[i..]);
+                break;
+            }
+            _ => {}
+        }
+    }
+    Ok(match method {
+        "find" | "detect" => Value::Undef,
+        "partition" => new_arr(vec![new_arr(kept), new_arr(rest)]),
+        "group_by" => with_host(|h| {
+            let m: IndexMap<RKey, Value> = groups
+                .into_iter()
+                .map(|(k, v)| (k, h.new_array(v)))
+                .collect();
+            h.new_hash(m)
+        }),
+        "each_index" => recv.clone(),
+        _ => new_arr(kept),
+    })
+}
+
 fn dispatch_enumerator(
     recv: &Value,
     name: &str,
@@ -13938,6 +13966,53 @@ fn dispatch_enumerator(
             Ok(recv.clone())
         }
         "size" | "length" if args.is_empty() && block.is_none() => Ok(Value::Int(buf.len() as i64)),
+        // Re-attaching a block to `a.map!` / `a.select!` / … runs the in-place
+        // method itself, writing back into the Array that built the Enumerator:
+        // `a.map!.with_index { |v, i| v * i }` changes `a`. These used to fall
+        // through to the read-only `with_index` below and left `a` untouched.
+        "each" | "with_index" | "each_with_index"
+            if block.is_some()
+                && (name != "each" || args.is_empty())
+                && with_host(|h| h.enum_method(recv))
+                    .is_some_and(|m| ARRAY_BANG_ITERATORS.contains(&m.as_str()))
+                && with_host(|h| h.enum_source(recv))
+                    .is_some_and(|s| with_host(|h| h.as_array(&s)).is_some()) =>
+        {
+            let method = with_host(|h| h.enum_method(recv)).unwrap_or_default();
+            let source = with_host(|h| h.enum_source(recv)).unwrap_or(Value::Undef);
+            let index = match name {
+                "each" => None,
+                "with_index" => Some(match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                }),
+                _ => Some(0),
+            };
+            array_bang_iterate(&source, &method, &buf, &block.unwrap(), index)
+        }
+        // `a.filter_map.with_index { |x, i| … }`, `a.sort_by.with_index`, … —
+        // the method that built this Enumerator, re-run with the index as the
+        // block's second argument. The generic `with_index` below only knows the
+        // map/select family and answered the bare elements for everything else.
+        "with_index" | "each_with_index"
+            if block.is_some()
+                && with_host(|h| h.enum_method(recv)).is_some_and(|m| {
+                    ARRAY_YIELD_METHODS.contains(&m.as_str())
+                        || matches!(m.as_str(), "sort_by" | "min_by" | "max_by" | "minmax_by")
+                }) =>
+        {
+            let method = with_host(|h| h.enum_method(recv)).unwrap_or_default();
+            let source = with_host(|h| h.enum_source(recv)).unwrap_or_else(|| new_arr(buf.clone()));
+            let offset = match (name, args.first()) {
+                ("with_index", Some(Value::Int(n))) => *n,
+                _ => 0,
+            };
+            if ARRAY_YIELD_METHODS.contains(&method.as_str()) {
+                array_yield_method(&source, &method, &buf, &block.unwrap(), Some(offset))
+            } else {
+                sort_by_family(&source, &method, &buf, &block, &[], Some(offset))
+            }
+        }
         // `with_index(offset=0)` re-attaches a block that also receives a running
         // index. What it returns depends on the method that built this
         // Enumerator: `map`/`collect`/`flat_map` collect the block's results,
@@ -13981,6 +14056,20 @@ fn dispatch_enumerator(
                             _ => x.clone(),
                         },
                     ),
+                }
+            }
+            // Over a Hash, `each`/`each_pair` answer the Hash itself and
+            // `select`/`filter`/`reject` a Hash of the kept pairs — what the
+            // block-taking Hash methods themselves answer.
+            if let Some(src) = with_host(|h| h.enum_source(recv))
+                .filter(|s| with_host(|h| h.as_hash(s)).is_some())
+            {
+                match method.as_str() {
+                    "each" | "each_pair" => return Ok(src),
+                    "select" | "filter" | "reject" => {
+                        return dispatch_array(&new_arr(collected), "to_h", &[], None);
+                    }
+                    _ => {}
                 }
             }
             Ok(new_arr(collected))
@@ -16969,6 +17058,28 @@ fn dispatch_hash(
         // Pattern-match protocol: return self (the requested-keys arg is only a
         // hint; the pattern re-checks each key). Matches MRI's `Hash#deconstruct_keys`.
         "deconstruct_keys" => Ok(recv.clone()),
+        // Block-less, Hash's own iterators answer an Enumerator, as MRI's
+        // `RETURN_SIZED_ENUMERATOR` does: `#<Enumerator: {a: 1}:map>`. They
+        // answered `[]`, `{}` or the receiver, so `h.map.with_index { … }` was a
+        // NoMethodError on Array and `h.each.next` had nothing to step.
+        "map" | "collect" | "each" | "each_pair" | "find" | "detect" | "select" | "filter"
+        | "reject" | "each_key" | "each_value"
+            if block.is_none() && args.is_empty() =>
+        {
+            let buf: Vec<Value> = with_host(|h| {
+                map.iter()
+                    .map(|(k, v)| match name {
+                        "each_key" => h.key_value(k),
+                        "each_value" => v.clone(),
+                        _ => {
+                            let kv = h.key_value(k);
+                            h.new_array(vec![kv, v.clone()])
+                        }
+                    })
+                    .collect()
+            });
+            Ok(with_host(|h| h.new_enumerator_of(buf, name, recv.clone())))
+        }
         "keys" => Ok(with_host(|h| {
             let ks: Vec<Value> = map.keys().map(|k| h.key_value(k)).collect();
             h.new_array(ks)
@@ -19195,18 +19306,9 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             with_host(|h| h.set_pending_exc(exc));
             Err(message)
         }
-        "rand" => Ok(kernel_rand(args)),
+        "rand" => kernel_rand(args),
         "sleep" => Ok(Value::Int(0)),
-        "srand" => {
-            let seed = match args.first() {
-                Some(Value::Int(n)) => *n,
-                _ => std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or(0),
-            };
-            Ok(Value::Int(rng_srand(seed)))
-        }
+        "srand" => random_srand(args),
         "Integer" => {
             // `Integer(str, base=0)` / `Integer(numeric)`. A base is only valid
             // for a string receiver; auto-detect (base 0) honours radix prefixes
@@ -19655,9 +19757,9 @@ fn puts_text(v: &Value, out: &mut String, seen: &mut Vec<u32>) {
 }
 
 thread_local! {
-    // SplitMix64 state driving `rand`, plus the last seed `srand` returns.
+    // SplitMix64 state behind `SecureRandom`'s draws (`rand` and `Random` use
+    // the MT19937 port in `crate::random`).
     static RNG_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0x2545F4914F6CDD1D) };
-    static RNG_SEED: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
 /// Advance the thread-local SplitMix64 state and return the next 64-bit word.
@@ -19672,48 +19774,258 @@ fn rng_next() -> u64 {
     z ^ (z >> 31)
 }
 
-/// Reseed the PRNG from `seed`; return the PREVIOUS seed (MRI `srand` semantics).
-fn rng_srand(seed: i64) -> i64 {
-    RNG_STATE.with(|c| c.set(seed as u64));
-    RNG_SEED.with(|c| c.replace(seed))
-}
+use crate::random::Gen;
 
-/// Build a random value from one 64-bit word and `rand`'s argument: `rand(n)` →
-/// `0..n-1`, `rand(a..b)` → an integer in the (inclusive/exclusive) range, and
-/// no/zero argument → a uniform double in `[0, 1)` (top 53 bits, like MRI).
-fn rand_value(z: u64, args: &[Value]) -> Value {
-    let unit = || (z >> 11) as f64 / (1u64 << 53) as f64;
-    match args.first() {
-        Some(Value::Int(n)) if *n > 0 => Value::Int((z % (*n as u64)) as i64),
-        Some(Value::Float(f)) if *f > 0.0 => Value::Float(unit() * f),
-        Some(v) => {
-            if let Some((lo, hi, excl)) = with_host(|h| h.as_range(v)) {
-                let span = (hi - lo + if excl { 0 } else { 1 }).max(1) as u64;
-                return Value::Int(lo + (z % span) as i64);
-            }
-            Value::Float(unit())
+/// The generator a `Random` value draws from: a `Random.new` instance has its
+/// own stream, while the `Random` class itself (the `random:` default) and
+/// anything else is the process-wide one.
+fn random_gen(v: Option<&Value>) -> Gen {
+    match v {
+        Some(r @ Value::Obj(id)) if with_host(|h| h.object_class(r)).as_deref() == Some("Random") => {
+            Gen::Instance(*id)
         }
-        None => Value::Float(unit()),
+        _ => Gen::Default,
     }
 }
 
-fn kernel_rand(args: &[Value]) -> Value {
-    rand_value(rng_next(), args)
+/// Split a trailing `random:` keyword off `args` (`shuffle(random: r)`,
+/// `sample(2, random: r)`), answering the positional rest and the generator.
+fn random_kwarg(args: &[Value]) -> (Vec<Value>, Gen) {
+    if let Some((last, rest)) = args.split_last() {
+        if let Some(m) = with_host(|h| h.as_hash(last).filter(|_| h.is_kwargs(last))) {
+            let g = random_gen(m.get(&RKey::Sym("random".to_string())));
+            return (rest.to_vec(), g);
+        }
+    }
+    (args.to_vec(), Gen::Default)
 }
 
-/// Advance a `Random` instance's own SplitMix64 state (stored in its `state`
-/// ivar) and return the next 64-bit word — so each `Random.new(seed)` is an
-/// independent, reproducible stream distinct from the global `rand`.
-fn random_advance(recv: &Value) -> u64 {
-    let cur = match with_host(|h| h.ivar_of(recv, "state")) {
-        Value::Int(n) => n as u64,
-        _ => 0x2545F4914F6CDD1D,
+/// An Integer argument as a `BigInt` (`rb_to_int`: a Float truncates).
+fn random_int_arg(v: &Value) -> Result<num_bigint::BigInt, String> {
+    if let Some(b) = with_host(|h| h.as_bigint(v)) {
+        return Ok(b);
+    }
+    Ok(num_bigint::BigInt::from(to_int(v)?))
+}
+
+/// `random_ulong_limited` / `random_ulong_limited_big`: uniform in `0..=limit`.
+/// MRI takes the word-at-a-time path while the limit is a Fixnum and the
+/// Bignum path past it, and the two consume draws differently.
+fn random_upto(g: Gen, limit: &num_bigint::BigInt) -> Value {
+    use num_traits::ToPrimitive;
+    const FIXNUM_MAX: i64 = (1 << 62) - 1;
+    match limit.to_i64().filter(|n| (0..=FIXNUM_MAX).contains(n)) {
+        Some(n) => Value::Int(crate::random::limited(g, n as u64) as i64),
+        None => with_host(|h| h.new_bigint(crate::random::limited_big(g, limit))),
+    }
+}
+
+/// MRI `rand_int`: `0...max`, or `None` for a zero max (and for a negative one
+/// when `restrictive`, as `Random#rand` is; `Kernel#rand` uses `max.abs`).
+fn random_int(g: Gen, max: &num_bigint::BigInt, restrictive: bool) -> Option<Value> {
+    use num_traits::{Signed, Zero};
+    if max.is_zero() || (restrictive && max.is_negative()) {
+        return None;
+    }
+    Some(random_upto(g, &(max.abs() - 1)))
+}
+
+/// MRI `rand_range`: `Ok(None)` when `v` is not a Range at all, `Ok(Some(nil))`
+/// for an empty one.
+fn random_range(g: Gen, v: &Value) -> Result<Option<Value>, String> {
+    if let Some((lo, hi, excl)) = with_host(|h| h.as_range(v)) {
+        let max = hi as i128 - lo as i128 - excl as i128;
+        if max < 0 {
+            return Ok(Some(Value::Undef));
+        }
+        let r = random_upto(g, &num_bigint::BigInt::from(max));
+        return Ok(Some(with_host(|h| h.num_op(fusevm::NumOp::Add, &Value::Int(lo), &r))?));
+    }
+    if let Some((lo, hi, excl)) = with_host(|h| h.as_float_range(v)) {
+        if !lo.is_finite() || !hi.is_finite() {
+            return Err(raise_exc("Errno::EDOM", "Numerical argument out of domain"));
+        }
+        let max = hi - lo;
+        return Ok(Some(if max > 0.0 {
+            Value::Float(crate::random::real(g, excl) * max + lo)
+        } else if max == 0.0 && !excl {
+            Value::Float(lo)
+        } else {
+            Value::Undef
+        }));
+    }
+    Ok(None)
+}
+
+/// `Kernel#rand` (`rb_f_rand`): a Range draws from it; any other argument is
+/// truncated to an Integer and its magnitude bounds the draw; no argument, nil
+/// or a zero bound answers a Float in `[0, 1)`.
+fn kernel_rand(args: &[Value]) -> Result<Value, String> {
+    let g = Gen::Default;
+    if let Some(v) = args.first().filter(|v| !matches!(v, Value::Undef)) {
+        if let Some(r) = random_range(g, v)? {
+            return Ok(r);
+        }
+        if let Some(r) = random_int(g, &random_int_arg(v)?, false) {
+            return Ok(r);
+        }
+    }
+    Ok(Value::Float(crate::random::real(g, true)))
+}
+
+/// `Random#rand` / `Random.rand` (`rand_random` + `check_random_number`): an
+/// Integer bound must be positive and a Float one non-negative, else
+/// `ArgumentError: invalid argument - <arg>`.
+fn random_rand(g: Gen, args: &[Value]) -> Result<Value, String> {
+    let Some(v) = args.first() else {
+        return Ok(Value::Float(crate::random::real(g, true)));
     };
-    let z = cur.wrapping_add(0x9E3779B97F4A7C15);
-    with_host(|h| h.set_ivar_of(recv, "state", Value::Int(z as i64)));
-    let mut m = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    m = (m ^ (m >> 27)).wrapping_mul(0x94D049BB133111EB);
-    m ^ (m >> 31)
+    let invalid = || {
+        let shown = with_host(|h| h.to_s(v));
+        raise_exc("ArgumentError", &format!("invalid argument - {shown}"))
+    };
+    if matches!(v, Value::Undef) {
+        return Err(invalid());
+    }
+    if with_host(|h| h.as_bigint(v)).is_some() {
+        return random_int(g, &random_int_arg(v)?, true).ok_or_else(invalid);
+    }
+    if let Value::Float(max) = v {
+        if !max.is_finite() {
+            return Err(raise_exc("Errno::EDOM", "Numerical argument out of domain"));
+        }
+        if *max < 0.0 {
+            return Err(invalid());
+        }
+        let r = crate::random::real(g, true);
+        return Ok(Value::Float(if *max > 0.0 { r * max } else { r }));
+    }
+    match random_range(g, v)? {
+        Some(Value::Undef) => Err(invalid()),
+        Some(r) => Ok(r),
+        None => Err(conv_error(v, "Integer")),
+    }
+}
+
+/// `srand` / `Random.srand`: reseed the default generator from `seed` (a fresh
+/// random seed when absent) and answer the previous seed.
+fn random_srand(args: &[Value]) -> Result<Value, String> {
+    let seed = match args.first() {
+        Some(v) => random_int_arg(v)?,
+        None => crate::random::new_seed(),
+    };
+    let old = crate::random::srand(seed);
+    Ok(with_host(|h| h.new_bigint(old)))
+}
+
+/// `Array#shuffle!` (`rb_ary_shuffle_bang`): walk down from the end, swapping
+/// each slot with one drawn from the slots not yet fixed.
+fn shuffle_in_place(a: &mut [Value], g: Gen) {
+    let mut i = a.len();
+    while i > 1 {
+        let j = crate::random::limited(g, i as u64 - 1) as usize;
+        i -= 1;
+        a.swap(i, j);
+    }
+}
+
+/// `Array#sample` (`ary_sample`), transcribed case for case: the up-front
+/// draws for small counts, the order-statistic insertion for up to ten, the
+/// memoized partial shuffle for a sparse pick from a long array, and a partial
+/// Fisher-Yates otherwise. `n` is `None` for the single-element form.
+fn sample_values(arr: &[Value], n: Option<i64>, g: Gen) -> Result<Value, String> {
+    use crate::random::limited;
+    let len = arr.len();
+    let upto = |max: usize| limited(g, max as u64 - 1) as usize;
+    let Some(n) = n else {
+        let i = if len < 2 { 0 } else { upto(len) };
+        return Ok(arr.get(i).cloned().unwrap_or(Value::Undef));
+    };
+    if n < 0 {
+        return Err(raise_exc("ArgumentError", "negative sample number"));
+    }
+    let n = (n as usize).min(len);
+    const SMALL: usize = 10;
+    let rnds: Vec<usize> = if n <= SMALL {
+        (0..n).map(|i| upto(len - i)).collect()
+    } else {
+        Vec::new()
+    };
+    let pick = |idx: &[usize]| new_arr(idx.iter().map(|&i| arr[i].clone()).collect());
+    match n {
+        0 => return Ok(new_arr(Vec::new())),
+        1 => return Ok(pick(&[rnds[0]])),
+        2 => {
+            let (i, mut j) = (rnds[0], rnds[1]);
+            if j >= i {
+                j += 1;
+            }
+            return Ok(pick(&[i, j]));
+        }
+        3 => {
+            let (i, mut j, mut k) = (rnds[0], rnds[1], rnds[2]);
+            let (mut l, mut gt) = (j, i);
+            if j >= i {
+                l = i;
+                j += 1;
+                gt = j;
+            }
+            if k >= l {
+                k += 1;
+                if k >= gt {
+                    k += 1;
+                }
+            }
+            return Ok(pick(&[i, j, k]));
+        }
+        _ => {}
+    }
+    let memo_threshold = if len < 2560 {
+        len / 128
+    } else if len < 5120 {
+        len / 64
+    } else if len < 10240 {
+        len / 32
+    } else {
+        len / 16
+    };
+    if n <= SMALL {
+        let mut sorted: Vec<usize> = vec![rnds[0]];
+        let mut idx: Vec<usize> = vec![rnds[0]];
+        for &r in &rnds[1..] {
+            let mut k = r;
+            let mut j = 0;
+            while j < sorted.len() {
+                if k < sorted[j] {
+                    break;
+                }
+                k += 1;
+                j += 1;
+            }
+            sorted.insert(j, k);
+            idx.push(k);
+        }
+        Ok(pick(&idx))
+    } else if n <= memo_threshold / 2 {
+        let draws: Vec<usize> = (0..n).map(|i| upto(len - i) + i).collect();
+        let mut memo: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut out = Vec::with_capacity(n);
+        for (i, &j) in draws.iter().enumerate() {
+            let i2 = memo.get(&i).copied().unwrap_or(i);
+            let j2 = memo.get(&j).copied().unwrap_or(j);
+            memo.insert(j, i2);
+            out.push(arr[j2].clone());
+        }
+        Ok(new_arr(out))
+    } else {
+        let mut a = arr.to_vec();
+        for i in 0..n {
+            let j = upto(len - i) + i;
+            a.swap(i, j);
+        }
+        a.truncate(n);
+        Ok(new_arr(a))
+    }
 }
 
 /// `Mutex`/`Monitor` instance methods. The lock state is a `__locked` flag on the
@@ -19906,7 +20218,7 @@ fn condvar_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Val
 /// for a name it does not handle.
 fn random_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Value>, String> {
     match name {
-        "rand" => Ok(Some(rand_value(random_advance(recv), args))),
+        "rand" => random_rand(random_gen(Some(recv)), args).map(Some),
         "seed" => Ok(Some(with_host(|h| h.ivar_of(recv, "seed")))),
         _ => Ok(None),
     }
@@ -24863,17 +25175,6 @@ fn repeated_permutations(arr: &[Value], n: i64) -> Vec<Vec<Value>> {
         }
         idx[i] += 1;
     }
-}
-
-/// Fisher–Yates shuffle driven by the shared SplitMix64 PRNG (the one `rand`
-/// and `srand` use), so `srand(n)` makes a shuffle reproducible.
-fn shuffled(arr: &[Value]) -> Vec<Value> {
-    let mut a = arr.to_vec();
-    for i in (1..a.len()).rev() {
-        let j = (rng_next() % (i as u64 + 1)) as usize;
-        a.swap(i, j);
-    }
-    a
 }
 
 fn permute_rec(

@@ -155,6 +155,16 @@ fn next_synth_id() -> u64 {
     SYNTH_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `Encoding::UTF_8`, the expression `__ENCODING__` compiles to.
+fn utf8_encoding_const() -> Expr {
+    Expr::Call {
+        recv: Some(Box::new(Expr::Var(VarKind::Const, "Encoding".into()))),
+        name: "UTF_8".into(),
+        args: Vec::new(),
+        block: None,
+    }
+}
+
 /// How many synthetic ids this process has minted so far. `--build --native`
 /// records it so the standalone binary can start its own counter past every
 /// name baked into the embedded program.
@@ -1205,6 +1215,19 @@ impl Compiler {
             Expr::Var(VarKind::Local, name) if name == "__LINE__" => {
                 b.emit(Op::LoadInt(self.cur_line as i64), 0);
                 return Ok(());
+            }
+            // `__ENCODING__` is the keyword for the source encoding, which is
+            // always UTF-8 here: it reads as the `Encoding::UTF_8` constant.
+            Expr::Call {
+                recv: None,
+                name,
+                args,
+                block: None,
+            } if name == "__ENCODING__" && args.is_empty() => {
+                return self.compile_expr(b, &utf8_encoding_const());
+            }
+            Expr::Var(VarKind::Local, name) if name == "__ENCODING__" => {
+                return self.compile_expr(b, &utf8_encoding_const());
             }
             _ => {}
         }
@@ -3072,15 +3095,31 @@ impl Compiler {
         }
         // Run the class body (`self` = class) once, at definition time. The class
         // ref is loaded by its qualified name directly (a single-candidate const).
+        // A class/module definition evaluates to its body's last statement
+        // (`x = class Foo; 7; end` is 7). When that statement runs in the
+        // deferred body its value is the body call's own result; a trailing
+        // `def` is its name Symbol; anything else compiled statically is nil.
+        let value_from_body = body.last().is_some_and(|s| init_body.last() == Some(s));
         if !init_body.is_empty() {
             self.kstr(b, &qname);
             b.emit(Op::CallBuiltin(ops::GETCONST, 1), 0);
             self.kstr(b, &body_name);
             b.emit(Op::CallBuiltin(ops::CALL_METHOD, 2), self.cur_line);
+            if value_from_body {
+                return Ok(());
+            }
             b.emit(Op::Pop, 0);
         }
-        // A class/module definition evaluates to nil here.
-        b.emit(Op::LoadUndef, 0);
+        match body.last().map(|s| &s.expr) {
+            Some(Expr::Def {
+                name,
+                singleton_recv: None,
+                ..
+            }) => self.compile_expr(b, &Expr::Symbol(name.clone()))?,
+            _ => {
+                b.emit(Op::LoadUndef, 0);
+            }
+        }
         Ok(())
     }
 

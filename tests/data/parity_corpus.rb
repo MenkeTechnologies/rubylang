@@ -1,3 +1,86 @@
+class MM
+  def method_missing(n, *a) = n
+  def respond_to_missing?(*) = true
+  def initialize_copy(o) = nil
+end
+p MM.instance_methods(false), MM.private_instance_methods(false).sort, MM.new.zork
+#==#
+t = {"h" => 1, "e" => 1, "l" => 2, "o" => 1}
+p t.max_by(2) { _2 }, t.min_by(2) { _2 }
+p (1..20).max_by(3) { _1 % 3 }, (1..20).min_by(3) { _1 % 3 }, [1, 1, 2].max_by(2) { 0 }, [3, 1].min_by(5) { _1 }
+#==#
+puts case 2 when 1 then "one" when 2 then "two" end
+p begin 7 end
+class Base; def m(x) = x * 2; end
+class Kid < Base
+  def m(x)
+    p super
+    p super(5)
+    super
+  end
+end
+p Kid.new.m(3)
+#==#
+a = [1, 2, 3]
+p a.map!.with_index { |v, i| v * i }, a
+b = [4, 5, 6, 7]
+p b.select!.with_index { |v, i| i.odd? }, b, b.reject!.each_with_index { |v, i| false }
+c = [1, 2, 3]
+r = c.map! { |x| break :stop if x == 2; x * 10 }
+p r, c
+d = [1, 2, 3, 4]
+r = d.select! { |x| break :early if x == 3; x == 1 }
+p r, d
+p [5, 6].map!, [5, 6].delete_if, [5, 6].reject!, [5, 6].sort_by!
+#==#
+w = %w[a b c d]
+p w.filter_map.with_index { |x, i| x * i if i.odd? }, w.sort_by.with_index { |x, i| -i }
+p w.group_by.with_index { |x, i| i % 2 }, w.partition.with_index { |x, i| i > 1 }
+p w.find.with_index { |x, i| i == 2 }, w.take_while.with_index { |x, i| i < 2 }, w.each_index.to_a
+p [1, 2].filter_map, [1, 2].sort_by, [1, 2].group_by, [1, 2].each_index, [1, 2].min_by(2)
+h = {a: 1, b: 2}
+p h.map, h.each, h.select, h.each_key, h.map.with_index { |(k, v), i| [k, v, i] }
+p h.select.with_index { |(k, v), i| i == 0 }, h.each.with_index(1) { |(k, v), i| }, h.each.next
+#==#
+class Pt
+  def initialize(x, y) = (@x, @y = x, y)
+end
+class Node; attr_accessor :nxt; end
+n = Node.new
+n.nxt = n
+hex = /0x\h{16}/
+p Pt.new(1, "s").inspect.gsub(hex, "X"), Pt.new(1, 2).to_s.gsub(hex, "X"), Object.new.inspect.gsub(hex, "X")
+p n.inspect.gsub(hex, "X"), [Pt.new([1], nil)].inspect.gsub(hex, "X"), Pt.new(1, 2).inspect =~ /\A#<Pt:0x\h{16} @x=1, @y=2>\z/
+#==#
+p __ENCODING__, __ENCODING__ == Encoding::UTF_8
+x = class Foo; 7; end
+y = module Mod; :m; end
+z = class Bar; def hi = 1; end
+p x, y, z, (class Empty; end)
+#==#
+p Integer.sqrt(2**80), Integer.sqrt(10**16 - 1), Integer.sqrt(10**40 + 5), Integer.sqrt(24.9)
+begin
+  Integer.sqrt(-(2**70))
+rescue Math::DomainError => e
+  p e.message
+end
+#==#
+p [[1, 2]].map { "#{_1}-#{_2}" }, %w[a b].map { "<#{it}>" }, [3].map { :"s#{_1}" }
+p [["ab", "b"]].map { /#{_2}/.match?(_1) }, [2].map { "#{[3].map { _1 * 10 }}#{it}" }, [1].map { %W[#{_1} x] }
+#==#
+srand(42)
+p rand(100), rand, rand(1..6), rand(2.5), rand(-7), rand(1.9), rand(5..1), rand(1.0...2.0), rand(3...4)
+r = Random.new(2024)
+p r.rand(1000), r.rand, r.rand(10..20), r.seed, Random.new(2**70).rand(10**30)
+p (1..10).to_a.shuffle(random: Random.new(7)), (1..10).to_a.sample(random: Random.new(7))
+p (1..30).to_a.sample(3, random: Random.new(1)), (1..30).to_a.sample(6, random: Random.new(2)), (1..100).to_a.sample(30, random: Random.new(3))
+p (1..5000).to_a.sample(15, random: Random.new(4)), srand(9) == 42
+begin
+  Random.new(1).rand(0)
+rescue ArgumentError => e
+  p e.message
+end
+#==#
 puts 1 + 2 * 3
 #==#
 puts (1 + 2) * 3
