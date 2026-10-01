@@ -395,8 +395,10 @@ a min above its max and skips a nil bound, `between?` does neither. `extend` / `
 alternation binding, the `deconstruct`/`deconstruct_keys` protocol on user
 objects) plus the one-line forms (`expr => pattern` rightward assignment and
 `expr in pattern` boolean match), reserved-word keyword labels
-(`def f(class:)`), `Date`/`Time`/
-`DateTime`, bare `%(…)` strings, and `__END__` are all implemented. `at_exit`
+(`def f(class:)`), `Date`/`DateTime`, `Time` (an exact Rational instant viewed
+in UTC, the local zone or a fixed offset, with MRI's `strftime`), `Binding`
+(`binding`, `eval(str, b)`, `ERB#result(b)`), output capture through a
+reassigned `$stdout`, bare `%(…)` strings, and `__END__` are all implemented. `at_exit`
 handlers run last-registered first as the program ends (after an uncaught
 exception too), and an exception carries the backtrace its raise unwound
 through, rendered by `full_message(highlight:, order:)` as MRI prints it and
