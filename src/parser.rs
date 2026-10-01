@@ -639,7 +639,9 @@ impl Parser {
             return Ok(e);
         }
         while self.eat_kw("rescue") {
+            // The fallback may itself assign: `c = load rescue c = :none`.
             let handler = self.ternary()?;
+            let handler = self.assign_tail(handler)?;
             e = Expr::Begin {
                 body: vec![e.into()],
                 rescues: vec![Rescue {

@@ -4944,3 +4944,46 @@ p St.new(1, 2).to_h { |k, v| [k.to_s, v * 2] }, Data.define(:x).new(x: 1).to_h {
 rescue TypeError, ArgumentError => e
   p [e.class, e.message]
 end
+#==#
+# A rescue-modifier fallback may itself assign.
+c = Integer("x") rescue c = :none
+a = (raise "q" rescue b = 5)
+x = [1].fetch(9) rescue y = 2
+p c, a, b, x, y
+#==#
+# Kernel#loop answers StopIteration#result: the each value, or what a
+# generator block returned.
+e = [1, 2].each
+p (loop { e.next }), (loop { raise StopIteration }), (loop { e.next; break :early })
+h = {a: 1}.each
+p loop { h.next }
+g = Enumerator.new { |y| y << 1; :done }
+p loop { g.next }
+begin
+  g.next
+rescue StopIteration => ex
+  p ex.result, ex.message
+end
+#==#
+# Binding: locals and self of the captured scope.
+x = 1
+b = binding
+p b.local_variable_get(:x), b.local_variable_defined?(:x), b.local_variable_defined?(:q)
+p b.receiver, b.eval("x + 1"), eval("x * 3", b), b.class
+b.local_variable_set(:x, 9)
+p x
+begin
+  b.local_variable_get(:nope)
+rescue NameError => e
+  p e.name, e.message.include?("local variable 'nope' is not defined for #<Binding")
+end
+def bnd(a) = binding
+bb = bnd(7)
+p bb.local_variables, bb.local_variable_get(:a), bb.receiver
+class Vw
+  def initialize(n) = @n = n
+  def get_binding = (title = "T#{@n}"; binding)
+end
+require "erb"
+p ERB.new("<%= title %>:<%= @n %>").result(Vw.new(3).get_binding)
+[1].each { |z| p local_variables.first(2) }

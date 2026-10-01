@@ -269,6 +269,9 @@ pub enum Derive {
 pub struct GenExt {
     pub fiber: Value,
     pub peeked: Option<Value>,
+    /// What the generator block returned once it finished: the `result` of
+    /// every `StopIteration` that `next` raises from then on.
+    pub result: Value,
 }
 
 /// The payload of an [`RObj::ArithSeq`].
@@ -553,6 +556,11 @@ pub enum RObj {
     /// cannot live inline in this `#[derive(Clone)]` enum, so it sits in the
     /// side table exactly like `procs`/`enum_sinks`/`around_stack`.
     Fiber {
+        id: u32,
+    },
+    /// A `Binding` (`Kernel#binding`): an index into `RubyHost.bindings`, the
+    /// captured `Scope` — which is not `Debug`, so it lives in a side table.
+    Binding {
         id: u32,
     },
     /// A `Thread`. Holds an index into `RubyHost.threads` (the `JoinHandle` +
@@ -1553,6 +1561,8 @@ pub struct RubyHost {
     /// unchanged, while `class_of`/`is_a?`/method resolution report the subclass
     /// so its own methods and `#class` behave like MRI.
     class_overrides: IndexMap<u32, String>,
+    /// The scopes `Kernel#binding` captured, indexed by `RObj::Binding.id`.
+    bindings: Vec<Scope>,
     /// Live `Thread`s, indexed by `RObj::Thread.id`: the OS-thread `JoinHandle`
     /// plus the shared result/done cells the thread body publishes into. Shared
     /// (not thread-local) — a `Thread` object is visible from any thread.
@@ -2079,6 +2089,17 @@ fn is_stop_iteration(_e: &str) -> bool {
     })
 }
 
+/// Run `f` with local access retargeted at the scope a `Binding` captured —
+/// how `Binding#eval`, `#local_variable_get`/`set` and `eval(str, binding)`
+/// see that scope's variables and `self`.
+pub fn in_binding<R>(binding: &Value, f: impl FnOnce() -> R) -> R {
+    let scope = with_host(|h| h.binding_scope(binding));
+    let saved = with_host(|h| std::mem::replace(&mut h.active_scope, scope));
+    let r = f();
+    with_host(|h| h.active_scope = saved);
+    r
+}
+
 pub fn eval_in_place(src: &str) -> Result<Value, String> {
     // Source that does not PARSE is a `SyntaxError`, not a `RuntimeError`. The
     // distinction is not cosmetic: `SyntaxError` is a `ScriptError`, so it is
@@ -2264,6 +2285,7 @@ impl RubyHost {
             user_key_canon: HashMap::new(),
             user_key_reps: HashMap::new(),
             around_stack: Vec::new(),
+            bindings: Vec::new(),
             threads: Vec::new(),
             queues: Vec::new(),
             condvars: Vec::new(),
@@ -2977,6 +2999,7 @@ impl RubyHost {
             *ext = Some(GenExt {
                 fiber,
                 peeked: None,
+                result: Value::Undef,
             });
         }
     }
@@ -2990,6 +3013,18 @@ impl RubyHost {
     pub fn generator_set_peeked(&mut self, v: &Value, val: Option<Value>) {
         if let Some(RObj::Generator { ext: Some(e), .. }) = self.obj_mut(v) {
             e.peeked = val;
+        }
+    }
+    /// Record / read the finished generator block's return value.
+    pub fn generator_set_result(&mut self, v: &Value, result: Value) {
+        if let Some(RObj::Generator { ext: Some(e), .. }) = self.obj_mut(v) {
+            e.result = result;
+        }
+    }
+    pub fn generator_result(&self, v: &Value) -> Value {
+        match self.obj(v) {
+            Some(RObj::Generator { ext: Some(e), .. }) => e.result.clone(),
+            _ => Value::Undef,
         }
     }
     /// A block-less endless `cycle` Enumerator: a `Generator` whose body is a
@@ -4773,6 +4808,49 @@ impl RubyHost {
             .collect()
     }
     /// Read a local, walking the scope chain to enclosing environments.
+    /// `Kernel#binding`: capture the scope local access currently targets.
+    pub fn capture_binding(&mut self) -> Value {
+        let scope = self.cur_scope().clone();
+        self.bindings.push(scope);
+        let id = (self.bindings.len() - 1) as u32;
+        self.alloc(RObj::Binding { id })
+    }
+    /// The scope a `Binding` captured, if `v` is one.
+    pub fn binding_scope(&self, v: &Value) -> Option<Scope> {
+        match self.obj(v) {
+            Some(RObj::Binding { id }) => self.bindings.get(*id as usize).cloned(),
+            _ => None,
+        }
+    }
+    /// The `self` a `Binding` captured (`Binding#receiver`).
+    pub fn binding_receiver(&self, v: &Value) -> Value {
+        self.binding_scope(v)
+            .map(|s| s.self_obj)
+            .unwrap_or(Value::Undef)
+    }
+    /// `Kernel#local_variables`: the user-visible locals of the current scope,
+    /// innermost scope first, each once. Synthetic compiler temporaries (`__…`)
+    /// are not locals of the program.
+    pub fn local_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut env = Some(self.cur_env());
+        while let Some(e) = env {
+            let data = e.lock().unwrap();
+            for name in data.vars.keys() {
+                let user = name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+                    && !name.starts_with("__")
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if user && !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+            env = data.parent.clone();
+        }
+        out
+    }
     pub fn get_local(&self, name: &str) -> Value {
         let mut env = self.cur_env();
         loop {
@@ -7909,6 +7987,7 @@ impl RubyHost {
                     "#<Enumerator::Yielder>".to_string()
                 }
                 Some(RObj::Fiber { .. }) => "#<Fiber (created)>".to_string(),
+                Some(RObj::Binding { .. }) => format!("#<Binding:{}>", self.object_address(v)),
                 Some(RObj::Thread { id }) => {
                     let alive = self
                         .threads
@@ -8347,6 +8426,7 @@ impl RubyHost {
                 Some(RObj::Generator { .. }) => "Enumerator",
                 Some(RObj::Yielder { .. }) | Some(RObj::FiberYielder) => "Enumerator::Yielder",
                 Some(RObj::Fiber { .. }) => "Fiber",
+                Some(RObj::Binding { .. }) => "Binding",
                 Some(RObj::Thread { .. }) => "Thread",
                 Some(RObj::IoHandle { id }) => self
                     .io_handles

@@ -3351,3 +3351,33 @@ nil
 [TypeError, "wrong element type Integer (expected array)"]
 [ArgumentError, "element has wrong array length (expected 2, was 1)"]
 [TypeError, "wrong element type nil (expected array)"]
+#==#
+:none
+5
+5
+2
+2
+#==#
+[1, 2]
+nil
+[1, 2]
+{a: 1}
+:done
+:done
+"iteration reached an end"
+#==#
+1
+true
+false
+main
+2
+3
+Binding
+9
+:nope
+true
+[:a]
+7
+main
+"T3:3"
+[:z, :x]

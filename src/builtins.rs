@@ -1793,6 +1793,7 @@ pub(crate) fn dispatch_by_type(
         "MatchData" => dispatch_matchdata(recv, name, args),
         "Set" => dispatch_set(recv, name, args, block),
         "Time" => dispatch_time(recv, name, args),
+        "Binding" => dispatch_binding(recv, name, args),
         "Date" => dispatch_date(recv, name, args),
         "DateTime" => dispatch_datetime(recv, name, args),
         "Enumerator" => dispatch_enumerator(recv, name, args, block),
@@ -16386,14 +16387,23 @@ fn generator_external_next(recv: &Value, gblock: &Value, advance: bool) -> Resul
             (f, with_host(|h| h.new_fiber_yielder()))
         }
     };
-    let stop = || raise_exc("StopIteration", "iteration reached an end");
+    // The `StopIteration` carries the block's return value as `result`.
+    let stop = || {
+        let result = with_host(|h| h.generator_result(recv));
+        raise_exc_with(
+            "StopIteration",
+            "iteration reached an end",
+            &[("result", result)],
+        )
+    };
     if !crate::host::fiber_alive(&fiber) {
         return Err(stop());
     }
     let v = crate::host::fiber_resume(&fiber, arg)?;
     // The block returned instead of yielding: the sequence is over, and its
-    // return value is not an element.
+    // return value is not an element but the iteration's result.
     if !crate::host::fiber_alive(&fiber) {
+        with_host(|h| h.generator_set_result(recv, v));
         return Err(stop());
     }
     if !advance {
@@ -16670,6 +16680,77 @@ fn time_strftime(
         }
     }
     out
+}
+
+/// `v` when it is a `Binding` (the optional scope argument of `eval` and
+/// `ERB#result`).
+fn binding_arg(v: Option<&Value>) -> Option<&Value> {
+    v.filter(|b| with_host(|h| h.binding_scope(b)).is_some())
+}
+
+/// `Binding` methods: local access and `eval` against the captured scope.
+fn dispatch_binding(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // A variable name argument, checked the way MRI's `check_local_id` does.
+    let var = |i: usize| -> Result<String, String> {
+        let n = args.get(i).map(name_of).unwrap_or_default();
+        let ok = n
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+            && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !ok {
+            let ins = with_host(|h| h.inspect(recv));
+            return Err(raise_exc(
+                "NameError",
+                &format!("wrong local variable name '{n}' for {ins}"),
+            ));
+        }
+        Ok(n)
+    };
+    let defined = |n: &str| {
+        crate::host::in_binding(recv, || with_host(|h| h.local_names()))
+            .iter()
+            .any(|v| v == n)
+    };
+    match name {
+        "local_variable_get" => {
+            let n = var(0)?;
+            if !defined(&n) {
+                let ins = with_host(|h| h.inspect(recv));
+                let sym = with_host(|h| h.new_symbol(&n));
+                return Err(raise_exc_with(
+                    "NameError",
+                    &format!("local variable '{n}' is not defined for {ins}"),
+                    &[("name", sym)],
+                ));
+            }
+            Ok(crate::host::in_binding(recv, || {
+                with_host(|h| h.get_local(&n))
+            }))
+        }
+        "local_variable_set" => {
+            let n = var(0)?;
+            let v = args.get(1).cloned().unwrap_or(Value::Undef);
+            crate::host::in_binding(recv, || with_host(|h| h.set_local(&n, v.clone())));
+            Ok(v)
+        }
+        "local_variable_defined?" => {
+            let n = var(0)?;
+            Ok(Value::Bool(defined(&n)))
+        }
+        "local_variables" => Ok(crate::host::in_binding(recv, || {
+            with_host(|h| {
+                let syms: Vec<Value> = h.local_names().iter().map(|n| h.new_symbol(n)).collect();
+                h.new_array(syms)
+            })
+        })),
+        "receiver" => Ok(with_host(|h| h.binding_receiver(recv))),
+        "eval" => {
+            let src = args.first().map(arg_str).unwrap_or_default();
+            crate::host::in_binding(recv, || crate::host::eval_in_place(&src))
+        }
+        _ => Err(no_method_error(recv, name)),
+    }
 }
 
 /// MRI's `num_exact`: an Integer, Rational or (finite) Float as an exact
@@ -20105,8 +20186,17 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
         // not modeled.)
         "eval" => {
             let src = arg_str(&args[0]);
-            crate::host::eval_in_place(&src)
+            // `eval(str, binding)` runs against that Binding's scope.
+            match binding_arg(args.get(1)) {
+                Some(b) => crate::host::in_binding(b, || crate::host::eval_in_place(&src)),
+                None => crate::host::eval_in_place(&src),
+            }
         }
+        "binding" => Ok(with_host(|h| h.capture_binding())),
+        "local_variables" => Ok(with_host(|h| {
+            let syms: Vec<Value> = h.local_names().iter().map(|n| h.new_symbol(n)).collect();
+            h.new_array(syms)
+        })),
         // `caller` / `caller_locations` — the call stack. A precise live
         // backtrace isn't tracked outside `--dap`, so return a best-effort single
         // frame from the current file. activesupport uses this only for
@@ -20515,13 +20605,15 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
         "loop" => {
             if let Some(b) = &block {
                 loop {
-                    // `Kernel#loop` silently rescues `StopIteration` and stops,
-                    // returning the iterator's result (nil for the common case).
+                    // `Kernel#loop` rescues `StopIteration` and stops, answering
+                    // the exception's `result` (the enumerator's `each` value).
                     if let Err(e) = call_proc(b, &[]) {
                         let exc = with_host(|h| h.take_pending_exc());
-                        let cls = exc.as_ref().and_then(|v| with_host(|h| h.object_class(v)));
-                        if cls.as_deref() == Some("StopIteration") {
-                            return Ok(Value::Undef);
+                        if let Some(x) = exc
+                            .as_ref()
+                            .filter(|x| with_host(|h| h.is_a(x, "StopIteration")))
+                        {
+                            return Ok(with_host(|h| h.ivar_of(x, "result")));
                         }
                         if let Some(v) = exc {
                             with_host(|h| h.set_pending_exc(v));
@@ -23180,9 +23272,8 @@ fn new_str(s: String) -> Value {
 /// can fall through to the generic object dispatch.
 ///
 /// - `result` / `result(binding)` — evaluate the compiled template in the
-///   caller's current scope (its top-level locals, instance variables, and
-///   methods are visible). An explicit `Binding` argument is accepted but not
-///   modeled; evaluation always uses the current scope.
+///   given Binding's scope, or without one in the caller's current scope (its
+///   top-level locals, instance variables, and methods are visible).
 /// - `result_with_hash(hash)` — evaluate in a fresh, isolated scope with the
 ///   hash keys bound as template locals.
 /// - `src` — the generated buffer-building Ruby source (matches MRI's `#src`).
@@ -23192,7 +23283,13 @@ fn erb_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Value>,
         with_host(|h| h.as_str(&v)).unwrap_or_default()
     };
     match name {
-        "result" => Ok(Some(crate::host::eval_in_place(&src())?)),
+        "result" => {
+            let src = src();
+            Ok(Some(match binding_arg(args.first()) {
+                Some(b) => crate::host::in_binding(b, || crate::host::eval_in_place(&src))?,
+                None => crate::host::eval_in_place(&src)?,
+            }))
+        }
         "result_with_hash" => {
             let hash = args
                 .first()

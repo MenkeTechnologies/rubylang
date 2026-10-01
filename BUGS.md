@@ -943,10 +943,15 @@ Honest limitations of this surface:
   but object identity is the heap slot, so it does not survive `dup`/`clone`
   (a shallow copy gets a new id and none of the original's singletons) — matching
   MRI, which also does not copy the singleton class on `dup`.
-- **`eval` binds to the current scope only.** The top-level / current-`self`
-  binding is supported; an explicit `Binding` argument (`eval(str, some_binding)`)
-  is not modeled. String `class_eval`/`instance_eval` rebind `self` but share the
-  caller's local scope.
+- **`Binding`.** `Kernel#binding` captures the current scope (locals and
+  `self`); `Binding#local_variable_get`/`set`/`defined?`, `#local_variables`,
+  `#receiver` and `#eval`, `eval(str, binding)` and `ERB#result(binding)` all run
+  against it. Two differences remain: `local_variables` (and
+  `local_variable_defined?`) list the locals ASSIGNED so far, where MRI lists
+  every local the parser saw in the scope, including ones assigned later; and
+  `local_variable_set` of a new name creates it in the captured scope itself,
+  where MRI keeps it visible only through the Binding. String
+  `class_eval`/`instance_eval` rebind `self` but share the caller's local scope.
 - **A bare `def` is still hoisted globally in addition to registering on an eval
   target.** Because top-level/`in-block` `def`s are hoisted into the method table
   at compile time, a `def` inside `class_eval`/`instance_eval` also leaves a
@@ -1795,12 +1800,11 @@ Honest limitations of this surface:
   does not see or pollute caller state). Trim mode: `"-"` is implemented —
   `-%>` chomps the immediately following newline, `<%-` strips leading blanks on
   its line; `dash_trim` is enabled when the mode string contains `-`. All the
-  above are verified byte-for-byte against MRI (`ruby -rerb`). **Limitations:**
-  (1) an explicit `Binding` argument to `#result` is accepted but not modeled —
-  evaluation always uses the current scope, so `#result(some_other_binding)` does
-  not switch scopes (same limit as the `eval` builtin). Inside a method body,
-  `#result` sees that method's scope rather than a fresh top-level binding, which
-  is broader access than MRI's default `new_toplevel_binding`. (2) The other MRI
+  above are verified byte-for-byte against MRI (`ruby -rerb`). An explicit
+  `Binding` argument to `#result` evaluates in that Binding's scope (its locals
+  and `self`). **Limitations:** (1) without one, inside a method body, `#result`
+  sees that method's scope rather than a fresh top-level binding, which is
+  broader access than MRI's default `new_toplevel_binding`. (2) The other MRI
   trim modes (`">"`, `"<>"`, `"%"`) are not implemented — only `"-"` (and the
   default no-trim). (3) The `%%>` → `%>` escape is not special-cased: `%%>` in
   template text stays literal (which is what MRI 6.x does in text); inside a tag
