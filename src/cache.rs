@@ -25,7 +25,7 @@ use std::path::PathBuf;
 ///
 /// 10 -> 11: a rescue clause carries no `binding`; `=> target` is lowered to an
 /// assignment from `$!` at the head of the clause body instead.
-const SCHEMA: u64 = 11;
+const SCHEMA: u64 = 12;
 
 /// The outer, rkyv-archived shard: the [`build_stamp`] of the binary that wrote
 /// it, then a flat list of (key, bincode-blob) entries.
@@ -53,6 +53,7 @@ type CMethod = (
     Vec<String>,
     Option<String>,
     Option<String>,
+    u16,
     u16,
     u16,
     Vec<String>,
@@ -355,13 +356,14 @@ fn m_to(name: &str, m: &MethodDef) -> CMethod {
         m.blockparam.clone(),
         m.req,
         m.opt,
+        m.post,
         m.kwreq.clone(),
         (*m.chunk).clone(),
         m.slot_params,
     )
 }
 fn m_from(
-    (name, params, splat, kwparams, kwsplat, blockparam, req, opt, kwreq, chunk, slot_params): CMethod,
+    (name, params, splat, kwparams, kwsplat, blockparam, req, opt, post, kwreq, chunk, slot_params): CMethod,
 ) -> (String, MethodDef) {
     (
         name,
@@ -374,6 +376,7 @@ fn m_from(
             blockparam,
             req,
             opt,
+            post,
             kwreq,
             chunk: std::sync::Arc::new(chunk),
             slot_params,

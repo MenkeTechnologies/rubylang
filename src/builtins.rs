@@ -1375,6 +1375,12 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
             None => Value::Undef,
         }));
     }
+    // A top-level `define_method` is main's own singleton method, which
+    // defines a public instance method of Object (MRI `top_define_method`).
+    if name == "define_method" && crate::host::is_main(&this) {
+        let object = with_host(|h| h.class_ref("Object"));
+        return dispatch(&object, "define_method", args, block);
+    }
     if let Some(cls) = with_host(|h| h.classref_name(&this)) {
         // `define_method(:name) { ... }` in a class body registers an instance
         // method whose body is the block.
@@ -2276,6 +2282,12 @@ pub(crate) fn dispatch(
         // `BasicObject#!`: the negated truthiness of the receiver.
         "!" if args.is_empty() => {
             return Ok(Value::Bool(!with_host(|h| h.truthy(recv))));
+        }
+        // `self.define_method` at the top level: main's singleton method, which
+        // defines a public instance method of Object.
+        "define_method" if crate::host::is_main(recv) => {
+            let object = with_host(|h| h.class_ref("Object"));
+            return dispatch(&object, "define_method", args, block);
         }
         "clone" => {
             // `clone` carries the frozen flag over (unlike `dup`), unless

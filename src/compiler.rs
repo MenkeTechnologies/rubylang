@@ -1158,6 +1158,15 @@ impl Compiler {
             .iter()
             .filter(|p| !p.keyword && !p.kwsplat && !p.block && !p.splat && p.default.is_some())
             .count() as u16;
+        // The required params after the last optional one / the `*rest`.
+        let positional: Vec<_> = params
+            .iter()
+            .filter(|p| !p.keyword && !p.kwsplat && !p.block)
+            .collect();
+        let post = positional
+            .iter()
+            .rposition(|p| p.splat || p.default.is_some())
+            .map_or(0, |last| positional.len() - last - 1) as u16;
         let kwreq: Vec<String> = params
             .iter()
             .filter(|p| p.keyword && p.default.is_none())
@@ -1172,6 +1181,7 @@ impl Compiler {
             blockparam,
             req,
             opt,
+            post,
             kwreq,
             chunk: Arc::new(b.build()),
             slot_params: n_slot_params,
@@ -3155,6 +3165,7 @@ impl Compiler {
             blockparam: None,
             req: 0,
             opt: 0,
+            post: 0,
             kwreq: vec![],
             chunk: Arc::new(b.build()),
             slot_params: 0,
@@ -3179,6 +3190,7 @@ impl Compiler {
             blockparam: None,
             req: 1,
             opt: 0,
+            post: 0,
             kwreq: vec![],
             chunk: Arc::new(b.build()),
             slot_params: 0,

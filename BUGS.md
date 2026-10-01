@@ -732,6 +732,13 @@ keeps both.
   keywords, and `unknown keyword(s): :z` / `missing keyword(s): :x`. (Previously
   a short call silently left the parameter unbound, so the body ran with a stray
   nil.)
+- **Positional parameters bind in MRI's order.** Leading required params take
+  the first arguments and trailing required params (`d` in `def m(a, b = 1, d)`
+  or `def m(a, *r, d)`) the last ones; the optional params take what is left,
+  left to right, and only the surplus reaches a `*rest`. `Method#parameters`
+  reports the same layout. A block's keyword params take only a hash passed AS
+  keywords and are not a positional slot, so they neither trigger auto-splat
+  nor shift a `*rest`'s trailing params.
 - **Lambda arity is enforced too.** A block template now carries the parameter
   shape as written (`req`/`opt`/keyword names/required keywords/`**rest`/`&blk`),
   so a lambda — `->`, `lambda { }`, a `define_method` body, `Method#to_proc` —

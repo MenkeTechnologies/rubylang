@@ -1210,6 +1210,11 @@ pub struct MethodDef {
     /// an `attr_*` accessor fills these in the same way a `def` does.
     pub req: u16,
     pub opt: u16,
+    /// How many of the `req` params come AFTER the optional ones / the `*rest`
+    /// (`d` in `def m(a, b = 1, d)`), which bind from the END of the argument
+    /// list. Ruby fixes the order — required, optional, `*rest`, required — so
+    /// this and `opt` place every positional parameter.
+    pub post: u16,
     pub kwreq: Vec<String>,
     /// The compiled body, SHARED. Every method lookup (`find_method_owner` and
     /// the six resolvers around it) hands back an owned `MethodDef`, so a bare
@@ -1232,6 +1237,26 @@ pub struct MethodDef {
     /// the dispatcher seeds those slots with the call's positional args before
     /// running the chunk. 0 = every param is host-bound as usual.
     pub slot_params: u16,
+}
+
+/// Where a signature's positional parameters sit. Ruby fixes their order —
+/// leading required, optional, `*rest`, trailing required — so the splat's
+/// index, the optional count and the trailing-required count place them all.
+#[derive(Clone, Copy)]
+pub struct PositionalShape {
+    pub splat: Option<usize>,
+    pub opt: usize,
+    pub post: usize,
+}
+
+impl MethodDef {
+    pub fn positional_shape(&self) -> PositionalShape {
+        PositionalShape {
+            splat: self.splat,
+            opt: self.opt as usize,
+            post: self.post as usize,
+        }
+    }
 }
 
 /// What a `Method`/`UnboundMethod` name resolved to, and the module that owns
@@ -2517,9 +2542,34 @@ impl RubyHost {
     /// existing entries, but the idiom (and the only caller that matters — the
     /// Journey GTG builder) sets it on a fresh empty hash, so subsequent inserts
     /// pick up identity keying via `hash_key`.
+    /// `compare_by_identity`: the hash is rehashed, so every entry already in
+    /// it is keyed by its key object's identity from now on, as MRI's
+    /// `rb_hash_compare_by_id` rebuilds the table.
     pub fn set_hash_by_identity(&mut self, v: &Value) {
-        if let Some(RObj::Hash { by_identity, .. }) = self.obj_mut(v) {
+        let Some(RObj::Hash { map, .. }) = self.obj(v).cloned() else {
+            return;
+        };
+        let mut rekeyed = IndexMap::new();
+        for (k, val) in map {
+            let key_obj = self.key_to_value(&k);
+            rekeyed.insert(self.identity_key(&key_obj), val);
+        }
+        if let Some(RObj::Hash {
+            map, by_identity, ..
+        }) = self.obj_mut(v)
+        {
+            *map = rekeyed;
             *by_identity = true;
+        }
+    }
+    /// The key a `compare_by_identity` hash files `v` under: the heap object
+    /// itself, except for values that are unique by value anyway (immediates
+    /// and Symbols), which keep their ordinary key.
+    fn identity_key(&self, v: &Value) -> RKey {
+        match (v, self.obj(v)) {
+            (_, Some(RObj::Symbol(_))) => self.to_key(v),
+            (Value::Obj(i), _) => RKey::Identity(*i),
+            _ => self.to_key(v),
         }
     }
     /// Whether a hash is in `compare_by_identity` mode.
@@ -2611,9 +2661,7 @@ impl RubyHost {
     /// Build a Hash key for `v` against the receiver hash's identity mode.
     pub fn hash_key(&self, recv: &Value, v: &Value) -> RKey {
         if self.hash_is_by_identity(recv) {
-            if let Value::Obj(i) = v {
-                return RKey::Identity(*i);
-            }
+            return self.identity_key(v);
         }
         self.to_key(v)
     }
@@ -4126,8 +4174,7 @@ impl RubyHost {
         match self.resolve_method_shape(recv, name, unbound) {
             Some(MethodShape::Def { def, .. }) => written_params(
                 &def.params,
-                def.splat,
-                def.opt as usize,
+                def.positional_shape(),
                 &def.kwparams,
                 &def.kwreq,
                 def.kwsplat.as_deref(),
@@ -4143,8 +4190,13 @@ impl RubyHost {
                 };
                 written_params(
                     positional,
-                    p.splat,
-                    p.arity.opt as usize,
+                    // A block template does not record trailing required
+                    // params; its optionals are taken to end at the last one.
+                    PositionalShape {
+                        splat: p.splat,
+                        opt: p.arity.opt as usize,
+                        post: 0,
+                    },
                     &p.arity.kwnames,
                     &p.arity.kwreq,
                     p.arity.kwsplat.as_deref(),
@@ -4198,8 +4250,13 @@ impl RubyHost {
                 };
                 let mut out = written_params(
                     positional,
-                    p.splat,
-                    p.arity.opt as usize,
+                    // A block template does not record trailing required
+                    // params; its optionals are taken to end at the last one.
+                    PositionalShape {
+                        splat: p.splat,
+                        opt: p.arity.opt as usize,
+                        post: 0,
+                    },
                     &p.arity.kwnames,
                     &p.arity.kwreq,
                     p.arity.kwsplat.as_deref(),
@@ -7144,7 +7201,7 @@ impl RubyHost {
     pub fn bind_params(
         &mut self,
         params: &[String],
-        splat: Option<usize>,
+        shape: PositionalShape,
         kwparams: &[String],
         kwsplat: Option<&str>,
         args: &[Value],
@@ -7167,35 +7224,43 @@ impl RubyHost {
             (args, None)
         };
 
+        // MRI's `setup_parameters_complex` order: the leading required params
+        // take the first arguments and the trailing (post) required params the
+        // last ones; the optional params take what is left over, left to
+        // right, and only then does a `*rest` collect the surplus. An optional
+        // param left without an argument stays unbound for its default.
+        let PositionalShape { splat, opt, post } = shape;
         let mut locals = IndexMap::new();
-        match splat {
-            None => {
-                for (i, p) in params.iter().enumerate() {
-                    if let Some(v) = positional.get(i) {
-                        locals.insert(p.clone(), v.clone());
-                    }
-                }
+        let n = positional.len();
+        let named = params.len() - splat.is_some() as usize;
+        let post = post.min(named);
+        let opt = opt.min(named - post);
+        let pre = named - post - opt;
+        let opt_given = n.saturating_sub(pre + post).min(opt);
+        let tail_start = n.saturating_sub(post).max(pre + opt_given);
+        let positional_params: Vec<&String> = params
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != splat)
+            .map(|(_, p)| p)
+            .collect();
+        for (i, p) in positional_params.iter().enumerate() {
+            let arg = if i < pre + opt {
+                (i < pre + opt_given).then(|| positional.get(i)).flatten()
+            } else {
+                positional.get(tail_start + (i - pre - opt))
+            };
+            if let Some(v) = arg {
+                locals.insert((*p).clone(), v.clone());
             }
-            Some(si) => {
-                let after = params.len() - si - 1;
-                for (i, p) in params.iter().take(si).enumerate() {
-                    if let Some(v) = positional.get(i) {
-                        locals.insert(p.clone(), v.clone());
-                    }
-                }
-                let splat_end = positional.len().saturating_sub(after).max(si);
-                let rest: Vec<Value> = positional
-                    .get(si..splat_end)
-                    .map(|s| s.to_vec())
-                    .unwrap_or_default();
-                let arr = self.new_array(rest);
-                locals.insert(params[si].clone(), arr);
-                for (j, p) in params.iter().skip(si + 1).enumerate() {
-                    if let Some(v) = positional.get(splat_end + j) {
-                        locals.insert(p.clone(), v.clone());
-                    }
-                }
-            }
+        }
+        if let Some(si) = splat {
+            let rest: Vec<Value> = positional
+                .get(pre + opt_given..tail_start)
+                .map(|s| s.to_vec())
+                .unwrap_or_default();
+            let arr = self.new_array(rest);
+            locals.insert(params[si].clone(), arr);
         }
         // Bind keyword params from the keyword hash; omitted ones stay unbound so
         // the method prologue can apply their default (a required keyword left
@@ -9711,23 +9776,26 @@ fn as_int(v: &Value) -> Option<i64> {
 /// desugared away (a block's, which the parser rewrites into a capture param).
 fn written_params(
     params: &[String],
-    splat: Option<usize>,
-    opt: usize,
+    shape: PositionalShape,
     kwnames: &[String],
     kwreq: &[String],
     kwsplat: Option<&str>,
     blockparam: Option<&str>,
 ) -> Vec<(&'static str, Option<String>)> {
+    let PositionalShape { splat, opt, post } = shape;
     let mut out: Vec<(&'static str, Option<String>)> = Vec::new();
-    let pre = splat.unwrap_or(params.len());
+    // The optional params sit right before the `*rest`, or, without one,
+    // right before the `post` trailing required params.
+    let opt_end = splat.unwrap_or(params.len().saturating_sub(post));
+    let opt_start = opt_end.saturating_sub(opt);
     for (i, p) in params.iter().enumerate() {
         let name = p.trim_start_matches('*').to_string();
         let kind = if Some(i) == splat {
             "rest"
-        } else if i < pre.saturating_sub(opt) || i > pre {
-            "req"
-        } else {
+        } else if (opt_start..opt_end).contains(&i) {
             "opt"
+        } else {
+            "req"
         };
         // A DESTRUCTURING parameter — `->(a, (b, c)) {}` — has no written name.
         // The parser gives it a synthetic one to bind against, and MRI reports
@@ -10587,7 +10655,7 @@ fn run_method(
     let saved_active = with_host(|h| {
         let mut binding = h.bind_params(
             &def.params,
-            def.splat,
+            def.positional_shape(),
             &def.kwparams,
             def.kwsplat.as_deref(),
             args,
@@ -12891,7 +12959,21 @@ pub fn call_proc_self_ctx(
     // array argument — `pairs.each { |k, v| … }`, and also `{ |first, *rest| … }`.
     // A lone `*rest` (one slot) does not auto-splat. A lambda never auto-splats:
     // `[[1,2]].map(&->(x, y){ … })` raises in MRI rather than unpacking the pair.
-    let bound: Vec<Value> = if !strict && def.params.len() > 1 && args.len() == 1 {
+    //
+    // Keyword params were desugared into a trailing `__blockkw` capture (see
+    // the parser's `desugar_block_kwargs`). It is not a positional slot: it
+    // takes the call's keyword hash, and only a hash passed AS keywords — a
+    // positional `{k: 2}` stays positional, as in MRI — and it neither counts
+    // toward auto-splatting nor shifts where a `*rest`'s trailing params bind.
+    let kw_cap = def.params.last().is_some_and(|p| p == "__blockkw");
+    let (args, kwhash) = match args.last() {
+        Some(last) if kw_cap && with_host(|h| h.is_kwargs(last)) => {
+            (&args[..args.len() - 1], last.clone())
+        }
+        _ => (args, Value::Undef),
+    };
+    let params = &def.params[..def.params.len() - kw_cap as usize];
+    let bound: Vec<Value> = if !strict && params.len() > 1 && args.len() == 1 {
         match with_host(|h| h.as_array(&args[0])) {
             Some(items) => items,
             None => args.to_vec(),
@@ -12904,9 +12986,16 @@ pub fn call_proc_self_ctx(
     // params are block-local while enclosing variables stay read/writable — and a
     // closure created inside keeps this env alive (via `Rc`) after the block ends.
     let child = child_env(scope.locals.clone());
+    if kw_cap {
+        child
+            .lock()
+            .unwrap()
+            .vars
+            .insert("__blockkw".to_string(), kwhash);
+    }
     match def.splat {
         None => {
-            for (i, p) in def.params.iter().enumerate() {
+            for (i, p) in params.iter().enumerate() {
                 child
                     .lock()
                     .unwrap()
@@ -12917,8 +13006,8 @@ pub fn call_proc_self_ctx(
         Some(si) => {
             // Params before the splat bind positionally; the splat collects the
             // middle; params after it bind from the end.
-            let after = def.params.len() - si - 1;
-            for (i, p) in def.params.iter().take(si).enumerate() {
+            let after = params.len() - si - 1;
+            for (i, p) in params.iter().take(si).enumerate() {
                 let v = bound.get(i).cloned().unwrap_or(Value::Undef);
                 child.lock().unwrap().vars.insert(p.clone(), v);
             }
@@ -12928,12 +13017,8 @@ pub fn call_proc_self_ctx(
                 .map(|s| s.to_vec())
                 .unwrap_or_default();
             let arr = with_host(|h| h.new_array(rest));
-            child
-                .lock()
-                .unwrap()
-                .vars
-                .insert(def.params[si].clone(), arr);
-            for (j, p) in def.params.iter().skip(si + 1).enumerate() {
+            child.lock().unwrap().vars.insert(params[si].clone(), arr);
+            for (j, p) in params.iter().skip(si + 1).enumerate() {
                 let v = bound.get(splat_end + j).cloned().unwrap_or(Value::Undef);
                 child.lock().unwrap().vars.insert(p.clone(), v);
             }

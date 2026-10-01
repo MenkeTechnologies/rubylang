@@ -4862,3 +4862,43 @@ p Set[Time.utc(2000)].include?(Time.utc(2000)), (Set[Time.utc(2000)] | Set[Time.
 require "date"
 dt = DateTime.new(2024, 1, 2, 3, 4, 5).to_time
 p dt, dt.utc?, dt.zone, dt.utc_offset
+#==#
+# Required params after the optional ones bind from the END of the arguments;
+# the optionals take what is left, left to right, before a *rest does.
+def po1(a, b = 5, d) = [a, b, d]
+def po2(a, b = a * 2, *c, d) = [a, b, c, d]
+def po3(a, b = 1, c = 2, d, e) = [a, b, c, d, e]
+def po4(b = 1, c = 2, *r, d, e:, **k) = [b, c, r, d, e, k]
+p po1(1, 2), po1(1, 2, 3), po2(1, 2), po2(1, 2, 3), po2(1, 2, 3, 4, 5)
+p po3(1, 2, 3), po3(1, 2, 3, 4), po3(1, 2, 3, 4, 5), po4(9, e: 1), po4(1, 2, 3, 4, 5, e: 0, z: 1)
+p method(:po1).parameters, method(:po3).parameters, method(:po3).arity, method(:po4).parameters
+#==#
+# A block's keyword params take only a hash passed AS keywords, and do not
+# count as a positional slot for auto-splat or a *rest's trailing params.
+pr = proc { |a, k: 1| [a, k] }
+p pr.call(1, {k: 2}), pr.call(1, k: 3), pr.call([1, {k: 4}]), pr.call(1), pr.call
+pr2 = proc { |a, *d, e: 5, **o| [a, d, e, o] }
+p pr2.call(1, 4), pr2.call(1, 4, e: 6, z: 1), pr2.call([1, 2, 3])
+pr3 = proc { |a, (b, c), *d, e: 5| [a, b, c, d, e] }
+p pr3.call(1, [2, 3], 4), pr3.(1)
+[[1, 2]].each { |a, b, k: 0| p [a, b, k] }
+def yk = yield(1, 2, k: 3)
+yk { |a, b, k:| p [a, b, k] }
+yk { |*a, **kw| p [a, kw] }
+#==#
+# compare_by_identity rehashes the entries already present; Symbols and
+# immediates are their own identity.
+h = {a: 1, "k" => 2, 3 => 4, nil => 5}
+h.compare_by_identity
+p h[:a], h.values_at(:a), h.key?(:a), h.fetch(:a), h["k"], h[3], h[nil], h, h.keys
+g = {}.compare_by_identity
+s = "x"
+g[s] = 1
+g["x"] = 2
+g[:sym] = 3
+p g[s], g["x"], g[:sym], g, g.size
+#==#
+# A top-level define_method defines a public method of Object.
+define_method(:tdm) { |a, k: 0| [a, k] }
+self.define_method(:tdm2) { 9 }
+p tdm(1, k: 2), tdm(1), tdm2, Object.public_method_defined?(:tdm), Object.new.tdm(4)
