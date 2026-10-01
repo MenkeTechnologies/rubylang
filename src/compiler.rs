@@ -2375,9 +2375,19 @@ impl Compiler {
         self.compile_assign(b, &subj, subject)?;
         b.emit(Op::Pop, 0);
 
+        // A single-pattern match (one `in`, no `else`; `subj => pat` too)
+        // records why it failed, for MRI's `NoMatchingPatternError` message.
+        let reason =
+            (clauses.len() == 1 && els.is_none()).then(|| format!("__pmreason{}__", self.tmp));
+        if let Some(var) = &reason {
+            self.compile_assign(b, &Expr::Var(VarKind::Local, var.clone()), &Expr::Nil)?;
+            b.emit(Op::Pop, 0);
+        }
         let mut end_jumps = Vec::new();
         for clause in clauses {
+            PM_REASON.with(|r| *r.borrow_mut() = reason.clone());
             let (test, binds) = lower_pattern(&clause.pattern, &subj);
+            PM_REASON.with(|r| *r.borrow_mut() = None);
             // Pattern test: on failure, skip to the next clause (`JumpIfFalse`
             // consumes the condition).
             self.compile_cond(b, &test)?;
@@ -2389,7 +2399,16 @@ impl Compiler {
             }
             // A guard runs after binding; failing it also falls through.
             let guard_next = if let Some(g) = &clause.guard {
-                self.compile_cond(b, g)?;
+                let g = match &reason {
+                    Some(var) => {
+                        PM_REASON.with(|r| *r.borrow_mut() = Some(var.clone()));
+                        let checked = pm_check(g.clone(), "guard", vec![]);
+                        PM_REASON.with(|r| *r.borrow_mut() = None);
+                        checked
+                    }
+                    None => g.clone(),
+                };
+                self.compile_cond(b, &g)?;
                 Some(b.emit(Op::JumpIfFalse(0), 0))
             } else {
                 None
@@ -2408,7 +2427,15 @@ impl Compiler {
             Some(body) => self.compile_seq(b, body)?,
             None => {
                 self.compile_expr(b, &subj)?;
-                b.emit(Op::CallBuiltin(ops::NO_MATCH, 1), 0);
+                match &reason {
+                    Some(var) => {
+                        self.compile_expr(b, &Expr::Var(VarKind::Local, var.clone()))?;
+                        b.emit(Op::CallBuiltin(ops::NO_MATCH, 2), 0);
+                    }
+                    None => {
+                        b.emit(Op::CallBuiltin(ops::NO_MATCH, 1), 0);
+                    }
+                }
             }
         }
         let end = b.current_pos();
@@ -3477,6 +3504,43 @@ fn pand(a: Expr, b: Expr) -> Expr {
     Expr::Binary(BinOp::And, Box::new(a), Box::new(b))
 }
 
+thread_local! {
+    /// While a SINGLE-pattern `case/in` (one `in`, no `else` — which includes
+    /// `subj => pattern`) is being lowered: the hidden local each failing check
+    /// records its reason in, for the `NoMatchingPatternError` message MRI
+    /// builds for exactly that form (compile.c's `single_pattern`).
+    static PM_REASON: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `test`, which in a single-pattern match also records `[kind, *details]` as
+/// the reason when it fails: `test || ((reason = [...]) && false)`. Outside
+/// one it is `test` itself.
+fn pm_check(test: Expr, kind: &str, details: Vec<Expr>) -> Expr {
+    let Some(var) = PM_REASON.with(|r| r.borrow().clone()) else {
+        return test;
+    };
+    let mut items = vec![Expr::Symbol(kind.to_string())];
+    items.extend(details);
+    let record = Expr::Assign(
+        Box::new(Expr::Var(VarKind::Local, var)),
+        Box::new(Expr::Array(items)),
+    );
+    Expr::Binary(
+        BinOp::Or,
+        Box::new(test),
+        Box::new(pand(record, Expr::False)),
+    )
+}
+
+/// `pattern === subj`, reported as `P === S does not return true`.
+fn eqq_check(pattern: &Expr, subj: &Expr) -> Expr {
+    pm_check(
+        pcall(pattern.clone(), "===", vec![subj.clone()]),
+        "eqq",
+        vec![pattern.clone(), subj.clone()],
+    )
+}
+
 /// The element `subj[i]` (a negative `i` counts from the end).
 fn pindex(subj: &Expr, i: i64) -> Expr {
     Expr::Index(Box::new(subj.clone()), vec![Expr::Int(i)])
@@ -3504,12 +3568,10 @@ static FIND_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 fn lower_pattern(pat: &Pattern, subj: &Expr) -> (Expr, Vec<Expr>) {
     match pat {
         // `in 5` / `in 1..10` / `in Integer` — case-equality (`pattern === subj`).
-        Pattern::Value(v) => (pcall(v.clone(), "===", vec![subj.clone()]), vec![]),
-        // `in ^x` — pinned value, matched with `==`.
-        Pattern::Pin(e) => (
-            Expr::Binary(BinOp::Eq, Box::new(subj.clone()), Box::new(e.clone())),
-            vec![],
-        ),
+        Pattern::Value(v) => (eqq_check(v, subj), vec![]),
+        // `in ^x` — a pinned value, matched with `===` like any value pattern
+        // (`in ^range` covers, `in ^klass` tests membership).
+        Pattern::Pin(e) => (eqq_check(e, subj), vec![]),
         Pattern::Bind(name) if name == "_" => (Expr::True, vec![]),
         Pattern::Bind(name) => (
             Expr::True,
@@ -3519,20 +3581,12 @@ fn lower_pattern(pat: &Pattern, subj: &Expr) -> (Expr, Vec<Expr>) {
             )],
         ),
         Pattern::Const(name, None) => (
-            pcall(
-                Expr::Var(VarKind::Const, name.clone()),
-                "===",
-                vec![subj.clone()],
-            ),
+            eqq_check(&Expr::Var(VarKind::Const, name.clone()), subj),
             vec![],
         ),
         // `Const[...]` / `Const(...)` — class check plus a deconstructed match.
         Pattern::Const(name, Some(inner)) => {
-            let type_test = pcall(
-                Expr::Var(VarKind::Const, name.clone()),
-                "===",
-                vec![subj.clone()],
-            );
+            let type_test = eqq_check(&Expr::Var(VarKind::Const, name.clone()), subj);
             // A hash-form inner pattern (`Point(x:, y:)`) reads `deconstruct_keys`
             // off the subject itself; an array form reads `deconstruct`.
             let (t, binds) = match inner.as_ref() {
@@ -3583,10 +3637,14 @@ fn lower_array_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
     // index below reads `d`, never the raw subject.
     let uid = FIND_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let d = Expr::Var(VarKind::Local, format!("__decon{uid}__"));
-    let gate = pcall(
-        subj.clone(),
-        "respond_to?",
-        vec![Expr::Symbol("deconstruct".into())],
+    let gate = pm_check(
+        pcall(
+            subj.clone(),
+            "respond_to?",
+            vec![Expr::Symbol("deconstruct".into())],
+        ),
+        "deconstruct",
+        vec![subj.clone()],
     );
     let assign_d = Expr::Assign(
         Box::new(d.clone()),
@@ -3602,10 +3660,18 @@ fn lower_array_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
             // Exact length, then element-wise.
             test = pand(
                 test,
-                Expr::Binary(
-                    BinOp::Eq,
-                    Box::new(len()),
-                    Box::new(Expr::Int(elems.len() as i64)),
+                pm_check(
+                    Expr::Binary(
+                        BinOp::Eq,
+                        Box::new(len()),
+                        Box::new(Expr::Int(elems.len() as i64)),
+                    ),
+                    "length",
+                    vec![
+                        d.clone(),
+                        len(),
+                        Expr::Str(vec![StrPart::Lit(elems.len().to_string())]),
+                    ],
                 ),
             );
             for (i, p) in elems.iter().enumerate() {
@@ -3620,7 +3686,15 @@ fn lower_array_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
             let min = (pre.len() + post.len()) as i64;
             test = pand(
                 test,
-                Expr::Binary(BinOp::Ge, Box::new(len()), Box::new(Expr::Int(min))),
+                pm_check(
+                    Expr::Binary(BinOp::Ge, Box::new(len()), Box::new(Expr::Int(min))),
+                    "length",
+                    vec![
+                        d.clone(),
+                        len(),
+                        Expr::Str(vec![StrPart::Lit(format!("{min}+"))]),
+                    ],
+                ),
             );
             for (i, p) in pre.iter().enumerate() {
                 let (t, bs) = lower_pattern(p, &pindex(&d, i as i64));
@@ -3677,12 +3751,16 @@ fn lower_find_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
     let len = || pcall(d.clone(), "length", vec![]);
 
     // Predicate over a candidate start `s`: every middle matches at `d[s+j]`.
+    // A candidate that fails is not a failure of the match, so the middles
+    // record no reason; only the scan coming up empty does.
+    let reason = PM_REASON.with(|r| r.borrow_mut().take());
     let pred = mids
         .iter()
         .enumerate()
         .map(|(j, m)| lower_pattern(m, &pindex_expr(&d, padd(s.clone(), j as i64))).0)
         .reduce(pand)
         .unwrap_or(Expr::True);
+    PM_REASON.with(|r| *r.borrow_mut() = reason);
 
     // idx = nil
     // (0..(len - k)).each { |s| idx = s if idx.nil? && pred }
@@ -3721,16 +3799,31 @@ fn lower_find_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
     // Find patterns match any object responding to `deconstruct`; the gate
     // short-circuits and the deconstructed array is bound once to `d` before the
     // scan runs.
-    let gate = pcall(
-        subj.clone(),
-        "respond_to?",
-        vec![Expr::Symbol("deconstruct".into())],
+    let gate = pm_check(
+        pcall(
+            subj.clone(),
+            "respond_to?",
+            vec![Expr::Symbol("deconstruct".into())],
+        ),
+        "deconstruct",
+        vec![subj.clone()],
     );
     let assign_d = Expr::Assign(
         Box::new(d.clone()),
         Box::new(pcall(subj.clone(), "deconstruct", vec![])),
     );
-    let test = pand(gate, pand(assign_d, found));
+    let found = pm_check(found, "find", vec![d.clone()]);
+    // Too short to hold the middles at all is a length mismatch, as in MRI.
+    let long_enough = pm_check(
+        Expr::Binary(BinOp::Ge, Box::new(len()), Box::new(Expr::Int(k))),
+        "length",
+        vec![
+            d.clone(),
+            len(),
+            Expr::Str(vec![StrPart::Lit(format!("{k}+"))]),
+        ],
+    );
+    let test = pand(gate, pand(assign_d, pand(long_enough, found)));
 
     // Bindings run once `idx` holds the first matching start position.
     let mut binds = Vec::new();
@@ -3774,10 +3867,14 @@ fn lower_hash_pattern(
     } else {
         Expr::Nil
     };
-    let gate = pcall(
-        subj.clone(),
-        "respond_to?",
-        vec![Expr::Symbol("deconstruct_keys".into())],
+    let gate = pm_check(
+        pcall(
+            subj.clone(),
+            "respond_to?",
+            vec![Expr::Symbol("deconstruct_keys".into())],
+        ),
+        "deconstruct_keys",
+        vec![subj.clone()],
     );
     let assign_dh = Expr::Assign(
         Box::new(dh.clone()),
@@ -3789,7 +3886,11 @@ fn lower_hash_pattern(
         let at = Expr::Index(Box::new(dh.clone()), vec![Expr::Symbol(key.clone())]);
         test = pand(
             test,
-            pcall(dh.clone(), "key?", vec![Expr::Symbol(key.clone())]),
+            pm_check(
+                pcall(dh.clone(), "key?", vec![Expr::Symbol(key.clone())]),
+                "key",
+                vec![Expr::Symbol(key.clone()), dh.clone()],
+            ),
         );
         match sub {
             None => binds.push(Expr::Assign(
@@ -3819,12 +3920,23 @@ fn lower_hash_pattern(
     let exact =
         matches!(rest, HashRest::Nil) || (matches!(rest, HashRest::None) && pairs.is_empty());
     if exact {
+        // `**nil` reports the leftover keys; a bare `{}` the whole hash.
+        let (kind, detail) = if pairs.is_empty() {
+            ("empty", dh.clone())
+        } else {
+            let keys = pairs.iter().map(|(k, _)| Expr::Symbol(k.clone())).collect();
+            ("rest", pcall(dh.clone(), "except", keys))
+        };
         test = pand(
             test,
-            Expr::Binary(
-                BinOp::Eq,
-                Box::new(pcall(dh.clone(), "length", vec![])),
-                Box::new(Expr::Int(pairs.len() as i64)),
+            pm_check(
+                Expr::Binary(
+                    BinOp::Eq,
+                    Box::new(pcall(dh.clone(), "length", vec![])),
+                    Box::new(Expr::Int(pairs.len() as i64)),
+                ),
+                kind,
+                vec![detail],
             ),
         );
     }

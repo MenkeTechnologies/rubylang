@@ -204,8 +204,7 @@ Four failure shapes turned up, and only the first is the obvious one:
 Remaining measured gaps in this family, all left deliberately: the frame name in
 a diagnostic (`in 'Kernel#require'` vs `in '<main>'`), already listed above --
 the line-0 bug beside it is now fixed; `ENV`'s address-bearing receiver phrase; `Module.new`'s
-`#<Module:0x…>` address; `NoMatchingPatternError` omitting which clause failed
-and why (`99: 1 === 99 does not return true`); MRI's `Socket::ResolutionError`
+`#<Module:0x…>` address; MRI's `Socket::ResolutionError`
 class and its `getaddrinfo` wording; `Zlib::GzipFile::Error`; and MRI's
 multi-line Prism syntax-error rendering.
 
@@ -1867,33 +1866,17 @@ Honest limitations of this surface:
   `deconstruct_keys` honours a requested-key filter (returning only the named
   members, in the requested order) or all members when passed `nil`.
 
-  **What a failed match REPORTS is thinner than MRI's.** The class is right
-  (`NoMatchingPatternError`) and so is the matchee, but the message is the
-  matchee alone where MRI appends the specific check that failed, and there is no
-  `NoMatchingPatternKeyError` subclass:
-
-  ```console
-  $ /opt/homebrew/opt/ruby/bin/ruby -e 'case 9; in String then 1; end'
-  9: String === 9 does not return true (NoMatchingPatternError)
-  $ /opt/homebrew/opt/ruby/bin/ruby -e '{a: 1} => {b:}'
-  {a: 1}: key not found: :b (NoMatchingPatternKeyError)
-  ```
-
-  rubylang reports `9` and `{a: 1}`. MRI's detail is one of six forms —
-  `<pat> === <val> does not return true`, `guard clause does not return true`,
-  `<val> length mismatch (given N, expected M)`, `does not respond to
-  #deconstruct`, `does not respond to #deconstruct_keys`, and `key not found:
-  :k` — and it appears ONLY when the `case` has a single `in` clause; with two or
-  more, MRI also reports the matchee alone.
-
-  This is not a message-formatting gap. `lower_pattern` compiles a pattern to a
-  boolean expression tree (`pcall(v, "===", [subj])` and friends) that the
-  compiler tests with `JumpIfFalse`, so at the point of failure nothing knows
-  WHICH sub-check said no — the information is not merely unformatted, it is
-  never produced. Reporting it means giving the lowering a failure-reason
-  channel, which also has to survive alternatives (`|`) and nesting. The same
-  channel is what `NoMatchingPatternKeyError` needs, since a missing key and a
-  present-but-non-matching value are the same `false` today.
+  **A failed single-pattern match says why, as MRI's does.** With one `in`
+  clause and no `else` (and for `subj => pattern`), each check the lowering
+  emits also records why it failed in a hidden local, which the raise reads:
+  `<pat> === <val> does not return true`, `<val> length mismatch (given N,
+  expected M)` / `expected M+`, `does not respond to #deconstruct` /
+  `#deconstruct_keys`, `does not match to find pattern`, `rest of {…} is not
+  empty`, `{…} is not empty`, `guard clause does not return true`, and a
+  missing hash key raises `NoMatchingPatternKeyError` (`key not found: :k`)
+  carrying `key` and `matchee`. With two or more clauses the message is the
+  matchee alone, as in MRI. `in ^x` matches with `===`, like any value
+  pattern, so a pinned Range or Class tests coverage / membership.
 
 ## `min(n)` / `max(n)` tie order past 7 survivors
 

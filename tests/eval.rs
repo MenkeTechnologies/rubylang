@@ -2578,12 +2578,13 @@ fn pattern_matching_case_in() {
         "case [1, 2]; in [Integer, Integer] => pair; pair; end",
         "[1, 2]",
     );
-    // No matching clause and no else raises.
-    // rubylang names the unmatched VALUE; MRI adds which clause failed and why
-    // (`99: 1 === 99 does not return true`). Pinned to what rubylang really
-    // says so the class is checked and a change here has to be deliberate; the
-    // missing detail is a measured gap, not a passing test.
-    raises("case 99; in 1; :x; end", "NoMatchingPatternError", "99");
+    // No matching clause and no else raises. A single-pattern match names the
+    // unmatched value and why its pattern failed, as MRI's message does.
+    raises(
+        "case 99; in 1; :x; end",
+        "NoMatchingPatternError",
+        "99: 1 === 99 does not return true",
+    );
 }
 
 #[test]
@@ -3710,11 +3711,10 @@ fn find_pattern_two_sided() {
     eq("case [1, 2, 3, 4]; in [*, x, y, *]; [x, y]; end", "[1, 2]");
     eq("case [1, 2, 2, 3]; in [*, 2 => x, *]; x; end", "2");
     // Empty / too-short array does not match a find pattern.
-    // MRI: `[]: [] length mismatch (given 0, expected 1+)` — same gap as above.
     raises(
         "case []; in [*, x, *]; x; end",
         "NoMatchingPatternError",
-        "[]",
+        "[]: [] length mismatch (given 0, expected 1+)",
     );
 }
 
@@ -5700,9 +5700,12 @@ fn one_line_pattern_matching() {
          config => {db: {host:, port:}}; [host, port]",
         "[\"x\", 5]",
     );
-    // A non-matching `=>` raises NoMatchingPatternError.
-    // MRI: `1: String === 1 does not return true` — same gap as above.
-    raises("1 => String", "NoMatchingPatternError", "1");
+    // A non-matching `=>` raises NoMatchingPatternError, saying why.
+    raises(
+        "1 => String",
+        "NoMatchingPatternError",
+        "1: String === 1 does not return true",
+    );
     // The `=>` inside a hash literal stays a pair separator (no regression).
     eq("{1 => 2, 3 => 4}", "{1 => 2, 3 => 4}");
     eq("({:a => 1, :b => 2})", "{a: 1, b: 2}");

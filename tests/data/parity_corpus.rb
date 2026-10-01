@@ -4987,3 +4987,28 @@ end
 require "erb"
 p ERB.new("<%= title %>:<%= @n %>").result(Vw.new(3).get_binding)
 [1].each { |z| p local_variables.first(2) }
+#==#
+# A single-pattern match that fails says why; a missing key raises
+# NoMatchingPatternKeyError. `in ^x` matches with ===.
+srcs = ['99 => String', 'case 99; in String then 1; in Symbol then 2; end', '[1, 2] => [a]',
+        '{a: 1} => {b:}', '5 => String | Symbol', '[1, 2] => [*, 3, *]', '[1] => [*, 1, 2, *]',
+        '{a: 1, b: 2} => {a: 1, **nil}', '5 => [x]', '5 => {a:}', '[1, [2, 3]] => [_, [_, String]]',
+        '{a: {b: 1}} => {a: {b: String}}', '[1, 2, 3] => [_, *, 4]', '[1] => [_, _, *]',
+        'x = 1; 2 => ^x', 'nil => Integer => n', 'case 5; in Integer if false; end',
+        'case 5; in x unless true; end', '{a: 1} => {}', '[{a: 1}] => [{b:}]', '[1] => []',
+        'x = (1..3); 5 => ^x', 'Struct.new(:x).new(1) => {x: String}']
+srcs.each do |s|
+  eval(s)
+rescue NoMatchingPatternKeyError => e
+  p [e.class, e.message, e.key, e.matchee]
+rescue NoMatchingPatternError => e
+  p [e.class, e.message]
+end
+r = (1..10)
+c = Integer
+case 5
+in ^r then p :pinrange
+end
+case 3
+in ^c then p :pinclass
+end

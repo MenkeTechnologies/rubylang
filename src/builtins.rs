@@ -413,11 +413,55 @@ fn pop_n(vm: &mut VM, n: usize) -> Vec<Value> {
     v
 }
 
-/// `case/in` fell through with no matching clause and no `else`.
-fn b_no_match(vm: &mut VM, _: u8) -> Value {
+/// `case/in` fell through with no matching clause and no `else`. A
+/// single-pattern match also passes the `[kind, *details]` reason its failing
+/// check recorded, which MRI appends to the message (and a missing hash key
+/// raises `NoMatchingPatternKeyError` carrying `key` and `matchee`).
+fn b_no_match(vm: &mut VM, argc: u8) -> Value {
+    let reason = if argc == 2 {
+        with_host(|h| h.as_array(&vm.pop()))
+    } else {
+        None
+    };
     let subj = vm.pop();
-    let msg = with_host(|h| h.inspect(&subj));
-    let e = raise_exc("NoMatchingPatternError", &msg);
+    let insp = |v: &Value| with_host(|h| h.inspect(v));
+    let mut msg = insp(&subj);
+    let mut class = "NoMatchingPatternError";
+    let mut fields = Vec::new();
+    if let Some(r) = reason.filter(|r| !r.is_empty()) {
+        let kind = with_host(|h| h.as_symbol(&r[0])).unwrap_or_default();
+        let arg = |i: usize| r.get(i).cloned().unwrap_or(Value::Undef);
+        let why = match kind.as_str() {
+            "eqq" => format!(
+                "{} === {} does not return true",
+                insp(&arg(1)),
+                insp(&arg(2))
+            ),
+            "length" => format!(
+                "{} length mismatch (given {}, expected {})",
+                insp(&arg(1)),
+                insp(&arg(2)),
+                with_host(|h| h.to_s(&arg(3)))
+            ),
+            "deconstruct" | "deconstruct_keys" => {
+                format!("{} does not respond to #{kind}", insp(&arg(1)))
+            }
+            "key" => {
+                class = "NoMatchingPatternKeyError";
+                fields = vec![("key", arg(1)), ("matchee", arg(2))];
+                format!("key not found: {}", insp(&arg(1)))
+            }
+            "rest" => format!("rest of {} is not empty", insp(&arg(1))),
+            "empty" => format!("{} is not empty", insp(&arg(1))),
+            "find" => format!("{} does not match to find pattern", insp(&arg(1))),
+            "guard" => "guard clause does not return true".to_string(),
+            _ => String::new(),
+        };
+        if !why.is_empty() {
+            msg = format!("{msg}: {why}");
+        }
+    }
+    let e = raise_exc_with(class, &msg, &fields);
     abort(vm, e)
 }
 
@@ -2673,6 +2717,17 @@ pub(crate) fn dispatch(
                         &[sym, include_private],
                         None,
                     );
+                }
+                // An exception's built-in surface (`message`, `full_message`,
+                // `KeyError#key`, …) is native, so no table above lists it; the
+                // reference interpreter's own table does. Kernel's module
+                // functions in it are private on an instance and do not count.
+                if with_host(|h| h.is_exception_class(&cls)) {
+                    if let Some(owner) = with_host(|h| h.builtin_owner(recv, &m)) {
+                        if !(owner == "Kernel" && is_kernel_function(&m)) {
+                            return Ok(Value::Bool(true));
+                        }
+                    }
                 }
                 // A method a BUILT-IN mixin provides is not in the class's own
                 // table, so nothing above finds it — `include Comparable` made
@@ -5413,6 +5468,9 @@ fn dispatch_object(
         // joined to the list above: `value` is a name any exception could
         // plausibly define, and only this one answers it in MRI.
         "tag" | "value" if cls == "UncaughtThrowError" => Ok(with_host(|h| h.ivar_of(recv, name))),
+        // `NoMatchingPatternKeyError#matchee`: the hash the missing key was
+        // looked up in.
+        "matchee" if cls == "NoMatchingPatternKeyError" => Ok(with_host(|h| h.ivar_of(recv, name))),
         // `NoMethodError#args` — the arguments the missing call was given. MRI
         // answers an empty Array, never nil, so a caller can splat it.
         "args" if with_host(|h| h.is_exception_class(cls)) => {
