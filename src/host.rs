@@ -5500,6 +5500,10 @@ impl RubyHost {
                 names.extend(m.keys().cloned());
             }
         }
+        // A class body that runs a block is stored as a synthetic
+        // `__class_body__N` class method; like every `__`-prefixed internal
+        // name it is excluded, as `instance_method_names_vis` excludes it.
+        names.retain(|n| !n.starts_with("__"));
         names.sort();
         names.dedup();
         names
@@ -6510,12 +6514,12 @@ impl RubyHost {
         if let Some(sc) = self.superclass_of(name) {
             return Some(sc);
         }
-        // Otherwise the first non-module ancestor after `name`.
-        let modules = ["Kernel", "Comparable", "Enumerable"];
+        // Otherwise the first ancestor after `name` that is not a module —
+        // built-in (`Kernel`, `Comparable`) or user-defined (`include G`).
         self.class_ancestry(name)
             .into_iter()
             .skip(1)
-            .find(|a| !modules.contains(&a.as_str()))
+            .find(|a| !self.is_module_name(a))
             .or_else(|| {
                 // A user class with no explicit superclass inherits from Object.
                 if self.classes.contains_key(name) {
@@ -6854,6 +6858,8 @@ impl RubyHost {
     /// deduplicated, keeping the first (nearest) occurrence.
     /// Ruby makes a handful of hook methods private by definition, so they never
     /// appear in `instance_methods`/`public_methods` however they were declared.
+    /// This is MRI's `rb_method_entry_make` list exactly: `method_missing` is NOT
+    /// on it, so a `def method_missing` is public (only `BasicObject`'s is private).
     const PRIVATE_HOOKS: &[&str] = &[
         "initialize",
         "initialize_copy",
@@ -6982,7 +6988,13 @@ impl RubyHost {
                 return Visibility::Public;
             }
         }
-        Visibility::Public
+        // Nothing user-defined answers it: the built-in. `BasicObject#method_missing`
+        // is private, so `Object.new.method_missing(:x)` is refused as private.
+        if method == "method_missing" {
+            Visibility::Private
+        } else {
+            Visibility::Public
+        }
     }
 
     /// Record `vis` for `class`'s entry `method` (`private :m`, `public :m`, and

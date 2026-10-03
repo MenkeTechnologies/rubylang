@@ -5071,3 +5071,68 @@ ensure
 end
 p capture_out { puts "in"; print 1, 2 }
 puts "back"
+#==#
+# ── Proc/Method/Symbol#to_proc composition with any callable (proc_compose_to_*) ──
+class Hundred; def call(x) = x * 100; end
+f = ->(x) { x + 1 }
+m = 2.method(:+)
+p (f >> Hundred.new).(1), (f << Hundred.new).(1), (m >> f).(1), (m << f).(1), (m >> Hundred.new).(1)
+p (proc { |x| x } >> f).lambda?, (proc { |x| x } << f).lambda?, (f << proc { |x| x }).lambda?
+p (m >> f).lambda?, (m << proc { |x| x }).lambda?, (proc { |x| x } << m).lambda?
+u = :upcase.to_proc
+p u.lambda?, u.arity, (u >> :reverse.to_proc).("ab"), (u << ->(x) { x * 2 }).("a")
+p((f >> 5 rescue $!), (m << nil rescue $!))
+#==#
+# ── superclass skips user modules; anonymous classes are classes, not metaclasses ──
+module Mixed; end
+class WithMixin; include Mixed; end
+class Below < WithMixin; end
+p WithMixin.superclass, Below.superclass, WithMixin.ancestors.take(3)
+anon = Class.new(StandardError)
+p anon.ancestors.take(3) == [anon, StandardError, Exception], anon.singleton_class?
+begin; raise anon, "m"; rescue => e; p [e.message, e.class == anon]; end
+begin; raise Class.new(KeyError), "k"; rescue IndexError => e; p e.message; end
+#==#
+# ── a user method_missing is public; BasicObject's stays private ──
+class Ghost; def method_missing(m, *a) = [m, a]; def respond_to_missing?(*) = true; end
+p Ghost.new.method_missing(:zz, 1), Ghost.public_method_defined?(:method_missing)
+p Ghost.instance_methods(false), Ghost.private_instance_methods(false)
+p((Object.new.method_missing(:x) rescue $!.message))
+#==#
+# ── singleton_methods lists no synthetic class-body entry ──
+class SingOrder
+  def self.b = 1
+  [1].each { }
+  def self.a = 2
+  class << self; attr_accessor :c; end
+end
+o = Object.new
+def o.z = 1
+def o.y = 2
+p SingOrder.singleton_methods.sort, o.singleton_methods.sort
+#==#
+# ── any?/all?/none?/one? with a pattern, and without a block ──
+p [nil, 1].all?, [false].all?, [].all?, [1, "a"].all?(Integer), [1, 2].all?(1..2)
+p [1, 2].any?(2..3), [1, 2].any?(String), [nil].any?, [nil].none?, [1, 2].none?(3), [1, 2].none?(2)
+p [1, nil].one?, [1, 1].one?, [1, 2].one?(1), %w[ab cd].one?(/a/), %w[ab cd].all?(/\w/)
+p (1..3).all?(Integer), (1..3).none?(5), {a: 1}.any?([:a, 1]), {a: 1}.all?(Array)
+#==#
+# ── short-circuiting Enumerable over an infinite generator / endless range ──
+g = Enumerator.new { |y| a = 0; loop { y << a; a += 1 } }
+p g.take_while { _1 < 5 }, g.find { _1 > 5 }, g.include?(4), g.any? { _1 > 3 }, g.any?(3)
+p g.all? { _1 < 3 }, g.none? { _1 > 3 }, g.one?(2..3), g.find_index(3), g.find_index { _1 > 2 }
+p g.each { |x| break x if x > 3 }, g.each_with_index { |x, i| break [x, i] if x > 3 }
+p g.each_slice(2) { |s| break s if s[0] > 2 }, g.each_cons(3) { |s| break s if s[0] > 2 }
+p g.find(-> { :none }) { _1 > 2 }, g.lazy.take_while { _1 < 3 }.to_a, g.each_slice(2).find { _1[0] > 3 }
+p (1..).find { _1 > 3 }, (1..).take_while { _1 < 3 }, (1..).find_index(3), (1..).any?(5), (1..).member?(4)
+p (1..).each_with_index { |x, i| break i if x > 3 }, (1..).each_slice(2).find { _1[0] > 3 }
+#==#
+# ── the streamed walk interleaves the generator with the block, once ──
+log = []
+g = Enumerator.new { |y| 3.times { |i| log << "g#{i}"; y << i }; log << "end"; :r }
+p g.each { |x| log << "b#{x}" }, log
+log.clear; p g.find { |x| log << "f#{x}"; x == 1 }, log
+log.clear; p g.lazy.map { log << "m#{_1}"; _1 }.first(2), log
+e = Enumerator.new { |y| y << 1; y.yield 2, 3; y << [4, 5]; :done }
+p e.take_while { |a| true }, e.find_index { |a, b| b == 3 }, e.any? { |a, b| b == 3 }
+p e.include?([2, 3]), e.each_with_index { |x, i| }, e.each_with_object([]) { |x, m| m << x }

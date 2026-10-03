@@ -843,6 +843,11 @@ Implemented and verified against the reference `ruby`:
     own class methods and extends, not a superclass's), else `undefined
     singleton method 'x' for '<inspect>'`. Pinned by
     `tests/eval.rs::public_method_singleton_method_and_included_modules`.
+  - **`Method#super_method` is not implemented.** A `Method` stores only its
+    receiver and name, and calling it re-dispatches from the receiver's class,
+    so there is no way to express "the next definition after this owner". It
+    raises `undefined method 'super_method'` where MRI answers the overridden
+    method (or nil). Needs a lookup-start class carried on the Method object.
   - **`Object#singleton_class` — on a class or module.** A CLASS or module
     answers its metaclass, and that chain is exact: it interleaves each
     `#<Class:X>` with the modules X was `extend`ed with, walks the superclass
@@ -1399,9 +1404,10 @@ Honest limitations of this surface:
   element on its own, so its state is a counter at most; `uniq` has to remember
   the keys it has already emitted. That seen-set belongs to the PULL, not to the
   stored op — the op is shared by every pull of the same pipeline, so
-  accumulating there makes the second `to_a` of one pipeline answer empty — and
-  it has to be reset again inside the generator re-drive loop, which replays the
-  source from the start in growing batches. Keys go through the same
+  accumulating there makes the second `to_a` of one pipeline answer empty. A
+  generator source is stepped once, one element at a time on a fiber, so the
+  body runs its side effects once each, interleaved with the stages' blocks, and
+  `take_while` over an endless generator stops instead of re-driving it. Keys go through the same
   `hash`/`eql?` key `Array#uniq` and Hash keys use, so `1` and `1.0` stay
   distinct; a block supplies the key while the ORIGINAL element is what passes
   through. Still missing on `Enumerator::Lazy`, though the arity table declares
@@ -1519,9 +1525,15 @@ Honest limitations of this surface:
   growing batches and reshapes it on demand, so `gen.each_slice(2).first(2)`
   draws four elements instead of hanging. An endless Range (`(1..)`,
   `(1..Float::INFINITY)`) gets the same treatment through a native counting
-  generator, where it used to raise `RangeError`. A call WITH a block, or one
-  that genuinely needs every element (`sort`, `sum`, `to_a`), still materializes
-  and so still runs forever on an infinite source — exactly as MRI does.
+  generator, where it used to raise `RangeError`. The Enumerable methods that
+  can stop before the source ends — `each`/`each_entry`/`each_with_index`/
+  `each_with_object`/`each_slice`/`each_cons` with a block (ended by `break`),
+  `find`/`detect`, `find_index`, `take_while`, `include?`/`member?`, and
+  `any?`/`all?`/`none?`/`one?` — pull a generator or an endless Range ONE
+  element at a time and run the block as each arrives, so they answer where MRI
+  answers instead of materializing first. A call that genuinely needs every
+  element (`sort`, `sum`, `to_a`, `map` with a block) still runs forever on an
+  infinite source — exactly as MRI does.
 - **Hash through Enumerable.** MRI derives Hash's Enumerable surface from
   `Hash#each`, and `each` yields the whole `[k, v]` pair as ONE value
   (`hash.c` `each_pair_i`) — so a one-parameter block sees the pair, not the key.

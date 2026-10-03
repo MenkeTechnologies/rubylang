@@ -12118,65 +12118,32 @@ fn dispatch_array(
                 .collect();
             Ok(new_arr(cols))
         }
-        "any?" => {
-            if let Some(b) = &block {
-                for x in &arr {
-                    let r = call_proc(b, std::slice::from_ref(x))?;
-                    if with_host(|h| h.truthy(&r)) {
-                        return Ok(Value::Bool(true));
-                    }
-                }
-                Ok(Value::Bool(false))
-            } else {
-                Ok(Value::Bool(arr.iter().any(|x| with_host(|h| h.truthy(x)))))
-            }
-        }
-        "all?" => {
-            if let Some(b) = &block {
-                for x in &arr {
-                    let r = call_proc(b, std::slice::from_ref(x))?;
-                    if !with_host(|h| h.truthy(&r)) {
-                        return Ok(Value::Bool(false));
-                    }
-                }
-            }
-            Ok(Value::Bool(true))
-        }
-        "none?" => {
-            if let Some(b) = &block {
-                for x in &arr {
-                    let r = call_proc(b, std::slice::from_ref(x))?;
-                    if with_host(|h| h.truthy(&r)) {
-                        return Ok(Value::Bool(false));
-                    }
-                }
-            } else {
-                for x in &arr {
-                    if with_host(|h| h.truthy(x)) {
-                        return Ok(Value::Bool(false));
-                    }
-                }
-            }
-            Ok(Value::Bool(true))
-        }
-        // `one?` — exactly one element is truthy (or yields truthy under a block).
-        "one?" => {
-            let mut n = 0usize;
+        // MRI's `enum_any`/`enum_all`/`enum_none`/`enum_one`: each element is
+        // tested by the PATTERN (`pattern === x`) when one is given, else by the
+        // block, else by its own truthiness — and the walk stops at the first
+        // element that decides the answer.
+        "any?" | "all?" | "none?" | "one?" => {
+            let mut hits = 0usize;
             for x in &arr {
-                let hit = if let Some(b) = &block {
-                    let r = call_proc(b, std::slice::from_ref(x))?;
-                    with_host(|h| h.truthy(&r))
-                } else {
-                    with_host(|h| h.truthy(x))
-                };
-                if hit {
-                    n += 1;
-                    if n > 1 {
-                        return Ok(Value::Bool(false));
+                let hit = predicate_hit(x, args, block.as_ref())?;
+                match name {
+                    "any?" if hit => return Ok(Value::Bool(true)),
+                    "all?" if !hit => return Ok(Value::Bool(false)),
+                    "none?" if hit => return Ok(Value::Bool(false)),
+                    "one?" if hit => {
+                        hits += 1;
+                        if hits > 1 {
+                            return Ok(Value::Bool(false));
+                        }
                     }
+                    _ => {}
                 }
             }
-            Ok(Value::Bool(n == 1))
+            Ok(Value::Bool(match name {
+                "any?" => false,
+                "one?" => hits == 1,
+                _ => true,
+            }))
         }
         "count" => {
             if let Some(b) = &block {
@@ -13808,47 +13775,25 @@ fn lazy_pull(
             lazy_flush(ops, &mut state, 0, &mut out, limit)?;
         }
     } else if let Some(gblock) = with_host(|h| h.generator_block(source)) {
-        // A generator source: drive it in growing raw-value batches, feeding
-        // each value through the pipeline, until it yields `limit` outputs or the
-        // generator is exhausted. Re-driving re-runs the (pure) block from the
-        // start. A pipeline that never reaches `limit` over an infinite generator
+        // A generator source is stepped one element at a time on a fiber, so
+        // the pipeline decides when to stop: `take_while`/`first(n)` end the
+        // pull, an infinite generator is never materialized, and the body's
+        // side effects happen once each, interleaved with the stages' blocks,
+        // as in MRI. A pipeline that never stops over an infinite generator
         // (e.g. `.select { false }.first(1)`) loops forever, matching MRI.
-        let mut raw_bound = limit.saturating_mul(2).max(16);
-        loop {
-            out.clear();
-            for (op, st) in ops.iter().zip(state.iter_mut()) {
-                *st = match op {
-                    LazyOp::Take(n) => LazyState::Take(*n),
-                    LazyOp::Drop(n) => LazyState::Drop(*n),
-                    LazyOp::DropWhile(_) => LazyState::Dropping(true),
-                    LazyOp::Zip(_) => LazyState::Zip(0),
-                    // Must be cleared like the rest: this loop replays the
-                    // generator from the start, so a seen-set carried over from
-                    // the previous, shorter drive would suppress every element.
-                    LazyOp::Uniq(_) => LazyState::Uniq(std::collections::HashSet::new()),
-                    LazyOp::WithIndex(off) => LazyState::Counter(off.unwrap_or(0)),
-                    LazyOp::EachSlice(_) | LazyOp::EachCons(_) | LazyOp::ChunkWhile(_, _) => {
-                        LazyState::Buffer(Vec::new())
-                    }
-                    _ => LazyState::None,
-                };
-            }
-            let raws = drive_generator(&gblock, raw_bound)?;
-            let produced = raws.len();
-            let mut stopped = false;
-            for elem in raws {
-                if !lazy_feed(ops, &mut state, 0, elem, &mut out, limit)? {
-                    stopped = true;
-                    break;
-                }
-            }
-            if produced < raw_bound && !stopped {
-                lazy_flush(ops, &mut state, 0, &mut out, limit)?;
-            }
-            if out.len() >= limit || produced < raw_bound || stopped {
+        let mut src = Stream::generator(&gblock);
+        let mut exhausted = false;
+        while out.len() < limit {
+            let Some(elem) = src.pull()? else {
+                exhausted = true;
+                break;
+            };
+            if !lazy_feed(ops, &mut state, 0, elem, &mut out, limit)? {
                 break;
             }
-            raw_bound = raw_bound.saturating_mul(2);
+        }
+        if exhausted {
+            lazy_flush(ops, &mut state, 0, &mut out, limit)?;
         }
     }
     Ok(out)
@@ -14380,6 +14325,18 @@ fn dispatch_enumerator(
     }
 }
 
+/// One element's verdict for `any?`/`all?`/`none?`/`one?`: `pattern === x` when
+/// a pattern argument is given (it takes precedence over a block, as in MRI),
+/// else the block's answer, else the element's own truthiness.
+fn predicate_hit(x: &Value, args: &[Value], block: Option<&Value>) -> Result<bool, String> {
+    let r = match (args.first(), block) {
+        (Some(pat), _) => dispatch(pat, "===", std::slice::from_ref(x), None)?,
+        (None, Some(b)) => call_proc(b, std::slice::from_ref(x))?,
+        (None, None) => x.clone(),
+    };
+    Ok(with_host(|h| h.truthy(&r)))
+}
+
 /// The native `Enumerator::Yielder` handed to a generator block as `|y|`.
 /// `<<`/`yield` push into the yielder's collector; hitting the drive's `limit`
 /// raises a break signal that unwinds the generator body (bounding infinite
@@ -14594,7 +14551,9 @@ fn derive_kind(name: &str, args: &[Value]) -> Option<Derive> {
         "each" | "each_entry" | "to_enum" | "enum_for" | "map" | "collect" | "select"
         | "filter" | "find_all" | "reject" | "filter_map" | "flat_map" | "collect_concat"
         | "take_while" | "drop_while" | "sort_by" | "min_by" | "max_by" | "group_by"
-        | "partition" | "find" | "detect" | "find_index" | "each_index" => Derive::Each,
+        | "partition" | "find" | "detect" | "each_index" => Derive::Each,
+        // `find_index(value)` searches; only the bare form is an Enumerator.
+        "find_index" if args.is_empty() => Derive::Each,
         "each_slice" => Derive::Slice(as_i(args.first()?).max(1) as usize),
         "each_cons" => Derive::Cons(as_i(args.first()?).max(1) as usize),
         "each_with_index" => Derive::WithIndex(0),
@@ -16481,6 +16440,220 @@ fn generator_external_next(recv: &Value, gblock: &Value, advance: bool) -> Resul
     Ok(v)
 }
 
+/// An element source pulled ONE value at a time, for the consumers that may
+/// stop early: a generator body stepped on a private fiber (so its side effects
+/// interleave with the block's exactly as MRI's internal iteration does), or the
+/// integers of an endless Range.
+enum Stream {
+    Gen {
+        fiber: Value,
+        started: bool,
+        /// What the generator body evaluated to, once it has returned.
+        result: Option<Value>,
+    },
+    Count(i64),
+}
+
+impl Stream {
+    fn generator(gblock: &Value) -> Self {
+        Stream::Gen {
+            fiber: crate::host::new_fiber(gblock.clone()),
+            started: false,
+            result: None,
+        }
+    }
+
+    /// The next element, or `None` once the source has ended.
+    fn pull(&mut self) -> Result<Option<Value>, String> {
+        match self {
+            Stream::Count(i) => {
+                let v = Value::Int(*i);
+                *i += 1;
+                Ok(Some(v))
+            }
+            Stream::Gen {
+                result: Some(_), ..
+            } => Ok(None),
+            Stream::Gen {
+                fiber,
+                started,
+                result,
+            } => {
+                // The first resume carries the yielder that becomes `|y|`.
+                let arg = if *started {
+                    Value::Undef
+                } else {
+                    *started = true;
+                    with_host(|h| h.new_fiber_yielder())
+                };
+                let v = crate::host::fiber_resume(fiber, arg)?;
+                if crate::host::fiber_alive(fiber) {
+                    Ok(Some(v))
+                } else {
+                    *result = Some(v);
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
+/// Whether [`stream_consume`] answers `name` called with these arguments: the
+/// Enumerable methods that can stop before the source ends, in the forms that
+/// do not answer an Enumerator.
+fn is_stream_consumer(name: &str, args: &[Value], block: bool) -> bool {
+    match name {
+        "each" | "each_entry" | "find" | "detect" | "take_while" | "each_with_index"
+        | "each_with_object" | "each_slice" | "each_cons" => block,
+        "find_index" => block || args.len() == 1,
+        "include?" | "member?" => args.len() == 1,
+        "any?" | "all?" | "none?" | "one?" => true,
+        _ => false,
+    }
+}
+
+/// MRI's `enum.c` walk for an [`is_stream_consumer`] method over a source that
+/// may never end (`Enumerator.new { loop { y << … } }`, `(1..)`). Elements are
+/// pulled one at a time and the block runs on each as it arrives, so the walk
+/// stops exactly where MRI's does — at the deciding element, or at a `break` —
+/// instead of materializing the source first and hanging on an infinite one.
+///
+/// A `y.yield a, b` element arrives packed; the methods whose block MRI hands
+/// the yielded values (`each`, `take_while`, `find_index`, the predicates) get
+/// them spread, the rest (`find`, `each_with_index`, `each_slice`, …) the pack.
+/// `each` answers what the generator body evaluated to (and so does
+/// `Enumerator#each_with_index`), the other iterators their receiver (or the
+/// memo), as MRI does.
+fn stream_consume(
+    recv: &Value,
+    mut src: Stream,
+    name: &str,
+    args: &[Value],
+    block: Option<&Value>,
+) -> Result<Value, String> {
+    let spread = matches!(
+        name,
+        "each" | "take_while" | "find_index" | "any?" | "all?" | "none?" | "one?"
+    );
+    let call = |b: &Value, x: &Value| -> Result<Value, String> {
+        match with_host(|h| h.as_array(x)).filter(|_| spread && with_host(|h| h.is_multi_yield(x)))
+        {
+            Some(vals) => call_proc(b, &vals),
+            None => call_proc(b, std::slice::from_ref(x)),
+        }
+    };
+    let truthy = |v: &Value| with_host(|h| h.truthy(v));
+    let mut kept: Vec<Value> = Vec::new();
+    let mut index: i64 = 0;
+    let mut hits = 0usize;
+    while let Some(x) = src.pull()? {
+        let decided = match name {
+            "each" | "each_entry" => {
+                block.map(|b| call(b, &x)).transpose()?;
+                None
+            }
+            "each_with_index" => {
+                block
+                    .map(|b| call_proc(b, &[x.clone(), Value::Int(index)]))
+                    .transpose()?;
+                None
+            }
+            "each_with_object" => {
+                block
+                    .map(|b| call_proc(b, &[x.clone(), args[0].clone()]))
+                    .transpose()?;
+                None
+            }
+            "each_slice" | "each_cons" => {
+                let n = as_i(&args[0]).max(1) as usize;
+                kept.push(x.clone());
+                if kept.len() == n {
+                    let group = new_arr(kept.clone());
+                    if name == "each_slice" {
+                        kept.clear();
+                    } else {
+                        kept.remove(0);
+                    }
+                    block.map(|b| call_proc(b, &[group])).transpose()?;
+                }
+                None
+            }
+            "find" | "detect" => {
+                let r = call(block.unwrap(), &x)?;
+                truthy(&r).then_some(x)
+            }
+            "find_index" => {
+                let hit = match block.filter(|_| args.is_empty()) {
+                    Some(b) => truthy(&call(b, &x)?),
+                    None => with_host(|h| h.rb_equal(&x, &args[0])),
+                };
+                hit.then_some(Value::Int(index))
+            }
+            "take_while" => {
+                if truthy(&call(block.unwrap(), &x)?) {
+                    kept.push(x);
+                    None
+                } else {
+                    Some(new_arr(std::mem::take(&mut kept)))
+                }
+            }
+            "include?" | "member?" => {
+                with_host(|h| h.rb_equal(&x, &args[0])).then_some(Value::Bool(true))
+            }
+            _ => {
+                let hit = match (args.first(), block) {
+                    (None, Some(b)) => truthy(&call(b, &x)?),
+                    _ => predicate_hit(&x, args, block)?,
+                };
+                hits += hit as usize;
+                match name {
+                    "any?" if hit => Some(Value::Bool(true)),
+                    "all?" if !hit => Some(Value::Bool(false)),
+                    "none?" if hit => Some(Value::Bool(false)),
+                    "one?" if hits > 1 => Some(Value::Bool(false)),
+                    _ => None,
+                }
+            }
+        };
+        // A `break` in the block: the signal carries the call's value out.
+        if has_pending_signal() {
+            return Ok(Value::Undef);
+        }
+        if let Some(v) = decided {
+            return Ok(v);
+        }
+        index += 1;
+    }
+    // The source ended without deciding.
+    Ok(match name {
+        // `Enumerator#each_with_index` is `with_index`, which answers what the
+        // underlying `each` did; Range's is Enumerable's, which answers self.
+        "each" | "each_with_index" => match src {
+            Stream::Gen { result, .. } => result.unwrap_or(Value::Undef),
+            Stream::Count(_) => recv.clone(),
+        },
+        "each_entry" | "each_slice" | "each_cons" => {
+            // A short final slice is still handed to the block.
+            if name == "each_slice" && !kept.is_empty() {
+                if let Some(b) = block {
+                    call_proc(b, &[new_arr(kept)])?;
+                }
+            }
+            recv.clone()
+        }
+        "each_with_object" => args[0].clone(),
+        "find" | "detect" => match args.first() {
+            Some(ifnone) if !matches!(ifnone, Value::Undef) => call_proc(ifnone, &[])?,
+            _ => Value::Undef,
+        },
+        "take_while" => new_arr(kept),
+        "find_index" => Value::Undef,
+        "include?" | "member?" | "any?" => Value::Bool(false),
+        "one?" => Value::Bool(hits == 1),
+        _ => Value::Bool(true),
+    })
+}
+
 /// A block-based generator (`Enumerator.new { |y| ... }`). Terminal operations
 /// re-drive the block; `next`/`peek` step it on a fiber.
 fn dispatch_generator(
@@ -16504,21 +16677,13 @@ fn dispatch_generator(
             Ok(new_arr(drive_generator(gblock, n)?))
         }
         "to_a" | "force" | "entries" => Ok(new_arr(drive_generator(gblock, usize::MAX)?)),
-        "each" if block.is_some() => {
-            let bl = block.unwrap();
-            let (values, generated) = drive_generator_value(gblock, usize::MAX)?;
-            for v in values {
-                // A `y.yield a, b` iteration hands the block BOTH values, so a
-                // one-parameter block binds `a` and `{ |*x| }` collects both.
-                match with_host(|h| h.as_array(&v)).filter(|_| with_host(|h| h.is_multi_yield(&v)))
-                {
-                    Some(vals) => call_proc(&bl, &vals)?,
-                    None => call_proc(&bl, std::slice::from_ref(&v))?,
-                };
-            }
-            // MRI answers what the generator body evaluated to, NOT the
-            // enumerator — `Enumerator.new { |y| y << 1; 42 }.each { }` is `42`.
-            Ok(generated)
+        // `each` with a block and the other methods that can stop early step
+        // the body one element at a time, so `break`, `find`, `take_while` and
+        // friends answer on an infinite generator. `each` answers what the
+        // body evaluated to, NOT the enumerator —
+        // `Enumerator.new { |y| y << 1; 42 }.each { }` is `42`.
+        _ if is_stream_consumer(name, args, block.is_some()) => {
+            stream_consume(recv, Stream::generator(gblock), name, args, block.as_ref())
         }
         // `.lazy` keeps the generator as the pipeline source (see `lazy_pull`).
         "lazy" => Ok(with_host(|h| h.new_lazy(recv.clone(), vec![]))),
@@ -18745,6 +18910,9 @@ fn dispatch_range(
                 let kind = derive_kind(name, args).unwrap();
                 return Ok(with_host(|h| h.new_endless_range_enumerator(lo, kind)));
             }
+            _ if is_stream_consumer(name, args, block.is_some()) => {
+                return stream_consume(recv, Stream::Count(lo), name, args, block.as_ref());
+            }
             _ => {
                 return Err(raise_exc(
                     "RangeError",
@@ -19421,6 +19589,11 @@ fn dispatch_proc(
             "parameters" => Ok(parameters_array(with_host(|h| {
                 h.proc_parameters(recv, None)
             }))),
+            // MRI's `Symbol#to_proc` is a lambda taking the receiver plus any
+            // rest: `lambda?` is true and `arity` is -2.
+            "lambda?" => Ok(Value::Bool(true)),
+            "arity" => Ok(Value::Int(-2)),
+            ">>" | "<<" => compose(recv, name, args, true),
             _ => Err(no_method_error(recv, name)),
         };
     }
@@ -19460,20 +19633,34 @@ fn dispatch_proc(
             let requested = requested.map(|n| n.max(0) as usize);
             with_host(|h| h.proc_curry(recv, requested)).ok_or_else(|| no_method_error(recv, name))
         }
-        // Composition: `(f >> g).call(x) == g.call(f.call(x))`.
-        ">>" => {
-            let g = args[0].clone();
-            let is_lambda = with_host(|h| h.proc_is_lambda(recv));
-            Ok(with_host(|h| h.new_composed(recv.clone(), g, is_lambda)))
-        }
-        // `(f << g).call(x) == f.call(g.call(x))`.
-        "<<" => {
-            let g = args[0].clone();
-            let is_lambda = with_host(|h| h.proc_is_lambda(recv));
-            Ok(with_host(|h| h.new_composed(g, recv.clone(), is_lambda)))
-        }
+        ">>" | "<<" => compose(recv, name, args, with_host(|h| h.proc_is_lambda(recv))),
         _ => Err(no_method_error(recv, name)),
     }
+}
+
+/// `Proc#>>` / `Proc#<<` (and `Method#`'s, with `self_lambda` true): MRI's
+/// `proc_compose_to_right` / `proc_compose_to_left`. `g` may be any object that
+/// answers `call`; anything else is `TypeError: callable object is expected`.
+/// `>>` keeps the receiver's lambda-ness; `<<` takes `g`'s when `g` is a Proc
+/// and is a lambda otherwise (a Method or a plain callable).
+fn compose(recv: &Value, name: &str, args: &[Value], self_lambda: bool) -> Result<Value, String> {
+    let g = args[0].clone();
+    let g_is_proc = with_host(|h| h.is_proc(&g));
+    let callable = g_is_proc
+        || with_host(|h| h.as_method(&g)).is_some()
+        || probe_dispatch(&g, "respond_to?", &[with_host(|h| h.new_symbol("call"))])
+            .is_some_and(|v| with_host(|h| h.truthy(&v)));
+    if !callable {
+        return Err(raise_exc("TypeError", "callable object is expected"));
+    }
+    Ok(with_host(|h| {
+        if name == ">>" {
+            h.new_composed(recv.clone(), g, self_lambda)
+        } else {
+            let lambda = !g_is_proc || h.proc_is_lambda(&g) || h.as_sym_proc(&g).is_some();
+            h.new_composed(g, recv.clone(), lambda)
+        }
+    }))
 }
 
 /// Methods on a bound `Method` object (`obj.method(:m)`): `call`/`[]`/`()` route
@@ -19542,13 +19729,8 @@ fn dispatch_method(
     let unbound = with_host(|h| h.is_unbound_method(recv));
     match name {
         "call" | "()" | "[]" | "yield" | "===" => call_bound(&mrecv, &mname, args, block),
-        // `Method#>>` / `#<<` compose like `Proc#>>`, and always into a lambda.
-        ">>" => Ok(with_host(|h| {
-            h.new_composed(recv.clone(), args[0].clone(), true)
-        })),
-        "<<" => Ok(with_host(|h| {
-            h.new_composed(args[0].clone(), recv.clone(), true)
-        })),
+        // `Method#>>` / `#<<` compose `method_to_proc(self)`, a lambda, like `Proc#>>`.
+        ">>" | "<<" if !unbound => compose(recv, name, args, true),
         // UnboundMethod (or Method) rebinding: `bind(obj)` yields a Method bound
         // to `obj`; `bind_call(obj, *args)` binds and invokes in one step.
         "bind" => Ok(with_host(|h| h.new_method(args[0].clone(), &mname))),
