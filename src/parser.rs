@@ -3259,7 +3259,11 @@ impl Parser {
         }
         self.advance();
         self.advance();
-        let parts = if dq { self.interp(&s)? } else { vec![StrPart::Lit(s)] };
+        let parts = if dq {
+            self.interp(&s)?
+        } else {
+            vec![StrPart::Lit(s)]
+        };
         if parts.iter().all(|p| matches!(p, StrPart::Lit(_))) {
             let name: String = parts
                 .into_iter()

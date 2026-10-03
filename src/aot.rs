@@ -193,7 +193,8 @@ fn embedded_program() -> crate::compiler::Program {
         let len = rubylang_aot_program_len as usize;
         std::slice::from_raw_parts(&rubylang_aot_program_blob as *const u8, len)
     };
-    crate::cache::program_from_blob(blob).unwrap_or_else(|e| panic!("aot: embedded program blob: {e}"))
+    crate::cache::program_from_blob(blob)
+        .unwrap_or_else(|e| panic!("aot: embedded program blob: {e}"))
 }
 
 /// Root `$LOAD_PATH`/`$LOADED_FEATURES` and the require file-dir stack at the

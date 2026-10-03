@@ -7332,9 +7332,8 @@ fn dispatch_number(
             if !(0..=limit).contains(&n) {
                 return Err(raise_exc("RangeError", &format!("{n} out of char range")));
             }
-            let invalid = |e: &str| {
-                raise_exc("RangeError", &format!("invalid codepoint 0x{n:X} in {e}"))
-            };
+            let invalid =
+                |e: &str| raise_exc("RangeError", &format!("invalid codepoint 0x{n:X} in {e}"));
             let out = match enc.as_str() {
                 "UTF-8" => match char::from_u32(n as u32) {
                     Some(c) => Ok(new_str(c.to_string())),
@@ -7345,7 +7344,11 @@ fn dispatch_number(
                         return Err(invalid("US-ASCII"));
                     }
                     let s = new_str((n as u8 as char).to_string());
-                    let tag = if e == "US-ASCII" { "US-ASCII" } else { "ASCII-8BIT" };
+                    let tag = if e == "US-ASCII" {
+                        "US-ASCII"
+                    } else {
+                        "ASCII-8BIT"
+                    };
                     with_host(|h| h.set_string_encoding(&s, tag));
                     Ok(s)
                 }
@@ -11536,7 +11539,9 @@ fn dispatch_array(
             let indices: Vec<Value> = (0..arr.len() as i64).map(Value::Int).collect();
             match &block {
                 Some(b) => array_yield_method(recv, name, &indices, b, None),
-                None => Ok(with_host(|h| h.new_enumerator_of(indices, name, recv.clone()))),
+                None => Ok(with_host(|h| {
+                    h.new_enumerator_of(indices, name, recv.clone())
+                })),
             }
         }
         "rotate!" => {
@@ -12079,12 +12084,10 @@ fn dispatch_array(
         // and `drop_while` share one body with their `with_index` re-attachment;
         // block-less, each answers an Enumerator.
         "filter_map" | "find" | "detect" | "partition" | "group_by" | "take_while"
-        | "drop_while" => {
-            match &block {
-                Some(b) => array_yield_method(recv, name, &arr, b, None),
-                None => Ok(with_host(|h| h.new_enumerator_of(arr, name, recv.clone()))),
-            }
-        }
+        | "drop_while" => match &block {
+            Some(b) => array_yield_method(recv, name, &arr, b, None),
+            None => Ok(with_host(|h| h.new_enumerator_of(arr, name, recv.clone()))),
+        },
         // `transpose` turns an array of equal-length rows into columns.
         "transpose" => {
             // Every element must BE an Array. `unwrap_or_default` turned a
@@ -12833,7 +12836,9 @@ fn sort_by_family(
             Some(n) => format!("{name}({})", with_host(|h| h.inspect(n))),
             None => name.to_string(),
         };
-        return Ok(with_host(|h| h.new_enumerator_of(arr.to_vec(), &tag, recv.clone())));
+        return Ok(with_host(|h| {
+            h.new_enumerator_of(arr.to_vec(), &tag, recv.clone())
+        }));
     };
     let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(arr.len());
     for (i, x) in arr.iter().enumerate() {
@@ -14268,8 +14273,8 @@ fn dispatch_enumerator(
             // Over a Hash, `each`/`each_pair` answer the Hash itself and
             // `select`/`filter`/`reject` a Hash of the kept pairs — what the
             // block-taking Hash methods themselves answer.
-            if let Some(src) = with_host(|h| h.enum_source(recv))
-                .filter(|s| with_host(|h| h.as_hash(s)).is_some())
+            if let Some(src) =
+                with_host(|h| h.enum_source(recv)).filter(|s| with_host(|h| h.as_hash(s)).is_some())
             {
                 match method.as_str() {
                     "each" | "each_pair" => return Ok(src),
@@ -19538,8 +19543,12 @@ fn dispatch_method(
     match name {
         "call" | "()" | "[]" | "yield" | "===" => call_bound(&mrecv, &mname, args, block),
         // `Method#>>` / `#<<` compose like `Proc#>>`, and always into a lambda.
-        ">>" => Ok(with_host(|h| h.new_composed(recv.clone(), args[0].clone(), true))),
-        "<<" => Ok(with_host(|h| h.new_composed(args[0].clone(), recv.clone(), true))),
+        ">>" => Ok(with_host(|h| {
+            h.new_composed(recv.clone(), args[0].clone(), true)
+        })),
+        "<<" => Ok(with_host(|h| {
+            h.new_composed(args[0].clone(), recv.clone(), true)
+        })),
         // UnboundMethod (or Method) rebinding: `bind(obj)` yields a Method bound
         // to `obj`; `bind_call(obj, *args)` binds and invokes in one step.
         "bind" => Ok(with_host(|h| h.new_method(args[0].clone(), &mname))),
@@ -19664,9 +19673,8 @@ fn location_absolute_path(path: &str) -> Option<String> {
     if path == "-e" || path == "-" || path.starts_with('(') {
         return None;
     }
-    let real = std::fs::canonicalize(path).or_else(|_| {
-        std::env::current_dir().map(|cwd| cwd.join(path))
-    });
+    let real =
+        std::fs::canonicalize(path).or_else(|_| std::env::current_dir().map(|cwd| cwd.join(path)));
     real.ok().map(|p| p.to_string_lossy().into_owned())
 }
 
@@ -20789,7 +20797,11 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
                 }
                 None => "exit".to_string(),
             };
-            Err(raise_exc_with("SystemExit", &msg, &[("status", Value::Int(1))]))
+            Err(raise_exc_with(
+                "SystemExit",
+                &msg,
+                &[("status", Value::Int(1))],
+            ))
         }
         // Bare `synchronize { … }` / `mon_synchronize { … }` — the MonitorMixin
         // surface called on an implicit self that includes it (concurrent-ruby's
@@ -20885,7 +20897,9 @@ use crate::random::Gen;
 /// anything else is the process-wide one.
 fn random_gen(v: Option<&Value>) -> Gen {
     match v {
-        Some(r @ Value::Obj(id)) if with_host(|h| h.object_class(r)).as_deref() == Some("Random") => {
+        Some(r @ Value::Obj(id))
+            if with_host(|h| h.object_class(r)).as_deref() == Some("Random") =>
+        {
             Gen::Instance(*id)
         }
         _ => Gen::Default,
@@ -20943,7 +20957,9 @@ fn random_range(g: Gen, v: &Value) -> Result<Option<Value>, String> {
             return Ok(Some(Value::Undef));
         }
         let r = random_upto(g, &num_bigint::BigInt::from(max));
-        return Ok(Some(with_host(|h| h.num_op(fusevm::NumOp::Add, &Value::Int(lo), &r))?));
+        return Ok(Some(with_host(|h| {
+            h.num_op(fusevm::NumOp::Add, &Value::Int(lo), &r)
+        })?));
     }
     if let Some((lo, hi, excl)) = with_host(|h| h.as_float_range(v)) {
         if !lo.is_finite() || !hi.is_finite() {
@@ -25958,7 +25974,8 @@ fn defines_own(v: &Value, name: &str) -> bool {
     with_host(|h| {
         h.find_singleton_method(v, name).is_some()
             || h.find_singleton_define_method(v, name).is_some()
-            || h.object_class(v).is_some_and(|cls| h.find_method(&cls, name).is_some())
+            || h.object_class(v)
+                .is_some_and(|cls| h.find_method(&cls, name).is_some())
     })
 }
 
@@ -25980,7 +25997,8 @@ fn identical(a: &Value, b: &Value) -> bool {
 /// anything else. Never dispatches `==` on `recv`, which is how it is reached.
 fn eq_fallback(recv: &Value, other: &Value) -> Result<bool, String> {
     let comparable = with_host(|h| {
-        h.object_class(recv).is_some_and(|c| h.find_method_owner(&c, "<=>").is_some())
+        h.object_class(recv)
+            .is_some_and(|c| h.find_method_owner(&c, "<=>").is_some())
             && h.is_a(recv, "Comparable")
     });
     if comparable {
@@ -26080,7 +26098,11 @@ pub(crate) fn rb_equal_d(a: &Value, b: &Value) -> Result<bool, String> {
 /// Hash supplying `%<name>s` references.
 fn io_printf_text(args: &[Value]) -> Result<String, String> {
     let fmt = arg_str(&args[0]);
-    match args.get(1).filter(|_| args.len() == 2).and_then(|a| with_host(|h| h.as_hash(a))) {
+    match args
+        .get(1)
+        .filter(|_| args.len() == 2)
+        .and_then(|a| with_host(|h| h.as_hash(a)))
+    {
         Some(map) => sprintf(&fmt, &args[1..], Some(&map)),
         None => sprintf(&fmt, &args[1..], None),
     }

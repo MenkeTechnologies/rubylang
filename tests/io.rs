@@ -269,7 +269,9 @@ fn io_printf_putc_fileno_and_tty() {
         "[Integer, false, 0, 2]",
     );
     eq(
-        &format!("f = File.open({p:?}); f.close; begin; f.fileno; rescue IOError => e; e.message; end"),
+        &format!(
+            "f = File.open({p:?}); f.close; begin; f.fileno; rescue IOError => e; e.message; end"
+        ),
         "\"closed stream\"",
     );
 }
@@ -289,7 +291,9 @@ fn puts_flattens_arrays_the_same_on_every_stream() {
     let p = d.path().join("puts.txt");
     let p = p.to_str().unwrap();
     eq(
-        &format!("File.open({p:?}, \"w\") {{ |f| f.puts []; f.puts 1, [], [[]] }}; File.read({p:?})"),
+        &format!(
+            "File.open({p:?}, \"w\") {{ |f| f.puts []; f.puts 1, [], [[]] }}; File.read({p:?})"
+        ),
         "\"1\\n\"",
     );
 }

@@ -251,7 +251,10 @@ fn at_exit_handlers_run_lifo_as_the_program_ends() {
     let (out, err, rc) = run_e_full(
         "at_exit { puts \"h1\" }; at_exit { at_exit { puts \"nested\" }; puts \"h2\" }; puts \"main\"",
     );
-    assert_eq!((out.as_str(), err.as_str(), rc), ("main\nh2\nnested\nh1\n", "", 0));
+    assert_eq!(
+        (out.as_str(), err.as_str(), rc),
+        ("main\nh2\nnested\nh1\n", "", 0)
+    );
 
     let (out, _, rc) = run_e_full("at_exit { puts \"h1\" }; exit 5");
     assert_eq!((out.as_str(), rc), ("h1\n", 5));
@@ -265,7 +268,11 @@ fn at_exit_handlers_run_lifo_as_the_program_ends() {
     let (out, err, rc) = run_e_full("at_exit { raise \"boom\" }; at_exit { puts \"first\" }");
     assert_eq!(
         (out.as_str(), err.as_str(), rc),
-        ("first\n", "-e:1:in 'block in <main>': boom (RuntimeError)\n", 1)
+        (
+            "first\n",
+            "-e:1:in 'block in <main>': boom (RuntimeError)\n",
+            1
+        )
     );
 
     let (out, _, rc) = run_e_full("at_exit { puts \"no\" }; exit! 4");

@@ -3981,13 +3981,17 @@ impl RubyHost {
     ) -> Option<MethodShape> {
         // A per-object singleton method is owned by the object's singleton
         // class, or by the module an `extend` copied it from.
-        if let (false, Value::Obj(id), Some(def)) = (unbound, recv, self.find_singleton_method(recv, name)) {
+        if let (false, Value::Obj(id), Some(def)) =
+            (unbound, recv, self.find_singleton_method(recv, name))
+        {
             let owner = if self.is_extended_singleton(*id, name) {
                 self.object_extends
                     .get(id)
                     .and_then(|mods| {
                         mods.iter().find(|m| {
-                            self.classes.get(*m).is_some_and(|d| d.methods.contains_key(name))
+                            self.classes
+                                .get(*m)
+                                .is_some_and(|d| d.methods.contains_key(name))
                         })
                     })
                     .cloned()
@@ -5376,7 +5380,10 @@ impl RubyHost {
                     if let Some(m) = self.singleton_define_methods.get_mut(&id) {
                         m.shift_remove(&n);
                     }
-                    self.singleton_methods.entry(id).or_default().insert(n.clone(), def);
+                    self.singleton_methods
+                        .entry(id)
+                        .or_default()
+                        .insert(n.clone(), def);
                     copied.insert(n);
                 }
             }
@@ -5388,7 +5395,10 @@ impl RubyHost {
                     if let Some(m) = self.singleton_methods.get_mut(&id) {
                         m.shift_remove(&n);
                     }
-                    self.singleton_define_methods.entry(id).or_default().insert(n.clone(), proc);
+                    self.singleton_define_methods
+                        .entry(id)
+                        .or_default()
+                        .insert(n.clone(), proc);
                     copied.insert(n);
                 }
             }
@@ -5399,7 +5409,11 @@ impl RubyHost {
     /// Forget that `obj`'s singleton entry `name` came from an `extend`: the
     /// object is defining its own, which replaces the copied one.
     fn claim_singleton(&mut self, id: u32, name: &str) {
-        if self.extended_singletons.get_mut(&id).is_some_and(|s| s.remove(name)) {
+        if self
+            .extended_singletons
+            .get_mut(&id)
+            .is_some_and(|s| s.remove(name))
+        {
             if let Some(m) = self.singleton_methods.get_mut(&id) {
                 m.shift_remove(name);
             }
@@ -5411,7 +5425,9 @@ impl RubyHost {
 
     /// Whether `obj`'s singleton entry `name` was copied in by an `extend`.
     pub fn is_extended_singleton(&self, id: u32, name: &str) -> bool {
-        self.extended_singletons.get(&id).is_some_and(|s| s.contains(name))
+        self.extended_singletons
+            .get(&id)
+            .is_some_and(|s| s.contains(name))
     }
 
     /// The object a per-object singleton class name (`#<Class:#<K:0x…>>`) is
@@ -5493,13 +5509,23 @@ impl RubyHost {
     /// inherited from a superclass (`Kernel#singleton_method`'s reach).
     pub fn has_own_class_method(&self, cls: &str, name: &str) -> bool {
         let defines = |c: &str| {
-            self.classes.get(c).is_some_and(|d| d.methods.contains_key(name))
-                || self.define_methods.get(c).is_some_and(|m| m.contains_key(name))
+            self.classes
+                .get(c)
+                .is_some_and(|d| d.methods.contains_key(name))
+                || self
+                    .define_methods
+                    .get(c)
+                    .is_some_and(|m| m.contains_key(name))
         };
         self.classes.get(cls).is_some_and(|d| {
             d.class_methods.contains_key(name)
-                || d.extends.iter().any(|m| defines(&self.resolve_module_name(m, cls)))
-        }) || self.class_define_methods.get(cls).is_some_and(|m| m.contains_key(name))
+                || d.extends
+                    .iter()
+                    .any(|m| defines(&self.resolve_module_name(m, cls)))
+        }) || self
+            .class_define_methods
+            .get(cls)
+            .is_some_and(|m| m.contains_key(name))
     }
     /// Register a `define_singleton_method` (a block Proc) on a specific object.
     pub fn add_singleton_define_method(&mut self, id: u32, name: &str, proc: Value) {
@@ -6205,7 +6231,11 @@ impl RubyHost {
         }
         // A module this object was `extend`ed with (`obj.extend(Enumerable)`).
         if let Value::Obj(id) = v {
-            if self.object_extends.get(id).is_some_and(|m| m.iter().any(|n| n == class)) {
+            if self
+                .object_extends
+                .get(id)
+                .is_some_and(|m| m.iter().any(|n| n == class))
+            {
                 return true;
             }
         }
@@ -6889,7 +6919,12 @@ impl RubyHost {
                     .get(&id)
                     .into_iter()
                     .flat_map(|m| m.keys())
-                    .chain(self.singleton_define_methods.get(&id).into_iter().flat_map(|m| m.keys()))
+                    .chain(
+                        self.singleton_define_methods
+                            .get(&id)
+                            .into_iter()
+                            .flat_map(|m| m.keys()),
+                    )
                     .filter(|k| !self.is_extended_singleton(id, k));
                 take(Box::new(own), &mut out);
             }
@@ -7484,7 +7519,11 @@ impl RubyHost {
             Some((s, m)) if m.starts_with("__class_body__") => {
                 let cls = s.def_class.as_deref().unwrap_or("Object");
                 let short = cls.rsplit("::").next().unwrap_or(cls);
-                let kind = if self.is_module_name(cls) { "module" } else { "class" };
+                let kind = if self.is_module_name(cls) {
+                    "module"
+                } else {
+                    "class"
+                };
                 format!("<{kind}:{short}>")
             }
             Some((s, m)) => {

@@ -10577,8 +10577,14 @@ fn every_object_that_can_carry_a_singleton_answers_singleton_class() {
 /// CLASS, so every singleton override printed the default `#<Object>`.
 #[test]
 fn a_singleton_to_s_or_inspect_is_what_renders_the_object() {
-    eq("o = Object.new; def o.to_s = \"sv\"; \"<#{o}>\"", "\"<sv>\"");
-    eq("o = Object.new; class << o; def to_s = \"cs\"; end; \"#{o}\"", "\"cs\"");
+    eq(
+        "o = Object.new; def o.to_s = \"sv\"; \"<#{o}>\"",
+        "\"<sv>\"",
+    );
+    eq(
+        "o = Object.new; class << o; def to_s = \"cs\"; end; \"#{o}\"",
+        "\"cs\"",
+    );
     eq(
         "module M; def to_s = \"m\"; end; o = Object.new.extend(M); \"#{o}\"",
         "\"m\"",
@@ -10587,7 +10593,10 @@ fn a_singleton_to_s_or_inspect_is_what_renders_the_object() {
         "o = Object.new; o.define_singleton_method(:to_s) { \"d\" }; \"#{o}\"",
         "\"d\"",
     );
-    eq("o = Object.new; def o.inspect = \"I\"; [o.inspect, [o].inspect]", "[\"I\", \"[I]\"]");
+    eq(
+        "o = Object.new; def o.inspect = \"I\"; [o.inspect, [o].inspect]",
+        "[\"I\", \"[I]\"]",
+    );
     // A singleton beats the class's own definition, and leaves siblings alone.
     eq(
         "class SA; def to_s = \"cls\"; end; a = SA.new; def a.to_s = \"one\"; \"#{a} #{SA.new}\"",
@@ -10600,13 +10609,31 @@ fn a_singleton_to_s_or_inspect_is_what_renders_the_object() {
 /// the host's default and printed `[#<A>]`.
 #[test]
 fn container_inspect_and_to_s_use_each_elements_own_inspect() {
-    eq("class IA; def inspect = \"I\"; end; [IA.new].inspect", "\"[I]\"");
-    eq("class IB; def inspect = \"I\"; end; [1, [IB.new]].to_s", "\"[1, [I]]\"");
-    eq("class IC; def inspect = \"I\"; end; {a: IC.new}.inspect", "\"{a: I}\"");
-    eq("class ID; def inspect = \"I\"; end; \"#{[ID.new]}\"", "\"[I]\"");
+    eq(
+        "class IA; def inspect = \"I\"; end; [IA.new].inspect",
+        "\"[I]\"",
+    );
+    eq(
+        "class IB; def inspect = \"I\"; end; [1, [IB.new]].to_s",
+        "\"[1, [I]]\"",
+    );
+    eq(
+        "class IC; def inspect = \"I\"; end; {a: IC.new}.inspect",
+        "\"{a: I}\"",
+    );
+    eq(
+        "class ID; def inspect = \"I\"; end; \"#{[ID.new]}\"",
+        "\"[I]\"",
+    );
     // A key renders through its own `inspect` too, bare or inside an Array key.
-    eq("class IE; def inspect = \"K\"; end; {IE.new => 1}.to_s", "\"{K => 1}\"");
-    eq("class IF; def inspect = \"K\"; end; {[IF.new] => 1}.inspect", "\"{[K] => 1}\"");
+    eq(
+        "class IE; def inspect = \"K\"; end; {IE.new => 1}.to_s",
+        "\"{K => 1}\"",
+    );
+    eq(
+        "class IF; def inspect = \"K\"; end; {[IF.new] => 1}.inspect",
+        "\"{[K] => 1}\"",
+    );
 }
 
 /// A plain object used as a Hash key is that object: it comes back out of
@@ -10622,9 +10649,18 @@ fn an_object_hash_key_is_the_object_itself() {
         "class HL; end; a = HL.new; b = HL.new; h = {a => 1, b => 2}; [h.size, h.key(2).equal?(b), h[HL.new]]",
         "[2, true, nil]",
     );
-    eq("class HM; end; a = HM.new; h = {a => 1}; h.each { |k, _| break k.equal?(a) }", "true");
-    eq("pr = proc { 7 }; h = {pr => :x}; [h[pr], h.keys.first.call]", "[:x, 7]");
-    eq("class HN; end; x = HN.new; [[x, x, HN.new].uniq.size, [x, x].tally.values]", "[2, [2]]");
+    eq(
+        "class HM; end; a = HM.new; h = {a => 1}; h.each { |k, _| break k.equal?(a) }",
+        "true",
+    );
+    eq(
+        "pr = proc { 7 }; h = {pr => :x}; [h[pr], h.keys.first.call]",
+        "[:x, 7]",
+    );
+    eq(
+        "class HN; end; x = HN.new; [[x, x, HN.new].uniq.size, [x, x].tally.values]",
+        "[2, [2]]",
+    );
 }
 
 /// A nested `(b, c)` group in a parallel-assignment LHS, a leading group, a
@@ -10632,13 +10668,25 @@ fn an_object_hash_key_is_the_object_itself() {
 /// parser before (`expected '=', found ')'`, `expected identifier`).
 #[test]
 fn nested_destructuring_targets_and_def_params() {
-    eq("(a, (b, c)), d = [1, [2, 3]], 4; [a, b, c, d]", "[1, 2, 3, 4]");
-    eq("a, (b, *c), d = 1, [2, 3, 4], 5; [a, b, c, d]", "[1, 2, [3, 4], 5]");
+    eq(
+        "(a, (b, c)), d = [1, [2, 3]], 4; [a, b, c, d]",
+        "[1, 2, 3, 4]",
+    );
+    eq(
+        "a, (b, *c), d = 1, [2, 3, 4], 5; [a, b, c, d]",
+        "[1, 2, [3, 4], 5]",
+    );
     eq("(a, b) = [3, 4]; [a, b]", "[3, 4]");
     // A scalar in a group's position binds its first name; the rest are nil.
     eq("a, (b, c) = 1, 5; [a, b, c]", "[1, 5, nil]");
-    eq("def dp1((a, b), c) = [a, b, c]; dp1([1, 2], 3)", "[1, 2, 3]");
-    eq("def dp2(x, (y, (z, w))); [x, y, z, w]; end; dp2(1, [2, [3, 4]])", "[1, 2, 3, 4]");
+    eq(
+        "def dp1((a, b), c) = [a, b, c]; dp1([1, 2], 3)",
+        "[1, 2, 3]",
+    );
+    eq(
+        "def dp2(x, (y, (z, w))); [x, y, z, w]; end; dp2(1, [2, [3, 4]])",
+        "[1, 2, 3, 4]",
+    );
     // A statement that merely starts with `(` is still an expression.
     eq("x = 2; (x + 1) * 3", "9");
     eq("(y = 4); y", "4");
@@ -10652,10 +10700,22 @@ fn nested_destructuring_targets_and_def_params() {
 fn a_single_value_is_destructured_only_through_to_ary() {
     eq("a, b = {x: 1}; [a, b]", "[{x: 1}, nil]");
     eq("a, b = 1..3; [a, b]", "[1..3, nil]");
-    eq("S9 = Struct.new(:m, :n); a, b = S9.new(1, 2); [a.class, b]", "[S9, nil]");
-    eq("r = []; [[1, {y: 2}]].each { |q, (s, t)| r = [s, t] }; r", "[{y: 2}, nil]");
-    eq("class TA; def to_ary = [7, 8]; end; a, b = TA.new; [a, b]", "[7, 8]");
-    eq("class TB; def to_a = [7, 8]; end; a, b = TB.new; [a.class, b]", "[TB, nil]");
+    eq(
+        "S9 = Struct.new(:m, :n); a, b = S9.new(1, 2); [a.class, b]",
+        "[S9, nil]",
+    );
+    eq(
+        "r = []; [[1, {y: 2}]].each { |q, (s, t)| r = [s, t] }; r",
+        "[{y: 2}, nil]",
+    );
+    eq(
+        "class TA; def to_ary = [7, 8]; end; a, b = TA.new; [a, b]",
+        "[7, 8]",
+    );
+    eq(
+        "class TB; def to_a = [7, 8]; end; a, b = TB.new; [a.class, b]",
+        "[TB, nil]",
+    );
     // A splat still means `to_a`.
     eq("a, b = *(1..3); [a, b]", "[1, 2]");
     raises(
@@ -10721,14 +10781,26 @@ fn pack_and_unpack_u_convert_code_points_and_utf8() {
     eq("\"a\u{e9}\u{1F600}\".unpack(\"U2\")", "[97, 233]");
     // Running out of input ends the directive: no trailing nil.
     eq("\"ab\".unpack(\"U*U\")", "[97, 98]");
-    raises("[-1].pack(\"U\")", "RangeError", "pack(U): value out of range");
-    raises("[0xff].pack(\"C\").unpack(\"U\")", "ArgumentError", "malformed UTF-8 character");
+    raises(
+        "[-1].pack(\"U\")",
+        "RangeError",
+        "pack(U): value out of range",
+    );
+    raises(
+        "[0xff].pack(\"C\").unpack(\"U\")",
+        "ArgumentError",
+        "malformed UTF-8 character",
+    );
     raises(
         "[0xc3].pack(\"C\").unpack(\"U\")",
         "ArgumentError",
         "malformed UTF-8 character (expected 2 bytes, given 1 bytes)",
     );
-    raises("[0xC0, 0x80].pack(\"C*\").unpack(\"U\")", "ArgumentError", "redundant UTF-8 sequence");
+    raises(
+        "[0xC0, 0x80].pack(\"C*\").unpack(\"U\")",
+        "ArgumentError",
+        "redundant UTF-8 sequence",
+    );
 }
 
 /// `Integer#chr(enc)` is a character OF that encoding. With UTF-8 it reaches
@@ -10737,12 +10809,30 @@ fn pack_and_unpack_u_convert_code_points_and_utf8() {
 #[test]
 fn integer_chr_with_an_encoding_answers_a_character_of_it() {
     eq("0x1F600.chr(\"UTF-8\")", "\"\u{1F600}\"");
-    eq("[233.chr(Encoding::UTF_8), 233.chr(\"utf-8\").bytes]", "[\"\u{e9}\", [195, 169]]");
+    eq(
+        "[233.chr(Encoding::UTF_8), 233.chr(\"utf-8\").bytes]",
+        "[\"\u{e9}\", [195, 169]]",
+    );
     eq("65.chr(Encoding::UTF_8).encoding", "#<Encoding:UTF-8>");
-    eq("[65.chr(\"BINARY\").encoding, 65.chr(\"US-ASCII\").encoding]", "[#<Encoding:BINARY (ASCII-8BIT)>, #<Encoding:US-ASCII>]");
-    raises("0xD800.chr(\"UTF-8\")", "RangeError", "invalid codepoint 0xD800 in UTF-8");
-    raises("0x110000.chr(\"UTF-8\")", "RangeError", "1114112 out of char range");
-    raises("233.chr(\"US-ASCII\")", "RangeError", "invalid codepoint 0xE9 in US-ASCII");
+    eq(
+        "[65.chr(\"BINARY\").encoding, 65.chr(\"US-ASCII\").encoding]",
+        "[#<Encoding:BINARY (ASCII-8BIT)>, #<Encoding:US-ASCII>]",
+    );
+    raises(
+        "0xD800.chr(\"UTF-8\")",
+        "RangeError",
+        "invalid codepoint 0xD800 in UTF-8",
+    );
+    raises(
+        "0x110000.chr(\"UTF-8\")",
+        "RangeError",
+        "1114112 out of char range",
+    );
+    raises(
+        "233.chr(\"US-ASCII\")",
+        "RangeError",
+        "invalid codepoint 0xE9 in US-ASCII",
+    );
 }
 
 /// `Array#join` converts a non-Array element through the object's own
@@ -10768,11 +10858,26 @@ fn join_converts_elements_through_user_conversions() {
 #[test]
 fn a_rescue_binding_is_a_variable_of_the_enclosing_scope() {
     eq("begin; raise \"x\"; rescue => e; end; e.message", "\"x\"");
-    eq("def m; begin; raise \"q\"; rescue => e; end; e.message; end; m", "\"q\"");
-    eq("e = 1; begin; raise \"x\"; rescue => e; end; e.class", "RuntimeError");
-    eq("begin; raise \"x\"; rescue => @err; end; @err.class", "RuntimeError");
-    eq("e = nil; [1].each { begin; raise \"q\"; rescue => e; end }; e.message", "\"q\"");
-    eq("[1].each { begin; raise \"q\"; rescue => zz; end }; defined?(zz)", "nil");
+    eq(
+        "def m; begin; raise \"q\"; rescue => e; end; e.message; end; m",
+        "\"q\"",
+    );
+    eq(
+        "e = 1; begin; raise \"x\"; rescue => e; end; e.class",
+        "RuntimeError",
+    );
+    eq(
+        "begin; raise \"x\"; rescue => @err; end; @err.class",
+        "RuntimeError",
+    );
+    eq(
+        "e = nil; [1].each { begin; raise \"q\"; rescue => e; end }; e.message",
+        "\"q\"",
+    );
+    eq(
+        "[1].each { begin; raise \"q\"; rescue => zz; end }; defined?(zz)",
+        "nil",
+    );
 }
 
 /// `Exception#full_message(highlight:, order:)` and `#detailed_message` render
@@ -10885,7 +10990,10 @@ fn equality_runs_the_elements_own_eq() {
          [[U.new(1)] == [U.new(1)], U.new(1) != U.new(1), [1, U.new(2)].include?(U.new(2)), [U.new(1)] == [1]]",
         "[true, false, true, false]",
     );
-    eq("class Z; def <=>(o) = 0; end; [Z.new == Z.new, Z.new != Z.new]", "[false, true]");
+    eq(
+        "class Z; def <=>(o) = 0; end; [Z.new == Z.new, Z.new != Z.new]",
+        "[false, true]",
+    );
     eq(
         "class W; include Comparable; def <=>(o) = raise(\"no\"); end; w = W.new; [w == w, w.==(w)]",
         "[true, true]",
@@ -10906,7 +11014,8 @@ fn enumerable_derives_the_remaining_each_methods() {
         &format!("{n}[n.chain([9]).to_a, n.cycle.first(5), n.cycle(2).to_a.size, n.respond_to?(:to_set)]"),
         "[[3, nil, 1, 2, 9], [3, nil, 1, 2, 3], 8, true]",
     );
-    let m = "class M; include Enumerable; def each; yield 3; yield 1; yield 2; end; end; m = M.new; ";
+    let m =
+        "class M; include Enumerable; def each; yield 3; yield 1; yield 2; end; end; m = M.new; ";
     eq(
         &format!("{m}[m.slice_after(&:odd?).to_a, m.slice_before(&:even?).to_a]"),
         "[[[3], [1], [2]], [[3, 1], [2]]]",
@@ -10954,7 +11063,9 @@ fn an_object_singleton_class_reflects_extend_and_own_defs() {
         "[true, false]",
     );
     eq(
-        &format!("{pre}b = A.new; b.extend(Comparable); b.singleton_class.ancestors.drop(1).first(3)"),
+        &format!(
+            "{pre}b = A.new; b.extend(Comparable); b.singleton_class.ancestors.drop(1).first(3)"
+        ),
         "[A, Comparable, Object]",
     );
     eq(
@@ -10986,10 +11097,26 @@ fn public_method_singleton_method_and_included_modules() {
     let k = "class K; def pub = 1; private def priv; end; protected def prot; end; \
              def inspect = \"KI\"; def self.c = 3; end; ";
     eq(&format!("{k}K.new.public_method(:pub).call"), "1");
-    raises(&format!("{k}K.new.public_method(:priv)"), "NameError", "method 'priv' for class 'K' is private");
-    raises(&format!("{k}K.new.public_method(:prot)"), "NameError", "method 'prot' for class 'K' is protected");
-    raises(&format!("{k}K.new.public_method(:nope)"), "NameError", "undefined method 'nope' for class 'K'");
-    raises(&format!("{k}K.new.singleton_method(:pub)"), "NameError", "undefined singleton method 'pub' for 'KI'");
+    raises(
+        &format!("{k}K.new.public_method(:priv)"),
+        "NameError",
+        "method 'priv' for class 'K' is private",
+    );
+    raises(
+        &format!("{k}K.new.public_method(:prot)"),
+        "NameError",
+        "method 'prot' for class 'K' is protected",
+    );
+    raises(
+        &format!("{k}K.new.public_method(:nope)"),
+        "NameError",
+        "undefined method 'nope' for class 'K'",
+    );
+    raises(
+        &format!("{k}K.new.singleton_method(:pub)"),
+        "NameError",
+        "undefined singleton method 'pub' for 'KI'",
+    );
     eq(
         &format!("{k}k = K.new; def k.s(a, b=1) = a; [k.singleton_method(:s).arity, k.singleton_method(:s).call(4)]"),
         "[-2, 4]",
@@ -10998,15 +11125,25 @@ fn public_method_singleton_method_and_included_modules() {
         &format!("{k}module M; def mm = :mm; end; k = K.new; k.extend(M); [k.singleton_method(:mm).call, k.singleton_method(:mm).owner]"),
         "[:mm, M]",
     );
-    eq("o = Object.new; o.define_singleton_method(:q) { 2 }; o.singleton_method(:q).call", "2");
+    eq(
+        "o = Object.new; o.define_singleton_method(:q) { 2 }; o.singleton_method(:q).call",
+        "2",
+    );
     eq(&format!("{k}K.singleton_method(:c).call"), "3");
-    raises(&format!("{k}K.singleton_method(:new)"), "NameError", "undefined singleton method 'new' for 'K'");
+    raises(
+        &format!("{k}K.singleton_method(:new)"),
+        "NameError",
+        "undefined singleton method 'new' for 'K'",
+    );
     raises(
         "class A; def self.x = 1; end; class B < A; end; B.singleton_method(:x)",
         "NameError",
         "undefined singleton method 'x' for 'B'",
     );
-    eq("module E; def e = 1; end; class A; extend E; end; A.singleton_method(:e).call", "1");
+    eq(
+        "module E; def e = 1; end; class A; extend E; end; A.singleton_method(:e).call",
+        "1",
+    );
     eq(
         "module M; end; class Z; include M; include Comparable; end; \
          [Z.included_modules, Comparable.included_modules, Integer.included_modules]",
