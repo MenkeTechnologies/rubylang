@@ -2472,6 +2472,9 @@ pub(crate) fn dispatch(
                 None => with_host(|h| h.is_frozen(recv)),
             };
             let copy = with_host(|h| h.dup_value(recv));
+            // Unlike `dup`, `clone` keeps the singleton class: `def obj.m`
+            // methods and `extend`ed modules come along.
+            with_host(|h| h.copy_singleton(recv, &copy));
             // The hook runs BEFORE the frozen flag is carried over: MRI copies
             // into a still-mutable object and freezes it afterwards, so a
             // `initialize_copy` that writes ivars works on a frozen original.
@@ -13707,13 +13710,53 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
         "numerator" => Ok(with_host(|h| h.new_bigint(r.numer().clone()))),
         "denominator" => Ok(with_host(|h| h.new_bigint(r.denom().clone()))),
         "to_f" => Ok(Value::Float(rational_to_f64(&r))),
-        "to_i" | "to_int" | "truncate" => Ok(with_host(|h| h.new_bigint(r.to_integer()))),
-        // `#floor`/`#ceil`/`#round` with no digits argument round to the nearest
-        // Integer (toward -inf / +inf / nearest). `num_rational::Ratio` provides
-        // exact rounding; `to_integer` then extracts the BigInt.
-        "floor" if args.is_empty() => Ok(with_host(|h| h.new_bigint(r.floor().to_integer()))),
-        "ceil" if args.is_empty() => Ok(with_host(|h| h.new_bigint(r.ceil().to_integer()))),
-        "round" if args.is_empty() => Ok(with_host(|h| h.new_bigint(r.round().to_integer()))),
+        "to_i" | "to_int" => Ok(with_host(|h| h.new_bigint(r.to_integer()))),
+        // MRI `f_round_common`: with no digits the result is the Integer the
+        // rounding picks (toward -inf / +inf / zero / nearest, ties by
+        // `half:`). With `ndigits` the value is scaled by `10**ndigits`,
+        // rounded, and scaled back — a Rational for `ndigits >= 1`, truncated
+        // to an Integer otherwise. A non-Integer digit count is refused.
+        "floor" | "ceil" | "truncate" | "round" => {
+            // Only `round` takes the `half:` keyword (a trailing Hash).
+            let kw = (name == "round")
+                .then(|| args.last().and_then(|a| with_host(|h| h.as_hash(a))))
+                .flatten();
+            let half = match &kw {
+                Some(m) => RoundHalf::from_arg(m.get(&crate::host::RKey::Sym("half".into())))?,
+                None => RoundHalf::Up,
+            };
+            let n = match args[..args.len() - usize::from(kw.is_some())].first() {
+                Some(Value::Int(n)) => Some(*n),
+                Some(_) => return Err(raise_exc("TypeError", "not an integer")),
+                None => None,
+            };
+            let apply = |x: &num_rational::BigRational| -> num_rational::BigRational {
+                match name {
+                    "floor" => x.floor(),
+                    "ceil" => x.ceil(),
+                    "truncate" => x.trunc(),
+                    _ => rational_round_half(x, half),
+                }
+            };
+            let Some(n) = n else {
+                return Ok(with_host(|h| h.new_bigint(apply(&r).to_integer())));
+            };
+            let ten = num_bigint::BigInt::from(10);
+            let b = if n >= 0 {
+                num_rational::BigRational::from(num_traits::pow(ten, n as usize))
+            } else {
+                num_rational::BigRational::new(
+                    num_bigint::BigInt::from(1),
+                    num_traits::pow(ten, n.unsigned_abs() as usize),
+                )
+            };
+            let s = apply(&(&r * &b)) / b;
+            if n < 1 {
+                Ok(with_host(|h| h.new_bigint(s.trunc().to_integer())))
+            } else {
+                Ok(rat(s))
+            }
+        }
         "to_r" => Ok(recv.clone()),
         "abs" | "magnitude" => Ok(rat(r.abs())),
         "-@" => Ok(rat(-r)),

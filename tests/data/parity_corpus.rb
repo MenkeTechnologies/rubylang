@@ -5356,3 +5356,13 @@ p Enumerator::Lazy, Enumerator::ArithmeticSequence, Enumerator::Yielder
 #==#
 p :$!, :"$-w", :"$-", :"$12", :"$1a", :"$a1", :"$~x", :"$-ww", :"$0", :"$-0", :"$\"", :"$_", :"$__a", :"$9", :"@1", :"$", :"$?"
 p %i[$! $; $,].map(&:inspect)
+#==#
+r = Rational(7, 3)
+p r.floor(1), r.ceil(1), r.truncate(1), r.round(1), r.floor(-1), r.ceil(-1), r.round(0), r.floor(0), r.truncate, (-r).truncate, (-r).truncate(2)
+p Rational(5, 2).round, Rational(-5, 2).round, Rational(5, 2).round(half: :even), Rational(5, 2).round(half: :down), Rational(-5, 2).round(half: :down), Rational(25, 100).round(1, half: :even), Rational(35, 100).round(1, half: :down)
+p Rational(4, 1).floor(1), Rational(123, 1).round(-1), Rational(125, 1).round(-1, half: :even), Rational(1, 3).ceil(3), (r.floor(1.5) rescue $!), (r.round(half: :foo) rescue $!), (r.floor(nil) rescue $!)
+#==#
+o = Object.new; def o.hi = 1; c = o.clone; p c.respond_to?(:hi), c.hi, c.singleton_methods, o.dup.respond_to?(:hi)
+module CloneExt; def ext = 2; end
+o2 = Object.new; o2.extend(CloneExt); p o2.clone.ext, o2.dup.respond_to?(:ext), o2.clone.singleton_class.include?(CloneExt), o2.clone.is_a?(CloneExt), o2.dup.is_a?(CloneExt)
+s = +"str"; def s.shout = upcase; p s.clone.shout, (s.dup.shout rescue $!.class)

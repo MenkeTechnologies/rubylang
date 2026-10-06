@@ -2487,6 +2487,27 @@ impl RubyHost {
     /// Shallow copy of `v` for `Object#dup`/`clone`: reference types get a fresh
     /// heap object whose contents alias the original (like Ruby's shallow dup);
     /// immediates (Int/Float/Bool/nil/Symbol) return unchanged.
+    /// Give `to` a copy of `from`'s singleton class — its own singleton methods
+    /// and the modules it was extended with — as MRI `rb_obj_clone` does
+    /// (`rb_singleton_class_clone`). `dup` does not call this.
+    pub fn copy_singleton(&mut self, from: &Value, to: &Value) {
+        let (Value::Obj(src), Value::Obj(dst)) = (from, to) else {
+            return;
+        };
+        let (src, dst) = (*src, *dst);
+        if let Some(m) = self.singleton_methods.get(&src).cloned() {
+            self.singleton_methods.insert(dst, m);
+        }
+        if let Some(m) = self.singleton_define_methods.get(&src).cloned() {
+            self.singleton_define_methods.insert(dst, m);
+        }
+        if let Some(e) = self.object_extends.get(&src).cloned() {
+            self.object_extends.insert(dst, e);
+        }
+        if let Some(e) = self.extended_singletons.get(&src).cloned() {
+            self.extended_singletons.insert(dst, e);
+        }
+    }
     pub fn dup_value(&mut self, v: &Value) -> Value {
         match self.obj(v) {
             // Interned symbols and class references dup to themselves in Ruby;

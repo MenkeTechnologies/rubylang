@@ -4035,3 +4035,41 @@ Enumerator::Yielder
 :"$"
 :$?
 [":$!", ":$;", ":$,"]
+#==#
+(23/10)
+(12/5)
+(23/10)
+(23/10)
+0
+10
+2
+2
+2
+-2
+(-233/100)
+3
+-3
+2
+2
+-2
+(1/5)
+(3/10)
+(4/1)
+120
+120
+(167/500)
+#<TypeError: not an integer>
+#<ArgumentError: invalid rounding mode: foo>
+#<TypeError: not an integer>
+#==#
+true
+1
+[:hi]
+false
+2
+false
+true
+true
+false
+"STR"
+NoMethodError
