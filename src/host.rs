@@ -3466,6 +3466,13 @@ impl RubyHost {
             _ => None,
         }
     }
+    /// Replace the pattern a MatchData records — `MatchData#regexp` builds the
+    /// Regexp of a String-pattern match on first use and keeps it.
+    pub fn set_matchdata_regexp(&mut self, v: &Value, re: Value) {
+        if let Some(RObj::MatchData { regexp, .. }) = self.obj_mut(v) {
+            *regexp = re;
+        }
+    }
     /// The compiled matcher + source of a regex value, if `v` is one.
     pub fn as_regex(&self, v: &Value) -> Option<(std::sync::Arc<fancy_regex::Regex>, String)> {
         match self.obj(v) {
@@ -8343,14 +8350,28 @@ impl RubyHost {
                     };
                     format!("{lo_s}{}{hi_s}", if exclusive { "..." } else { ".." })
                 }
+                // A match made by a String pattern (`sub`/`gsub`/`scan` with a
+                // String) carries no Regexp yet, and MRI `match_inspect` shows it
+                // as `#<MatchData: TEXT>` — the whole match by `to_s`, no groups —
+                // until `#regexp` builds one.
+                Some(RObj::MatchData { groups, regexp, .. }) if self.as_str(&regexp).is_some() => {
+                    let whole = groups.first().and_then(|g| g.clone()).unwrap_or_default();
+                    format!("#<MatchData: {whole}>")
+                }
                 // `#<MatchData "ll" 1:"l">` — whole match then numbered groups.
-                Some(RObj::MatchData { groups, .. }) => {
+                // MRI `match_inspect` labels a named group by its name.
+                Some(RObj::MatchData { groups, names, .. }) => {
                     let whole = groups.first().and_then(|g| g.clone()).unwrap_or_default();
                     let mut out = format!("#<MatchData {whole:?}");
                     for (i, g) in groups.iter().enumerate().skip(1) {
+                        let label = names
+                            .iter()
+                            .rev()
+                            .find(|(_, idx)| *idx == i)
+                            .map_or_else(|| i.to_string(), |(n, _)| n.clone());
                         match g {
-                            Some(s) => out.push_str(&format!(" {i}:{}", inspect_string(s))),
-                            None => out.push_str(&format!(" {i}:nil")),
+                            Some(s) => out.push_str(&format!(" {label}:{}", inspect_string(s))),
+                            None => out.push_str(&format!(" {label}:nil")),
                         }
                     }
                     out.push('>');

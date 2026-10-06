@@ -1880,6 +1880,30 @@ impl Compiler {
                 // (Ruby drops it). Evaluate operands into temps in source order,
                 // call `[]=`, discard its result, yield the RHS.
                 let tr = self.eval_to_temp(b, recv)?;
+                if idx.iter().any(|i| matches!(i, Expr::Splat(_))) {
+                    // A spread index (`a[*i] = v`) is `recv.[]=(*i, v)`: the
+                    // operands still go to temps in source order, and the
+                    // splatted ones are spread back out at the call.
+                    let mut spread = Vec::with_capacity(idx.len() + 1);
+                    for i in idx {
+                        spread.push(match i {
+                            Expr::Splat(inner) => Expr::Splat(Box::new(Expr::Var(
+                                VarKind::Local,
+                                self.eval_to_temp(b, inner)?,
+                            ))),
+                            _ => Expr::Var(VarKind::Local, self.eval_to_temp(b, i)?),
+                        });
+                    }
+                    let tv = self.eval_to_temp(b, value)?;
+                    spread.push(Expr::Var(VarKind::Local, tv.clone()));
+                    self.compile_expr(b, &Expr::Var(VarKind::Local, tr))?;
+                    self.kstr(b, "[]=");
+                    self.compile_spread(b, &spread)?;
+                    b.emit(Op::CallBuiltin(ops::CALL_METHOD_ARR, 3), self.cur_line);
+                    b.emit(Op::Pop, 0);
+                    self.compile_expr(b, &Expr::Var(VarKind::Local, tv))?;
+                    return Ok(());
+                }
                 let tis = idx
                     .iter()
                     .map(|i| self.eval_to_temp(b, i))

@@ -1946,7 +1946,7 @@ pub(crate) fn dispatch_by_type(
         // Both share one handler: it reads the `unbound` tag off the value to
         // pick the bound/unbound behaviour per method.
         "Method" | "UnboundMethod" => dispatch_method(recv, name, args, block),
-        "Regexp" => dispatch_regexp(recv, name, args),
+        "Regexp" => dispatch_regexp(recv, name, args, block),
         "MatchData" => dispatch_matchdata(recv, name, args),
         "Set" => dispatch_set(recv, name, args, block),
         "Time" => dispatch_time(recv, name, args),
@@ -6066,7 +6066,7 @@ fn enumerable_method(
     }
     let elems = enum_to_vec(recv)?;
     let arr = with_host(|h| h.new_array(elems));
-    let out = dispatch_array(&arr, name, args, block)?;
+    let out = enum_delegate(&arr, name, args, block)?;
     // The Array dispatcher recorded the TEMPORARY array as the Enumerator's
     // source; the real one is this receiver (`(1..3).each_with_index` inspects as
     // `#<Enumerator: 1..3:each_with_index>`, not as the materialized array).
@@ -9449,11 +9449,14 @@ fn dispatch_string_body(
             }
         }))),
         "end_with?" => Ok(Value::Bool(args.iter().any(|a| s.ends_with(&arg_str(a))))),
-        "match?" => {
-            let m = str_regex(&args[0])
-                .map(|re| re.is_match(&s).unwrap_or(false))
-                .unwrap_or(false);
-            Ok(Value::Bool(m))
+        // `rb_str_match_m` / `rb_str_match_m_p`: the pattern goes through
+        // `get_pat`, then the Regexp's own `match`/`match?` runs with this
+        // string and the optional position (and block).
+        "match?" | "match" => {
+            let pat = get_pat(&args[0])?;
+            let mut rargs = vec![recv.clone()];
+            rargs.extend(args.iter().skip(1).cloned());
+            dispatch_regexp(&pat, name, &rargs, block)
         }
         "=~" => match str_regex(&args[0]) {
             // `=~` sets `$~`/`$1`.. as a side effect, then yields the char offset.
@@ -9480,23 +9483,44 @@ fn dispatch_string_body(
                 _ => dispatch(&args[0], "=~", std::slice::from_ref(recv), None),
             },
         },
-        "match" => match str_regex(&args[0]) {
-            Some(re) => Ok(match_data(&re, &s, &args[0])),
-            None => Ok(Value::Undef),
-        },
-        "scan" => match str_regex(&args[0]) {
-            // With a block, yield each match and return the string (self); each
-            // yielded value is the whole match, or the capture-group array for a
-            // grouped pattern. Without a block, collect them into an array.
-            Some(re) => match &block {
+        // With a block, yield each match and return the string (self); each
+        // yielded value is the whole match, or the capture-group array for a
+        // grouped pattern. Without a block, collect them into an array.
+        //
+        // MRI `rb_str_scan` takes the pattern through `get_pat_quoted`: a
+        // String is a LITERAL (`"a.c".scan(".")` is `["."]`), anything but a
+        // String or Regexp is a TypeError. Either way `$~` is the last match
+        // afterwards, or nil when there was none.
+        "scan" => {
+            let re = match str_regex(&args[0]) {
+                Some(re) => re,
+                None => {
+                    let lit = with_host(|h| h.as_str(&args[0])).ok_or_else(|| {
+                        raise_exc(
+                            "TypeError",
+                            &format!(
+                                "wrong argument type {} (expected Regexp)",
+                                conv_operand_name(&args[0])
+                            ),
+                        )
+                    })?;
+                    std::sync::Arc::new(
+                        fancy_regex::Regex::new(&regex_escape(&lit))
+                            .map_err(|e| raise_exc("RegexpError", &e.to_string()))?,
+                    )
+                }
+            };
+            let out = match &block {
                 Some(bl) => {
                     scan_each(&re, &s, bl, &args[0])?;
-                    Ok(recv.clone())
+                    recv.clone()
                 }
-                None => Ok(scan_regex(&re, &s)),
-            },
-            None => Ok(new_arr(vec![])),
-        },
+                None => scan_regex(&re, &s),
+            };
+            let last = ruby_matches(&re, &s).pop();
+            set_match_globals(last.as_ref().map(|c| (c, s.as_str())), &re, &args[0]);
+            Ok(out)
+        }
         "split" => {
             let limit = args.get(1).map(as_i).unwrap_or(0);
             // Awk mode: no separator, or a single-space string. Splits on runs of
@@ -9533,22 +9557,16 @@ fn dispatch_string_body(
                 return regex_replace(&re, &s, &args[1..], &block, all, &args[0]);
             }
             let from = arg_str(&args[0]);
-            // With a block the pattern is the ONLY argument, so there is no
-            // `args[1]` to read: the block's value replaces each match. A String
-            // pattern is a literal one, so it is escaped into a Regexp and run
-            // through the same path — which is also what gives the block the `$~`
-            // MRI sets for a String pattern (`"aXb".gsub("X") { $~[0] }`).
-            if block.is_some() {
-                let re = fancy_regex::Regex::new(&regex_escape(&from))
-                    .map_err(|e| raise_exc("RegexpError", &e.to_string()))?;
-                return regex_replace(&re, &s, &[], &block, all, &args[0]);
-            }
-            let to = arg_str(&args[1]);
-            Ok(new_str(if all {
-                s.replace(&from, &to)
-            } else {
-                s.replacen(&from, &to, 1)
-            }))
+            // A String pattern is a literal one, so it is escaped into a Regexp
+            // and run through the same path. That gives the block the `$~` MRI
+            // sets for a String pattern (`"aXb".gsub("X") { $~[0] }`), a Hash
+            // replacement its lookup, and a replacement STRING its back-reference
+            // expansion: MRI runs `rb_reg_regsub` whatever the pattern's type,
+            // so `"abc".sub("b", '<\0>')` is "a<b>c" and `'\\\\'` is one
+            // backslash. A plain `str.replace` inserted the replacement verbatim.
+            let re = fancy_regex::Regex::new(&regex_escape(&from))
+                .map_err(|e| raise_exc("RegexpError", &e.to_string()))?;
+            regex_replace(&re, &s, &args[1..], &block, all, &args[0])
         }
         "replace" => {
             let n = arg_str(&args[0]);
@@ -10047,10 +10065,77 @@ fn str_find(s: &str, needle: &str, pos: Option<i64>, rev: bool) -> Value {
 /// int+len, or Range) with the trailing replacement string, mutating `recv`.
 fn str_index_set(recv: &Value, s: &str, args: &[Value]) -> Result<Value, String> {
     let (sel, repl) = args.split_at(args.len() - 1);
-    let val = arg_str(&repl[0]);
     let mut chars: Vec<char> = s.chars().collect();
     let len = chars.len();
-    let (start, end) = match sel {
+    let byte_to_char = |b: usize| s[..b].chars().count();
+    // MRI `rb_str_subpat_set`: a Regexp index (with an optional group number
+    // or name) replaces that group of the first match, which also sets `$~`.
+    if let Some(re) = sel.first().and_then(str_regex) {
+        let md = match_data(&re, s, &sel[0]);
+        if matches!(md, Value::Undef) {
+            return Err(raise_exc("IndexError", "regexp not matched"));
+        }
+        let caps = re.captures(s).ok().flatten().expect("matched above");
+        let ngroups = caps.len() as i64;
+        let nth = match sel.get(1) {
+            None => 0,
+            Some(Value::Int(n)) => *n,
+            Some(name) => {
+                let nm = arg_str(name);
+                match re.capture_names().position(|n| n == Some(nm.as_str())) {
+                    Some(i) => i as i64,
+                    None => {
+                        return Err(raise_exc(
+                            "IndexError",
+                            &format!("undefined group name reference: {nm}"),
+                        ))
+                    }
+                }
+            }
+        };
+        if nth >= ngroups || (nth < -1 && -nth >= ngroups) {
+            return Err(raise_exc(
+                "IndexError",
+                &format!("index {nth} out of regexp"),
+            ));
+        }
+        let nth = if nth < 0 { nth + ngroups } else { nth } as usize;
+        let Some(g) = caps.get(nth) else {
+            return Err(raise_exc(
+                "IndexError",
+                &format!("regexp group {nth} not matched"),
+            ));
+        };
+        let val = implicit_str(&repl[0])?;
+        let (st, e) = (byte_to_char(g.start()), byte_to_char(g.end()));
+        chars.splice(st..e, val.chars());
+        with_host(|h| h.set_str(recv, chars.into_iter().collect()));
+        return Ok(repl[0].clone());
+    }
+    // A String index replaces its first occurrence (`rb_str_aset`, T_STRING).
+    if let [idx] = sel {
+        if let Some(needle) = with_host(|h| h.as_str(idx)) {
+            let Some(b) = s.find(&needle) else {
+                return Err(raise_exc("IndexError", "string not matched"));
+            };
+            let val = implicit_str(&repl[0])?;
+            let st = byte_to_char(b);
+            chars.splice(st..st + needle.chars().count(), val.chars());
+            with_host(|h| h.set_str(recv, chars.into_iter().collect()));
+            return Ok(repl[0].clone());
+        }
+    }
+    let val = arg_str(&repl[0]);
+    // Anything that is not a Range is a position: `NUM2LONG` converts it (a
+    // Float truncates, nil is a TypeError), as MRI `rb_str_aset` falls through.
+    let conv: Vec<Value> = match sel {
+        [one] if with_host(|h| h.as_range(one)).is_some() => sel.to_vec(),
+        _ => sel
+            .iter()
+            .map(|v| to_int(v).map(Value::Int))
+            .collect::<Result<_, _>>()?,
+    };
+    let (start, end) = match conv.as_slice() {
         [Value::Int(i)] => {
             let k = match norm_idx(*i, len) {
                 Some(k) if k < len => k,
@@ -10301,7 +10386,19 @@ fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value,
         // `#regexp` — the pattern the match ran against, retained on the
         // MatchData when it was built. This used to answer nil unconditionally,
         // which is a legal MatchData shape nowhere in MRI.
-        "regexp" => Ok(with_host(|h| h.matchdata_regexp(recv)).unwrap_or(Value::Undef)),
+        //
+        // A String-pattern match records the String; MRI `match_regexp` turns it
+        // into the quoted Regexp on first call and stores it, which also changes
+        // the MatchData's `inspect` from `#<MatchData: b>` to `#<MatchData "b">`.
+        "regexp" => {
+            let re = with_host(|h| h.matchdata_regexp(recv)).unwrap_or(Value::Undef);
+            let Some(src) = with_host(|h| h.as_str(&re)) else {
+                return Ok(re);
+            };
+            let built = with_host(|h| h.new_regex(&regex_escape(&src), ""))?;
+            with_host(|h| h.set_matchdata_regexp(recv, built.clone()));
+            Ok(built)
+        }
         // The position methods. `#begin`/`#end`/`#offset` count CHARACTERS and
         // `#bytebegin`/`#byteend`/`#byteoffset` count BYTES; the two agree only
         // while the subject is all-ASCII, so the character forms convert
@@ -10683,35 +10780,67 @@ fn regex_replace(
     all: bool,
     re_val: &Value,
 ) -> Result<Value, String> {
+    // MRI `rb_str_sub_bang`/`str_gsub`: without a block the replacement is a
+    // Hash (`rb_check_hash_type`) or else must convert with `StringValue`, so
+    // `"x".gsub("x", 1)` is a TypeError — checked once, before any match.
+    let hash = if block.is_none() {
+        rest.first()
+            .filter(|v| with_host(|h| h.as_hash(v)).is_some())
+    } else {
+        None
+    };
+    let repl = match (block, hash, rest.first()) {
+        (None, None, Some(v)) => Some(implicit_str(v)?),
+        _ => None,
+    };
     let mut out = String::new();
     let mut last = 0;
+    let mut matched_any = false;
     for (count, caps) in ruby_matches(re, s).into_iter().enumerate() {
         if !all && count >= 1 {
             break;
         }
+        matched_any = true;
         let m = caps.get(0).unwrap();
         out.push_str(&s[last..m.start()]);
+        // `$~`/`$1`.. are the current match for the block, and the LAST match
+        // once the call returns, whatever the replacement form.
+        set_match_globals(Some((&caps, s)), re, re_val);
         if let Some(bl) = block {
-            // Expose `$~`/`$1`.. to the block for the current match.
-            set_match_globals(Some((&caps, s)), re, re_val);
             let r = call_proc(bl, &[new_str(m.as_str().to_string())])?;
             out.push_str(&with_host(|h| h.to_s(&r)));
-        } else if let Some(map) = rest.first().and_then(|v| with_host(|h| h.as_hash(v))) {
-            // `gsub(re, hash)`: each match is replaced by `hash[match]` (empty for
-            // a key the hash lacks).
+        } else if let Some(map) = hash {
+            // `gsub(re, hash)`: each match is replaced by `hash[match]` through
+            // `rb_hash_aref`, so a default or default proc answers a missing key.
             let matched = new_str(m.as_str().to_string());
-            let key = with_host(|h| h.value_to_key(&matched));
-            if let Some(v) = map.get(&key) {
-                out.push_str(&with_host(|h| h.to_s(v)));
-            }
-        } else {
-            let repl = arg_str(&rest[0]);
-            out.push_str(&expand_backrefs(&repl, &caps, re, s)?);
+            let v = dispatch(map, "[]", &[matched], None)?;
+            out.push_str(&with_host(|h| h.to_s(&v)));
+        } else if let Some(repl) = &repl {
+            out.push_str(&expand_backrefs(repl, &caps, re, s)?);
         }
         last = m.end();
     }
+    // A search that finds nothing clears `$~` (`rb_pat_search` → `rb_backref_set(Qnil)`).
+    if !matched_any {
+        set_match_globals(None, re, re_val);
+    }
     out.push_str(&s[last..]);
     Ok(new_str(out))
+}
+
+/// MRI `StringValue`: a String as is, an object defining `to_str` through it,
+/// anything else the `no implicit conversion of X into String` TypeError.
+fn implicit_str(v: &Value) -> Result<String, String> {
+    if let Some(s) = with_host(|h| h.as_str(v)) {
+        return Ok(s);
+    }
+    if defines_own(v, "to_str") {
+        let r = dispatch(v, "to_str", &[], None)?;
+        if let Some(s) = with_host(|h| h.as_str(&r)) {
+            return Ok(s);
+        }
+    }
+    Err(conv_error(v, "String"))
 }
 
 /// Expand the back-references of a `sub`/`gsub` replacement string.
@@ -11296,6 +11425,41 @@ fn dedup_keep(items: Vec<Value>) -> Vec<Value> {
         }
     }
     out
+}
+
+/// MRI `rb_range_beg_len` with `err = 1` (the `Array#[]=` form): the start and
+/// slot count an Integer Range selects in a sequence of `len` elements. A
+/// start that stays negative after counting from the end is a RangeError; an
+/// end past the sequence is NOT clamped (the splice extends it).
+fn range_beg_len(
+    rv: &Value,
+    (lo, hi, excl): (i64, i64, bool),
+    len: i64,
+) -> Result<(i64, i64), String> {
+    let mut beg = if lo == crate::host::RANGE_BEGINLESS {
+        0
+    } else {
+        lo
+    };
+    let (mut end, excl) = if hi == crate::host::RANGE_ENDLESS {
+        (-1, false)
+    } else {
+        (hi, excl)
+    };
+    if beg < 0 {
+        beg += len;
+        if beg < 0 {
+            let shown = with_host(|h| h.inspect(rv));
+            return Err(raise_exc("RangeError", &format!("{shown} out of range")));
+        }
+    }
+    if end < 0 {
+        end += len;
+    }
+    if !excl {
+        end += 1;
+    }
+    Ok((beg, (end - beg).max(0)))
 }
 
 fn dispatch_array(
@@ -12489,15 +12653,91 @@ fn dispatch_array(
                 },
             }
         }
+        // MRI `rb_ary_aset`: `[start, length] = v` and `[range] = v` SPLICE the
+        // slots with `v` as an Array (`rb_ary_to_ary`: `[v]` unless it is one),
+        // and `[index] = v` stores one slot (`rb_ary_store`), padding with nil.
         "[]=" => {
-            let mut a = arr;
-            let idx = norm_idx(as_i(&args[0]), a.len()).unwrap_or(a.len());
-            while a.len() <= idx {
-                a.push(Value::Undef);
+            if !(2..=3).contains(&args.len()) {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!(
+                        "wrong number of arguments (given {}, expected 2..3)",
+                        args.len()
+                    ),
+                ));
             }
-            a[idx] = args[args.len() - 1].clone();
+            let val = args[args.len() - 1].clone();
+            let olen = arr.len() as i64;
+            let splice = match args.len() {
+                3 => Some((to_int(&args[0])?, to_int(&args[1])?)),
+                _ => match with_host(|h| h.as_range(&args[0])) {
+                    Some(r) => Some(range_beg_len(&args[0], r, olen)?),
+                    None => None,
+                },
+            };
+            let mut a = arr;
+            match splice {
+                Some((beg, len)) => {
+                    let rpl = match with_host(|h| h.as_array(&val)) {
+                        Some(r) => r,
+                        None if defines_own(&val, "to_ary") => {
+                            let r = dispatch(&val, "to_ary", &[], None)?;
+                            with_host(|h| h.as_array(&r)).unwrap_or_else(|| vec![val.clone()])
+                        }
+                        None => vec![val.clone()],
+                    };
+                    if len < 0 {
+                        return Err(raise_exc("IndexError", &format!("negative length ({len})")));
+                    }
+                    let mut beg = beg;
+                    if beg < 0 {
+                        beg += olen;
+                        if beg < 0 {
+                            return Err(raise_exc(
+                                "IndexError",
+                                &format!(
+                                    "index {} too small for array; minimum: -{olen}",
+                                    beg - olen
+                                ),
+                            ));
+                        }
+                    }
+                    let len = if olen < len || olen < beg + len {
+                        olen - beg
+                    } else {
+                        len
+                    };
+                    let (beg, len) = (beg as usize, len.max(0) as usize);
+                    if beg >= a.len() {
+                        a.resize(beg, Value::Undef);
+                        a.extend(rpl);
+                    } else {
+                        a.splice(beg..beg + len, rpl);
+                    }
+                }
+                None => {
+                    let mut idx = to_int(&args[0])?;
+                    if idx < 0 {
+                        idx += olen;
+                        if idx < 0 {
+                            return Err(raise_exc(
+                                "IndexError",
+                                &format!(
+                                    "index {} too small for array; minimum: -{olen}",
+                                    idx - olen
+                                ),
+                            ));
+                        }
+                    }
+                    let idx = idx as usize;
+                    if a.len() <= idx {
+                        a.resize(idx + 1, Value::Undef);
+                    }
+                    a[idx] = val.clone();
+                }
+            }
             with_host(|h| h.set_array(recv, a));
-            Ok(args[args.len() - 1].clone())
+            Ok(val)
         }
         "take" => Ok(new_arr(
             arr.into_iter()
@@ -14576,7 +14816,7 @@ fn dispatch_enumerator(
         // Every non-iteration message is delegated to the buffered values as an
         // Array, preserving the full Enumerable surface (`map`, `to_a`,
         // `select`, …) that block-less calls exposed before Enumerator existed.
-        _ => remap_array_delegate(dispatch_array(&new_arr(buf), name, args, block), recv, name),
+        _ => remap_array_delegate(enum_delegate(&new_arr(buf), name, args, block), recv, name),
     }
 }
 
@@ -19041,29 +19281,7 @@ fn dispatch_hash(
             for (k, v) in &map {
                 let kv = with_host(|h| h.key_value(k));
                 let r = call_proc(b, &[kv, v.clone()])?;
-                // MRI names nil/true/false by value here (`rb_builtin_class_name`).
-                let Some(pair) = with_host(|h| h.as_array(&r)) else {
-                    let what = match r {
-                        Value::Undef => "nil".to_string(),
-                        Value::Bool(b) => b.to_string(),
-                        _ => with_host(|h| h.class_of(&r)),
-                    };
-                    return Err(raise_exc(
-                        "TypeError",
-                        &format!("wrong element type {what} (expected array)"),
-                    ));
-                };
-                if pair.len() != 2 {
-                    return Err(raise_exc(
-                        "ArgumentError",
-                        &format!(
-                            "element has wrong array length (expected 2, was {})",
-                            pair.len()
-                        ),
-                    ));
-                }
-                let nk = with_host(|h| h.value_to_key(&pair[0]));
-                out.insert(nk, pair[1].clone());
+                hash_set_pair(&mut out, &r)?;
             }
             Ok(with_host(|h| h.new_hash(out)))
         }
@@ -19422,7 +19640,7 @@ fn dispatch_range(
         _ => {
             let arr: Vec<Value> = (lo..end).map(Value::Int).collect();
             let tmp = with_host(|h| h.new_array(arr));
-            remap_array_delegate(dispatch_array(&tmp, name, args, block), recv, name)
+            remap_array_delegate(enum_delegate(&tmp, name, args, block), recv, name)
         }
     }
 }
@@ -19707,7 +19925,7 @@ fn dispatch_obj_range(
         cur = dispatch(&cur, "succ", &[], None)?;
     }
     let arr = new_arr(elems);
-    dispatch_array(&arr, name, args, block)
+    enum_delegate(&arr, name, args, block)
 }
 
 fn dispatch_str_range(
@@ -19797,7 +20015,7 @@ fn dispatch_str_range(
         _ => {
             let arr = elems();
             let tmp = with_host(|h| h.new_array(arr));
-            remap_array_delegate(dispatch_array(&tmp, name, args, block), recv, name)
+            remap_array_delegate(enum_delegate(&tmp, name, args, block), recv, name)
         }
     }
 }
@@ -19855,13 +20073,8 @@ fn dispatch_symbol(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         "[]" | "slice" => str_index(&s, args),
         "start_with?" => Ok(Value::Bool(args.iter().any(|a| s.starts_with(&arg_str(a))))),
         "end_with?" => Ok(Value::Bool(args.iter().any(|a| s.ends_with(&arg_str(a))))),
-        // `match?` tests the name against a Regexp (or string pattern) without $~.
-        "match?" => {
-            let m = str_regex(&args[0])
-                .map(|re| re.is_match(&s).unwrap_or(false))
-                .unwrap_or(false);
-            Ok(Value::Bool(m))
-        }
+        // `match?` tests the name as `String#match?` would (`rb_sym_match_m_p`).
+        "match?" => dispatch_string(&new_str(s), name, args, None),
         // `<=>` compares names; nil when the other operand is not a Symbol.
         "<=>" => Ok(match with_host(|h| h.as_symbol(&args[0])) {
             Some(other) => Value::Int(match s.cmp(&other) {
@@ -20416,13 +20629,64 @@ fn regex_named_groups(source: &str) -> Vec<(String, i64)> {
     out
 }
 
-fn dispatch_regexp(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+/// The BYTE offset a `match`/`match?` search with character position `pos`
+/// starts at (`rb_reg_match_m`'s `reg_match_pos`): nil or absent is 0, a
+/// negative position counts from the end, and one that falls before the start
+/// or past the end is no search at all (`None`).
+fn reg_start_pos(s: &str, pos: Option<&Value>) -> Result<Option<usize>, String> {
+    let p = match pos {
+        None | Some(Value::Undef) => return Ok(Some(0)),
+        Some(v) => to_int(v)?,
+    };
+    let len = s.chars().count() as i64;
+    let p = if p < 0 { p + len } else { p };
+    if p < 0 || p > len {
+        return Ok(None);
+    }
+    Ok(Some(
+        s.char_indices().nth(p as usize).map_or(s.len(), |(b, _)| b),
+    ))
+}
+
+/// MRI `get_pat`: the Regexp a String method searches with. A String is
+/// compiled as a pattern SOURCE (not quoted — `"a.c".match(".")` matches
+/// `"a"`), and anything else is refused.
+fn get_pat(v: &Value) -> Result<Value, String> {
+    if str_regex(v).is_some() {
+        return Ok(v.clone());
+    }
+    match with_host(|h| h.as_str(v)) {
+        Some(src) => with_host(|h| h.new_regex(&src, "")).map_err(|e| raise_exc("RegexpError", &e)),
+        None => Err(raise_exc(
+            "TypeError",
+            &format!(
+                "wrong argument type {} (expected Regexp)",
+                conv_operand_name(v)
+            ),
+        )),
+    }
+}
+
+fn dispatch_regexp(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
     let (re, source) = with_host(|h| h.as_regex(recv)).unwrap();
     match name {
         "source" => Ok(new_str(source)),
         "match?" => {
+            // `rb_reg_match_p`: nil never matches, and `$~` is left alone.
+            if matches!(args.first(), Some(Value::Undef)) {
+                return Ok(Value::Bool(false));
+            }
             let s = arg_str(&args[0]);
-            Ok(Value::Bool(re.is_match(&s).unwrap_or(false)))
+            let found = match reg_start_pos(&s, args.get(1))? {
+                Some(at) => re.captures_from_pos(&s, at).ok().flatten().is_some(),
+                None => false,
+            };
+            Ok(Value::Bool(found))
         }
         "=~" => {
             let s = arg_str(&args[0]);
@@ -20435,8 +20699,24 @@ fn dispatch_regexp(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
                 .unwrap_or(Value::Undef))
         }
         "match" => {
+            // `rb_reg_match_m`: nil clears `$~` and answers nil; otherwise the
+            // search starts at the optional character position `pos` (negative
+            // counts from the end), and a block receives the MatchData and
+            // supplies the result.
+            if matches!(args.first(), Some(Value::Undef)) {
+                set_match_globals(None, &re, recv);
+                return Ok(Value::Undef);
+            }
             let s = arg_str(&args[0]);
-            Ok(match_data(&re, &s, recv))
+            let caps = match reg_start_pos(&s, args.get(1))? {
+                Some(at) => re.captures_from_pos(&s, at).ok().flatten(),
+                None => None,
+            };
+            let md = set_match_globals(caps.as_ref().map(|c| (c, s.as_str())), &re, recv);
+            match block {
+                Some(b) if !matches!(md, Value::Undef) => call_proc(&b, &[md]),
+                _ => Ok(md),
+            }
         }
         "scan" => {
             let s = arg_str(&args[0]);
@@ -26512,6 +26792,63 @@ fn check_public_visibility(recv: &Value, name: &str) -> Result<(), String> {
 /// buffer). If the method is missing there too, rewrite the resulting
 /// `NoMethodError` so it names the original receiver's class rather than
 /// `Array`.
+/// `dispatch_array` for an Enumerable that is NOT an Array, over its
+/// materialized elements. Everything is the Array implementation except
+/// `to_h`, which MRI implements separately for Enumerable (`enum_to_h` ->
+/// `rb_hash_set_pair`) with its own messages: no `at INDEX`, and nil/true/false
+/// named by value (`(1..2).to_h` is "wrong element type Integer (expected
+/// array)", not Array#to_h's "... at 0 ...").
+fn enum_delegate(
+    arr: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    if name != "to_h" || !args.is_empty() {
+        return dispatch_array(arr, name, args, block);
+    }
+    let elems = with_host(|h| h.as_array(arr)).unwrap_or_default();
+    let mut m = IndexMap::new();
+    for x in &elems {
+        let elem = match &block {
+            Some(b) => call_proc(b, std::slice::from_ref(x))?,
+            None => x.clone(),
+        };
+        if has_pending_signal() {
+            return Ok(Value::Undef);
+        }
+        hash_set_pair(&mut m, &elem)?;
+    }
+    Ok(with_host(|h| h.new_hash(m)))
+}
+
+/// MRI `rb_hash_set_pair`: store a `[key, value]` element into a hash being
+/// built by `Enumerable#to_h` / block `Hash#to_h`, refusing anything else.
+fn hash_set_pair(m: &mut IndexMap<RKey, Value>, elem: &Value) -> Result<(), String> {
+    let Some(pair) = with_host(|h| h.as_array(elem)) else {
+        // `rb_builtin_class_name`: nil/true/false by value, else the class.
+        return Err(raise_exc(
+            "TypeError",
+            &format!(
+                "wrong element type {} (expected array)",
+                conv_operand_name(elem)
+            ),
+        ));
+    };
+    if pair.len() != 2 {
+        return Err(raise_exc(
+            "ArgumentError",
+            &format!(
+                "element has wrong array length (expected 2, was {})",
+                pair.len()
+            ),
+        ));
+    }
+    let k = with_host(|h| h.value_to_key(&pair[0]));
+    m.insert(k, pair[1].clone());
+    Ok(())
+}
+
 fn remap_array_delegate(
     r: Result<Value, String>,
     recv: &Value,

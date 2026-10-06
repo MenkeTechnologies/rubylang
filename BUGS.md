@@ -1146,7 +1146,15 @@ Honest limitations of this surface:
   full escape set `\0`, `\1`..`\9`, `\&`, `` \` ``, `\'`, `\+`, `\\` and
   `\k<name>`; an unrecognized escape keeps its backslash, and `\k<name>` naming
   no group is an `IndexError`), and `Regexp#{source,match,scan,match?}`
-  plus `case`/`when /re/` case-equality. A successful match sets the globals
+  plus `case`/`when /re/` case-equality. `match`/`match?` take an optional
+  start position (negative counts from the end) and `match` a block; on a
+  String receiver a String pattern is compiled as a regexp SOURCE (MRI
+  `get_pat`: `"a.c".match(".")` matches `"a"`), while `scan`/`sub`/`gsub`
+  treat it as a LITERAL with the same replacement escapes and Hash lookup as a
+  Regexp. After `sub`/`gsub`/`scan` `$~` is the last match, or nil when
+  nothing matched; a String-pattern match inspects as `#<MatchData: text>`
+  until `#regexp` builds its quoted Regexp, as in MRI. `String#[]=` takes a
+  Regexp index (optionally with a group number or name) or a String index. A successful match sets the globals
   `$~` (MatchData), `$&` (whole match), `` $` ``/`$'` (pre/post text), `$+`
   (last group), and `$1`..`$9` (numbered groups) — visible after `=~`/`match`
   and inside a `sub`/`gsub` block. (`` $` `` reads correctly inside a *brace*

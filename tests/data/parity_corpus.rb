@@ -5282,3 +5282,65 @@ s = N.new(1, 2)
 [5, -3, 2, -2, :z, "b", 1.9, nil].each { |i| puts "[#{i.inspect}] #{(s[i].inspect rescue "#{$!.class}: #{$!.message}")}" }
 [5, :z].each { |i| r = begin; s[i] = 0; rescue => e; "#{e.class}: #{e.message}"; end; puts "[#{i.inspect}]= #{r}" }
 s[:a] = 9; s[-1] = 8; p s
+#==#
+p (1..5).each_slice(2).to_h rescue p $!
+p [[1]].to_h rescue p $!
+p (1..2).to_h rescue p $!
+p (1..2).to_h { [_1] } rescue p $!
+p (1..2).to_h { nil } rescue p $!
+p (1..2).to_h { [_1, _1 * 2] }, [3, 4].each_with_index.to_h, ('a'..'b').to_h { [_1, 1] }
+p({a: 1}.to_h { true }) rescue p $!
+class ToHE; include Enumerable; def each; yield [1, 2]; yield 3; end; end
+p ToHE.new.to_h rescue p $!
+#==#
+p "abc".gsub("b", '\\\\'), "abc".sub("b", '<\0>'), "abc".sub("b", '<\&\&>'), "abc".gsub("b", '\`|\''), "a.c".sub(".", '[\0]'), "abc".sub("b", '\1x')
+p "abc".gsub("", "-"), "aXbX".gsub("X", "X" => "1"), "a.b.c".gsub(".", "\\&\\&"), "a+b".sub("+", "\\\\+")
+p "ab".gsub(/./, Hash.new("z")), "ab".gsub(/a/, Hash.new { |h, k| k * 3 }), "ab".gsub(/a/, {"a" => 1})
+p(("x".gsub("x", 1) rescue $!), ("a".sub("a", :b) rescue $!))
+o = Object.new; def o.to_str = "S"; p "a".sub("a", o)
+#==#
+"xaxbx".gsub(/x/, "y"); p $~
+"xaxbx".gsub("x", "y"); p $~, $~.pre_match, $~.begin(0)
+"abc" =~ /a/; "q".gsub(/z/, "y"); p $~
+"abc" =~ /a/; "q".sub("z", "y"); p $~
+"xx".sub("x", "y"); m = $~; p m; p m.regexp; p m, m.to_s, m.captures
+"a.c".sub(".", "-"); p $~.regexp
+"abc".sub("b") { p $~; 1 }
+"xaxbx".scan("x"); p $~, $~.pre_match
+"xaxbx".scan(/x/); p $~
+"xaxbx".scan("q"); p $~
+#==#
+s = +"abc"; s["b"] = "BB"; p s
+s = +"hello"; s[/l+/] = "L"; p s, $~
+s = +"John Smith"; s[/(\w+) (\w+)/, 2] = "Doe"; p s
+s = +"John Smith"; s[/(?<f>\w+) (?<l>\w+)/, "f"] = "Jane"; p s
+s = +"John Smith"; s[/(?<f>\w+) (?<l>\w+)/, :l] = "X"; p s
+[["z"], [/z/], [/(a)/, 2], [/(a)/, -3], [/(a)|(b)/, 2], [/(a)/, "zz"]].each do |idx|
+  s = +"ab"
+  begin; s[*idx] = "q"; rescue => e; p e; end
+end
+s = +"ab"; (s[/(a)/] = 5) rescue p $!
+s = +"日本語"; s["本"] = "x"; p s; s[/語/] = "yy"; p s
+s = +"ab"; r = (s[/(a)/, -1] = "Q"); p r, s
+#==#
+p "abc".match("b"), $~, "abc".match?("b"), "a.c".match("."), "abc" =~ /(?<x>b)(c)/, $~, /(?<x>b)(?<y>z)?/.match("b")
+p(/b/.match("abcb") { |m| m.pre_match }, /b/.match("abcb", 2).pre_match, /b/.match("abcb", -1).begin(0), /b/.match("abc", -5), /\Ab/.match("ab", 1), /(?<=a)b/.match("ab", 1))
+p /b/.match?("abc", 2), /b/.match?(nil), /b/.match(nil), $~
+p "abcb".match("b", 2).begin(0), "abc".match("b") { 5 }, "abc".match?("b", 1), ("abc".match(1) rescue $!), ("abc".match?(nil) rescue $!)
+p "a.c".scan("."), "a b#c-d".scan(" "), "x?y".scan("?"), ("ab".scan(1) rescue $!), :abc.match?("b"), :abc.match?(/z/), "ab".match(/(?<a>a)/) { |m| m[:a] }
+#==#
+a = [1, 2, 3]; a[0..1] = 9; p a; a[5] = 1; p a; a[1, 0] = [7, 8]; p a
+a = [1, 2, 3]; a[0, 2] = 9; p a; a[1..] = []; p a; a[..0] = [4, 5]; p a; a[10..12] = 0; p a
+a = [1, 2]; a[-1, 1] = [:x, :y]; p a; a[1...-1] = :z; p a; a[-1..] = nil; p a
+[[-9], [-9, 1], [0, -1], [-9..1]].each { |i| b = [1, 2]; begin; b[*i] = 0; rescue => e; p e; end }
+a = [1, 2]; (a[nil] = 1) rescue p $!; a[1.9] = :f; p a
+o = Object.new; def o.to_ary = [:t, :u]; a = [1, 2]; a[0, 1] = o; p a
+x = [1, 2, 3]; p(x[0, 2] = 5); p x
+a = [1, 2].freeze; (a[0, 1] = 3) rescue p $!
+#==#
+a = [1, 2, 3]; i = [0, 2]; a[*i] = 9; p a
+h = {}; k = [:x]; h[*k] = 1; p h
+class SplatAset; def []=(*a); p(a); end; end; SplatAset.new[*[1, 2]] = 3
+s = +"ab"; idx = ["a"]; s[*idx] = "q"; p s
+s = +"ab"; (s[nil] = "x") rescue p $!
+s = +"ab"; s[1.5] = "x"; p s

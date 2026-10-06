@@ -3875,3 +3875,125 @@ N [{"a" => 1}] -> #<struct N a={"a" => 1}, b=nil>
 [5]= IndexError: offset 5 too large for struct(size:2)
 [:z]= NameError: no member 'z' in struct
 #<struct N a=9, b=8>
+#==#
+#<ArgumentError: element has wrong array length (expected 2, was 1)>
+#<ArgumentError: wrong array length at 0 (expected 2, was 1)>
+#<TypeError: wrong element type Integer (expected array)>
+#<ArgumentError: element has wrong array length (expected 2, was 1)>
+#<TypeError: wrong element type nil (expected array)>
+{1 => 2, 2 => 4}
+{3 => 0, 4 => 1}
+{"a" => 1, "b" => 1}
+#<TypeError: wrong element type true (expected array)>
+#<TypeError: wrong element type Integer (expected array)>
+#==#
+"a\\c"
+"a<b>c"
+"a<bb>c"
+"aa|'c"
+"a[.]c"
+"axc"
+"-a-b-c-"
+"a1b1"
+"a..b..c"
+"a\\+b"
+"zz"
+"aaab"
+"1b"
+#<TypeError: no implicit conversion of Integer into String>
+#<TypeError: no implicit conversion of Symbol into String>
+"S"
+#==#
+#<MatchData "x">
+#<MatchData: x>
+"xaxb"
+4
+nil
+nil
+#<MatchData: x>
+/x/
+#<MatchData "x">
+"x"
+[]
+/\./
+#<MatchData: b>
+#<MatchData: x>
+"xaxb"
+#<MatchData "x">
+nil
+#==#
+"aBBc"
+"heLo"
+#<MatchData "ll">
+"John Doe"
+"Jane Smith"
+"John X"
+#<IndexError: string not matched>
+#<IndexError: regexp not matched>
+#<IndexError: index 2 out of regexp>
+#<IndexError: index -3 out of regexp>
+#<IndexError: regexp group 2 not matched>
+#<IndexError: undefined group name reference: zz>
+#<TypeError: no implicit conversion of Integer into String>
+"日x語"
+"日xyy"
+"Q"
+"Qb"
+#==#
+#<MatchData "b">
+#<MatchData "b">
+true
+#<MatchData "a">
+1
+#<MatchData "bc" x:"b">
+#<MatchData "b" x:"b" y:nil>
+"a"
+"abc"
+3
+nil
+nil
+#<MatchData "b">
+false
+false
+nil
+nil
+3
+5
+true
+#<TypeError: wrong argument type Integer (expected Regexp)>
+#<TypeError: wrong argument type nil (expected Regexp)>
+["."]
+[" "]
+["?"]
+#<TypeError: wrong argument type Integer (expected Regexp)>
+true
+false
+"a"
+#==#
+[9, 3]
+[9, 3, nil, nil, nil, 1]
+[9, 7, 8, 3, nil, nil, nil, 1]
+[9, 3]
+[9]
+[4, 5]
+[4, 5, nil, nil, nil, nil, nil, nil, nil, nil, 0]
+[1, :x, :y]
+[1, :z, :y]
+[1, :z, nil]
+#<IndexError: index -9 too small for array; minimum: -2>
+#<IndexError: index -9 too small for array; minimum: -2>
+#<IndexError: negative length (-1)>
+#<RangeError: -9..1 out of range>
+#<TypeError: no implicit conversion from nil to integer>
+[1, :f]
+[:t, :u, 2]
+5
+[5, 3]
+#<FrozenError: can't modify frozen Array: [1, 2]>
+#==#
+[9, 3]
+{x: 1}
+[1, 2, 3]
+"qb"
+#<TypeError: no implicit conversion from nil to integer>
+"ax"
