@@ -3755,3 +3755,47 @@ nil
 9
 20
 [1, 2]
+#==#
+true
+true
+true
+1
+-1
+Infinity
+-Infinity
+nil
+false
+#==#
+gcd: "undefined method 'gcd' for an instance of Float"
+lcm: "undefined method 'lcm' for an instance of Float"
+ceildiv: "undefined method 'ceildiv' for an instance of Float"
+chr: "undefined method 'chr' for an instance of Float"
+digits: "undefined method 'digits' for an instance of Float"
+bit_length: "undefined method 'bit_length' for an instance of Float"
+times: "undefined method 'times' for an instance of Float"
+even?: "undefined method 'even?' for an instance of Float"
+odd?: "undefined method 'odd?' for an instance of Float"
+pred: "undefined method 'pred' for an instance of Float"
+succ: "undefined method 'succ' for an instance of Float"
+pow: "undefined method 'pow' for an instance of Float"
+allbits?: "undefined method 'allbits?' for an instance of Float"
+size: "undefined method 'size' for an instance of Float"
+next: "undefined method 'next' for an instance of Float"
+#==#
+(0.0+2.8284271247461903i)
+(0.0-0.816496580927726i)
+(0.0-8.0i)
+(0.0+32.0i)
+4.0
+-512.0
+(0.0+3.0i)
+#==#
+-1
+1
+0
+nil
+-1
+1
+nil
+-1
+nil

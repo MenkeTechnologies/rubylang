@@ -5230,3 +5230,22 @@ p c.each { }, c.to_a, c.next, c.with_index.to_a, c.each_with_index { }, c.select
 begin; c.next; c.next; rescue StopIteration => x; p x.result; end
 p [1, 2].to_enum.size, [1, 2].to_enum(:map).size, [1, 2].each.size, {a: 1}.to_enum.size, [1, 2].to_enum { 9 }.size
 p [1, 2, 3].enum_for(:each_slice, 2) { |n| n * 10 }.size, [1, 2].to_enum.each { }
+#==#
+# ── an infinite Float orders against a Bignum past the double range ──
+big = 10**400
+p Float::INFINITY > big, big < Float::INFINITY, -Float::INFINITY < -big, Float::INFINITY <=> big, big <=> Float::INFINITY
+p [big, Float::INFINITY, 1.0].max, [big, -Float::INFINITY].min, (Float::NAN <=> big), Float::INFINITY == big
+#==#
+# ── a Float answers none of the Integer-only methods ──
+%i[gcd lcm ceildiv chr digits bit_length times even? odd? pred succ pow allbits? size next].each do |m|
+  a = %i[gcd lcm ceildiv pow allbits?].include?(m) ? [2] : []
+  r = begin; 6.0.public_send(m, *a); rescue NoMethodError => e; e.message; end
+  puts "#{m}: #{r.inspect}"
+end
+#==#
+# ── a negative base to a non-integral power is Complex (on-axis results are exact) ──
+p (-8.0) ** 0.5, (-1.5) ** -0.5, (-4) ** 1.5, (-4) ** 2.5, (-2) ** 2.0, (-8.0) ** 3.0, (-9) ** 0.5
+#==#
+# ── Module#<=> ──
+module W; end; class A; end; class B < A; include W; end
+p B <=> A, A <=> B, A <=> A, A <=> String, B <=> W, W <=> B, A <=> 3, Integer <=> Comparable, String <=> Integer

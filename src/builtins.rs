@@ -4699,6 +4699,23 @@ fn dispatch_classref(
         // so this returns the empty array (correct at the top level; a namespaced
         // call site would report its enclosing modules in MRI).
         "nesting" if cls == "Module" => Ok(new_arr(vec![])),
+        // `Module#<=>` (`rb_mod_cmp`): 0 for the same module, -1 when the
+        // receiver descends from the argument, 1 the other way round, nil when
+        // they are unrelated or the argument is not a module.
+        "<=>" if args.len() == 1 => Ok(with_host(|h| {
+            let Some(other) = h.classref_name(&args[0]) else {
+                return Value::Undef;
+            };
+            if other == cls {
+                Value::Int(0)
+            } else if h.class_ancestry(cls).contains(&other) {
+                Value::Int(-1)
+            } else if h.class_ancestry(&other).iter().any(|a| a == cls) {
+                Value::Int(1)
+            } else {
+                Value::Undef
+            }
+        })),
         // `Module#ancestors` — the class/module ancestor chain as class refs.
         "ancestors" => Ok(with_host(|h| {
             let refs: Vec<Value> = h
@@ -6831,6 +6848,12 @@ fn dispatch_number(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    // Integer and Float share this dispatcher, but a Float does not answer the
+    // Integer-only methods (`gcd`, `even?`, `times`, `digits`, …): MRI's Float
+    // ancestry defines none of them.
+    if matches!(recv, Value::Float(_)) && integer_only_method(name) {
+        return Err(no_method_error(recv, name));
+    }
     // Promoted BigInt receivers need arbitrary-precision handling for the
     // methods that would otherwise truncate through `i64`.
     if let Some(b) = with_host(|h| h.as_promoted_bigint(recv)) {
@@ -6992,7 +7015,13 @@ fn dispatch_number(
                 let r = num_rational::BigRational::new(num_bigint::BigInt::from(1), denom);
                 return Ok(with_host(|h| h.new_rational(r)));
             }
-            Ok(Value::Float(as_f(recv).powf(coerce_num(recv, &args[0])?)))
+            // `fix_pow` / `flo_pow`: a negative base to a non-integral power is
+            // the Complex root on the principal branch.
+            let (x, y) = (as_f(recv), coerce_num(recv, &args[0])?);
+            if x < 0.0 && y != y.round() {
+                return Ok(dbl_complex_new_polar_pi((-x).powf(y), y));
+            }
+            Ok(Value::Float(x.powf(y)))
         }
         "/" => match (recv, &args[0]) {
             (Value::Int(_), Value::Int(0)) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
@@ -26113,6 +26142,60 @@ const HASH_MUTATORS: &[&str] = &[
     "transform_keys!",
 ];
 
+/// Whether MRI defines `name` on Integer but nowhere in Float's ancestry.
+fn integer_only_method(name: &str) -> bool {
+    use crate::arity_table::{ancestry, lookup};
+    lookup("Integer", name).is_some()
+        && ancestry("Float").is_some_and(|chain| chain.iter().all(|o| lookup(o, name).is_none()))
+}
+
+/// `rb_dbl_complex_new_polar_pi(abs, ang)` (complex.c): `abs * e^(i·π·ang)`,
+/// exact on the axes — a half-integer `ang` is purely imaginary and an integer
+/// one purely real.
+fn dbl_complex_new_polar_pi(abs: f64, ang: f64) -> Value {
+    let fi = ang.trunc();
+    let fr = ang - fi;
+    let pos = fr == 0.5;
+    let complex =
+        |re: f64, im: f64| with_host(|h| h.new_complex(Value::Float(re), Value::Float(im)));
+    if pos || fr == -0.5 {
+        let half = (fi / 2.0) - (fi / 2.0).trunc();
+        let abs = if (half != fr) ^ pos { -abs } else { abs };
+        return complex(0.0, abs);
+    }
+    if fr == 0.0 {
+        let half = (fi / 2.0) - (fi / 2.0).trunc();
+        return Value::Float(if half != 0.0 { -abs } else { abs });
+    }
+    complex(abs * cospi(ang), abs * sinpi(ang))
+}
+
+// MRI uses libm's `__cospi`/`__sinpi` where the platform has them (Apple's
+// libm), else `cos(M_PI * x)` — so the two builds round differently, and so
+// does this port, the same way.
+#[cfg(target_vendor = "apple")]
+fn cospi(x: f64) -> f64 {
+    extern "C" {
+        fn __cospi(x: f64) -> f64;
+    }
+    unsafe { __cospi(x) }
+}
+#[cfg(target_vendor = "apple")]
+fn sinpi(x: f64) -> f64 {
+    extern "C" {
+        fn __sinpi(x: f64) -> f64;
+    }
+    unsafe { __sinpi(x) }
+}
+#[cfg(not(target_vendor = "apple"))]
+fn cospi(x: f64) -> f64 {
+    (std::f64::consts::PI * x).cos()
+}
+#[cfg(not(target_vendor = "apple"))]
+fn sinpi(x: f64) -> f64 {
+    (std::f64::consts::PI * x).sin()
+}
+
 /// Raise a `NoMethodError` with the ruby-4.0 message form for `recv`:
 /// `for nil` / `for true` / `for false`, `for class C` when the receiver is a
 /// class/module reference, or `for an instance of C` for every other value.
@@ -27775,18 +27858,10 @@ fn rankable_number(v: &Value) -> Option<Value> {
 /// `None` only for a NaN, which ranks against no number at all — not even
 /// itself. Both operands must already be numbers (`rankable_number`).
 fn cmp_numeric(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
-    let (ra, rb) = with_host(|h| (h.as_rational(a), h.as_rational(b)));
-    // A FINITE Float converts to an exact rational too, so a mixed pair stays
-    // exact: `3**34` really is greater than `(3**34).to_f`, which rounded down.
-    let ra = ra.or_else(|| as_exact_rational(a));
-    let rb = rb.or_else(|| as_exact_rational(b));
-    if let (Some(x), Some(y)) = (ra, rb) {
-        return Some(x.cmp(&y));
-    }
-    // Only an infinity or a NaN has no exact rational value. An infinity still
-    // ranks against every finite number and against the other infinity; a NaN
-    // is where `partial_cmp` answers None.
-    as_f(a).partial_cmp(&as_f(b))
+    // Exact when both have a rational value, or one is an infinity against a
+    // finite number (`RubyHost::exact_num_cmp`). Otherwise both are infinite or
+    // one is NaN: the doubles order the infinities, and a NaN answers None.
+    with_host(|h| h.exact_num_cmp(a, b)).or_else(|| as_f(a).partial_cmp(&as_f(b)))
 }
 
 /// Whether a value is one of Ruby's numbers — the operand kinds `<=>` will
@@ -27794,15 +27869,6 @@ fn cmp_numeric(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
 fn is_numeric_value(v: &Value) -> bool {
     matches!(v, Value::Int(_) | Value::Float(_))
         || with_host(|h| matches!(h.class_of(v).as_str(), "Integer" | "Float" | "Rational"))
-}
-
-/// A finite Float as the exact rational it really is (every finite double is a
-/// dyadic rational). `None` for NaN/infinity and for anything not a Float.
-fn as_exact_rational(v: &Value) -> Option<num_rational::BigRational> {
-    match v {
-        Value::Float(f) if f.is_finite() => num_rational::BigRational::from_float(*f),
-        _ => None,
-    }
 }
 
 /// Apply an operator/method symbol between the accumulator and an element for

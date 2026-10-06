@@ -9472,11 +9472,26 @@ impl RubyHost {
     /// rational value to compare. Every finite double IS a rational, so a mixed
     /// Integer/Float pair never has to round either side.
     pub fn exact_num_cmp(&self, a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering::{Greater, Less};
         let exact = |v: &Value| match v {
             Value::Float(f) if f.is_finite() => num_rational::BigRational::from_float(*f),
             Value::Float(_) => None,
             _ => self.as_rational(v),
         };
+        // An infinite Float against a finite exact number orders by its sign
+        // (`rb_integer_float_cmp`): `Float::INFINITY > 10**400`, even though
+        // `(10**400).to_f` is itself infinite.
+        match (a, b) {
+            (Value::Float(x), _) if x.is_infinite() => {
+                exact(b)?;
+                return Some(if *x > 0.0 { Greater } else { Less });
+            }
+            (_, Value::Float(y)) if y.is_infinite() => {
+                exact(a)?;
+                return Some(if *y > 0.0 { Less } else { Greater });
+            }
+            _ => {}
+        }
         Some(exact(a)?.cmp(&exact(b)?))
     }
 
