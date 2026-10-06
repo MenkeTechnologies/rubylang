@@ -2714,7 +2714,9 @@ pub(crate) fn dispatch(
                         return Err(raise_exc("TypeError", "can't define singleton"));
                     }
                     Ok(with_host(|h| {
-                        h.class_ref(&format!("#<Class:#<{cls}:0x{id:016x}>>"))
+                        h.class_ref(&crate::host::RubyHost::object_singleton_class_name(
+                            &cls, *id,
+                        ))
                     }))
                 }
                 _ => Err(raise_exc("TypeError", "can't define singleton")),

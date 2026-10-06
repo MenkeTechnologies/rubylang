@@ -4073,3 +4073,20 @@ true
 false
 "STR"
 NoMethodError
+#==#
+"#<Class:X>"
+nil
+"#<Class:X>"
+"#<Module:X>"
+"#<#<Class:X>:X>"
+"#<#<Class:X>: hi>"
+"[#<Class:X>, Object]"
+"AnonNamed"
+"AnonNamed"
+AnonNamed
+true
+1
+[:hi]
+Object
+"#<Class:#<#<Class:X>:X>>"
+true

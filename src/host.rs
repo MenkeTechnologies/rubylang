@@ -5287,18 +5287,38 @@ impl RubyHost {
     /// name and return it. The optional superclass seeds the `ClassDef`; the block
     /// body (if any) is run afterwards as a `class_eval` by the caller.
     /// The class a METACLASS name `#<Class:X>` is attached to, or `None` for any
-    /// other name. An anonymous class (`Class.new`) is named `#<Class:N>` with a
-    /// numeric counter and is NOT a metaclass: no class a program can name is
-    /// spelled with digits only.
+    /// other name. An anonymous class (`Class.new`) is named `#<Class:0x…>` with
+    /// an address, as MRI's `rb_class_path` shows it, and is NOT a metaclass: no
+    /// class a program can name is spelled `0x` and hex digits.
     pub fn metaclass_attached(name: &str) -> Option<&str> {
         name.strip_prefix("#<Class:")
             .and_then(|r| r.strip_suffix('>'))
-            .filter(|inner| !inner.is_empty() && !inner.bytes().all(|b| b.is_ascii_digit()))
+            .filter(|inner| {
+                let anon = inner
+                    .strip_prefix("0x")
+                    .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()));
+                !inner.is_empty() && !anon
+            })
+    }
+    /// The display address of heap object `id` — the one `Object#inspect`
+    /// prints, and the one its singleton class's name carries.
+    pub fn heap_address(id: u32) -> u64 {
+        0x1_0000_0000u64 + id as u64 * 0x28
+    }
+    /// The name of heap object `id`'s singleton class, `#<Class:#<K:0x…>>`,
+    /// carrying the same address the object inspects with.
+    pub fn object_singleton_class_name(cls: &str, id: u32) -> String {
+        format!("#<Class:#<{cls}:0x{:016x}>>", Self::heap_address(id))
     }
     pub fn define_anon_class(&mut self, superclass: Option<String>, is_module: bool) -> String {
         self.struct_counter += 1;
         let kind = if is_module { "Module" } else { "Class" };
-        let name = format!("#<{kind}:{}>", self.struct_counter);
+        // MRI shows an anonymous class or module by address; the counter keeps
+        // it unique, offset clear of the heap-object addresses.
+        let name = format!(
+            "#<{kind}:0x{:016x}>",
+            0x2_0000_0000u64 + u64::from(self.struct_counter) * 0x28
+        );
         self.classes_mut().insert(
             name.clone(),
             ClassDef {
@@ -5548,7 +5568,10 @@ impl RubyHost {
         let inner = Self::metaclass_attached(name)?;
         let body = inner.strip_prefix("#<")?.strip_suffix('>')?;
         let (cls, hex) = body.rsplit_once(":0x")?;
-        Some((cls, u32::from_str_radix(hex, 16).ok()?))
+        let addr = u64::from_str_radix(hex, 16).ok()?;
+        let id = addr.checked_sub(0x1_0000_0000)?;
+        (id % 0x28 == 0).then_some(())?;
+        Some((cls, u32::try_from(id / 0x28).ok()?))
     }
 
     /// Register a per-object singleton method (`def obj.m`, `class << obj`).
@@ -5668,7 +5691,7 @@ impl RubyHost {
         if matches!(cls.as_str(), "Symbol" | "Integer" | "Float") {
             return None;
         }
-        Some(format!("#<Class:#<{cls}:0x{id:016x}>>"))
+        Some(Self::object_singleton_class_name(&cls, *id))
     }
     pub fn find_singleton_define_method(&self, v: &Value, name: &str) -> Option<Value> {
         // `obj.singleton_class.define_method(:m)` registers on the metaclass
@@ -6617,7 +6640,7 @@ impl RubyHost {
         if let Some(inner) = name
             .strip_prefix("#<Class:#<")
             .and_then(|s| s.strip_suffix(">>"))
-            .and_then(|s| s.split_once(":0x"))
+            .and_then(|s| s.rsplit_once(":0x"))
             .map(|(c, _)| c)
         {
             return Some(inner.to_string());
@@ -8070,7 +8093,7 @@ impl RubyHost {
             Value::Obj(id) => *id as u64,
             _ => 0,
         };
-        format!("0x{:016x}", 0x1_0000_0000u64 + id * 0x28)
+        format!("0x{:016x}", Self::heap_address(id as u32))
     }
 
     /// `to_s` — the human string form used by `puts`/interpolation. Renders the

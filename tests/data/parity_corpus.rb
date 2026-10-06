@@ -5366,3 +5366,10 @@ o = Object.new; def o.hi = 1; c = o.clone; p c.respond_to?(:hi), c.hi, c.singlet
 module CloneExt; def ext = 2; end
 o2 = Object.new; o2.extend(CloneExt); p o2.clone.ext, o2.dup.respond_to?(:ext), o2.clone.singleton_class.include?(CloneExt), o2.clone.is_a?(CloneExt), o2.dup.is_a?(CloneExt)
 s = +"str"; def s.shout = upcase; p s.clone.shout, (s.dup.shout rescue $!.class)
+#==#
+def anon_norm(s) = s.to_s.gsub(/0x\h{16}/, "X")
+c = Class.new; m = Module.new
+p anon_norm(c.inspect), c.name, anon_norm(c.to_s), anon_norm(m.inspect), anon_norm(c.new.inspect), anon_norm(Class.new(StandardError).new("hi").inspect), anon_norm(c.ancestors.first(2).inspect)
+AnonNamed = c; p AnonNamed.name, AnonNamed.inspect, AnonNamed.new.class
+o = Object.new; p o.singleton_class.inspect == "#<Class:#{o.inspect}>"
+ac = Class.new { def hi = 1 }; p ac.new.hi, ac.instance_methods(false), ac.superclass, anon_norm(ac.new.singleton_class), ac.new.singleton_class.superclass == ac

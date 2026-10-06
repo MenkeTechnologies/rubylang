@@ -784,7 +784,9 @@ keeps both.
   object IS an `M` (`is_a?`, `kind_of?`, `M ===`), and `extend(Enumerable)` /
   `extend(Comparable)` give it the `each`- and `<=>`-derived surface.
   `Class.new(StandardError)` keeps its superclass chain, so `rescue` catches
-  it (its `#<Class:N>` name was read as a METACLASS). `Method#>>`/`#<<` exist,
+  it (its anonymous `#<Class:0x…>` name was read as a METACLASS). An anonymous
+  class or module inspects by address as MRI shows it, and an object's singleton
+  class carries the same address the object inspects with. `Method#>>`/`#<<` exist,
   and either half of a composition may be any object with `call`. Still open:
   `Method#super_method` is not implemented.
 - **An object's singleton class reflects `extend` — fixed.**
