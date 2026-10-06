@@ -3799,3 +3799,14 @@ nil
 nil
 -1
 nil
+#==#
+true
+false
+true
+false
+true
+true
+true
+"no implicit conversion of Integer into Hash"
+"undefined method '<=' for an instance of Array"
+[1]

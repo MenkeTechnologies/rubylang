@@ -18432,6 +18432,18 @@ fn dispatch_hash(
     // the default value, the default proc and the miss block keep their single
     // implementation.
     match name {
+        "<=" | "<" | ">=" | ">" if args.len() == 1 => {
+            let other = &args[0];
+            if with_host(|h| h.as_hash(other)).is_none() {
+                return Err(conv_error(other, "Hash"));
+            }
+            return Ok(Value::Bool(match name {
+                "<=" => hash_le(recv, other, false)?,
+                "<" => hash_le(recv, other, true)?,
+                ">=" => hash_le(other, recv, false)?,
+                _ => hash_le(other, recv, true)?,
+            }));
+        }
         "[]" | "fetch" if !args.is_empty() => {
             let k = with_host(|h| h.hash_key(recv, &args[0]));
             if let Some(Some(v)) = with_host(|h| h.hash_at(recv, &k)) {
@@ -24424,7 +24436,23 @@ pub fn numeric_hook(op: fusevm::NumOp, a: &Value, b: &Value) -> Result<Value, St
     if matches!(op, Add | Sub | Lt | Gt | Le | Ge) && with_host(|h| h.as_time(a).is_some()) {
         return dispatch(a, num_op_method(op), std::slice::from_ref(b), None);
     }
-    with_host(|h| h.num_op(op, a, b))
+    // `Hash#< <= > >=` are the sub-/superset predicates (hash.c).
+    if matches!(op, Lt | Gt | Le | Ge) && with_host(|h| h.as_hash(a).is_some()) {
+        return dispatch(a, num_op_method(op), std::slice::from_ref(b), None);
+    }
+    // A failure here is a raised exception like any method's: give it its
+    // class and receiver, so an uncaught one reports as MRI does.
+    with_host(|h| h.num_op(op, a, b)).map_err(|e| {
+        if with_host(|h| h.has_pending_exc()) {
+            return e;
+        }
+        let class = crate::host::infer_exc_class(&e);
+        if class == "NoMethodError" {
+            raise_exc_with(&class, &e, &[("receiver", a.clone())])
+        } else {
+            raise_exc(&class, &e)
+        }
+    })
 }
 
 /// The method name for an operator `NumOp`, or `""` if it has none.
@@ -27959,4 +27987,33 @@ fn sort_with_block(mut arr: Vec<Value>, bl: &Value) -> Result<Vec<Value>, String
         }
     }
     Ok(arr)
+}
+
+/// `rb_hash_le` / `rb_hash_lt` (hash.c): every pair of `a` is in `b` with an
+/// `==` value, and for the strict form `a` is also smaller.
+fn hash_le(a: &Value, b: &Value, strict: bool) -> Result<bool, String> {
+    let (sa, sb) = with_host(|h| {
+        (
+            h.as_hash(a).map_or(0, |m| m.len()),
+            h.as_hash(b).map_or(0, |m| m.len()),
+        )
+    });
+    if (strict && sa >= sb) || sa > sb {
+        return Ok(false);
+    }
+    let pairs: Vec<(Value, Value)> = with_host(|h| {
+        h.as_hash(a)
+            .unwrap_or_default()
+            .iter()
+            .map(|(k, v)| (h.key_value(k), v.clone()))
+            .collect()
+    });
+    for (k, v) in pairs {
+        let key = with_host(|h| h.hash_key(b, &k));
+        match with_host(|h| h.hash_at(b, &key)) {
+            Some(Some(v2)) if rb_equal_d(&v, &v2)? => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }

@@ -5249,3 +5249,8 @@ p (-8.0) ** 0.5, (-1.5) ** -0.5, (-4) ** 1.5, (-4) ** 2.5, (-2) ** 2.0, (-8.0) *
 # ── Module#<=> ──
 module W; end; class A; end; class B < A; include W; end
 p B <=> A, A <=> B, A <=> A, A <=> String, B <=> W, W <=> B, A <=> 3, Integer <=> Comparable, String <=> Integer
+#==#
+# ── Hash#<= < >= > are the sub-/superset predicates ──
+p({a: 1} <= {a: 1, b: 2}, {a: 1} < {a: 1}, {a: 1} >= {}, {a: 2} <= {a: 1, b: 2}, {a: 1} > {}, {a: 1.0} <= {a: 1}, {} < {x: nil})
+begin; {a: 1} <= 3; rescue TypeError => e; p e.message; end
+begin; [1] <= 3; rescue NoMethodError => e; p e.message, e.receiver; end

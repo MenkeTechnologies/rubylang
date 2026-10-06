@@ -2172,7 +2172,8 @@ impl Compiler {
             BinOp::Shr => Op::Shr,
             BinOp::And | BinOp::Or | BinOp::Match | BinOp::NMatch | BinOp::CaseEq => unreachable!(),
         };
-        b.emit(native, 0);
+        // The line names the op in the backtrace when the numeric hook raises.
+        b.emit(native, self.cur_line);
         Ok(())
     }
 

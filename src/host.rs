@@ -10406,7 +10406,22 @@ fn run_chunk_pooled(
         None => match outcome {
             VMResult::Ok(v) => Ok(v),
             VMResult::Halted => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),
-            VMResult::Error(e) => Err(e),
+            // A native op that failed in the numeric hook raised a Ruby
+            // exception without passing through a builtin's `abort`, so its
+            // innermost frame (the op's line) is recorded here.
+            VMResult::Error(e) => {
+                if with_host(|h| h.has_pending_exc()) {
+                    let line = vm
+                        .chunk
+                        .lines
+                        .get(vm.ip.wrapping_sub(1))
+                        .copied()
+                        .unwrap_or(0);
+                    let src = current_file_path().unwrap_or_else(|| "-e".into());
+                    with_host(|h| h.record_backtrace_frame(&src, line));
+                }
+                Err(e)
+            }
         },
     };
     VM_POOL.with(|p| {
@@ -11435,7 +11450,7 @@ fn run_template(id: usize, args: &[Value]) -> Result<Value, String> {
 /// that returned `Err(msg)` without an explicit `raise_exc`. Mirrors the class
 /// MRI would raise for the same condition; defaults to `RuntimeError` (Ruby's
 /// default for a bare `raise "msg"`).
-fn infer_exc_class(msg: &str) -> String {
+pub(crate) fn infer_exc_class(msg: &str) -> String {
     let m = msg;
     if m.starts_with("undefined method") || m.starts_with("undefined singleton method") {
         "NoMethodError"
