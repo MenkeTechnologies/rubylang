@@ -7804,21 +7804,28 @@ impl RubyHost {
     }
 
     pub fn format_uncaught(&mut self) -> Option<String> {
+        self.format_uncaught_as(None)
+    }
+    /// [`Self::format_uncaught`] with the `<msg> (<Class>)` part already
+    /// rendered by the exception's own `detailed_message` (see
+    /// [`uncaught_report`]).
+    pub fn format_uncaught_as(&mut self, detailed: Option<String>) -> Option<String> {
         let exc = self.pending_exc.take()?;
         let class = self.class_of(&exc).to_string();
         let msg = match self.ivar_of(&exc, "message") {
             Value::Undef => class.clone(),
             m => self.to_s(&m),
         };
+        let detailed = detailed.unwrap_or_else(|| format!("{msg} ({class})"));
         let frames: Vec<String> = match &exc {
             Value::Obj(id) => self.exc_backtraces.get(id).cloned().unwrap_or_default(),
             _ => Vec::new(),
         };
         let mut out = match frames.split_first() {
-            Some((first, _)) => format!("{first}: {msg} ({class})"),
+            Some((first, _)) => format!("{first}: {detailed}"),
             // No captured frame (e.g. an exception raised before any op ran):
             // fall back to the bare `<msg> (<Class>)` MRI still prints.
-            None => format!("{msg} ({class})"),
+            None => detailed,
         };
         for f in frames.iter().skip(1) {
             out.push('\n');
@@ -10352,11 +10359,23 @@ pub fn run_main(chunk: Chunk) -> Result<Value, String> {
     // <msg> (<Class>)` + backtrace). `abort` captured each frame as the exception
     // unwound; format them here at the top-level boundary.
     if r.is_err() {
-        if let Some(formatted) = with_host(|h| h.format_uncaught()) {
+        if let Some(formatted) = uncaught_report() {
             return Err(formatted);
         }
     }
     r
+}
+
+/// Format the pending uncaught exception, running a user `detailed_message` /
+/// `message` / `to_s` override first. The exception is taken off the pending
+/// slot while that user code runs, so the call starts with a clean state.
+fn uncaught_report() -> Option<String> {
+    let exc = with_host(|h| h.pending_exc.take())?;
+    let detailed = crate::builtins::uncaught_detailed_message(&exc);
+    with_host(|h| {
+        h.pending_exc = Some(exc);
+        h.format_uncaught_as(detailed)
+    })
 }
 
 /// Run the `at_exit` handlers, last registered first, as the program ends —
@@ -10377,7 +10396,7 @@ pub fn run_at_exit_handlers() -> Option<i32> {
                 with_host(|h| h.pending_exc = None);
                 status = Some(code);
             } else {
-                let msg = with_host(|h| h.format_uncaught()).unwrap_or(e);
+                let msg = uncaught_report().unwrap_or(e);
                 eprintln!("{msg}");
                 status = Some(1);
             }

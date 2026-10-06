@@ -5136,3 +5136,14 @@ log.clear; p g.lazy.map { log << "m#{_1}"; _1 }.first(2), log
 e = Enumerator.new { |y| y << 1; y.yield 2, 3; y << [4, 5]; :done }
 p e.take_while { |a| true }, e.find_index { |a, b| b == 3 }, e.any? { |a, b| b == 3 }
 p e.include?([2, 3]), e.each_with_index { |x, i| }, e.each_with_object([]) { |x, m| m << x }
+#==#
+# ── %a hex floats, Integer#ord, Exception#message via to_s, bare native self-calls ──
+puts "%a" % 1.5, "%.0a" % 1.5, "%A" % 0.1, "%a" % 5e-324, "%+a" % 0.0, "%10.2a|" % -3.25, "%#.0a" % 1.0
+p 65.ord
+class E < StandardError; def to_s = "custom"; end
+e = E.new; p e.message, e, e.full_message(highlight: false).lines.first.include?("custom (E)")
+p [1, 2, 3].each_slice(2).each_with_index { |a, i| }, {a: 1}.each_with_object([]).to_a
+S = Struct.new(:a, :b) do
+  def go = [members, to_a, to_h]
+end
+p S.new(1, 2).go

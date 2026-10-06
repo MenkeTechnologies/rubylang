@@ -649,6 +649,11 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
                 Err(e) => return abort(vm, e),
             }
         }
+        match native_self_call(&this, &name, &[], None) {
+            Some(Ok(v)) => return propagate(vm, v),
+            Some(Err(e)) => return abort(vm, e),
+            None => {}
+        }
     }
     // A bare argless read of a class-level attr accessor on a classref self —
     // `singleton_class.attr_accessor :registered_details` then a bare
@@ -1666,6 +1671,9 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
                 return dispatch(&this, name, args, block);
             }
         }
+        if let Some(r) = native_self_call(&this, name, args, block.clone()) {
+            return r;
+        }
     }
     // A bare call inside a method whose `self` is a builtin-typed value (String,
     // Array, Hash, Integer, …): dispatch its native/reopened methods FIRST, so
@@ -1757,6 +1765,50 @@ fn method_object_or_name_error(recv: &Value, m: &str, unbound: bool) -> Result<(
 
 /// Object methods available on every value (so a bare self-call inside a method
 /// resolves them before falling through to Kernel).
+/// A receiverless call on a user object reaching a NATIVE method of its
+/// ancestry — `object_id`/`inspect` from Object, `to_a`/`map` from an included
+/// `Enumerable`, `members`/`to_h` of a Struct, `with` of a Data, `message` of
+/// an Exception — the way `self.name(...)` already does. MRI resolves a bare
+/// call through self's whole ancestry; only user-defined methods, attrs and a
+/// short universal list used to be tried, so these were NameErrors.
+///
+/// `None` when self has no such method (resolution continues to top-level
+/// defs and Kernel). Kernel functions and the frame-sensitive names
+/// (`block_given?`, `binding`, `__method__`, …) are never sent to self: their
+/// answer depends on the CALLER's frame, which an object dispatch would lose.
+fn native_self_call(
+    this: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Option<Result<Value, String>> {
+    const FRAME_SENSITIVE: &[&str] = &[
+        "binding",
+        "caller",
+        "caller_locations",
+        "__method__",
+        "__callee__",
+        "__dir__",
+        "local_variables",
+        "iterator?",
+    ];
+    if is_kernel_function(name) || FRAME_SENSITIVE.contains(&name) {
+        return None;
+    }
+    match dispatch(this, name, args, block) {
+        // A miss on THIS name is the soft "self does not answer it": drop the
+        // exception it recorded so the fallbacks start clean.
+        Err(e)
+            if e.starts_with(&format!("undefined method '{name}' for"))
+                || e.starts_with(&format!("private method '{name}' called")) =>
+        {
+            with_host(|h| h.take_pending_exc());
+            None
+        }
+        r => Some(r),
+    }
+}
+
 fn is_universal_object_method(name: &str) -> bool {
     matches!(
         name,
@@ -5435,6 +5487,11 @@ fn dispatch_object(
     }
     match name {
         "message" | "to_s" => {
+            // MRI's `exc_message` is `rb_funcall(exc, :to_s)`, so a subclass's
+            // own `to_s` is what `message` answers.
+            if name == "message" && defines_own(recv, "to_s") {
+                return dispatch(recv, "to_s", &[], None);
+            }
             let m = with_host(|h| h.ivar_of(recv, "message"));
             if matches!(m, Value::Undef) {
                 Ok(new_str(cls.to_string()))
@@ -7355,6 +7412,10 @@ fn dispatch_number(
                 _ => dispatch_number(recv, "chr", &[], None),
             };
             out
+        }
+        // `Integer#ord` is the integer itself (`String#ord`'s inverse of `chr`).
+        "ord" if matches!(recv, Value::Int(_)) || with_host(|h| h.as_promoted_bigint(recv)).is_some() => {
+            Ok(recv.clone())
         }
         "chr" => {
             let n = as_i(recv);
@@ -14175,9 +14236,10 @@ fn dispatch_enumerator(
         // Enumerator: `map`/`collect`/`flat_map` collect the block's results,
         // `select`/`filter`/`reject` filter the elements, `each` (and anything
         // else) runs for side effects and returns the receiver's elements.
-        "with_index" if block.is_some() => {
-            let offset = match args.first() {
-                Some(Value::Int(n)) => *n,
+        // `Enumerator#each_with_index` is `with_index(0)` (enumerator.c).
+        "with_index" | "each_with_index" if block.is_some() => {
+            let offset = match (name, args.first()) {
+                ("with_index", Some(Value::Int(n))) => *n,
                 _ => 0,
             };
             let b = block.unwrap();
@@ -14229,7 +14291,15 @@ fn dispatch_enumerator(
                     _ => {}
                 }
             }
-            Ok(new_arr(collected))
+            // Anything but the collecting methods answers what the
+            // enumerator's own `each` answers — the memo of an
+            // `each_with_object`, the receiver of an `each_slice` — since
+            // `with_index` returns the underlying iteration's result.
+            match method.as_str() {
+                "map" | "collect" | "flat_map" | "collect_concat" | "select" | "filter"
+                | "reject" => Ok(new_arr(collected)),
+                _ => Ok(enum_each_result(recv, buf)),
+            }
         }
         // `with_object(memo)` threads a memo object through the block and
         // returns it, regardless of the source method.
@@ -14285,25 +14355,11 @@ fn dispatch_enumerator(
                     break;
                 }
             }
-            if name == "each_entry" {
-                return Ok(recv.clone());
+            if name == "each" {
+                Ok(enum_each_result(recv, buf))
+            } else {
+                Ok(recv.clone())
             }
-            // Re-running `each_with_object` answers the MEMO, not the receiver,
-            // and every buffered pair carries it. With nothing buffered there is
-            // no memo to read — and an empty source means the recorded receiver
-            // is empty too, which is what MRI's memo prints as.
-            if with_host(|h| h.enum_method(recv))
-                .is_some_and(|m| m.starts_with("each_with_object") || m.starts_with("with_object"))
-            {
-                if let Some(memo) = buf
-                    .first()
-                    .and_then(|p| with_host(|h| h.as_array(p)))
-                    .and_then(|vals| vals.get(1).cloned())
-                {
-                    return Ok(memo);
-                }
-            }
-            Ok(with_host(|h| h.enum_source(recv)).unwrap_or_else(|| new_arr(buf)))
         }
         // Consumers that DECIDE with the block but answer with the SOURCE
         // elements, over a source that yields two values per iteration. The two
@@ -14323,6 +14379,27 @@ fn dispatch_enumerator(
         // `select`, …) that block-less calls exposed before Enumerator existed.
         _ => remap_array_delegate(dispatch_array(&new_arr(buf), name, args, block), recv, name),
     }
+}
+
+/// What a buffered Enumerator's `each { }` answers: the object it iterates
+/// (`[1, 2, 3, 4].each_slice(2).each { }` is `[1, 2, 3, 4]`), which the buffer
+/// cannot reconstruct since `each_cons` windows overlap — except that
+/// re-running `each_with_object` answers the MEMO, which every buffered pair
+/// carries. With nothing buffered there is no memo to read, and an empty source
+/// means the recorded receiver is empty too, which is what MRI's memo prints as.
+fn enum_each_result(recv: &Value, buf: Vec<Value>) -> Value {
+    if with_host(|h| h.enum_method(recv))
+        .is_some_and(|m| m.starts_with("each_with_object") || m.starts_with("with_object"))
+    {
+        if let Some(memo) = buf
+            .first()
+            .and_then(|p| with_host(|h| h.as_array(p)))
+            .and_then(|vals| vals.get(1).cloned())
+        {
+            return memo;
+        }
+    }
+    with_host(|h| h.enum_source(recv)).unwrap_or_else(|| new_arr(buf))
 }
 
 /// One element's verdict for `any?`/`all?`/`none?`/`one?`: `pattern === x` when
@@ -18611,6 +18688,20 @@ fn dispatch_hash(
                     "wrong number of arguments (given 0, expected 1)",
                 ));
             };
+            // Block-less: an Enumerator of `[[k, v], memo]` pairs, as Array's is,
+            // iterating this Hash — not the memo.
+            if block.is_none() {
+                let pairs: Vec<Value> = with_host(|h| {
+                    map.iter()
+                        .map(|(k, v)| {
+                            let kv = h.key_value(k);
+                            h.new_array(vec![kv, v.clone()])
+                        })
+                        .collect()
+                });
+                let r = dispatch_array(&new_arr(pairs), name, args, None);
+                return remap_array_delegate(r, recv, name);
+            }
             if let Some(b) = &block {
                 for (k, v) in &map {
                     // Hash#each_with_object yields the [key, value] pair and the memo.
@@ -22706,6 +22797,74 @@ fn sci(f: f64, prec: usize) -> String {
     }
 }
 
+/// The digits of `%a` after the `0x` prefix, for a finite non-negative `f`:
+/// BSD `__hdtoa` as MRI's `sprintf` uses it. The leading hex digit is always
+/// `1` (a subnormal is normalized, so `5e-324` is `1p-1074`) except for zero;
+/// without a precision the fraction is the shortest exact one, and with one it
+/// is rounded half-to-even on the mantissa bits, carrying into the exponent
+/// (`"%.0a" % 1.5` is `1p+1`). `#` keeps the point when no digit follows it.
+fn fmt_hexfloat(f: f64, prec: Option<usize>, upper: bool, alt: bool) -> String {
+    const FRAC_BITS: u32 = 52;
+    let (mut frac, mut exp) = if f == 0.0 {
+        (0u64, 0i64)
+    } else {
+        let bits = f.to_bits();
+        let raw_exp = ((bits >> FRAC_BITS) & 0x7ff) as i64;
+        let mut frac = bits & ((1u64 << FRAC_BITS) - 1);
+        let mut exp = raw_exp - 1023;
+        if raw_exp == 0 {
+            // Subnormal: shift the first set bit up into the implicit-1 slot.
+            exp = -1022;
+            while frac & (1u64 << FRAC_BITS) == 0 {
+                frac <<= 1;
+                exp -= 1;
+            }
+            frac &= (1u64 << FRAC_BITS) - 1;
+        }
+        (frac, exp)
+    };
+    let lead = if f == 0.0 { '0' } else { '1' };
+    let digits = match prec {
+        None => {
+            let s = format!("{frac:013x}");
+            s.trim_end_matches('0').to_string()
+        }
+        Some(p) if p >= 13 => format!("{frac:013x}{}", "0".repeat(p - 13)),
+        Some(p) => {
+            // Round the whole significand, leading digit included: with no
+            // fraction digits left, its parity decides a tie (`1.8` → `2`).
+            let bits = 4 * p as u32;
+            let shift = FRAC_BITS - bits;
+            let sig = if f == 0.0 { 0 } else { frac | (1u64 << FRAC_BITS) };
+            let mut q = sig >> shift;
+            let rem = sig & ((1u64 << shift) - 1);
+            let half = 1u64 << (shift - 1);
+            if rem > half || (rem == half && q & 1 == 1) {
+                q += 1;
+            }
+            if q >> bits >= 2 {
+                // `1.ff…` rounded up to `2.00…`, which is `1.00…` one exponent up.
+                q >>= 1;
+                exp += 1;
+            }
+            frac = q & ((1u64 << bits) - 1);
+            if p == 0 {
+                String::new()
+            } else {
+                format!("{frac:0width$x}", width = p)
+            }
+        }
+    };
+    let point = if digits.is_empty() && !alt { "" } else { "." };
+    let sign = if exp < 0 { '-' } else { '+' };
+    let s = format!("{lead}{point}{digits}p{sign}{}", exp.abs());
+    if upper {
+        s.to_uppercase()
+    } else {
+        s
+    }
+}
+
 /// Render a non-negative finite float in `%e`/`%E` form with Ruby's exponent
 /// style (sign + at-least-two digits): `1.23e+04`.
 fn fmt_e(f: f64, prec: usize, upper: bool, alt: bool) -> String {
@@ -23391,9 +23550,9 @@ fn sprintf(
                         zero_ok = false;
                         if !f.is_nan() && f.is_sign_negative() {
                             sign = "-";
-                        } else if !f.is_nan() && plus {
+                        } else if plus {
                             sign = "+";
-                        } else if !f.is_nan() && space {
+                        } else if space {
                             sign = " ";
                         }
                         if f.is_nan() {
@@ -23426,9 +23585,9 @@ fn sprintf(
                     zero_ok = false;
                     if !f.is_nan() && f.is_sign_negative() {
                         sign = "-";
-                    } else if !f.is_nan() && plus {
+                    } else if plus {
                         sign = "+";
-                    } else if !f.is_nan() && space {
+                    } else if space {
                         sign = " ";
                     }
                     if f.is_nan() {
@@ -23449,6 +23608,27 @@ fn sprintf(
                     } else {
                         fmt_g(f.abs(), prec.unwrap_or(6), up, alt)
                     }
+                }
+            }
+            // `%a`/`%A`: the C99 hexadecimal float MRI formats with BSD
+            // `__hdtoa`. The `0x` is a prefix, so zero padding goes after it.
+            'a' | 'A' => {
+                numeric = true;
+                let f = sprintf_float(&arg)?;
+                let up = conv == 'A';
+                if f.is_sign_negative() && !f.is_nan() {
+                    sign = "-";
+                } else if plus {
+                    sign = "+";
+                } else if space {
+                    sign = " ";
+                }
+                if f.is_finite() {
+                    prefix = if up { "0X" } else { "0x" }.to_string();
+                    fmt_hexfloat(f.abs(), prec, up, alt)
+                } else {
+                    zero_ok = false;
+                    if f.is_nan() { "NaN" } else { "Inf" }.into()
                 }
             }
             'c' => {
@@ -26070,6 +26250,13 @@ fn remap_array_delegate(
 /// every other shape — the `name: value` shorthand for a symbol key, `[...]`
 /// for a cycle, Struct, Set, Range — and re-deriving any of it here would be a
 /// second implementation to keep in step.
+/// The class of `v` when it is an exception whose class defines its own `to_s`
+/// — the case `Exception#inspect` has to run user code for.
+fn exception_with_own_to_s(v: &Value) -> Option<String> {
+    let class = with_host(|h| h.object_class(v))?;
+    (with_host(|h| h.is_exception_class(&class)) && defines_own(v, "to_s")).then_some(class)
+}
+
 fn inspect_of(v: &Value) -> Result<String, String> {
     if !reaches_user_inspect(v, 0) {
         return Ok(with_host(|h| h.inspect(v)));
@@ -26080,6 +26267,19 @@ fn inspect_of(v: &Value) -> Result<String, String> {
         // fact failed.
         let s = dispatch(v, "inspect", &[], None)?;
         return Ok(with_host(|h| h.as_str(&s).unwrap_or_default()));
+    }
+    if let Some(class) = exception_with_own_to_s(v) {
+        // MRI's `exc_inspect` renders `rb_obj_as_string(exc)` — the user's
+        // `to_s` — in the shape the host uses for the stored message.
+        let s = dispatch(v, "to_s", &[], None)?;
+        let msg = with_host(|h| h.to_s(&s));
+        return Ok(if msg.is_empty() {
+            class
+        } else if msg.contains('\n') {
+            format!("#<{class}:{}>", crate::host::inspect_string(&msg))
+        } else {
+            format!("#<{class}: {msg}>")
+        });
     }
     if let Some(items) = with_host(|h| h.as_array(v)) {
         let inner: Vec<String> = items.iter().map(inspect_of).collect::<Result<_, _>>()?;
@@ -26112,7 +26312,7 @@ fn reaches_user_inspect(v: &Value, depth: u32) -> bool {
     if depth > 16 {
         return false;
     }
-    if defines_own(v, "inspect") {
+    if defines_own(v, "inspect") || exception_with_own_to_s(v).is_some() {
         return true;
     }
     if let Some(items) = with_host(|h| h.as_array(v)) {
@@ -26159,6 +26359,36 @@ fn defines_own(v: &Value, name: &str) -> bool {
             || h.object_class(v)
                 .is_some_and(|cls| h.find_method(&cls, name).is_some())
     })
+}
+
+/// The report text of an UNCAUGHT exception whose class overrides what MRI's
+/// `rb_ec_error_print` reads — `detailed_message`, or the `message`/`to_s` it
+/// is built from — so the user code that answers it runs, as it does in MRI
+/// (`class E < StandardError; def to_s = "x"; end; raise E` prints `x (E)`).
+/// `None` for every other exception: the stored message is already the answer.
+pub(crate) fn uncaught_detailed_message(exc: &Value) -> Option<String> {
+    if !["detailed_message", "message", "to_s"]
+        .iter()
+        .any(|m| defines_own(exc, m))
+    {
+        return None;
+    }
+    let kw = with_host(|h| {
+        let mut m = IndexMap::new();
+        m.insert(RKey::Sym("highlight".into()), Value::Bool(false));
+        let v = h.new_hash(m);
+        h.mark_kwargs(&v);
+        v
+    });
+    // A `detailed_message` (or the `message` under it) that itself raises
+    // leaves MRI printing the bare class name (`error.c`, emesg undefined).
+    match dispatch(exc, "detailed_message", &[kw], None) {
+        Ok(d) => Some(with_host(|h| h.to_s(&d))),
+        Err(_) => with_host(|h| {
+            h.take_pending_exc();
+            Some(h.class_of(exc).to_string())
+        }),
+    }
 }
 
 /// `equal?` — whether `a` and `b` are the same object.
@@ -26338,7 +26568,7 @@ fn backtrace_type_error() -> String {
 /// name alone, or `unhandled exception` for a RuntimeError. With `highlight`,
 /// MRI's bold/underline escapes wrap the parts.
 fn exc_detailed_message(recv: &Value, cls: &str, highlight: bool) -> Result<String, String> {
-    let msg = if defines_own(recv, "message") {
+    let msg = if defines_own(recv, "message") || defines_own(recv, "to_s") {
         let m = dispatch(recv, "message", &[], None)?;
         with_host(|h| h.to_s(&m))
     } else {
