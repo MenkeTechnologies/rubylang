@@ -5373,3 +5373,7 @@ p anon_norm(c.inspect), c.name, anon_norm(c.to_s), anon_norm(m.inspect), anon_no
 AnonNamed = c; p AnonNamed.name, AnonNamed.inspect, AnonNamed.new.class
 o = Object.new; p o.singleton_class.inspect == "#<Class:#{o.inspect}>"
 ac = Class.new { def hi = 1 }; p ac.new.hi, ac.instance_methods(false), ac.superclass, anon_norm(ac.new.singleton_class), ac.new.singleton_class.superclass == ac
+#==#
+class EndlessOps; def ==(o) = true; def <=(o) = 1; def !=(o) = 2; def ===(o) = 3; def >=(o) = 4; def ok! = 5; end
+e = EndlessOps.new; p e == 1, e <= 1, e != 1, e === 1, e >= 1, e.ok!
+p((eval("def bad_setter=(v) = 1") rescue $!.class), (eval("def []=(k, v) = 1") rescue $!.class))

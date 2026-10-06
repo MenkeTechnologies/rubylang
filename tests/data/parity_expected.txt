@@ -4090,3 +4090,5 @@ true
 Object
 "#<Class:#<#<Class:X>:X>>"
 true
+#==#
+<error>

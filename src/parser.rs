@@ -2935,6 +2935,13 @@ impl Parser {
         // The body is a single expression and there is no `end`.
         if self.eat_op("=") {
             let line = self.line();
+            // A setter (`x=`, `[]=`) cannot be endless; the comparison
+            // operators that merely end in `=` can (parse.y `endless_method_name`).
+            if name.ends_with('=') && !matches!(name.as_str(), "==" | "!=" | "<=" | ">=" | "===") {
+                return Err(format!(
+                    "line {line}: invalid method name; a setter method cannot be defined in an endless method definition"
+                ));
+            }
             let expr = self.statement()?;
             self.no_do_block = saved_no_do;
             return Ok(Expr::Def {
