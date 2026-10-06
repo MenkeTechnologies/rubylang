@@ -3672,14 +3672,34 @@ fn dispatch_classref(
         // frozen instance; a keyword-only hash is detected as the sole argument.
         if with_host(|h| h.is_data_class(cls)) && (name == "new" || name == "[]") {
             let obj = with_host(|h| h.new_object(cls));
-            let kw = match args.first() {
-                Some(a) if args.len() == 1 => with_host(|h| h.as_hash(a)),
-                _ => None,
+            // Only keywords written at the call site are keywords: a positional
+            // Hash is the first member's value (`D.new({x: 1})`).
+            let kwargs = args.last().filter(|a| with_host(|h| h.is_kwargs(a)));
+            if kwargs.is_some() && args.len() > 1 {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!(
+                        "wrong number of arguments (given {}, expected 0)",
+                        args.len()
+                    ),
+                ));
+            }
+            let kw = kwargs.and_then(|a| with_host(|h| h.as_hash(a)));
+            // `missing keyword: :x` / `missing keywords: :x, :y`.
+            let keyword_error = |kind: &str, names: &[String]| {
+                raise_exc(
+                    "ArgumentError",
+                    &format!(
+                        "{kind} keyword{}: :{}",
+                        if names.len() == 1 { "" } else { "s" },
+                        names.join(", :")
+                    ),
+                )
             };
             match kw {
                 // Keyword form: `D.new(x: 1, y: 2)`. Every member is mandatory
                 // and no extra key is accepted — a Data class is strict where a
-                // Struct is lenient.
+                // Struct is lenient. Missing members are reported first.
                 Some(k) => {
                     let missing: Vec<String> = members
                         .iter()
@@ -3693,17 +3713,11 @@ fn dispatch_classref(
                             _ => None,
                         })
                         .collect();
-                    if !unknown.is_empty() {
-                        return Err(raise_exc(
-                            "ArgumentError",
-                            &format!("unknown keyword: :{}", unknown.join(", :")),
-                        ));
-                    }
                     if !missing.is_empty() {
-                        return Err(raise_exc(
-                            "ArgumentError",
-                            &format!("missing keyword: :{}", missing.join(", :")),
-                        ));
+                        return Err(keyword_error("missing", &missing));
+                    }
+                    if !unknown.is_empty() {
+                        return Err(keyword_error("unknown", &unknown));
                     }
                     for m in &members {
                         let v = k
@@ -3748,14 +3762,47 @@ fn dispatch_classref(
         }
         if name == "new" || name == "[]" {
             let obj = with_host(|h| h.new_object(cls));
-            if keyword_init == Some(true) {
-                let kw = args.first().and_then(|a| with_host(|h| h.as_hash(a)));
+            // `rb_struct_initialize_m`: `keyword_init: true` takes one Hash
+            // (positional or keywords) and nothing else; left unset, keywords
+            // written at the call site initialize by name; `false` never does.
+            let lone_hash = args.len() == 1 && with_host(|h| h.as_hash(&args[0])).is_some();
+            if keyword_init == Some(true) && !args.is_empty() && !lone_hash {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!(
+                        "wrong number of arguments (given {}, expected 0)",
+                        args.len()
+                    ),
+                ));
+            }
+            let by_keyword = lone_hash
+                && match keyword_init {
+                    Some(true) => true,
+                    Some(false) => false,
+                    None => with_host(|h| h.is_kwargs(&args[0])),
+                };
+            if by_keyword {
+                let kw = with_host(|h| h.as_hash(&args[0])).unwrap_or_default();
                 for m in &members {
-                    let v = kw
-                        .as_ref()
-                        .and_then(|k| k.get(&RKey::Sym(m.clone())).cloned())
-                        .unwrap_or(Value::Undef);
-                    with_host(|h| h.set_ivar_of(&obj, m, v));
+                    with_host(|h| h.set_ivar_of(&obj, m, Value::Undef));
+                }
+                let mut unknown = Vec::new();
+                for (k, v) in &kw {
+                    let name = match k {
+                        RKey::Sym(s) | RKey::Str(s) => s.clone(),
+                        other => with_host(|h| h.key_inspect(other)),
+                    };
+                    if members.contains(&name) {
+                        with_host(|h| h.set_ivar_of(&obj, &name, v.clone()));
+                    } else {
+                        unknown.push(name);
+                    }
+                }
+                if !unknown.is_empty() {
+                    return Err(raise_exc(
+                        "ArgumentError",
+                        &format!("unknown keywords: {}", unknown.join(", ")),
+                    ));
                 }
             } else {
                 // A Struct accepts FEWER values than it has members (the rest
@@ -5316,22 +5363,15 @@ fn struct_method(
             }
             with_host(|h| h.new_hash(map))
         }
-        "[]" => {
-            let vals = values();
-            match &args[0] {
-                Value::Int(i) => norm_idx(*i, vals.len())
-                    .and_then(|k| vals.get(k))
-                    .cloned()
-                    .unwrap_or(Value::Undef),
-                other => {
-                    let key = with_host(|h| h.as_symbol(other))
-                        .or_else(|| with_host(|h| h.as_str(other)));
-                    key.and_then(|k| members.iter().position(|m| *m == k))
-                        .and_then(|i| vals.get(i))
-                        .cloned()
-                        .unwrap_or(Value::Undef)
-                }
-            }
+        "[]" if args.len() == 1 => {
+            let i = struct_pos(members, &args[0])?;
+            with_host(|h| h.ivar_of(recv, &members[i]))
+        }
+        "[]=" if args.len() == 2 => {
+            let i = struct_pos(members, &args[0])?;
+            frozen_guard(recv, "[]=", &["[]="])?;
+            with_host(|h| h.set_ivar_of(recv, &members[i], args[1].clone()));
+            args[1].clone()
         }
         "each" if block.is_some() => {
             let bl = block.clone().unwrap();
@@ -12281,6 +12321,22 @@ fn dispatch_array(
         // `filter_map`, `find`/`detect`, `partition`, `group_by`, `take_while`
         // and `drop_while` share one body with their `with_index` re-attachment;
         // block-less, each answers an Enumerator.
+        // `find(ifnone)`: with no element found, the result of calling `ifnone`.
+        "find" | "detect"
+            if block.is_some() && args.first().is_some_and(|a| !matches!(a, Value::Undef)) =>
+        {
+            let b = block.unwrap();
+            for x in &arr {
+                let r = call_proc(&b, std::slice::from_ref(x))?;
+                if has_pending_signal() {
+                    return Ok(Value::Undef);
+                }
+                if with_host(|h| h.truthy(&r)) {
+                    return Ok(x.clone());
+                }
+            }
+            dispatch(&args[0], "call", &[], None)
+        }
         "filter_map" | "find" | "detect" | "partition" | "group_by" | "take_while"
         | "drop_while" => match &block {
             Some(b) => array_yield_method(recv, name, &arr, b, None),
@@ -18737,7 +18793,13 @@ fn dispatch_hash(
                     return Ok(new_arr(vec![kv, v.clone()]));
                 }
             }
-            Ok(Value::Undef)
+            // `find(ifnone)` calls `ifnone` when nothing matched.
+            match args.first() {
+                Some(ifnone) if !matches!(ifnone, Value::Undef) => {
+                    dispatch(ifnone, "call", &[], None)
+                }
+                _ => Ok(Value::Undef),
+            }
         }
         "select" | "filter" | "reject" => {
             let keep = name != "reject";
@@ -28016,4 +28078,38 @@ fn hash_le(a: &Value, b: &Value, strict: bool) -> Result<bool, String> {
         }
     }
     Ok(true)
+}
+
+/// `rb_struct_pos` (struct.c): the member index a `Struct#[]` / `#[]=` key
+/// names — a Symbol or String by name, anything else through `to_int`,
+/// negative from the end — or the IndexError / NameError MRI raises.
+fn struct_pos(members: &[String], key: &Value) -> Result<usize, String> {
+    let name = with_host(|h| h.as_symbol(key).or_else(|| h.as_str(key)));
+    if let Some(n) = name {
+        return members.iter().position(|m| *m == n).ok_or_else(|| {
+            raise_exc_with(
+                "NameError",
+                &format!("no member '{n}' in struct"),
+                &[("name", with_host(|h| h.new_symbol(&n)))],
+            )
+        });
+    }
+    let i = to_int(key)?;
+    let len = members.len() as i64;
+    if i < 0 {
+        if i + len < 0 {
+            return Err(raise_exc(
+                "IndexError",
+                &format!("offset {i} too small for struct(size:{len})"),
+            ));
+        }
+        Ok((i + len) as usize)
+    } else if i >= len {
+        Err(raise_exc(
+            "IndexError",
+            &format!("offset {i} too large for struct(size:{len})"),
+        ))
+    } else {
+        Ok(i as usize)
+    }
 }

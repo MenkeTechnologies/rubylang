@@ -3810,3 +3810,68 @@ true
 "no implicit conversion of Integer into Hash"
 "undefined method '<=' for an instance of Array"
 [1]
+#==#
+"A\u0000\n\aa\u00008"
+"bA"
+"Z"
+true
+[1]
+:A
+"A"
+"qw("
+"ab"
+"\u0001"
+"\u0001"
+"\u007F"
+"éA"
+:aqb
+"é"
+"\\é"
+["\\é", "a b"]
+"x\#{y}"
+" \a"
+"bé"
+"é\\"
+tAq
+#==#
+:none
+nil
+7
+:h
+[:a, 1]
+:r
+#==#
+missing keywords: :a, :b, :c
+missing keywords: :b, :c
+missing keyword: :c
+unknown keyword: :x
+missing keywords: :a, :b, :c
+missing keywords: :b, :c
+wrong number of arguments (given 4, expected 0..3)
+#<data D a=1, b=2, c=3>
+K [1, 2] -> ArgumentError: wrong number of arguments (given 2, expected 0)
+N [1, 2] -> #<struct N a=1, b=2>
+K [{a: 1}] -> #<struct K a=1, b=nil>
+N [{a: 1}] -> #<struct N a={a: 1}, b=nil>
+K [{a: 1, c: 2, d: 3}] -> ArgumentError: unknown keywords: c, d
+N [{a: 1, c: 2, d: 3}] -> #<struct N a={a: 1, c: 2, d: 3}, b=nil>
+K [] -> #<struct K a=nil, b=nil>
+N [] -> #<struct N a=nil, b=nil>
+K [{a: 1}, 2] -> ArgumentError: wrong number of arguments (given 2, expected 0)
+N [{a: 1}, 2] -> #<struct N a={a: 1}, b=2>
+K [{"a" => 1}] -> #<struct K a=1, b=nil>
+N [{"a" => 1}] -> #<struct N a={"a" => 1}, b=nil>
+#<struct N a=1, b=2>
+#<struct N a={a: 1, b: 2}, b=nil>
+#<struct K a=1, b=2>
+[5] IndexError: offset 5 too large for struct(size:2)
+[-3] IndexError: offset -3 too small for struct(size:2)
+[2] IndexError: offset 2 too large for struct(size:2)
+[-2] 1
+[:z] NameError: no member 'z' in struct
+["b"] 2
+[1.9] 2
+[nil] TypeError: no implicit conversion from nil to integer
+[5]= IndexError: offset 5 too large for struct(size:2)
+[:z]= NameError: no member 'z' in struct
+#<struct N a=9, b=8>

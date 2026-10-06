@@ -3429,10 +3429,11 @@ fn matchop(op: &str) -> BinOp {
     }
 }
 
-/// Scan a double-quoted string body for `#{ … }` interpolation, decoding the
-/// common backslash escapes in the literal segments.
+/// Scan an interpolating REGEXP body for `#{ … }`, decoding the common
+/// backslash escapes in the literal segments but leaving `\1`..`\7` alone: in a
+/// pattern those are backreferences, not octal bytes.
 pub(crate) fn scan_interp(raw: &str) -> Result<Vec<StrPart>, String> {
-    scan_interp_implicit(raw).map(|(parts, _)| parts)
+    scan_interp_full(raw, false).map(|(parts, _)| parts)
 }
 
 /// The implicit block parameters an interpolation references outside any block
@@ -3469,9 +3470,30 @@ fn parse_interp_fragment(src: &str) -> Result<(Vec<Stmt>, ImplicitParams), Strin
     Ok((stmts, seen))
 }
 
-/// [`scan_interp`], also answering the implicit parameters the interpolations
-/// reference (see [`parse_interp_fragment`]).
+/// A double-quoted body with no interpolation, its escapes decoded exactly as
+/// a string literal's (the lexer's non-interpolating `:"…"` symbols).
+pub(crate) fn decode_dquote_body(raw: &str) -> String {
+    let mut no_interp = |_: &str| -> Result<Vec<Stmt>, String> { Ok(Vec::new()) };
+    match scan_interp_with(raw, &mut no_interp, true) {
+        Ok(parts) => parts
+            .into_iter()
+            .filter_map(|p| match p {
+                StrPart::Lit(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => raw.to_string(),
+    }
+}
+
+/// Scan a double-quoted STRING body (every string escape decoded), also
+/// answering the implicit parameters its interpolations reference (see
+/// [`parse_interp_fragment`]).
 fn scan_interp_implicit(raw: &str) -> Result<(Vec<StrPart>, ImplicitParams), String> {
+    scan_interp_full(raw, true)
+}
+
+fn scan_interp_full(raw: &str, string: bool) -> Result<(Vec<StrPart>, ImplicitParams), String> {
     let mut seen = ImplicitParams::default();
     let mut parse = |src: &str| -> Result<Vec<Stmt>, String> {
         let (stmts, s) = parse_interp_fragment(src)?;
@@ -3479,13 +3501,14 @@ fn scan_interp_implicit(raw: &str) -> Result<(Vec<StrPart>, ImplicitParams), Str
         seen.it |= s.it;
         Ok(stmts)
     };
-    let parts = scan_interp_with(raw, &mut parse)?;
+    let parts = scan_interp_with(raw, &mut parse, string)?;
     Ok((parts, seen))
 }
 
 fn scan_interp_with(
     raw: &str,
     parse: &mut dyn FnMut(&str) -> Result<Vec<Stmt>, String>,
+    string: bool,
 ) -> Result<Vec<StrPart>, String> {
     let b = raw.as_bytes();
     let mut i = 0;
@@ -3494,6 +3517,18 @@ fn scan_interp_with(
     while i < b.len() {
         if b[i] == b'\\' && i + 1 < b.len() {
             let n = b[i + 1];
+            // `\NNN` — one to three octal digits → a byte (`"\101"` is `"A"`).
+            if string && (b'0'..=b'7').contains(&n) {
+                let mut j = i + 1;
+                let mut val = 0u32;
+                while j < b.len() && j < i + 4 && (b'0'..=b'7').contains(&b[j]) {
+                    val = val * 8 + u32::from(b[j] - b'0');
+                    j += 1;
+                }
+                lit.push(char::from_u32(val & 0xff).unwrap_or('\u{fffd}'));
+                i = j;
+                continue;
+            }
             match n {
                 b'n' => lit.push('\n'),
                 b't' => lit.push('\t'),
@@ -3548,6 +3583,34 @@ fn scan_interp_with(
                     }
                     lit.push(char::from_u32(val).unwrap_or('\u{fffd}'));
                     i = j;
+                    continue;
+                }
+                // A string literal (not a regexp, whose escapes the regex
+                // engine reads) also decodes the rest of MRI's escapes.
+                // Backslash-newline joins the lines.
+                b'\n' if string => {}
+                // `\cx` / `\C-x` — the control character (`\c?` is DEL).
+                b'c' | b'C' if string => {
+                    let at = if n == b'c' { i + 2 } else { i + 3 };
+                    let ok = n == b'c' || b.get(i + 2) == Some(&b'-');
+                    match b.get(at) {
+                        Some(&c) if ok && c.is_ascii() => {
+                            lit.push(if c == b'?' {
+                                '\x7f'
+                            } else {
+                                char::from(c & 0x9f)
+                            });
+                            i = at + 1;
+                            continue;
+                        }
+                        _ => lit.push(n as char),
+                    }
+                }
+                // Any other escaped character is itself (`"\q"` is `"q"`).
+                _ if string => {
+                    let ch = raw[i + 1..].chars().next().unwrap_or('\\');
+                    lit.push(ch);
+                    i += 1 + ch.len_utf8();
                     continue;
                 }
                 other => {

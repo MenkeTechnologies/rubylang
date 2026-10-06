@@ -557,20 +557,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         // Keep escapes raw for double-quoted (the parser's interp
                         // scan decodes them); decode the essentials for single.
                         let n = b[i + 1];
-                        if dq {
-                            s.push('\\');
-                            s.push(n as char);
-                        } else {
-                            match n {
-                                b'\'' => s.push('\''),
-                                b'\\' => s.push('\\'),
-                                other => {
-                                    s.push('\\');
-                                    s.push(other as char);
-                                }
+                        // The escaped character is copied whole: it may be a
+                        // multi-byte one (`"\é"`).
+                        let cl = utf8_len(n);
+                        match n {
+                            b'\'' if !dq => s.push('\''),
+                            b'\\' if !dq => s.push('\\'),
+                            _ => {
+                                s.push('\\');
+                                s.push_str(&src[i + 1..i + 1 + cl]);
                             }
                         }
-                        i += 2;
+                        i += 1 + cl;
                         continue;
                     }
                     // A `#{ … }` interpolation in a double-quoted string is copied
@@ -600,8 +598,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                                     while i < b.len() && b[i] != q {
                                         if b[i] == b'\\' && i + 1 < b.len() {
                                             s.push('\\');
-                                            s.push(b[i + 1] as char);
-                                            i += 2;
+                                            let cl = utf8_len(b[i + 1]);
+                                            s.push_str(&src[i + 1..i + 1 + cl]);
+                                            i += 1 + cl;
                                             continue;
                                         }
                                         if b[i] == b'\n' {
@@ -651,8 +650,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                                         let c = b[i];
                                         if c == b'\\' && i + 1 < b.len() {
                                             s.push('\\');
-                                            s.push(b[i + 1] as char);
-                                            i += 2;
+                                            let cl = utf8_len(b[i + 1]);
+                                            s.push_str(&src[i + 1..i + 1 + cl]);
+                                            i += 1 + cl;
                                             continue;
                                         }
                                         if c == b'[' {
@@ -1202,8 +1202,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     let ch = b[i];
                     if ch == b'\\' && i + 1 < b.len() {
                         pat.push('\\');
-                        pat.push(b[i + 1] as char);
-                        i += 2;
+                        let cl = utf8_len(b[i + 1]);
+                        pat.push_str(&src[i + 1..i + 1 + cl]);
+                        i += 1 + cl;
                         continue;
                     }
                     // `#{ … }` interpolation — copy the whole expression through
@@ -1445,30 +1446,10 @@ fn op_symbol_at(s: &str) -> Option<&'static str> {
     OP_SYMBOLS.iter().find(|op| s.starts_with(**op)).copied()
 }
 
-/// Decode the double-quote escapes a non-interpolating `:"…"` symbol supports
-/// (`\n \t \0 \e \\ \"`), leaving any other escaped char as its literal.
+/// Decode a non-interpolating `:"…"` symbol body with the same escapes as a
+/// double-quoted string.
 fn decode_dquote_escapes(body: &str) -> String {
-    let b = body.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\\' && i + 1 < b.len() {
-            match b[i + 1] {
-                b'n' => out.push(b'\n'),
-                b't' => out.push(b'\t'),
-                b'0' => out.push(0),
-                b'e' => out.push(0x1b),
-                b'\\' => out.push(b'\\'),
-                b'"' => out.push(b'"'),
-                other => out.push(other),
-            }
-            i += 2;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    crate::parser::decode_dquote_body(body)
 }
 
 /// Whether a `%` here begins a `%(…)`-style double-quoted string rather than

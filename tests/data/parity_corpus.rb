@@ -5254,3 +5254,31 @@ p B <=> A, A <=> B, A <=> A, A <=> String, B <=> W, W <=> B, A <=> 3, Integer <=
 p({a: 1} <= {a: 1, b: 2}, {a: 1} < {a: 1}, {a: 1} >= {}, {a: 2} <= {a: 1, b: 2}, {a: 1} > {}, {a: 1.0} <= {a: 1}, {} < {x: nil})
 begin; {a: 1} <= 3; rescue TypeError => e; p e.message; end
 begin; [1] <= 3; rescue NoMethodError => e; p e.message, e.receiver; end
+#==#
+# ── string escapes: octal, control, unknown, line continuation, multibyte; regexp backreferences untouched ──
+x = "b"
+p "\101\0\012\7a\08", "#{x}\101", "aa".gsub(/(a)\1/, "Z"), "abab".match?(/(ab)#{"\\1"}/), "\1".bytes, :"\101", %Q(\101)
+p "\q\w\(", "a\
+b", "\C-a", "\ca", "\c?", "\u00e9\x41", :"a\qb", "\é", %q(\é), %w[\é a\ b], "x\#{y}", "\s\a", "#{x}\é", "é\\"
+puts <<~E
+  t\101\q
+E
+#==#
+# ── find(ifnone) on Array and Hash ──
+p [1, 2, 3].detect(-> { :none }) { _1 > 5 }, [nil].find(-> { :x }) { true }, [1].find(proc { 7 }) { false }
+p({a: 1}.find(-> { :h }) { false }, {a: 1}.find(-> { :h }) { true }, (1..3).find(-> { :r }) { _1 > 9 })
+#==#
+# ── Struct/Data construction and Struct#[] bounds ──
+D = Data.define(:a, :b, :c)
+[{}, {a: 1}, {a: 1, b: 1, x: 1}, {a: 1, b: 2, c: 3, x: 4}, {x: 1, y: 2}].each { |h| puts((D.new(**h).inspect rescue $!.message)) }
+puts((D.new({a: 1}) rescue $!.message), (D.new(1, 2, 3, 4) rescue $!.message), D.new(1, 2, 3).inspect)
+K = Struct.new(:a, :b, keyword_init: true)
+N = Struct.new(:a, :b)
+[[1, 2], [{a: 1}], [{a: 1, c: 2, d: 3}], [], [{a: 1}, 2], [{"a" => 1}]].each do |a|
+  [K, N].each { |s| puts "#{s} #{a.inspect} -> #{(s.new(*a).inspect rescue "#{$!.class}: #{$!.message}")}" }
+end
+p N.new(a: 1, b: 2), N.new({a: 1, b: 2}), K.new(a: 1, b: 2)
+s = N.new(1, 2)
+[5, -3, 2, -2, :z, "b", 1.9, nil].each { |i| puts "[#{i.inspect}] #{(s[i].inspect rescue "#{$!.class}: #{$!.message}")}" }
+[5, :z].each { |i| r = begin; s[i] = 0; rescue => e; "#{e.class}: #{e.message}"; end; puts "[#{i.inspect}]= #{r}" }
+s[:a] = 9; s[-1] = 8; p s

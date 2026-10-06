@@ -1041,9 +1041,11 @@ Honest limitations of this surface:
   `a % b`). A bare local variable that MRI would treat as modulo (`foo %(3)`
   where `foo` is a local) is read as a string command arg here, since this lexer
   has no local-variable table. `__END__` alone on a line stops the program (the
-  trailing DATA section is out of scope). Not yet: an unknown escape like `"\d"`
-  keeps its backslash rather than dropping it as MRI does (deliberate, for
-  regex-source strings).
+  trailing DATA section is out of scope). A double-quoted string decodes every
+  MRI escape — octal `\101`, `\cx`/`\C-x`, backslash-newline, and an unknown
+  escape drops its backslash (`"\d"` is `"d"`); an interpolated regexp keeps
+  its escapes for the regex engine. Not yet: `\M-x` (a non-UTF-8 byte), and
+  `Regexp#source` keeps a `\/` or `\é` escape MRI drops.
 - **`<<` heredoc vs left-shift.** A `<<` glued to the right of a value with no
   preceding space (`s<<"b"`, `arr<<CONST`) is the shift/append operator, not a
   heredoc — the quoted (`<<"X"`) and bare-uppercase (`<<END`) heredoc forms are
