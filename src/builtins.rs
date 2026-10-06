@@ -7414,7 +7414,10 @@ fn dispatch_number(
             out
         }
         // `Integer#ord` is the integer itself (`String#ord`'s inverse of `chr`).
-        "ord" if matches!(recv, Value::Int(_)) || with_host(|h| h.as_promoted_bigint(recv)).is_some() => {
+        "ord"
+            if matches!(recv, Value::Int(_))
+                || with_host(|h| h.as_promoted_bigint(recv)).is_some() =>
+        {
             Ok(recv.clone())
         }
         "chr" => {
@@ -22835,7 +22838,11 @@ fn fmt_hexfloat(f: f64, prec: Option<usize>, upper: bool, alt: bool) -> String {
             // fraction digits left, its parity decides a tie (`1.8` → `2`).
             let bits = 4 * p as u32;
             let shift = FRAC_BITS - bits;
-            let sig = if f == 0.0 { 0 } else { frac | (1u64 << FRAC_BITS) };
+            let sig = if f == 0.0 {
+                0
+            } else {
+                frac | (1u64 << FRAC_BITS)
+            };
             let mut q = sig >> shift;
             let rem = sig & ((1u64 << shift) - 1);
             let half = 1u64 << (shift - 1);

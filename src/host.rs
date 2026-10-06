@@ -7808,7 +7808,7 @@ impl RubyHost {
     }
     /// [`Self::format_uncaught`] with the `<msg> (<Class>)` part already
     /// rendered by the exception's own `detailed_message` (see
-    /// [`uncaught_report`]).
+    /// `uncaught_report`).
     pub fn format_uncaught_as(&mut self, detailed: Option<String>) -> Option<String> {
         let exc = self.pending_exc.take()?;
         let class = self.class_of(&exc).to_string();
