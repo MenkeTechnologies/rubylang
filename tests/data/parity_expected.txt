@@ -3709,3 +3709,49 @@ Set[1,
        "yyyyyyyyyyyyyyyyyyyy",
        "zzzzzzzzzzzzzzzzzzzz",
        "wwwwwwwwwwwwwwwwwwww"]}}}
+#==#
+json true
+json.rb false
+thread false
+rbconfig false
+pp true
+prettyprint false
+time true
+date false
+digest/md5 true
+digest false
+tempfile true
+tmpdir false
+fileutils false
+LoadError
+#==#
+false
+NoMethodError
+:loaded
+"[1, {a: 2}]\n"
+"\"x\"\n"
+#==#
+1
+2
+3
+[:ret, nil]
+[:ret, nil]
+[1, 2, 3]
+[2, 4, 6]
+nil
+[1, 2]
+true
+:done
+[1, 2]
+1
+[[1, 0], [2, 1]]
+:done
+[1]
+:done
+nil
+nil
+2
+nil
+9
+20
+[1, 2]

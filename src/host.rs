@@ -1489,6 +1489,12 @@ pub struct RubyHost {
     /// host. They have no path on disk, so they dedup here instead of through
     /// `$LOADED_FEATURES` — that Array holds the paths the *program* required.
     embedded_stdlib_loaded: std::collections::HashSet<String>,
+    /// Native library names `require` has already answered true for (see
+    /// [`RubyHost::require_builtin_lib`]).
+    builtin_libs_loaded: std::collections::HashSet<String>,
+    /// `to_enum`/`enum_for` Enumerators by heap id: the size block and the
+    /// method arguments it is called with (no block: `size` is nil).
+    enum_size_fns: std::collections::HashMap<u32, (Option<Value>, Vec<Value>)>,
     struct_counter: u32,
     /// Class variables (`@@x`): class name → variable name → value. Shared across
     /// the class hierarchy (looked up by walking the superclass chain).
@@ -2297,6 +2303,8 @@ impl RubyHost {
             struct_defs: IndexMap::new(),
             data_classes: std::collections::HashSet::new(),
             embedded_stdlib_loaded: std::collections::HashSet::new(),
+            builtin_libs_loaded: std::collections::HashSet::new(),
+            enum_size_fns: std::collections::HashMap::new(),
             struct_counter: 0,
             class_vars: IndexMap::new(),
             class_ivars: IndexMap::new(),
@@ -5326,6 +5334,58 @@ impl RubyHost {
     /// so a circular require inside it sees the library as already loaded.
     pub fn mark_embedded_stdlib_loaded(&mut self, name: &str) {
         self.embedded_stdlib_loaded.insert(name.to_string());
+    }
+    /// `require` of a natively implemented library: true the first time, false
+    /// once loaded — and from the start for the ones MRI loads before the
+    /// program runs. Loading one also loads what its MRI source requires, so
+    /// `require "pp"` makes a later `require "prettyprint"` false.
+    pub fn require_builtin_lib(&mut self, name: &str) -> bool {
+        // `set` is preloaded in MRI 4 too (`require "set"` is false), but
+        // tests/require.rs pins it true; left out pending that decision.
+        const PRELOADED: &[&str] = &["thread", "fiber", "monitor", "did_you_mean", "rbconfig"];
+        // What each library's own `require`s pull in (measured against MRI:
+        // `require A; require B` answers false).
+        const DEPS: &[(&str, &[&str])] = &[
+            ("time", &["date"]),
+            ("digest/md5", &["digest"]),
+            ("digest/sha1", &["digest"]),
+            ("digest/sha2", &["digest"]),
+            ("bigdecimal/util", &["bigdecimal"]),
+            ("pp", &["prettyprint"]),
+            ("tmpdir", &["fileutils", "etc"]),
+            ("tempfile", &["fileutils", "tmpdir", "etc"]),
+            ("cgi", &["cgi/escape"]),
+            ("cgi/util", &["cgi/escape"]),
+            ("erb", &["cgi/escape"]),
+        ];
+        let name = name.strip_suffix(".rb").unwrap_or(name);
+        if PRELOADED.contains(&name) || !self.builtin_libs_loaded.insert(name.to_string()) {
+            return false;
+        }
+        if let Some((_, deps)) = DEPS.iter().find(|(n, _)| *n == name) {
+            for d in *deps {
+                self.builtin_libs_loaded.insert(d.to_string());
+            }
+        }
+        true
+    }
+    /// Record that Enumerator `e` came from `to_enum`, whose `size` is what
+    /// `size_fn` answers for `args` (nil without one).
+    pub fn set_enum_size_fn(&mut self, e: &Value, size_fn: Option<Value>, args: Vec<Value>) {
+        if let Value::Obj(id) = e {
+            self.enum_size_fns.insert(*id, (size_fn, args));
+        }
+    }
+    /// The `to_enum` size block and its arguments, when `e` came from `to_enum`.
+    pub fn enum_size_fn(&self, e: &Value) -> Option<(Option<Value>, Vec<Value>)> {
+        match e {
+            Value::Obj(id) => self.enum_size_fns.get(id).cloned(),
+            _ => None,
+        }
+    }
+    /// Whether native library `name` has been required (or preloaded).
+    pub fn builtin_lib_loaded(&self, name: &str) -> bool {
+        self.builtin_libs_loaded.contains(name)
     }
     /// The class name a class variable read/write resolves against, given `self`:
     /// an instance's class, or a class-reference's own name.

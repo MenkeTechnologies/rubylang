@@ -1886,7 +1886,6 @@ fn is_universal_object_method(name: &str) -> bool {
             | "kind_of?"
             | "instance_of?"
             | "tap"
-            | "pretty_inspect"
             | "then"
             | "yield_self"
             | "itself"
@@ -2557,7 +2556,7 @@ pub(crate) fn dispatch(
         }
         // `Kernel#pretty_inspect`: `PP.pp(self, "")`, whose String output has
         // no `winsize`, so the width is `$COLUMNS` or 80, less one.
-        "pretty_inspect" if args.is_empty() => {
+        "pretty_inspect" if args.is_empty() && with_host(|h| h.builtin_lib_loaded("pp")) => {
             let s = crate::pp::pretty_inspect(recv, crate::pp::env_width() - 1)?;
             return Ok(with_host(|h| h.new_string(s)));
         }
@@ -2603,13 +2602,24 @@ pub(crate) fn dispatch(
             let sink = with_host(|h| h.new_enum_sink());
             // The method is invoked as `send` would: a top-level `def gen`
             // (private on Object) enumerates through `to_enum(:gen)`.
-            if let Some(def) = top_level_method_for(recv, &method) {
-                crate::host::run_top_method(&def, recv.clone(), &method, &rest, Some(sink))?;
+            let user_method = top_level_method_for(recv, &method);
+            let ret = if let Some(def) = &user_method {
+                crate::host::run_top_method(def, recv.clone(), &method, &rest, Some(sink))?
             } else {
-                dispatch(recv, &method, &rest, Some(sink))?;
-            }
+                dispatch(recv, &method, &rest, Some(sink))?
+            };
             let collected = with_host(|h| h.take_enum_sink());
-            return Ok(with_host(|h| h.new_enumerator(collected, &method)));
+            let e = with_host(|h| h.new_enumerator(collected, &method));
+            // `Enumerator#size` of a `to_enum` is its size block's answer, nil
+            // without one — never the count it happens to yield.
+            with_host(|h| h.set_enum_size_fn(&e, block.clone(), rest.clone()));
+            // Over a user method, what the enumerator's `each` (and the
+            // `StopIteration#result` at its end) answers is that method's own
+            // return value, its `yield`s having answered nil.
+            if user_method.is_some() || with_host(|h| h.object_class(recv)).is_some() {
+                with_host(|h| h.set_enum_source(&e, ret));
+            }
+            return Ok(e);
         }
         // `.lazy` wraps an enumerable in a lazy pipeline. A range (possibly
         // endless) stays a range source; anything else materializes to an array.
@@ -2795,6 +2805,11 @@ pub(crate) fn dispatch(
                 || with_host(|h| h.find_singleton_define_method(recv, &m)).is_some()
             {
                 return Ok(Value::Bool(true));
+            }
+            // `Kernel#pretty_inspect` is defined by pp.rb, which loads on the
+            // first `pp` or `require "pp"`.
+            if m == "pretty_inspect" && !with_host(|h| h.builtin_lib_loaded("pp")) {
+                return Ok(Value::Bool(false));
             }
             if let Some(cls) = with_host(|h| h.object_class(recv)) {
                 if with_host(|h| h.find_method_owner(&cls, &m)).is_some()
@@ -14276,7 +14291,13 @@ fn dispatch_enumerator(
             with_host(|h| h.enum_rewind(recv));
             Ok(recv.clone())
         }
-        "size" | "length" if args.is_empty() && block.is_none() => Ok(Value::Int(buf.len() as i64)),
+        "size" | "length" if args.is_empty() && block.is_none() => {
+            match with_host(|h| h.enum_size_fn(recv)) {
+                Some((Some(f), a)) => call_proc(&f, &a),
+                Some((None, _)) => Ok(Value::Undef),
+                None => Ok(Value::Int(buf.len() as i64)),
+            }
+        }
         // Re-attaching a block to `a.map!` / `a.select!` / … runs the in-place
         // method itself, writing back into the Array that built the Enumerator:
         // `a.map!.with_index { |v, i| v * i }` changes `a`. These used to fall
@@ -20691,6 +20712,8 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
         }
         // `Kernel#pp` (pp.rb): each object through `PP.pp` at `$stdout`'s width.
         "pp" => {
+            // Kernel#pp is `require "pp"` then `PP.pp` on each object.
+            with_host(|h| h.require_builtin_lib("pp"));
             for a in args {
                 let s = crate::pp::pretty_inspect(a, crate::pp::stdout_width())?;
                 crate::host::write_stdout(&s);
@@ -24467,8 +24490,6 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "pp"
             | "prettyprint"
             | "ostruct"
-            | "comparable"
-            | "enumerable"
             | "benchmark"
             | "stringio"
             | "fileutils"
@@ -24501,7 +24522,6 @@ pub(crate) fn is_builtin_lib(name: &str) -> bool {
             | "rbconfig"
             | "ripper"
             | "objspace"
-            | "date/format"
             // Prism (Ruby's parser, a C extension) — no-op the require so railties'
             // source_annotation_extractor loads. Only its `rails notes` command uses
             // it; serving never does.
@@ -24667,7 +24687,7 @@ fn do_require(args: &[Value], mode: ReqMode) -> Result<Value, String> {
 
     // A known builtin library name is a no-op that reports success.
     if mode == ReqMode::Require && is_builtin_lib(&raw) {
-        return Ok(Value::Bool(true));
+        return Ok(Value::Bool(with_host(|h| h.require_builtin_lib(&raw))));
     }
 
     let abs = match mode {

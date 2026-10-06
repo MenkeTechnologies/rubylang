@@ -5202,3 +5202,31 @@ h = {k: 1}; h[:self] = h; pp h
 x = pp({a: 1}, [2]); p x, pp
 pp "abc".match(/(?<x>a)(b)?(z)?/), Set[*1..30]
 pp({deep: {deeper: {deepest: ["x" * 20, "y" * 20, "z" * 20, "w" * 20]}}})
+#==#
+# ── require of a native library: true once, then false; preloaded and dependency-loaded ones false ──
+%w[json json.rb thread rbconfig pp prettyprint time date digest/md5 digest tempfile tmpdir fileutils].each do |l|
+  puts "#{l} #{require(l)}"
+end
+p((begin; require "comparable"; rescue LoadError => e; e.class; end))
+#==#
+# ── pretty_inspect exists once pp is loaded ──
+p 1.respond_to?(:pretty_inspect)
+begin; 1.pretty_inspect; rescue NoMethodError => e; p e.class; end
+pp :loaded
+p [1, {a: 2}].pretty_inspect, "x".pretty_inspect
+#==#
+# ── to_enum over a user method: each / StopIteration#result answer its return; size is nil or the size block's ──
+def gen
+  return to_enum(:gen) unless block_given?
+  yield 1; yield 2; r = yield 3; [:ret, r]
+end
+e = gen
+p e.next, e.next, e.next
+begin; e.next; rescue StopIteration => x; p x.result; end
+p e.each { }, e.to_a, e.map { _1 * 2 }, e.size, e.first(2), e.include?(2)
+class C; include Enumerable; def each; yield 1; yield 2; :done; end; end
+c = C.new.to_enum
+p c.each { }, c.to_a, c.next, c.with_index.to_a, c.each_with_index { }, c.select(&:odd?)
+begin; c.next; c.next; rescue StopIteration => x; p x.result; end
+p [1, 2].to_enum.size, [1, 2].to_enum(:map).size, [1, 2].each.size, {a: 1}.to_enum.size, [1, 2].to_enum { 9 }.size
+p [1, 2, 3].enum_for(:each_slice, 2) { |n| n * 10 }.size, [1, 2].to_enum.each { }

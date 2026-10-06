@@ -278,8 +278,17 @@ smaller thread stack and prove nothing about `ruby -e`.
   Data, Range, multi-line String, MatchData, `pp_object` with sorted ivars),
   at `PP.width_for`'s width. Not closed: a user-defined `pretty_print(q)` is
   never called (there is no Ruby-visible `PP` object), so such an object
-  prints through its `inspect`; and `pretty_inspect` exists before `pp` /
-  `require "pp"` has run, where MRI raises `NoMethodError`.
+  prints through its `inspect`. `pretty_inspect` appears once `pp` or
+  `require "pp"` has run, as pp.rb defines it.
+- **`require` of a native library answers true once, then false — fixed.**
+  Libraries MRI loads before the program (`thread`, `rbconfig`, …) and those
+  another library pulls in (`pp` loads `prettyprint`, `tmpdir` loads
+  `fileutils`) answer false. Not closed: `require "set"` still answers true
+  (MRI 4: false, Set is core) because `tests/require.rs` pins true.
+  `require "comparable"`/`"enumerable"` now raise `LoadError` as in MRI.
+- **`to_enum` Enumerators: `size` is nil (or the size block's answer) and
+  `each`/`StopIteration#result` answer the user method's return value — fixed.**
+  The method still runs eagerly when `to_enum` is called.
 - **A bare undefined CONSTANT raises `NameError` — fixed.** `p Nope` raises
   `uninitialized constant Nope` (qualified by the lexical class inside a
   namespace: `A::Foo::Bar`), with `#name` and `#receiver` set, after
