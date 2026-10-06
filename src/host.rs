@@ -5106,6 +5106,10 @@ impl RubyHost {
             _ => self.globals.contains_key(&format!("@{name}")),
         }
     }
+    /// The keys of the global table, in assignment order (without the `$`).
+    pub fn global_names(&self) -> Vec<String> {
+        self.globals.keys().cloned().collect()
+    }
     /// Whether global `name` has been assigned — true for one assigned nil.
     pub fn global_defined(&self, name: &str) -> bool {
         self.globals.contains_key(name)
@@ -6695,6 +6699,11 @@ impl RubyHost {
                 | "Struct"
                 | "Data"
                 | "Enumerator"
+                // The Enumerator classes values of rubylang are instances of, so the
+                // constant names what `.class` answers.
+                | "Enumerator::Lazy"
+                | "Enumerator::ArithmeticSequence"
+                | "Enumerator::Yielder"
                 | "Time"
                 | "Date"
                 | "DateTime"
@@ -9829,6 +9838,23 @@ pub fn plain_symbol_name(s: &str) -> bool {
     ];
     if OPS.contains(&s) {
         return true;
+    }
+    // MRI `is_special_global_name`: `$` and one punctuation character, `$-`
+    // and one identifier character, or `$` and digits (`:$!`, `:$-w`, `:$12`).
+    if let Some(rest) = s.strip_prefix('$') {
+        let mut cs = rest.chars();
+        let special = match cs.next() {
+            Some(c) if "~*$?!@/\\;,.=:<>\"&`'+0".contains(c) => cs.next().is_none(),
+            Some('-') => {
+                matches!(cs.next(), Some(c) if c == '_' || c.is_alphanumeric())
+                    && cs.next().is_none()
+            }
+            Some(c) if c.is_ascii_digit() => rest.chars().all(|c| c.is_ascii_digit()),
+            _ => false,
+        };
+        if special {
+            return true;
+        }
     }
     // `@ivar` / `@@cvar` / `$gvar` keep their sigil; only a plain name may also
     // carry a trailing `?` (predicate), `!` (bang) or `=` (writer).

@@ -21039,6 +21039,70 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             let syms: Vec<Value> = h.local_names().iter().map(|n| h.new_symbol(n)).collect();
             h.new_array(syms)
         })),
+        // MRI `rb_f_global_variables`: every entry of the global table — the
+        // interpreter's own (listed in the order MRI 4.0 prints them) and each
+        // one the program assigned — then `$1`..`$n` for the groups of the
+        // current `$~`.
+        "global_variables" => Ok(with_host(|h| {
+            const MRI_GLOBALS: &[&str] = &[
+                "$",
+                "-w",
+                "DEBUG",
+                "-d",
+                "@",
+                ";",
+                "-F",
+                ":",
+                "-I",
+                "LOAD_PATH",
+                "\"",
+                "LOADED_FEATURES",
+                "-p",
+                "-l",
+                "-a",
+                "0",
+                "PROGRAM_NAME",
+                "&",
+                "`",
+                "'",
+                "+",
+                "=",
+                "stdin",
+                "stdout",
+                ">",
+                "stderr",
+                "VERBOSE",
+                "-v",
+                ",",
+                "/",
+                "-0",
+                "\\",
+                "-W",
+                "_",
+                "~",
+                "<",
+                "!",
+                ".",
+                "FILENAME",
+                "-i",
+                "*",
+                "?",
+            ];
+            let mut names: Vec<String> = MRI_GLOBALS.iter().map(|g| format!("${g}")).collect();
+            for g in h.global_names() {
+                let internal = g.starts_with('@')
+                    || g.starts_with("__")
+                    || g.chars().all(|c| c.is_ascii_digit());
+                if !internal && !MRI_GLOBALS.contains(&g.as_str()) {
+                    names.push(format!("${g}"));
+                }
+            }
+            let md = h.get_global("~");
+            let ngroups = h.as_matchdata(&md).map_or(0, |(groups, ..)| groups.len());
+            names.extend((1..ngroups).map(|i| format!("${i}")));
+            let syms: Vec<Value> = names.iter().map(|n| h.new_symbol(n)).collect();
+            h.new_array(syms)
+        })),
         // `caller` / `caller_locations` — the call stack. A precise live
         // backtrace isn't tracked outside `--dap`, so return a best-effort single
         // frame from the current file. activesupport uses this only for

@@ -5344,3 +5344,15 @@ class SplatAset; def []=(*a); p(a); end; end; SplatAset.new[*[1, 2]] = 3
 s = +"ab"; idx = ["a"]; s[*idx] = "q"; p s
 s = +"ab"; (s[nil] = "x") rescue p $!
 s = +"ab"; s[1.5] = "x"; p s
+#==#
+p global_variables.sort.first(8), global_variables.size, global_variables.include?(:$stdout)
+$gv_probe = 1; $gv_nil = nil; p global_variables.include?(:$gv_probe), global_variables.include?(:$gv_nil), global_variables.size
+"ab" =~ /(a)(b)/; p global_variables.grep(/\d/).sort, global_variables.size
+"ab" =~ /x/; p global_variables.grep(/\d/).sort
+#==#
+p (1..3).lazy.class == Enumerator::Lazy, Enumerator::Lazy.ancestors.first(3), 1.step(3).instance_of?(Enumerator::ArithmeticSequence), Enumerator::Yielder.ancestors.first(2)
+Enumerator.new { |y| p y.class == Enumerator::Yielder; y << 1 }.to_a
+p Enumerator::Lazy, Enumerator::ArithmeticSequence, Enumerator::Yielder
+#==#
+p :$!, :"$-w", :"$-", :"$12", :"$1a", :"$a1", :"$~x", :"$-ww", :"$0", :"$-0", :"$\"", :"$_", :"$__a", :"$9", :"@1", :"$", :"$?"
+p %i[$! $; $,].map(&:inspect)
