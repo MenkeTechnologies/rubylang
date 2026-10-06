@@ -3536,3 +3536,176 @@ true
 [1, 2, 3]
 [[[:a, 1], []]]
 [[:a, :b], [1, 2], {a: 1, b: 2}]
+#==#
+"uninitialized constant A::Foo::Bar"
+:Bar
+A::Foo
+"uninitialized constant Nope"
+:Nope
+Object
+:rescued
+3
+4
+nil
+"constant"
+#==#
+"cm:Zed"
+#==#
+"instance-variable"
+nil
+"global-variable"
+nil
+nil
+"super"
+nil
+"super"
+"super"
+nil
+["instance-variable", nil]
+nil
+#==#
+"wrong number of arguments (given 1, expected 0)"
+"wrong number of arguments (given 2, expected 0..1)"
+{}
+nil
+3
+3
+[:a, nil]
+[:a, 7]
+[:z, 0]
+#==#
+[1,
+ 2,
+ 3,
+ 4,
+ 5,
+ 6,
+ 7,
+ 8,
+ 9,
+ 10,
+ 11,
+ 12,
+ 13,
+ 14,
+ 15,
+ 16,
+ 17,
+ 18,
+ 19,
+ 20,
+ 21,
+ 22,
+ 23,
+ 24,
+ 25,
+ 26,
+ 27,
+ 28,
+ 29,
+ 30]
+{a: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+ b: "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+ "str" =>
+  [1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1,
+   1],
+ 2 => nil,
+ "a b": 1,
+ "+": 2,
+ a?: 3}
+[{name: "alphaalphaalphaalphaalpha",
+  list:
+   [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]},
+ "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"]
+#<struct S2
+ aaaaaaaaaaaaaaa="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+ bbbbbbbbbbbbbbbbbbbbb="yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+ ccccccccccccccccc=[1, 1, 1, 1, 1, 1, 1, 1, 1, 1]>
+#<struct  a=1>
+#<data z=1>
+#<data D2
+ width="wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww",
+ height="hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh">
+"line one\n" +
+"line two\n" +
+"line one\n" +
+"line two\n" +
+"line one\n" +
+"line two\n"
+1..10
+1...
+"a".."c"
+1.0..2.5
+..5
+[1, 2, [...]]
+{k: 1, self: {...}}
+{a: 1}
+[2]
+[{a: 1}, [2]]
+nil
+#<MatchData "ab" x:"a">
+Set[1,
+ 2,
+ 3,
+ 4,
+ 5,
+ 6,
+ 7,
+ 8,
+ 9,
+ 10,
+ 11,
+ 12,
+ 13,
+ 14,
+ 15,
+ 16,
+ 17,
+ 18,
+ 19,
+ 20,
+ 21,
+ 22,
+ 23,
+ 24,
+ 25,
+ 26,
+ 27,
+ 28,
+ 29,
+ 30]
+{deep:
+  {deeper:
+    {deepest:
+      ["xxxxxxxxxxxxxxxxxxxx",
+       "yyyyyyyyyyyyyyyyyyyy",
+       "zzzzzzzzzzzzzzzzzzzz",
+       "wwwwwwwwwwwwwwwwwwww"]}}}

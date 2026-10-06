@@ -5147,3 +5147,58 @@ S = Struct.new(:a, :b) do
   def go = [members, to_a, to_h]
 end
 p S.new(1, 2).go
+#==#
+# ── an undefined constant raises NameError (after const_missing); X ||= v guards with defined? ──
+module A; class Foo; def m = Bar; end; end
+begin; A::Foo.new.m; rescue NameError => e; p e.message, e.name, e.receiver; end
+begin; Nope; rescue NameError => e; p e.message, e.name, e.receiver; end
+p((Missing rescue :rescued))
+Lazy ||= 3; p Lazy
+module M; end; M::Q ||= 4; p M::Q
+Z = nil; p Z, defined?(Z)
+#==#
+# ── const_missing on Object answers a bare missing constant ──
+class Object; def self.const_missing(n) = "cm:#{n}"; end
+p Zed
+#==#
+# ── defined? of nil-valued variables and of super ──
+@x = nil; $g = nil
+p defined?(@x), defined?(@y), defined?($g), defined?($nope), defined?(super)
+class Base; def m = 1; def self.k = 1; end
+class Sub < Base
+  def m = defined?(super)
+  def n = defined?(super)
+  def to_s = defined?(super)
+  def self.k = defined?(super)
+  def self.j = defined?(super)
+  def initialize; @q = nil; end
+  def iv = [defined?(@q), defined?(@r)]
+end
+p Sub.new.m, Sub.new.n, Sub.new.to_s, Sub.k, Sub.j, Sub.new.iv
+module Mo; def m = defined?(super); end
+class C1; include Mo; end
+p C1.new.m
+#==#
+# ── Hash.new argument checks; endless range before => / | in a pattern ──
+begin; Hash.new(1) { }; rescue => e; p e.message; end
+begin; Hash.new(1, 2); rescue => e; p e.message; end
+p Hash.new(capacity: 3), Hash.new(capacity: 3)[:x], Hash.new(3, capacity: 2)[:x]
+case {major: 3}
+in {major: 2.. => mj} then p mj
+end
+[nil, 7, 0].each { |v| case v; in 1.. | nil then p [:a, v]; in Integer => i if i.zero? then p [:z, i]; end }
+#==#
+# ── pp breaks at 80 columns (PrettyPrint) ──
+pp (1..30).to_a
+pp({a: "x" * 50, b: "y" * 50, "str" => [1] * 30, 2 => nil, :"a b" => 1, :+ => 2, :a? => 3})
+pp [{name: "alpha" * 5, list: (1..20).to_a}, "z" * 40]
+S2 = Struct.new(:aaaaaaaaaaaaaaa, :bbbbbbbbbbbbbbbbbbbbb, :ccccccccccccccccc)
+pp S2.new("x" * 30, "y" * 30, [1] * 10), Struct.new(:a).new(1), Data.define(:z).new(z: 1)
+D2 = Data.define(:width, :height); pp D2.new(width: "w" * 40, height: "h" * 40)
+pp "line one\nline two\n" * 3
+pp (1..10), (1...), ("a".."c"), (1.0..2.5), (..5)
+a = [1, 2]; a << a; pp a
+h = {k: 1}; h[:self] = h; pp h
+x = pp({a: 1}, [2]); p x, pp
+pp "abc".match(/(?<x>a)(b)?(z)?/), Set[*1..30]
+pp({deep: {deeper: {deepest: ["x" * 20, "y" * 20, "z" * 20, "w" * 20]}}})

@@ -5075,6 +5075,26 @@ impl RubyHost {
                 .unwrap_or(Value::Undef),
         }
     }
+    /// Whether `@name` has been assigned on the current `self` — true for one
+    /// assigned nil, which [`Self::get_ivar`] cannot tell from unset.
+    pub fn ivar_defined(&self, name: &str) -> bool {
+        let this = self.current_self();
+        match &this {
+            Value::Obj(id) => match self.obj(&this) {
+                Some(RObj::Object { ivars, .. }) => ivars.contains_key(name),
+                Some(RObj::ClassRef(cls)) => self
+                    .class_ivars
+                    .get(cls)
+                    .is_some_and(|m| m.contains_key(name)),
+                _ => self.obj_ivars.get(id).is_some_and(|m| m.contains_key(name)),
+            },
+            _ => self.globals.contains_key(&format!("@{name}")),
+        }
+    }
+    /// Whether global `name` has been assigned — true for one assigned nil.
+    pub fn global_defined(&self, name: &str) -> bool {
+        self.globals.contains_key(name)
+    }
     pub fn set_ivar(&mut self, name: &str, v: Value) {
         let this = self.current_self();
         match this {
@@ -7939,7 +7959,7 @@ impl RubyHost {
     /// A user-defined (or bare `Object`) instance that inspects through
     /// `Object#inspect` — not a Struct/Data, an exception, or one of the
     /// natively rendered library objects (`Encoding`, `OpenStruct`).
-    fn is_plain_object(&self, class: &str) -> bool {
+    pub(crate) fn is_plain_object(&self, class: &str) -> bool {
         (class == "Object" || self.classes.contains_key(class))
             && !self.struct_defs.contains_key(class)
             && !self.is_exception_class(class)
@@ -7948,7 +7968,7 @@ impl RubyHost {
 
     /// The `0x…` that `Object#inspect` prints, 16 hex digits as on a 64-bit MRI,
     /// derived from the heap slot so it is stable for the object's lifetime.
-    fn object_address(&self, v: &Value) -> String {
+    pub(crate) fn object_address(&self, v: &Value) -> String {
         let id = match v {
             Value::Obj(id) => *id as u64,
             _ => 0,
@@ -12387,14 +12407,11 @@ pub fn write_stderr(s: &str) {
     }
 }
 
-/// Kernel output goes to whatever `$stdout` / `$stderr` currently holds, as
-/// MRI's `rb_io_puts` on `rb_stdout` does: reassigned to a `StringIO` (the
-/// usual output-capture idiom) or any object with `write`, the text is sent
-/// there. Answers false when the global still holds a standard stream, which
-/// the caller then writes itself.
-fn redirected_write(global: &str, s: &str) -> bool {
+/// Whether `$stdout` / `$stderr` (named by `global`) still holds a standard
+/// stream rather than a reassigned `StringIO` or writer object.
+pub fn is_standard_stream(global: &str) -> bool {
     let target = with_host(|h| h.get_global(global));
-    let standard = match io_id(&target) {
+    match io_id(&target) {
         Some(id) => with_host(|h| {
             matches!(
                 h.io_handles.get(id as usize),
@@ -12402,10 +12419,19 @@ fn redirected_write(global: &str, s: &str) -> bool {
             )
         }),
         None => matches!(target, Value::Undef),
-    };
-    if standard {
+    }
+}
+
+/// Kernel output goes to whatever `$stdout` / `$stderr` currently holds, as
+/// MRI's `rb_io_puts` on `rb_stdout` does: reassigned to a `StringIO` (the
+/// usual output-capture idiom) or any object with `write`, the text is sent
+/// there. Answers false when the global still holds a standard stream, which
+/// the caller then writes itself.
+fn redirected_write(global: &str, s: &str) -> bool {
+    if is_standard_stream(global) {
         return false;
     }
+    let target = with_host(|h| h.get_global(global));
     let text = with_host(|h| h.new_string(s.to_string()));
     let _ = crate::builtins::dispatch(&target, "write", &[text], None);
     true

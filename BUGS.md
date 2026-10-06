@@ -6,9 +6,9 @@ reference `ruby` by the parity harness (`cargo run --bin parity`, replayed in CI
 by `tests/parity.rs`). This file tracks what is deliberately not done yet, so the
 gaps are honest rather than surprising. Unimplemented METHODS raise
 `undefined method` rather than answering a plausible value. The guarantee stops
-at methods: some unimplemented CONSTANTS answer `nil` instead of raising
-`NameError` (`FileUtils`, `Socket`, `UNIXServer`, `Addrinfo`, and `Errno::*`
-through it), and a few flag-valued APIs answer a wrong number rather than
+at methods and constants: an unmodelled library constant (`FileUtils`,
+`Socket`, `Benchmark`, `Open3`, …) raises `NameError: uninitialized constant`
+as MRI does without the require, even after `require` succeeds. A few flag-valued APIs answer a wrong number rather than
 refusing (`Regexp::EXTENDED`/`MULTILINE` read back as `1`; `~/re/` answers
 `-1`). Those are listed in their own sections below.
 
@@ -273,12 +273,18 @@ smaller thread stack and prove nothing about `ruby -e`.
   `#reason`, but the `break` signal from a stored proc never reaches it. The
   other `LocalJumpError` shape (`def m; yield; end; m`) does raise, with
   `#reason == :noreason`, and is pinned.
-- **A bare undefined CONSTANT answers nil instead of raising.** `p Nope` is
-  `nil` where MRI raises `NameError`. This is the constant half of the "some
-  unimplemented constants answer nil" note at the top of this file, and it stays
-  open on purpose: the nil is what lets a program name a library constant
-  rubylang does not model (`FileUtils`, `Socket`, `Errno::*`) without stopping.
-  The lowercase half is CLOSED — `p nope` now raises
+- **`pp` line-breaks like MRI — fixed.** `src/pp.rs` ports `prettyprint.rb`
+  and the core `pretty_print` bodies of `pp.rb` (Array, Hash, Set, Struct,
+  Data, Range, multi-line String, MatchData, `pp_object` with sorted ivars),
+  at `PP.width_for`'s width. Not closed: a user-defined `pretty_print(q)` is
+  never called (there is no Ruby-visible `PP` object), so such an object
+  prints through its `inspect`; and `pretty_inspect` exists before `pp` /
+  `require "pp"` has run, where MRI raises `NoMethodError`.
+- **A bare undefined CONSTANT raises `NameError` — fixed.** `p Nope` raises
+  `uninitialized constant Nope` (qualified by the lexical class inside a
+  namespace: `A::Foo::Bar`), with `#name` and `#receiver` set, after
+  `const_missing` on that class is given its turn. `X ||= v` reads the constant
+  only when `defined?`, as MRI compiles it. The lowercase half is CLOSED too — `p nope` now raises
   `NameError: undefined local variable or method 'nope' for main`, with `#name`
   and `#receiver` set. Closing it needed the compiler, as predicted here: a name
   the scope assigns at or before the read is a local (Ruby hoists it to nil from
@@ -2263,9 +2269,9 @@ Not modeled / boundaries:
   round-trips through `load` (no anchors/tags/multi-doc/block scalars/custom
   objects). `module_function` (both the bare-directive and
   `module_function :m` forms) and `to_yaml` on builtin receivers both work.
-  Not yet: `FileUtils`/similar native pseudo-modules whose *constant* is unbound
-  (`FileUtils.mkdir_p` works, but `FileUtils.class` is `NilClass` where MRI
-  raises `NameError: uninitialized constant FileUtils`).
+  Not yet: `FileUtils` and similar libraries with no model at all — their
+  constant raises `NameError: uninitialized constant FileUtils` even after the
+  `require`.
 - **`__dir__`** returns the directory of the file currently running (from the
   same file-dir stack), a String. MRI computes `File.dirname(File.realpath(
   __FILE__))`, so under `-e`/stdin — where `__FILE__` is the literal `"-e"` /

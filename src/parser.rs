@@ -515,7 +515,30 @@ impl Parser {
                     _ => unreachable!(),
                 };
                 let make = |t: Expr| {
-                    let combined = Expr::Binary(op, Box::new(t.clone()), Box::new(rhs.clone()));
+                    // `X ||= v` / `M::X ||= v` reads the constant only when it is
+                    // defined (MRI compiles a `defined?` guard), so an unset one
+                    // is assigned instead of raising `NameError`.
+                    let is_const = match &t {
+                        Expr::Var(VarKind::Const, _) => true,
+                        Expr::Call {
+                            recv: Some(_),
+                            name,
+                            args,
+                            block: None,
+                        } => args.is_empty() && name.starts_with(|c: char| c.is_ascii_uppercase()),
+                        _ => false,
+                    };
+                    let read = if is_const && op == BinOp::Or {
+                        Expr::If {
+                            cond: Box::new(Expr::Defined(Box::new(t.clone()))),
+                            then: vec![t.clone().into()],
+                            elifs: vec![],
+                            els: None,
+                        }
+                    } else {
+                        t.clone()
+                    };
+                    let combined = Expr::Binary(op, Box::new(read), Box::new(rhs.clone()));
                     Expr::Assign(Box::new(t), Box::new(combined))
                 };
                 return Ok(Self::rebind_assign(lhs, &make));
@@ -724,7 +747,12 @@ impl Parser {
         if self.is_op("..") || self.is_op("...") {
             let exclusive = self.is_op("...");
             self.advance();
-            let hi = if self.range_end_follows() {
+            let hi = if self.range_end_follows()
+                // In a pattern, a capture `=>` or an alternation `|` also ends
+                // an endless range: `in 2.. => n`, `in 1.. | nil`.
+                || self.is_op("=>")
+                || self.is_op("|")
+            {
                 None
             } else {
                 Some(Box::new(self.binary(6)?))

@@ -143,12 +143,19 @@ fn b_defined_desc(vm: &mut VM, _: u8) -> Value {
             // constant before the module defines it (skipping the `unless defined?`
             // guard that gems use to define it once).
             let defined = with_host(|h| {
-                set(h.get_const(&name)) || h.class_exists(&name) || h.is_builtin_class(&name)
+                set(h.get_const(&name))
+                    || h.has_const(&name)
+                    || h.class_exists(&name)
+                    || h.is_builtin_class(&name)
             }) || (builtin_exception_const(&name));
             defined.then_some("constant")
         }
-        "ivar" => with_host(|h| set(h.get_ivar(&name))).then_some("instance-variable"),
-        "gvar" => with_host(|h| set(h.get_global(&name))).then_some("global-variable"),
+        // A variable assigned nil is defined: nil and unset share `Undef`, so
+        // the stores are asked whether the name is present.
+        "ivar" => with_host(|h| set(h.get_ivar(&name)) || h.ivar_defined(&name))
+            .then_some("instance-variable"),
+        "gvar" => with_host(|h| set(h.get_global(&name)) || h.global_defined(&name))
+            .then_some("global-variable"),
         "cvar" => with_host(|h| {
             let this = h.current_self();
             h.cvar_owner(&this)
@@ -166,12 +173,37 @@ fn b_defined_desc(vm: &mut VM, _: u8) -> Value {
             }
         }
         "yield" => current_block().is_some().then_some("yield"),
+        "super" => super_defined().then_some("super"),
         _ => None,
     };
     match desc {
         Some(s) => new_str(s.to_string()),
         None => Value::Undef,
     }
+}
+
+/// `defined?(super)`: whether the running method has a method of the same name
+/// above its defining class — a user one in the ancestry (singleton chain for a
+/// class method), or a native one the receiver's built-in ancestors define
+/// (`def to_s; defined?(super)` sees `Kernel#to_s`). Outside a method, nil.
+fn super_defined() -> bool {
+    let (this, method, def_class, _) = with_host(|h| h.super_context());
+    let (Some(method), Some(def_class)) = (method, def_class) else {
+        return false;
+    };
+    with_host(|h| {
+        let method = h.alias_original(&def_class, &method).unwrap_or(method);
+        let user = match (h.object_class(&this), h.classref_name(&this)) {
+            (None, Some(cls)) => h
+                .find_super_class_method(&cls, &def_class, &method)
+                .is_some(),
+            (recv_class, _) => {
+                let recv_class = recv_class.unwrap_or_else(|| def_class.clone());
+                h.find_super(&recv_class, &def_class, &method).is_some()
+            }
+        };
+        user || h.builtin_owner(&this, &method).is_some()
+    })
 }
 
 /// Concatenate `argc` arrays into one (splat argument/element building).
@@ -824,7 +856,7 @@ fn b_getconst(vm: &mut VM, _: u8) -> Value {
     // separator, at the top level) is the plain name.
     for name in encoded.split('\u{1f}') {
         let v = with_host(|h| h.get_const(name));
-        if !matches!(v, Value::Undef) {
+        if !matches!(v, Value::Undef) || with_host(|h| h.has_const(name)) {
             return v;
         }
         // An unassigned constant that names a class (user-defined, or a builtin
@@ -883,7 +915,36 @@ fn b_getconst(vm: &mut VM, _: u8) -> Value {
             }
         }
     }
-    Value::Undef
+    match const_miss(&encoded) {
+        Ok(v) => v,
+        Err(e) => abort(vm, e),
+    }
+}
+
+/// A bare constant read no candidate answered: MRI's `rb_const_missing` sends
+/// `const_missing(:Name)` to the innermost lexical class (`Object` at the top
+/// level), whose default raises `NameError` naming the constant under that
+/// class (`uninitialized constant A::Foo::Bar`, `#name` `:Bar`, `#receiver`
+/// the class).
+fn const_miss(encoded: &str) -> Result<Value, String> {
+    let first = encoded.split('\u{1f}').next().unwrap_or(encoded);
+    let (cref, bare) = first.rsplit_once("::").unwrap_or(("Object", first));
+    if let Some(def) = with_host(|h| h.find_class_method(cref, "const_missing")) {
+        let recv = with_host(|h| h.class_ref(cref));
+        let sym = with_host(|h| h.new_symbol(bare));
+        return crate::host::call_class_method(recv, &def, "const_missing", cref, &[sym], None);
+    }
+    let fields = with_host(|h| {
+        [
+            ("name", h.new_symbol(bare)),
+            ("receiver", h.class_ref(cref)),
+        ]
+    });
+    Err(raise_exc_with(
+        "NameError",
+        &format!("uninitialized constant {first}"),
+        &fields,
+    ))
 }
 
 /// Builtin exception class names that resolve to a class reference even without
@@ -1825,6 +1886,7 @@ fn is_universal_object_method(name: &str) -> bool {
             | "kind_of?"
             | "instance_of?"
             | "tap"
+            | "pretty_inspect"
             | "then"
             | "yield_self"
             | "itself"
@@ -2492,6 +2554,12 @@ pub(crate) fn dispatch(
             let key = format!("@{}", raw.strip_prefix('@').unwrap_or(&raw));
             let has = with_host(|h| h.ivar_names(recv).contains(&key));
             return Ok(Value::Bool(has));
+        }
+        // `Kernel#pretty_inspect`: `PP.pp(self, "")`, whose String output has
+        // no `winsize`, so the width is `$COLUMNS` or 80, less one.
+        "pretty_inspect" if args.is_empty() => {
+            let s = crate::pp::pretty_inspect(recv, crate::pp::env_width() - 1)?;
+            return Ok(with_host(|h| h.new_string(s)));
         }
         "tap" => {
             if let Some(b) = &block {
@@ -4396,10 +4464,32 @@ fn dispatch_classref(
             // for a missing key (the counter idiom `Hash.new(0)`); the block form
             // `Hash.new { |h,k| ... }` calls the block on each miss instead.
             if cls == "Hash" {
+                // hash.rb `initialize(ifnone = unset, capacity: 0, &block)`: the
+                // `capacity:` keyword is a sizing hint only, and `rb_hash_init`
+                // rejects an `ifnone` given alongside a block.
+                let positional = match args.split_last() {
+                    Some((last, rest)) if with_host(|h| h.is_kwargs(last)) => rest,
+                    _ => args,
+                };
+                if positional.len() > 1 {
+                    return Err(raise_exc(
+                        "ArgumentError",
+                        &format!(
+                            "wrong number of arguments (given {}, expected 0..1)",
+                            positional.len()
+                        ),
+                    ));
+                }
                 if let Some(bl) = block {
+                    if !positional.is_empty() {
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            "wrong number of arguments (given 1, expected 0)",
+                        ));
+                    }
                     return Ok(with_host(|h| h.new_hash_with_proc(IndexMap::new(), bl)));
                 }
-                let default = args.first().cloned().unwrap_or(Value::Undef);
+                let default = positional.first().cloned().unwrap_or(Value::Undef);
                 return Ok(with_host(|h| {
                     h.new_hash_with_default(IndexMap::new(), default)
                 }));
@@ -20599,7 +20689,18 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
                 _ => with_host(|h| h.new_array(args.to_vec())),
             })
         }
-        "pp" => kernel("p", args, block),
+        // `Kernel#pp` (pp.rb): each object through `PP.pp` at `$stdout`'s width.
+        "pp" => {
+            for a in args {
+                let s = crate::pp::pretty_inspect(a, crate::pp::stdout_width())?;
+                crate::host::write_stdout(&s);
+            }
+            Ok(match args.len() {
+                0 => Value::Undef,
+                1 => args[0].clone(),
+                _ => with_host(|h| h.new_array(args.to_vec())),
+            })
+        }
         // `Kernel#open(path, mode="r")` delegates to `File.open` for a plain
         // path (no pipe/`|command` support).
         "open" => file_open(args, block),
@@ -26264,7 +26365,7 @@ fn exception_with_own_to_s(v: &Value) -> Option<String> {
     (with_host(|h| h.is_exception_class(&class)) && defines_own(v, "to_s")).then_some(class)
 }
 
-fn inspect_of(v: &Value) -> Result<String, String> {
+pub(crate) fn inspect_of(v: &Value) -> Result<String, String> {
     if !reaches_user_inspect(v, 0) {
         return Ok(with_host(|h| h.inspect(v)));
     }
@@ -26359,7 +26460,7 @@ fn is_container(v: &Value) -> bool {
 /// (`def obj.m`, `class << obj`, `obj.extend(M)`, `define_singleton_method`)
 /// or an instance method of its user class. A singleton was missed here, so
 /// `def o.to_s` never reached `puts o` or `"#{o}"`, nor `def o.inspect` `p o`.
-fn defines_own(v: &Value, name: &str) -> bool {
+pub(crate) fn defines_own(v: &Value, name: &str) -> bool {
     with_host(|h| {
         h.find_singleton_method(v, name).is_some()
             || h.find_singleton_define_method(v, name).is_some()

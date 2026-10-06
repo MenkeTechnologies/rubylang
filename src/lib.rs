@@ -22,6 +22,7 @@ pub mod lexer;
 pub mod lsp;
 pub mod oracle;
 pub mod parser;
+pub mod pp;
 pub mod random;
 pub mod repl;
 pub mod rtime;

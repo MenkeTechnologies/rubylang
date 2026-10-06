@@ -1802,7 +1802,7 @@ impl Compiler {
         if let VarKind::Const = kind {
             let encoded = self.const_candidates(name);
             self.kstr(b, &encoded);
-            b.emit(Op::CallBuiltin(ops::GETCONST, 1), 0);
+            b.emit(Op::CallBuiltin(ops::GETCONST, 1), self.cur_line);
             return;
         }
         // A slot-lowered local reads from the frame slot (native-lowerable) rather
@@ -3129,7 +3129,7 @@ impl Compiler {
         if let Some(sc) = superclass {
             let encoded = self.const_candidates(sc);
             self.kstr(b, &encoded);
-            b.emit(Op::CallBuiltin(ops::GETCONST, 1), 0);
+            b.emit(Op::CallBuiltin(ops::GETCONST, 1), self.cur_line);
             b.emit(Op::Pop, 0);
         }
         // `inherited(subclass)` fires when the subclass is opened — before its body.
@@ -3401,6 +3401,7 @@ impl Compiler {
             Expr::Var(VarKind::Class, n) => check(self, b, "cvar", n),
             Expr::Var(VarKind::Local, n) => check(self, b, "local", n),
             Expr::Yield(_) => check(self, b, "yield", ""),
+            Expr::Super { .. } => check(self, b, "super", ""),
             // A qualified constant path (`A::B`, `URI::RFC2396_PARSER`) parses as a
             // no-arg capitalized method call on a constant path. `defined?` must
             // treat it as a constant reference — returning nil (not raising) when
