@@ -4091,4 +4091,11 @@ Object
 "#<Class:#<#<Class:X>:X>>"
 true
 #==#
-<error>
+true
+1
+2
+3
+4
+5
+SyntaxError
+SyntaxError

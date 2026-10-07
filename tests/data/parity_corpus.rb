@@ -5376,4 +5376,4 @@ ac = Class.new { def hi = 1 }; p ac.new.hi, ac.instance_methods(false), ac.super
 #==#
 class EndlessOps; def ==(o) = true; def <=(o) = 1; def !=(o) = 2; def ===(o) = 3; def >=(o) = 4; def ok! = 5; end
 e = EndlessOps.new; p e == 1, e <= 1, e != 1, e === 1, e >= 1, e.ok!
-p((eval("def bad_setter=(v) = 1") rescue $!.class), (eval("def []=(k, v) = 1") rescue $!.class))
+p((begin; eval("def bad_setter=(v) = 1"); rescue SyntaxError; $!.class; end), (begin; eval("def []=(k, v) = 1"); rescue SyntaxError; $!.class; end))
