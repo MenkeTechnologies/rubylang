@@ -13949,6 +13949,87 @@ fn complex_pow_special_angle(re: &Value, im: &Value, other: &Value) -> Result<Op
     Ok(Some(with_host(|h| h.new_complex(zr, zi))))
 }
 
+/// Port of rational.c `rb_rational_pow` (`Rational#**`).
+fn rational_pow(
+    recv: &Value,
+    r: &num_rational::BigRational,
+    other: &Value,
+) -> Result<Value, String> {
+    use num_bigint::BigInt;
+    use num_traits::{One as _, Zero as _};
+    let rat = |n: BigInt, d: BigInt| with_host(|h| h.new_rational(num_rational::BigRational::new(n, d)));
+    let one = || rat(BigInt::one(), BigInt::one());
+    let class = with_host(|h| h.class_of(other));
+    let numeric = matches!(class.as_str(), "Integer" | "Float" | "Rational" | "Complex");
+    if numeric && cx_exact_zero_p(other)? {
+        return Ok(one());
+    }
+    let mut other = other.clone();
+    if class == "Rational" {
+        let o = with_host(|h| h.as_rational(&other)).unwrap();
+        if o.is_integer() {
+            other = with_host(|h| h.new_bigint(o.to_integer()));
+        }
+    }
+    // The special cases 1**n, (-1)**n and 0**n, for any exact exponent.
+    if numeric && !matches!(other, Value::Float(_)) && r.denom().is_one() {
+        if r.numer().is_one() {
+            return Ok(one());
+        }
+        if *r.numer() == -BigInt::one() && is_integer_value(&other) {
+            let odd = as_i(&with_host(|h| h.num_op(fusevm::NumOp::Mod, &other, &Value::Int(2)))?) == 1;
+            return Ok(rat(BigInt::from(if odd { -1 } else { 1 }), BigInt::one()));
+        }
+        if r.numer().is_zero() {
+            // `rb_num_negative_p`: a value with no `<` (a Complex) cannot be
+            // ranked against zero.
+            let negative = if with_host(|h| h.complex_parts(&other)).is_some() {
+                return Err(raise_exc("ArgumentError", "comparison of Complex with 0 failed"));
+            } else {
+                let lt = dispatch(&other, "<", &[Value::Int(0)], None)?;
+                with_host(|h| h.truthy(&lt))
+            };
+            if negative {
+                return Err(raise_exc("ZeroDivisionError", "divided by 0"));
+            }
+            return Ok(rat(BigInt::zero(), BigInt::one()));
+        }
+    }
+    if let Value::Int(n) = other {
+        let (base_num, base_den) = if n >= 0 {
+            (r.numer().clone(), r.denom().clone())
+        } else {
+            (r.denom().clone(), r.numer().clone())
+        };
+        let e = Value::Int(n.checked_abs().unwrap_or(i64::MAX));
+        let big = |b: BigInt| with_host(|h| h.new_bigint(b));
+        let num = dispatch(&big(base_num), "**", std::slice::from_ref(&e), None)?;
+        let den = dispatch(&big(base_den), "**", std::slice::from_ref(&e), None)?;
+        // An Integer power past what fits answers a Float Infinity.
+        match (&num, &den) {
+            (Value::Float(_), Value::Float(_)) => return Ok(Value::Float(f64::NAN)),
+            (Value::Float(_), _) => return Ok(num),
+            (_, Value::Float(_)) => return Ok(rat(BigInt::zero(), BigInt::one())),
+            _ => {}
+        }
+        let (n, d) = with_host(|h| (h.as_bigint(&num), h.as_bigint(&den)));
+        return Ok(rat(n.unwrap(), d.unwrap()));
+    }
+    if is_integer_value(&other) {
+        return Err(raise_exc("ArgumentError", "exponent is too large"));
+    }
+    if matches!(other, Value::Float(_)) || with_host(|h| h.class_of(&other)) == "Rational" {
+        return dispatch(&Value::Float(rational_to_f64(r)), "**", std::slice::from_ref(&other), None);
+    }
+    // `rb_num_coerce_bin`: a Complex exponent promotes self to Complex.
+    if with_host(|h| h.complex_parts(&other)).is_some() {
+        let c = with_host(|h| h.new_complex(recv.clone(), Value::Int(0)));
+        return complex_pow(&c, &other);
+    }
+    let named = with_host(|h| h.coerce_operand_name(&other));
+    Err(raise_exc("TypeError", &format!("{named} can't be coerced into Rational")))
+}
+
 /// Port of complex.c `rb_complex_pow`.
 fn complex_pow(recv: &Value, other: &Value) -> Result<Value, String> {
     let (re, im) = with_host(|h| h.complex_parts(recv)).unwrap();
@@ -14213,18 +14294,7 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
             }
             None => Ok(Value::Float(rational_to_f64(&r) / as_f(&args[0]))),
         },
-        "**" | "pow" => {
-            if let Some(exp) = int_arg(&args[0]) {
-                let p = if exp >= 0 {
-                    num_traits::pow::pow(r, exp as usize)
-                } else {
-                    num_traits::pow::pow(r.recip(), (-exp) as usize)
-                };
-                Ok(rat(p))
-            } else {
-                Ok(Value::Float(rational_to_f64(&r).powf(as_f(&args[0]))))
-            }
-        }
+        "**" => rational_pow(recv, &r, &args[0]),
         // Against another Rational or an Integer this is exact; against a Float
         // MRI's `nurat_cmp` goes through `to_f`, matching how `Rational#==`
         // treats one. A NaN orders against nothing.

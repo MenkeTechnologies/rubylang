@@ -5414,3 +5414,9 @@ p c ** 0.5, c ** Rational(1, 2), c ** c, Complex(1, 1) ** Complex(0, 1), Complex
 p Complex(1, 2) ** 5, Complex(1, 2) ** -2, Complex(0, 3) ** 3, Complex(0, 3) ** 4, Complex(-2, 0) ** 3, Complex(2, -2) ** 3, Complex(1.5, 2) ** 3, Complex(Rational(1, 2), 1) ** 3, Complex(0.0, 2) ** 3, Complex(-0.0, -2) ** 2
 p 2 ** c, 2.0 ** c, 1 ** c, 0 ** c, 1.0 ** c, (-8) ** Complex(1, 0), Complex(1e300, 1e300) ** 2, Complex(3, 4) ** 2**3
 p((c ** "x" rescue $!), (c ** (2**64) rescue $!), (Complex(1, 2).pow(3) rescue $!.class))
+#==#
+r = Rational(2, 3); c = Complex(1, 1)
+p r ** 2, r ** -2, r ** 0, r ** 0.0, r ** 0.5, r ** Rational(1, 2), r ** Rational(4, 2), r ** Rational(0), Rational(-2, 3) ** -3, Rational(4) ** -2, r.send(:**, 3), [r, 2].reduce(:**)
+p Rational(0) ** -1.0, Rational(0) ** 2, Rational(0) ** 0.5, Rational(1) ** (2**70), Rational(-1) ** (2**70 + 1), Rational(-1) ** -3, Rational(-1) ** Rational(1, 2), Rational(-8, 27) ** Rational(1, 3), Rational(-8, 27) ** 0.5
+p Rational(1, 3) ** c, Rational(1) ** c, Rational(5) ** Complex(0, 0), Rational(2, 3) ** 1000 == Rational(2**1000, 3**1000), Rational(1, 10) ** -400 == 10**400, r ** 1e400
+p((Rational(0) ** -1 rescue $!), (Rational(0) ** Rational(-1, 2) rescue $!), (Rational(0) ** -2**70 rescue $!), (r ** (2**70) rescue $!), (Rational(0) ** c rescue $!), (r ** "x" rescue $!), (r.pow(2) rescue $!.class))

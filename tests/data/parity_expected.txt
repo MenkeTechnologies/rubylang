@@ -4251,3 +4251,38 @@ false
 #<TypeError: String can't be coerced into Complex>
 #<ArgumentError: exponent is too large>
 NoMethodError
+#==#
+(4/9)
+(9/4)
+(1/1)
+1.0
+0.816496580927726
+0.816496580927726
+(4/9)
+(1/1)
+(-27/8)
+(1/16)
+(8/27)
+(4/9)
+Infinity
+(0/1)
+0.0
+(1/1)
+(-1/1)
+(-1/1)
+(0.0+1.0i)
+(0.3333333333333333+0.5773502691896257i)
+(0.0+0.5443310539518174i)
+(0.15161080760886989-0.296859013889249i)
+(1/1)
+(1/1)
+true
+true
+0.0
+#<ZeroDivisionError: divided by 0>
+#<ZeroDivisionError: divided by 0>
+#<ZeroDivisionError: divided by 0>
+#<ArgumentError: exponent is too large>
+#<ArgumentError: comparison of Complex with 0 failed>
+#<TypeError: String can't be coerced into Rational>
+NoMethodError
