@@ -2175,6 +2175,28 @@ pub(crate) fn dispatch(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    match dispatch_resolved(recv, name, args, block.clone()) {
+        // Every object inherits Kernel's module functions as (private) instance
+        // methods, so a call that got past visibility — `self.puts`,
+        // `obj.send(:format, ...)` — runs Kernel's. The per-type dispatchers
+        // do not list them; reaching one is a miss on exactly this name.
+        Err(e)
+            if is_kernel_module_function_of(recv, name)
+                && e == format!("undefined method '{name}' for {}", receiver_phrase(recv)) =>
+        {
+            with_host(|h| h.take_pending_exc());
+            kernel(name, args, block)
+        }
+        r => r,
+    }
+}
+
+fn dispatch_resolved(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
     let keyed = with_host(|h| h.user_keyed_operands(recv, name, args));
     if !keyed.is_empty() {
         canon_user_keys(&keyed)?;
@@ -27410,6 +27432,7 @@ fn receiver_phrase(recv: &Value) -> String {
 /// `send`/`__send__` and implicit-self calls do not route through here, so both
 /// keep bypassing visibility exactly as in MRI.
 fn check_visibility(recv: &Value, name: &str) -> Result<(), String> {
+    check_kernel_private(recv, name)?;
     // A class/module reference is checked against the CLASS-method map
     // (`private_class_method :m`), not the instance map: `private :run` and
     // `private_class_method :run` are independent, and consulting the instance
@@ -27451,6 +27474,59 @@ fn check_visibility(recv: &Value, name: &str) -> Result<(), String> {
             vis.word(),
             receiver_phrase(recv)
         ),
+    ))
+}
+
+/// Whether `recv.name` resolves to one of Kernel's module functions: the
+/// built-in lookup lands on `Kernel`, Kernel defines it as a singleton method
+/// too (which is exactly MRI's set of private Kernel instance methods), and no
+/// user method of that name — nor a `method_missing` MRI would route a refused
+/// call to — sits ahead of it.
+fn is_kernel_module_function_of(recv: &Value, name: &str) -> bool {
+    if crate::arity_table::lookup("#<Class:Kernel>", name).is_none()
+        || with_host(|h| h.builtin_owner(recv, name)) != Some("Kernel")
+    {
+        return false;
+    }
+    !with_host(|h| {
+        let cls = h.class_of(recv);
+        // The built-in table describes the core classes only. A native library
+        // class it has no rows for (StringIO, Psych, …) implements methods the
+        // table cannot see — `StringIO#gets` is not Kernel's — so the lookup is
+        // trusted only when every class ahead of Kernel is core or user-written.
+        let base = h.classref_name(recv).unwrap_or_else(|| h.dispatch_class(recv));
+        let opaque = h
+            .class_ancestry(&base)
+            .iter()
+            .any(|c| crate::arity_table::ancestry(c).is_none() && !h.class_exists(c));
+        opaque
+            || h.find_singleton_method(recv, name).is_some()
+            || h.find_singleton_method(recv, "method_missing").is_some()
+            || h.find_method_owner(&cls, name).is_some()
+            || h.find_method_owner(&cls, "method_missing").is_some()
+    })
+}
+
+/// Kernel's module functions (`puts`, `format`, `rand`, `raise`, `select`, …)
+/// are PRIVATE instance methods in MRI — exactly the ones Kernel also defines
+/// as singleton methods — so `obj.puts` raises `private method 'puts' called`
+/// unless `obj` is `self`. Only the built-in resolves this way: a user method
+/// of the same name, or a `method_missing` that MRI would route the refused
+/// call to, leaves the call alone.
+fn check_kernel_private(recv: &Value, name: &str) -> Result<(), String> {
+    // A class/module receiver is left out: native library modules (YAML, …)
+    // answer singleton methods the built-in table has no rows for, and their
+    // registration does not set them apart from user-written modules.
+    if with_host(|h| h.classref_name(recv)).is_some() || !is_kernel_module_function_of(recv, name) {
+        return Ok(());
+    }
+    let this = with_host(|h| h.current_self());
+    if identical(recv, &this) {
+        return Ok(());
+    }
+    Err(raise_exc(
+        "NoMethodError",
+        &format!("private method '{name}' called for {}", receiver_phrase(recv)),
     ))
 }
 

@@ -5431,3 +5431,12 @@ e = [1, 2, 3].map; p e.each { _1 * 3 }, e.next, e.each { _1 }
 o = Object.new; def o.each; yield 3; yield 1; end; o.extend(Enumerable)
 p o.select { _1 > 2 }, o.select.class, o.filter.class, o.select.each { _1 > 2 }, o.method(:select).owner, o.method(:map).arity, o.respond_to?(:select)
 v = Object.new; def v.<=>(o) = 0; v.extend(Comparable); p v.clamp(1, 2).equal?(v), v.method(:clamp).owner
+#==#
+o = Object.new
+p((o.select rescue $!), (o.puts("x") rescue $!), (o.format("%d", 1) rescue $!), (o.sleep(0) rescue $!), (o.rand rescue $!), (o.Integer("1") rescue $!), (o.raise rescue $!), (1.puts rescue $!), (o.loop rescue $!))
+self.puts "self ok"; p self.format("%d", 3), (nil.rand rescue $!), Kernel.format("%d", 4)
+class Sel; def select = :mine; end; p Sel.new.select
+class MM; def method_missing(n, *a) = [:mm, n]; end; p MM.new.puts
+o2 = Object.new; def o2.format(*) = :own; p o2.format, (o2.tap { } .equal?(o2)), o2.then { 1 }, o2.frozen?
+p Object.new.send(:format, "%d", 1), 5.send(:format, "%x", 255), "s".__send__(:Integer, "7"), [].send(:rand, 1)
+Object.new.send(:puts, "hi")

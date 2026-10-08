@@ -4322,3 +4322,28 @@ Enumerable
 true
 true
 Comparable
+#==#
+#<NoMethodError: private method 'select' called for an instance of Object>
+#<NoMethodError: private method 'puts' called for an instance of Object>
+#<NoMethodError: private method 'format' called for an instance of Object>
+#<NoMethodError: private method 'sleep' called for an instance of Object>
+#<NoMethodError: private method 'rand' called for an instance of Object>
+#<NoMethodError: private method 'Integer' called for an instance of Object>
+#<NoMethodError: private method 'raise' called for an instance of Object>
+#<NoMethodError: private method 'puts' called for an instance of Integer>
+#<NoMethodError: private method 'loop' called for an instance of Object>
+self ok
+"3"
+#<NoMethodError: private method 'rand' called for nil>
+"4"
+:mine
+[:mm, :puts]
+:own
+true
+1
+false
+"1"
+"ff"
+7
+0
+hi
