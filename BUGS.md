@@ -942,7 +942,10 @@ Implemented and verified against the reference `ruby`:
   their textual position — a pre-existing hoisting deviation from MRI), so when a
   later reopening *redefines* a method the last definition wins for the whole run
   rather than only after its textual point. Additive reopenings (distinct method
-  names) match MRI exactly.
+  names) match MRI exactly. The same hoisting inverts `alias` followed by a
+  `def` of the alias name: `def a = 1; alias b a; def b = 2` answers `b == 1`
+  (MRI: 2), because the hoisted `def b` is installed before the runtime `alias`
+  copies `a`'s body over it; `Method#original_name` then still reports `:a`.
 - **Top-level `self`.** Fixed to `main`, an ordinary `Object`, so
   `self.class.name == "Object"` (was `"NilClass"`). Top-level instance variables
   now live on that object, and it prints as `main` (see the `Method` section).

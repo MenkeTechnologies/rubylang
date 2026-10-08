@@ -4499,3 +4499,9 @@ nil
 {b: 2}
 {b: 2}
 #<FrozenError: can't modify frozen Hash: {}>
+#==#
+:hi
+:hi
+:hey2
+:hi
+:plain

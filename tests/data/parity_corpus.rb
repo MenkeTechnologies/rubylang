@@ -5509,3 +5509,7 @@ h={a: 1}; p((h.each { h.replace({b: 1}) } rescue $!), (h.each { h.replace(h) }),
 #==#
 h={a: 1}; h.replace({}.compare_by_identity); p h.compare_by_identity?; g={}.compare_by_identity; g.replace({b: 1}); p g.compare_by_identity?; d=Hash.new(5); d.replace(Hash.new { 7 }); p d[:x], d.default; e=Hash.new{1}; e.replace(Hash.new(3)); p e.default_proc, e[:q]; p (({}.replace(1)) rescue $!); o=Object.new; def o.to_hash = {z: 1}; p({}.replace(o))
 x = {a: 1}; p x.replace({b: 2}), x, x.replace(x), (({}.freeze.replace({})) rescue $!)
+#==#
+class A; def hi = "A"; alias_method :hey, :hi; alias hey2 hey; def plain = 1; end
+class B < A; alias_method :b_hi, :hi; end
+p A.instance_method(:hey).original_name, A.new.method(:hey2).original_name, A.new.method(:hey2).name, B.new.method(:b_hi).original_name, A.new.method(:plain).original_name

@@ -21303,6 +21303,20 @@ fn dispatch_method(
             h.method_parameters(&mrecv, &mname, unbound)
         }))),
         "name" => Ok(with_host(|h| h.new_symbol(&mname))),
+        // `Method#original_name` — the name the method was DEFINED under: an
+        // `alias`/`alias_method` name resolves to the method it copied.
+        "original_name" => Ok(with_host(|h| {
+            let owner = h.method_owner(&mrecv, &mname, unbound);
+            let mut name = mname.clone();
+            // Bounded: an alias of an alias resolves step by step.
+            for _ in 0..64 {
+                match h.alias_original(&owner, &name) {
+                    Some(orig) if orig != name => name = orig,
+                    _ => break,
+                }
+            }
+            h.new_symbol(&name)
+        })),
         // An UnboundMethod has no receiver — its stored value is the class the
         // name was looked up on — so MRI defines `#receiver` on `Method` only.
         "receiver" if unbound => Err(raise_exc(
