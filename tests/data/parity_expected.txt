@@ -4447,3 +4447,19 @@ false
 true
 true
 true
+#==#
+"hi Object"
+"hi Integer"
+true
+[Object, TopG, Kernel]
+true
+true
+[TopP, String, Comparable]
+true
+B1
+A1 Object
+true
+:a1
+[A1, B1]
+B1
+:b1

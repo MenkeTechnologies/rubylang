@@ -5483,3 +5483,12 @@ p Exception.new("a") == Exception.new("a"), Exception.new("a") == Exception.new(
 x = Exception.new("a"); y = Exception.new("a"); y.set_backtrace(["l"]); p x == y, x != y, x.equal?(y)
 p [RuntimeError.new("x")] == [RuntimeError.new("x")], [KeyError.new("a")].include?(KeyError.new("a"))
 class Conv; def exception = RuntimeError.new("c"); end; p RuntimeError.new("c") == Conv.new
+#==#
+module TopG; def tg_hi = "hi #{self.class}"; end
+include TopG
+p tg_hi, 5.tg_hi, Object.include?(TopG), Object.ancestors.take(3), String.ancestors.include?(TopG), Integer.include?(TopG)
+module TopP; end; String.prepend(TopP); p String.ancestors.take(3), String.include?(TopP)
+module A1; def self.extended(o) = puts("A1 #{o.class}"); def w = :a1; end
+module B1; def self.extended(o) = puts("B1"); def w = :b1; end
+o = Object.new; p o.extend(A1, B1).equal?(o), o.w, o.singleton_class.ancestors.take(3).drop(1)
+s = +"str"; s.extend(B1); p s.w

@@ -6575,7 +6575,7 @@ impl RubyHost {
             );
             return dedup_keep_first(out);
         }
-        match name {
+        let chain = match name {
             "BasicObject" => vec!["BasicObject".into()],
             "Object" => vec!["Object".into(), "Kernel".into(), "BasicObject".into()],
             // Bare modules are their own only ancestor here.
@@ -6669,7 +6669,38 @@ impl RubyHost {
                     own(&[])
                 }
             }
+        };
+        self.splice_reopened_mixins(chain)
+    }
+    /// A reopened BUILT-IN class or module (`class Object; include G; end`,
+    /// `String.prepend(P)`, a top-level `include`) carries user mixins that the
+    /// fixed built-in chains above do not list. Splice each class's prepends
+    /// (with their own chains) in before it and its includes after it, as MRI
+    /// inserts an included module right above the class.
+    fn splice_reopened_mixins(&self, chain: Vec<String>) -> Vec<String> {
+        let reopened = |c: &String| {
+            self.classes
+                .get(c)
+                .is_some_and(|d| !d.includes.is_empty() || !d.prepends.is_empty())
+        };
+        if !chain.iter().any(reopened) {
+            return chain;
         }
+        let mut out = Vec::with_capacity(chain.len());
+        for c in chain {
+            let Some(def) = self.classes.get(&c).filter(|_| reopened(&c)) else {
+                out.push(c);
+                continue;
+            };
+            for m in def.prepends.iter().rev() {
+                out.extend(self.class_ancestry(&self.resolve_module_name(m, &c)));
+            }
+            out.push(c.clone());
+            for m in def.includes.iter().rev() {
+                out.extend(self.class_ancestry(&self.resolve_module_name(m, &c)));
+            }
+        }
+        dedup_keep_first(out)
     }
     /// The direct superclass name of a class (`Module#superclass`), or `None`
     /// for `BasicObject`. Derived from the ancestry, skipping modules.

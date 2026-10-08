@@ -1499,6 +1499,12 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
         let object = with_host(|h| h.class_ref("Object"));
         return dispatch(&object, "define_method", args, block);
     }
+    // A top-level `include` is main's private singleton method, which includes
+    // the modules into Object (eval.c `top_include`).
+    if name == "include" && !args.is_empty() && crate::host::is_main(&this) {
+        let object = with_host(|h| h.class_ref("Object"));
+        return dispatch(&object, "include", args, block);
+    }
     if let Some(cls) = with_host(|h| h.classref_name(&this)) {
         // `define_method(:name) { ... }` in a class body registers an instance
         // method whose body is the block.
@@ -3227,10 +3233,15 @@ fn dispatch_resolved(
         "extend"
             if matches!(recv, Value::Obj(_)) && with_host(|h| h.classref_name(recv)).is_none() =>
         {
+            // eval.c `rb_obj_extend`: the modules are applied LAST first, each
+            // followed by its `extended` hook.
             if let Value::Obj(id) = recv {
-                for a in args {
+                for a in args.iter().rev() {
                     if let Some(mname) = with_host(|h| h.classref_name(a)) {
                         with_host(|h| h.extend_object(*id, &mname));
+                        if with_host(|h| h.find_class_method(&mname, "extended")).is_some() {
+                            dispatch(a, "extended", std::slice::from_ref(recv), None)?;
+                        }
                     }
                 }
             }
