@@ -1465,6 +1465,11 @@ pub struct RubyHost {
     /// positionally stays the last positional argument, and the callee's arity
     /// judges it as one. See `Expr::KwArgs` and `bind_params`.
     kwargs_hashes: HashSet<u32>,
+    /// Exceptions built by a built-in `initialize` (`KeyError.new(...)`), by
+    /// object id. On these an unset `key`/`receiver`/`matchee` raises `no …
+    /// is available` as in MRI; an exception raised by rubylang itself answers
+    /// nil instead, since not every raise site records those fields.
+    initialized_exceptions: HashSet<u32>,
     /// User objects whose class defines its own `hash`, mapped (by heap id) to
     /// the first object seen that is `eql?` to them — see
     /// `crate::builtins::canon_user_keys`. Hash/Set/`uniq` key such an object as
@@ -2288,6 +2293,7 @@ impl RubyHost {
             class_gen: 0,
             ancestry_cache: std::cell::RefCell::new(AncestryCache::default()),
             kwargs_hashes: HashSet::new(),
+            initialized_exceptions: HashSet::new(),
             user_key_canon: HashMap::new(),
             user_key_reps: HashMap::new(),
             around_stack: Vec::new(),
@@ -3708,6 +3714,17 @@ impl RubyHost {
         if let Value::Obj(id) = v {
             self.kwargs_hashes.insert(*id);
         }
+    }
+    /// Record that `v` was built by a built-in exception `initialize` — see
+    /// `initialized_exceptions`.
+    pub fn mark_initialized_exception(&mut self, v: &Value) {
+        if let Value::Obj(id) = v {
+            self.initialized_exceptions.insert(*id);
+        }
+    }
+    /// Whether `v` is one.
+    pub fn is_initialized_exception(&self, v: &Value) -> bool {
+        matches!(v, Value::Obj(id) if self.initialized_exceptions.contains(id))
     }
     /// Whether `v` is one, i.e. whether it may bind to keyword parameters.
     pub fn is_kwargs(&self, v: &Value) -> bool {
@@ -7424,6 +7441,14 @@ impl RubyHost {
         let class = self.object_class(self_obj)?;
         self.find_method_owner(&class, method)
             .map(|(m, owner)| (m, owner, self_obj.clone()))
+    }
+    /// `rb_ivar_lookup(obj, name, Qundef)`: the instance variable when one has
+    /// been set — nil included — and `None` when it never was.
+    pub fn ivar_lookup(&self, obj: &Value, name: &str) -> Option<Value> {
+        match self.obj(obj) {
+            Some(RObj::Object { ivars, .. }) => ivars.get(name).cloned(),
+            _ => None,
+        }
     }
     pub fn ivar_of(&self, obj: &Value, name: &str) -> Value {
         match self.obj(obj) {
@@ -11306,9 +11331,7 @@ pub fn call_super_blk(
             let args = explicit_args.unwrap_or(cur_args);
             let is_exc = with_host(|h| h.is_exception_class(&recv_class));
             if is_exc {
-                if let Some(msg) = args.first() {
-                    with_host(|h| h.set_ivar_of(&self_obj, "message", msg.clone()));
-                }
+                crate::builtins::exception_initialize(&self_obj, &recv_class, &args)?;
             }
             return Ok(Value::Undef);
         }

@@ -4713,11 +4713,9 @@ fn dispatch_classref(
                 with_host(|h| h.set_ivar_of(&exc, "status", Value::Int(status)));
                 Ok(exc)
             } else if is_exception_class(cls) {
-                let msg = match args.first() {
-                    Some(a) if !matches!(a, Value::Undef) => with_host(|h| h.to_s(a)),
-                    _ => cls.to_string(),
-                };
-                Ok(with_host(|h| h.new_exception(cls, &msg)))
+                let exc = with_host(|h| h.new_exception(cls, cls));
+                exception_initialize(&exc, cls, args)?;
+                Ok(exc)
             } else {
                 Ok(with_host(|h| h.new_object(cls)))
             }
@@ -5762,9 +5760,9 @@ fn dispatch_object(
         // objects: a plain user object's `name` must reach its own method or
         // `method_missing` (mustermann's Capture aliases `name` to `payload`, read
         // through a DelegateClass — an unguarded handler returned an empty Symbol).
-        "name" if with_host(|h| h.is_exception_class(cls)) => {
-            let stored = with_host(|h| h.ivar_of(recv, "name"));
-            if !matches!(stored, Value::Undef) {
+        "name" if matches!(exception_init_owner(cls), Some("NameError" | "NoMethodError")) => {
+            // Set by `NameError.new` (nil included) or at the raise site.
+            if let Some(stored) = with_host(|h| h.ivar_lookup(recv, "name")) {
                 return Ok(stored);
             }
             let msg = with_host(|h| h.as_str(&h.ivar_of(recv, "message"))).unwrap_or_default();
@@ -5776,10 +5774,23 @@ fn dispatch_object(
                 None => Ok(Value::Undef),
             }
         }
-        // The structured readers MRI puts on specific exception classes. Each is
-        // recorded at the raise site by `raise_exc_with`; a hand-constructed
-        // exception (`KeyError.new("m")`) answers nil, as MRI's does.
-        "key" | "result" | "path" | "reason" | "exit_value" | "errno" | "destination_encoding"
+        // The structured readers MRI puts on specific exception classes, each
+        // recorded at the raise site by `raise_exc_with` or by the class's
+        // `initialize` (`exception_initialize`).
+        // `KeyError#key`/`#receiver`, `NoMatchingPatternKeyError#key`/`#matchee`
+        // and `NameError#receiver` (NoMethodError's and FrozenError's too)
+        // raise when the exception carries none, as error.c's readers do.
+        "key" | "receiver" | "matchee"
+            if exception_reader_raises(cls, name) =>
+        {
+            match with_host(|h| (h.ivar_lookup(recv, name), h.is_initialized_exception(recv))) {
+                (Some(v), _) => Ok(v),
+                (None, true) => Err(raise_exc("ArgumentError", &format!("no {name} is available"))),
+                // Raised by rubylang at a site that did not record the field.
+                (None, false) => Ok(Value::Undef),
+            }
+        }
+        "result" | "path" | "reason" | "exit_value" | "errno" | "destination_encoding"
             if with_host(|h| h.is_exception_class(cls)) =>
         {
             Ok(with_host(|h| h.ivar_of(recv, name)))
@@ -5788,24 +5799,17 @@ fn dispatch_object(
         // joined to the list above: `value` is a name any exception could
         // plausibly define, and only this one answers it in MRI.
         "tag" | "value" if cls == "UncaughtThrowError" => Ok(with_host(|h| h.ivar_of(recv, name))),
-        // `NoMatchingPatternKeyError#matchee`: the hash the missing key was
-        // looked up in.
-        "matchee" if cls == "NoMatchingPatternKeyError" => Ok(with_host(|h| h.ivar_of(recv, name))),
-        // `NoMethodError#args` — the arguments the missing call was given. MRI
-        // answers an empty Array, never nil, so a caller can splat it.
-        "args" if with_host(|h| h.is_exception_class(cls)) => {
-            Ok(match with_host(|h| h.ivar_of(recv, "args")) {
-                Value::Undef => new_arr(Vec::new()),
-                v => v,
-            })
+        // `NoMethodError#args` — the arguments the missing call was given (nil
+        // for a `NoMethodError.new` given none). A raise site that recorded no
+        // arguments answers an empty Array.
+        "args" if exception_init_owner(cls) == Some("NoMethodError") => {
+            Ok(with_host(|h| h.ivar_lookup(recv, "args")).unwrap_or_else(|| new_arr(Vec::new())))
         }
         // `NoMethodError#private_call?` — whether the call that missed used an
         // explicit receiver. Every miss rubylang raises comes from an explicit
         // send, so this is false, matching `1.nope`.
-        "private_call?" if with_host(|h| h.is_exception_class(cls)) => Ok(Value::Bool(false)),
-        // `NameError#receiver` / `NoMethodError#receiver`.
-        "receiver" if with_host(|h| h.is_exception_class(cls)) => {
-            Ok(with_host(|h| h.ivar_of(recv, "receiver")))
+        "private_call?" if exception_init_owner(cls) == Some("NoMethodError") => {
+            Ok(with_host(|h| h.ivar_lookup(recv, "private_call?")).unwrap_or(Value::Bool(false)))
         }
         // `SystemExit#status` / `#success?` — the code `exit` was given, or the
         // one `SystemExit.new(n)` was constructed with. Beside the other
@@ -10979,6 +10983,150 @@ fn regex_replace(
     }
     out.push_str(&s[last..]);
     Ok(new_str(out))
+}
+
+/// Whether `exc.name` is one of error.c's readers that raise `no <name> is
+/// available` for an unset value: `key` on KeyError and
+/// NoMatchingPatternKeyError, `matchee` on the latter, `receiver` on KeyError,
+/// NameError (so NoMethodError) and FrozenError.
+fn exception_reader_raises(cls: &str, name: &str) -> bool {
+    matches!(
+        (exception_init_owner(cls), name),
+        (Some("KeyError" | "NoMatchingPatternKeyError"), "key")
+            | (Some("NoMatchingPatternKeyError"), "matchee")
+            | (Some("KeyError" | "NameError" | "NoMethodError" | "FrozenError"), "receiver")
+    )
+}
+
+/// `rb_get_kwargs` with every keyword optional: the value of each of `names`
+/// in the keyword hash `kw` (`None` when absent). Any other key is MRI's
+/// `unknown keyword` ArgumentError.
+fn optional_kwargs(kw: Option<&Value>, names: &[&str]) -> Result<Vec<Option<Value>>, String> {
+    let map = kw.and_then(|k| with_host(|h| h.as_hash(k))).unwrap_or_default();
+    let mut unknown = Vec::new();
+    for k in map.keys() {
+        if !matches!(k, RKey::Sym(s) if names.contains(&s.as_str())) {
+            unknown.push(with_host(|h| h.key_inspect(k)));
+        }
+    }
+    if !unknown.is_empty() {
+        let s = if unknown.len() > 1 { "s" } else { "" };
+        return Err(raise_exc(
+            "ArgumentError",
+            &format!("unknown keyword{s}: {}", unknown.join(", ")),
+        ));
+    }
+    Ok(names
+        .iter()
+        .map(|n| map.get(&RKey::Sym(n.to_string())).cloned())
+        .collect())
+}
+
+/// The built-in exception class whose `initialize` an exception of class
+/// `cls` runs: the nearest of the error.c classes that override it.
+fn exception_init_owner(cls: &str) -> Option<&'static str> {
+    const OWNERS: &[&str] = &[
+        "UncaughtThrowError",
+        "NoMatchingPatternKeyError",
+        "KeyError",
+        "NoMethodError",
+        "NameError",
+        "FrozenError",
+    ];
+    with_host(|h| h.class_ancestry(cls))
+        .iter()
+        .find_map(|c| OWNERS.iter().copied().find(|o| o == c))
+}
+
+/// The built-in `initialize` of an exception, ported from error.c:
+///
+/// * `exc_initialize` — `(message = nil)`
+/// * `key_err_initialize` — `(message = nil, receiver:, key:)`
+/// * `no_matching_pattern_key_err_initialize` — `(message = nil, matchee:, key:)`
+/// * `name_err_initialize` — `(message = nil, name = nil, receiver:)`
+/// * `nometh_err_initialize` — `(message = nil, name = nil, args = nil,
+///   private = false, receiver:)`
+/// * `frozen_err_initialize` — `(message = nil, receiver:)`
+///
+/// A keyword that is not passed leaves its ivar unset, which is what makes
+/// the reader raise (`no receiver is available`) instead of answering nil.
+pub(crate) fn exception_initialize(exc: &Value, cls: &str, args: &[Value]) -> Result<(), String> {
+    let (mut pos, kw) = match args.split_last() {
+        Some((last, rest)) if with_host(|h| h.is_kwargs(last)) => (rest.to_vec(), Some(last)),
+        _ => (args.to_vec(), None),
+    };
+    with_host(|h| h.mark_initialized_exception(exc));
+    let set = |name: &str, v: Value| with_host(|h| h.set_ivar_of(exc, name, v));
+    let mut kwargs: Vec<(&str, Option<Value>)> = Vec::new();
+    // UncaughtThrowError formats its message with the tag (`"uncaught throw %p"`).
+    let mut throw_tag = None;
+    match exception_init_owner(cls) {
+        // vm_eval.c `uncaught_throw_init`: `(tag, value, *super_args)`.
+        Some("UncaughtThrowError") => {
+            pos.extend(kw.cloned());
+            if pos.len() < 2 {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!("wrong number of arguments (given {}, expected 2+)", pos.len()),
+                ));
+            }
+            let rest = pos.split_off(2);
+            set("tag", pos[0].clone());
+            throw_tag = Some(pos[0].clone());
+            set("value", pos[1].clone());
+            pos = rest;
+        }
+        Some(owner @ ("KeyError" | "NoMatchingPatternKeyError")) => {
+            let first = if owner == "KeyError" { "receiver" } else { "matchee" };
+            let vals = optional_kwargs(kw, &[first, "key"])?;
+            kwargs.extend([first, "key"].into_iter().zip(vals));
+        }
+        Some(owner @ ("NameError" | "NoMethodError")) => {
+            if owner == "NoMethodError" {
+                let private = pos.len() > 3 && with_host(|h| h.truthy(&pos.pop().unwrap()));
+                let call_args = if pos.len() > 2 { pos.pop().unwrap() } else { Value::Undef };
+                set("args", call_args);
+                set("private_call?", Value::Bool(private));
+            }
+            let vals = optional_kwargs(kw, &["receiver"])?;
+            let name = if pos.len() > 1 { pos.pop().unwrap() } else { Value::Undef };
+            set("name", name);
+            kwargs.extend(["receiver"].into_iter().zip(vals));
+        }
+        Some(_) => {
+            let vals = optional_kwargs(kw, &["receiver"])?;
+            kwargs.extend(["receiver"].into_iter().zip(vals));
+        }
+        // `Exception#initialize` takes no keywords: a keyword hash is its
+        // one positional argument.
+        None => pos.extend(kw.cloned()),
+    }
+    if pos.len() > 1 {
+        return Err(raise_exc(
+            "ArgumentError",
+            &format!("wrong number of arguments (given {}, expected 0..1)", pos.len()),
+        ));
+    }
+    // The message is kept as its `to_s`; nil stays unset, so `message`
+    // answers the class name. UncaughtThrowError's `to_s` is
+    // `format(message, tag)`, applied here once.
+    let message = match pos.pop() {
+        Some(m) if !matches!(m, Value::Undef) => {
+            let text = with_host(|h| h.to_s(&m));
+            match &throw_tag {
+                Some(tag) => new_str(sprintf(&text, std::slice::from_ref(tag), None)?),
+                None => new_str(text),
+            }
+        }
+        _ => Value::Undef,
+    };
+    set("message", message);
+    for (name, v) in kwargs {
+        if let Some(v) = v {
+            set(name, v);
+        }
+    }
+    Ok(())
 }
 
 // The system crypt(3), as MRI calls it: in libSystem on macOS, in libcrypt
@@ -25605,6 +25753,10 @@ pub fn numeric_hook(op: fusevm::NumOp, a: &Value, b: &Value) -> Result<Value, St
                 _ => false,
             }));
         }
+        // An exception without a user `==` compares by `Exception#==`.
+        if matches!(op, Eq | Ne) && with_host(|h| h.is_exception_class(&cls)) {
+            return Ok(Value::Bool(exc_equal(a, b)? == (op == Eq)));
+        }
     }
     // An Array or Hash whose elements carry a user `==` compares them through
     // it; `rb_equal_d` falls back to the structural answer for the rest.
@@ -28024,7 +28176,36 @@ fn eq_fallback(recv: &Value, other: &Value) -> Result<bool, String> {
     if with_host(|h| h.as_array(recv).is_some() || h.as_hash(recv).is_some()) {
         return rb_equal_d(recv, other);
     }
+    if with_host(|h| h.is_exception_class(&h.class_of(recv))) {
+        return exc_equal(recv, other);
+    }
     Ok(with_host(|h| h.eq_values(recv, other)))
+}
+
+/// `Exception#==` — error.c `exc_equal`: the same class (after converting the
+/// other side with its `exception`), an equal message and an equal backtrace.
+fn exc_equal(recv: &Value, other: &Value) -> Result<bool, String> {
+    if identical(recv, other) {
+        return Ok(true);
+    }
+    let cls = with_host(|h| h.class_of(recv));
+    let mut other = other.clone();
+    if with_host(|h| h.class_of(&other)) != cls {
+        // An exception's own `exception` answers itself, so only an object
+        // with a user `exception` can convert to the receiver's class.
+        if !defines_own(&other, "exception") {
+            return Ok(false);
+        }
+        other = dispatch(&other, "exception", &[], None)?;
+        if with_host(|h| h.class_of(&other)) != cls {
+            return Ok(false);
+        }
+    }
+    let (m1, m2) = with_host(|h| (h.ivar_of(recv, "message"), h.ivar_of(&other, "message")));
+    if !rb_equal_d(&m1, &m2)? {
+        return Ok(false);
+    }
+    Ok(with_host(|h| h.exc_backtrace(recv) == h.exc_backtrace(&other)))
 }
 
 /// Whether comparing `v` with `==` can reach Ruby code: `v` is a plain user
@@ -28043,7 +28224,9 @@ fn involves_user_eq(v: &Value, depth: u32) -> bool {
     let Some(cls) = with_host(|h| h.object_class(v)) else {
         return false;
     };
-    defines_own(v, "==")
+    // `Exception#==` compares class, message and backtrace.
+    with_host(|h| h.is_exception_class(&cls))
+        || defines_own(v, "==")
         || with_host(|h| h.is_a(v, "Comparable") && h.find_method_owner(&cls, "<=>").is_some())
 }
 

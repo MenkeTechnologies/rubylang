@@ -5465,3 +5465,21 @@ p(("x".crypt("a") rescue $!), ("x".crypt("") rescue $!), ("x".crypt(1) rescue $!
 h = {:< => 1, :! => 1, :[] => 1, :a= => 1, :@a=>1, :$a=>1, :"!="=>1, :<=> => 1, :** => 1, :-@ => 1, :` => 1, :=~ => 1, :[]= => 1, :Ab => 1, :@@x => 1, :"9a" => 1, :"" => 1, :a? => 1, :b! => 1, :+ => 1, :% => 1, :"a b" => 1, :_x => 1, :$1 => 1, :"$-w" => 1}
 p h
 puts h.to_s
+#==#
+e = KeyError.new("k", receiver: {a: 1}, key: :z); p e.message, e.key, e.receiver
+p((KeyError.new("k").key rescue $!), (KeyError.new.receiver rescue $!), KeyError.new(receiver: 1).message)
+n = NameError.new("nm", :foo, receiver: 5); p n.message, n.name, n.receiver, (NameError.new("x").receiver rescue $!), NameError.new("undefined method 'q'").name
+m = NoMethodError.new("nme", :bar, [1, 2], receiver: "r"); p m.name, m.args, m.receiver, m.private_call?, NoMethodError.new("nme", :bar, [1], true).private_call?, NoMethodError.new("x").args
+f = FrozenError.new("fz", receiver: [1]); p f.receiver, f.message, (FrozenError.new("x").receiver rescue $!)
+k = NoMatchingPatternKeyError.new("m", matchee: {a: 1}, key: :b); p k.matchee, k.key, (NoMatchingPatternKeyError.new("m").matchee rescue $!)
+p((KeyError.new("a", bogus: 1) rescue $!), (KeyError.new("a", "b") rescue $!), (NameError.new("a", :b, :c) rescue $!), (Exception.new(1, 2) rescue $!))
+p RuntimeError.new(a: 1).message, Exception.new(5).message, Exception.new(nil).message
+p UncaughtThrowError.new(:t, 3, "msg %p").message, UncaughtThrowError.new(:t, 3, "m").value, (UncaughtThrowError.new(:t) rescue $!)
+class MyKey < KeyError; def initialize(m) = super(m, receiver: 1, key: 2); end
+mk = MyKey.new("mm"); p mk.message, mk.key, mk.receiver
+p((5.foo rescue $!.receiver), ({a: 1}.fetch(:b) rescue [$!.key, $!.receiver]), (RuntimeError.new.key rescue $!.class), (KeyError.new.name rescue $!.class))
+#==#
+p Exception.new("a") == Exception.new("a"), Exception.new("a") == Exception.new("b"), RuntimeError.new("a") == StandardError.new("a"), Exception.new("a") == "a", Exception.new == Exception.new
+x = Exception.new("a"); y = Exception.new("a"); y.set_backtrace(["l"]); p x == y, x != y, x.equal?(y)
+p [RuntimeError.new("x")] == [RuntimeError.new("x")], [KeyError.new("a")].include?(KeyError.new("a"))
+class Conv; def exception = RuntimeError.new("c"); end; p RuntimeError.new("c") == Conv.new

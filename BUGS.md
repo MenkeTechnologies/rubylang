@@ -328,7 +328,14 @@ can see, because those readers are how a `rescue` body branches. Closed here:
 
 `raise_exc_with` is the mechanism: it records the structured fields on the
 exception object at the raise site, where they are known. A hand-constructed
-exception (`KeyError.new("m")`) answers nil for them, as MRI's does.
+exception runs the error.c `initialize` of its class (`KeyError.new(msg,
+receiver:, key:)`, `NameError.new(msg, name, receiver:)`, `NoMethodError.new(msg,
+name, args, private, receiver:)`, `FrozenError.new(msg, receiver:)`,
+`NoMatchingPatternKeyError.new(msg, matchee:, key:)`, `UncaughtThrowError.new(tag,
+value, msg)`); a keyword it was not given makes the reader raise `no receiver is
+available` / `no key is available`, as MRI's does. A field a rubylang raise site
+did not record answers nil instead. `Exception#==` is error.c `exc_equal`: same
+class, equal message, equal backtrace.
 
 **Not closed, and why:**
 

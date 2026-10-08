@@ -4394,3 +4394,56 @@ NoMethodError
 #==#
 {"<": 1, "!": 1, "[]": 1, "a=": 1, "@a": 1, "$a": 1, "!=": 1, "<=>": 1, "**": 1, "-@": 1, "`": 1, "=~": 1, "[]=": 1, Ab: 1, "@@x": 1, "9a": 1, "": 1, a?: 1, b!: 1, "+": 1, "%": 1, "a b": 1, _x: 1, "$1": 1, "$-w": 1}
 {"<": 1, "!": 1, "[]": 1, "a=": 1, "@a": 1, "$a": 1, "!=": 1, "<=>": 1, "**": 1, "-@": 1, "`": 1, "=~": 1, "[]=": 1, Ab: 1, "@@x": 1, "9a": 1, "": 1, a?: 1, b!: 1, "+": 1, "%": 1, "a b": 1, _x: 1, "$1": 1, "$-w": 1}
+#==#
+"k"
+:z
+{a: 1}
+#<ArgumentError: no key is available>
+#<ArgumentError: no receiver is available>
+"KeyError"
+"nm"
+:foo
+5
+#<ArgumentError: no receiver is available>
+nil
+:bar
+[1, 2]
+"r"
+false
+true
+nil
+[1]
+"fz"
+#<ArgumentError: no receiver is available>
+{a: 1}
+:b
+#<ArgumentError: no matchee is available>
+#<ArgumentError: unknown keyword: :bogus>
+#<ArgumentError: wrong number of arguments (given 2, expected 0..1)>
+#<ArgumentError: wrong number of arguments (given 2, expected 0..1)>
+#<ArgumentError: wrong number of arguments (given 2, expected 0..1)>
+"{a: 1}"
+"5"
+"Exception"
+"msg :t"
+3
+#<ArgumentError: wrong number of arguments (given 1, expected 2+)>
+"mm"
+2
+1
+5
+[:b, {a: 1}]
+NoMethodError
+NoMethodError
+#==#
+true
+false
+false
+false
+true
+false
+true
+false
+true
+true
+true
