@@ -5397,3 +5397,13 @@ p 2 / c, 2.0 / c, (2**70) / c, 1.send(:/, c), 2.quo(c), 2.0.quo(c), Rational(1, 
 p Complex(3, 4) / Complex(1, 2), Complex(-2, 9) / Complex(-9, 2), Complex(1, 2) / Complex(3.0, 4), Complex(9, 8) / 4, Complex(20, 9) / 9.8, Complex(11, 22).fdiv(3), Complex(1, 2).quo(Complex(1, 2))
 p Complex(2**70, 1) / Complex(1, 2**65), Complex(-0.0, 2) / Complex(1, 0), Complex(1, 2) / 0.0, 4.quo(2), 4.quo(2.0), 7.quo(Rational(1, 2)), 2.5.quo(2), 1.0.quo(0)
 p((Complex(1, 2) / Complex(0, 0) rescue $!), (Complex(1, 2) / 0 rescue $!), (Complex(1, 1) / "x" rescue $!), (1.quo(0) rescue $!))
+#==#
+o = Object.new; def o.method_missing(n, *a) = n.to_s.start_with?("x") ? [n, a] : super; def o.respond_to_missing?(n, p = false) = n.to_s.start_with?("x") || super
+m = o.method(:xq); p m.call(2), m.arity, m.name, m.owner == o.singleton_class, m.receiver.equal?(o), (o.method(:zz) rescue $!.class), o.respond_to?(:xa), o.respond_to?(:za)
+class RM; def respond_to_missing?(n, ip) = 1; def method_missing(n, *a) = :mm; end
+p RM.new.respond_to?(:q), RM.new.method(:q).call, RM.new.method(:q).owner, RM.new.method(:q).unbind.class
+o2 = Object.new; def o2.respond_to_missing?(n, ip) = false; p((o2.method(:x) rescue $!.class))
+class CR; def self.respond_to_missing?(n, ip) = "yes"; end; p CR.respond_to?(:zz)
+class CR2 < CR; end; p CR2.respond_to?(:zz), CR.respond_to?(:new)
+module RMx; def respond_to_missing?(n, ip) = n == :mx; end; class CR3; extend RMx; end; p CR3.respond_to?(:mx), CR3.respond_to?(:my)
+class CR4; class << self; def respond_to_missing?(n, ip) = n == :c4; end; end; p CR4.respond_to?(:c4), CR4.respond_to?(:c5)

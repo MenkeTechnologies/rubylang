@@ -4231,6 +4231,12 @@ impl RubyHost {
         match self.resolve_method_shape(recv, name, unbound) {
             Some(MethodShape::Def { owner, .. }) | Some(MethodShape::Block { owner, .. }) => owner,
             Some(MethodShape::Builtin { owner, .. }) => owner.to_string(),
+            // A `respond_to_missing?`-backed Method is owned by `CLASS_OF(recv)`
+            // (proc.c `mnew_missing`): the singleton class once the object has
+            // singleton methods, its class otherwise.
+            None if !unbound && !self.singleton_method_names(recv).is_empty() => self
+                .singleton_class_name(recv)
+                .unwrap_or_else(|| self.dispatch_class(recv)),
             None => self
                 .classref_name(recv)
                 .map(|c| format!("#<Class:{c}>"))

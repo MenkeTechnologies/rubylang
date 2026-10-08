@@ -1797,7 +1797,21 @@ fn method_object_or_name_error(recv: &Value, m: &str, unbound: bool) -> Result<(
         return Ok(());
     }
     if !unbound {
-        if let Some(cls) = with_host(|h| h.object_class(recv)) {
+        // A singleton `def obj.respond_to_missing?` is found first: MRI's
+        // lookup starts at the singleton class.
+        if let Some(def) = with_host(|h| h.find_singleton_method(recv, "respond_to_missing?")) {
+            let sym = with_host(|h| h.new_symbol(m));
+            let r = crate::host::call_singleton(
+                recv.clone(),
+                &def,
+                "respond_to_missing?",
+                &[sym, Value::Bool(true)],
+                None,
+            )?;
+            if with_host(|h| h.truthy(&r)) {
+                return Ok(());
+            }
+        } else if let Some(cls) = with_host(|h| h.object_class(recv)) {
             if with_host(|h| h.find_method_owner(&cls, "respond_to_missing?")).is_some() {
                 let sym = with_host(|h| h.new_symbol(m));
                 let r = call_instance_method(
@@ -2839,24 +2853,28 @@ pub(crate) fn dispatch(
                 {
                     let include_private = args.get(1).cloned().unwrap_or(Value::Bool(false));
                     let sym = with_host(|h| h.new_symbol(&m));
-                    return crate::host::call_singleton(
+                    let r = crate::host::call_singleton(
                         recv.clone(),
                         &def,
                         "respond_to_missing?",
                         &[sym, include_private],
                         None,
-                    );
+                    )?;
+                    // `respond_to?` answers RTEST of the hook, a boolean.
+                    return Ok(Value::Bool(with_host(|h| h.truthy(&r))));
                 }
                 if with_host(|h| h.find_method_owner(&cls, "respond_to_missing?")).is_some() {
                     let include_private = args.get(1).cloned().unwrap_or(Value::Bool(false));
                     let sym = with_host(|h| h.new_symbol(&m));
-                    return call_instance_method(
+                    let r = call_instance_method(
                         recv.clone(),
                         &cls,
                         "respond_to_missing?",
                         &[sym, include_private],
                         None,
-                    );
+                    )?;
+                    // `respond_to?` answers RTEST of the hook, a boolean.
+                    return Ok(Value::Bool(with_host(|h| h.truthy(&r))));
                 }
                 // An exception's built-in surface (`message`, `full_message`,
                 // `KeyError#key`, …) is native, so no table above lists it; the
@@ -2967,17 +2985,36 @@ pub(crate) fn dispatch(
                         == crate::host::Visibility::Private;
                     return Ok(Value::Bool(include_private || !private));
                 }
+                // A `def self.respond_to_missing?` (or one inherited from a
+                // superclass's singleton, or from an `extend`ed module).
+                if let Some((def, owner)) =
+                    with_host(|h| h.find_class_method_owner(&cname, "respond_to_missing?"))
+                {
+                    let include_private = args.get(1).cloned().unwrap_or(Value::Bool(false));
+                    let sym = with_host(|h| h.new_symbol(&m));
+                    let r = crate::host::call_class_method(
+                        recv.clone(),
+                        &def,
+                        "respond_to_missing?",
+                        &owner,
+                        &[sym, include_private],
+                        None,
+                    )?;
+                    return Ok(Value::Bool(with_host(|h| h.truthy(&r))));
+                }
                 let sclass = format!("#<Class:{cname}>");
                 if with_host(|h| h.find_method_owner(&sclass, "respond_to_missing?")).is_some() {
                     let include_private = args.get(1).cloned().unwrap_or(Value::Bool(false));
                     let sym = with_host(|h| h.new_symbol(&m));
-                    return call_instance_method(
+                    let r = call_instance_method(
                         recv.clone(),
                         &sclass,
                         "respond_to_missing?",
                         &[sym, include_private],
                         None,
-                    );
+                    )?;
+                    // `respond_to?` answers RTEST of the hook, a boolean.
+                    return Ok(Value::Bool(with_host(|h| h.truthy(&r))));
                 }
                 // `Kernel` as a receiver answers for its module functions and
                 // nothing else: MRI makes `puts`/`format`/… public singleton

@@ -4189,3 +4189,24 @@ Infinity
 #<ZeroDivisionError: divided by 0>
 #<TypeError: String can't be coerced into Complex>
 #<ZeroDivisionError: divided by 0>
+#==#
+[:xq, [2]]
+-1
+:xq
+true
+true
+NameError
+true
+false
+true
+:mm
+RM
+UnboundMethod
+NameError
+true
+true
+true
+true
+false
+true
+false
