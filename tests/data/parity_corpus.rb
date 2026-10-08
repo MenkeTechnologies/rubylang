@@ -5447,3 +5447,4 @@ p Kernel.format("%d", 2), String.send(:format, "%d", 3), String.method(:format).
 class KF; puts "body"; self.puts "self"; end
 class KMM; def self.method_missing(n, *a) = [:mm, n, a]; end; p KMM.puts(1)
 p((5.public_send(:puts, "x") rescue $!), (String.public_send(:puts, "x") rescue $!), (self.public_send(:format, "%d", 1) rescue $!), Kernel.public_send(:format, "%d", 1), String.public_send(:new, "a"))
+p Random.rand(1), Random.public_send(:rand, 1), (Random.srand(1); Random.rand(1))

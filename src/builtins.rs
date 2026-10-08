@@ -27538,8 +27538,16 @@ fn mark_explicit_class_call(cls: &str, name: &str, self_ok: bool) {
     // A class reference is keyed by its name, so comparing names is the
     // identity test against `self`.
     let is_self = || with_host(|h| h.classref_name(&h.current_self())).as_deref() == Some(cls);
+    // A built-in singleton of the same name ahead of Kernel (`IO.select`,
+    // `Random.rand`) is public and may be served by the same Kernel code.
+    let resolves_to_kernel =
+        || with_host(|h| {
+            let recv = h.class_ref(cls);
+            h.builtin_owner(&recv, name) == Some("Kernel")
+        });
     let mark = cls != "Kernel"
         && crate::arity_table::lookup("#<Class:Kernel>", name).is_some()
+        && resolves_to_kernel()
         && !(self_ok && is_self());
     EXPLICIT_CLASS_CALL.with(|c| {
         *c.borrow_mut() = mark.then(|| (cls.to_string(), name.to_string()));

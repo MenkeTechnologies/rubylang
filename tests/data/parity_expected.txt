@@ -4366,3 +4366,6 @@ self
 #<NoMethodError: private method 'format' called for main>
 "1"
 "a"
+0
+0
+0
