@@ -3433,6 +3433,7 @@ fn dispatch_classref(
         Some(n) => (n, true),
         None => (name, false),
     };
+    let explicit_recv = take_explicit_class_call(cls, name);
     // A user-defined class method takes precedence over the native builtin
     // handlers below: a reopened builtin's `def self.m`, and the synthetic
     // `__class_body__` that runs a reopened module/class body. Without this,
@@ -5249,6 +5250,33 @@ fn dispatch_classref(
             // method of every object, including a class object, so a class receiver
             // can invoke it — e.g. `method(:Array)` bound to a class and called via
             // `flat_map(&method(:Array))` (sinatra's error handler registration).
+            // That is an implicit-self (FCALL) privilege: written with an explicit
+            // receiver (`String.puts`) the call is refused as MRI refuses it, since
+            // Kernel's module functions are private instance methods.
+            // A class-level `method_missing` (Rails::Railtie's `class << self;
+            // def method_missing` forwards unknown class calls to the application
+            // instance, e.g. `MyApp.initialize!`) handles both a refused private
+            // call and an unknown name before we give up, as in MRI.
+            let class_method_missing = |block: Option<Value>| {
+                with_host(|h| h.find_class_method(cls, "method_missing")).map(|def| {
+                    let recv = with_host(|h| h.class_ref(cls));
+                    let sym = with_host(|h| h.new_symbol(name));
+                    let mut mm_args = vec![sym];
+                    mm_args.extend_from_slice(args);
+                    crate::host::call_class_method(recv, &def, "method_missing", cls, &mm_args, block)
+                })
+            };
+            if explicit_recv {
+                return class_method_missing(block).unwrap_or_else(|| {
+                    Err(raise_exc(
+                        "NoMethodError",
+                        &format!(
+                            "private method '{name}' called for {}",
+                            receiver_phrase(&with_host(|h| h.class_ref(cls)))
+                        ),
+                    ))
+                });
+            }
             let kernel_block = block.clone();
             match kernel(name, args, block) {
                 // Only rewrite when `name` itself is the unknown Kernel function.
@@ -5259,31 +5287,15 @@ fn dispatch_classref(
                     if e == format!("undefined method '{name}'")
                         || e.starts_with(&format!("undefined method '{name}' ")) =>
                 {
-                    // A class-level `method_missing` (Rails::Railtie's
-                    // `class << self; def method_missing` forwards unknown class
-                    // calls to the application instance, e.g. `MyApp.initialize!`)
-                    // handles the call before we give up.
-                    if let Some(def) = with_host(|h| h.find_class_method(cls, "method_missing")) {
-                        let recv = with_host(|h| h.class_ref(cls));
-                        let sym = with_host(|h| h.new_symbol(name));
-                        let mut mm_args = vec![sym];
-                        mm_args.extend_from_slice(args);
-                        return crate::host::call_class_method(
-                            recv,
-                            &def,
-                            "method_missing",
-                            cls,
-                            &mm_args,
-                            kernel_block,
-                        );
-                    }
-                    Err(raise_exc(
-                        "NoMethodError",
-                        &format!(
-                            "undefined method '{name}' for {} {cls}",
-                            with_host(|h| h.class_or_module_word(cls))
-                        ),
-                    ))
+                    class_method_missing(kernel_block).unwrap_or_else(|| {
+                        Err(raise_exc(
+                            "NoMethodError",
+                            &format!(
+                                "undefined method '{name}' for {} {cls}",
+                                with_host(|h| h.class_or_module_word(cls))
+                            ),
+                        ))
+                    })
                 }
                 other => other,
             }
@@ -27507,6 +27519,43 @@ fn is_kernel_module_function_of(recv: &Value, name: &str) -> bool {
     })
 }
 
+thread_local! {
+    /// The `(class, name)` of an explicit-receiver class call (`String.puts`)
+    /// naming a Kernel module function, recorded by [`check_kernel_private`]
+    /// just before the call dispatches and consumed by [`dispatch_classref`].
+    /// MRI tells the two call forms apart by the call-site flag (FCALL vs
+    /// CALL); this is that flag for the one fallback that needs it.
+    static EXPLICIT_CLASS_CALL: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record an explicit-receiver call `cls.name` when `name` is one of Kernel's
+/// module functions. An ordinary call exempts the current `self` (`self.puts`
+/// inside a class body is legal); `public_send` passes `self_ok = false`, as it
+/// refuses a private method on any receiver. `Kernel` itself is exempt: its
+/// module functions are public singleton methods.
+fn mark_explicit_class_call(cls: &str, name: &str, self_ok: bool) {
+    // A class reference is keyed by its name, so comparing names is the
+    // identity test against `self`.
+    let is_self = || with_host(|h| h.classref_name(&h.current_self())).as_deref() == Some(cls);
+    let mark = cls != "Kernel"
+        && crate::arity_table::lookup("#<Class:Kernel>", name).is_some()
+        && !(self_ok && is_self());
+    EXPLICIT_CLASS_CALL.with(|c| {
+        *c.borrow_mut() = mark.then(|| (cls.to_string(), name.to_string()));
+    });
+}
+
+/// Consume the mark left by [`mark_explicit_class_call`]: whether THIS
+/// dispatch of `cls.name` is the explicit-receiver call it recorded.
+fn take_explicit_class_call(cls: &str, name: &str) -> bool {
+    EXPLICIT_CLASS_CALL.with(|c| {
+        c.borrow_mut()
+            .take()
+            .is_some_and(|(c, n)| c == cls && n == name)
+    })
+}
+
 /// Kernel's module functions (`puts`, `format`, `rand`, `raise`, `select`, …)
 /// are PRIVATE instance methods in MRI — exactly the ones Kernel also defines
 /// as singleton methods — so `obj.puts` raises `private method 'puts' called`
@@ -27514,10 +27563,15 @@ fn is_kernel_module_function_of(recv: &Value, name: &str) -> bool {
 /// of the same name, or a `method_missing` that MRI would route the refused
 /// call to, leaves the call alone.
 fn check_kernel_private(recv: &Value, name: &str) -> Result<(), String> {
-    // A class/module receiver is left out: native library modules (YAML, …)
-    // answer singleton methods the built-in table has no rows for, and their
-    // registration does not set them apart from user-written modules.
-    if with_host(|h| h.classref_name(recv)).is_some() || !is_kernel_module_function_of(recv, name) {
+    // A class/module receiver is not judged here: native library modules
+    // (SecureRandom, …) answer singleton methods the built-in table has no rows
+    // for. The call is only marked as explicit-receiver; `dispatch_classref`
+    // refuses it at the point it would fall back to the Kernel function.
+    if let Some(cls) = with_host(|h| h.classref_name(recv)) {
+        mark_explicit_class_call(&cls, name, true);
+        return Ok(());
+    }
+    if !is_kernel_module_function_of(recv, name) {
         return Ok(());
     }
     let this = with_host(|h| h.current_self());
@@ -27601,6 +27655,15 @@ fn receiver_visibility(recv: &Value, name: &str) -> crate::host::Visibility {
 }
 
 fn check_public_visibility(recv: &Value, name: &str) -> Result<(), String> {
+    // Kernel's module functions are private on every receiver but Kernel.
+    if let Some(cls) = with_host(|h| h.classref_name(recv)) {
+        mark_explicit_class_call(&cls, name, false);
+    } else if is_kernel_module_function_of(recv, name) {
+        return Err(raise_exc(
+            "NoMethodError",
+            &format!("private method '{name}' called for {}", receiver_phrase(recv)),
+        ));
+    }
     let vis = receiver_visibility(recv, name);
     if vis == crate::host::Visibility::Public {
         return Ok(());

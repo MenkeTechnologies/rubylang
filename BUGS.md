@@ -1272,11 +1272,15 @@ Honest limitations of this surface:
   — while rubylang tests object identity. So `z = self; z.priv` and
   `def self.go; C.priv_cm; end` are accepted where MRI raises. Distinguishing
   them needs the compiler to mark a literal-`self` receiver on the call op.
-  Still open: the private surface of the BUILT-IN Kernel methods is not modelled
-  (`Kernel#puts`/`print`/`require`/`raise`/… are private instance methods in
-  MRI), so `5.public_send(:puts, "x")` reports `undefined method 'puts'` where
-  MRI reports `private method 'puts'`. Only user-defined classes and modules
-  record visibility; closing this needs a generated visibility column in
+  The BUILT-IN Kernel module functions (`puts`/`format`/`rand`/`raise`/…, the
+  names Kernel also defines as singleton methods) are private instance
+  methods, as in MRI: `obj.puts`, `String.puts` and `x.public_send(:puts)`
+  raise `private method 'puts' called for …`, while `self.puts`, a bare
+  `puts`, `send` and a `method`-captured call run Kernel's. A class receiver is
+  refused only where its dispatch would fall back to the Kernel function, so a
+  native module's own singleton of that name (`IO.select`, `Random.rand`) and
+  a class-level `method_missing` still win. The other built-in private methods
+  are not modelled; that needs a generated visibility column in
   `src/arity_table.rs`.
   Still open: the singleton-class reflection surface is empty —
   `C.singleton_class.instance_methods(false)` and its `private_` sibling both

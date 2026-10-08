@@ -5440,3 +5440,10 @@ class MM; def method_missing(n, *a) = [:mm, n]; end; p MM.new.puts
 o2 = Object.new; def o2.format(*) = :own; p o2.format, (o2.tap { } .equal?(o2)), o2.then { 1 }, o2.frozen?
 p Object.new.send(:format, "%d", 1), 5.send(:format, "%x", 255), "s".__send__(:Integer, "7"), [].send(:rand, 1)
 Object.new.send(:puts, "hi")
+#==#
+class KF; end; module KM; end
+p((String.puts("x") rescue $!), (Integer.format("%d", 1) rescue $!), (KF.rand rescue $!), (KM.sleep(0) rescue $!), (Comparable.Integer("1") rescue $!), (Class.raise rescue $!))
+p Kernel.format("%d", 2), String.send(:format, "%d", 3), String.method(:format).call("%d", 4), [1].flat_map(&String.method(:Array))
+class KF; puts "body"; self.puts "self"; end
+class KMM; def self.method_missing(n, *a) = [:mm, n, a]; end; p KMM.puts(1)
+p((5.public_send(:puts, "x") rescue $!), (String.public_send(:puts, "x") rescue $!), (self.public_send(:format, "%d", 1) rescue $!), Kernel.public_send(:format, "%d", 1), String.public_send(:new, "a"))

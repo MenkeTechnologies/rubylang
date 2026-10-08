@@ -4347,3 +4347,22 @@ false
 7
 0
 hi
+#==#
+#<NoMethodError: private method 'puts' called for class String>
+#<NoMethodError: private method 'format' called for class Integer>
+#<NoMethodError: private method 'rand' called for class KF>
+#<NoMethodError: private method 'sleep' called for module KM>
+#<NoMethodError: private method 'Integer' called for module Comparable>
+#<NoMethodError: private method 'raise' called for class Class>
+"2"
+"3"
+"4"
+[1]
+body
+self
+[:mm, :puts, [1]]
+#<NoMethodError: private method 'puts' called for an instance of Integer>
+#<NoMethodError: private method 'puts' called for class String>
+#<NoMethodError: private method 'format' called for main>
+"1"
+"a"
