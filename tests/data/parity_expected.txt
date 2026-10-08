@@ -4117,3 +4117,31 @@ Infinity
 #<FloatDomainError: NaN>
 #<FloatDomainError: Infinity>
 #<ZeroDivisionError: divided by 0>
+#==#
+[4, (1/3)]
+[-2, (-5/3)]
+[4, 0.3333333333333335]
+-5
+(-5/3)
+-0.16666666666666652
+(1/3)
+(-1/3)
+0.3333333333333335
+1.1666666666666667
+-4.666666666666667
+Infinity
+-Infinity
+NaN
+NaN
+[2754713781673959707989, (1/7)]
+#<ZeroDivisionError: divided by 0>
+#<ZeroDivisionError: divided by 0>
+#<ZeroDivisionError: divided by 0>
+#<ZeroDivisionError: divided by 0>
+#<ZeroDivisionError: divided by 0>
+(1/3)
+[-8, (1/3)]
+(1/3)
+787061080478274202282
+0.2999999999999998
+[7, 0.1666666666666668]

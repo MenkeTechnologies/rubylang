@@ -9024,6 +9024,20 @@ impl RubyHost {
         if matches!(self.obj(a), Some(RObj::Rational(_)))
             || matches!(self.obj(b), Some(RObj::Rational(_)))
         {
+            // `Rational#%` is Numeric's `num_modulo` (`x - y * x.div(y)`): it
+            // raises on any zero divisor, `0.0` included, and answers a Float
+            // remainder against a Float. One implementation, in `Rational#modulo`.
+            // An Integer receiver coerces to a Rational first (`int_modulo` ->
+            // `rb_num_coerce_bin`), so `5 % Rational(0)` raises the same way.
+            if matches!(op, Mod) && !matches!(a, Value::Float(_)) {
+                let ra = match self.obj(a) {
+                    Some(RObj::Rational(_)) => Some(a.clone()),
+                    _ => self.as_rational(a).map(|r| self.new_rational(r)),
+                };
+                if let Some(ra) = ra {
+                    return crate::builtins::dispatch(&ra, "modulo", std::slice::from_ref(b), None);
+                }
+            }
             if matches!(a, Value::Float(_)) || matches!(b, Value::Float(_)) {
                 use num_traits::ToPrimitive as _;
                 let to_f = |this: &Self, v: &Value| -> f64 {

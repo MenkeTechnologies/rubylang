@@ -6901,6 +6901,18 @@ fn dispatch_number(
     }
     // Promoted BigInt receivers need arbitrary-precision handling for the
     // methods that would otherwise truncate through `i64`.
+    // An Integer meeting a Rational in the floored-division family coerces
+    // itself to a Rational and resends (`rb_num_coerce_bin`), so the result is
+    // exact: `-5.divmod(Rational(2, 3))` is `[-8, (1/3)]`, not a Float pair.
+    if !matches!(recv, Value::Float(_))
+        && matches!(name, "%" | "modulo" | "div" | "divmod" | "remainder")
+        && args.first().is_some_and(|a| with_host(|h| h.class_of(a)) == "Rational")
+    {
+        let r = with_host(|h| h.as_rational(recv).map(|r| h.new_rational(r)));
+        if let Some(r) = r {
+            return dispatch(&r, name, args, None);
+        }
+    }
     if let Some(b) = with_host(|h| h.as_promoted_bigint(recv)) {
         if let Some(r) = dispatch_bigint(&b, name, args)? {
             return Ok(r);
@@ -13856,6 +13868,94 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
         // at all: `Rational(1, 2).between?(0, 1)` raised NoMethodError.
         "between?" => comparable_between(recv, args),
         "clamp" => comparable_clamp(recv, args),
+        // Rational defines none of these; MRI answers them through Numeric
+        // (numeric.c `num_div` / `num_modulo` / `num_divmod` / `num_remainder`),
+        // each built from `/`, `floor`, `-` and `*` sends, so the result type
+        // follows the operand: exact against a Rational or an Integer, a Float
+        // remainder against a Float.
+        // MRI `rb_rational_fdiv`: a zero divisor divides by `0.0` (so it
+        // answers +/-Infinity or NaN, never raises); otherwise the exact
+        // quotient rendered as a Float.
+        "fdiv" => {
+            let y = &args[0];
+            let y_is_zero = match y {
+                Value::Int(n) => *n == 0,
+                Value::Float(f) => *f == 0.0,
+                _ => with_host(|h| h.as_rational(y)).is_some_and(|q| q.is_zero()),
+            };
+            if y_is_zero {
+                return dispatch(recv, "/", &[Value::Float(0.0)], None);
+            }
+            let q = dispatch(recv, "/", args, None)?;
+            if let Value::Float(_) = q {
+                return Ok(q);
+            }
+            if with_host(|h| h.class_of(&q)) == "Rational" {
+                let r = with_host(|h| h.as_rational(&q)).unwrap();
+                return Ok(Value::Float(rational_to_f64(&r)));
+            }
+            dispatch(&q, "to_f", &[], None)
+        }
+        "div" | "modulo" | "divmod" | "remainder" => {
+            let y = &args[0];
+            // `num_div` raises on `0 == y` before dividing: `r.div(0.0)` and
+            // `r.modulo(0.0)` raise rather than answering Infinity/NaN.
+            let y_is_zero = match y {
+                Value::Int(0) => true,
+                Value::Float(f) => *f == 0.0,
+                _ => with_host(|h| h.as_rational(y)).is_some_and(|q| q.is_zero()),
+            };
+            let div = || -> Result<Value, String> {
+                if y_is_zero {
+                    return Err(raise_exc("ZeroDivisionError", "divided by 0"));
+                }
+                dispatch(&dispatch(recv, "/", args, None)?, "floor", &[], None)
+            };
+            let modulo = |q: &Value| -> Result<Value, String> {
+                dispatch(recv, "-", &[dispatch(y, "*", std::slice::from_ref(q), None)?], None)
+            };
+            match name {
+                "div" => div(),
+                "modulo" => modulo(&div()?),
+                "divmod" => {
+                    let q = div()?;
+                    let m = modulo(&q)?;
+                    Ok(new_arr(vec![q, m]))
+                }
+                _ => {
+                    // `num_remainder`: the modulo, moved back toward zero when
+                    // self and y have opposite signs (an infinite Float y
+                    // leaves self).
+                    let z = modulo(&div()?)?;
+                    let sign = |v: &Value| match v {
+                        Value::Int(i) => i.signum(),
+                        Value::Float(f) if *f > 0.0 => 1,
+                        Value::Float(f) if *f < 0.0 => -1,
+                        Value::Float(_) => 0,
+                        _ => with_host(|h| h.as_rational(v)).map_or(0, |q| {
+                            if q.is_positive() {
+                                1
+                            } else if q.is_negative() {
+                                -1
+                            } else {
+                                0
+                            }
+                        }),
+                    };
+                    let z_is_zero = match &z {
+                        Value::Float(f) => *f == 0.0,
+                        _ => sign(&z) == 0,
+                    };
+                    if !z_is_zero && sign(recv) * sign(y) < 0 {
+                        if matches!(y, Value::Float(f) if f.is_infinite()) {
+                            return Ok(recv.clone());
+                        }
+                        return dispatch(&z, "-", args, None);
+                    }
+                    Ok(z)
+                }
+            }
+        }
         // The arithmetic/comparison operators reach here when invoked as methods
         // (`r.+(x)`, e.g. `reduce(:+)`); delegate to the numeric hook.
         "+" | "-" | "*" | "%" | "==" | "<" | ">" | "<=" | ">=" => {

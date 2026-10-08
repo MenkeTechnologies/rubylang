@@ -5382,3 +5382,9 @@ x = 10.0; y = 3.3
 p x % y, x.divmod(y), -10.0 % 3.3, 10 % 3.3, 10.0.modulo(-3.3), [10.0, 3.3].inject(:%), 7.5.divmod(2), 2.divmod(0.7)
 p 5.0 % Float::INFINITY, -5.0 % Float::INFINITY, 5.0.divmod(Float::INFINITY), -0.0 % 5.0, 1e20.divmod(3.0)
 p((Float::INFINITY.divmod(2.0) rescue $!), (5.0.divmod(Float::NAN) rescue $!), (1e300.divmod(1e-300) rescue $!), ([1.0, 0.0].inject(:%) rescue $!))
+#==#
+r = Rational(7, 3)
+p r.divmod(Rational(1, 2)), r.divmod(-2), r.divmod(0.5), r.div(-0.5), r.modulo(-2), r % -0.5, r.remainder(-2), Rational(-7, 3).remainder(2), r.remainder(-0.5)
+p r.fdiv(2), r.fdiv(-0.5), r.fdiv(0), Rational(-1, 3).fdiv(0), Rational(0).fdiv(0), r.remainder(Float::INFINITY), (2**70).to_r.divmod(Rational(3, 7))
+p((r.divmod(0) rescue $!), (r.div(0.0) rescue $!), (r % 0.0 rescue $!), (r.remainder(0) rescue $!), (5 % Rational(0) rescue $!))
+p 5 % Rational(2, 3), -5.divmod(Rational(2, 3)), 5.remainder(Rational(2, 3)), (2**70).div(Rational(3, 2)), 5.3 % Rational(1, 2), 2.5.divmod(Rational(1, 3))
