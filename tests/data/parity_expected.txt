@@ -4463,3 +4463,39 @@ true
 [A1, B1]
 B1
 :b1
+#==#
+#<RuntimeError: can't add a new key into hash during iteration>
+{a: 1}
+{a: 5}
+{}
+#<RuntimeError: can't add a new key into hash during iteration>
+{a: 1, b: 2}
+#<RuntimeError: rehash during iteration>
+#<RuntimeError: compare_by_identity during iteration>
+{a: 1, b: 2, zz: 1, after: 1}
+#<RuntimeError: x>
+5
+5
+true
+{x: 2}
+{}
+#<RuntimeError: can't add a new key into hash during iteration>
+#<RuntimeError: can't replace hash during iteration>
+{a: 3, n: 1}
+{a: 3, n: 1}
+{a: 3, n: 1}
+{a: 1}
+{a: 3, n: 1}
+#==#
+true
+false
+7
+nil
+nil
+3
+#<TypeError: no implicit conversion of Integer into Hash>
+{z: 1}
+{b: 2}
+{b: 2}
+{b: 2}
+#<FrozenError: can't modify frozen Hash: {}>

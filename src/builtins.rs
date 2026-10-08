@@ -19654,7 +19654,67 @@ fn dispatch_set(
     }
 }
 
+/// The Hash methods whose block runs inside MRI's `rb_hash_foreach` over the
+/// receiver (hash.c's own iterators, and the Enumerable ones through `each`).
+/// Absent: `sort` (Enumerable#sort reads the pairs out first and compares
+/// afterwards), `select`/`filter`/`reject`/`transform_values` (they iterate a
+/// copy of the receiver) and `merge`/`update` (they iterate their ARGUMENT).
+const HASH_BLOCK_ITERATORS: &[&str] = &[
+    "all?", "any?", "chunk_while", "collect", "collect_concat", "count", "delete_if",
+    "detect", "each", "each_cons", "each_entry", "each_key", "each_pair", "each_slice",
+    "each_value", "each_with_index", "each_with_object", "filter", "filter!", "filter_map",
+    "find", "find_all", "find_index", "flat_map", "group_by", "inject", "keep_if", "map",
+    "max", "max_by", "min", "min_by", "minmax", "minmax_by", "none?", "one?", "partition",
+    "reduce", "reject!", "select!", "slice_when", "sort_by", "sum", "to_h", "transform_keys",
+    "uniq",
+];
+
+/// Hash dispatch under MRI's iteration lock (hash.c `hash_iter_lev`): a block
+/// iterating the receiver holds it, and while it is held `[]=`/`store` refuse
+/// a key the Hash does not already have, and `rehash`/`compare_by_identity`
+/// refuse outright.
 fn dispatch_hash(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    if with_host(|h| h.hash_iterating(recv)) {
+        let refused = match name {
+            "[]=" | "store" if args.len() == 2 => {
+                let k = with_host(|h| h.hash_key(recv, &args[0]));
+                with_host(|h| h.hash_at(recv, &k)).flatten().is_none()
+                    .then_some("can't add a new key into hash during iteration")
+            }
+            // `update` stores pair by pair, so a new key among them is refused.
+            "merge!" | "update" => args
+                .iter()
+                .filter_map(|a| with_host(|h| h.as_hash(a)))
+                .flat_map(|m| m.into_keys())
+                .any(|k| with_host(|h| h.hash_at(recv, &k)).flatten().is_none())
+                .then_some("can't add a new key into hash during iteration"),
+            "replace" if args.len() == 1 && !identical(recv, &args[0]) => {
+                Some("can't replace hash during iteration")
+            }
+            "rehash" => Some("rehash during iteration"),
+            "compare_by_identity" => Some("compare_by_identity during iteration"),
+            _ => None,
+        };
+        if let Some(msg) = refused {
+            frozen_guard(recv, name, HASH_MUTATORS)?;
+            return Err(raise_exc("RuntimeError", msg));
+        }
+    }
+    if block.is_none() || !HASH_BLOCK_ITERATORS.contains(&name) {
+        return dispatch_hash_body(recv, name, args, block);
+    }
+    with_host(|h| h.hash_iter_step(recv, 1));
+    let out = dispatch_hash_body(recv, name, args, block);
+    with_host(|h| h.hash_iter_step(recv, -1));
+    out
+}
+
+fn dispatch_hash_body(
     recv: &Value,
     name: &str,
     args: &[Value],
@@ -19879,6 +19939,25 @@ fn dispatch_hash(
             let mut m = map;
             m.clear();
             with_host(|h| h.set_hash(recv, m));
+            Ok(recv.clone())
+        }
+        // hash.c `rb_hash_replace`: the argument (through `to_hash`) lends its
+        // pairs, default value/proc and identity mode, in place.
+        "replace" if args.len() == 1 => {
+            if identical(recv, &args[0]) {
+                return Ok(recv.clone());
+            }
+            let mut other = args[0].clone();
+            if with_host(|h| h.as_hash(&other)).is_none() {
+                if !defines_own(&other, "to_hash") {
+                    return Err(conv_error(&other, "Hash"));
+                }
+                other = dispatch(&other, "to_hash", &[], None)?;
+                if with_host(|h| h.as_hash(&other)).is_none() {
+                    return Err(conv_error(&args[0], "Hash"));
+                }
+            }
+            with_host(|h| h.hash_replace(recv, &other));
             Ok(recv.clone())
         }
         "merge!" | "update" => {

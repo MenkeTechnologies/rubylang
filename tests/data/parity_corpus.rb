@@ -5492,3 +5492,20 @@ module A1; def self.extended(o) = puts("A1 #{o.class}"); def w = :a1; end
 module B1; def self.extended(o) = puts("B1"); def w = :b1; end
 o = Object.new; p o.extend(A1, B1).equal?(o), o.w, o.singleton_class.ancestors.take(3).drop(1)
 s = +"str"; s.extend(B1); p s.w
+#==#
+h = {a: 1}
+p((h.each { |k, v| h[:b] = 2 } rescue $!), h)
+h.each { |k, v| h[:a] = 5 }; p h
+h.each { |k, v| h.delete(:a) }; p h
+h = {a: 1, b: 2}
+p((h.map { h.store(:c, 3) } rescue $!), (h.select { h[:zz] = 1 } rescue $!), (h.each_key { h.rehash } rescue $!), (h.any? { h.compare_by_identity } rescue $!))
+h.each { break }; h[:after] = 1; p h
+p((h.each { raise "x" } rescue $!)); h[:after2] = 2; p h.size
+p h.sort { |a, b| h[:s] = 1; a <=> b }.size, h.key?(:s)
+g = {x: 1}; g.each { g.each { } ; g[:x] = 2 }; p g
+f = {}.freeze; p((f.each { f[:a] = 1 } rescue $!))
+p((h.each { h.merge!(q: 1) } rescue $!))
+h={a: 1}; p((h.each { h.replace({b: 1}) } rescue $!), (h.each { h.replace(h) }), (h.each { h.update(a: 3) }), h, (h.transform_values { h[:n] = 1 }), h)
+#==#
+h={a: 1}; h.replace({}.compare_by_identity); p h.compare_by_identity?; g={}.compare_by_identity; g.replace({b: 1}); p g.compare_by_identity?; d=Hash.new(5); d.replace(Hash.new { 7 }); p d[:x], d.default; e=Hash.new{1}; e.replace(Hash.new(3)); p e.default_proc, e[:q]; p (({}.replace(1)) rescue $!); o=Object.new; def o.to_hash = {z: 1}; p({}.replace(o))
+x = {a: 1}; p x.replace({b: 2}), x, x.replace(x), (({}.freeze.replace({})) rescue $!)

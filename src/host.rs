@@ -1470,6 +1470,9 @@ pub struct RubyHost {
     /// is available` as in MRI; an exception raised by rubylang itself answers
     /// nil instead, since not every raise site records those fields.
     initialized_exceptions: HashSet<u32>,
+    /// How many block iterations are running over each Hash, by object id —
+    /// MRI's `hash_iter_lev`. While it is non-zero the Hash refuses a NEW key.
+    hash_iter_lev: HashMap<u32, u32>,
     /// User objects whose class defines its own `hash`, mapped (by heap id) to
     /// the first object seen that is `eql?` to them — see
     /// `crate::builtins::canon_user_keys`. Hash/Set/`uniq` key such an object as
@@ -2294,6 +2297,7 @@ impl RubyHost {
             ancestry_cache: std::cell::RefCell::new(AncestryCache::default()),
             kwargs_hashes: HashSet::new(),
             initialized_exceptions: HashSet::new(),
+            hash_iter_lev: HashMap::new(),
             user_key_canon: HashMap::new(),
             user_key_reps: HashMap::new(),
             around_stack: Vec::new(),
@@ -2566,6 +2570,28 @@ impl RubyHost {
             default_proc: None,
             by_identity: false,
         })
+    }
+    /// `Hash#replace`'s copy (hash.c `hash_copy` + `COPY_DEFAULT`): `dst` takes
+    /// `src`'s pairs, default value, default proc and identity mode.
+    pub fn hash_replace(&mut self, dst: &Value, src: &Value) {
+        let Some(RObj::Hash {
+            map,
+            default,
+            default_proc,
+            by_identity,
+        }) = self.obj(src).cloned()
+        else {
+            return;
+        };
+        if let Some(RObj::Hash {
+            map: m,
+            default: d,
+            default_proc: p,
+            by_identity: b,
+        }) = self.obj_mut(dst)
+        {
+            (*m, *d, *p, *b) = (map, default, default_proc, by_identity);
+        }
     }
     /// Set the value returned for missing keys (`Hash#default=`), in place.
     pub fn set_hash_default(&mut self, v: &Value, default: Value) {
@@ -3725,6 +3751,22 @@ impl RubyHost {
     /// Whether `v` is one.
     pub fn is_initialized_exception(&self, v: &Value) -> bool {
         matches!(v, Value::Obj(id) if self.initialized_exceptions.contains(id))
+    }
+    /// Enter (`delta = 1`) or leave (`delta = -1`) a block iteration over the
+    /// Hash `v` — see `hash_iter_lev`.
+    pub fn hash_iter_step(&mut self, v: &Value, delta: i32) {
+        let Value::Obj(id) = v else {
+            return;
+        };
+        let lev = self.hash_iter_lev.entry(*id).or_insert(0);
+        *lev = lev.saturating_add_signed(delta);
+        if *lev == 0 {
+            self.hash_iter_lev.remove(id);
+        }
+    }
+    /// Whether a block iteration over the Hash `v` is running.
+    pub fn hash_iterating(&self, v: &Value) -> bool {
+        matches!(v, Value::Obj(id) if self.hash_iter_lev.contains_key(id))
     }
     /// Whether `v` is one, i.e. whether it may bind to keyword parameters.
     pub fn is_kwargs(&self, v: &Value) -> bool {
