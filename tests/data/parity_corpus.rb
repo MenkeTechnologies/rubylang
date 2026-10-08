@@ -5427,3 +5427,7 @@ p [1, 2, 3].find_index.each { _1 == 2 }, {a: 1, b: 2}.select.each { |k, v| v > 1
 p [1, 2, 3].take_while.each { _1 < 3 }, [1, 2, 3].detect.each { _1 > 1 }, %w[a b].each_with_index.map.each { |s, i| s * (i + 1) } rescue p $!
 o = Object.new; def o.each; yield 3; yield 1; end; o.extend(Enumerable); p o.map.each { _1 * 2 }, o.sort_by.each { _1 }
 e = [1, 2, 3].map; p e.each { _1 * 3 }, e.next, e.each { _1 }
+#==#
+o = Object.new; def o.each; yield 3; yield 1; end; o.extend(Enumerable)
+p o.select { _1 > 2 }, o.select.class, o.filter.class, o.select.each { _1 > 2 }, o.method(:select).owner, o.method(:map).arity, o.respond_to?(:select)
+v = Object.new; def v.<=>(o) = 0; v.extend(Comparable); p v.clamp(1, 2).equal?(v), v.method(:clamp).owner

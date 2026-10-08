@@ -4312,3 +4312,13 @@ NoMethodError
 [3, 6, 9]
 1
 [1, 2, 3]
+#==#
+[3]
+Enumerator
+Enumerator
+[3]
+Enumerable
+0
+true
+true
+Comparable

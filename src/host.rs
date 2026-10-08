@@ -4151,6 +4151,13 @@ impl RubyHost {
     /// The chain depends only on the receiver's dispatch class (and whether the
     /// lookup is unbound), so it is recomputed only when a class changes.
     fn builtin_chain_cached(&self, recv: &Value, unbound: bool) -> Arc<Vec<String>> {
+        // An object's own `extend`s sit ahead of its class in the chain, so an
+        // extended object cannot share its class's cached chain.
+        if let (false, Value::Obj(id)) = (unbound, recv) {
+            if self.object_extends.get(id).is_some_and(|e| !e.is_empty()) {
+                return Arc::new(self.builtin_chain(recv, unbound));
+            }
+        }
         let key = match self.classref_name(recv) {
             Some(cls) => (format!("c\u{1}{cls}"), unbound),
             None => (self.dispatch_class(recv), unbound),
@@ -4185,7 +4192,22 @@ impl RubyHost {
                 c.extend(self.expanded_ancestry(&cls));
                 c
             }
-            None => self.expanded_ancestry(&self.dispatch_class(recv)),
+            None => {
+                // An object's singleton ancestry: the modules it was extended
+                // with (most recent first), then its class chain. `o.extend(Enumerable)`
+                // makes `o.select` Enumerable's, not Kernel's `IO.select`.
+                let mut out = Vec::new();
+                if let Value::Obj(id) = recv {
+                    for m in self.object_extends.get(id).into_iter().flatten() {
+                        match crate::arity_table::ancestry(m) {
+                            Some(chain) => out.extend(chain.iter().map(|s| s.to_string())),
+                            None => out.push(m.clone()),
+                        }
+                    }
+                }
+                out.extend(self.expanded_ancestry(&self.dispatch_class(recv)));
+                dedup_keep_first(out)
+            }
         }
     }
     /// The ancestor chain to resolve a built-in method against: the runtime's own
