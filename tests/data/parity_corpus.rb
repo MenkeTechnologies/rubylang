@@ -5388,3 +5388,12 @@ p r.divmod(Rational(1, 2)), r.divmod(-2), r.divmod(0.5), r.div(-0.5), r.modulo(-
 p r.fdiv(2), r.fdiv(-0.5), r.fdiv(0), Rational(-1, 3).fdiv(0), Rational(0).fdiv(0), r.remainder(Float::INFINITY), (2**70).to_r.divmod(Rational(3, 7))
 p((r.divmod(0) rescue $!), (r.div(0.0) rescue $!), (r % 0.0 rescue $!), (r.remainder(0) rescue $!), (5 % Rational(0) rescue $!))
 p 5 % Rational(2, 3), -5.divmod(Rational(2, 3)), 5.remainder(Rational(2, 3)), (2**70).div(Rational(3, 2)), 5.3 % Rational(1, 2), 2.5.divmod(Rational(1, 3))
+#==#
+p((2**62).send(:+, 2**62), (-(2**62)).send(:-, 2**62), 3.send(:*, 2**63), 1.+(Rational(1, 4)), 2.*(Rational(1, 4)), 2.-(Rational(1, 4)), 1.0.+(1r), 3.send(:*, Complex(1, 2)))
+p((1.send(:+, "a") rescue $!), (1.send(:<, "a") rescue $!), 1.send(:<, 2**64), 2.5.send(:>=, 2), (1.0.send(:<, nil) rescue $!))
+#==#
+c = Complex(1, 1)
+p 2 / c, 2.0 / c, (2**70) / c, 1.send(:/, c), 2.quo(c), 2.0.quo(c), Rational(1, 3) / c, Rational(1, 3).quo(c), c / Rational(1, 3), c.fdiv(2)
+p Complex(3, 4) / Complex(1, 2), Complex(-2, 9) / Complex(-9, 2), Complex(1, 2) / Complex(3.0, 4), Complex(9, 8) / 4, Complex(20, 9) / 9.8, Complex(11, 22).fdiv(3), Complex(1, 2).quo(Complex(1, 2))
+p Complex(2**70, 1) / Complex(1, 2**65), Complex(-0.0, 2) / Complex(1, 0), Complex(1, 2) / 0.0, 4.quo(2), 4.quo(2.0), 7.quo(Rational(1, 2)), 2.5.quo(2), 1.0.quo(0)
+p((Complex(1, 2) / Complex(0, 0) rescue $!), (Complex(1, 2) / 0 rescue $!), (Complex(1, 1) / "x" rescue $!), (1.quo(0) rescue $!))

@@ -6913,6 +6913,11 @@ fn dispatch_number(
             return dispatch(&r, name, args, None);
         }
     }
+    // A real number divided by a Complex coerces to `Complex(self, 0)` (MRI
+    // `rb_num_coerce_bin` through `Complex#coerce`); the numeric hook does that.
+    if name == "/" && args.first().is_some_and(|a| with_host(|h| h.complex_parts(a)).is_some()) {
+        return with_host(|h| h.num_op(fusevm::NumOp::Div, recv, &args[0]));
+    }
     if let Some(b) = with_host(|h| h.as_promoted_bigint(recv)) {
         if let Some(r) = dispatch_bigint(&b, name, args)? {
             return Ok(r);
@@ -7511,17 +7516,19 @@ fn dispatch_number(
         }
         // `quo` is EXACT division, which is what separates it from `/`: on two
         // Integers it answers a Rational and never truncates, so `4.quo(2)` is
-        // `(2/1)` rather than `2`. A Float on either side makes it a Float.
-        "quo" => {
-            if let (Value::Int(a), Value::Int(b)) = (recv, &args[0]) {
-                if *b == 0 {
-                    return Err(raise_exc("ZeroDivisionError", "divided by 0"));
-                }
-                let r = num_rational::BigRational::new((*a).into(), (*b).into());
-                return Ok(with_host(|h| h.new_rational(r)));
+        // `(2/1)` rather than `2`. `Float#quo` is plain `/` (`flo_quo`);
+        // `Integer#quo` is Numeric's `rb_numeric_quo`: `fdiv` against a Float,
+        // otherwise the receiver as a Rational divided by the operand, so a
+        // Rational or Complex operand stays exact.
+        "quo" => match recv {
+            Value::Float(_) => dispatch(recv, "/", args, None),
+            _ if matches!(args[0], Value::Float(_)) => dispatch(recv, "fdiv", args, None),
+            _ => {
+                let r = with_host(|h| h.as_rational(recv).map(|r| h.new_rational(r)))
+                    .ok_or_else(|| no_method_error(recv, name))?;
+                dispatch(&r, "/", args, None)
             }
-            Ok(Value::Float(as_f(recv) / as_f(&args[0])))
-        }
+        },
         // A real number's `arg`/`angle`/`phase` is the argument of the complex
         // number it stands for: 0 when non-negative, π when negative. The test
         // is on the SIGN BIT, not on `< 0` — `-0.0.angle` is π, and `-0.0 < 0`
@@ -7750,31 +7757,22 @@ fn dispatch_number(
         "between?" => comparable_between(recv, args),
         // Arithmetic/comparison operators normally lower to native VM ops, so they
         // only reach here through an explicit send (`5.method(:+).call(3)`,
-        // `5.send(:+, 3)`). Compute them the same way the VM would: an Int/Int pair
-        // stays Integer, any Float operand promotes to Float.
-        "+" | "-" | "*" | "<" | ">" | "<=" | ">=" => match (recv, &args[0]) {
-            (Value::Int(x), Value::Int(y)) => Ok(match name {
-                "+" => Value::Int(x + y),
-                "-" => Value::Int(x - y),
-                "*" => Value::Int(x * y),
-                "<" => Value::Bool(x < y),
-                ">" => Value::Bool(x > y),
-                "<=" => Value::Bool(x <= y),
-                _ => Value::Bool(x >= y),
-            }),
-            _ => {
-                let (x, y) = (as_f(recv), as_f(&args[0]));
-                Ok(match name {
-                    "+" => Value::Float(x + y),
-                    "-" => Value::Float(x - y),
-                    "*" => Value::Float(x * y),
-                    "<" => Value::Bool(x < y),
-                    ">" => Value::Bool(x > y),
-                    "<=" => Value::Bool(x <= y),
-                    _ => Value::Bool(x >= y),
-                })
-            }
-        },
+        // `5.send(:+, 3)`). Compute them through the same numeric hook the VM
+        // uses, so a send agrees with the operator: Integer overflow promotes to
+        // a Bignum, a Rational or Complex operand stays exact, and a
+        // non-numeric operand raises the coercion error.
+        "+" | "-" | "*" | "<" | ">" | "<=" | ">=" => {
+            let op = match name {
+                "+" => fusevm::NumOp::Add,
+                "-" => fusevm::NumOp::Sub,
+                "*" => fusevm::NumOp::Mul,
+                "<" => fusevm::NumOp::Lt,
+                ">" => fusevm::NumOp::Gt,
+                "<=" => fusevm::NumOp::Le,
+                _ => fusevm::NumOp::Ge,
+            };
+            with_host(|h| h.num_op(op, recv, &args[0]))
+        }
         _ => Err(no_method_error(recv, name)),
     }
 }
@@ -13611,6 +13609,125 @@ fn arr_index(arr: &[Value], args: &[Value]) -> Result<Value, String> {
 
 /// `Complex` methods. Arithmetic arrives via the numeric hook; this handles the
 /// queries, conversions, and the operator methods (`reduce(:+)`).
+fn is_integer_value(v: &Value) -> bool {
+    matches!(v, Value::Int(_)) || with_host(|h| h.class_of(v)) == "Integer"
+}
+
+/// complex.c `f_add`: the arithmetic on a Complex's parts, with MRI's zero
+/// shortcuts (`0 + -0.0` is `-0.0`, which a plain sum would turn into `0.0`).
+fn cx_add(x: &Value, y: &Value) -> Result<Value, String> {
+    let y_zero = matches!(y, Value::Int(0));
+    if is_integer_value(x) {
+        if matches!(x, Value::Int(0)) {
+            return Ok(y.clone());
+        }
+        if y_zero {
+            return Ok(x.clone());
+        }
+    } else if y_zero && (matches!(x, Value::Float(_)) || with_host(|h| h.class_of(x)) == "Rational") {
+        return Ok(x.clone());
+    }
+    dispatch(x, "+", std::slice::from_ref(y), None)
+}
+
+/// complex.c `f_mul`, with its exact-zero and one shortcuts.
+fn cx_mul(x: &Value, y: &Value) -> Result<Value, String> {
+    if is_integer_value(x) {
+        if matches!(y, Value::Int(0)) || matches!(x, Value::Int(0)) && is_integer_value(y) {
+            return Ok(Value::Int(0));
+        }
+        if matches!(x, Value::Int(1)) {
+            return Ok(y.clone());
+        }
+    }
+    if matches!(y, Value::Int(1)) {
+        return Ok(x.clone());
+    }
+    dispatch(x, "*", std::slice::from_ref(y), None)
+}
+
+/// complex.c `f_sub`: subtracting an exact zero leaves `x` untouched.
+fn cx_sub(x: &Value, y: &Value) -> Result<Value, String> {
+    if matches!(y, Value::Int(0)) {
+        return Ok(x.clone());
+    }
+    dispatch(x, "-", std::slice::from_ref(y), None)
+}
+
+/// complex.c `f_quo`: an Integer or Rational part divides EXACTLY
+/// (`rb_numeric_quo`: `fdiv` against a Float, else as a Rational); a Float part
+/// is plain Float division.
+fn cx_quo(x: &Value, y: &Value) -> Result<Value, String> {
+    if matches!(x, Value::Float(_)) {
+        return dispatch(x, "/", std::slice::from_ref(y), None);
+    }
+    if matches!(y, Value::Float(_)) {
+        return dispatch(x, "fdiv", std::slice::from_ref(y), None);
+    }
+    match with_host(|h| h.as_rational(x).map(|r| h.new_rational(r))) {
+        Some(r) => dispatch(&r, "/", std::slice::from_ref(y), None),
+        None => dispatch(x, "quo", std::slice::from_ref(y), None),
+    }
+}
+
+/// `rb_rational_canonicalize`: a Rational with denominator 1 is its numerator.
+fn rational_canonicalize(v: Value) -> Value {
+    if with_host(|h| h.class_of(&v)) != "Rational" {
+        return v;
+    }
+    let r = with_host(|h| h.as_rational(&v)).unwrap();
+    if r.is_integer() {
+        with_host(|h| h.new_bigint(r.to_integer()))
+    } else {
+        v
+    }
+}
+
+/// Port of complex.c `f_divide` for `Complex#/`, `#quo` (`fdiv == false`, parts
+/// divided by `f_quo`) and `#fdiv` (parts divided by `fdiv`).
+fn complex_divide(re: &Value, im: &Value, other: &Value, fdiv: bool) -> Result<Value, String> {
+    let func = |x: &Value, y: &Value| {
+        if fdiv {
+            dispatch(x, "fdiv", std::slice::from_ref(y), None)
+        } else {
+            cx_quo(x, y)
+        }
+    };
+    let new = |x: Value, y: Value| Ok(with_host(|h| h.new_complex(x, y)));
+    if let Some((br, bi)) = with_host(|h| h.complex_parts(other)) {
+        let flo = [re, im, &br, &bi].iter().any(|v| matches!(v, Value::Float(_)));
+        let abs = |v: &Value| dispatch(v, "abs", &[], None);
+        let gt = dispatch(&abs(&br)?, ">", &[abs(&bi)?], None)?;
+        let (x, y) = if with_host(|h| h.truthy(&gt)) {
+            let r = func(&bi, &br)?;
+            let n = cx_mul(&br, &cx_add(&Value::Int(1), &cx_mul(&r, &r)?)?)?;
+            let x = func(&cx_add(re, &cx_mul(im, &r)?)?, &n)?;
+            let y = func(&cx_sub(im, &cx_mul(re, &r)?)?, &n)?;
+            (x, y)
+        } else {
+            let r = func(&br, &bi)?;
+            let n = cx_mul(&bi, &cx_add(&Value::Int(1), &cx_mul(&r, &r)?)?)?;
+            let x = func(&cx_add(&cx_mul(re, &r)?, im)?, &n)?;
+            let y = func(&cx_sub(&cx_mul(im, &r)?, re)?, &n)?;
+            (x, y)
+        };
+        return if flo {
+            new(x, y)
+        } else {
+            new(rational_canonicalize(x), rational_canonicalize(y))
+        };
+    }
+    let real = matches!(other, Value::Int(_) | Value::Float(_))
+        || with_host(|h| h.as_rational(other).is_some());
+    if real {
+        let x = rational_canonicalize(func(re, other)?);
+        let y = rational_canonicalize(func(im, other)?);
+        return new(x, y);
+    }
+    let named = with_host(|h| h.coerce_operand_name(other));
+    Err(raise_exc("TypeError", &format!("{named} can't be coerced into Complex")))
+}
+
 fn dispatch_complex(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     let (re, im) = with_host(|h| h.complex_parts(recv)).unwrap();
     match name {
@@ -13696,36 +13813,12 @@ fn dispatch_complex(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
         } else {
             recv.clone()
         }),
-        // `(a+bi) / (c+di) == ((ac+bd) + (bc-ad)i) / (c²+d²)`. Integer parts stay
-        // exact by dividing through Rational, as MRI does.
-        "/" | "quo" => {
-            let (cr, ci) = match with_host(|h| h.complex_parts(&args[0])) {
-                Some(p) => p,
-                // A real divisor scales both parts.
-                None => (args[0].clone(), Value::Int(0)),
-            };
-            let mul = |a: &Value, b: &Value| with_host(|h| h.num_op(fusevm::NumOp::Mul, a, b));
-            let add = |a: &Value, b: &Value| with_host(|h| h.num_op(fusevm::NumOp::Add, a, b));
-            let sub = |a: &Value, b: &Value| with_host(|h| h.num_op(fusevm::NumOp::Sub, a, b));
-            let denom = add(&mul(&cr, &cr)?, &mul(&ci, &ci)?)?;
-            if as_f(&denom) == 0.0 {
-                return Err(raise_exc("ZeroDivisionError", "divided by 0"));
-            }
-            let nr = add(&mul(&re, &cr)?, &mul(&im, &ci)?)?;
-            let ni = sub(&mul(&im, &cr)?, &mul(&re, &ci)?)?;
-            // Two exact integers divide like `Integer#quo`: an Integer when the
-            // division is exact, otherwise a reduced Rational (MRI keeps
-            // `(11/25)` exact). Anything with a Float in it divides as a Float.
-            let part = |n: &Value| match (int_arg(n), int_arg(&denom)) {
-                (Some(a), Some(b)) if b != 0 && a % b == 0 => Value::Int(a / b),
-                (Some(a), Some(b)) => with_host(|h| {
-                    h.new_rational(num_rational::BigRational::new(a.into(), b.into()))
-                }),
-                _ => Value::Float(as_f(n) / as_f(&denom)),
-            };
-            let (qr, qi) = (part(&nr), part(&ni));
-            Ok(with_host(|h| h.new_complex(qr, qi)))
-        }
+        // MRI `f_divide` (complex.c): `/`/`quo` divide each part with `f_quo`,
+        // `fdiv` with `fdiv`. A Complex divisor goes through Smith's
+        // algorithm, scaling by whichever of its parts is larger in magnitude;
+        // with no Float anywhere the parts canonicalize (a whole Rational
+        // becomes its Integer). A real divisor divides each part directly.
+        "/" | "quo" | "fdiv" => complex_divide(&re, &im, &args[0], name == "fdiv"),
         "+" | "-" | "*" => {
             let op = match name {
                 "+" => fusevm::NumOp::Add,
@@ -13821,6 +13914,11 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
         "/" | "quo" => match with_host(|h| h.as_rational(&args[0])) {
             Some(d) if !d.is_zero() => Ok(rat(r / d)),
             Some(_) => Err(raise_exc("ZeroDivisionError", "divided by 0")),
+            // `rb_num_coerce_bin`: a Complex divisor promotes self to Complex.
+            None if with_host(|h| h.complex_parts(&args[0])).is_some() => {
+                let c = with_host(|h| h.new_complex(recv.clone(), Value::Int(0)));
+                dispatch(&c, "/", args, None)
+            }
             None => Ok(Value::Float(rational_to_f64(&r) / as_f(&args[0]))),
         },
         "**" | "pow" => {

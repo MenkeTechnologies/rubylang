@@ -9150,6 +9150,16 @@ impl RubyHost {
                     let im = self.num_op(Add, &ii1, &ii2)?;
                     Some((re, im))
                 }
+                // Division is `Complex#/` (complex.c `f_divide`); a real
+                // dividend first coerces to `Complex(x, 0)` as `rb_num_coerce_bin`
+                // does through `Complex#coerce`.
+                Div if self.complex_parts(a).is_some() => {
+                    return crate::builtins::dispatch(a, "/", std::slice::from_ref(b), None);
+                }
+                Div if matches!(a, Value::Int(_) | Value::Float(_)) || self.as_rational(a).is_some() => {
+                    let lhs = self.new_complex(a.clone(), Value::Int(0));
+                    return crate::builtins::dispatch(&lhs, "/", std::slice::from_ref(b), None);
+                }
                 _ => None,
             };
             if let Some((re, im)) = result {

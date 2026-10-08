@@ -4145,3 +4145,47 @@ NaN
 787061080478274202282
 0.2999999999999998
 [7, 0.1666666666666668]
+#==#
+9223372036854775808
+-9223372036854775808
+27670116110564327424
+(5/4)
+(1/2)
+(7/4)
+2.0
+(3+6i)
+#<TypeError: String can't be coerced into Integer>
+#<ArgumentError: comparison of Integer with String failed>
+true
+true
+#<ArgumentError: comparison of Float with nil failed>
+#==#
+(1-1i)
+(1.0-1.0i)
+(590295810358705651712-590295810358705651712i)
+((1/2)-(1/2)*i)
+(1-1i)
+(1.0-1.0i)
+((1/6)-(1/6)*i)
+((1/6)-(1/6)*i)
+(3+3i)
+(0.5+0.5i)
+((11/5)-(2/5)*i)
+((36/85)-(77/85)*i)
+(0.44+0.08i)
+((9/4)+2i)
+(2.0408163265306123+0.9183673469387754i)
+(3.6666666666666665+7.333333333333333i)
+(1+0i)
+((1217485108864830406656/1361129467683753853853498429727072845825)-(43556142965880123323311949751266331066367/1361129467683753853853498429727072845825)*i)
+(0.0+2.0i)
+(Infinity+Infinity*i)
+(2/1)
+2.0
+(14/1)
+1.25
+Infinity
+#<ZeroDivisionError: divided by 0>
+#<ZeroDivisionError: divided by 0>
+#<TypeError: String can't be coerced into Complex>
+#<ZeroDivisionError: divided by 0>
