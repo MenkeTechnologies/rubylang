@@ -4391,3 +4391,6 @@ NoMethodError
 #<TypeError: no implicit conversion of Integer into String>
 #<ArgumentError: string contains null byte>
 #<ArgumentError: salt too short (need >=2 bytes)>
+#==#
+{"<": 1, "!": 1, "[]": 1, "a=": 1, "@a": 1, "$a": 1, "!=": 1, "<=>": 1, "**": 1, "-@": 1, "`": 1, "=~": 1, "[]=": 1, Ab: 1, "@@x": 1, "9a": 1, "": 1, a?: 1, b!: 1, "+": 1, "%": 1, "a b": 1, _x: 1, "$1": 1, "$-w": 1}
+{"<": 1, "!": 1, "[]": 1, "a=": 1, "@a": 1, "$a": 1, "!=": 1, "<=>": 1, "**": 1, "-@": 1, "`": 1, "=~": 1, "[]=": 1, Ab: 1, "@@x": 1, "9a": 1, "": 1, a?: 1, b!: 1, "+": 1, "%": 1, "a b": 1, _x: 1, "$1": 1, "$-w": 1}

@@ -8556,7 +8556,7 @@ impl RubyHost {
         match k {
             // Ruby 3.4+ prints a symbol key as `name: value`; every other key
             // type keeps the `key => value` form.
-            RKey::Sym(s) if plain_symbol_name(s) => format!("{s}: "),
+            RKey::Sym(s) if !symbol_key_needs_quote(s) => format!("{s}: "),
             // A symbol key that needs quoting keeps the `key:` shorthand but
             // quotes the name: `{"a b": 1}`, as MRI does.
             RKey::Sym(s) => format!("{}: ", inspect_string(s)),
@@ -9972,6 +9972,19 @@ pub fn plain_symbol_name(s: &str) -> bool {
         _ => return false,
     }
     cs.all(|c| c == '_' || c.is_alphanumeric())
+}
+
+/// hash.c `symbol_key_needs_quote`: whether a Symbol key is written quoted in
+/// `Hash#inspect` (`{"a b": 1}`). Beyond the names a bare `:` cannot carry, a
+/// sigiled or `!`-led name and any name ending in an operator character are
+/// quoted, since `{<: 1}` or `{a=: 1}` would not read back as a key.
+pub fn symbol_key_needs_quote(s: &str) -> bool {
+    if s.is_empty() || !plain_symbol_name(s) || s.starts_with(['@', '$', '!']) {
+        return true;
+    }
+    s.ends_with([
+        '+', '-', '*', '/', '`', '%', '^', '&', '|', ']', '<', '=', '>', '~', '@',
+    ])
 }
 
 pub fn inspect_string(s: &str) -> String {

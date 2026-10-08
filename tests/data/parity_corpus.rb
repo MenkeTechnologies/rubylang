@@ -5461,3 +5461,7 @@ p z.zork, z.other
 #==#
 p "secret".crypt("ab"), "".crypt("zz"), "longpassword123".crypt("Xy"), "x".crypt("abc"), "pw".crypt("./")
 p(("x".crypt("a") rescue $!), ("x".crypt("") rescue $!), ("x".crypt(1) rescue $!), ("a\0b".crypt("ab") rescue $!), ("x".crypt("a\0") rescue $!))
+#==#
+h = {:< => 1, :! => 1, :[] => 1, :a= => 1, :@a=>1, :$a=>1, :"!="=>1, :<=> => 1, :** => 1, :-@ => 1, :` => 1, :=~ => 1, :[]= => 1, :Ab => 1, :@@x => 1, :"9a" => 1, :"" => 1, :a? => 1, :b! => 1, :+ => 1, :% => 1, :"a b" => 1, :_x => 1, :$1 => 1, :"$-w" => 1}
+p h
+puts h.to_s
