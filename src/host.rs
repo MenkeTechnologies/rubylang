@@ -9099,7 +9099,8 @@ impl RubyHost {
                     Sub => Some(Value::Float(x - y)),
                     Mul => Some(Value::Float(x * y)),
                     Div => Some(Value::Float(x / y)),
-                    Mod => Some(Value::Float(x - y * (x / y).floor())),
+                    // A zero divisor falls through to the method send, which raises.
+                    Mod => crate::builtins::flodivmod(x, y).map(|(_, m)| Value::Float(m)),
                     Pow => Some(Value::Float(x.powf(y))),
                     Lt => Some(Value::Bool(x < y)),
                     Gt => Some(Value::Bool(x > y)),

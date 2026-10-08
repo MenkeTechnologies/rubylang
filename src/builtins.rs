@@ -7118,12 +7118,10 @@ fn dispatch_number(
             _ => {
                 let (x, y) = (as_f(recv), coerce_num(recv, &args[0])?);
                 // `Float#%` by zero RAISES; only `/` and `fdiv` answer Infinity.
-                // Computing it as `x - (x/y).floor()*y` had produced NaN, which
-                // is what IEEE gives and not what Ruby does.
-                if y == 0.0 {
-                    return Err(raise_exc("ZeroDivisionError", "divided by 0"));
+                match flodivmod(x, y) {
+                    Some((_, m)) => Ok(Value::Float(m)),
+                    None => Err(raise_exc("ZeroDivisionError", "divided by 0")),
                 }
-                Ok(Value::Float(x - (x / y).floor() * y))
             }
         },
         "step" => {
@@ -7545,11 +7543,10 @@ fn dispatch_number(
                 let (x, y) = (as_f(recv), as_f(&args[0]));
                 // Same as `%`: a zero divisor raises rather than answering the
                 // IEEE `[i64::MAX, NaN]` pair that flooring Infinity produces.
-                if y == 0.0 {
+                let Some((q, m)) = flodivmod(x, y) else {
                     return Err(raise_exc("ZeroDivisionError", "divided by 0"));
-                }
-                let q = (x / y).floor();
-                Ok(new_arr(vec![Value::Int(q as i64), Value::Float(x - q * y)]))
+                };
+                Ok(new_arr(vec![dbl2ival(q)?, Value::Float(m)]))
             }
         },
         // `Integer#chr` is a BYTE, so only 0..255 is in range. Casting through
@@ -8418,6 +8415,49 @@ fn floor_div(a: i128, b: i128) -> i128 {
     } else {
         q
     }
+}
+
+/// Port of MRI `flodivmod` (numeric.c): the floored quotient and modulo of two
+/// Floats, `None` for a zero divisor (`rb_num_zerodiv`). The modulo is C `fmod`
+/// corrected toward the divisor's sign, NOT `x - y*floor(x/y)`: that formula
+/// rounds twice and answers `10.0 % 3.3` as `0.10000000000000142` where MRI's
+/// single `fmod` rounding gives `0.10000000000000053`, and it turns
+/// `5.0 % Float::INFINITY` into NaN where MRI keeps the dividend.
+pub(crate) fn flodivmod(x: f64, y: f64) -> Option<(f64, f64)> {
+    if y.is_nan() {
+        return Some((y, y));
+    }
+    if y == 0.0 {
+        return None;
+    }
+    let mut m = if x == 0.0 || (y.is_infinite() && !x.is_infinite()) {
+        x
+    } else {
+        x % y
+    };
+    let mut d = if x.is_infinite() && !y.is_infinite() {
+        x
+    } else {
+        ((x - m) / y).round()
+    };
+    if y * m < 0.0 {
+        m += y;
+        d -= 1.0;
+    }
+    Some((d, m))
+}
+
+/// Port of MRI `dbl2ival`: a Float quotient as an Integer, raising
+/// FloatDomainError for the non-finite ones (`Float::INFINITY.divmod(2.0)`).
+fn dbl2ival(d: f64) -> Result<Value, String> {
+    if d.is_nan() {
+        return Err(raise_exc("FloatDomainError", "NaN"));
+    }
+    if d.is_infinite() {
+        let s = if d > 0.0 { "Infinity" } else { "-Infinity" };
+        return Err(raise_exc("FloatDomainError", s));
+    }
+    Ok(float_to_int_value(d))
 }
 
 /// Ruby integer modulo takes the sign of the DIVISOR (`-7 % 3 == 2`), where
@@ -28428,7 +28468,10 @@ fn reduce_sym(acc: &Value, op: &str, x: &Value) -> Result<Value, String> {
             "-" => Value::Float(a - b),
             "*" => Value::Float(a * b),
             "/" => Value::Float(a / b),
-            "%" => Value::Float(a - (a / b).floor() * b),
+            "%" => match flodivmod(a, b) {
+                Some((_, m)) => Value::Float(m),
+                None => return Err(raise_exc("ZeroDivisionError", "divided by 0")),
+            },
             "**" => Value::Float(a.powf(b)),
             _ => return dispatch(acc, op, std::slice::from_ref(x), None),
         });

@@ -5377,3 +5377,8 @@ ac = Class.new { def hi = 1 }; p ac.new.hi, ac.instance_methods(false), ac.super
 class EndlessOps; def ==(o) = true; def <=(o) = 1; def !=(o) = 2; def ===(o) = 3; def >=(o) = 4; def ok! = 5; end
 e = EndlessOps.new; p e == 1, e <= 1, e != 1, e === 1, e >= 1, e.ok!
 p((begin; eval("def bad_setter=(v) = 1"); rescue SyntaxError; $!.class; end), (begin; eval("def []=(k, v) = 1"); rescue SyntaxError; $!.class; end))
+#==#
+x = 10.0; y = 3.3
+p x % y, x.divmod(y), -10.0 % 3.3, 10 % 3.3, 10.0.modulo(-3.3), [10.0, 3.3].inject(:%), 7.5.divmod(2), 2.divmod(0.7)
+p 5.0 % Float::INFINITY, -5.0 % Float::INFINITY, 5.0.divmod(Float::INFINITY), -0.0 % 5.0, 1e20.divmod(3.0)
+p((Float::INFINITY.divmod(2.0) rescue $!), (5.0.divmod(Float::NAN) rescue $!), (1e300.divmod(1e-300) rescue $!), ([1.0, 0.0].inject(:%) rescue $!))
