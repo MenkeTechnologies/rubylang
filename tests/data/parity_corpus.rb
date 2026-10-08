@@ -5420,3 +5420,10 @@ p r ** 2, r ** -2, r ** 0, r ** 0.0, r ** 0.5, r ** Rational(1, 2), r ** Rationa
 p Rational(0) ** -1.0, Rational(0) ** 2, Rational(0) ** 0.5, Rational(1) ** (2**70), Rational(-1) ** (2**70 + 1), Rational(-1) ** -3, Rational(-1) ** Rational(1, 2), Rational(-8, 27) ** Rational(1, 3), Rational(-8, 27) ** 0.5
 p Rational(1, 3) ** c, Rational(1) ** c, Rational(5) ** Complex(0, 0), Rational(2, 3) ** 1000 == Rational(2**1000, 3**1000), Rational(1, 10) ** -400 == 10**400, r ** 1e400
 p((Rational(0) ** -1 rescue $!), (Rational(0) ** Rational(-1, 2) rescue $!), (Rational(0) ** -2**70 rescue $!), (r ** (2**70) rescue $!), (Rational(0) ** c rescue $!), (r ** "x" rescue $!), (r.pow(2) rescue $!.class))
+#==#
+p [1, 2, 3].map.each { _1 * 2 }, [1, 2, 3].select.each { _1.odd? }, [1, 2, 3].reject.each { _1.odd? }, [3, 1, 2].sort_by.each { -_1 }, [1, 2, 3].flat_map.each { [_1, _1] }
+p [1, 2, 3].each_with_index.each { |x, i| }, [1, 2].each.each { }, {a: 1}.map.each { |k, v| [v, k] }, [1, 2, 3].group_by.each(&:odd?), [1, 2, 3].min_by.each { -_1 }, [1, 2, 3].partition.each(&:odd?)
+p [1, 2, 3].find_index.each { _1 == 2 }, {a: 1, b: 2}.select.each { |k, v| v > 1 }, {a: 1, b: 2}.min_by.each { |k, v| -v }, (1..4).map.each { _1 + 1 }, (1..4).select.each(&:even?), [4, 5].filter_map.each { _1 if _1 > 4 }
+p [1, 2, 3].take_while.each { _1 < 3 }, [1, 2, 3].detect.each { _1 > 1 }, %w[a b].each_with_index.map.each { |s, i| s * (i + 1) } rescue p $!
+o = Object.new; def o.each; yield 3; yield 1; end; o.extend(Enumerable); p o.map.each { _1 * 2 }, o.sort_by.each { _1 }
+e = [1, 2, 3].map; p e.each { _1 * 3 }, e.next, e.each { _1 }

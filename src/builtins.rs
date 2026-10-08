@@ -15162,6 +15162,32 @@ fn array_bang_iterate(
 /// Array methods that decide with the block and answer from the ELEMENTS (or,
 /// for `filter_map`, the block's truthy results), whose `with_index`
 /// re-attachment runs the same body with `index` set.
+/// Block-taking, argument-less methods whose block-less form is an Enumerator
+/// that `each { }` re-runs WITH the block (see `dispatch_enumerator`).
+const ENUM_REINVOKE_METHODS: &[&str] = &[
+    "map",
+    "collect",
+    "flat_map",
+    "collect_concat",
+    "select",
+    "filter",
+    "reject",
+    "filter_map",
+    "sort_by",
+    "min_by",
+    "max_by",
+    "minmax_by",
+    "group_by",
+    "partition",
+    "find",
+    "detect",
+    "find_index",
+    "take_while",
+    "drop_while",
+    "chunk_while",
+    "slice_when",
+];
+
 const ARRAY_YIELD_METHODS: &[&str] = &[
     "filter_map",
     "find",
@@ -15426,6 +15452,22 @@ fn dispatch_enumerator(
         // which the buffer cannot reconstruct (`each_cons` windows overlap). A
         // multi-yield iteration hands the block both values; `each_entry` exists
         // precisely to hand it the packed one, and answers the enumerator itself.
+        // An Enumerator is `obj.to_enum(meth)`, and its `each { }` is
+        // `obj.meth { }` (enumerator.c `enumerator_each`): `[1, 2].map.each { }`
+        // maps and `select.each { }` filters, rather than walking the elements
+        // and answering the receiver. Limited to the block-taking methods that
+        // take no arguments, which is all the recorded method name can carry.
+        "each"
+            if args.is_empty()
+                && block.is_some()
+                && with_host(|h| h.enum_method(recv))
+                    .is_some_and(|m| ENUM_REINVOKE_METHODS.contains(&m.as_str()))
+                && with_host(|h| h.enum_source(recv)).is_some() =>
+        {
+            let method = with_host(|h| h.enum_method(recv)).unwrap_or_default();
+            let source = with_host(|h| h.enum_source(recv)).unwrap();
+            dispatch(&source, &method, &[], block)
+        }
         "each" | "each_entry" if args.is_empty() && block.is_some() => {
             let b = block.unwrap();
             let spread = name == "each"
