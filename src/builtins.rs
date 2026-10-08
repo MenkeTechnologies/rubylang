@@ -9857,6 +9857,7 @@ fn dispatch_string_body(
             Some(c) => Ok(Value::Int(c as i64)),
             None => Err(raise_exc("ArgumentError", "empty string")),
         },
+        "crypt" => str_crypt(&s, args.first().unwrap_or(&Value::Undef)),
         "chr" => Ok(new_str(
             s.chars().next().map(|c| c.to_string()).unwrap_or_default(),
         )),
@@ -10977,6 +10978,51 @@ fn regex_replace(
         set_match_globals(None, re, re_val);
     }
     out.push_str(&s[last..]);
+    Ok(new_str(out))
+}
+
+// The system crypt(3), as MRI calls it: in libSystem on macOS, in libcrypt
+// (libxcrypt) elsewhere.
+#[cfg_attr(not(target_vendor = "apple"), link(name = "crypt"))]
+extern "C" {
+    fn crypt(key: *const std::os::raw::c_char, salt: *const std::os::raw::c_char)
+        -> *mut std::os::raw::c_char;
+}
+
+/// `String#crypt` — ported from string.c `rb_str_crypt`: the salt must hold two
+/// non-NUL bytes, the key must be a C string, and the hash is whatever the
+/// platform's crypt(3) answers (traditional DES for a two-character salt; the
+/// `$id$` schemes where libcrypt supports them). crypt(3) returns a static
+/// buffer, so calls are serialized as MRI does without `crypt_r`.
+fn str_crypt(key: &str, salt: &Value) -> Result<Value, String> {
+    static CRYPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let salt = implicit_str(salt)?;
+    let sb = salt.as_bytes();
+    if sb.len() < 2 || sb[0] == 0 || sb[1] == 0 {
+        return Err(raise_exc("ArgumentError", "salt too short (need >=2 bytes)"));
+    }
+    let key = std::ffi::CString::new(key)
+        .map_err(|_| raise_exc("ArgumentError", "string contains null byte"))?;
+    // `RSTRING_PTR(salt)` is read as a C string, so it ends at its first NUL.
+    let salt = std::ffi::CString::new(sb.split(|&b| b == 0).next().unwrap_or_default())
+        .expect("no interior NUL after split");
+    let _guard = CRYPT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: both pointers are valid NUL-terminated strings for the call, and
+    // the returned static buffer is copied out while the lock is held.
+    let res = unsafe { crypt(key.as_ptr(), salt.as_ptr()) };
+    if res.is_null() {
+        let err = std::io::Error::last_os_error();
+        let n = err.raw_os_error().unwrap_or(0);
+        let text = err.to_string();
+        let text = text.split(" (os error").next().unwrap_or(&text);
+        return Err(raise_exc_with(
+            errno_class(n).unwrap_or("SystemCallError"),
+            &format!("{text} - crypt"),
+            &[("errno", Value::Int(i64::from(n)))],
+        ));
+    }
+    // SAFETY: a non-null crypt(3) result is a NUL-terminated string.
+    let out = unsafe { std::ffi::CStr::from_ptr(res) }.to_string_lossy().into_owned();
     Ok(new_str(out))
 }
 

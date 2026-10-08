@@ -4380,3 +4380,14 @@ self
 NoMethodError
 :object_zork
 :mm
+#==#
+"abNANd1rDfiNc"
+"zz6dpSdr.LHZw"
+"Xy3GYGsL3apDg"
+"abiQ6Ep3EYTHc"
+"./Pkhn1tKbCbc"
+#<ArgumentError: salt too short (need >=2 bytes)>
+#<ArgumentError: salt too short (need >=2 bytes)>
+#<TypeError: no implicit conversion of Integer into String>
+#<ArgumentError: string contains null byte>
+#<ArgumentError: salt too short (need >=2 bytes)>

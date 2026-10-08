@@ -5458,3 +5458,6 @@ p h.x, h[:k], (h.y rescue $!.class)
 class Object; def zork = :object_zork; end
 z = "z"; def z.method_missing(n, *) = :mm
 p z.zork, z.other
+#==#
+p "secret".crypt("ab"), "".crypt("zz"), "longpassword123".crypt("Xy"), "x".crypt("abc"), "pw".crypt("./")
+p(("x".crypt("a") rescue $!), ("x".crypt("") rescue $!), ("x".crypt(1) rescue $!), ("a\0b".crypt("ab") rescue $!), ("x".crypt("a\0") rescue $!))
