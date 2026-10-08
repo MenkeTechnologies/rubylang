@@ -4369,3 +4369,14 @@ self
 0
 0
 0
+#==#
+[:mm, :zap, [1], nil]
+"ABC"
+[:mm, :zip, [], 2]
+"amm:bar:2"
+1
+:x_ok
+1
+NoMethodError
+:object_zork
+:mm

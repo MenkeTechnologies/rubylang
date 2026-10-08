@@ -3328,6 +3328,25 @@ fn dispatch_resolved(
             // OrderedOptions < Hash) can define `method_missing` for dynamic
             // methods (`prod?`, `foo=`); route there when native dispatch and the
             // subclass's own methods didn't resolve the name.
+            // A `method_missing` on the value's own singleton class
+            // (`def str.method_missing`) is the most specific one; it runs once
+            // the whole lookup — including user methods on Object — has failed.
+            let object_defines =
+                class != "Object" && with_host(|h| h.find_method_owner("Object", name)).is_some();
+            if !object_defines {
+                if let Some(def) = with_host(|h| h.find_singleton_method(recv, "method_missing")) {
+                    with_host(|h| h.take_pending_exc());
+                    let mut mm_args = vec![with_host(|h| h.new_symbol(name))];
+                    mm_args.extend_from_slice(args);
+                    return crate::host::call_singleton(
+                        recv.clone(),
+                        &def,
+                        "method_missing",
+                        &mm_args,
+                        fallback_block,
+                    );
+                }
+            }
             let ovr = with_host(|h| h.class_of(recv));
             if ovr != class && with_host(|h| h.find_method_owner(&ovr, "method_missing").is_some())
             {

@@ -5448,3 +5448,13 @@ class KF; puts "body"; self.puts "self"; end
 class KMM; def self.method_missing(n, *a) = [:mm, n, a]; end; p KMM.puts(1)
 p((5.public_send(:puts, "x") rescue $!), (String.public_send(:puts, "x") rescue $!), (self.public_send(:format, "%d", 1) rescue $!), Kernel.public_send(:format, "%d", 1), String.public_send(:new, "a"))
 p Random.rand(1), Random.public_send(:rand, 1), (Random.srand(1); Random.rand(1))
+#==#
+s = +"abc"; def s.method_missing(n, *a, &b) = [:mm, n, a, b&.call]
+p s.zap(1), s.upcase, s.zip { 2 }
+a = [1]; def a.method_missing(n, *args) = "amm:#{n}:#{args.size}"
+p a.bar(1, 2), a.size
+h = {k: 1}; def h.method_missing(n, *) = n == :x ? :x_ok : super
+p h.x, h[:k], (h.y rescue $!.class)
+class Object; def zork = :object_zork; end
+z = "z"; def z.method_missing(n, *) = :mm
+p z.zork, z.other
