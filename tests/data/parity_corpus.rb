@@ -5407,3 +5407,10 @@ class CR; def self.respond_to_missing?(n, ip) = "yes"; end; p CR.respond_to?(:zz
 class CR2 < CR; end; p CR2.respond_to?(:zz), CR.respond_to?(:new)
 module RMx; def respond_to_missing?(n, ip) = n == :mx; end; class CR3; extend RMx; end; p CR3.respond_to?(:mx), CR3.respond_to?(:my)
 class CR4; class << self; def respond_to_missing?(n, ip) = n == :c4; end; end; p CR4.respond_to?(:c4), CR4.respond_to?(:c5)
+#==#
+c = Complex(1, 1)
+p c ** 2, c ** 3, c ** 8, c ** -1, c ** -3, c ** 0, c ** 0.0, c ** 1, c ** Complex(2, 0), c ** Rational(4, 2), Complex(0, 1) ** 2
+p c ** 0.5, c ** Rational(1, 2), c ** c, Complex(1, 1) ** Complex(0, 1), Complex(-8) ** Rational(1, 3), Complex(1.5, 2) ** 2.5, Complex(0, 0) ** 0.5, Complex(0, 0) ** Complex(1, 1)
+p Complex(1, 2) ** 5, Complex(1, 2) ** -2, Complex(0, 3) ** 3, Complex(0, 3) ** 4, Complex(-2, 0) ** 3, Complex(2, -2) ** 3, Complex(1.5, 2) ** 3, Complex(Rational(1, 2), 1) ** 3, Complex(0.0, 2) ** 3, Complex(-0.0, -2) ** 2
+p 2 ** c, 2.0 ** c, 1 ** c, 0 ** c, 1.0 ** c, (-8) ** Complex(1, 0), Complex(1e300, 1e300) ** 2, Complex(3, 4) ** 2**3
+p((c ** "x" rescue $!), (c ** (2**64) rescue $!), (Complex(1, 2).pow(3) rescue $!.class))

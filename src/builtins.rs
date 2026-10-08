@@ -6955,6 +6955,13 @@ fn dispatch_number(
     if name == "/" && args.first().is_some_and(|a| with_host(|h| h.complex_parts(a)).is_some()) {
         return with_host(|h| h.num_op(fusevm::NumOp::Div, recv, &args[0]));
     }
+    if matches!(name, "**" | "pow")
+        && args.len() == 1
+        && with_host(|h| h.complex_parts(&args[0])).is_some()
+    {
+        let c = with_host(|h| h.new_complex(recv.clone(), Value::Int(0)));
+        return complex_pow(&c, &args[0]);
+    }
     if let Some(b) = with_host(|h| h.as_promoted_bigint(recv)) {
         if let Some(r) = dispatch_bigint(&b, name, args)? {
             return Ok(r);
@@ -13765,6 +13772,269 @@ fn complex_divide(re: &Value, im: &Value, other: &Value, fdiv: bool) -> Result<V
     Err(raise_exc("TypeError", &format!("{named} can't be coerced into Complex")))
 }
 
+/// complex.c `f_zero_p`: a numeric zero of any type (`-0.0` included).
+fn cx_zero_p(v: &Value) -> Result<bool, String> {
+    Ok(match v {
+        Value::Float(f) => *f == 0.0,
+        Value::Int(n) => *n == 0,
+        _ => match with_host(|h| h.class_of(v)).as_str() {
+            "Integer" => false,
+            "Rational" => with_host(|h| h.as_rational(v)).is_some_and(|r| r.numer() == &0.into()),
+            _ => {
+                let r = dispatch(v, "==", &[Value::Int(0)], None)?;
+                with_host(|h| h.truthy(&r))
+            }
+        },
+    })
+}
+
+/// complex.c `k_exact_zero_p`: a zero that is not a Float.
+fn cx_exact_zero_p(v: &Value) -> Result<bool, String> {
+    Ok(!matches!(v, Value::Float(_)) && cx_zero_p(v)?)
+}
+
+/// complex.c `f_negative_p`.
+fn cx_negative_p(v: &Value) -> Result<bool, String> {
+    Ok(match v {
+        Value::Int(n) => *n < 0,
+        Value::Float(f) => *f < 0.0,
+        _ => {
+            let r = dispatch(v, "<", &[Value::Int(0)], None)?;
+            with_host(|h| h.truthy(&r))
+        }
+    })
+}
+
+fn cx_negate(v: &Value) -> Result<Value, String> {
+    dispatch(v, "-@", &[], None)
+}
+
+/// complex.c `comp_mul` with its `safe_mul`: a finite Float factor against an
+/// exact zero is replaced by its sign, so `0 * Infinity` does not turn into NaN.
+fn cx_comp_mul(ar: &Value, ai: &Value, br: &Value, bi: &Value) -> Result<(Value, Value), String> {
+    let safe_mul = |a: &Value, b: &Value, az: bool, bz: bool| -> Result<Value, String> {
+        let sign = |v: &Value, own_zero: bool, other_zero: bool| match v {
+            Value::Float(f) if !own_zero && other_zero && !f.is_nan() => {
+                Value::Float(if f.is_sign_negative() { -1.0 } else { 1.0 })
+            }
+            _ => v.clone(),
+        };
+        cx_mul(&sign(a, az, bz), &sign(b, bz, az))
+    };
+    let (arz, aiz, brz, biz) = (cx_zero_p(ar)?, cx_zero_p(ai)?, cx_zero_p(br)?, cx_zero_p(bi)?);
+    let re = cx_sub(&safe_mul(ar, br, arz, brz)?, &safe_mul(ai, bi, aiz, biz)?)?;
+    let im = cx_add(&safe_mul(ar, bi, arz, biz)?, &safe_mul(ai, br, aiz, brz)?)?;
+    Ok((re, im))
+}
+
+/// complex.c `f_complex_polar_real`, for the Float angle every `**` produces.
+fn complex_polar(x: Value, y: Value) -> Result<Value, String> {
+    let new = |x: Value, y: Value| Ok(with_host(|h| h.new_complex(x, y)));
+    if cx_zero_p(&x)? || cx_zero_p(&y)? {
+        return new(x, Value::Float(0.0));
+    }
+    let Value::Float(arg) = y else {
+        // An exact angle: `x * Math.cos(y)`, `x * Math.sin(y)`.
+        let a = as_f(&y);
+        let re = cx_mul(&x, &Value::Float(a.cos()))?;
+        let im = cx_mul(&x, &Value::Float(a.sin()))?;
+        return new(re, im);
+    };
+    use std::f64::consts::{FRAC_PI_2, PI};
+    if arg == PI {
+        new(cx_negate(&x)?, Value::Float(0.0))
+    } else if arg == FRAC_PI_2 {
+        new(Value::Float(0.0), x)
+    } else if arg == FRAC_PI_2 + PI {
+        new(Value::Float(0.0), cx_negate(&x)?)
+    } else if let Value::Float(abs) = x {
+        new(Value::Float(abs * arg.cos()), Value::Float(abs * arg.sin()))
+    } else {
+        let im = cx_mul(&x, &Value::Float(arg.sin()))?;
+        let re = cx_mul(&x, &Value::Float(arg.cos()))?;
+        new(re, im)
+    }
+}
+
+/// complex.c `rb_complex_abs`: exact when one part is zero, `hypot` otherwise.
+fn complex_abs(re: &Value, im: &Value) -> Result<Value, String> {
+    if cx_zero_p(re)? {
+        let a = dispatch(im, "abs", &[], None)?;
+        return if matches!(re, Value::Float(_)) && !matches!(im, Value::Float(_)) {
+            dispatch(&a, "to_f", &[], None)
+        } else {
+            Ok(a)
+        };
+    }
+    if cx_zero_p(im)? {
+        let a = dispatch(re, "abs", &[], None)?;
+        return if !matches!(re, Value::Float(_)) && matches!(im, Value::Float(_)) {
+            dispatch(&a, "to_f", &[], None)
+        } else {
+            Ok(a)
+        };
+    }
+    Ok(Value::Float(as_f(re).hypot(as_f(im))))
+}
+
+/// `Math.atan2(im, re)` as complex.c `rb_complex_arg` computes it, with
+/// math.c's signed-zero handling.
+fn complex_arg(re: &Value, im: &Value) -> f64 {
+    let (dx, dy) = (as_f(re), as_f(im));
+    if dx == 0.0 && dy == 0.0 {
+        if !dx.is_sign_negative() {
+            return dy;
+        }
+        return if dy.is_sign_negative() { -std::f64::consts::PI } else { std::f64::consts::PI };
+    }
+    dy.atan2(dx)
+}
+
+/// complex.c `complex_pow_for_special_angle`: an Integer power of a Complex on
+/// one of the eight axis/diagonal directions stays exact. `None` = not special.
+fn complex_pow_special_angle(re: &Value, im: &Value, other: &Value) -> Result<Option<Value>, String> {
+    if !is_integer_value(other) {
+        return Ok(None);
+    }
+    let eqeq = |x: &Value, y: &Value| -> Result<bool, String> {
+        let r = dispatch(x, "==", std::slice::from_ref(y), None)?;
+        Ok(with_host(|h| h.truthy(&r)))
+    };
+    let (mut x, mut dir) = if cx_zero_p(im)? {
+        (re.clone(), 0i64)
+    } else if cx_zero_p(re)? {
+        (im.clone(), 2)
+    } else if eqeq(re, im)? {
+        (re.clone(), 1)
+    } else if eqeq(re, &cx_negate(im)?)? {
+        (im.clone(), 3)
+    } else {
+        return Ok(None);
+    };
+    if cx_negative_p(&x)? {
+        x = cx_negate(&x)?;
+        dir += 4;
+    }
+    let num = |op, a: &Value, b: &Value| with_host(|h| h.num_op(op, a, b));
+    use fusevm::NumOp::{Div, Mod, Mul};
+    let zx = if dir % 2 == 0 {
+        dispatch(&x, "**", std::slice::from_ref(other), None)?
+    } else {
+        let two_x_sq = dispatch(&num(Mul, &Value::Int(2), &x)?, "*", std::slice::from_ref(&x), None)?;
+        let half = num(Div, other, &Value::Int(2))?;
+        let z = dispatch(&two_x_sq, "**", &[half], None)?;
+        if as_i(&num(Mod, other, &Value::Int(2))?) == 1 {
+            dispatch(&z, "*", std::slice::from_ref(&x), None)?
+        } else {
+            z
+        }
+    };
+    const DIRS: [(i8, i8); 8] = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)];
+    let z_dir = as_i(&num(Mod, &num(Mul, &Value::Int(dir), other)?, &Value::Int(8))?) as usize;
+    let zero_for = |v: &Value| match v {
+        Value::Float(_) => Value::Float(0.0),
+        _ if with_host(|h| h.class_of(v)) == "Rational" => {
+            with_host(|h| h.new_rational(num_rational::BigRational::from_integer(0.into())))
+        }
+        _ => Value::Int(0),
+    };
+    let part = |d: i8| -> Result<Value, String> {
+        match d {
+            0 => Ok(zero_for(&zx)),
+            1 => Ok(zx.clone()),
+            _ => cx_negate(&zx),
+        }
+    };
+    let (zr, zi) = (part(DIRS[z_dir].0)?, part(DIRS[z_dir].1)?);
+    Ok(Some(with_host(|h| h.new_complex(zr, zi))))
+}
+
+/// Port of complex.c `rb_complex_pow`.
+fn complex_pow(recv: &Value, other: &Value) -> Result<Value, String> {
+    let (re, im) = with_host(|h| h.complex_parts(recv)).unwrap();
+    let new = |x: Value, y: Value| Ok(with_host(|h| h.new_complex(x, y)));
+    let class = with_host(|h| h.class_of(other));
+    let numeric = matches!(class.as_str(), "Integer" | "Float" | "Rational" | "Complex");
+    if numeric && cx_exact_zero_p(other)? {
+        return new(Value::Int(1), Value::Int(0));
+    }
+    let mut other = other.clone();
+    if class == "Rational" {
+        let r = with_host(|h| h.as_rational(&other)).unwrap();
+        if r.is_integer() {
+            other = with_host(|h| h.new_bigint(r.to_integer()));
+        }
+    }
+    if let Some((ore, oim)) = with_host(|h| h.complex_parts(&other)) {
+        if cx_exact_zero_p(&oim)? {
+            other = ore;
+        }
+    }
+    if matches!(other, Value::Int(1)) {
+        return new(re, im);
+    }
+    if let Some(v) = complex_pow_special_angle(&re, &im, &other)? {
+        return Ok(v);
+    }
+    if let Some((ore, oim)) = with_host(|h| h.complex_parts(&other)) {
+        let r = as_f(&complex_abs(&re, &im)?);
+        let theta = complex_arg(&re, &im);
+        let log_r = Value::Float(r.ln());
+        let theta_v = Value::Float(theta);
+        let nr = cx_sub(&cx_mul(&ore, &log_r)?, &cx_mul(&oim, &theta_v)?)?;
+        let nr = Value::Float(as_f(&nr).exp());
+        let ntheta = cx_add(&cx_mul(&theta_v, &ore)?, &cx_mul(&oim, &log_r)?)?;
+        return complex_polar(nr, ntheta);
+    }
+    if let Value::Int(n) = other {
+        if n == 0 {
+            return new(Value::Int(1), Value::Int(0));
+        }
+        let (mut xr, mut xi) = (re, im);
+        let mut n = n;
+        if n < 0 {
+            let recip = cx_quo(&Value::Int(1), recv)?;
+            (xr, xi) = with_host(|h| h.complex_parts(&recip)).unwrap();
+            n = -n;
+            other = Value::Int(n);
+        }
+        let (mut zr, mut zi) = (xr.clone(), xi.clone());
+        if cx_zero_p(&xi)? {
+            zr = dispatch(&zr, "**", std::slice::from_ref(&other), None)?;
+        } else if cx_zero_p(&xr)? {
+            zi = dispatch(&zi, "**", std::slice::from_ref(&other), None)?;
+            if n & 2 != 0 {
+                zi = cx_negate(&zi)?;
+            }
+            if n & 1 == 0 {
+                std::mem::swap(&mut zr, &mut zi);
+            }
+        } else {
+            n -= 1;
+            while n > 0 {
+                while n % 2 == 0 {
+                    let tmp = cx_sub(&cx_mul(&xr, &xr)?, &cx_mul(&xi, &xi)?)?;
+                    xi = cx_mul(&cx_mul(&Value::Int(2), &xr)?, &xi)?;
+                    xr = tmp;
+                    n /= 2;
+                }
+                (zr, zi) = cx_comp_mul(&zr, &zi, &xr, &xi)?;
+                n -= 1;
+            }
+        }
+        return new(zr, zi);
+    }
+    if numeric {
+        let r = complex_abs(&re, &im)?;
+        let theta = Value::Float(complex_arg(&re, &im));
+        let nr = dispatch(&r, "**", std::slice::from_ref(&other), None)?;
+        let ntheta = cx_mul(&theta, &other)?;
+        return complex_polar(nr, ntheta);
+    }
+    let named = with_host(|h| h.coerce_operand_name(&other));
+    Err(raise_exc("TypeError", &format!("{named} can't be coerced into Complex")))
+}
+
 fn dispatch_complex(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     let (re, im) = with_host(|h| h.complex_parts(recv)).unwrap();
     match name {
@@ -13864,22 +14134,7 @@ fn dispatch_complex(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
             };
             with_host(|h| h.num_op(op, recv, &args[0]))
         }
-        "**" | "pow" => {
-            // Non-negative integer exponent by repeated multiplication.
-            match int_arg(&args[0]) {
-                Some(e) if e >= 0 => {
-                    let mut acc = with_host(|h| h.new_complex(Value::Int(1), Value::Int(0)));
-                    for _ in 0..e {
-                        acc = with_host(|h| h.num_op(fusevm::NumOp::Mul, &acc, recv))?;
-                    }
-                    Ok(acc)
-                }
-                _ => Err(raise_exc(
-                    "NotImplementedError",
-                    "Complex ** non-integer is not supported",
-                )),
-            }
-        }
+        "**" => complex_pow(recv, &args[0]),
         _ => Err(no_method_error(recv, name)),
     }
 }
