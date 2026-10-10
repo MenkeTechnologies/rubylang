@@ -131,18 +131,45 @@ fn collect_heredoc_body(
 /// `<<~` squiggly heredoc: strip the least-indented line's leading whitespace
 /// from every line.
 fn strip_squiggly(body: &str) -> String {
+    // Indentation is measured in columns: a space is one, a tab advances to the
+    // next multiple of 8 (as MRI's `dedent_string` does).
+    let width_of = |l: &str| -> usize {
+        let mut col = 0;
+        for c in l.chars() {
+            match c {
+                ' ' => col += 1,
+                '\t' => col = (col / 8 + 1) * 8,
+                _ => break,
+            }
+        }
+        col
+    };
     let indent = body
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())
+        .map(width_of)
         .min()
         .unwrap_or(0);
     let mut out = String::new();
     for line in body.split_inclusive('\n') {
         let content = line.strip_suffix('\n').unwrap_or(line);
-        if content.len() >= indent {
-            out.push_str(&content[indent..]);
+        // Remove leading whitespace until `indent` columns are gone; a tab that
+        // would overshoot is kept whole.
+        let mut col = 0;
+        let mut cut = 0;
+        for c in content.chars() {
+            let next = match c {
+                ' ' => col + 1,
+                '\t' => (col / 8 + 1) * 8,
+                _ => break,
+            };
+            if next > indent {
+                break;
+            }
+            col = next;
+            cut += c.len_utf8();
         }
+        out.push_str(&content[cut..]);
         if line.ends_with('\n') {
             out.push('\n');
         }
@@ -174,15 +201,20 @@ fn next_line_leading_dot(b: &[u8], mut j: usize) -> bool {
 /// value is NOT on the stack (start of expression, after an operator/`(`/`,`),
 /// or whenever an unambiguous form (`<<~`/`<<-`/`<<"`/`<<'`) is used.
 fn heredoc_here(out: &[Token], after: &[u8], space_before: bool) -> bool {
-    // `<<~`/`<<-` are always heredocs — no left-shift form uses them.
-    if matches!(after.first(), Some(b'~') | Some(b'-')) {
-        return true;
-    }
-    // Quoted (`<<"X"`/`<<'X'`) or bare uppercase/`_` (`<<END`) delimiters are the
-    // only heredoc candidates. `<< x` with a space (or any other char) after is a
-    // left-shift, handled by the general operator path.
-    let quoted = matches!(after.first(), Some(b'"') | Some(b'\''));
-    let bare_ok = matches!(after.first(), Some(c) if c.is_ascii_uppercase() || *c == b'_');
+    // `<<~`/`<<-` open a heredoc only when a delimiter follows (an identifier or
+    // a quote); `5<<-1` is a left shift by -1. Whether a value precedes is
+    // decided by the position test below, which governs the unambiguous forms
+    // too (`x<<~b` is a shift when no space separates it from a value).
+    let squiggly = matches!(after.first(), Some(b'~') | Some(b'-'));
+    let after_flag = if squiggly { &after[1..] } else { after };
+    let quoted = matches!(after_flag.first(), Some(b'"') | Some(b'\'') | Some(b'`'));
+    let bare_ok = if squiggly {
+        matches!(after_flag.first(), Some(c) if c.is_ascii_alphabetic() || *c == b'_')
+    } else {
+        // Quoted (`<<"X"`/`<<'X'`) or bare uppercase/`_` (`<<END`) delimiters
+        // are the only heredoc candidates; `<< x` is a left shift.
+        matches!(after_flag.first(), Some(c) if c.is_ascii_uppercase() || *c == b'_')
+    };
     if !quoted && !bare_ok {
         return false;
     }

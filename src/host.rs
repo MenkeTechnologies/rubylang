@@ -1504,6 +1504,18 @@ pub struct RubyHost {
     /// method arguments it is called with (no block: `size` is nil).
     enum_size_fns: std::collections::HashMap<u32, (Option<Value>, Vec<Value>)>,
     struct_counter: u32,
+    /// `refine Target do … end` definitions: the refining module → its
+    /// `(target class, refinement class)` pairs. A refinement's methods live in
+    /// an anonymous class named `#<refinement:Target@Module>`.
+    refinement_defs: IndexMap<String, Vec<(String, String)>>,
+    /// The `(target, refinement class)` pairs `using` has activated, oldest
+    /// first. Activation is process-wide from the `using` call onward.
+    active_refinements: Vec<(String, String)>,
+    /// The modules `using` has activated, oldest first (`Module.used_modules`).
+    used_modules: Vec<String>,
+    /// A method name whose refined lookup is skipped once: a refined method's
+    /// `super` reaches the class's own definition through this.
+    skip_refined: Option<String>,
     /// Class variables (`@@x`): class name → variable name → value. Shared across
     /// the class hierarchy (looked up by walking the superclass chain).
     class_vars: IndexMap<String, IndexMap<String, Value>>,
@@ -2318,6 +2330,10 @@ impl RubyHost {
             builtin_libs_loaded: std::collections::HashSet::new(),
             enum_size_fns: std::collections::HashMap::new(),
             struct_counter: 0,
+            refinement_defs: IndexMap::new(),
+            active_refinements: Vec::new(),
+            used_modules: Vec::new(),
+            skip_refined: None,
             class_vars: IndexMap::new(),
             class_ivars: IndexMap::new(),
             class_object_ids: IndexMap::new(),
@@ -2388,6 +2404,9 @@ impl RubyHost {
                                 | RObj::FloatRange { .. }
                                 | RObj::StrRange { .. }
                                 | RObj::ObjRange { .. }
+                                | RObj::Rational(_)
+                                | RObj::Complex { .. }
+                                | RObj::BigInt(_)
                         )
                     )
                     || self.frozen.contains(id)
@@ -2596,18 +2615,55 @@ impl RubyHost {
             (*m, *d, *p, *b) = (map, default, default_proc, by_identity);
         }
     }
+    /// A new Hash holding `map` that inherits `src`'s identity mode, and, when
+    /// `defaults` is set, its default value and default proc too — the two
+    /// shapes MRI's copying methods take (`hash_dup` keeps both; the filters
+    /// keep only `compare_by_identity`).
+    pub fn new_hash_like(
+        &mut self,
+        src: &Value,
+        map: IndexMap<RKey, Value>,
+        defaults: bool,
+    ) -> Value {
+        let Some(RObj::Hash {
+            default,
+            default_proc,
+            by_identity,
+            ..
+        }) = self.obj(src).cloned()
+        else {
+            return self.new_hash(map);
+        };
+        self.alloc(RObj::Hash {
+            map,
+            default: if defaults { default } else { Value::Undef },
+            default_proc: if defaults { default_proc } else { None },
+            by_identity,
+        })
+    }
     /// Set the value returned for missing keys (`Hash#default=`), in place.
+    /// A default value replaces any default proc (and vice versa).
     pub fn set_hash_default(&mut self, v: &Value, default: Value) {
-        if let Some(RObj::Hash { default: d, .. }) = self.obj_mut(v) {
+        if let Some(RObj::Hash {
+            default: d,
+            default_proc: p,
+            ..
+        }) = self.obj_mut(v)
+        {
             *d = default;
+            *p = None;
         }
     }
     /// `Hash#default_proc=` — set (or clear, with nil) the miss block.
     pub fn set_hash_default_proc(&mut self, v: &Value, proc: Value) {
         if let Some(RObj::Hash {
-            default_proc: p, ..
+            default: d,
+            default_proc: p,
+            ..
         }) = self.obj_mut(v)
         {
+            // A default proc replaces the default value (and nil clears both).
+            *d = Value::Undef;
             *p = if matches!(proc, Value::Undef) {
                 None
             } else {
@@ -2674,7 +2730,7 @@ impl RubyHost {
         match self.obj(v) {
             // A Time keys by its instant (`Time#hash`/`#eql?`), not identity.
             Some(RObj::Time(_)) => true,
-            Some(RObj::Object { class, .. }) if !self.struct_defs.contains_key(class) => {
+            Some(RObj::Object { class, .. }) if !self.is_struct_class(class) => {
                 self.find_method_owner(class, "hash").is_some()
                     || self.find_define_method(class, "hash").is_some()
             }
@@ -4672,6 +4728,10 @@ impl RubyHost {
             _ => None,
         }
     }
+    /// A value usable as a block as it stands: a Proc of any kind or a Method.
+    pub fn is_block_callable(&self, v: &Value) -> bool {
+        self.is_proc(v) || matches!(self.obj(v), Some(RObj::Method { .. }))
+    }
     pub fn is_proc(&self, v: &Value) -> bool {
         matches!(
             self.obj(v),
@@ -4794,7 +4854,9 @@ impl RubyHost {
             // A `module M` reference is an instance of `Module`, a `class C` one
             // an instance of `Class` — `Class < Module`, so only the module side
             // needs distinguishing.
-            Some(RObj::ClassRef(n)) => if self.is_module_name(n) {
+            Some(RObj::ClassRef(n)) => if Self::is_refinement_class(n) {
+                "Refinement"
+            } else if self.is_module_name(n) {
                 "Module"
             } else {
                 "Class"
@@ -5425,15 +5487,21 @@ impl RubyHost {
     pub fn object_singleton_class_name(cls: &str, id: u32) -> String {
         format!("#<Class:#<{cls}:0x{:016x}>>", Self::heap_address(id))
     }
-    pub fn define_anon_class(&mut self, superclass: Option<String>, is_module: bool) -> String {
+    /// A fresh `#<Class:0x…>` name for a class that has no constant yet. MRI
+    /// shows an anonymous class by address; the counter keeps it unique,
+    /// offset clear of the heap-object addresses.
+    fn next_anon_name(&mut self, kind: &str) -> String {
         self.struct_counter += 1;
-        let kind = if is_module { "Module" } else { "Class" };
-        // MRI shows an anonymous class or module by address; the counter keeps
-        // it unique, offset clear of the heap-object addresses.
-        let name = format!(
+        format!(
             "#<{kind}:0x{:016x}>",
             0x2_0000_0000u64 + u64::from(self.struct_counter) * 0x28
-        );
+        )
+    }
+    fn next_anon_class_name(&mut self) -> String {
+        self.next_anon_name("Class")
+    }
+    pub fn define_anon_class(&mut self, superclass: Option<String>, is_module: bool) -> String {
+        let name = self.next_anon_name(if is_module { "Module" } else { "Class" });
         self.classes_mut().insert(
             name.clone(),
             ClassDef {
@@ -5447,11 +5515,116 @@ impl RubyHost {
     /// Register a `Struct.new(...)` definition under a fresh anonymous name and
     /// return that name (used as the class of its instances until renamed).
     pub fn define_struct(&mut self, members: Vec<String>, keyword_init: Option<bool>) -> String {
-        self.struct_counter += 1;
-        let name = format!("Struct:{}", self.struct_counter);
+        let name = self.next_anon_class_name();
         self.struct_defs
             .insert(name.clone(), (members, keyword_init));
         name
+    }
+    /// `refine target do … end` inside `module_name`: a refinement class for
+    /// `target` (reused when `target` is refined twice in one module). Returns
+    /// its name.
+    pub fn define_refinement(&mut self, module_name: &str, target: &str) -> String {
+        if let Some((_, existing)) = self
+            .refinement_defs
+            .get(module_name)
+            .and_then(|v| v.iter().find(|(t, _)| t == target))
+        {
+            return existing.clone();
+        }
+        let name = format!("#<refinement:{target}@{module_name}>");
+        self.classes_mut().insert(
+            name.clone(),
+            ClassDef {
+                superclass: None,
+                is_module: true,
+                ..ClassDef::default()
+            },
+        );
+        self.refinement_defs
+            .entry(module_name.to_string())
+            .or_default()
+            .push((target.to_string(), name.clone()));
+        name
+    }
+    /// The `(target, refinement class)` pairs a module defined.
+    pub fn refinements_of(&self, module_name: &str) -> Vec<(String, String)> {
+        self.refinement_defs
+            .get(module_name)
+            .cloned()
+            .unwrap_or_default()
+    }
+    /// Copy the Ruby-defined instance methods of `src` into `dst` (a
+    /// refinement's `import_methods`). False when `src` defines none — a
+    /// built-in module, whose methods have no Ruby body to copy.
+    pub fn copy_methods_into(&mut self, src: &str, dst: &str) -> bool {
+        let Some(methods) = self.classes.get(src).map(|c| c.methods.clone()) else {
+            return false;
+        };
+        if methods.is_empty() {
+            return false;
+        }
+        if let Some(d) = self.classes_mut().get_mut(dst) {
+            d.methods.extend(methods);
+        }
+        true
+    }
+    /// The target class a refinement class refines.
+    pub fn refinement_target(&self, refinement: &str) -> Option<String> {
+        self.refinement_defs
+            .values()
+            .flatten()
+            .find(|(_, r)| r == refinement)
+            .map(|(t, _)| t.clone())
+    }
+    /// Whether `name` is a refinement class.
+    pub fn is_refinement_class(name: &str) -> bool {
+        name.starts_with("#<refinement:")
+    }
+    /// `using module_name`: activate each of its refinements (newest wins).
+    pub fn activate_refinements(&mut self, module_name: &str) {
+        for pair in self.refinements_of(module_name) {
+            self.active_refinements.retain(|p| *p != pair);
+            self.active_refinements.push(pair);
+        }
+        self.used_modules.retain(|m| m != module_name);
+        self.used_modules.push(module_name.to_string());
+    }
+    /// `Module.used_modules`, newest first.
+    pub fn used_modules(&self) -> Vec<String> {
+        self.used_modules.iter().rev().cloned().collect()
+    }
+    /// Whether any refinement is active (a cheap gate for the dispatch path).
+    pub fn refinements_active(&self) -> bool {
+        !self.active_refinements.is_empty()
+    }
+    /// Skip the refined lookup of `name` for the next call that asks.
+    pub fn skip_refined_once(&mut self, name: &str) {
+        self.skip_refined = Some(name.to_string());
+    }
+    /// The active refinement method `name` that applies to `recv`, with the
+    /// refinement class that owns it. The newest activation wins.
+    pub fn find_refined_method(&mut self, recv: &Value, name: &str) -> Option<(MethodDef, String)> {
+        if self.skip_refined.as_deref() == Some(name) {
+            self.skip_refined = None;
+            return None;
+        }
+        let class = match self.classref_name(recv) {
+            // A class receiver sees refinements of `Class`/`Module`/`Object`.
+            Some(_) => "Class".to_string(),
+            None => self
+                .object_class(recv)
+                .unwrap_or_else(|| self.class_of(recv)),
+        };
+        let ancestry = self.class_ancestry(&class);
+        for (target, refname) in self.active_refinements.iter().rev() {
+            if !ancestry.iter().any(|a| a == target) && !(class == "Class" && target == "Module") {
+                continue;
+            }
+            if let Some(def) = self.classes.get(refname).and_then(|c| c.methods.get(name)) {
+                return Some((def.clone(), refname.clone()));
+            }
+        }
+        None
     }
     /// The `(members, keyword_init)` of a struct class, if `name` names one.
     ///
@@ -5459,7 +5632,31 @@ impl RubyHost {
     /// definition passed `keyword_init:`, `None` when it did not — which is
     /// exactly what `Struct#keyword_init?` reports back.
     pub fn struct_def(&self, name: &str) -> Option<(Vec<String>, Option<bool>)> {
-        self.struct_defs.get(name).cloned()
+        let owner = self.struct_owner(name)?;
+        self.struct_defs.get(&owner).cloned()
+    }
+    /// The `Struct.new` / `Data.define` class that supplies `name`'s members:
+    /// `name` itself, or the nearest ancestor in the superclass chain (a
+    /// `class P < Point` or `Class.new(Point)` inherits the struct surface).
+    pub fn struct_owner(&self, name: &str) -> Option<String> {
+        if self.struct_defs.is_empty() {
+            return None;
+        }
+        let mut cur = name.to_string();
+        for _ in 0..64 {
+            if self.struct_defs.contains_key(&cur) {
+                return Some(cur);
+            }
+            cur = self.superclass_of(&cur)?;
+        }
+        None
+    }
+    /// Whether `name` is, or inherits from, a `Struct.new` / `Data.define` class.
+    pub fn struct_defs_contain(&self, name: &str) -> bool {
+        self.struct_defs.contains_key(name)
+    }
+    pub fn is_struct_class(&self, name: &str) -> bool {
+        self.struct_owner(name).is_some()
     }
     /// `Data.define(:x, :y)` — an immutable value class. Reuses the struct member
     /// store (so accessors / `to_h` / `==` / `members` / Enumerable come for
@@ -5467,8 +5664,7 @@ impl RubyHost {
     /// accepts positional *or* keyword args, `with` is available, and `inspect`
     /// uses the `#<data …>` form.
     pub fn define_data(&mut self, members: Vec<String>) -> String {
-        self.struct_counter += 1;
-        let name = format!("Struct:{}", self.struct_counter);
+        let name = self.next_anon_class_name();
         self.struct_defs.insert(name.clone(), (members, None));
         self.data_classes.insert(name.clone());
         name
@@ -5482,7 +5678,7 @@ impl RubyHost {
         } else {
             "struct"
         };
-        if class.starts_with("Struct:") {
+        if class.starts_with("#<") {
             format!("#<{kind}")
         } else {
             format!("#<{kind} {class}")
@@ -5490,7 +5686,8 @@ impl RubyHost {
     }
     /// Whether `name` is a `Data.define`d class (vs a plain `Struct`).
     pub fn is_data_class(&self, name: &str) -> bool {
-        self.data_classes.contains(name)
+        self.struct_owner(name)
+            .is_some_and(|o| self.data_classes.contains(&o))
     }
     /// Whether the bundled stdlib `name` has already been run on this host, so a
     /// repeat `require` returns false without re-running it.
@@ -6556,7 +6753,7 @@ impl RubyHost {
             // at all — it registers as a struct definition — so neither gate above
             // sees it, and `Trio.new(1, 2).is_a?(Struct)` was false while
             // `Trio.ancestors` already listed `Struct`.
-            || self.struct_defs.contains_key(&actual)
+            || self.is_struct_class(&actual)
         {
             return self.class_ancestry(&actual).iter().any(|a| a == class);
         }
@@ -6606,7 +6803,7 @@ impl RubyHost {
     /// answers `map`/`select`/…), while `Data` deliberately does not.
     fn ancestry_tail(&self, name: &str) -> Vec<String> {
         let mut out = Vec::new();
-        if self.struct_defs.contains_key(name) {
+        if self.is_struct_class(name) {
             out.push(
                 if self.is_data_class(name) {
                     "Data"
@@ -7248,6 +7445,17 @@ impl RubyHost {
             }
             if let Some(dm) = self.define_methods.get(n) {
                 take(Box::new(dm.keys()), &mut out);
+            }
+            // A `Struct.new` / `Data.define` class owns its member readers (and,
+            // for a Struct, the writers).
+            if let Some((members, _)) = self.struct_defs.get(n) {
+                let writers = !self.data_classes.contains(n);
+                for m in members {
+                    out.push(m.clone());
+                    if writers {
+                        out.push(format!("{m}="));
+                    }
+                }
             }
             // An object's singleton class owns the methods the object defined
             // itself; those an `extend` copied in belong to their module.
@@ -8297,7 +8505,7 @@ impl RubyHost {
             RObj::Array(_) => "[...]".to_string(),
             RObj::Hash { .. } => "{...}".to_string(),
             RObj::Set(_) => "Set[...]".to_string(),
-            RObj::Object { class, .. } if self.struct_defs.contains_key(class) => format!(
+            RObj::Object { class, .. } if self.is_struct_class(class) => format!(
                 "#<{} {class}:...>",
                 if self.is_data_class(class) {
                     "data"
@@ -8320,7 +8528,7 @@ impl RubyHost {
     /// natively rendered library objects (`Encoding`, `OpenStruct`).
     pub(crate) fn is_plain_object(&self, class: &str) -> bool {
         (class == "Object" || self.classes.contains_key(class))
-            && !self.struct_defs.contains_key(class)
+            && !self.is_struct_class(class)
             && !self.is_exception_class(class)
             && !matches!(class, "Encoding" | "OpenStruct")
     }
@@ -8736,6 +8944,12 @@ impl RubyHost {
                     out.push('>');
                     out
                 }
+                // A `keyword_init: true` struct class shows the option.
+                Some(RObj::ClassRef(n))
+                    if self.struct_def(&n).is_some_and(|(_, k)| k == Some(true)) =>
+                {
+                    format!("{n}(keyword_init: true)")
+                }
                 _ => self.uncycled_to_s(v),
             },
             _ => self.uncycled_to_s(v),
@@ -8914,7 +9128,9 @@ impl RubyHost {
                 Some(RObj::Regexp { .. }) => "Regexp",
                 Some(RObj::MatchData { .. }) => "MatchData",
                 Some(RObj::ClassRef(n)) => {
-                    if self.is_module_name(n) {
+                    if Self::is_refinement_class(n) {
+                        "Refinement"
+                    } else if self.is_module_name(n) {
                         "Module"
                     } else {
                         "Class"
@@ -9042,7 +9258,7 @@ impl RubyHost {
                 // A Struct/Data instance compares and hashes BY VALUE in Ruby —
                 // two `P.new(1, 2)` are the same hash key and report the same
                 // `hash` — so key it on its class plus its members.
-                Some(RObj::Object { class, ivars }) if self.struct_defs.contains_key(class) => {
+                Some(RObj::Object { class, ivars }) if self.is_struct_class(class) => {
                     let mut parts = vec![RKey::Class(class.clone())];
                     parts.extend(ivars.values().map(|m| self.to_key_seen(m, seen)));
                     RKey::Array(parts)
@@ -9666,6 +9882,10 @@ impl RubyHost {
             Value::Undef => "nil".to_string(),
             Value::Bool(true) => "true".to_string(),
             Value::Bool(false) => "false".to_string(),
+            // MRI's `coerce_failed` inspects special constants and Floats
+            // (`3.0 can't be coerced into Integer`) and names other objects by
+            // class.
+            Value::Float(f) => fmt_float(*f),
             _ => match self.obj(v) {
                 Some(RObj::Symbol(s)) => format!(":{s}"),
                 _ => self.class_of(v),
@@ -9779,7 +9999,7 @@ impl RubyHost {
                     class: sb,
                     ivars: ib,
                 }),
-            ) if self.struct_defs.contains_key(sa) => {
+            ) if self.is_struct_class(sa) => {
                 sa == sb
                     && ia.len() == ib.len()
                     && ia
@@ -9894,7 +10114,7 @@ impl RubyHost {
     fn is_container(&self, v: &Value) -> bool {
         match self.obj(v) {
             Some(RObj::Array(_) | RObj::Hash { .. } | RObj::Set(_)) => true,
-            Some(RObj::Object { class, .. }) => self.struct_defs.contains_key(class),
+            Some(RObj::Object { class, .. }) => self.is_struct_class(class),
             _ => false,
         }
     }
@@ -10427,6 +10647,9 @@ fn written_params(
         // $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ->(a, (b, c)) {}.parameters'
         // [[:req, :a], [:req]]
         // ```
+        if name == "__excess" {
+            continue;
+        }
         let written = (!name.starts_with("__destructure_")).then_some(name);
         out.push((kind, written));
     }
@@ -10435,8 +10658,12 @@ fn written_params(
         out.push((kind, Some(k.clone())));
     }
     if let Some(ks) = kwsplat {
-        let name = ks.trim_start_matches('*');
-        out.push(("keyrest", (!name.is_empty()).then(|| name.to_string())));
+        if ks == crate::parser::NO_KEYWORDS_PARAM {
+            out.push(("nokey", None));
+        } else {
+            let name = ks.trim_start_matches('*');
+            out.push(("keyrest", (!name.is_empty()).then(|| name.to_string())));
+        }
     }
     if let Some(bp) = blockparam {
         out.push(("block", Some(bp.trim_start_matches('&').to_string())));
@@ -11050,6 +11277,8 @@ pub struct ArityFacts<'a> {
     /// The keyword params with no default.
     kwreq: &'a [String],
     has_kwrest: bool,
+    /// `def m(**nil)`: passing any keyword is an ArgumentError.
+    no_kw: bool,
 }
 
 impl<'a> ArityFacts<'a> {
@@ -11060,7 +11289,11 @@ impl<'a> ArityFacts<'a> {
             has_rest: def.splat.is_some(),
             kwnames: &def.kwparams,
             kwreq: &def.kwreq,
-            has_kwrest: def.kwsplat.is_some(),
+            has_kwrest: def
+                .kwsplat
+                .as_deref()
+                .is_some_and(|k| k != crate::parser::NO_KEYWORDS_PARAM),
+            no_kw: def.kwsplat.as_deref() == Some(crate::parser::NO_KEYWORDS_PARAM),
         }
     }
     /// Takes the written `BlockArity` and whether the template has a `*rest`,
@@ -11073,7 +11306,11 @@ impl<'a> ArityFacts<'a> {
             has_rest,
             kwnames: &arity.kwnames,
             kwreq: &arity.kwreq,
-            has_kwrest: arity.kwsplat.is_some(),
+            has_kwrest: arity
+                .kwsplat
+                .as_deref()
+                .is_some_and(|k| k != crate::parser::NO_KEYWORDS_PARAM),
+            no_kw: arity.kwsplat.as_deref() == Some(crate::parser::NO_KEYWORDS_PARAM),
         }
     }
     /// MRI's `rb_iseq_min_max_arity`: the mandatory count, and the maximum
@@ -11115,6 +11352,17 @@ impl<'a> ArityFacts<'a> {
 /// Three checks, in MRI's order: positional count, then unknown keywords, then
 /// missing keywords.
 fn check_call_arity(def: &ArityFacts, args: &[Value]) -> Result<(), String> {
+    if def.no_kw {
+        let passed = args.last().is_some_and(|v| {
+            with_host(|h| h.is_kwargs(v) && h.as_hash(v).is_some_and(|m| !m.is_empty()))
+        });
+        if passed {
+            return Err(crate::builtins::raise_exc(
+                "ArgumentError",
+                "no keywords accepted",
+            ));
+        }
+    }
     let wants_kw = !def.kwnames.is_empty() || def.has_kwrest;
     // With keyword params, a trailing Hash argument is the keyword hash and does
     // not count as positional (`bind_params` splits it the same way).
@@ -11300,6 +11548,7 @@ fn run_method(
         _ => None,
     };
     check_arity(def, args)?;
+    let block = crate::builtins::coerce_block_arg(block)?;
     let frame_id = next_frame_id();
     let saved_active = with_host(|h| {
         let mut binding = h.bind_params(
@@ -11483,6 +11732,18 @@ pub fn call_super_blk(
     let (Some(method), Some(def_class)) = (method, def_class) else {
         return Err("super called outside of a method".to_string());
     };
+    // `super` from a refined method reaches the method the refinement
+    // overrides: the refined lookup is skipped once and the call re-dispatches
+    // on the receiver, which finds the class's own definition (or builtin).
+    if RubyHost::is_refinement_class(&def_class) {
+        let args = explicit_args.unwrap_or(cur_args);
+        let block = match block_override {
+            Some(b) => Some(b),
+            None => with_host(|h| h.cur_scope().block.clone()),
+        };
+        with_host(|h| h.skip_refined_once(&method));
+        return crate::builtins::dispatch(&self_obj, &method, &args, block);
+    }
     // If the running method is an alias of a user method, `super` resolves as the
     // original name (Ruby aliases preserve the super binding).
     let method = with_host(|h| h.alias_original(&def_class, &method)).unwrap_or(method);
@@ -11520,6 +11781,8 @@ pub fn call_super_blk(
             let is_exc = with_host(|h| h.is_exception_class(&recv_class));
             if is_exc {
                 crate::builtins::exception_initialize(&self_obj, &recv_class, &args)?;
+            } else if with_host(|h| h.is_struct_class(&recv_class)) {
+                crate::builtins::struct_default_init(&self_obj, &recv_class, &args)?;
             }
             return Ok(Value::Undef);
         }

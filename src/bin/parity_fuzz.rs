@@ -975,6 +975,227 @@ fn gen_objmodel(seed: u64) -> Vec<String> {
     })
 }
 
+/// Integer bit surface: `Integer#[]` (index, `(i, len)`, ranges, wide
+/// receivers), `digits` radix validation, shifts by negative/wide counts,
+/// bit operators against non-Integers, modular `pow`, `Integer()` of a
+/// non-finite Float.
+fn gen_intbits(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let n = r.range(-300, 300);
+    let (i, len) = (r.range(0, 12), r.range(0, 6));
+    let guard = |body: &str| format!("p(begin; {body}; rescue => e; [e.class, e.message]; end)");
+    one(match r.below(16) {
+        0 => format!("p {n}[{i}]"),
+        1 => format!("p {n}[{i}, {len}]"),
+        2 => format!("p {n}[{i}..{}]", i + len),
+        3 => format!("p {n}[{i}...{}]", i + len),
+        4 => format!("p {n}[{i}..]"),
+        5 => format!("p (2**70 + {n})[{}]", r.range(0, 80)),
+        6 => format!("p (-(2**70) + {n})[{}, 4]", r.range(0, 80)),
+        7 => guard(&format!(
+            "{}.digits({})",
+            n.abs(),
+            r.pick(&["-2", "0", "1", "2", "16", "\"a\"", "2.5"])
+        )),
+        8 => format!("p [{n} << {i}, {n} >> {i}, {n} << -{i}, {n} >> -{i}]"),
+        9 => format!("p [{n} >> 200, {n} << 0, 5 << {}]", r.range(-5, 5)),
+        10 => guard(&format!(
+            "{n} {} {}",
+            r.pick(&["&", "|", "^"]),
+            r.pick(&["3.0", "nil", "\"a\"", ":s", "2**70"])
+        )),
+        11 => guard(&format!(
+            "{n} {} {}",
+            r.pick(&["<<", ">>"]),
+            r.pick(&["1.5", "nil", "\"a\"", "2**70", "-(2**70)"])
+        )),
+        12 => guard(&format!(
+            "{}.pow({}, {})",
+            r.range(-9, 9),
+            r.range(-3, 40),
+            r.range(-9, 9)
+        )),
+        13 => guard(&format!(
+            "{n}.pow({}, 5)",
+            r.pick(&["0.5", "nil", "\"a\"", "2"])
+        )),
+        14 => guard(&format!(
+            "Integer({})",
+            r.pick(&[
+                "Float::NAN",
+                "Float::INFINITY",
+                "-Float::INFINITY",
+                "1e30",
+                "-1e20",
+                "12.9"
+            ])
+        )),
+        _ => guard(&format!("{n}.step({}, {})", r.range(-5, 5), r.range(-2, 2))),
+    })
+}
+
+/// Struct/Data construction through a user `initialize` (and `super` into the
+/// generated one), subclasses of struct classes, `values_at`, frozen writers.
+fn gen_structinit(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (a, b) = (r.range(0, 9), r.range(0, 9));
+    let guard = |body: &str| format!("p(begin; {body}; rescue => e; [e.class, e.message]; end)");
+    one(match r.below(16) {
+        0 => format!(
+            "class P < Struct.new(:a, :b)\n  def initialize(a, b = {b})\n    super\n  end\nend\np P.new({a}), P.new({a}, {b} + 1)"
+        ),
+        1 => format!(
+            "S = Struct.new(:a) do\n  def initialize(a = {a}) = super(a * 2)\nend\np S.new, S.new({b})"
+        ),
+        2 => format!(
+            "class Q < Struct.new(:x)\n  def initialize(*)\n    super\n    self.x ||= {a}\n  end\nend\np Q.new, Q.new({b})"
+        ),
+        3 => format!(
+            "D = Data.define(:v) do\n  def initialize(v: {a}) = super(v: v * 2)\nend\np D.new, D.new({b}), D.new(v: {b})"
+        ),
+        4 => format!(
+            "class A < Struct.new(:x); end\nclass B < A; def y = x * 2; end\np B.new({a}).y, B.new({a}) == B.new({a}), B.members"
+        ),
+        5 => format!("S = Struct.new(:a, :b)\np S.new({a}, {b}).values_at({})", r.pick(&["0", "-1", "0, 1", "0..1", "1..5", "-2..-1"])),
+        6 => guard(&format!("S = Struct.new(:a, :b)\nS.new({a}, {b}).values_at({})", r.pick(&["2", "-3", "5", "0, 9"]))),
+        7 => guard(&format!("S = Struct.new(:a)\ns = S.new({a}).freeze\ns.a = {b}")),
+        8 => guard(&format!("D = Data.define(:a, :b)\nD.new({a}, {b}).{}", r.pick(&["a = 1", "to_a", "each", "size", "to_h", "members", "deconstruct", "inspect"]))),
+        9 => guard(&format!("D = Data.define(:a, :b)\nD.new({})", r.pick(&["1", "1, 2, 3", "a: 1", "a: 1, b: 2, c: 3", "\"a\" => 1, \"b\" => 2", "b: 1, a: 2"]))),
+        10 => guard(&format!("D = Data.define(:a, :b)\nD.new({a}, {b}).with({})", r.pick(&["", "a: 9", "c: 1", "9", "b: 0, a: 7"]))),
+        11 => guard(&format!("Struct.new({}); :ok", r.pick(&[":a, :a", "1", "\"Foo\", :x", "\"foo\"", "", "keyword_init: true"]))),
+        12 => guard(&format!("Data.define({}); :ok", r.pick(&[":a, :a", "\"a\"", ":a=", ":a?", ""]))),
+        13 => guard(&format!("S = Struct.new(:a, :b)\nS.new({a}, {b}).deconstruct_keys({})", r.pick(&["nil", "[:a]", "[:a, :z]", "[:z, :a]", "1", "[:a, :b, :c]"]))),
+        14 => "S = Struct.new(:a, :b)\np S.instance_methods(false).sort, S.method_defined?(:a=), S.new(1, 2).instance_variables".to_string(),
+        _ => format!("D = Data.define(:a, :b)\np D.instance_methods(false).sort, D.method_defined?(:with), D.respond_to?(:new), D.new({a}, {b}).respond_to?(:a=)"),
+    })
+}
+
+/// Hash default / default proc / `compare_by_identity` interplay and which
+/// copying methods carry them over.
+fn gen_hashdefault(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (a, b) = (r.range(0, 9), r.range(0, 9));
+    let copy = r.pick(&[
+        "merge({z: 1})",
+        "select { true }",
+        "reject { false }",
+        "compact",
+        "slice(:a)",
+        "except(:b)",
+        "transform_values { _1 }",
+        "dup",
+        "to_h",
+        "invert",
+        "sort_by { 0 }.to_h",
+    ]);
+    let guard = |body: &str| format!("p(begin; {body}; rescue => e; [e.class, e.message]; end)");
+    one(match r.below(12) {
+        0 => format!("h = Hash.new({a}); h[:a] = {b}; r = h.{copy}; p [r.default, r.compare_by_identity?, r.size]"),
+        1 => format!("h = Hash.new {{ |hh, k| {a} }}; h[:a] = {b}; r = h.{copy}; p [r.default_proc.nil?, r[:q], r.size]"),
+        2 => format!("h = {{a: {a}, b: {b}}}.compare_by_identity; r = h.{copy}; p [r.compare_by_identity?, r.size]"),
+        3 => format!("h = Hash.new({a}); p [h.dig(:x), h.dig(:q)]"),
+        4 => format!("h = Hash.new {{ 1 }}; h.default = {a}; p [h.default_proc, h[:q], h.default]"),
+        5 => format!("h = Hash.new({a}); h.default_proc = proc {{ {b} }}; p [h.default, h[:q]]"),
+        6 => guard(&format!("h = {{}}; h.default_proc = {}; :ok", r.pick(&["5", "nil", "->(a) { 1 }", "->(a, b) { 1 }", "proc { |a| 1 }", "->(*a) { 1 }"]))),
+        7 => guard(&format!("{{a: 1}}.freeze.{}", r.pick(&["default = 1", "compare_by_identity", "default_proc = nil", "store(:b, 1)", "merge(b: 1).frozen?"]))),
+        8 => guard(&format!("{{a: {a}}}.dig(:a, {})", r.pick(&[":b", "0", "1"]))),
+        9 => format!("p [{{a: {a}}}, [1, 2]].map {{ |x| x.zip({{b: {b}}}).size }}"),
+        10 => format!("p [1, 2, 3].zip({}, {})", r.pick(&["{a: 1}", "1..", "(5..9)", "[7]", "Set[8, 9]"]), r.pick(&["[4]", "{}", "10..11"])),
+        _ => format!("h = Hash.new({a}); h2 = h.merge({{a: {b}}}); p [h2.default, h2[:zz], h2[:a]]"),
+    })
+}
+
+/// Refinements: `refine`/`using` activation, `super` into the refined method,
+/// `send`/`&:sym`/`method` honoring them, and the argument errors.
+fn gen_refinement(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let n = r.range(1, 9);
+    let target = r.pick(&["String", "Integer", "Array", "Symbol"]);
+    let recv = match *target {
+        "String" => "\"ab\"",
+        "Integer" => "7",
+        "Array" => "[1, 2]",
+        _ => ":ab",
+    };
+    let guard = |body: &str| format!("p(begin; {body}; rescue => e; [e.class, e.message]; end)");
+    let defn = format!(
+        "module Ext\n  refine {target} do\n    def fz = {n}\n    def size = super + 100\n  end\nend\n"
+    );
+    one(match r.below(10) {
+        0 => format!("{defn}p({recv}.fz) rescue p $!.class\nusing Ext\np {recv}.fz"),
+        1 => format!("{defn}using Ext\np {recv}.size"),
+        2 => format!("{defn}using Ext\np {recv}.send(:fz)"),
+        3 => format!("{defn}using Ext\np [{recv}].map(&:fz)"),
+        4 => format!("{defn}using Ext\np {recv}.method(:fz).call"),
+        5 => format!("{defn}p Ext.refinements.size, Ext.refinements[0].target, Ext.refinements[0].class"),
+        6 => guard("Module.new { refine(3) {} }"),
+        7 => guard("Module.new { refine(String) }"),
+        8 => guard("using Class"),
+        _ => format!(
+            "class Box\n  def v = {n}\nend\nmodule BoxExt\n  refine Box do\n    def v = super * 2\n    def w = v + 1\n  end\nend\nusing BoxExt\np Box.new.v, Box.new.w"
+        ),
+    })
+}
+
+/// Keyword-argument shapes: `**h` against literal keys in either order,
+/// `**nil`, required/unknown keyword errors, trailing-comma block params.
+fn gen_kwsplat(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (a, b) = (r.range(0, 9), r.range(0, 9));
+    let guard = |body: &str| format!("p(begin; {body}; rescue => e; [e.class, e.message]; end)");
+    one(match r.below(10) {
+        0 => format!("def m(*a, **k) = [a, k]\nh = {{k: {a}, z: {b}}}\np m(**h, k: {b}), m(k: {b}, **h)"),
+        1 => format!("def m(k: 0, **o) = [k, o]\nh = {{k: {a}, z: {b}}}\np m(**h, k: {b}), m(k: {b}, **h), m(z: 1, **h, w: 2)"),
+        2 => format!("def m(a, **nil) = a\np m({a}), m({{b: 1}})"),
+        3 => guard(&format!("def m(a, **nil) = a\nm({a}, b: {b})")),
+        4 => "def m(a, **nil) = a\np method(:m).parameters, method(:m).arity".to_string(),
+        5 => format!("p proc {{ |a, | a }}.call([{a}, {b}]), proc {{ |a,| }}.arity, [[{a}, {b}]].map {{ |x,| x }}"),
+        6 => format!("def m(a, k: {a}) = [a, k]\np m({b}), m({b}, k: 1), m({{k: 2}})"),
+        7 => guard(&format!("def m(a, k:) = [a, k]\nm({})", r.pick(&["1", "k: 1", "1, k: 2, j: 3", "{k: 1}", "1, {k: 2}"]))),
+        8 => guard("def bb(&b) = b\nbb(&5)"),
+        _ => format!("def m(*, **, &) = n(*, **, &)\ndef n(*a, **k) = [a, k]\np m({a}, {b}, z: 1)"),
+    })
+}
+
+/// Squiggly-heredoc dedent (spaces, tabs, blank lines, interpolation) and the
+/// `<<` shift-versus-heredoc decision.
+fn gen_heredoc(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let ind = r.pick(&["  ", "    ", "\t", "  \t", "      "]);
+    let ind2 = r.pick(&["", "  ", "\t", "    "]);
+    let n = r.range(0, 9);
+    one(match r.below(9) {
+        0 => format!("s = <<~EOS\n{ind}one\n{ind}{ind2}two\n{ind}three\nEOS\np s"),
+        1 => format!("s = <<~EOS\n{ind}one\n\n{ind}{ind2}two\nEOS\np s"),
+        2 => format!("s = <<~EOS\n{ind}a #{{{n}}}\n{ind2}{ind}b\nEOS\np s"),
+        3 => format!("s = <<~'EOS'\n{ind}raw #{{x}}\n{ind}\\n\nEOS\np s"),
+        4 => format!("s = <<~EOS\n{ind}x\n{ind2}\n{ind}y\nEOS\np s"),
+        5 => format!("x = {n}\np x<<2, [x]<<3, {n}<<-1, {n}>>1"),
+        6 => format!("a = [<<~A, <<~B]\n{ind}first\nA\n{ind}{ind2}second\nB\np a"),
+        7 => format!("s = <<-EOS\n{ind}keep\n{ind}EOS\np s"),
+        _ => format!("def m(s, t) = [s, t]\np m(<<~X, {n})\n{ind}xx\nX"),
+    })
+}
+
+/// Top-level `def` is a private method of Object: `self.m` works, other
+/// receivers and `public_send` get the private-method error.
+fn gen_toplevelpriv(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let n = r.range(0, 9);
+    let guard = |body: &str| format!("p(begin; {body}; rescue => e; [e.class, e.message]; end)");
+    let d = format!("def helper = {n}\nclass Foo\n  def t = helper\n  def u = self.helper\nend\n");
+    one(match r.below(8) {
+        0 => format!("{d}p self.helper, send(:helper), Foo.new.t, Foo.new.u"),
+        1 => guard(&format!("{d}Foo.new.helper")),
+        2 => guard(&format!("{d}Object.new.helper")),
+        3 => guard(&format!("{d}public_send(:helper)")),
+        4 => guard(&format!("{d}Foo.new.public_send(:helper)")),
+        5 => format!("{d}p respond_to?(:helper), respond_to?(:helper, true), Foo.new.respond_to?(:helper)"),
+        6 => format!("{d}p Foo.new.send(:helper), Foo.new.method(:helper).call"),
+        _ => format!("o = Object.new\nbegin\n  def o.sing = {n}\nend\np o.sing\nf = Object.new.freeze\nbegin; def f.x; end; rescue => e; p e.class; end"),
+    })
+}
+
 // Mode plumbing.
 // ---------------------------------------------------------------------------
 
@@ -1034,6 +1255,13 @@ enum Mode {
     Arrreshape,
     Numprec,
     Objmodel,
+    Intbits,
+    Structinit,
+    Hashdefault,
+    Refinement,
+    Kwsplat,
+    Heredoc,
+    Toplevelpriv,
     /// Round-robin over every mode in `ALL_MODES`. Not itself a member of
     /// `ALL_MODES` (that would recurse), so adding a mode never changes any
     /// other mode's own seed→case mapping — but it DOES reshuffle which mode
@@ -1097,6 +1325,13 @@ const ALL_MODES: &[Mode] = &[
     Mode::Arrreshape,
     Mode::Numprec,
     Mode::Objmodel,
+    Mode::Intbits,
+    Mode::Structinit,
+    Mode::Hashdefault,
+    Mode::Refinement,
+    Mode::Kwsplat,
+    Mode::Heredoc,
+    Mode::Toplevelpriv,
 ];
 
 fn gen_intmeth(seed: u64) -> Vec<String> {
@@ -2274,6 +2509,13 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Arrreshape => gen_arrreshape(seed),
         Mode::Numprec => gen_numprec(seed),
         Mode::Objmodel => gen_objmodel(seed),
+        Mode::Intbits => gen_intbits(seed),
+        Mode::Structinit => gen_structinit(seed),
+        Mode::Hashdefault => gen_hashdefault(seed),
+        Mode::Refinement => gen_refinement(seed),
+        Mode::Kwsplat => gen_kwsplat(seed),
+        Mode::Heredoc => gen_heredoc(seed),
+        Mode::Toplevelpriv => gen_toplevelpriv(seed),
         Mode::All => gen_case(seed, ALL_MODES[(seed as usize) % ALL_MODES.len()]),
     }
 }
@@ -2901,6 +3143,13 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Arrreshape => "arrreshape",
         Mode::Numprec => "numprec",
         Mode::Objmodel => "objmodel",
+        Mode::Intbits => "intbits",
+        Mode::Structinit => "structinit",
+        Mode::Hashdefault => "hashdefault",
+        Mode::Refinement => "refinement",
+        Mode::Kwsplat => "kwsplat",
+        Mode::Heredoc => "heredoc",
+        Mode::Toplevelpriv => "toplevelpriv",
         Mode::All => "all",
     }
 }

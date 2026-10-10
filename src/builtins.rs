@@ -1044,7 +1044,7 @@ fn b_setconst(vm: &mut VM, _: u8) -> Value {
     let name = name_of(&vm.pop());
     // `Point = Struct.new(...)` names the anonymous struct after the constant.
     let val = with_host(|h| match h.classref_name(&val) {
-        Some(cref) if cref.starts_with("Struct:") && h.struct_def(&cref).is_some() => {
+        Some(cref) if cref.starts_with("#<") && h.struct_defs_contain(&cref) => {
             h.rename_struct(&cref, &name);
             // Also move any methods defined by a `Struct.new(...) do ... end` body.
             h.rename_class(&cref, &name);
@@ -1077,6 +1077,18 @@ fn b_define_singleton(vm: &mut VM, _: u8) -> Value {
     let Some(def) = with_host(|h| h.method_def(&synth)) else {
         return abort(vm, format!("internal: missing method body '{synth}'"));
     };
+    // A frozen object's singleton class is frozen too: no method may be added.
+    if with_host(|h| h.classref_name(&recv).is_none() && h.is_frozen(&recv)) {
+        let (cls, insp) = with_host(|h| (h.class_of(&recv), h.inspect(&recv)));
+        return abort(
+            vm,
+            raise_exc_with(
+                "FrozenError",
+                &format!("can't modify frozen {cls}: {insp}"),
+                &[("receiver", recv.clone())],
+            ),
+        );
+    }
     with_host(|h| {
         if let Some(cls) = h.classref_name(&recv) {
             h.add_class_method(&cls, &name, def);
@@ -1360,7 +1372,11 @@ fn b_mkregex(vm: &mut VM, _: u8) -> Value {
     let flags = name_of(&vm.pop());
     let source = name_of(&vm.pop());
     match with_host(|h| h.new_regex(&source, &flags)) {
-        Ok(v) => v,
+        // A Regexp literal is frozen (`Regexp.new` is not).
+        Ok(v) => {
+            with_host(|h| h.freeze_value(&v));
+            v
+        }
         Err(e) => abort(vm, e),
     }
 }
@@ -1670,6 +1686,9 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
                     | "constants"
                     | "ancestors"
                     | "superclass"
+                    | "refine"
+                    | "using"
+                    | "import_methods"
             )
             || with_host(|h| h.class_responds_to(&cls, name))
         {
@@ -2288,6 +2307,9 @@ fn dispatch_resolved(
         UserMethod,
         /// Nothing user-defined claims it — fall through to the built-ins.
         Builtin,
+        /// A method an active `refine` block defines for the receiver's class,
+        /// with the refinement class that owns it.
+        Refined(Box<crate::host::MethodDef>, String),
     }
     let (owner, cls) = with_host(|h| {
         if let Some(def) = h.find_singleton_method(recv, name) {
@@ -2295,6 +2317,11 @@ fn dispatch_resolved(
         }
         if let Some(p) = h.find_singleton_define_method(recv, name) {
             return (Owner::SingletonProc(p), String::new());
+        }
+        if h.refinements_active() {
+            if let Some((def, refname)) = h.find_refined_method(recv, name) {
+                return (Owner::Refined(Box::new(def), refname), String::new());
+            }
         }
         // The value's FULL class (`class_of`: "String"/"Array"/…) when it is not
         // a user object, so a method added to a BUILT-IN class by reopening it
@@ -2322,6 +2349,9 @@ fn dispatch_resolved(
             return crate::host::call_singleton(recv.clone(), &def, name, args, block)
         }
         Owner::SingletonProc(p) => return crate::host::call_proc_self(&p, args, Some(recv)),
+        Owner::Refined(def, refname) => {
+            return crate::host::call_class_method(recv.clone(), &def, name, &refname, args, block)
+        }
         Owner::DefineMethod(p) => {
             return crate::host::call_proc_self_ctx(
                 &p,
@@ -2373,6 +2403,10 @@ fn dispatch_resolved(
                 // `tests/data/parity_fuzz_baseline.txt` instead.
                 if from_string {
                     h.inherit_string_encoding(&out, recv, ascii);
+                }
+                // `nil.to_s` / `true.to_s` / `false.to_s` are frozen strings.
+                if matches!(recv, Value::Undef | Value::Bool(_)) {
+                    h.freeze_value(&out);
                 }
                 out
             }));
@@ -2571,6 +2605,15 @@ fn dispatch_resolved(
                 Some(v) => with_host(|h| h.truthy(v)),
                 None => with_host(|h| h.is_frozen(recv)),
             };
+            // Immediates are permanently frozen: they cannot be thawed.
+            let immediate = matches!(
+                recv,
+                Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Undef
+            ) || with_host(|h| h.as_symbol(recv).is_some());
+            if immediate && freeze_opt.is_some() && !freeze {
+                let cls = with_host(|h| h.class_of(recv));
+                return Err(raise_exc("ArgumentError", &format!("can't unfreeze {cls}")));
+            }
             let copy = with_host(|h| h.dup_value(recv));
             // Unlike `dup`, `clone` keeps the singleton class: `def obj.m`
             // methods and `extend`ed modules come along.
@@ -2640,7 +2683,14 @@ fn dispatch_resolved(
             return Ok(val);
         }
         "instance_variables" => {
-            let names = with_host(|h| h.ivar_names(recv));
+            let mut names = with_host(|h| h.ivar_names(recv));
+            // A Struct/Data member is not an instance variable (the generated
+            // accessors keep members out of `instance_variables`).
+            if let Some((members, _)) =
+                with_host(|h| h.object_class(recv).and_then(|c| h.struct_def(&c)))
+            {
+                names.retain(|n| !members.iter().any(|m| n.trim_start_matches('@') == m));
+            }
             return Ok(with_host(|h| {
                 let syms: Vec<Value> = names.iter().map(|n| h.new_symbol(n)).collect();
                 h.new_array(syms)
@@ -2933,6 +2983,13 @@ fn dispatch_resolved(
             // first `pp` or `require "pp"`.
             if m == "pretty_inspect" && !with_host(|h| h.builtin_lib_loaded("pp")) {
                 return Ok(Value::Bool(false));
+            }
+            // A top-level `def` is a private method of every object: only the
+            // private-inclusive query reports it.
+            if args.get(1).is_some_and(|a| with_host(|h| h.truthy(a)))
+                && with_host(|h| h.has_method(&m))
+            {
+                return Ok(Value::Bool(true));
             }
             if let Some(cls) = with_host(|h| h.object_class(recv)) {
                 if with_host(|h| h.find_method_owner(&cls, &m)).is_some()
@@ -3515,7 +3572,14 @@ fn dispatch_bool(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
         "|" => Ok(Value::Bool(this || arg())),
         "^" => Ok(Value::Bool(this != arg())),
         "!" => Ok(Value::Bool(!this)),
-        "to_s" | "inspect" => Ok(new_str(with_host(|h| h.to_s(recv)))),
+        // `nil.to_s` / `true.to_s` / `false.to_s` are shared frozen strings.
+        "to_s" => Ok(with_host(|h| {
+            let s = h.to_s(recv);
+            let v = h.new_string(s);
+            h.freeze_value(&v);
+            v
+        })),
+        "inspect" => Ok(new_str(with_host(|h| h.to_s(recv)))),
         // `nil.to_a` is `[]`; `nil.to_h` is `{}` — the empty-conversion methods.
         "to_a" if matches!(recv, Value::Undef) => Ok(new_arr(vec![])),
         "to_h" if matches!(recv, Value::Undef) => Ok(with_host(|h| h.new_hash(IndexMap::new()))),
@@ -3550,6 +3614,23 @@ pub(crate) fn probe_dispatch(recv: &Value, name: &str, args: &[Value]) -> Option
             });
             None
         }
+    }
+}
+
+/// The block a call receives for `&value`: a Proc (or an object `to_proc`
+/// converts, as MRI does at the call) stands as given, nil means no block, and
+/// anything else is the TypeError MRI raises when the call is made.
+pub(crate) fn coerce_block_arg(block: Option<Value>) -> Result<Option<Value>, String> {
+    let Some(v) = &block else {
+        return Ok(None);
+    };
+    let callable = matches!(v, Value::Undef) || with_host(|h| h.is_block_callable(v));
+    if callable {
+        return Ok(block);
+    }
+    match probe_dispatch(v, "to_proc", &[]) {
+        Some(p) if with_host(|h| h.is_block_callable(&p)) => Ok(Some(p)),
+        _ => Err(conv_error(v, "Proc")),
     }
 }
 
@@ -3813,24 +3894,42 @@ fn dispatch_classref(
             obj
         }));
     }
-    // `Struct.new(:a, :b [, keyword_init: true])` defines a new struct class and
-    // returns a reference to it (usually assigned to a constant).
+    // `Struct.new([class_name,] :a, :b [, keyword_init: true])` defines a new
+    // struct class and returns a reference to it (usually assigned to a
+    // constant). A leading String names it under `Struct`.
     if cls == "Struct" && name == "new" {
-        let mut members = Vec::new();
-        // `None` until a `keyword_init:` is actually written: MRI's
-        // `keyword_init?` distinguishes "not specified" (nil) from an explicit
-        // `false`.
-        let mut keyword_init: Option<bool> = None;
-        for a in args {
-            if let Some(sym) = with_host(|h| h.as_symbol(a)) {
-                members.push(sym);
-            } else if let Some(kw) = with_host(|h| h.as_hash(a)) {
-                if let Some(v) = kw.get(&RKey::Sym("keyword_init".into())) {
-                    keyword_init = Some(with_host(|h| h.truthy(v)));
+        // A leading non-Symbol, non-keyword argument is the class name: a String
+        // (or nil for "no name"); anything else is a conversion TypeError.
+        let (class_name, rest) = match args.split_first() {
+            Some((first, rest)) => {
+                let is_option = with_host(|h| h.is_kwargs(first));
+                if with_host(|h| h.as_symbol(first).is_some()) || is_option {
+                    (None, args)
+                } else if matches!(first, Value::Undef) {
+                    (None, rest)
+                } else {
+                    match with_host(|h| h.as_str(first)) {
+                        Some(s) => (Some(s), rest),
+                        None => return Err(conv_error(first, "String")),
+                    }
                 }
             }
+            None => (None, args),
+        };
+        if let Some(n) = &class_name {
+            if !n.starts_with(|c: char| c.is_ascii_uppercase()) {
+                return Err(raise_exc(
+                    "NameError",
+                    &format!("identifier {n} needs to be constant"),
+                ));
+            }
         }
+        let (members, keyword_init) = struct_member_args(rest, false)?;
         let struct_name = with_host(|h| h.define_struct(members, keyword_init));
+        let struct_name = match class_name {
+            Some(n) => name_struct_class(&struct_name, &format!("Struct::{n}")),
+            None => struct_name,
+        };
         let cref = with_host(|h| h.class_ref(&struct_name));
         // `Struct.new(:a) do ... end` — the block body defines instance methods on
         // the new struct class (run as a `class_eval`).
@@ -3846,12 +3945,7 @@ fn dispatch_classref(
     }
     // `Data.define(:x, :y)` — an immutable value class. Reuses struct storage.
     if cls == "Data" && name == "define" {
-        let mut members = Vec::new();
-        for a in args {
-            if let Some(sym) = with_host(|h| h.as_symbol(a)) {
-                members.push(sym);
-            }
-        }
+        let (members, _) = struct_member_args(args, true)?;
         let data_name = with_host(|h| h.define_data(members));
         let cref = with_host(|h| h.class_ref(&data_name));
         // `Data.define(:x) do ... end` — the block defines instance methods.
@@ -3865,157 +3959,15 @@ fn dispatch_classref(
         }
         return Ok(cref);
     }
+    // `Data` itself is abstract: only the classes `define` makes are instantiable.
+    if cls == "Data" && matches!(name, "new" | "[]") {
+        return Err(no_method_error(&with_host(|h| h.class_ref("Data")), name));
+    }
     // Instantiating a struct class: bind positional args (or keyword args) to the
     // member instance variables.
     if let Some((members, keyword_init)) = with_host(|h| h.struct_def(cls)) {
-        // A `Data.define`d class accepts positional *or* keyword args and yields a
-        // frozen instance; a keyword-only hash is detected as the sole argument.
-        if with_host(|h| h.is_data_class(cls)) && (name == "new" || name == "[]") {
-            let obj = with_host(|h| h.new_object(cls));
-            // Only keywords written at the call site are keywords: a positional
-            // Hash is the first member's value (`D.new({x: 1})`).
-            let kwargs = args.last().filter(|a| with_host(|h| h.is_kwargs(a)));
-            if kwargs.is_some() && args.len() > 1 {
-                return Err(raise_exc(
-                    "ArgumentError",
-                    &format!(
-                        "wrong number of arguments (given {}, expected 0)",
-                        args.len()
-                    ),
-                ));
-            }
-            let kw = kwargs.and_then(|a| with_host(|h| h.as_hash(a)));
-            // `missing keyword: :x` / `missing keywords: :x, :y`.
-            let keyword_error = |kind: &str, names: &[String]| {
-                raise_exc(
-                    "ArgumentError",
-                    &format!(
-                        "{kind} keyword{}: :{}",
-                        if names.len() == 1 { "" } else { "s" },
-                        names.join(", :")
-                    ),
-                )
-            };
-            match kw {
-                // Keyword form: `D.new(x: 1, y: 2)`. Every member is mandatory
-                // and no extra key is accepted — a Data class is strict where a
-                // Struct is lenient. Missing members are reported first.
-                Some(k) => {
-                    let missing: Vec<String> = members
-                        .iter()
-                        .filter(|m| !k.contains_key(&RKey::Sym((*m).clone())))
-                        .cloned()
-                        .collect();
-                    let unknown: Vec<String> = k
-                        .keys()
-                        .filter_map(|key| match key {
-                            RKey::Sym(s) if !members.contains(s) => Some(s.clone()),
-                            _ => None,
-                        })
-                        .collect();
-                    if !missing.is_empty() {
-                        return Err(keyword_error("missing", &missing));
-                    }
-                    if !unknown.is_empty() {
-                        return Err(keyword_error("unknown", &unknown));
-                    }
-                    for m in &members {
-                        let v = k
-                            .get(&RKey::Sym(m.clone()))
-                            .cloned()
-                            .unwrap_or(Value::Undef);
-                        with_host(|h| h.set_ivar_of(&obj, m, v));
-                    }
-                }
-                // Positional form: `D.new(1, 2)` — exactly one value per member.
-                None => {
-                    if args.len() != members.len() {
-                        return Err(raise_exc(
-                            "ArgumentError",
-                            &if args.len() > members.len() {
-                                format!(
-                                    "wrong number of arguments (given {}, expected 0..{})",
-                                    args.len(),
-                                    members.len()
-                                )
-                            } else {
-                                format!(
-                                    "missing keyword{}: :{}",
-                                    if members.len() - args.len() == 1 {
-                                        ""
-                                    } else {
-                                        "s"
-                                    },
-                                    members[args.len()..].join(", :")
-                                )
-                            },
-                        ));
-                    }
-                    for (i, m) in members.iter().enumerate() {
-                        let v = args.get(i).cloned().unwrap_or(Value::Undef);
-                        with_host(|h| h.set_ivar_of(&obj, m, v));
-                    }
-                }
-            }
-            with_host(|h| h.freeze_value(&obj));
-            return Ok(obj);
-        }
         if name == "new" || name == "[]" {
-            let obj = with_host(|h| h.new_object(cls));
-            // `rb_struct_initialize_m`: `keyword_init: true` takes one Hash
-            // (positional or keywords) and nothing else; left unset, keywords
-            // written at the call site initialize by name; `false` never does.
-            let lone_hash = args.len() == 1 && with_host(|h| h.as_hash(&args[0])).is_some();
-            if keyword_init == Some(true) && !args.is_empty() && !lone_hash {
-                return Err(raise_exc(
-                    "ArgumentError",
-                    &format!(
-                        "wrong number of arguments (given {}, expected 0)",
-                        args.len()
-                    ),
-                ));
-            }
-            let by_keyword = lone_hash
-                && match keyword_init {
-                    Some(true) => true,
-                    Some(false) => false,
-                    None => with_host(|h| h.is_kwargs(&args[0])),
-                };
-            if by_keyword {
-                let kw = with_host(|h| h.as_hash(&args[0])).unwrap_or_default();
-                for m in &members {
-                    with_host(|h| h.set_ivar_of(&obj, m, Value::Undef));
-                }
-                let mut unknown = Vec::new();
-                for (k, v) in &kw {
-                    let name = match k {
-                        RKey::Sym(s) | RKey::Str(s) => s.clone(),
-                        other => with_host(|h| h.key_inspect(other)),
-                    };
-                    if members.contains(&name) {
-                        with_host(|h| h.set_ivar_of(&obj, &name, v.clone()));
-                    } else {
-                        unknown.push(name);
-                    }
-                }
-                if !unknown.is_empty() {
-                    return Err(raise_exc(
-                        "ArgumentError",
-                        &format!("unknown keywords: {}", unknown.join(", ")),
-                    ));
-                }
-            } else {
-                // A Struct accepts FEWER values than it has members (the rest
-                // are nil) but never more; extra ones were silently dropped.
-                if args.len() > members.len() {
-                    return Err(raise_exc("ArgumentError", "struct size differs"));
-                }
-                for (i, m) in members.iter().enumerate() {
-                    let v = args.get(i).cloned().unwrap_or(Value::Undef);
-                    with_host(|h| h.set_ivar_of(&obj, m, v));
-                }
-            }
-            return Ok(obj);
+            return struct_new(cls, &members, keyword_init, args, block);
         }
         if name == "members" {
             let syms: Vec<Value> = members
@@ -4838,13 +4790,10 @@ fn dispatch_classref(
         }
         // A class or module never bound to a constant (`Class.new`,
         // `Module.new`, `Struct.new(:a)`, a singleton class) has no name.
-        "name"
-            if cls.starts_with("#<")
-                || cls
-                    .strip_prefix("Struct:")
-                    .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())) =>
-        {
-            Ok(Value::Undef)
+        "name" if cls.starts_with("#<") => Ok(Value::Undef),
+        // A keyword_init struct class shows the option: `S(keyword_init: true)`.
+        "inspect" if with_host(|h| h.struct_def(cls)).is_some_and(|(_, k)| k == Some(true)) => {
+            Ok(new_str(format!("{cls}(keyword_init: true)")))
         }
         "name" | "to_s" | "inspect" => Ok(new_str(cls.to_string())),
         // Runtime `Class#include`/`prepend`/`extend(Module, …)` — the same mixin
@@ -5028,7 +4977,7 @@ fn dispatch_classref(
         | "private_method_defined?"
         | "protected_method_defined?" => {
             let m = name_of(&args[0]);
-            if mixin_provides(cls, &m) {
+            if mixin_provides(cls, &m) || struct_provides(cls, &m) {
                 // Built-in mixin methods are public, so only the private query
                 // answers false for one.
                 return Ok(Value::Bool(name != "private_method_defined?"));
@@ -5086,6 +5035,69 @@ fn dispatch_classref(
         // on it register class-level members on `cls` (see the accessor check in
         // the `_` arm below). activesupport: `singleton_class.attr_accessor :x`.
         "singleton_class" => Ok(with_host(|h| h.class_ref(&format!("#<Class:{cls}>")))),
+        // `Module#refine(target) { … }`: the block's `def`s define the
+        // refinement's methods; `using` activates them.
+        "refine" if args.len() == 1 && with_host(|h| h.is_module_name(cls)) => {
+            let Some(target) = with_host(|h| h.classref_name(&args[0])) else {
+                let cname = with_host(|h| h.class_of(&args[0]));
+                return Err(raise_exc(
+                    "TypeError",
+                    &format!("wrong argument type {cname} (expected Class or Module)"),
+                ));
+            };
+            let Some(bl) = block else {
+                return Err(raise_exc("ArgumentError", "no block given"));
+            };
+            let refname = with_host(|h| h.define_refinement(cls, &target));
+            let rref = with_host(|h| h.class_ref(&refname));
+            crate::host::eval_block_scoped(
+                &bl,
+                &rref,
+                crate::host::DefTarget::Instance(refname),
+                std::slice::from_ref(&rref),
+            )?;
+            Ok(rref)
+        }
+        "refinements" if args.is_empty() => Ok(with_host(|h| {
+            let refs: Vec<Value> = h
+                .refinements_of(cls)
+                .iter()
+                .map(|(_, r)| h.class_ref(r))
+                .collect();
+            h.new_array(refs)
+        })),
+        "target" | "refined_class" if args.is_empty() && cls.starts_with("#<refinement:") => {
+            Ok(with_host(|h| {
+                let t = h.refinement_target(cls).unwrap_or_default();
+                h.class_ref(&t)
+            }))
+        }
+        // `Module#using(mod)` inside a module or class body.
+        "using" if args.len() == 1 && with_host(|h| h.classref_name(&args[0])).is_some() => {
+            activate_refinements(&args[0])?;
+            Ok(recv_ref(cls))
+        }
+        "used_modules" if cls == "Module" && args.is_empty() => Ok(with_host(|h| {
+            let mods: Vec<Value> = h.used_modules().iter().map(|m| h.class_ref(m)).collect();
+            h.new_array(mods)
+        })),
+        // `import_methods(*modules)` inside a refine block: copy the Ruby-defined
+        // methods of each module into the refinement.
+        "import_methods" if cls.starts_with("#<refinement:") => {
+            for m in args {
+                let Some(src) = with_host(|h| h.classref_name(m)) else {
+                    continue;
+                };
+                let copied = with_host(|h| h.copy_methods_into(&src, cls));
+                if !copied {
+                    return Err(raise_exc(
+                        "ArgumentError",
+                        &format!("Can't import method which is not defined with Ruby code: {src}"),
+                    ));
+                }
+            }
+            Ok(recv_ref(cls))
+        }
         // `Module#instance_method(:name)` — an UnboundMethod, modeled as a
         // receiver-less Method (`recv` = nil) that `bind`/`bind_call` re-target.
         "instance_method" | "public_instance_method" => {
@@ -5523,15 +5535,35 @@ fn struct_method(
             .map(|m| with_host(|h| h.ivar_of(recv, m)))
             .collect()
     };
-    // A member reader / writer (`p.x` / `p.x = v`).
+    let is_data = with_host(|h| h.is_data_class(cls));
+    // A member reader / writer (`p.x` / `p.x = v`). A Data member has no writer.
     if let Some(m) = name.strip_suffix('=') {
-        if members.iter().any(|mm| mm == m) {
+        if !is_data && members.iter().any(|mm| mm == m) {
+            frozen_guard(recv, name, &[name])?;
             with_host(|h| h.set_ivar_of(recv, m, args[0].clone()));
             return Ok(Some(args[0].clone()));
         }
     }
     if members.iter().any(|m| m == name) {
         return Ok(Some(with_host(|h| h.ivar_of(recv, name))));
+    }
+    // A Data instance answers only its own small surface; the Array-like
+    // methods below (`to_a`, `each`, `[]`, Enumerable, …) belong to Struct.
+    if is_data
+        && !matches!(
+            name,
+            "members"
+                | "to_h"
+                | "deconstruct_keys"
+                | "with"
+                | "deconstruct"
+                | "inspect"
+                | "to_s"
+                | "=="
+                | "eql?"
+        )
+    {
+        return Ok(None);
     }
     let r = match name {
         "to_a" | "values" | "deconstruct" => new_arr(values()),
@@ -5557,17 +5589,36 @@ fn struct_method(
         }
         "deconstruct_keys" => {
             let mut map = IndexMap::new();
-            match args.first().and_then(|a| with_host(|h| h.as_array(a))) {
+            let wanted = match args.first() {
+                None | Some(Value::Undef) => None,
+                Some(a) => match with_host(|h| h.as_array(a)) {
+                    Some(req) => Some(req),
+                    None => {
+                        let cname = with_host(|h| h.class_of(a));
+                        return Err(raise_exc(
+                            "TypeError",
+                            &format!("wrong argument type {cname} (expected Array or nil)"),
+                        ));
+                    }
+                },
+            };
+            match wanted {
                 // An Array of symbols selects those members, in the requested
-                // order; unknown keys are skipped. Matches MRI `deconstruct_keys`.
+                // order. MRI answers `{}` for more keys than members and stops
+                // at the first key that is not a member, keeping what it has.
                 Some(req) => {
+                    if req.len() > members.len() {
+                        return Ok(Some(with_host(|h| h.new_hash(map))));
+                    }
                     for k in req {
-                        if let Some(m) = with_host(|h| h.as_symbol(&k)) {
-                            if members.contains(&m) {
-                                let v = with_host(|h| h.ivar_of(recv, &m));
-                                map.insert(RKey::Sym(m), v);
-                            }
+                        let Some(m) = with_host(|h| h.as_symbol(&k)) else {
+                            break;
+                        };
+                        if !members.contains(&m) {
+                            break;
                         }
+                        let v = with_host(|h| h.ivar_of(recv, &m));
+                        map.insert(RKey::Sym(m), v);
                     }
                 }
                 // `nil` (or no argument) returns every member in declaration order.
@@ -5603,15 +5654,32 @@ fn struct_method(
         // counts from the end), in the requested order.
         "values_at" => {
             let vals = values();
+            let size = vals.len() as i64;
             let mut out = Vec::new();
             for a in args {
-                if let Value::Int(i) = a {
-                    let v = norm_idx(*i, vals.len())
-                        .and_then(|k| vals.get(k))
-                        .cloned()
-                        .unwrap_or(Value::Undef);
-                    out.push(v);
+                if let Some(rng) = with_host(|h| h.as_range(a)) {
+                    // A Range selects `beg...beg+len` and pads past the end with
+                    // nil (MRI `rb_get_values_at`).
+                    let (beg, len) = range_beg_len(a, rng, size)?;
+                    for j in beg..beg + len {
+                        out.push(vals.get(j as usize).cloned().unwrap_or(Value::Undef));
+                    }
+                    continue;
                 }
+                let i = to_int(a)?;
+                if i >= size {
+                    return Err(raise_exc(
+                        "IndexError",
+                        &format!("offset {i} too large for struct(size:{size})"),
+                    ));
+                }
+                if i < -size {
+                    return Err(raise_exc(
+                        "IndexError",
+                        &format!("offset {i} too small for struct(size:{size})"),
+                    ));
+                }
+                out.push(vals[norm_idx(i, vals.len()).unwrap_or(0)].clone());
             }
             new_arr(out)
         }
@@ -5672,6 +5740,19 @@ fn struct_method(
         // `Data#with(**changes)` — a copy of the receiver with the named members
         // replaced (unknown keys raise ArgumentError, as in MRI). Result frozen.
         "with" if with_host(|h| h.is_data_class(cls)) => {
+            let kwargs_only = args.len() == 1 && with_host(|h| h.is_kwargs(&args[0]));
+            if args.is_empty() {
+                return Ok(Some(recv.clone()));
+            }
+            if !kwargs_only {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!(
+                        "wrong number of arguments (given {}, expected 0)",
+                        args.len()
+                    ),
+                ));
+            }
             let obj = with_host(|h| h.new_object(cls));
             for m in members {
                 let cur = with_host(|h| h.ivar_of(recv, m));
@@ -6134,6 +6215,24 @@ fn dispatch_object(
             mm_args.extend_from_slice(args);
             call_instance_method(recv.clone(), cls, "method_missing", &mm_args, block)
         }
+        // A top-level `def` is a private method of Object. It runs for an
+        // explicit receiver only when that receiver is the caller's own self
+        // (`self.helper`); any other receiver is the private-call error.
+        _ if with_host(|h| h.has_method(name)) => {
+            let this = with_host(|h| h.current_self());
+            if matches!((recv, &this), (Value::Obj(a), Value::Obj(b)) if a == b) {
+                crate::host::call_method(name, args, block)
+            } else {
+                Err(raise_exc_with(
+                    "NoMethodError",
+                    &format!(
+                        "private method '{name}' called for {}",
+                        receiver_phrase(recv)
+                    ),
+                    &[("receiver", recv.clone())],
+                ))
+            }
+        }
         // One phrasing for every receiver, so `main` reads as `main` here too
         // rather than as `an instance of Object`.
         _ => Err(no_method_error(recv, name)),
@@ -6148,7 +6247,23 @@ fn comparable_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<
     let spaceship = |other: &Value| -> Result<Option<i64>, String> {
         match dispatch(recv, "<=>", std::slice::from_ref(other), None)? {
             Value::Undef => Ok(None),
-            v => Ok(Some(as_i(&v))),
+            // MRI `rb_cmpint`: an Integer's sign; anything else is asked
+            // `> 0` then `< 0`, so a String result raises its own comparison
+            // error and a fractional Float keeps its sign.
+            Value::Int(n) => Ok(Some(n.signum())),
+            v => {
+                if let Some(b) = with_host(|h| h.as_bigint(&v)) {
+                    use num_traits::Signed as _;
+                    return Ok(Some(if b.is_negative() { -1 } else { 1 }));
+                }
+                let zero = [Value::Int(0)];
+                let gt = dispatch(&v, ">", &zero, None)?;
+                if with_host(|h| h.truthy(&gt)) {
+                    return Ok(Some(1));
+                }
+                let lt = dispatch(&v, "<", &zero, None)?;
+                Ok(Some(if with_host(|h| h.truthy(&lt)) { -1 } else { 0 }))
+            }
         }
     };
     // Shares MRI's `rb_cmperr` rendering with the numeric ordering paths. It
@@ -7015,8 +7130,7 @@ fn dispatch_bigint(
         "succ" | "next" => big(b + 1),
         "pred" => big(b - 1),
         "digits" => {
-            let base = args.first().and_then(int_arg).unwrap_or(10).max(2);
-            let base = num_bigint::BigInt::from(base);
+            let base = num_bigint::BigInt::from(digits_radix(args)?);
             let mut n = b.abs();
             let mut out = Vec::new();
             if n.is_zero() {
@@ -7184,6 +7298,19 @@ fn dispatch_number(
         "**" | "pow" => {
             // Two-arg `Integer#pow(e, mod)` is modular exponentiation.
             if name == "pow" && args.len() >= 2 {
+                let is_int = |v: &Value| with_host(|h| h.as_bigint(v).is_some());
+                if !is_int(&args[0]) {
+                    return Err(raise_exc(
+                        "TypeError",
+                        "Integer#pow() 2nd argument not allowed unless a 1st argument is integer",
+                    ));
+                }
+                if !is_int(&args[1]) {
+                    return Err(raise_exc(
+                        "TypeError",
+                        "Integer#pow() 2nd argument not allowed unless all arguments are integers",
+                    ));
+                }
                 if let (Value::Int(base), Value::Int(exp), Value::Int(m)) =
                     (recv, &args[0], &args[1])
                 {
@@ -7407,6 +7534,11 @@ fn dispatch_number(
             }
             let to = kw_to.or_else(|| pos.first().cloned());
             let by_val = kw_by.or_else(|| pos.get(1).cloned());
+            if let Some(by) = &by_val {
+                if with_host(|h| h.eq_values(by, &Value::Int(0))) {
+                    return Err(raise_exc("ArgumentError", "step can't be 0"));
+                }
+            }
             // No limit: the sequence runs forever. A block loops on it; without
             // one the Enumerator stays unmaterialized so `first(n)` bounds it.
             let Some(to) = to else {
@@ -7667,7 +7799,7 @@ fn dispatch_number(
             // otherwise both become Float (matching Numeric#coerce).
             (Value::Int(a), Value::Int(b)) => Ok(new_arr(vec![Value::Int(*b), Value::Int(*a)])),
             _ => Ok(new_arr(vec![
-                Value::Float(as_f(&args[0])),
+                Value::Float(coerce_float_operand(&args[0])?),
                 Value::Float(as_f(recv)),
             ])),
         },
@@ -7678,6 +7810,12 @@ fn dispatch_number(
         }),
         // `abs2` is the square of the magnitude (self * self), preserving the
         // Integer/Float distinction like Ruby's `Numeric#abs2`.
+        // `Numeric#polar` is `[abs, arg]`.
+        "polar" => {
+            let abs = dispatch(recv, "abs", &[], None)?;
+            let arg = dispatch(recv, "arg", &[], None)?;
+            Ok(new_arr(vec![abs, arg]))
+        }
         "abs2" => Ok(match recv {
             Value::Int(n) => int_wide(*n as i128 * *n as i128),
             Value::Float(f) => Value::Float(f * f),
@@ -7729,11 +7867,19 @@ fn dispatch_number(
         // by one is the definition — `x + Float::EPSILON` is not, since EPSILON
         // is the gap at 1.0 only.
         "next_float" | "prev_float" => {
+            // Float-only: an Integer receiver has no such method.
+            if !matches!(recv, Value::Float(_)) {
+                return Err(no_method_error(recv, name));
+            }
             let x = as_f(recv);
             if x.is_nan() {
                 return Ok(Value::Float(x));
             }
             let up = name == "next_float";
+            // Stepping past the end of the finite range stays at the infinity.
+            if x.is_infinite() && (x > 0.0) == up {
+                return Ok(Value::Float(x));
+            }
             let bits = x.to_bits();
             // Away from zero raises the magnitude, toward zero lowers it; the
             // two signed zeroes both step off zero itself.
@@ -7899,31 +8045,14 @@ fn dispatch_number(
             };
             Ok(new_arr(vec![Value::Int(g), Value::Int(l)]))
         }
-        "[]" => {
-            // `Integer#[i]` reads bit i of the two's-complement representation;
-            // beyond the value's range positives read 0 and negatives read 1.
-            let n = as_i(recv);
-            let i = as_i(&args[0]);
-            let bit = if i < 0 {
-                0
-            } else if i >= 64 {
-                if n < 0 {
-                    1
-                } else {
-                    0
-                }
-            } else {
-                (n >> i) & 1
-            };
-            Ok(Value::Int(bit))
-        }
+        "[]" => int_bit_ref(recv, args),
         "digits" => {
             let mut n = as_i(recv);
             if n < 0 {
                 // Ruby raises for a negative receiver rather than using abs.
                 return Err(raise_exc("Math::DomainError", "out of domain"));
             }
-            let base = args.first().map(as_i).unwrap_or(10).max(2);
+            let base = digits_radix(args)?;
             let mut out = Vec::new();
             if n == 0 {
                 out.push(Value::Int(0));
@@ -7977,16 +8106,45 @@ fn dispatch_number(
             );
             match (a, b) {
                 (Some(a), Some(b)) => {
-                    use num_traits::ToPrimitive;
+                    use num_traits::{Signed as _, ToPrimitive as _, Zero as _};
                     let r = match name {
-                        "<<" => a << b.to_i64().unwrap_or(0).max(0) as usize,
-                        ">>" => a >> b.to_i64().unwrap_or(0).max(0) as usize,
+                        "<<" | ">>" => {
+                            // A negative count shifts the other way; a count too
+                            // wide for the machine saturates (to 0 / -1) on a
+                            // right shift and is a RangeError on a left shift.
+                            let left = (name == "<<") == !b.is_negative();
+                            let count = b.abs().to_usize();
+                            match (left, count) {
+                                (true, Some(c)) if c < (1 << 40) => a << c,
+                                (true, _) if a.is_zero() => a,
+                                (true, _) => {
+                                    return Err(raise_exc("RangeError", "shift width too big"))
+                                }
+                                (false, Some(c)) => a >> c,
+                                (false, None) if a.is_negative() => num_bigint::BigInt::from(-1),
+                                (false, None) => num_bigint::BigInt::zero(),
+                            }
+                        }
                         "&" => a & b,
                         "|" => a | b,
                         _ => a ^ b,
                     };
                     Ok(with_host(|h| h.new_bigint(r)))
                 }
+                // Shift counts go through `to_int` (a Float truncates); the
+                // logical operators coerce, so a non-Integer is a coercion error.
+                (Some(_), None) if name == "<<" || name == ">>" => {
+                    // `nil` is named by literal here, not by `to_int`'s wording.
+                    if matches!(args[0], Value::Undef) {
+                        return Err(raise_exc(
+                            "TypeError",
+                            "no implicit conversion of nil into Integer",
+                        ));
+                    }
+                    let count = Value::Int(to_int(&args[0])?);
+                    dispatch_number(recv, name, &[count], None)
+                }
+                (Some(_), None) => Err(coerce_bit_operand(recv, &args[0])),
                 _ => Err(raise_exc("TypeError", "no implicit conversion to Integer")),
             }
         }
@@ -9627,7 +9785,7 @@ fn dispatch_string_body(
         }
         "center" => {
             let width = to_int(&args[0])?.max(0) as usize;
-            let padstr = pad_str(args);
+            let padstr = pad_str(args)?;
             let len = s.chars().count();
             if len >= width || padstr.is_empty() {
                 Ok(new_str(s.clone()))
@@ -9899,6 +10057,20 @@ fn dispatch_string_body(
             append_in_place(recv, &s, &joined, decider.or(args.first()));
             Ok(recv.clone())
         }
+        // The ordering operators reached by name (`"a".send(:>, "b")`): Strings
+        // compare bytewise, anything else is Comparable's failure.
+        "<" | "<=" | ">" | ">=" if args.len() == 1 => match with_host(|h| h.as_str(&args[0])) {
+            Some(other) => {
+                let ord = s.as_str().cmp(other.as_str());
+                Ok(Value::Bool(match name {
+                    "<" => ord.is_lt(),
+                    "<=" => ord.is_le(),
+                    ">" => ord.is_gt(),
+                    _ => ord.is_ge(),
+                }))
+            }
+            None => Err(with_host(|h| h.cmp_failed(recv, &args[0]))),
+        },
         "<=>" => match with_host(|h| h.as_str(&args[0])) {
             Some(other) => Ok(Value::Int(match s.cmp(&other) {
                 std::cmp::Ordering::Less => -1,
@@ -9934,13 +10106,13 @@ fn dispatch_string_body(
         "ljust" => Ok(new_str(pad(
             &s,
             to_int(&args[0])?.max(0) as usize,
-            pad_str(args),
+            pad_str(args)?,
             true,
         ))),
         "rjust" => Ok(new_str(pad(
             &s,
             to_int(&args[0])?.max(0) as usize,
-            pad_str(args),
+            pad_str(args)?,
             false,
         ))),
         "each_char" => {
@@ -11470,18 +11642,38 @@ fn expand_backrefs(
 /// circuiting to `nil` the moment a step is `nil`.
 fn dig(recv: &Value, keys: &[Value]) -> Result<Value, String> {
     let mut cur = recv.clone();
-    for k in keys {
+    for (i, k) in keys.iter().enumerate() {
         if matches!(cur, Value::Undef) {
             return Ok(Value::Undef);
+        }
+        if i > 0 && with_host(|h| h.as_array(&cur).is_none() && h.as_hash(&cur).is_none()) {
+            // An intermediate value must itself be diggable: an Array, a Hash,
+            // Struct, or any object answering `dig`. Anything else is MRI's
+            // TypeError rather than a silent nil.
+            let diggable = with_host(|h| {
+                h.is_struct_class(&h.class_of(&cur))
+                    || h.is_a(&cur, "OpenStruct")
+                    || h.object_class(&cur)
+                        .is_some_and(|c| h.find_method_owner(&c, "dig").is_some())
+                    || h.find_singleton_method(&cur, "dig").is_some()
+            });
+            if !diggable {
+                let cname = with_host(|h| h.class_of(&cur));
+                return Err(raise_exc(
+                    "TypeError",
+                    &format!("{cname} does not have #dig method"),
+                ));
+            }
+            return dispatch(&cur, "dig", &keys[i..], None);
         }
         cur = if with_host(|h| h.as_array(&cur)).is_some() {
             arr_index(
                 &with_host(|h| h.as_array(&cur).unwrap()),
                 std::slice::from_ref(k),
             )?
-        } else if let Some(m) = with_host(|h| h.as_hash(&cur)) {
-            let key = with_host(|h| h.value_to_key(k));
-            m.get(&key).cloned().unwrap_or(Value::Undef)
+        } else if with_host(|h| h.as_hash(&cur)).is_some() {
+            // `Hash#[]`, so a default value or default proc answers a miss.
+            dispatch(&cur, "[]", std::slice::from_ref(k), None)?
         } else {
             return Ok(Value::Undef);
         };
@@ -11716,8 +11908,12 @@ fn char_matcher(args: &[Value]) -> impl Fn(char) -> bool {
     move |c| parsed.iter().all(|(neg, set)| *neg != set.contains(&c))
 }
 
-fn pad_str(args: &[Value]) -> String {
-    args.get(1).map(arg_str).unwrap_or_else(|| " ".to_string())
+fn pad_str(args: &[Value]) -> Result<String, String> {
+    let p = args.get(1).map(arg_str).unwrap_or_else(|| " ".to_string());
+    if p.is_empty() {
+        return Err(raise_exc("ArgumentError", "zero width padding"));
+    }
+    Ok(p)
 }
 fn pad(s: &str, width: usize, p: String, left: bool) -> String {
     let len = s.chars().count();
@@ -13347,13 +13543,28 @@ fn dispatch_array(
                 .map(|a| {
                     // An operand that is not enumerable is refused; treating it
                     // as an empty array padded the rows with nil instead.
-                    with_host(|h| h.as_array(a)).ok_or_else(|| {
-                        let cls = with_host(|h| h.class_of(a));
-                        raise_exc(
-                            "TypeError",
-                            &format!("wrong argument type {cls} (must respond to :each)"),
-                        )
-                    })
+                    if let Some(v) = with_host(|h| h.as_array(a)) {
+                        return Ok(v);
+                    }
+                    // Any enumerable (Hash, Range, Set, Enumerator) lends its
+                    // first `arr.len()` elements; only that many are needed,
+                    // which also keeps an endless Range finite.
+                    let each =
+                        probe_dispatch(a, "respond_to?", &[with_host(|h| h.new_symbol("each"))])
+                            .is_some_and(|v| with_host(|h| h.truthy(&v)));
+                    if each {
+                        let n = Value::Int(arr.len() as i64);
+                        if let Some(rows) = probe_dispatch(a, "first", &[n])
+                            .and_then(|r| with_host(|h| h.as_array(&r)))
+                        {
+                            return Ok(rows);
+                        }
+                    }
+                    let cls = with_host(|h| h.class_of(a));
+                    Err(raise_exc(
+                        "TypeError",
+                        &format!("wrong argument type {cls} (must respond to :each)"),
+                    ))
                 })
                 .collect::<Result<_, _>>()?;
             let rows: Vec<Value> = arr
@@ -15014,8 +15225,61 @@ fn dispatch_lazy(
             h.new_lazy_of(source.clone(), next, origin)
         })
     };
-    let blk = || block.clone().ok_or_else(|| "no block given".to_string());
+    let blk = || {
+        block.clone().ok_or_else(|| {
+            raise_exc(
+                "ArgumentError",
+                &format!("tried to call lazy {name} without a block"),
+            )
+        })
+    };
     match name {
+        // MRI `lazy_size`: the source's size carried through the stages that
+        // keep it (`map`, `zip`, `with_index`), clipped by `take`/`drop`, and
+        // unknown (nil) once a stage can drop elements.
+        "size" if args.is_empty() => {
+            let mut size: Option<Value> = match with_host(|h| h.as_array(&source)) {
+                Some(items) => Some(Value::Int(items.len() as i64)),
+                None => match with_host(|h| h.as_range(&source)) {
+                    Some((_, hi, _)) if hi == crate::host::RANGE_ENDLESS => {
+                        Some(Value::Float(f64::INFINITY))
+                    }
+                    Some(_) => Some(dispatch(&source, "size", &[], None)?),
+                    None => None,
+                },
+            };
+            for op in &ops {
+                size = match (op, size) {
+                    (
+                        LazyOp::Map(_)
+                        | LazyOp::Zip(_)
+                        | LazyOp::WithIndex(_)
+                        | LazyOp::WithObject(..),
+                        s,
+                    ) => s,
+                    (LazyOp::Take(n), Some(s)) => {
+                        let cut = Value::Int(*n);
+                        let smaller = dispatch(&s, "<", std::slice::from_ref(&cut), None)?;
+                        Some(if with_host(|h| h.truthy(&smaller)) {
+                            s
+                        } else {
+                            cut
+                        })
+                    }
+                    (LazyOp::Drop(n), Some(s)) => {
+                        let left = dispatch(&s, "-", &[Value::Int(*n)], None)?;
+                        let neg = dispatch(&left, "<", &[Value::Int(0)], None)?;
+                        Some(if with_host(|h| h.truthy(&neg)) {
+                            Value::Int(0)
+                        } else {
+                            left
+                        })
+                    }
+                    _ => None,
+                };
+            }
+            Ok(size.unwrap_or(Value::Undef))
+        }
         "map" | "collect" => Ok(extend(LazyOp::Map(blk()?))),
         "select" | "filter" => Ok(extend(LazyOp::Select(blk()?))),
         "reject" => Ok(extend(LazyOp::Reject(blk()?))),
@@ -15036,8 +15300,14 @@ fn dispatch_lazy(
         // demand one.
         "uniq" => Ok(extend(LazyOp::Uniq(block.clone()))),
         "compact" => Ok(extend(LazyOp::Compact)),
-        "grep" => Ok(extend(LazyOp::Grep(args[0].clone(), false))),
-        "grep_v" => Ok(extend(LazyOp::Grep(args[0].clone(), true))),
+        // A block maps the elements the pattern selects.
+        "grep" | "grep_v" if args.len() == 1 => {
+            let filtered = extend(LazyOp::Grep(args[0].clone(), name == "grep_v"));
+            match &block {
+                Some(b) => dispatch_lazy(&filtered, "map", &[], Some(b.clone())),
+                None => Ok(filtered),
+            }
+        }
         // `with_index` takes an optional offset and inspects with it;
         // `each_with_index` takes none. Both stay lazy in MRI.
         "with_index" if block.is_none() => Ok(extend(LazyOp::WithIndex(Some(
@@ -16060,6 +16330,8 @@ fn dispatch_yielder(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
         "<<" | "yield" => {
             let v = match args {
                 [single] => single.clone(),
+                // `y.yield` with no value yields nil.
+                [] => Value::Undef,
                 // `y.yield a, b` yields TWO values. The buffer holds them packed
                 // (that is the element `to_a` sees), and the pack is marked so a
                 // consumer can still hand the block both — MRI's
@@ -20224,7 +20496,9 @@ fn dispatch_hash_body(
                     m.extend(other);
                 }
             }
-            Ok(with_host(|h| h.new_hash(m)))
+            // `merge` is a `dup` plus `update`: default, default proc and
+            // identity mode carry over.
+            Ok(with_host(|h| h.new_hash_like(recv, m, true)))
         }
         // `merge!` / `update` — the in-place form of `merge`: each hash argument
         // is merged into the receiver left-to-right, a block resolves collisions
@@ -20371,7 +20645,7 @@ fn dispatch_hash_body(
                     }
                 }
             }
-            Ok(with_host(|h| h.new_hash(out)))
+            Ok(with_host(|h| h.new_hash_like(recv, out, false)))
         }
         // In-place filters. `select!`/`keep_if` keep entries the block accepts;
         // `reject!`/`delete_if` drop them. The `!` forms return the receiver when
@@ -20408,7 +20682,7 @@ fn dispatch_hash_body(
                     out.insert(k.clone(), call_proc(b, std::slice::from_ref(v))?);
                 }
             }
-            Ok(with_host(|h| h.new_hash(out)))
+            Ok(with_host(|h| h.new_hash_like(recv, out, false)))
         }
         "transform_keys" => {
             // `transform_keys(hash = {}) { |key| ... }` — a key present in the
@@ -20587,6 +20861,25 @@ fn dispatch_hash_body(
         // HashWithIndifferentAccess copies the source hash's default_proc.
         "default_proc" => Ok(with_host(|h| h.hash_default_proc(recv)).unwrap_or(Value::Undef)),
         "default_proc=" => {
+            let p = &args[0];
+            if !matches!(p, Value::Undef) {
+                if !with_host(|h| h.is_proc(p)) {
+                    let cname = with_host(|h| h.class_of(p));
+                    return Err(raise_exc(
+                        "TypeError",
+                        &format!("wrong default_proc type {cname} (expected Proc)"),
+                    ));
+                }
+                // A lambda must accept (hash, key); any other arity is refused.
+                let strict = with_host(|h| h.proc_is_lambda(p));
+                let arity = with_host(|h| h.proc_arity(p)).unwrap_or(2);
+                if strict && arity != 2 && (arity >= 0 || -arity - 1 > 2) {
+                    return Err(raise_exc(
+                        "TypeError",
+                        &format!("default_proc takes two arguments (2 for {arity})"),
+                    ));
+                }
+            }
             with_host(|h| h.set_hash_default_proc(recv, args[0].clone()));
             Ok(args[0].clone())
         }
@@ -20619,7 +20912,7 @@ fn dispatch_hash_body(
                     out.insert(k.clone(), v.clone());
                 }
             }
-            Ok(with_host(|h| h.new_hash(out)))
+            Ok(with_host(|h| h.new_hash_like(recv, out, false)))
         }
         "slice" => {
             // Return a copy with only the given keys, in argument order (MRI).
@@ -20630,7 +20923,7 @@ fn dispatch_hash_body(
                     out.insert(k, v.clone());
                 }
             }
-            Ok(with_host(|h| h.new_hash(out)))
+            Ok(with_host(|h| h.new_hash_like(recv, out, false)))
         }
         "compact" => {
             // Drop pairs whose value is nil.
@@ -20640,7 +20933,8 @@ fn dispatch_hash_body(
                     out.insert(k.clone(), v.clone());
                 }
             }
-            Ok(with_host(|h| h.new_hash(out)))
+            // A `dup` minus the nil pairs: the default carries over.
+            Ok(with_host(|h| h.new_hash_like(recv, out, true)))
         }
         "each_with_index" => {
             let pairs: Vec<Value> = with_host(|h| {
@@ -21180,6 +21474,39 @@ fn dispatch_obj_range(
             }
             return Ok(Value::Undef);
         }
+        // Non-numeric `Range#step(n)` walks `begin + n`, `begin + 2n`, … while
+        // `<=>` keeps it inside the range (MRI 3.4+); a `+` the begin lacks is
+        // the NoMethodError the walk itself raises.
+        "step" | "%" if args.len() == 1 && !matches!(lo, Value::Undef) => {
+            let step = args[0].clone();
+            if with_host(|h| h.eq_values(&step, &Value::Int(0))) {
+                return Err(raise_exc("ArgumentError", "step can't be 0"));
+            }
+            let mut items = Vec::new();
+            let mut cur = lo.clone();
+            loop {
+                if !matches!(hi, Value::Undef) {
+                    match cmp(&cur, &hi)? {
+                        Some(c) if c < 0 || (c == 0 && !excl) => {}
+                        _ => break,
+                    }
+                }
+                match &block {
+                    Some(b) => {
+                        call_proc(b, std::slice::from_ref(&cur))?;
+                        if has_pending_signal() {
+                            break;
+                        }
+                    }
+                    None => items.push(cur.clone()),
+                }
+                cur = dispatch(&cur, "+", std::slice::from_ref(&step), None)?;
+            }
+            return Ok(match block {
+                Some(_) => _recv.clone(),
+                None => with_host(|h| h.new_enumerator(items, "step")),
+            });
+        }
         "begin" | "first" if args.is_empty() => return Ok(lo),
         "end" | "last" if args.is_empty() => return Ok(hi),
         "exclude_end?" => return Ok(Value::Bool(excl)),
@@ -21517,7 +21844,10 @@ pub(crate) fn call_bound(
     block: Option<Value>,
 ) -> Result<Value, String> {
     match dispatch(recv, name, args, block.clone()) {
-        Err(e) if e.starts_with("undefined method") => {
+        Err(e)
+            if e.starts_with("undefined method")
+                || e.starts_with(&format!("private method '{name}' called")) =>
+        {
             // A top-level `def` is not an instance method of Object — it lives in
             // the flat method table — so `method(:m).call` has to look there
             // before falling back to the Kernel private methods.
@@ -22367,6 +22697,11 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             }
         }
         "binding" => Ok(with_host(|h| h.capture_binding())),
+        // `main.using(mod)` at the top level.
+        "using" if args.len() == 1 => {
+            activate_refinements(&args[0])?;
+            Ok(with_host(|h| h.current_self()))
+        }
         "local_variables" => Ok(with_host(|h| {
             let syms: Vec<Value> = h.local_names().iter().map(|n| h.new_symbol(n)).collect();
             h.new_array(syms)
@@ -22626,7 +22961,18 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
                             "base specified for non string value",
                         ));
                     }
-                    Ok(Value::Int(*f as i64))
+                    if f.is_finite() {
+                        Ok(float_to_int_value(*f))
+                    } else {
+                        let name = if f.is_nan() {
+                            "NaN"
+                        } else if *f > 0.0 {
+                            "Infinity"
+                        } else {
+                            "-Infinity"
+                        };
+                        Err(raise_exc("FloatDomainError", name))
+                    }
                 }
                 _ => match with_host(|h| h.as_str(&args[0])) {
                     Some(s) => {
@@ -24890,6 +25236,10 @@ fn sprintf_int(v: &Value) -> Result<num_bigint::BigInt, String> {
             raise_exc("FloatDomainError", name)
         });
     }
+    // `rb_Integer` on a Rational truncates toward zero.
+    if let Some(r) = with_host(|h| h.as_rational(v)) {
+        return Ok(r.to_integer());
+    }
     match with_host(|h| h.as_str(v)) {
         Some(s) => match ruby_integer_str(&s, 0) {
             Some(n) => Ok(num_bigint::BigInt::from(n)),
@@ -25255,6 +25605,7 @@ fn sprintf(
         }
         // width (`*` = dynamic; a negative dynamic width means left-align)
         let mut width = 0usize;
+        let mut width_digits = false;
         if i < bytes.len() && bytes[i] == '*' {
             i += 1;
             let w = as_i(&aster_arg!());
@@ -25267,6 +25618,7 @@ fn sprintf(
         } else {
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 width = width * 10 + (bytes[i] as usize - '0' as usize);
+                width_digits = true;
                 i += 1;
             }
         }
@@ -25293,10 +25645,14 @@ fn sprintf(
         // A spec that runs off the end of the string is an error, not a stray
         // `%`: MRI names the `%%` escape the writer probably meant.
         let Some(&conv) = bytes.get(i) else {
-            return Err(raise_exc(
-                "ArgumentError",
-                "incomplete format specifier; use %% (double %) instead",
-            ));
+            // A width or precision that runs off the end is `GETNUM`'s error;
+            // flags alone are the incomplete-specifier one.
+            let msg = if width_digits || prec.is_some() {
+                "malformed format string - %*[0-9]"
+            } else {
+                "incomplete format specifier; use %% (double %) instead"
+            };
+            return Err(raise_exc("ArgumentError", msg));
         };
         i += 1;
         if conv == '%' {
@@ -27895,6 +28251,8 @@ const ARRAY_MUTATORS: &[&str] = &[
     "fill",
     "[]=",
     "store",
+    "keep_if",
+    "delete_if",
 ];
 
 /// Explicit (non-`!`) Hash mutators guarded against a frozen receiver.
@@ -27910,6 +28268,11 @@ const HASH_MUTATORS: &[&str] = &[
     "rehash",
     "transform_values!",
     "transform_keys!",
+    "compare_by_identity",
+    "default=",
+    "default_proc=",
+    "keep_if",
+    "delete_if",
 ];
 
 /// Whether MRI defines `name` on Integer but nowhere in Float's ancestry.
@@ -28377,6 +28740,24 @@ fn check_public_visibility(recv: &Value, name: &str) -> Result<(), String> {
             ),
         ));
     }
+    // A top-level `def` is a private method of Object: `public_send` on an
+    // object that has no method of that name of its own refuses it.
+    let toplevel_private = with_host(|h| {
+        h.has_method(name)
+            && h.object_class(recv).is_some_and(|c| {
+                h.find_method_owner(&c, name).is_none()
+                    && h.find_singleton_method(recv, name).is_none()
+            })
+    });
+    if toplevel_private {
+        return Err(raise_exc(
+            "NoMethodError",
+            &format!(
+                "private method '{name}' called for {}",
+                receiver_phrase(recv)
+            ),
+        ));
+    }
     let vis = receiver_visibility(recv, name);
     if vis == crate::host::Visibility::Public {
         return Ok(());
@@ -28645,7 +29026,7 @@ fn identical(a: &Value, b: &Value) -> bool {
                 })
         }
         (Value::Int(i), Value::Int(j)) => i == j,
-        (Value::Float(i), Value::Float(j)) => i == j,
+        (Value::Float(i), Value::Float(j)) => i.to_bits() == j.to_bits(),
         (Value::Bool(i), Value::Bool(j)) => i == j,
         (Value::Undef, Value::Undef) => true,
         _ => false,
@@ -30096,6 +30477,469 @@ fn struct_pos(members: &[String], key: &Value) -> Result<usize, String> {
     } else {
         Ok(i as usize)
     }
+}
+
+/// The radix argument of `Integer#digits` (default 10): an Integer that is at
+/// least 2. MRI reports a negative one as "negative radix" and 0/1 as
+/// "invalid radix N".
+fn digits_radix(args: &[Value]) -> Result<i64, String> {
+    let Some(v) = args.first() else {
+        return Ok(10);
+    };
+    let base = to_int(v)?;
+    if base < 0 {
+        return Err(raise_exc("ArgumentError", "negative radix"));
+    }
+    if base < 2 {
+        return Err(raise_exc("ArgumentError", &format!("invalid radix {base}")));
+    }
+    Ok(base)
+}
+
+/// MRI's error for an Integer bit operator (`& | ^ << >>`) whose operand is
+/// not an Integer: a Float or other non-Integer is reported as
+/// `X can't be coerced into Integer`.
+fn coerce_bit_operand(recv: &Value, operand: &Value) -> String {
+    let (class, named) = with_host(|h| (h.class_of(recv), h.coerce_operand_name(operand)));
+    raise_exc(
+        "TypeError",
+        &format!("{named} can't be coerced into {class}"),
+    )
+}
+
+/// `Integer#[]` on the two's-complement representation (MRI `int_aref`):
+/// `n[i]` is bit `i`; `n[i, len]` and `n[beg..end]` are `(n >> i) & mask`. A
+/// beginless range is only defined when the bits below its end are all zero.
+fn int_bit_ref(recv: &Value, args: &[Value]) -> Result<Value, String> {
+    use num_bigint::BigInt;
+    use num_traits::{One as _, Signed as _, ToPrimitive as _, Zero as _};
+    let n = with_host(|h| h.as_bigint(recv)).unwrap_or_else(|| BigInt::from(as_i(recv)));
+    let shifted = |n: &BigInt, i: &BigInt| -> BigInt {
+        match i.to_i64() {
+            Some(i) if i >= 0 => n >> i as usize,
+            Some(i) => n << i.unsigned_abs() as usize,
+            None if i.is_negative() => BigInt::zero(),
+            None if n.is_negative() => BigInt::from(-1),
+            None => BigInt::zero(),
+        }
+    };
+    let low_bits = |n: BigInt, len: i64| -> BigInt {
+        let mask = (BigInt::one() << len as usize) - 1;
+        n & mask
+    };
+    let idx = |v: &Value| -> Result<BigInt, String> {
+        with_host(|h| h.as_bigint(v)).map_or_else(|| to_int(v).map(BigInt::from), Ok)
+    };
+    let range = args.first().and_then(|v| with_host(|h| h.as_range(v)));
+    let out = match (args, range) {
+        ([_], Some((lo, hi, excl))) => {
+            if lo == crate::host::RANGE_BEGINLESS {
+                if hi == crate::host::RANGE_ENDLESS {
+                    return Ok(Value::Int(0));
+                }
+                let end = if excl { hi } else { hi + 1 };
+                if end >= 0 && !low_bits(n, end).is_zero() {
+                    return Err(raise_exc(
+                        "ArgumentError",
+                        "The beginless range for Integer#[] results in infinity",
+                    ));
+                }
+                BigInt::zero()
+            } else if hi == crate::host::RANGE_ENDLESS {
+                shifted(&n, &BigInt::from(lo))
+            } else {
+                let len = hi - lo + i64::from(!excl);
+                if len < 0 {
+                    // A descending range keeps every bit from `lo` upward.
+                    shifted(&n, &BigInt::from(lo))
+                } else {
+                    low_bits(shifted(&n, &BigInt::from(lo)), len)
+                }
+            }
+        }
+        ([i], None) => {
+            let bit = shifted(&n, &idx(i)?) & BigInt::one();
+            return Ok(Value::Int(bit.to_i64().unwrap_or(0)));
+        }
+        ([i, len], _) => {
+            let (i, len) = (idx(i)?, to_int(len)?);
+            if len < 0 {
+                shifted(&n, &i)
+            } else {
+                low_bits(shifted(&n, &i), len)
+            }
+        }
+        _ => {
+            return Err(raise_exc(
+                "ArgumentError",
+                &format!(
+                    "wrong number of arguments (given {}, expected 1..2)",
+                    args.len()
+                ),
+            ))
+        }
+    };
+    Ok(bigint_to_value(out))
+}
+
+/// `Numeric#coerce`'s operand as a Float (MRI `rb_Float`): numerics convert, a
+/// String is parsed strictly, nil/true/false are a TypeError.
+fn coerce_float_operand(v: &Value) -> Result<f64, String> {
+    match v {
+        Value::Int(_) | Value::Float(_) => Ok(as_f(v)),
+        Value::Undef | Value::Bool(_) => Err(raise_exc(
+            "TypeError",
+            &format!(
+                "can't convert {} into Float",
+                with_host(|h| h.coerce_operand_name(v))
+            ),
+        )),
+        _ => {
+            if let Some(s) = with_host(|h| h.as_str(v)) {
+                return ruby_float_str(&s).ok_or_else(|| {
+                    raise_exc(
+                        "ArgumentError",
+                        &format!(
+                            "invalid value for Float(): {}",
+                            crate::host::inspect_string(&s)
+                        ),
+                    )
+                });
+            }
+            Ok(as_f(v))
+        }
+    }
+}
+
+/// The member names (and `keyword_init:`) of a `Struct.new` / `Data.define`
+/// call. Members are Symbols or Strings; the option hash is the trailing
+/// keyword argument. MRI rejects duplicates, and Data additionally refuses a
+/// writer-shaped name.
+fn struct_member_args(args: &[Value], data: bool) -> Result<(Vec<String>, Option<bool>), String> {
+    let mut members: Vec<String> = Vec::new();
+    let mut keyword_init: Option<bool> = None;
+    for a in args {
+        let member = with_host(|h| h.as_symbol(a).or_else(|| h.as_str(a)));
+        if let Some(m) = member {
+            if data && m.ends_with('=') {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!("invalid data member: {m}"),
+                ));
+            }
+            if members.contains(&m) {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!("duplicate member: {m}"),
+                ));
+            }
+            members.push(m);
+        } else if let Some(kw) =
+            with_host(|h| h.as_hash(a).filter(|_| h.is_kwargs(a))).filter(|_| !data)
+        {
+            for (k, v) in &kw {
+                match k {
+                    RKey::Sym(s) if s == "keyword_init" => {
+                        keyword_init = match v {
+                            Value::Undef => None,
+                            v => Some(with_host(|h| h.truthy(v))),
+                        };
+                    }
+                    other => {
+                        let shown = with_host(|h| h.key_inspect(other));
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            &format!("unknown keyword: {shown}"),
+                        ));
+                    }
+                }
+            }
+        } else {
+            let shown = with_host(|h| h.inspect(a));
+            return Err(raise_exc(
+                "TypeError",
+                &format!("{shown} is not a symbol nor a string"),
+            ));
+        }
+    }
+    Ok((members, keyword_init))
+}
+
+/// Give an anonymous struct class the constant name `full` (`Struct::Foo`),
+/// moving its definition and methods, and bind the constant. Returns the name.
+fn name_struct_class(anon: &str, full: &str) -> String {
+    with_host(|h| {
+        h.rename_struct(anon, full);
+        h.rename_class(anon, full);
+        let cref = h.class_ref(full);
+        h.set_const(full, cref);
+    });
+    full.to_string()
+}
+
+/// `Klass.new(*args)` for a `Struct.new` / `Data.define` class: allocate, run
+/// `initialize` (a user override, which reaches the generated one through
+/// `super`, or the generated one directly) and, for Data, freeze.
+fn struct_new(
+    cls: &str,
+    members: &[String],
+    keyword_init: Option<bool>,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    let _ = keyword_init;
+    let is_data = with_host(|h| h.is_data_class(cls));
+    let obj = with_host(|h| h.new_object(cls));
+    // Members start as nil, so a user `initialize` that skips `super` reads nil.
+    for m in members {
+        with_host(|h| h.set_ivar_of(&obj, m, Value::Undef));
+    }
+    let init_args = if is_data {
+        data_new_args(members, args)?
+    } else {
+        args.to_vec()
+    };
+    if with_host(|h| h.find_method(cls, "initialize")).is_some() {
+        call_instance_method(obj.clone(), cls, "initialize", &init_args, block)?;
+    } else {
+        struct_default_init(&obj, cls, &init_args)?;
+    }
+    if is_data {
+        with_host(|h| h.freeze_value(&obj));
+    }
+    Ok(obj)
+}
+
+/// `Data.new` / `Data.[]` argument shaping (MRI `rb_data_s_new`): keywords pass
+/// through as the one Hash; positional values become a keyword Hash keyed by
+/// member, refusing more values than members.
+fn data_new_args(members: &[String], args: &[Value]) -> Result<Vec<Value>, String> {
+    let kwargs = args.last().filter(|a| with_host(|h| h.is_kwargs(a)));
+    if kwargs.is_some() {
+        if args.len() > 1 {
+            return Err(raise_exc(
+                "ArgumentError",
+                &format!(
+                    "wrong number of arguments (given {}, expected 0)",
+                    args.len()
+                ),
+            ));
+        }
+        return Ok(args.to_vec());
+    }
+    if args.len() > members.len() {
+        return Err(raise_exc(
+            "ArgumentError",
+            &format!(
+                "wrong number of arguments (given {}, expected 0..{})",
+                args.len(),
+                members.len()
+            ),
+        ));
+    }
+    if args.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut map = IndexMap::new();
+    for (m, v) in members.iter().zip(args) {
+        map.insert(RKey::Sym(m.clone()), v.clone());
+    }
+    Ok(vec![with_host(|h| {
+        let hash = h.new_hash(map);
+        h.mark_kwargs(&hash);
+        hash
+    })])
+}
+
+/// The generated `initialize` of a struct / data class (`rb_struct_initialize_m`
+/// / `rb_data_initialize_m`), also what `super` from a user `initialize` reaches.
+pub(crate) fn struct_default_init(obj: &Value, cls: &str, args: &[Value]) -> Result<(), String> {
+    let Some((members, keyword_init)) = with_host(|h| h.struct_def(cls)) else {
+        return Ok(());
+    };
+    let set = |m: &str, v: Value| with_host(|h| h.set_ivar_of(obj, m, v));
+    if with_host(|h| h.is_data_class(cls)) {
+        let keyword_error = |kind: &str, names: &[String]| {
+            raise_exc(
+                "ArgumentError",
+                &format!(
+                    "{kind} keyword{}: {}",
+                    if names.len() == 1 { "" } else { "s" },
+                    names.join(", ")
+                ),
+            )
+        };
+        let sym_names =
+            |ms: Vec<&String>| -> Vec<String> { ms.iter().map(|m| format!(":{m}")).collect() };
+        let Some(first) = args.first() else {
+            if members.is_empty() {
+                with_host(|h| h.freeze_value(obj));
+                return Ok(());
+            }
+            return Err(keyword_error(
+                "missing",
+                &sym_names(members.iter().collect()),
+            ));
+        };
+        let kw = with_host(|h| h.as_hash(first)).filter(|_| args.len() == 1);
+        let Some(kw) = kw else {
+            return Err(raise_exc(
+                "ArgumentError",
+                &format!(
+                    "wrong number of arguments (given {}, expected 0)",
+                    args.len()
+                ),
+            ));
+        };
+        let key_member = |k: &RKey| match k {
+            RKey::Sym(s) | RKey::Str(s) => members.iter().find(|m| *m == s).cloned(),
+            _ => None,
+        };
+        // Missing members are reported before unknown keys.
+        let given: Vec<String> = kw.keys().filter_map(key_member).collect();
+        let missing: Vec<&String> = members.iter().filter(|m| !given.contains(m)).collect();
+        if !missing.is_empty() {
+            return Err(keyword_error("missing", &sym_names(missing)));
+        }
+        let mut unknown = Vec::new();
+        for (k, v) in &kw {
+            match key_member(k) {
+                Some(m) => set(&m, v.clone()),
+                None => unknown.push(with_host(|h| h.key_inspect(k))),
+            }
+        }
+        if !unknown.is_empty() {
+            return Err(keyword_error("unknown", &unknown));
+        }
+        with_host(|h| h.freeze_value(obj));
+        return Ok(());
+    }
+    // `rb_struct_initialize_m`: `keyword_init: true` takes one Hash (positional
+    // or keywords) and nothing else; left unset, keywords written at the call
+    // site initialize by name; `false` never does.
+    let lone_hash = args.len() == 1 && with_host(|h| h.as_hash(&args[0])).is_some();
+    if keyword_init == Some(true) && !args.is_empty() && !lone_hash {
+        return Err(raise_exc(
+            "ArgumentError",
+            &format!(
+                "wrong number of arguments (given {}, expected 0)",
+                args.len()
+            ),
+        ));
+    }
+    let by_keyword = lone_hash
+        && match keyword_init {
+            Some(true) => true,
+            Some(false) => false,
+            None => with_host(|h| h.is_kwargs(&args[0])),
+        };
+    if by_keyword {
+        let kw = with_host(|h| h.as_hash(&args[0])).unwrap_or_default();
+        for m in &members {
+            set(m, Value::Undef);
+        }
+        let mut unknown = Vec::new();
+        for (k, v) in &kw {
+            let name = match k {
+                RKey::Sym(s) | RKey::Str(s) => s.clone(),
+                other => with_host(|h| h.key_inspect(other)),
+            };
+            if members.contains(&name) {
+                set(&name, v.clone());
+            } else {
+                unknown.push(name);
+            }
+        }
+        if !unknown.is_empty() {
+            return Err(raise_exc(
+                "ArgumentError",
+                &format!("unknown keywords: {}", unknown.join(", ")),
+            ));
+        }
+    } else {
+        // A Struct accepts FEWER values than it has members (the rest are nil)
+        // but never more.
+        if args.len() > members.len() {
+            return Err(raise_exc("ArgumentError", "struct size differs"));
+        }
+        for (i, m) in members.iter().enumerate() {
+            set(m, args.get(i).cloned().unwrap_or(Value::Undef));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `method` is part of the surface a `Struct.new` / `Data.define`
+/// class generates (member readers/writers and the fixed container methods).
+fn struct_provides(cls: &str, method: &str) -> bool {
+    let Some((members, _)) = with_host(|h| h.struct_def(cls)) else {
+        return false;
+    };
+    let is_data = with_host(|h| h.is_data_class(cls));
+    let member = method.strip_suffix('=').unwrap_or(method);
+    if members.iter().any(|m| m == member) && (!is_data || !method.ends_with('=')) {
+        return true;
+    }
+    const DATA: &[&str] = &[
+        "to_h",
+        "with",
+        "members",
+        "deconstruct",
+        "deconstruct_keys",
+        "inspect",
+        "to_s",
+        "==",
+        "eql?",
+        "hash",
+    ];
+    const STRUCT: &[&str] = &[
+        "each",
+        "each_pair",
+        "to_a",
+        "to_h",
+        "values",
+        "values_at",
+        "members",
+        "size",
+        "length",
+        "dig",
+        "[]",
+        "[]=",
+        "deconstruct",
+        "deconstruct_keys",
+        "inspect",
+        "to_s",
+        "==",
+        "eql?",
+        "hash",
+        "select",
+        "filter",
+    ];
+    (if is_data { DATA } else { STRUCT }).contains(&method)
+}
+
+/// `using mod`: activate the refinements `mod` defined. The argument must be a
+/// Module (a Class is MRI's `wrong argument type Class (expected Module)`).
+fn activate_refinements(arg: &Value) -> Result<(), String> {
+    let name = with_host(|h| h.classref_name(arg).filter(|n| h.is_module_name(n)));
+    match name {
+        Some(n) => {
+            with_host(|h| h.activate_refinements(&n));
+            Ok(())
+        }
+        None => {
+            let kind = with_host(|h| h.class_of(arg));
+            Err(raise_exc(
+                "TypeError",
+                &format!("wrong argument type {kind} (expected Module)"),
+            ))
+        }
+    }
+}
+
+/// A reference to the class or module named `name`.
+fn recv_ref(name: &str) -> Value {
+    with_host(|h| h.class_ref(name))
 }
 
 #[cfg(test)]

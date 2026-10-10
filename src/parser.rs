@@ -50,6 +50,9 @@ impl ParamAcc {
     }
 }
 
+/// The synthetic keyword-splat name a `def m(**nil)` parameter list records.
+pub const NO_KEYWORDS_PARAM: &str = "**nil";
+
 /// A parsed block/lambda parameter list: the flat parameter names, the splat
 /// index (if any), the destructuring "prelude" assignments to prepend to
 /// the block body (unpacking each `(a, b)` group from its temp parameter), and
@@ -1093,6 +1096,23 @@ impl Parser {
         self.call_tail()
     }
 
+    /// Record one literal `key: value` call argument. Pairs written before the
+    /// first `**splat` form the base hash; one written after it is merged after
+    /// the splat, so a later literal key overrides an earlier splat's (and the
+    /// reverse), as in source order.
+    fn push_kwarg(
+        kwargs: &mut Vec<(Expr, Expr)>,
+        kwsplats: &mut Vec<Expr>,
+        key: Expr,
+        value: Expr,
+    ) {
+        if kwsplats.is_empty() {
+            kwargs.push((key, value));
+        } else {
+            kwsplats.push(Expr::Hash(vec![(key, value)]));
+        }
+    }
+
     /// Append the trailing keyword hash to `args`: the literal `key: value` pairs,
     /// then each `**hash` merged in (last-wins), matching Ruby's keyword-splat
     /// semantics.
@@ -1168,7 +1188,10 @@ impl Parser {
         }
         // `"key": value` — a quoted label is a symbol key too.
         if let Some(key) = self.string_label()? {
-            kwargs.push((key, self.arg()?));
+            {
+                let v = self.arg()?;
+                Self::push_kwarg(kwargs, kwsplats, key, v);
+            }
             return Ok(());
         }
         // `key: value` keyword argument (symbol key). The label may be any
@@ -1183,7 +1206,7 @@ impl Parser {
             } else {
                 self.arg()?
             };
-            kwargs.push((Expr::Symbol(key), v));
+            Self::push_kwarg(kwargs, kwsplats, Expr::Symbol(key), v);
             return Ok(());
         }
         // `*expr` — splat the array's elements into the argument list. A bare `*`
@@ -1261,7 +1284,7 @@ impl Parser {
         if self.is_op("=>") {
             self.advance();
             let v = self.arg()?;
-            kwargs.push((e, v));
+            Self::push_kwarg(kwargs, kwsplats, e, v);
             return Ok(());
         }
         args.push(e);
@@ -1406,7 +1429,14 @@ impl Parser {
                 self.block_param(&mut acc)?;
                 while self.eat_op(",") {
                     if self.is_op("|") {
-                        break; // trailing comma
+                        // A trailing comma (`|a,|`) makes a lone parameter
+                        // auto-splat an Array argument, like `|a, _|`, without
+                        // changing the written arity. A hidden surplus parameter
+                        // gives the call path the second slot to splat into.
+                        if acc.params.len() == 1 && acc.splat.is_none() {
+                            acc.params.push("__excess".to_string());
+                        }
+                        break;
                     }
                     self.block_param(&mut acc)?;
                 }
@@ -1579,6 +1609,11 @@ impl Parser {
         }
         // `**rest` — a keyword-splat collector (desugared from the trailing hash).
         if self.eat_op("**") {
+            if matches!(self.peek(), Tok::Keyword(k) if k == "nil") {
+                self.advance();
+                acc.kwsplat = Some(NO_KEYWORDS_PARAM.to_string());
+                return Ok(());
+            }
             acc.kwsplat = Some(self.ident_name().unwrap_or_else(|_| "__kwrest".to_string()));
             return Ok(());
         }
@@ -3074,6 +3109,10 @@ impl Parser {
                 || matches!(self.peek(), Tok::Newline | Tok::Semicolon)
             {
                 "**".to_string()
+            } else if matches!(self.peek(), Tok::Keyword(k) if k == "nil") {
+                // `**nil`: the method accepts no keyword arguments at all.
+                self.advance();
+                NO_KEYWORDS_PARAM.to_string()
             } else {
                 self.ident_name()?
             };

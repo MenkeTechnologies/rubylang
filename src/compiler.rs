@@ -392,6 +392,11 @@ fn slot_scan_expr(
         Expr::BlockPass(x) | Expr::Splat(x) => slot_scan_expr(x, caps, disq, in_closure),
         // Separate scopes: a nested def/class/module/singleton-class body cannot
         // reference this scope's locals, so it neither captures nor disqualifies.
+        // The receiver of `def obj.m` is evaluated HERE, so it is scanned.
+        Expr::Def {
+            singleton_recv: Some(recv),
+            ..
+        } => slot_scan_expr(recv, caps, disq, in_closure),
         Expr::Def { .. }
         | Expr::Class { .. }
         | Expr::Module { .. }

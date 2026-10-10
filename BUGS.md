@@ -1013,11 +1013,20 @@ Honest limitations of this surface:
   `ancestors` calling `respond_to?(:initializers)` on each), and `Kernel` answers
   for exactly the module functions it dispatches — `Kernel.respond_to?(:puts)` is
   `true`, `Kernel.respond_to?(:initializers)` is `false`, as in MRI.
-- **Refinements (`refine` / `using`) are not implemented.** `refine Klass do … end`
-  raises `undefined method 'refine'`. Scoped, lexically-activated monkey-patching
-  needs a whole activation-scope substrate (per-lexical-scope method-table
-  overlays) that does not exist yet; global reopening (`class String; … end`)
-  covers the common patch case in the meantime.
+- **Refinements (`refine` / `using`) are process-wide from the `using` call, not
+  lexically scoped.** `Module#refine` builds a refinement class holding the
+  block's `def`s, `using` (top level or in a module/class body) activates it,
+  and method dispatch consults the active refinements of the receiver's class
+  ahead of the class's own methods. `super` from a refined method reaches the
+  class's own definition; `send`, `public_send`, `&:sym`, `method` and
+  `respond_to?` see refinements; `Module#refinements`, `Refinement#target`,
+  `Module.used_modules` and `import_methods` (Ruby-defined modules only) exist.
+  What is not modelled: lexical scope (a refinement activated in one file or
+  class body is visible everywhere afterwards, and `Module.used_modules` is
+  global), refined operators that compile to native ops (`Integer#+` on two
+  Integers never reaches dispatch), `to_s` refinements honored by string
+  interpolation, and a refinement being active inside its own `refine` block
+  before any `using`.
 
 ## Lexer
 
@@ -1069,6 +1078,39 @@ Honest limitations of this surface:
   spaced-command-arg symbols (`:foo`, `p :bar`, `[:a, :b]`) are unaffected.
 
 ## Runtime / methods
+
+- **`Struct` / `Data` construction runs `initialize`.** `Klass.new` allocates
+  and calls `initialize`, so a user override (and `super` into the generated
+  one, with the current parameter values for a bare `super`) behaves as in MRI;
+  `Data.new` turns positional values into the keyword Hash `initialize`
+  receives. A struct class's members are found through the superclass chain, so
+  `class B < A` where `A < Struct.new(:x)`, and `Class.new(Point)`, keep the
+  struct surface. Struct classes are anonymous `#<Class:0x…>` until bound to a
+  constant. Residue: a member is stored as an instance variable under its bare
+  name, so `@a` inside a method of `Struct.new(:a)` aliases the member.
+- **Open divergences found by the second parity round** (each reproduces against
+  MRI; none is hidden by the corpus):
+  - `&:sym` literal blocks captured through `&blk` report `lambda? == false`,
+    `arity == -1`, `parameters == [[:rest, :__symargs__]]` where MRI has a
+    lambda of arity -2, `[[:req], [:rest]]`.
+  - A block with only keyword parameters yielded a positional Hash binds it as
+    keywords (`yield({a: 1})` to `|a:|`); MRI raises `missing keyword`.
+  - A Comparable `<=>` that answers a non-Integer is judged by `as_i` in the
+    native `<` / `>` operators (MRI asks `> 0` / `< 0` of the answer).
+  - `Enumerator::Lazy#next`/`#peek`/`#rewind`, `Lazy.new(src) { |y, v| }`,
+    `lazy.zip(endless_range)`, `Enumerator.new(size)`, and the size argument of
+    `Enumerator.new` are not modelled.
+  - A frozen Class/Module accepts `def`, `attr_*` and `const_set`; an object's
+    `singleton_class.frozen?` is false; `-"lit"` and `"lit".freeze` are not
+    interned, so `equal?` across two of them is false.
+  - `Hash#rehash` cannot see a mutated Array key (keys are snapshotted at
+    insertion), and string keys read back from `Hash#keys` are not frozen.
+  - `Encoding` has no `find`/`names`/`compatible?`/`dummy?`/`ascii_compatible?`,
+    `String#dump`/`undump` are missing, `:é` is not a lexable symbol, and
+    `Integer`/`Symbol`/`nil#to_s` report UTF-8 rather than US-ASCII (the
+    non-UTF-8 byte-string substrate gap recorded in the fuzz baseline).
+  - `Kernel#system`, backticks and `%x` do not exist, so a `<<~`CMD`` heredoc
+    cannot run.
 
 - **Equality runs the element's own `==` — fixed.** `Array#==`, `Hash#==`,
   `include?`, `index`/`rindex`, `count` and `delete` compare through a user

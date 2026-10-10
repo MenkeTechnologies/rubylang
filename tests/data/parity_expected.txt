@@ -4577,3 +4577,1105 @@ FrozenError
 #==#
 [:hi, :q, :q=, :r]
 [:cfg, :cfg=, :y, :z]
+#==#
+24
+RangeError: Integer#pow() 1st argument cannot be negative when 2nd argument specified
+-3
+3
+ZeroDivisionError: divided by 0
+TypeError: Integer#pow() 2nd argument not allowed unless a 1st argument is integer
+[5, 4, 3, 2, 1]
+[45, 23, 1]
+Math::DomainError: out of domain
+ArgumentError: invalid radix 1
+ArgumentError: negative radix
+TypeError: no implicit conversion of String into Integer
+[424, 303, 411, 717, 620, 591, 180, 1]
+1
+1
+1
+5
+1
+1
+3
+8
+65
+-6
+TypeError: 3.0 can't be coerced into Integer
+2
+0
+-1
+1180591620717411303424
+1180591620717411303429
+-1180591620717411303423
+2.5
+[-4, -2]
+[-4, 1.0]
+1
+-1
+1.5
+4
+"11111111"
+ArgumentError: invalid radix 37
+ArgumentError: invalid radix 1
+9
+Math::DomainError: Numerical argument is out of domain - "isqrt"
+1099511627776
+2
+20
+#==#
+[2, 20]
+TypeError: not an integer
+false
+1
+5
+5
+TypeError: wrong argument type Integer (expected Range)
+ArgumentError: min argument must be less than or equal to max argument
+true
+true
+false
+true
+1200
+1300
+1200
+1200
+ArgumentError: invalid rounding mode: bad
+1200
+1300
+-1200
+4
+[0, 1, 2]
+[1, 4, 7, 10]
+[10, 6, 2]
+[1, 3, 5, 7]
+ArgumentError: step can't be 0
+[1.0, 1.5, 2.0]
+[]
+31
+1000
+ArgumentError: invalid value for Integer(): "1__0"
+12
+ArgumentError: invalid value for Integer(): "12abc"
+nil
+TypeError: can't convert nil into Integer
+nil
+35
+12
+FloatDomainError: NaN
+[2.5, 10.0]
+[3.0, 10.0]
+TypeError: can't convert nil into Float
+nil
+TypeError: nil can't be coerced into Integer
+TypeError: String can't be coerced into Integer
+#==#
+ArgumentError: comparison of Integer with String failed
+true
+false
+true
+(1/4)
+ZeroDivisionError: divided by 0
+100000000000000000000
+(1/100000000000000000000)
+9
+1
+8
+9
+"nf"
+"A"
+RangeError: 256 out of char range
+"Ā"
+RangeError: -1 out of char range
+"😀"
+97
+0.7000000000000002
+0.2999999999999998
+ZeroDivisionError: divided by 0
+ZeroDivisionError: divided by 0
+ZeroDivisionError: divided by 0
+Infinity
+ZeroDivisionError: divided by 0
+ZeroDivisionError: divided by 0
+-1
+125
+true
+true
+nil
+3
+1
+(3/1)
+(3+0i)
+0
+3.141592653589793
+[3, 0]
+9
+3
+3
+4
+#==#
+3
+true
+FrozenError: can't modify frozen Integer: 3
+TypeError: can't define singleton
+ArgumentError: can't unfreeze Integer
+#==#
+3
+4
+-3
+2
+2
+3
+3
+2
+2.68
+1.01
+1
+1200
+0
+1234.567
+1.0e+300
+1.235e-07
+12.3
+-12.4
+12.4
+-12.3
+10
+20
+12.3
+0.30000000000000004
+1.0e+16
+1.0e+15
+123456789012345.0
+1.234567890123456e+15
+1.2345678901234568e+16
+0.0001
+1.0e-05
+0.0001234
+1.0e-10
+-0.0
+"100.0"
+1.0e+100
+1.7976931348623157e+308
+5.0e-324
+1.7976931348623157e+308
+2.2250738585072014e-308
+2.220446049250313e-16
+15
+"Infinity"
+"NaN"
+false
+#==#
+true
+true
+FloatDomainError: Infinity
+FloatDomainError: NaN
+FloatDomainError: NaN
+FloatDomainError: Infinity
+Infinity
+FloatDomainError: Infinity
+(3/2)
+(3602879701896397/36028797018963968)
+(1/10)
+(1/3)
+(22/7)
+3
+2
+[3, 0.10000000000000031]
+[-4, 1.0999999999999996]
+-1.0999999999999996
+0.10000000000000031
+true
+true
+true
+true
+false
+1.0000000000000002
+0.9999999999999999
+5.0e-324
+Infinity
+3
+-3
+3
+100000000000000000000
+10000000000000000905969664
+"3.0"
+"3.0"
+3
+4
+false
+true
+true
+1
+-1
+true
+false
+1.5
+#==#
+1.5
+3
+1.0715086071862673e+301
+Infinity
+1.0
+[3, 1.0]
+[1.1, 1.4000000000000001, 1.7000000000000002, 2.0]
+11
+[1.0, 1.5, 2.0]
+TypeError: can't iterate from Float
+[2.0, 1.0]
+1.5
+ArgumentError: invalid value for Float(): "1.5abc"
+100000.0
+10.5
+0.5
+5.0
+8.0
+ArgumentError: invalid value for Float(): ""
+TypeError: can't convert nil into Float
+1.5
+1.5
+nil
+1.5
+1.0
+0.5
+-5.0
+1000.5
+0.0
+0.0
+0.0
+100
+10
+20
+20
+0
+0
+-1
+0
+"5.0e-324"
+"4.35"
+9.007199254740992e+15
+0.1
+#==#
+"123.46"
+#==#
+"003.1"
+"+5  5"
+"ff FF 0xff 010 101 0b101 101"
+"..f01"
+"..1011"
+"..70"
+"0x..f01"
+"-ff"
+"-ff"
+"..111011"
+"abc"
+"ab      |"
+"      ab|"
+"A"
+"h"
+"😀"
+"%"
+"1.234568e+04"
+"1.200000E-04"
+"1.23457e+06"
+"1.234e-05"
+"100000"
+"1e+06"
+"1E-10"
+"0x1p+0"
+"    3.1416|"
+"3.1416    |"
+"0"
+"2"
+"2"
+"2.68"
+"3"
+"12"
+"31"
+ArgumentError: invalid value for Integer(): "abc"
+TypeError: can't convert nil into Integer
+"1180591620717411303424"
+"400000000000000000"
+"1180591620717411303424.000000"
+ArgumentError: too few arguments
+"1"
+"1 x"
+"1-x"
+KeyError: key<a> not found
+ArgumentError: unnumbered(1) mixed with named
+#==#
+"a b a"
+ArgumentError: too few arguments
+"   42"
+"42   |"
+"3.14"
+""
+"nil"
+"\"a\" :b"
+"       \"a\"|"
+"Inf"
+"-Inf"
+"NaN"
+"  NaN|"
+FloatDomainError: NaN
+FloatDomainError: Infinity
+"0.000000e+00"
+"[1, \"a\"]"
+"{a: 1}"
+"+3   |"
+"+0003"
+"   ab"
+"0000000005"
+"+005"
+"1.00"
+"1.00000"
+ArgumentError: malformed format string - %z
+ArgumentError: incomplete format specifier; use %% (double %) instead
+ArgumentError: malformed format string - %*[0-9]
+"1.500000"
+ArgumentError: invalid value for Float(): "abc"
+TypeError: can't convert nil into Float
+"0.333333"
+"0.33333333333333333333"
+"3"
+"7/2"
+"5"
+"-5"
+"a and b"
+""
+"[1, 2]"
+"50%"
+"a    |    b|"
+"1.23e+05"
+"sym"
+"Hi"
+#==#
+"-003.142"
+" 003.142"
+"+003.142"
+"3"
+ArgumentError: named<a> after unnumbered(1)
+"12345.6789"
+"1234567.9"
+"005"
+"***5****"
+"abc"
+"121abc1212"
+ArgumentError: zero width padding
+#==#
+#<struct S a=1, b=2>
+#<struct S a=1, b=nil>
+ArgumentError: struct size differs
+[1, 2]
+{a: 1, b: 2}
+{"a" => 2, "b" => 4}
+[:a, :b]
+[:a, :b]
+true
+true
+false
+true
+true
+1
+2
+2
+IndexError: offset 2 too large for struct(size:2)
+IndexError: offset -3 too small for struct(size:2)
+NameError: no member 'c' in struct
+NameError: no member 'c' in struct
+#<struct S a=9, b=2>
+IndexError: offset 5 too large for struct(size:2)
+FrozenError: can't modify frozen S: #<struct S a=1, b=2>
+FrozenError: can't modify frozen S: #<struct S a=1, b=2>
+[1, 2]
+[[:a, 1], [:b, 2]]
+[1, 2]
+[1, 2]
+IndexError: offset 3 too large for struct(size:2)
+1
+2
+nil
+[1]
+[4]
+2
+"#<struct S a=1, b=2>"
+"#<struct S a=1, b=2>"
+"#<struct S a=#<struct S a=1, b=2>, b=3>"
+"#<struct S a=1, b=#<struct S:...>>"
+#<struct Struct::Foo x=1>
+ArgumentError: duplicate member: a
+NameError: identifier foo needs to be constant
+TypeError: no implicit conversion of Integer into String
+#<struct a=1>
+ArgumentError: wrong number of arguments (given 1, expected 0)
+#==#
+ArgumentError: unknown keywords: b
+true
+#<struct a=1, b=2>
+#<struct a={a: 1, b: 2}, b=nil>
+#<struct a={a: 1, b: 2}, b=nil>
+nil
+5.0
+#<data D a=1, b=2>
+#<data D a=1, b=2>
+ArgumentError: missing keyword: :b
+ArgumentError: wrong number of arguments (given 3, expected 0..2)
+ArgumentError: missing keyword: :b
+ArgumentError: unknown keyword: :c
+#<data D a=1, b=2>
+#<data D a=1, b=5>
+ArgumentError: unknown keyword: :c
+ArgumentError: wrong number of arguments (given 1, expected 0)
+#<data D a=1, b=2>
+{a: 1, b: 2}
+"#<data D a=1, b=2>"
+"#<data D a=1, b=2>"
+true
+true
+false
+true
+[:a, :b]
+[:a, :b]
+1
+NoMethodError: undefined method 'a=' for an instance of D
+FrozenError: can't modify frozen D: #<data D a=1, b=2>
+false
+[1, 2]
+{a: 1}
+#<data >
+"#<data >"
+ArgumentError: duplicate member: a
+ArgumentError: invalid data member: a=
+NoMethodError: undefined method 'new' for class Data
+8
+[#<data F v=0>, #<data F v=5>, #<data F v=7>]
+true
+[D, Data]
+Data
+[:a, :b]
+#<data a=1, b=2>
+#==#
+[1, 3]
+#<data D a="st", b=2>
+true
+#<data D a=1, b=2>
+true
+1
+#<data D a=2, b=1>
+#<data D a=1, b=2>
+NoMethodError: undefined method 'to_a' for an instance of D
+NoMethodError: undefined method 'each' for an instance of D
+#<data G x=#<data G x=1>>
+1
+#==#
+true
+false
+true
+1
+NoMatchingPatternError: 5: String === 5 does not return true
+3
+NoMatchingPatternKeyError: {a: 1}: key not found: :b
+true
+true
+[NoMatchingPatternError, StandardError, Exception]
+[:b, {a: 1}]
+"5: String === 5 does not return true"
+"[1, 2]: [1, 2] length mismatch (given 2, expected 1)"
+"{a: 1}: String === 1 does not return true"
+"5: String === 5 does not return true"
+"[1]: [1] length mismatch (given 1, expected 0)"
+"5: 4 === 5 does not return true"
+"5: 2 === 5 does not return true"
+"nil: nil does not respond to #deconstruct_keys"
+"{a: 1, b: 2}: rest of {b: 2} is not empty"
+nil
+#==#
+[1, 2, [], 1, {}]
+[1, 2, [3], 4, {z: 5}]
+[1, {k: 2}, [], 1, {}]
+[1, 2, [], 2, {}]
+[{k: 2}, 2, [], 1, {}]
+ArgumentError: wrong number of arguments (given 0, expected 1+)
+ArgumentError: wrong number of arguments (given 0, expected 1+)
+[1, 2]
+ArgumentError: missing keyword: :a
+ArgumentError: unknown keyword: :c
+ArgumentError: unknown keywords: :c, :d
+ArgumentError: wrong number of arguments (given 1, expected 0; required keyword: a)
+ArgumentError: wrong number of arguments (given 1, expected 0; required keyword: a)
+ArgumentError: missing keyword: :a
+[[1], {a: 2}]
+[[{a: 2}], {}]
+[[], {}]
+[[], {"a" => 1, b: 2}]
+[[1, {a: 1}], {}]
+[[1], {a: 1}]
+{a: 1}
+{a: 1}
+ArgumentError: wrong number of arguments (given 0, expected 1)
+[[:req, :a], [:opt, :b], [:rest, :r], [:key, :k], [:keyrest, :o], [:block, :blk]]
+[[:keyreq, :a], [:key, :b]]
+[[:rest, :a], [:keyrest, :k]]
+-2
+1
+-1
+[1, 1, 1]
+[1, 2, 2]
+[1, 2, 3, 4]
+[1, 2, nil, 4]
+[[1, 2], {a: 3}]
+[[1], {a: 2}]
+[[1, 2], {b: 3}]
+[1, 2, [3], 1, {"s" => 1}]
+[1, {x: 1}, {}]
+[1, {}, {x: 1}]
+[1, 5]
+[5, 6]
+[1, 2, 3]
+[1, 5, 3]
+ArgumentError: wrong number of arguments (given 1, expected 2..3)
+ArgumentError: wrong number of arguments (given 4, expected 2..3)
+#==#
+2
+1
+-1
+1
+2
+1
+2
+1
+1
+[1, 2]
+[1, nil]
+[1, 2, 3]
+[[1, 2], 3]
+[[1, 2], 1]
+[1, 3]
+ArgumentError: wrong number of arguments (given 1, expected 2)
+ArgumentError: wrong number of arguments (given 1, expected 2)
+ArgumentError: wrong number of arguments (given 1, expected 0)
+ArgumentError: missing keyword: :k
+ArgumentError: unknown keyword: :j
+ArgumentError: wrong number of arguments (given 0, expected 1)
+[{k: 5}, 1]
+[{k: 5}, 6]
+true
+false
+nil
+1
+[1, 2, nil]
+[1, 2]
+NoMethodError: undefined method 'yh' for main
+NoMethodError: undefined method 'yh' for main
+{a: 1}
+1
+{a: 1}
+[nil, {a: 1}]
+[1, 2]
+[1, 2]
+[1, [2]]
+[[1, 2]]
+[[1, 2], 1]
+:early
+2
+#==#
+[1, 2]
+NoMethodError: private method 'm2' called for main
+[5, 10]
+[1, 2]
+{"a b": 1, c: 2}
+[:"a b"]
+[1, {x: 2}]
+[1, {"x" => 2}]
+[1, {}]
+[0, 2, [], 2, {}]
+[0, 2, [], 1, {}]
+{x: 1, y: 2}
+3
+#==#
+[4, {2 => 4}, :d, false, nil, Proc]
+[5, 0, 5, 1, 5, []]
+7
+[nil, 2]
+[nil, 9]
+TypeError: wrong default_proc type Integer (expected Proc)
+TypeError: default_proc takes two arguments (2 for 1)
+1
+RuntimeError: boom x
+ArgumentError: wrong number of arguments (given 1, expected 0)
+{}
+1
+{"h" => 1, "e" => 1, "l" => 2, "o" => 1}
+{a: [1], b: [2]}
+{}
+0
+nil
+0
+0
+nil
+Array
+nil
+nil
+nil
+3
+nil
+nil
+[]
+3
+[1, 2, nil]
+[true, false]
+1
+1
+1
+"{\"a\" => 1}"
+false
+nil
+true
+true
+true
+[[:a, 1]]
+FrozenError: can't modify frozen Hash: {a: 1}
+true
+false
+true
+#==#
+true
+false
+true
+false
+true
+2
+true
+{a: 2, b: 1}
+[:b, 1]
+RuntimeError: can't add a new key into hash during iteration
+{}
+{a: 5, b: 2}
+[[:a, 1]]
+[[[:a, 1], 0]]
+[:a]
+[:b, 2]
+[[[:b, 2]], [[:a, 1]]]
+{true => [[:a, 1]], false => [[:b, 2]]}
+3
+3
+[[[:a, 1], 1], [[:b, 2], 2]]
+[:a, :b, :b]
+2
+true
+true
+[[[:a, 1]], [[:b, 2]]]
+[[:b, 2], [:a, 1]]
+[[:b, 2], [:a, 1]]
+[[:a, :b], [1, 2]]
+[:b]
+[[[:a, 1], [:b, 2]]]
+{a: 1}
+{b: 2}
+nil
+nil
+nil
+"no z"
+[:a, 1]
+nil
+nil
+[:a, 1, :b, 2]
+[:a, 1]
+[:b, 2]
+:b
+{1 => :a, 2 => :b}
+#==#
+{a: 6, b: 2}
+{a: 5, b: 2, c: 1}
+{a: 1, b: 2}
+1
+KeyError: key not found: :z
+KeyError: key not found: "z"
+:z
+KeyError: key not found: :z
+[1, nil]
+{1 => :a}
+TypeError: wrong element type Integer (expected array)
+TypeError: Array can't be coerced into Integer
+{}
+true
+false
+[:a, 1]
+{1 => 2, 3 => 4}
+ArgumentError: odd number of arguments for Hash
+{1 => 2, 3 => 4}
+ArgumentError: wrong element type Integer at 0 (expected array)
+TypeError: can't convert Array into Hash
+{}
+{}
+TypeError: can't convert Integer into Hash
+[:a, 1]
+[1]
+[:a, 1]
+[:b, 2]
+"{a: 1}"
+"{1 => 2, \"a\" => :b, nil => nil, [1] => {x: 1}}"
+"{\"a b\": 1, c: 2, \"d-e\": 3, \"+\": 4, a?: 5, b!: 6, \"c=\": 7, \"[]\": 8, A: 9, \"9a\": 10}"
+"{a: 1}"
+"{self: {...}}"
+nil
+false
+false
+FrozenError: can't modify frozen Hash: {a: 1}
+FrozenError: can't modify frozen Hash: {a: 1}
+FrozenError: can't modify frozen Hash: {a: 1}
+FrozenError: can't modify frozen Hash: {a: 1}
+{a: 1}
+[:a, 2]
+Hash
+[[:a, 1], [:b, 2]]
+[1]
+#==#
+{b: 2}
+{b: 2, "c" => 1}
+{"a" => 2}
+{x: 3}
+Enumerator
+3.0
+[[:a, 1, 0]]
+[[:a, 1, 0]]
+[[[:a, 1], 1]]
+[[:a, 1]]
+[[:b, 2]]
+[:a, 1]
+[[:a, 1]]
+[[:a, 1], [:b, 2]]
+[[:a, 1], [:b, 2], [:a, 1]]
+[[:a, 1], [:b, 2]]
+{[:a, 1] => 1, [:b, 2] => 1}
+[[:a, 1], [:b, 2]]
+[[:a, 1]]
+[[[:a, 1], [:b, 2]]]
+[[[:a, 1]], [[:b, 2]]]
+[[[:a, 1], [:c, 1]], [[:b, 2], nil]]
+[{a: 1, b: 2}]
+#==#
+FrozenError: can't modify frozen String: "a"
+"symx"
+FrozenError: can't modify frozen Array: [1]
+FrozenError: can't modify frozen Array: [1]
+FrozenError: can't modify frozen Array: [1]
+FrozenError: can't modify frozen Array: [1]
+FrozenError: can't modify frozen Array: [3, 1]
+FrozenError: can't modify frozen Array: [3, 1]
+FrozenError: can't modify frozen Array: [1]
+FrozenError: can't modify frozen Array: [1]
+FrozenError: can't modify frozen Array: [1]
+FrozenError: can't modify frozen Array: [1]
+FrozenError: can't modify frozen Array: [1]
+FrozenError: can't modify frozen Array: [1]
+FrozenError: can't modify frozen Array: [1]
+FrozenError: can't modify frozen Array: [1]
+FrozenError: can't modify frozen Array: [1, 2]
+FrozenError: can't modify frozen Array: [1, 2]
+FrozenError: can't modify frozen Array: [1, 2]
+FrozenError: can't modify frozen Array: [1, 2]
+FrozenError: can't modify frozen Array: [1, 2]
+FrozenError: can't modify frozen Array: [1, 2]
+FrozenError: can't modify frozen Array: [1, 2]
+FrozenError: can't modify frozen Array: [1, 2]
+FrozenError: can't modify frozen Array: [1, 2]
+FrozenError: can't modify frozen Array: [1, 2]
+FrozenError: can't modify frozen Array: [1, 2]
+false
+true
+false
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+#==#
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+FrozenError: can't modify frozen String: "abc"
+"a"
+false
+false
+false
+false
+true
+true
+false
+false
+false
+true
+false
+true
+true
+true
+true
+true
+true
+true
+false
+false
+false
+FrozenError: can't modify frozen Hash: {a: 1}
+FrozenError: can't modify frozen Hash: {a: 1}
+FrozenError: can't modify frozen Hash: {a: 1}
+FrozenError: can't modify frozen Hash: {a: 1}
+FrozenError: can't modify frozen Hash: {a: 1}
+FrozenError: can't modify frozen Hash: {a: 1}
+FrozenError: can't modify frozen Hash: {a: 1}
+FrozenError: can't modify frozen Hash: {a: 1}
+FrozenError: can't modify frozen Hash: {a: 1}
+FrozenError: can't modify frozen Hash: {a: 1}
+FrozenError: can't modify frozen Hash: {a: 1}
+[[:a, 1], 1]
+#==#
+FrozenError: can't modify frozen Symbol: :a
+FrozenError: can't modify frozen Integer: 1
+FrozenError: can't modify frozen NilClass: nil
+FrozenError: can't modify frozen String: "x"
+false
+false
+false
+false
+"nil"
+true
+1
+[1, 2, 3]
+["a", [FrozenError, RuntimeError, StandardError]]
+"can't modify frozen Array: [1]"
+0
+"can't modify frozen Hash: {}"
+"can't modify frozen Symbol: :a"
+"can't modify frozen Integer: 1"
+0
+"can't modify frozen Range: 1..2"
+nil
+"can't modify frozen NilClass: nil"
+"can't modify frozen String: \"a\""
+"can't modify frozen String: \"\""
+nil
+FrozenError: can't modify frozen String: ""
+FrozenError: can't modify frozen Array: []
+FrozenError: can't modify frozen Array: []
+FrozenError: can't modify frozen Array: []
+FrozenError: can't modify frozen Array: []
+FrozenError: can't modify frozen Array: []
+FrozenError: can't modify frozen Hash: {}
+FrozenError: can't modify frozen Hash: {}
+true
+["a", "ab"]
+[1, 1]
+[[1, 2]]
+true
+true
+true
+false
+false
+false
+false
+false
+#==#
+true
+true
+TypeError: true can't be coerced into Integer
+true
+true
+false
+true
+false
+false
+false
+#==#
+true
+true
+ArgumentError: comparison of Ver with 5 failed
+ArgumentError: comparison of Ver with nil failed
+false
+true
+V3
+V3
+ArgumentError: cannot clamp with an exclusive range
+V3
+V7
+[V1, V3]
+V1
+[V1, V3]
+ArgumentError: comparison of Ver with 1 failed
+ArgumentError: comparison of Integer with Ver failed
+[V1, V2, V3]
+true
+[V1, V2]
+[[V1, V2], [V3]]
+nil
+3
+V1
+V3
+NoMethodError: undefined method '+' for an instance of Ver
+true
+false
+RuntimeError: boom
+true
+ArgumentError: comparison of Bad4 with 3 failed
+2.5
+"b"
+"c"
+0
+2
+1
+ArgumentError: cannot clamp with an exclusive range
+[6, 12, 18]
+[2, 4, 6]
+[4, 16, 64, 100]
+[1, 2, 3, 4]
+[5, 6]
+[4, 5]
+[2, 6, 10]
+[1, 1, 2, 2, 3]
+#==#
+[[1, 0], [2, 1]]
+[0, 2, 6]
+[1, 2, 3]
+[1, 2, 3, 4, 5]
+15
+true
+[]
+3
+3
+Infinity
+Infinity
+nil
+#<Enumerator::Lazy: #<Enumerator::Lazy: 1..3>:map>
+#<Enumerator::Lazy: #<Enumerator::Lazy: #<Enumerator::Lazy: 1..3>:select>:map>
+Enumerator
+Enumerator::Lazy
+[5, 6]
+[4, 5]
+[4]
+[1, 2, 3]
+[1, 2]
+[2, 3]
+[4, 6]
+[1, 3]
+[[1], [2], [3]]
+[[1, 2, 3]]
+[[1, 4], [2, 5], [3, nil]]
+{1 => 1, 2 => 1, 3 => 1}
+1
+[3, 2, 1]
+6
+[[1, 2], [3]]
+Enumerator::Lazy
+[[1, 2], [2, 3]]
+[[1, 3], [2]]
+{true => [1, 3], false => [2]}
+ArgumentError: tried to call lazy map without a block
+Enumerator::Lazy
+[1, 3]
+3
+[3]
+1
+m1 m2 [1, 2]
+s1 m1 s2 s3 m3 [1, 3]
+t1 t2 [1, 2]
+#==#
+[1]
+[1, 2, [3, 4], nil]
+[2, 4]
+[1, 1, 1]
+nil
+[1, 2, 4, 8, 16]
+[1, 2, 3, 4]
+[1, 1]
+[1, 1, 2, 3, 5, 8]
+[Enumerator::Lazy, Enumerator, Enumerable]
+[1, 2, 2, 3, StopIteration, "iteration reached an end"]
+1
+[1, 0]
+[1]
+1
+2
+1
+2
+4
+5
+:done
+nil
+[1]
+[1, 2, 3]
+0.6000000000000001
+0.6
+0.6000000000000001
+1.0
+4.0
+8.0
+"ab"
+TypeError: String can't be coerced into Integer
+[1, 2]
+1.0
+Infinity
+NaN
+#==#
+undefined method 'shout' for an instance of String
+A!
+99
+4
+99
+["A!"]
+X!
+3
+Refinement
+String
+5
+[2, 4]
+6
+refined bar
+baz!
+baz
+UP:X
+UP:ABC
+TypeError
+wrong argument type Integer (expected Class or Module)
+no block given
+wrong argument type Class (expected Module)
+#==#
+"one\n  two\nthree\n"
+"raw \#{x}\n\\n tab\\t\n"
+"a 2\n  b\n\tc\n"
+"\nblank above\n\nand between\n"
+["first\n", "second\n"]
+["x", "y"]
+"line one continued\ntwo\n"
+"mixed\n\ttab\n"
+"tab-indented\n  more\n"
+"interp\n  indented 1\n"
+["xx\n", "yy\n"]
+"  deep\nshallow\n    deeper\n"
+{k: "val\n", j: 1}
+"SHOUT\n"
+"1\n 2\n"
+""
+"\#{not}\n"
+"one\ntwo\n"
+"    keep\n    indent\n"
+2
+0
+16
+[1, 2]

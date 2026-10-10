@@ -394,11 +394,7 @@ impl Printer {
                 } else {
                     "struct"
                 };
-                let name = if class.starts_with("Struct:") {
-                    ""
-                } else {
-                    &class
-                };
+                let name = if class.starts_with("#<") { "" } else { &class };
                 self.q.text(&format!("#<{kind} {name}:...>"));
                 return Ok(());
             }
@@ -470,7 +466,7 @@ impl Printer {
 
     /// `Struct#pretty_print` / `Data#pretty_print`.
     fn pp_struct(&mut self, v: &Value, class: &str, members: &[String]) -> Result<(), String> {
-        let anonymous = class.starts_with("Struct:");
+        let anonymous = class.starts_with("#<");
         let head = if with_host(|h| h.is_data_class(class)) {
             if anonymous {
                 "#<data".to_string()

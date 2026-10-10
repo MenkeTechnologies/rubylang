@@ -5583,3 +5583,1482 @@ x = Object.new
 class << x; def hi = 1; attr_accessor :q; attr_reader :r; end
 class SingletonHolder; class << self; attr_accessor :cfg; def z = 1; end; def self.y = 2; end
 p x.singleton_class.instance_methods(false).sort, SingletonHolder.singleton_class.instance_methods(false).sort
+#==#
+# ── Integer pow/digits/bit ops (1) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { 2.pow(10, 1000) }
+t { 2.pow(-1, 5) }
+t { 3.pow(4, -7) }
+t { (-3).pow(3, 5) }
+t { 2.pow(10, 0) }
+t { 2.pow(0.5, 5) }
+t { 12345.digits }
+t { 12345.digits(100) }
+t { -5.digits }
+t { 5.digits(1) }
+t { 5.digits(-2) }
+t { 5.digits("a") }
+t { (2**70).digits(1000) }
+t { 5[0] }
+t { 5[0,2] }
+t { 0b1010[1..2] }
+t { 0b1010[1..] }
+t { (-1)[100] }
+t { (2**70)[70] }
+t { 5.bit_length }
+t { (-256).bit_length }
+t { (2**64).bit_length }
+t { ~5 }
+t { 5 & 3.0 }
+t { 5 << -1 }
+t { 5 >> 100 }
+t { -5 >> 100 }
+t { 1 << 70 }
+t { 5 ^ (2**70) }
+t { (-2**70) | 1 }
+t { 10.fdiv(4) }
+t { 10.divmod(-3) }
+t { -7.divmod(2.0) }
+t { 7.remainder(-3) }
+t { -7.remainder(3) }
+t { 7.5.remainder(2) }
+t { 10.ceildiv(3) }
+t { 255.to_s(2) }
+t { 255.to_s(37) }
+t { 255.to_s(1) }
+t { Integer.sqrt(99) }
+t { Integer.sqrt(-1) }
+t { Integer.sqrt(2**80) }
+t { 10.gcd(4) }
+t { 10.lcm(4) }
+#==#
+# ── Integer pow/digits/bit ops (2) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { 10.gcdlcm(4) }
+t { 10.gcd(2.0) }
+t { 3.zero? }
+t { 1.0.to_i }
+t { 10.clamp(1, 5) }
+t { 10.clamp(..5) }
+t { 10.clamp(1) }
+t { 10.clamp(5, 1) }
+t { 5.between?(1, 10) }
+t { 5.allbits?(5) }
+t { 6.anybits?(1) }
+t { 6.nobits?(1) }
+t { 1234.round(-2) }
+t { 1250.round(-2) }
+t { 1250.round(-2, half: :even) }
+t { 1250.round(-2, half: :down) }
+t { 1250.round(-2, half: :bad) }
+t { 1234.floor(-2) }
+t { 1234.ceil(-2) }
+t { -1234.truncate(-2) }
+t { 5.pred }
+t { 3.times.to_a }
+t { 1.step(10, 3).to_a }
+t { 10.step(1, -4).to_a }
+t { 1.step(by: 2, to: 7).to_a }
+t { 1.step(3, 0) }
+t { 1.0.step(2.0, 0.5).to_a }
+t { 5.upto(3).to_a }
+t { Integer("0x1f", 16) }
+t { Integer("1_000") }
+t { Integer("1__0") }
+t { Integer(" 12 ") }
+t { Integer("12abc") }
+t { Integer("12abc", exception: false) }
+t { Integer(nil) }
+t { Integer(nil, exception: false) }
+t { Integer("z", 36) }
+t { Integer(12.9) }
+t { Integer(Float::NAN) }
+t { 10.coerce(2.5) }
+t { 10.coerce("3") }
+t { 10.coerce(nil) }
+t { 1 <=> "a" }
+t { 1 + nil }
+t { 1 + "a" }
+#==#
+# ── Integer pow/digits/bit ops (3) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { 1 < "a" }
+t { 1 == 1.0 }
+t { 1.eql?(1.0) }
+t { 1.equal?(1) }
+t { 2**-2 }
+t { 0**-1 }
+t { 10**20 }
+t { 10**-20 }
+t { 7.pow(2**70, 13) }
+t { 0.pow(0) }
+t { 4.size }
+t { (2**70).size }
+t { 1.next_float rescue "nf" }
+t { 65.chr }
+t { 256.chr }
+t { 256.chr("UTF-8") }
+t { -1.chr }
+t { 0x1F600.chr(Encoding::UTF_8) }
+t { 97.ord }
+t { 3.7 % 1 }
+t { -3.7 % 1 }
+t { 5 % 0 }
+t { 5.0 % 0 }
+t { 5 / 0 }
+t { 5 / 0.0 }
+t { 5.divmod(0) }
+t { 5.0.divmod(0) }
+t { 5.modulo(-3) }
+t { 5.pow(3) }
+t { 1.integer? }
+t { 1.finite? }
+t { 1.infinite? }
+t { 3.numerator }
+t { 3.denominator }
+t { 3.rationalize }
+t { 3.to_c }
+t { 3.arg }
+t { -3.arg }
+t { 3.polar }
+t { 3.abs2 }
+t { -3.magnitude }
+t { 3.ord }
+t { 10.bit_length }
+#==#
+# ── Integer pow/digits/bit ops (4) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { 3.dup }
+t { 3.frozen? }
+t { 3.instance_variable_set(:@a, 1) }
+t { 3.singleton_class }
+t { 3.clone(freeze: false) }
+#==#
+# ── Float rounding and parsing (1) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { 2.5.round }
+t { 3.5.round }
+t { -2.5.round }
+t { 2.5.round(half: :even) }
+t { 2.5.round(half: :down) }
+t { 2.5.round(half: :up) }
+t { 2.5.round(half: nil) }
+t { 2.5.round(half: "even") }
+t { 2.675.round(2) }
+t { 1.005.round(2) }
+t { 0.5.round(0) }
+t { 1234.567.round(-2) }
+t { 1234.567.round(-5) }
+t { 1234.567.round(400) }
+t { 1e300.round(2) }
+t { 1.23456789e-7.round(10) }
+t { 12.34.floor(1) }
+t { -12.34.floor(1) }
+t { 12.34.ceil(1) }
+t { -12.34.ceil(1) }
+t { 12.34.floor(-1) }
+t { 12.34.ceil(-1) }
+t { 12.34.truncate(1) }
+t { 0.1 + 0.2 }
+t { 1e16 }
+t { 1e15 }
+t { 123456789012345.0 }
+t { 1234567890123456.0 }
+t { 12345678901234567.0 }
+t { 1e-4 }
+t { 1e-5 }
+t { 0.0001234 }
+t { 1.0e-10 }
+t { -0.0 }
+t { 100.0.to_s }
+t { 1e100 }
+t { 1.7976931348623157e308 }
+t { 5e-324 }
+t { Float::MAX }
+t { Float::MIN }
+t { Float::EPSILON }
+t { Float::DIG }
+t { Float::INFINITY.to_s }
+t { Float::NAN.to_s }
+t { Float::NAN == Float::NAN }
+#==#
+# ── Float rounding and parsing (2) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { Float::NAN.equal?(Float::NAN) }
+t { [Float::NAN].include?(Float::NAN) }
+t { Float::INFINITY.to_i }
+t { Float::NAN.to_i }
+t { Float::NAN.round }
+t { Float::INFINITY.round }
+t { Float::INFINITY.round(2) }
+t { Float::INFINITY.floor }
+t { 1.5.to_r }
+t { 0.1.to_r }
+t { 0.1.rationalize }
+t { 0.333.rationalize(0.01) }
+t { 3.14.rationalize(Rational(1,100)) }
+t { 1.5.numerator }
+t { 1.5.denominator }
+t { 3.7.divmod(1.2) }
+t { -3.7.divmod(1.2) }
+t { 3.7.modulo(-1.2) }
+t { 3.7.remainder(-1.2) }
+t { 1.0.eql?(1.0) }
+t { 1.0.hash == 1.0.hash }
+t { 0.0 == -0.0 }
+t { 0.0.eql?(-0.0) }
+t { 0.0.equal?(-0.0) }
+t { 1.0.next_float }
+t { 1.0.prev_float }
+t { 0.0.next_float }
+t { Float::INFINITY.next_float }
+t { 3.7.to_i }
+t { -3.7.to_i }
+t { 3.7.truncate }
+t { 1e20.to_i }
+t { 1e25.to_i }
+t { 3.0.to_s }
+t { 3.0.inspect }
+t { 3.14.floor }
+t { 3.99.ceil }
+t { 1.0.nan? }
+t { 1.0.finite? }
+t { (0.0/0.0).nan? }
+t { (1/0.0).infinite? }
+t { (-1/0.0).infinite? }
+t { 1.0.positive? }
+t { -0.0.negative? }
+t { 1.5.abs }
+#==#
+# ── Float rounding and parsing (3) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { -1.5.abs }
+t { 3.7.clamp(1, 3) }
+t { 2.0**1000 }
+t { 2.0**2000 }
+t { 0.0**0 }
+t { 10.0.divmod(3) }
+t { 1.1.step(2.0, 0.3).to_a }
+t { 1.0.step(2.0, 0.1).to_a.size }
+t { (1.0..2.0).step(0.5).to_a }
+t { (1.0..2.0).each {} }
+t { 1.0.coerce(2) }
+t { Float("1.5") }
+t { Float("1.5abc") }
+t { Float("1e5") }
+t { Float("1_0.5") }
+t { Float(".5") }
+t { Float("5.") }
+t { Float("0x1p3") }
+t { Float("") }
+t { Float(nil) }
+t { Float("  1.5  ") }
+t { Float("1.5", exception: false) }
+t { Float("abc", exception: false) }
+t { "1.5abc".to_f }
+t { "1e".to_f }
+t { ".5".to_f }
+t { "-.5e1".to_f }
+t { "1_000.5".to_f }
+t { "0x1A".to_f }
+t { "Infinity".to_f }
+t { "NaN".to_f }
+t { 1e2.to_i }
+t { 12.0.floor(-1) }
+t { 15.0.round(-1) }
+t { 25.0.round(-1, half: :even) }
+t { 0.5.floor }
+t { -0.5.ceil }
+t { -0.5.round }
+t { -0.4.round }
+t { 5.0e-324.to_s }
+t { 4.35.to_s }
+t { 9007199254740993.0 }
+t { 0.1.floor(20) }
+#==#
+# ── Float rounding and parsing (4) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { 123.456.round(2).to_s }
+#==#
+# ── format/sprintf (1) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { format("%05.1f", 3.14159) }
+t { format("%+d % d", 5, 5) }
+t { format("%x %X %#x %#o %b %#b %B", 255, 255, 255, 8, 5, 5, 5) }
+t { format("%x", -255) }
+t { format("%b", -5) }
+t { format("%o", -8) }
+t { format("%#x", -255) }
+t { format("% x", -255) }
+t { format("%+x", -255) }
+t { format("%08b", -5) }
+t { format("%.3s", "abcdef") }
+t { format("%-8s|", "ab") }
+t { format("%8s|", "ab") }
+t { format("%c", 65) }
+t { format("%c", "hello") }
+t { format("%c", 0x1F600) }
+t { format("%%") }
+t { format("%e", 12345.678) }
+t { format("%E", 0.00012) }
+t { format("%g", 1234567.0) }
+t { format("%g", 0.00001234) }
+t { format("%g", 100000.0) }
+t { format("%g", 1e6) }
+t { format("%G", 1e-10) }
+t { format("%a", 1.0) }
+t { format("%10.4f|", Math::PI) }
+t { format("%-10.4f|", Math::PI) }
+t { format("%.0f", 0.5) }
+t { format("%.0f", 1.5) }
+t { format("%.0f", 2.5) }
+t { format("%.2f", 2.675) }
+t { format("%d", 3.99) }
+t { format("%d", "12") }
+t { format("%d", "0x1f") }
+t { format("%d", "abc") }
+t { format("%d", nil) }
+t { format("%d", 2**70) }
+t { format("%x", 2**70) }
+t { format("%f", 2**70) }
+t { format("%s %s", 1) }
+t { format("%s", 1, 2) }
+t { format("%<a>d %<b>s", a: 1, b: "x") }
+t { format("%{a}-%{b}", a: 1, b: "x") }
+t { format("%<a>d", {}) }
+t { format("%<a>d %d", {a: 1}) }
+#==#
+# ── format/sprintf (2) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { format("%1$s %2$s %1$s", "a", "b") }
+t { format("%2$s", "a") }
+t { format("%*d", 5, 42) }
+t { format("%-*d|", 5, 42) }
+t { format("%.*f", 2, 3.14159) }
+t { format("%s", nil) }
+t { format("%p", nil) }
+t { format("%p %p", "a", :b) }
+t { format("%10p|", "a") }
+t { format("%f", Float::INFINITY) }
+t { format("%f", -Float::INFINITY) }
+t { format("%f", Float::NAN) }
+t { format("%5.1f|", Float::NAN) }
+t { format("%d", Float::NAN) }
+t { format("%d", Float::INFINITY) }
+t { format("%e", 0) }
+t { format("%s", [1, "a"]) }
+t { format("%s", {a: 1}) }
+t { format("%-+5d|", 3) }
+t { format("%+05d", 3) }
+t { format("%05s", "ab") }
+t { format("%.10d", 5) }
+t { format("%+.3d", 5) }
+t { format("%#.3g", 1.0) }
+t { format("%#g", 1.0) }
+t { format("%z", 1) }
+t { format("%", 1) }
+t { format("%5") }
+t { format("%f", "1.5") }
+t { format("%f", "abc") }
+t { format("%f", nil) }
+t { format("%f", Rational(1, 3)) }
+t { format("%.20f", Rational(1, 3)) }
+t { format("%d", Rational(7, 2)) }
+t { format("%s", Rational(7, 2)) }
+t { format("%i", 5) }
+t { format("%u", -5) }
+t { "%s and %s" % %w[a b] }
+t { "%s" % nil }
+t { "%s" % [[1, 2]] }
+t { "%d%%" % 50 }
+t { "%-5s|%5s|" % ["a", "b"] }
+t { "%.2e" % 123456 }
+t { "%s" % :sym }
+t { "%c%c" % [72, "i"] }
+#==#
+# ── format/sprintf (3) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { "%08.3f" % -3.14159 }
+t { "% 08.3f" % 3.14159 }
+t { "%+08.3f" % 3.14159 }
+t { "%x" % 3.7 }
+t { "%s %<a>s" % [{a: 1}] }
+t { 12345.6789.to_s }
+t { 1234567.89.round(1).to_s }
+t { 5.to_s.rjust(3, "0") }
+t { 5.to_s.center(8, "*") }
+t { "abc".ljust(2) }
+t { "abc".center(10, "12") }
+t { "abc".rjust(10, "") }
+#==#
+# ── Struct and Data (1) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+S = Struct.new(:a, :b)
+D = Data.define(:a, :b)
+t { S.new(1, 2) }
+t { S.new(1) }
+t { S.new(1, 2, 3) }
+t { S.new(1, 2).to_a }
+t { S.new(1, 2).to_h }
+t { S.new(1, 2).to_h { |k, v| [k.to_s, v * 2] } }
+t { S.new(1, 2).members }
+t { S.members }
+t { S.new(1, 2) == S.new(1, 2) }
+t { S.new(1, 2).eql?(S.new(1, 2)) }
+t { S.new(1, 2).eql?(S.new(1.0, 2)) }
+t { S.new(1, 2) == S.new(1.0, 2) }
+t { S.new(1, 2).hash == S.new(1, 2).hash }
+t { S.new(1, 2)[0] }
+t { S.new(1, 2)[:b] }
+t { S.new(1, 2)["b"] }
+t { S.new(1, 2)[2] }
+t { S.new(1, 2)[-3] }
+t { S.new(1, 2)[:c] }
+t { S.new(1, 2)["c"] }
+t { x = S.new(1, 2); x[:a] = 9; x }
+t { x = S.new(1, 2); x[5] = 9; x }
+t { x = S.new(1, 2).freeze; x.a = 3 }
+t { x = S.new(1, 2).freeze; x[:a] = 3 }
+t { S.new(1, 2).each.to_a }
+t { S.new(1, 2).each_pair.to_a }
+t { S.new(1, 2).values_at(0, 1) }
+t { S.new(1, 2).values_at(0..1) }
+t { S.new(1, 2).values_at(3) }
+t { S.new(1, 2).dig(:a) }
+t { S.new([1, [2]], 2).dig(:a, 1, 0) }
+t { S.new(1, 2).dig(:c) }
+t { S.new(1, 2).select(&:odd?) }
+t { S.new(1, 2).filter_map { |x| x * 2 if x > 1 } }
+t { S.new(1, 2).size }
+t { S.new(1, 2).inspect }
+t { S.new(1, 2).to_s }
+t { S.new(S.new(1, 2), 3).inspect }
+t { a = S.new(1); a.b = a; a.inspect }
+t { Struct.new("Foo", :x).new(1) }
+t { Struct.new(:a, :a) }
+t { Struct.new("foo") }
+t { Struct.new(1) }
+t { Struct.new(:a, keyword_init: true).new(a: 1) }
+t { Struct.new(:a, keyword_init: true).new(1) }
+#==#
+# ── Struct and Data (2) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+S = Struct.new(:a, :b)
+D = Data.define(:a, :b)
+t { Struct.new(:a, keyword_init: true).new(b: 1) }
+t { Struct.new(:a, keyword_init: true).keyword_init? }
+t { Struct.new(:a, :b).new(a: 1, b: 2) }
+t { Struct.new(:a, :b).new({a: 1, b: 2}) }
+t { Struct.new(:a, :b, keyword_init: false).new(a: 1, b: 2) }
+t { Struct.new(:a, :b).keyword_init? }
+t { Point = Struct.new(:x, :y) { def dist = Math.sqrt(x*x + y*y) }; Point.new(3, 4).dist }
+t { D.new(1, 2) }
+t { D.new(a: 1, b: 2) }
+t { D.new(1) }
+t { D.new(1, 2, 3) }
+t { D.new(a: 1) }
+t { D.new(a: 1, b: 2, c: 3) }
+t { D[1, 2] }
+t { D.new(1, 2).with(b: 5) }
+t { D.new(1, 2).with(c: 5) }
+t { D.new(1, 2).with(1) }
+t { D.new(1, 2).with }
+t { D.new(1, 2).to_h }
+t { D.new(1, 2).inspect }
+t { D.new(1, 2).to_s }
+t { D.new(1, 2).frozen? }
+t { D.new(1, 2) == D.new(1, 2) }
+t { D.new(1, 2).eql?(D.new(1.0, 2)) }
+t { D.new(1, 2) == D.new(1.0, 2) }
+t { D.members }
+t { D.new(1, 2).members }
+t { D.new(1, 2).a }
+t { D.new(1, 2).a = 1 }
+t { D.new(1, 2).instance_variable_set(:@a, 1) }
+t { D.new(1, 2).respond_to?(:to_a) }
+t { D.new(1, 2).deconstruct }
+t { D.new(1, 2).deconstruct_keys([:a]) }
+t { Data.define.new }
+t { Data.define.new.inspect }
+t { Data.define(:a, :a) }
+t { Data.define(:a=) }
+t { Data.new }
+t { E = Data.define(:v) { def double = v * 2 }; E.new(4).double }
+t { F = Data.define(:v) { def initialize(v: 0) = super(v: v.to_i) }; [F.new, F.new("5"), F.new(v: 7)] }
+t { D.new(1, 2).hash == D.new(1, 2).hash }
+t { D.ancestors.take(2) }
+t { D.superclass }
+t { D.instance_methods(false).sort }
+t { Class.new(D).new(1, 2) }
+#==#
+# ── Struct and Data (3) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+S = Struct.new(:a, :b)
+D = Data.define(:a, :b)
+t { D.new([1], 2).a << 3 }
+t { x = D.new("s", 2); x.a << "t"; x }
+t { D.method_defined?(:with) }
+t { D.new(1, 2).dup }
+t { D.new(1, 2).clone.frozen? }
+t { D.new(1, 2).then { _1.a } }
+t { D.new(b: 1, a: 2) }
+t { D.new("a" => 1, "b" => 2) }
+t { D.new(1, 2).to_a }
+t { D.new(1, 2).each }
+t { G = Data.define(:x); G.new(x: G.new(x: 1)) }
+t { h = {D.new(1, 2) => 1}; h[D.new(1, 2)] }
+#==#
+# ── case/in pattern matching (1) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { 5 in Integer }
+t { 5 in String }
+t { {a: 1} in {a: Integer} }
+t { h = {a: 1}; h => {a:}; a }
+t { 5 => String }
+t { [1, 2] => [a, b]; a + b }
+t { {a: 1} => {b:} }
+t { r = (1 in Integer); r }
+t { in_check = {status: "ok", items: [1, 2]}; in_check in {status: "ok", items: [_, _]} }
+t { NoMatchingPatternError.ancestors.take(3) }
+t { begin; {a: 1} => {b:}; rescue NoMatchingPatternKeyError => e; [e.key, e.matchee]; end }
+t { begin; 5 => String; rescue NoMatchingPatternError => e; e.message; end }
+t { begin; [1, 2] => [a]; rescue NoMatchingPatternError => e; e.message; end }
+t { begin; {a: 1} => {a: String}; rescue NoMatchingPatternError => e; e.message; end }
+t { begin; case 5; in String then 1; end; rescue NoMatchingPatternError => e; e.message; end }
+t { begin; case [1]; in [] then 1; end; rescue NoMatchingPatternError => e; e.message; end }
+t { begin; 5 => ^(2+2); rescue NoMatchingPatternError => e; e.message; end }
+t { begin; 5 => 1 | 2; rescue NoMatchingPatternError => e; e.message; end }
+t { begin; nil => {a:}; rescue NoMatchingPatternError => e; e.message; end }
+t { begin; {a: 1} => {a: 1, **nil}; {a: 1, b: 2} => {a: 1, **nil}; rescue NoMatchingPatternError => e; e.message; end }
+t { begin; 5 => Integer => n if false; rescue SyntaxError, NoMatchingPatternError => e; 1; end }
+#==#
+# ── keyword args, procs and block params (1) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+def m1(a, b = 2, *r, k: 1, **o, &blk) = [a, b, r, k, o]
+def m2(a:, b: a * 2) = [a, b]
+def m3(*a, **k) = [a, k]
+def m4(h) = h
+def m6(a, b = a, c = b) = [a, b, c]
+def m7(a, (b, c), d) = [a, b, c, d]
+def m8(*, **, &) = m3(*, **, &)
+def m9(...) = m3(...)
+def m10(a, ...) = m3(a, ...)
+def m11(a, b = {}, **k) = [a, b, k]
+def m12(a = 1, b) = [a, b]
+def m13(a, b = 2, c) = [a, b, c]
+l = ->(a, b = 1, *c, d:, e: 2, **f) {}
+t { m1(1) }
+t { m1(1, 2, 3, k: 4, z: 5) }
+t { m1(1, {k: 2}) }
+t { m1(1, **{k: 2}) }
+t { m1({k: 2}) }
+t { m1(k: 2) }
+t { m1() }
+t { m2(a: 1) }
+t { m2 }
+t { m2(a: 1, c: 2) }
+t { m2(a: 1, c: 2, d: 3) }
+t { m2(1) }
+t { m2({a: 1}) }
+t { m2("a" => 1) }
+t { m3(1, a: 2) }
+t { m3({a: 2}) }
+t { m3(**{}) }
+t { m3("a" => 1, b: 2) }
+t { m3(*[1, {a: 1}]) }
+t { m3(*[1], **{a: 1}) }
+t { m4(a: 1) }
+t { m4(**{a: 1}) }
+t { m4(**{}) }
+t { method(:m1).parameters }
+t { method(:m2).parameters }
+t { method(:m3).parameters }
+t { method(:m1).arity }
+t { method(:m2).arity }
+t { method(:m3).arity }
+t { m6(1) }
+t { m6(1, 2) }
+t { m7(1, [2, 3], 4) }
+t { m7(1, 2, 4) }
+t { m8(1, 2, a: 3) }
+t { m9(1, a: 2) }
+t { m10(1, 2, b: 3) }
+t { m1(1, 2, 3, **{"s" => 1}) }
+t { m11(1, {x: 1}) }
+t { m11(1, x: 1) }
+t { m12(5) }
+t { m12(5, 6) }
+t { m13(1, 3) }
+t { m13(1, 5, 3) }
+t { m13(1) }
+t { m13(1,2,3,4) }
+#==#
+# ── keyword args, procs and block params (2) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+def m1(a, b = 2, *r, k: 1, **o, &blk) = [a, b, r, k, o]
+def m2(a:, b: a * 2) = [a, b]
+def m3(*a, **k) = [a, k]
+def m4(h) = h
+def m6(a, b = a, c = b) = [a, b, c]
+def m7(a, (b, c), d) = [a, b, c, d]
+def m8(*, **, &) = m3(*, **, &)
+def m9(...) = m3(...)
+def m10(a, ...) = m3(a, ...)
+def m11(a, b = {}, **k) = [a, b, k]
+def m12(a = 1, b) = [a, b]
+def m13(a, b = 2, c) = [a, b, c]
+l = ->(a, b = 1, *c, d:, e: 2, **f) {}
+t { proc { |a, b| }.arity }
+t { proc { |a, b = 1| }.arity }
+t { proc { |*a| }.arity }
+t { proc { |a, | }.arity }
+t { proc { |a, k:| }.arity }
+t { proc { |a, k: 1| }.arity }
+t { lambda { |a, k:| }.arity }
+t { proc { |a, | a }.call([1, 2]) }
+t { proc { |a| a }.call(1, 2) }
+t { proc { |a, b| [a, b] }.call([1, 2]) }
+t { proc { |a, b| [a, b] }.call(1) }
+t { proc { |a, (b, c)| [a, b, c] }.call(1, [2, 3]) }
+t { proc { |*a, b| [a, b] }.call(1, 2, 3) }
+t { proc { |a, k: 1| [a, k] }.call([1, 2]) }
+t { proc { |a, k: 1| [a, k] }.call(1, k: 3) }
+t { lambda { |a, b| }.call(1) }
+t { lambda { |a, b| }.call([1, 2]) }
+t { ->(){}.call(1) }
+t { ->(k:){}.call }
+t { ->(k:){}.call(k: 1, j: 2) }
+t { def kk(a, k: 1) = [a, k]; kk(k: 5) }
+t { kk({k: 5}) }
+t { kk({k: 5}, k: 6) }
+t { def bb(&b) = b; bb.nil? }
+t { bb {}.lambda? }
+t { bb(&nil) }
+t { def yy = yield(1, 2); yy { |a| a } }
+t { yy { |a, b, c| [a, b, c] } }
+t { yy { |*a| a } }
+t { yh { |h| h } }
+t { yh { |**h| h } }
+t { def yk = yield(a: 1); yk { |h| h } }
+t { yk { |a:| a } }
+t { yk { |**h| h } }
+t { yk { |a, **h| [a, h] } }
+t { def ar = yield([1, 2]); ar { |a, b| [a, b] } }
+t { ar { |a| a } }
+t { ar { |a, *b| [a, b] } }
+t { ar { |*a| a } }
+t { ar { |a, k: 1| [a, k] } }
+t { def opt(a, b = (return :early; 1)) = [a, b]; opt(1) }
+t { def dd(a, b = a.succ) = b; dd(1) }
+#==#
+# ── keyword args, procs and block params (3) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+def m1(a, b = 2, *r, k: 1, **o, &blk) = [a, b, r, k, o]
+def m2(a:, b: a * 2) = [a, b]
+def m3(*a, **k) = [a, k]
+def m4(h) = h
+def m6(a, b = a, c = b) = [a, b, c]
+def m7(a, (b, c), d) = [a, b, c, d]
+def m8(*, **, &) = m3(*, **, &)
+def m9(...) = m3(...)
+def m10(a, ...) = m3(a, ...)
+def m11(a, b = {}, **k) = [a, b, k]
+def m12(a = 1, b) = [a, b]
+def m13(a, b = 2, c) = [a, b, c]
+l = ->(a, b = 1, *c, d:, e: 2, **f) {}
+t { send(:m2, a: 1) }
+t { public_send(:m2, a: 1) }
+t { method(:m2).to_proc.call(a: 5) }
+t { m2(**{a: 1, "b": 2}) }
+t { def kw_s(**o) = o; kw_s("a b": 1, "c": 2) }
+t { {"a b": 1}.keys }
+t { def opts(a, o = {}) = [a, o]; opts(1, x: 2) }
+t { opts(1, "x" => 2) }
+t { opts(1, **{}) }
+t { h = {k: 1}; m1(0, **h, k: 2) }
+t { h = {k: 1}; m1(0, k: 2, **h) }
+t { x = 1; y = 2; {x:, y:} }
+t { def sh(x:, y:) = x + y; x = 1; y = 2; sh(x:, y:) }
+#==#
+# ── Hash defaults, identity and enumeration (1) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { h = Hash.new { |hh, k| hh[k] = k * 2 }; [h[2], h, h.fetch(3, :d), h.key?(3), h.default, h.default_proc.class] }
+t { h = Hash.new(5); [h[:a], h.size, h.default, h.fetch(:a, 1), h.dig(:a), h.to_a] }
+t { h = Hash.new(5); h.default = 7; h[:z] }
+t { h = Hash.new { 1 }; h.default = 2; [h.default_proc, h[:q]] }
+t { h = Hash.new(1); h.default_proc = proc { 9 }; [h.default, h[:x]] }
+t { h = {}; h.default_proc = 5 }
+t { h = {}; h.default_proc = ->(a) { 1 } }
+t { h = {}; h.default_proc = ->(a, b) { 1 }; h[:x] }
+t { h = Hash.new { |hh, k| raise "boom #{k}" }; h[:x] }
+t { Hash.new(1) { 2 } }
+t { Hash.new(capacity: 10) }
+t { Hash.new(1, capacity: 10)[:x] }
+t { h = Hash.new(0); "hello".each_char { |c| h[c] += 1 }; h }
+t { h = Hash.new { |hh, k| hh[k] = [] }; h[:a] << 1; h[:b] << 2; h }
+t { h = Hash.new { |hh, k| [] }; h[:a] << 1; h }
+t { h = Hash.new(0); h.merge({a: 1})[:zz] }
+t { h = Hash.new(0); h.select { true }.default }
+t { h = Hash.new(0); h.dup.default }
+t { h = Hash.new(0); h.to_h.default }
+t { h = Hash.new(0); h.reject { false }.default }
+t { h = Hash.new(0); h.sort_by { 1 }.class }
+t { h = Hash.new(3); h.transform_values { 1 }.default }
+t { h = Hash.new(3); h.invert.default }
+t { h = Hash.new(3); Hash[h].default }
+t { h = Hash.new(3); h.compact.default }
+t { h = Hash.new(3); h.slice(:a).default }
+t { h = Hash.new(3); h.except(:a).default }
+t { h = Hash.new(3); h.filter_map { 1 } }
+t { h = {a: 1}.compare_by_identity; h["x"] = 1; h["x"] = 2; h.size }
+t { h = {}.compare_by_identity; k = "x"; h[k] = 1; h[k] = 2; [h.size, h[k], h["x"]] }
+t { h = {}.compare_by_identity; [h.compare_by_identity?, {}.compare_by_identity?] }
+t { h = {}.compare_by_identity; h[:a] = 1; h[:a] }
+t { h = {}.compare_by_identity; h[1] = 1; h[1] }
+t { h = {}.compare_by_identity; h[1.5] = 1; h[1.5] }
+t { h = {}.compare_by_identity; h["a"] = 1; h.inspect }
+t { h = {}.compare_by_identity; h["a".dup] = 1; h.key?("a") }
+t { h = {}.compare_by_identity; h[2**70] = 1; h[2**70] }
+t { h = {}.compare_by_identity; h.dup.compare_by_identity? }
+t { h = {a: 1}.compare_by_identity; h.select { true }.compare_by_identity? }
+t { h = {a: 1}.compare_by_identity; h.merge({b: 1}).compare_by_identity? }
+t { h = {a: 1}.compare_by_identity; h.to_a }
+t { h = {a: 1}; h.freeze.compare_by_identity }
+t { {a: 1} == {a: 1.0} }
+t { {a: 1}.eql?({a: 1.0}) }
+t { {a: 1, b: 2} == {b: 2, a: 1} }
+#==#
+# ── Hash defaults, identity and enumeration (2) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { {a: 1} <= {a: 1, b: 2} }
+t { {a: 1} < {a: 1} }
+t { {a: 1, b: 2} >= {b: 2} }
+t { {a: 1} > {a: 2} }
+t { {a: 1}.hash == {a: 1}.hash }
+t { {1 => :a, 1.0 => :b}.size }
+t { {"a" => 1}.key?("a".dup) }
+t { h = {b: 1, a: 2}; h.sort.to_h }
+t { h = {b: 1, a: 2}; h.min_by { |k, v| v } }
+t { h = {a: 1}; h.each { |k, v| h[:b] = 2 } }
+t { h = {a: 1}; h.each { |k, v| h.delete(:a) }; h }
+t { h = {a: 1, b: 2}; h.each { |k, v| h[:a] = 5 }; h }
+t { h = {a: 1}; h.map { |k, v| [k, v] } }
+t { h = {a: 1}; h.each_with_index.to_a }
+t { h = {a: 1}; h.each_with_object([]) { |(k, v), a| a << k } }
+t { h = {a: 1, b: 2}; h.find { |k, v| v == 2 } }
+t { h = {a: 1, b: 2}; h.partition { |k, v| v > 1 } }
+t { h = {a: 1, b: 2}; h.group_by { |k, v| v.odd? } }
+t { h = {a: 1, b: 2}; h.sum { |k, v| v } }
+t { h = {a: 1, b: 2}; h.reduce(0) { |s, (k, v)| s + v } }
+t { h = {a: 1, b: 2}; h.zip([1, 2]) }
+t { h = {a: 1, b: 2}; h.flat_map { |k, v| [k] * v } }
+t { h = {a: 1, b: 2}; h.count { |k, v| v > 0 } }
+t { h = {a: 1, b: 2}; h.any? { |k, v| v > 1 } }
+t { h = {a: 1, b: 2}; h.all?(Array) }
+t { h = {a: 1, b: 2}; h.each_slice(1).to_a }
+t { h = {a: 1, b: 2}; h.min_by(2) { |k, v| -v } }
+t { h = {a: 1, b: 2}; h.sort_by { |k, v| -v } }
+t { h = {a: 1, b: 2}; h.to_a.transpose }
+t { h = {a: 1, b: 2}; h.filter_map { |k, v| k if v > 1 } }
+t { h = {a: 1, b: 2}; h.each_cons(2).to_a }
+t { h = {a: 1, b: 2}; h.delete_if { |k, v| v > 1 } }
+t { h = {a: 1, b: 2}; h.keep_if { |k, v| v > 1 } }
+t { h = {a: 1, b: 2}; h.select! { true } }
+t { h = {a: 1, b: 2}; h.reject! { false } }
+t { h = {a: 1, b: 2}; h.compact! }
+t { h = {a: 1, b: 2}; h.delete(:z) { |k| "no #{k}" } }
+t { h = {a: 1, b: 2}; h.shift }
+t { Hash.new(5).shift }
+t { {}.shift }
+t { h = {a: 1, b: 2}; h.to_a.flatten }
+t { h = {a: 1, b: 2}; h.assoc(:a) }
+t { h = {a: 1, b: 2}; h.rassoc(2) }
+t { h = {a: 1, b: 2}; h.key(2) }
+t { h = {a: 1, b: 2}; h.invert }
+#==#
+# ── Hash defaults, identity and enumeration (3) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { h = {a: 1, b: 2}; h.update({a: 5}) { |k, o, n| o + n } }
+t { h = {a: 1, b: 2}; h.merge({a: 5}, {c: 1}) { |k, o, n| o * n } }
+t { h = {a: 1, b: 2}; h.merge }
+t { h = {a: {b: 1}}; h.dig(:a, :b) }
+t { h = {a: 1, b: 2}; h.fetch(:z) }
+t { h = {"a" => 1}; h.fetch("z") }
+t { h = {a: 1}; h.fetch(:z) { |k| k } }
+t { h = {a: 1}; h.fetch_values(:a, :z) }
+t { h = {a: 1}; h.values_at(:a, :z) }
+t { h = {a: 1}; h.to_h { |k, v| [v, k] } }
+t { h = {a: 1}; h.to_h { 1 } }
+t { h = {a: 1}; h.sum }
+t { h = {a: nil}; h.compact }
+t { h = {a: 1}; h.any? }
+t { {}.any? }
+t { {a: 1}.sum([]) }
+t { Hash[[[1, 2], [3, 4]]] }
+t { Hash[1, 2, 3] }
+t { Hash[1, 2, 3, 4] }
+t { Hash[[1, 2]] }
+t { Hash([[1, 2]]) }
+t { Hash(nil) }
+t { Hash([]) }
+t { Hash(1) }
+t { {a: 1}.each_pair.next }
+t { {a: 1}.filter_map { |k, v| v } }
+t { {a: 1, b: 2}.min }
+t { {a: 1, b: 2}.max_by { |k, v| v } }
+t { {a: 1}.inspect }
+t { {1 => 2, "a" => :b, nil => nil, [1] => {x: 1}}.inspect }
+t { {"a b": 1, "c": 2, :"d-e" => 3, :+ => 4, :a? => 5, :b! => 6, :c= => 7, :[] => 8, :A => 9, :"9a" => 10}.inspect }
+t { {a: 1}.to_s }
+t { h = {}; h[:self] = h; h.inspect }
+t { {a: 1}.default_proc }
+t { {a: 1}.frozen? }
+t { {a: 1}.freeze.merge(b: 1).frozen? }
+t { {a: 1}.freeze.store(:b, 1) }
+t { {a: 1}.freeze.delete(:a) }
+t { {a: 1}.freeze.clear }
+t { {a: 1}.freeze.default = 1 }
+t { {a: 1}.deconstruct_keys(nil) rescue $!.class }
+t { {b: 1, a: 2}.sort_by { |k, v| k }.first }
+t { {a: 1}.group_by { |k, v| v }.class }
+t { {a: 1, b: 2}.each_entry.to_a rescue $!.class }
+t { {a: 1}.lazy.map { |k, v| v }.to_a }
+#==#
+# ── Hash defaults, identity and enumeration (4) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { {a: 2}.transform_keys({a: :b}) }
+t { {a: 2, c: 1}.transform_keys({a: :b}) { |k| k.to_s } }
+t { {a: 2}.transform_keys!(&:to_s) }
+t { {a: 2, b: 3}.transform_keys { :x } }
+t { {a: 1}.filter_map.class }
+t { {a: 1, b: 2}.sum { |k, v| v.to_f } }
+t { {a: 1}.map.with_index { |(k, v), i| [k, v, i] } }
+t { {a: 1}.each_with_index.map { |(k, v), i| [k, v, i] } }
+t { {a: 1}.each.with_index(1).to_a }
+t { {a: 1, b: 2}.take_while { |k, v| v < 2 } }
+t { {a: 1, b: 2}.drop(1) }
+t { {a: 1, b: 2}.first }
+t { {a: 1, b: 2}.first(1) }
+t { {a: 1, b: 2}.entries }
+t { {a: 1, b: 2}.cycle.first(3) }
+t { {a: 1, b: 2}.each_entry.to_a }
+t { {a: 1, b: 2}.tally }
+t { {a: 1, b: 2}.minmax }
+t { {a: 1, b: 2}.uniq { |k, v| 1 } }
+t { {a: 1, b: 2}.chunk_while { true }.to_a }
+t { {a: 1, b: 2}.slice_when { true }.to_a }
+t { {a: 1, b: 2}.zip({c: 1}) }
+t { {a: 1, b: 2} .each_slice(2).map(&:to_h) }
+#==#
+# ── freeze and FrozenError (1) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { "a".freeze << "b" }
+t { :sym.to_s << "x" }
+t { [1].freeze << 2 }
+t { [1].freeze.push(2) }
+t { [1].freeze.pop }
+t { [1].freeze.clear }
+t { [3, 1].freeze.sort! }
+t { [3, 1].freeze.map! { 1 } }
+t { [1].freeze.concat([2]) }
+t { [1].freeze.unshift(0) }
+t { [1].freeze.delete(1) }
+t { [1].freeze.delete_at(0) }
+t { [1].freeze.insert(0, 1) }
+t { [1].freeze.fill(0) }
+t { [1].freeze.replace([2]) }
+t { [1].freeze[0] = 2 }
+t { [1, 2].freeze.reverse! }
+t { [1, 2].freeze.shuffle! }
+t { [1, 2].freeze.uniq! }
+t { [1, 2].freeze.compact! }
+t { [1, 2].freeze.flatten! }
+t { [1, 2].freeze.select! { true } }
+t { [1, 2].freeze.reject! { false } }
+t { [1, 2].freeze.keep_if { true } }
+t { [1, 2].freeze.rotate! }
+t { [1, 2].freeze.slice!(0) }
+t { [1, 2].freeze.shift }
+t { [1, 2].freeze.dup.frozen? }
+t { [1, 2].freeze.clone.frozen? }
+t { [1, 2].freeze.clone(freeze: false).frozen? }
+t { "abc".freeze.upcase! }
+t { "abc".freeze.sub!("a", "b") }
+t { "abc".freeze.gsub!("a", "b") }
+t { "abc".freeze.concat("d") }
+t { "abc".freeze.replace("d") }
+t { "abc".freeze.clear }
+t { "abc".freeze.insert(0, "x") }
+t { "abc".freeze.prepend("x") }
+t { "abc".freeze[0] = "x" }
+t { "abc".freeze.strip! }
+t { "abc".freeze.chomp! }
+t { "abc".freeze.squeeze! }
+t { "abc".freeze.force_encoding("BINARY") }
+t { "abc".freeze.setbyte(0, 1) }
+t { "abc".freeze.succ! }
+#==#
+# ── freeze and FrozenError (2) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { "abc".freeze.reverse! }
+t { "abc".freeze.tr!("a", "b") }
+t { "abc".freeze.delete!("a") }
+t { "abc".freeze.slice!(0) }
+t { "abc".freeze.capitalize! }
+t { "abc".freeze.swapcase! }
+t { "abc".freeze.downcase! }
+t { "abc".freeze.lstrip! }
+t { "abc".freeze.chop! }
+t { "abc".freeze.encode!("UTF-8") }
+t { "abc".freeze.unicode_normalize! }
+t { "".freeze.dup << "a" }
+t { "lit".frozen? }
+t { "a#{1}b".frozen? }
+t { :a.to_s.frozen? }
+t { 1.to_s.frozen? }
+t { nil.to_s.frozen? }
+t { true.to_s.frozen? }
+t { [].to_s.frozen? }
+t { "a".dup.frozen? }
+t { (+"a").frozen? }
+t { (-"a").frozen? }
+t { String.new.frozen? }
+t { :a.frozen? }
+t { 1.frozen? }
+t { nil.frozen? }
+t { 1.5.frozen? }
+t { (1..2).frozen? }
+t { Range.new(1, 2).frozen? }
+t { (1..).frozen? }
+t { [1].frozen? }
+t { Object.new.frozen? }
+t { Comparable.frozen? }
+t { {a: 1}.freeze[:b] = 1 }
+t { {a: 1}.freeze.delete(:a) }
+t { {a: 1}.freeze.merge!(b: 1) }
+t { {a: 1}.freeze.update(b: 1) }
+t { {a: 1}.freeze.transform_values!(&:to_s) }
+t { {a: 1}.freeze.select! { true } }
+t { {a: 1}.freeze.shift }
+t { {a: 1}.freeze.compare_by_identity }
+t { {a: 1}.freeze.rehash }
+t { {a: 1}.freeze.replace({}) }
+t { {a: 1}.freeze.default_proc = nil }
+t { {a: 1}.freeze.to_a << 1 }
+#==#
+# ── freeze and FrozenError (3) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { :a.instance_variable_set(:@a, 1) }
+t { 1.instance_variable_set(:@a, 1) }
+t { nil.instance_variable_set(:@a, 1) }
+t { "x".freeze.instance_variable_set(:@a, 1) }
+t { ENV.frozen? }
+t { $stdout.frozen? }
+t { ARGV.frozen? }
+t { __FILE__.frozen? }
+t { __method__.inspect }
+t { "a".freeze.hash == "a".hash }
+t { e = [1, 2].freeze.each; e.next }
+t { A_CONST = [1, 2]; A_CONST << 3; A_CONST }
+t { begin; "a".freeze << "b"; rescue FrozenError => e; [e.receiver, e.class.ancestors.take(3)]; end }
+t { begin; [1].freeze << 1; rescue => e; e.message; end }
+t { begin; Object.new.freeze.instance_variable_set(:@a, 1); rescue => e; e.message =~ /can't modify frozen Object: #<Object:0x[0-9a-f]+>/; end }
+t { begin; {}.freeze[:a] = 1; rescue => e; e.message; end }
+t { begin; :a.instance_variable_set(:@a, 1); rescue => e; e.message; end }
+t { begin; 1.instance_variable_set(:@a, 1); rescue => e; e.message; end }
+t { begin; Struct.new(:a).new(1).freeze.a = 1; rescue => e; e.message =~ /can't modify frozen #<Class:0x[0-9a-f]+>: #<struct a=1>/; end }
+t { begin; (1..2).instance_variable_set(:@a, 1); rescue => e; e.message; end }
+t { begin; FZ.new.freeze.a = 1; rescue => e; e.message =~ /can't modify frozen FZ: #<FZ:0x[0-9a-f]+>/; end }
+t { begin; nil.instance_variable_set(:@a, 1); rescue => e; e.message; end }
+t { begin; "a".freeze.upcase!; rescue => e; e.message; end }
+t { begin; "".freeze << ""; rescue => e; e.message; end }
+t { "abc".freeze.upcase! if false }
+t { "".freeze.clear }
+t { [].freeze.clear }
+t { [].freeze.concat }
+t { [].freeze.push }
+t { [].freeze.sort! }
+t { [].freeze.uniq! }
+t { {}.freeze.clear }
+t { {}.freeze.merge! }
+t { Object.new.freeze.then { _1.frozen? } }
+t { x = "a".freeze; y = x.dup; y << "b"; [x, y] }
+t { x = [1].freeze; y = x.map { _1 }; y << 1; y }
+t { x = [[1]].freeze; x[0] << 2; x }
+t { Ractor.respond_to?(:make_shareable) }
+t { 5.freeze.equal?(5) }
+t { :"a b".frozen? }
+t { "a".to_sym.to_proc.frozen? }
+t { proc {}.frozen? }
+t { method(:puts).frozen? }
+t { Object.new.method(:to_s).unbind.frozen? }
+t { Time.at(0).frozen? }
+#==#
+# ── freeze and FrozenError (4) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { Rational(1, 2).frozen? }
+t { Complex(1, 2).frozen? }
+t { 2**70.frozen? }
+t { (2**70).frozen? }
+t { /a/.frozen? }
+t { Regexp.new("a").frozen? }
+t { Float::NAN.frozen? }
+t { [].each.frozen? }
+t { Object.frozen? }
+t { main = self; main.frozen? }
+#==#
+# ── Comparable and lazy enumerators (1) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+class Ver; include Comparable; attr_reader :n; def initialize(n) = @n = n; def <=>(o) = o.is_a?(Ver) ? n <=> o.n : nil; def inspect = "V#{n}"; def succ = Ver.new(n + 1); end
+t { Ver.new(1) < Ver.new(2) }
+t { Ver.new(1) == Ver.new(1) }
+t { Ver.new(1) < 5 }
+t { Ver.new(1) <= nil }
+t { Ver.new(1) == 5 }
+t { Ver.new(1).between?(Ver.new(0), Ver.new(2)) }
+t { Ver.new(5).clamp(Ver.new(1), Ver.new(3)) }
+t { Ver.new(5).clamp(Ver.new(1)..Ver.new(3)) }
+t { Ver.new(5).clamp(Ver.new(1)...Ver.new(3)) }
+t { Ver.new(5).clamp(..Ver.new(3)) }
+t { Ver.new(5).clamp(Ver.new(7)..) }
+t { [Ver.new(3), Ver.new(1)].sort }
+t { [Ver.new(3), Ver.new(1)].min }
+t { [Ver.new(3), Ver.new(1)].minmax }
+t { [Ver.new(3), 1].sort }
+t { [Ver.new(3), 1].max }
+t { (Ver.new(1)..Ver.new(3)).to_a }
+t { (Ver.new(1)..Ver.new(3)).include?(Ver.new(2)) }
+t { (Ver.new(1)...Ver.new(3)).to_a }
+t { (Ver.new(1)..Ver.new(3)).each_slice(2).to_a }
+t { (Ver.new(1)..Ver.new(3)).size }
+t { (Ver.new(1)..Ver.new(3)).count }
+t { (Ver.new(1)..Ver.new(3)).min }
+t { (Ver.new(1)..Ver.new(3)).max }
+t { (Ver.new(1)..Ver.new(3)).step(2).to_a }
+t { (Ver.new(1)..Ver.new(3)) === Ver.new(2) }
+t { Ver.new(1).eql?(Ver.new(1)) }
+t { class Bad; include Comparable; def <=>(o) = raise("boom"); end; Bad.new == Bad.new }
+t { class Bad3; include Comparable; def <=>(o) = 1.5; end; Bad3.new > Bad3.new }
+t { class Bad4; include Comparable; def <=>(o) = nil; end; Bad4.new < 3 }
+t { 3.clamp(1.0, 2.5) }
+t { "b".clamp("a", "c") }
+t { "z".clamp("a", "c") }
+t { 1.clamp(nil, 0) }
+t { 1.clamp(2, nil) }
+t { 1.clamp(nil..nil) }
+t { 5.clamp(1...3) }
+t { (1..Float::INFINITY).lazy.map { _1 * 2 }.select { _1 % 3 == 0 }.first(3) }
+t { (1..).lazy.map { _1 * 2 }.take(3).to_a }
+t { (1..).lazy.select(&:even?).map { _1 * _1 }.reject { _1 % 3 == 0 }.first(4) }
+t { (1..).lazy.take_while { _1 < 5 }.to_a }
+t { (1..).lazy.drop_while { _1 < 5 }.first(2) }
+t { (1..).lazy.drop(3).first(2) }
+t { (1..20).lazy.filter_map { _1 * 2 if _1.odd? }.first(3) }
+t { (1..).lazy.flat_map { [_1, _1] }.first(5) }
+#==#
+# ── Comparable and lazy enumerators (2) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+class Ver; include Comparable; attr_reader :n; def initialize(n) = @n = n; def <=>(o) = o.is_a?(Ver) ? n <=> o.n : nil; def inspect = "V#{n}"; def succ = Ver.new(n + 1); end
+t { (1..).lazy.each_with_index.first(2) }
+t { (1..).lazy.with_index.map { |x, i| x * i }.first(3) }
+t { (1..).lazy.uniq { _1 % 3 }.first(3) }
+t { (1..).lazy.take(5).force }
+t { (1..).lazy.take(5).sum }
+t { (1..).lazy.take(5).include?(3) }
+t { (1..).lazy.take(0).to_a }
+t { (1..).lazy.take(3).map { _1 }.size }
+t { (1..3).lazy.size }
+t { (1..).lazy.size }
+t { (1..).lazy.map { _1 }.size }
+t { (1..).lazy.select { _1 }.size }
+t { (1..3).lazy.map { _1 * 2 } }
+t { (1..3).lazy.select(&:odd?).map { _1 } }
+t { (1..3).lazy.eager.class }
+t { (1..3).lazy.lazy.class }
+t { [4, 5].lazy.map { _1 + 1 }.to_a }
+t { [4, 5].lazy.compact.to_a }
+t { [4, nil].lazy.compact.to_a }
+t { [[1, 2], [3]].lazy.flat_map { _1 }.to_a }
+t { [1, 2].lazy.flat_map { _1 }.to_a }
+t { [1, 2, 3].lazy.grep(2..3).to_a }
+t { [1, 2, 3].lazy.grep(2..3) { _1 * 2 }.to_a }
+t { [1, 2, 3].lazy.grep_v(2).to_a }
+t { [1, 2, 3].lazy.slice_when { _2 > _1 }.to_a }
+t { [1, 2, 3].lazy.chunk_while { _2 == _1 + 1 }.to_a }
+t { [1, 2, 3].lazy.zip([4, 5]).to_a }
+t { [1, 2, 3].lazy.tally }
+t { [1, 2, 3].lazy.min }
+t { [1, 2, 3].lazy.sort_by { -_1 } }
+t { [1, 2, 3].lazy.reduce(:+) }
+t { [1, 2, 3].lazy.each_slice(2).to_a }
+t { [1, 2, 3].lazy.each_slice(2).class }
+t { [1, 2, 3].lazy.each_cons(2).to_a }
+t { [1, 2, 3].lazy.partition(&:odd?) }
+t { [1, 2, 3].lazy.group_by(&:odd?) }
+t { [1, 2, 3].lazy.map.class }
+t { [1, 2, 3].lazy.each_entry.class rescue :err }
+t { [3, 1].lazy.sort }
+t { [3, 1].lazy.first }
+t { [3, 1].lazy.first(1) }
+t { [3, 1].lazy.find { _1 == 1 } }
+t { l = (1..3).lazy.map { |x| print "m#{x} "; x }; l.first(2) }
+t { l = (1..3).lazy.select { |x| print "s#{x} "; x.odd? }.map { |x| print "m#{x} "; x }; l.to_a }
+t { (1..3).lazy.take(2).map { |x| print "t#{x} "; x }.to_a }
+#==#
+# ── Comparable and lazy enumerators (3) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+class Ver; include Comparable; attr_reader :n; def initialize(n) = @n = n; def <=>(o) = o.is_a?(Ver) ? n <=> o.n : nil; def inspect = "V#{n}"; def succ = Ver.new(n + 1); end
+t { (1..3).each_entry.lazy.map { _1 }.first(1) }
+t { Enumerator.new { |y| y << 1 << 2; y.yield 3, 4; y.yield }.to_a }
+t { Enumerator.new { |y| y << 1; y << 2 }.lazy.map { _1 * 2 }.to_a }
+t { Enumerator.new { |y| loop { y << 1 } }.lazy.take(3).to_a }
+t { Enumerator.new { |y| y << 1 }.size }
+t { Enumerator.produce(1) { _1 * 2 }.take(5) }
+t { Enumerator.produce(1) { raise StopIteration if _1 > 3; _1 + 1 }.to_a }
+t { Enumerator.produce { 1 }.first(2) }
+t { Enumerator.produce([1, 1]) { |a, b| [b, a + b] }.lazy.map(&:first).first(6) }
+t { Enumerator::Lazy.ancestors.take(3) }
+t { e = [1, 2, 3].each; [e.next, e.peek, e.next, e.next, (e.next rescue $!.class), (e.peek rescue $!.message)] }
+t { e = [1, 2].each; e.next; e.rewind; e.next }
+t { e = [1, 2].each_with_index; e.next }
+t { e = [1, 2].each_slice(1); e.next }
+t { e = [1, 2].map; e.next }
+t { e = [1, 2].each; e.size }
+t { [1, 2].each_slice(2).size }
+t { [1, 2, 3].each_cons(2).size }
+t { (1..10).each_slice(3).size }
+t { loop { break 5 } }
+t { e = [1].each; loop { e.next }; :done }
+t { r = loop { raise StopIteration, "x" }; r }
+t { e = [1].each; e.next; begin; e.next; rescue StopIteration => x; x.result; end }
+t { [1, 2, 3].each_entry.to_a }
+t { [1, 2, 3].sum { _1 * 0.1 } }
+t { [0.1, 0.2, 0.3].sum }
+t { [0.1, 0.2, 0.3].inject(:+) }
+t { [0.1] * 10 == [0.1] * 10 and ([0.1] * 10).sum }
+t { [1, 2.5, Rational(1, 2)].sum }
+t { [3.0, 5].sum(0.0) }
+t { ["a", "b"].sum("") }
+t { ["a", "b"].sum }
+t { [[1], [2]].sum([]) }
+t { [1e100, 1.0, -1e100].sum }
+t { [Float::INFINITY, 1.0].sum }
+t { [Float::INFINITY, -Float::INFINITY].sum }
+#==#
+# ── refinements ──
+module StrExt
+  refine String do
+    def shout = upcase + "!"
+    def length = 99
+  end
+  refine Integer do
+    def double = self * 2
+  end
+  refine Array do
+    def second = self[1]
+  end
+end
+begin; "a".shout; rescue NoMethodError => e; puts e.message; end
+using StrExt
+puts "a".shout
+puts "abc".length
+puts 2.double
+puts "abc".send(:length)
+puts ["a"].map(&:shout).inspect
+puts "x".method(:shout).call
+puts StrExt.refinements.size
+puts StrExt.refinements[0].class
+puts StrExt.refinements[0].target
+puts [4, 5].second
+puts [1, 2].map(&:double).inspect
+puts 3.then { _1.double }
+class Foo
+  def bar = "bar"
+  def baz = "baz"
+end
+module FooExt
+  refine Foo do
+    def bar = "refined " + super
+    def extra = baz + "!"
+  end
+end
+using FooExt
+puts Foo.new.bar
+puts Foo.new.extra
+puts Foo.new.baz
+module Sup
+  refine String do
+    def upcase = "UP:" + super
+  end
+end
+using Sup
+puts "x".upcase
+class Holder
+  using Module.new { refine(Symbol) { def loud = to_s.upcase } }
+  def go = :abc.loud
+end
+puts Holder.new.go
+begin
+  Module.new { refine(3) {} }
+rescue => e
+  puts e.class, e.message
+end
+begin
+  Module.new { refine(String) }
+rescue ArgumentError => e
+  puts e.message
+end
+begin
+  using Class
+rescue TypeError => e
+  puts e.message
+end
+#==#
+# ── squiggly heredocs and << disambiguation ──
+a = <<~EOS
+  one
+    two
+  three
+EOS
+p a
+b = <<~'EOS'
+  raw #{x}
+  \n tab\t
+EOS
+p b
+c = <<~EOS
+  a #{1 + 1}
+    b
+  \tc
+EOS
+p c
+e = <<~EOS
+
+  blank above
+
+  and between
+EOS
+p e
+f = [<<~A, <<~B]
+  first
+A
+  second
+B
+p f
+g = <<~EOS.lines.map(&:strip)
+  x
+  y
+EOS
+p g
+i = <<~EOS
+  line one \
+  continued
+  two
+EOS
+p i
+k = <<~EOS
+  mixed
+	tab
+EOS
+p k
+j = <<~EOS
+	tab-indented
+	  more
+EOS
+p j
+l = <<~EOS
+  #{"interp"}
+    indented #{1}
+EOS
+p l
+def m(s, t) = [s, t]
+p m(<<~X, <<~Y)
+  xx
+X
+  yy
+Y
+o = <<~EOS
+    deep
+  shallow
+      deeper
+EOS
+p o
+s = {k: <<~V, j: 1}
+  val
+V
+p s
+t = <<~EOS.upcase
+  shout
+EOS
+p t
+v = <<~EOS
+  #{1}
+   #{2}
+EOS
+p v
+w = <<~EOS
+EOS
+p w
+y = <<~EOS
+      \#{not}
+EOS
+p y
+z = <<~E1 + <<~E2
+  one
+E1
+  two
+E2
+p z
+d = <<-EOS
+    keep
+    indent
+    EOS
+p d
+p 5<<-1, 5<<~1.succ - 1 rescue p $!.class
+x = 4
+p x<<2, [1]<<2
