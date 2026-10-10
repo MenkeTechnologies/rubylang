@@ -19,8 +19,7 @@
 
 **Ruby in Rust** — a compiled Ruby runtime, hosted on the
 [`fusevm`](https://github.com/MenkeTechnologies/fusevm) bytecode VM with a
-three-tier Cranelift JIT — the same engine behind `zshrs`, `stryke`, `awkrs`,
-and `elisp`.
+three-tier Cranelift JIT, shared with the other fusevm frontends.
 
 ### [`Read the Docs`](https://menketechnologies.github.io/rubylang/) &middot; [`Engineering Report`](https://menketechnologies.github.io/rubylang/report.html) &middot; [`Builtin Reference`](https://menketechnologies.github.io/rubylang/reference.html)
 
@@ -49,8 +48,8 @@ JIT. rubylang carries no VM or JIT of its own. Highlights:
 
 - **Compiled, not tree-walked** — arithmetic and comparison operators lower to
   native fusevm ops so the JIT can trace hot loops.
-- **fusevm-hosted** — no local `vm.rs` / `jit.rs`; the shared engine behind
-  `zshrs`, `stryke`, `awkrs`, and `elisp`. `jit-disk-cache` persists native code
+- **fusevm-hosted** — no local `vm.rs` / `jit.rs`; the shared engine
+  used by every fusevm frontend. `jit-disk-cache` persists native code
   across runs.
 - **Native arithmetic** — a strict numeric hook supplies Ruby semantics
   (String/Array `+`, floored integer division, cross-type `==`) only for
@@ -101,7 +100,7 @@ cargo build
 
 `rubylang` is a standalone Rust crate (an explicit empty `[workspace]` keeps it
 independent of the meta repo). `fusevm` is pulled from crates.io with the `jit`,
-`jit-disk-cache`, and `aot` features. Run the tests with `cargo test`.
+`jit-disk-cache`, `aot`, and `ffi` features. Run the tests with `cargo test`.
 
 #### Zsh tab completion
 
