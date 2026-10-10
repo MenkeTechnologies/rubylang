@@ -5513,3 +5513,73 @@ x = {a: 1}; p x.replace({b: 2}), x, x.replace(x), (({}.freeze.replace({})) rescu
 class A; def hi = "A"; alias_method :hey, :hi; alias hey2 hey; def plain = 1; end
 class B < A; alias_method :b_hi, :hi; end
 p A.instance_method(:hey).original_name, A.new.method(:hey2).original_name, A.new.method(:hey2).name, B.new.method(:b_hi).original_name, A.new.method(:plain).original_name
+#==#
+c = Class.new { attr_accessor :v; def hi = :hi }
+o = c.new
+o.v = 3
+h = {c => 1}
+sub = Class.new(c)
+Named = c
+SubNamed = sub
+p c.name, c.to_s, o.class, o.v, o.hi, o.is_a?(Named), h[Named], h.keys.first, sub.superclass, sub.name, c.new.inspect =~ /\A#<Named/
+#==#
+m = Module.new { def greet = "hi" }
+Greeter = m
+class UsesGreeter; include Greeter; end
+p m.name, Greeter, UsesGreeter.new.greet, UsesGreeter.ancestors.first(2), m.instance_method(:greet).owner
+#==#
+s = Struct.new(:a)
+before = s.new(1)
+Pair = s
+p s.name, before, s.new(2).inspect, Pair.new(3).to_a
+#==#
+c = Class.new
+c.class_eval { attr_accessor :w }
+Holder = c
+p Holder.instance_method(:w).owner, Holder.instance_method(:w=).owner, Holder.new.method(:w).owner
+#==#
+class Foo; end
+a = Foo
+Alias2 = a
+p Foo.equal?(Alias2), Foo.object_id == Alias2.object_id, Foo.object_id == String.object_id, Foo.equal?(String)
+#==#
+case "hello"
+when /^h(.)/ then p $1, $~[0]
+end
+case "abc" when /(?<m>b)/ then p $~[:m] end
+p(/a/ === :a, /a/ === nil, $~, /a/ === 1)
+r = case "k9" when /\d/ then $& end
+p r
+#==#
+o = Object.new
+[["bad"], ["@"], ["@@a"], ["@1"], [3]].each do |(n)|
+  [:instance_variable_get, :instance_variable_defined?, :remove_instance_variable].each do |m|
+    begin
+      o.send(m, n)
+      p [m, :ok]
+    rescue NameError, TypeError => e
+      p [m, e.class, e.message]
+    end
+  end
+end
+begin; o.remove_instance_variable(:@nope); rescue NameError => e; p e.message, e.name; end
+o.instance_variable_set(:@a, nil)
+p o.remove_instance_variable("@a"), o.instance_variables
+o.instance_variable_set(:@b, 1)
+o.freeze
+begin; o.remove_instance_variable(:@b); rescue => e; p e.class; end
+#==#
+class Priv; private def sec = 1; protected def pro = 2; end
+k = Priv.new
+o = Object.new
+p [k.respond_to?(:sec), k.respond_to?(:sec, true), k.respond_to?(:pro), k.respond_to?(:pro, true)]
+p [o.respond_to?(:puts), o.respond_to?(:puts, true), o.respond_to?(:initialize), o.respond_to?(:initialize, true)]
+p [o.respond_to?(:freeze), o.respond_to?(:to_s), o.respond_to?(:instance_variable_get), o.respond_to?(:extend), o.respond_to?(:format, true)]
+p [3.respond_to?(:puts), 3.respond_to?(:puts, true), Comparable.respond_to?(:new), Priv.respond_to?(:module_function), Priv.respond_to?(:attr_accessor)]
+#==#
+p %w[-9 -99 a-9 -a 1.9.9 9.9 - -- a.9 z.z -z Az-9 $9 1-9 a--9 zz99 a9z <<koala>> 1999zzz].map(&:succ)
+#==#
+x = Object.new
+class << x; def hi = 1; attr_accessor :q; attr_reader :r; end
+class SingletonHolder; class << self; attr_accessor :cfg; def z = 1; end; def self.y = 2; end
+p x.singleton_class.instance_methods(false).sort, SingletonHolder.singleton_class.instance_methods(false).sort

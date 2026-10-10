@@ -339,7 +339,9 @@ lambda-vs-proc arity, metaprogramming hooks, `Comparable`/`Enumerable` mixins,
 `Set`, `Data`, `freeze`, object introspection, `Method` reflection
 (`#arity`/`#owner`/`#parameters`), multi-value Enumerator yields, string
 encodings, byte strings, the `Array#pack` / `String#unpack` directive surface,
-the `tr`/`squeeze`/`count`/`delete` character sets, `Complex`, …)
+the `tr`/`squeeze`/`count`/`delete` character sets, `Complex`, the object model
+(anonymous-class naming on constant assignment, `instance_variable_*` name
+validation, `respond_to?` visibility, `String#succ` carry rules), …)
 and diffs stdout + exit code of the reference
 `ruby` against rubylang. Every divergence is delta-debugged to a minimal
 reproducer and replays exactly with `parity-fuzz --seed N --once`. It runs

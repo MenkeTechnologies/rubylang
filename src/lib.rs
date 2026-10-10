@@ -8,6 +8,7 @@
 
 pub mod aot;
 pub mod arity_table;
+pub mod private_builtins;
 pub mod ast;
 pub mod banner;
 pub mod builtins;

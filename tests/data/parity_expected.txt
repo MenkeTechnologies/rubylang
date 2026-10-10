@@ -4505,3 +4505,75 @@ nil
 :hey2
 :hi
 :plain
+#==#
+"Named"
+"Named"
+Named
+3
+:hi
+true
+1
+Named
+Named
+"SubNamed"
+0
+#==#
+"Greeter"
+Greeter
+"hi"
+[UsesGreeter, Greeter]
+Greeter
+#==#
+"Pair"
+#<struct Pair a=1>
+"#<struct Pair a=2>"
+[3]
+#==#
+Holder
+Holder
+Holder
+#==#
+true
+true
+false
+false
+#==#
+"e"
+"he"
+"b"
+true
+false
+nil
+false
+"9"
+#==#
+[:instance_variable_get, NameError, "'bad' is not allowed as an instance variable name"]
+[:instance_variable_defined?, NameError, "'bad' is not allowed as an instance variable name"]
+[:remove_instance_variable, NameError, "'bad' is not allowed as an instance variable name"]
+[:instance_variable_get, NameError, "'@' is not allowed as an instance variable name"]
+[:instance_variable_defined?, NameError, "'@' is not allowed as an instance variable name"]
+[:remove_instance_variable, NameError, "'@' is not allowed as an instance variable name"]
+[:instance_variable_get, NameError, "'@@a' is not allowed as an instance variable name"]
+[:instance_variable_defined?, NameError, "'@@a' is not allowed as an instance variable name"]
+[:remove_instance_variable, NameError, "'@@a' is not allowed as an instance variable name"]
+[:instance_variable_get, NameError, "'@1' is not allowed as an instance variable name"]
+[:instance_variable_defined?, NameError, "'@1' is not allowed as an instance variable name"]
+[:remove_instance_variable, NameError, "'@1' is not allowed as an instance variable name"]
+[:instance_variable_get, TypeError, "3 is not a symbol nor a string"]
+[:instance_variable_defined?, TypeError, "3 is not a symbol nor a string"]
+[:remove_instance_variable, TypeError, "3 is not a symbol nor a string"]
+"instance variable @nope not defined"
+:@nope
+nil
+[]
+FrozenError
+#==#
+[false, true, false, true]
+[false, true, false, true]
+[true, true, true, true, true]
+[false, true, false, false, true]
+#==#
+["-10", "-100", "a-10", "-b", "2.0.0", "10.0", ".", "-.", "a.10", "aa.a", "-aa", "Az-10", "$10", "2-0", "a--10", "aaa00", "b0a", "<<koalb>>", "2000aaa"]
+#==#
+[:hi, :q, :q=, :r]
+[:cfg, :cfg=, :y, :z]

@@ -878,6 +878,64 @@ fn gen_numprec(seed: u64) -> Vec<String> {
     })
 }
 
+/// OBJECT MODEL: what an anonymous class becomes once a constant names it, and
+/// the reflection surface around it — `instance_variable_*` name validation,
+/// `remove_instance_variable`, `respond_to?` with and without the private
+/// surface, `equal?`/`object_id` of a class, and `String#succ` across
+/// separators.
+///
+/// The naming cases create the instance BEFORE the constant assignment and read
+/// the class back through the local that held the anonymous class: both are
+/// holders of the old name, and a rename that only moves the class table leaves
+/// them pointing at nothing.
+fn gen_objmodel(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let cname = r.pick(&["Alpha", "Beta", "Gamma9", "Delta_x"]);
+    let ivname = r.pick(&[
+        "\"@a\"", ":@a", "\"a\"", "\"@\"", "\"@@a\"", "\"@1\"", ":\"@a b\"", "\"@\\u00e9\"", "3",
+    ]);
+    let recv = r.pick(&["Object.new", "3", "\"s\"", "[]", "nil", "Class.new", "Comparable"]);
+    let meth = r.pick(&[
+        ":puts", ":initialize", ":freeze", ":to_s", ":format", ":instance_variable_get", ":extend",
+        ":new", ":attr_accessor", ":module_function", ":respond_to_missing?", ":binding",
+    ]);
+    let succ = r.pick(&[
+        "-9", "a-9", "-a", "1.9.9", "9.9", "z.z", "Az-9", "$9", "1-9", "a--9", "zz99", "<<koala>>",
+        "a!9", "9z", "--", "a.9",
+    ]);
+    one(match r.below(9) {
+        0 => format!(
+            "c = Class.new {{ attr_accessor :v; def hi = :hi }}\no = c.new\no.v = 1\n\
+             {cname} = c\np [c.name, o.class, o.hi, o.v, {cname}.new.hi, c.equal?({cname})]"
+        ),
+        1 => format!(
+            "m = Module.new {{ def hi = :hi }}\n{cname} = m\n\
+             class Host_{cname}; include {cname}; end\np [m.name, Host_{cname}.new.hi, m.equal?({cname})]"
+        ),
+        2 => format!(
+            "base = Class.new\nsub = Class.new(base)\n{cname} = base\n\
+             p [sub.superclass, sub.superclass.name, {{base => 1}}[{cname}]]"
+        ),
+        3 => format!(
+            "o = Object.new\no.instance_variable_set(:@a, 1)\n\
+             [:instance_variable_get, :instance_variable_defined?, :remove_instance_variable].each do |m|\n  \
+             begin\n    p [m, o.send(m, {ivname})]\n  rescue NameError, TypeError => e\n    \
+             p [m, e.class, e.message]\n  end\nend\np o.instance_variables"
+        ),
+        4 => format!(
+            "o = Object.new\no.freeze\nbegin\n  o.remove_instance_variable(:@a)\nrescue => e\n  \
+             p e.class\nend"
+        ),
+        5 => format!("p [{recv}.respond_to?({meth}), {recv}.respond_to?({meth}, true)]"),
+        6 => "p [String.equal?(String), Object.object_id == Object.object_id, String.object_id == Object.object_id]".to_string(),
+        7 => format!("p {succ:?}.succ"),
+        _ => format!(
+            "c = Class.new\n{cname} = c\np [{cname}.equal?(c), {cname}.object_id == c.object_id, \
+             c.to_s, c.inspect]"
+        ),
+    })
+}
+
 // Mode plumbing.
 // ---------------------------------------------------------------------------
 
@@ -936,6 +994,7 @@ enum Mode {
     Strpart,
     Arrreshape,
     Numprec,
+    Objmodel,
     /// Round-robin over every mode in `ALL_MODES`. Not itself a member of
     /// `ALL_MODES` (that would recurse), so adding a mode never changes any
     /// other mode's own seed→case mapping — but it DOES reshuffle which mode
@@ -998,6 +1057,7 @@ const ALL_MODES: &[Mode] = &[
     Mode::Strpart,
     Mode::Arrreshape,
     Mode::Numprec,
+    Mode::Objmodel,
 ];
 
 fn gen_intmeth(seed: u64) -> Vec<String> {
@@ -2174,6 +2234,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Strpart => gen_strpart(seed),
         Mode::Arrreshape => gen_arrreshape(seed),
         Mode::Numprec => gen_numprec(seed),
+        Mode::Objmodel => gen_objmodel(seed),
         Mode::All => gen_case(seed, ALL_MODES[(seed as usize) % ALL_MODES.len()]),
     }
 }
@@ -2800,6 +2861,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Strpart => "strpart",
         Mode::Arrreshape => "arrreshape",
         Mode::Numprec => "numprec",
+        Mode::Objmodel => "objmodel",
         Mode::All => "all",
     }
 }

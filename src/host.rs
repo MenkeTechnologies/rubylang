@@ -1511,6 +1511,8 @@ pub struct RubyHost {
     /// inside `def self.m` or `class << self`): class name → variable name →
     /// value. Unlike `@@` class variables these are NOT inherited.
     class_ivars: IndexMap<String, IndexMap<String, Value>>,
+    /// Class names in first-`object_id` order; the position is the class's id.
+    class_object_ids: IndexMap<String, ()>,
     /// Native attribute accessors declared at runtime (`class_eval { attr_accessor
     /// :x }`, `C.send(:attr_reader, :y)`): class → field → (has_reader, has_writer).
     /// Checked in dispatch as an `@field` get/set, so no bytecode method is
@@ -2318,6 +2320,7 @@ impl RubyHost {
             struct_counter: 0,
             class_vars: IndexMap::new(),
             class_ivars: IndexMap::new(),
+            class_object_ids: IndexMap::new(),
             attr_accessors: IndexMap::new(),
             attr_aliases: IndexMap::new(),
             define_methods: IndexMap::new(),
@@ -4318,11 +4321,34 @@ impl RubyHost {
             None if !unbound && !self.singleton_method_names(recv).is_empty() => self
                 .singleton_class_name(recv)
                 .unwrap_or_else(|| self.dispatch_class(recv)),
-            None => self
-                .classref_name(recv)
-                .map(|c| format!("#<Class:{c}>"))
-                .unwrap_or_else(|| self.dispatch_class(recv)),
+            // A runtime `attr_*` (via `send`/`class_eval`, or on an anonymous
+            // class) lives in the attribute registry, not the method table; the
+            // class that registered it owns it.
+            None => self.runtime_attr_owner(recv, name, unbound).unwrap_or_else(|| {
+                self.classref_name(recv)
+                    .map(|c| format!("#<Class:{c}>"))
+                    .unwrap_or_else(|| self.dispatch_class(recv))
+            }),
         }
+    }
+    /// The class in `recv`'s ancestry whose runtime attribute registry defines
+    /// `name` (a reader, or a `name=` writer), mirroring [`Self::attr_access`].
+    fn runtime_attr_owner(&self, recv: &Value, name: &str, unbound: bool) -> Option<String> {
+        let class = match self.object_class(recv) {
+            Some(c) => c,
+            None if unbound => self.classref_name(recv)?,
+            None => return None,
+        };
+        let (field, writer) = match name.strip_suffix('=') {
+            Some(f) => (f, true),
+            None => (name, false),
+        };
+        self.class_ancestry(&class).into_iter().find(|c| {
+            self.attr_accessors
+                .get(c)
+                .and_then(|m| m.get(field))
+                .is_some_and(|(r, w)| if writer { *w } else { *r })
+        })
     }
     /// `Method#parameters` descriptors: `(kind, name)` pairs, with the name absent
     /// for a built-in (native code has no written parameter names, and MRI reports
@@ -6229,7 +6255,7 @@ impl RubyHost {
     /// (matching MRI) and `include Foo` (resolved by name) finds it. Also moves any
     /// class variables / class-level ivars keyed by the old anonymous name.
     pub fn is_anon_class(&self, name: &str) -> bool {
-        name.starts_with("#<Class:") && self.classes.contains_key(name)
+        (name.starts_with("#<Class:") || name.starts_with("#<Module:")) && self.classes.contains_key(name)
     }
     pub fn rename_class(&mut self, old: &str, new: &str) {
         if let Some(def) = self.classes_mut().shift_remove(old) {
@@ -6253,6 +6279,51 @@ impl RubyHost {
         if let Some(v) = self.method_aliases.shift_remove(old) {
             self.method_aliases.insert(new.to_string(), v);
         }
+        self.rewrite_class_name(old, new);
+    }
+    /// Re-point every holder of the class name `old` at `new`: instances, class
+    /// references (locals, hash keys, array slots) and the superclass / mixin
+    /// lists of other classes. Classes are keyed by name, so an anonymous
+    /// `Class.new` acquiring its constant name would otherwise leave instances
+    /// created beforehand, and values still holding the old reference, dangling.
+    fn rewrite_class_name(&mut self, old: &str, new: &str) {
+        for obj in &mut self.heap {
+            match obj {
+                RObj::Object { class, .. } | RObj::ClassRef(class) if class == old => {
+                    *class = new.to_string();
+                }
+                // A class used as a Hash key is keyed by name; rebuild in place
+                // so the entry keeps its position.
+                RObj::Hash { map, .. } if map.contains_key(&RKey::Class(old.to_string())) => {
+                    *map = std::mem::take(map)
+                        .into_iter()
+                        .map(|(k, v)| match k {
+                            RKey::Class(n) if n == old => (RKey::Class(new.to_string()), v),
+                            k => (k, v),
+                        })
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+        let rename = |n: &mut String| {
+            if n == old {
+                *n = new.to_string();
+            }
+        };
+        for def in self.classes_mut().values_mut() {
+            def.superclass.iter_mut().for_each(rename);
+            for list in [&mut def.includes, &mut def.prepends, &mut def.extends] {
+                list.iter_mut().for_each(rename);
+            }
+        }
+    }
+    /// The stable `object_id` of the class `name`. A class is one object in
+    /// Ruby, but each constant read here makes a fresh reference cell, so the id
+    /// is keyed by name; ids start clear of the heap-handle range.
+    pub fn class_object_id(&mut self, name: &str) -> i64 {
+        let (index, _) = self.class_object_ids.insert_full(name.to_string(), ());
+        (1 << 40) + (index as i64) * 8
     }
     /// Allocate an instance of `class`.
     pub fn new_object(&mut self, class: &str) -> Value {
@@ -7192,6 +7263,30 @@ impl RubyHost {
                     .filter(|k| !self.is_extended_singleton(id, k));
                 take(Box::new(own), &mut out);
             }
+            // Attribute accessors registered through a metaclass
+            // (`class << obj; attr_accessor :q; end`) live in the attribute
+            // registry, not in a method table; a class's own metaclass also
+            // owns its class methods.
+            if n.starts_with("#<Class:") {
+                let attrs = self.attr_accessors.get(n).into_iter().flatten();
+                let accessors = attrs.flat_map(|(field, (r, w))| {
+                    let reader = r.then(|| field.clone());
+                    let writer = w.then(|| format!("{field}="));
+                    reader.into_iter().chain(writer)
+                });
+                let mut owned: Vec<String> = accessors.collect();
+                if let Some(attached) = n.strip_prefix("#<Class:").and_then(|s| s.strip_suffix('>')) {
+                    if let Some(def) = self.classes.get(attached) {
+                        owned.extend(def.class_methods.keys().cloned());
+                    }
+                    if let Some(m) = self.class_define_methods.get(attached) {
+                        owned.extend(m.keys().cloned());
+                    }
+                }
+                if want.contains(&Visibility::Public) {
+                    out.extend(owned.into_iter().filter(|k| !k.starts_with("__")));
+                }
+            }
             // `Comparable` and `Enumerable` have no entry in `classes` — their
             // methods are dispatched natively — so walking the tables alone
             // reported `Comparable.instance_methods` as empty and left every
@@ -7578,6 +7673,20 @@ impl RubyHost {
                         .insert(name.to_string(), v);
                 }
             }
+        }
+    }
+    /// Unset the instance variable `name` (bare, no `@`) on `obj` — object,
+    /// class-level, or native-handle side table — answering its value, or
+    /// `None` when it was never set.
+    pub fn remove_ivar_of(&mut self, obj: &Value, name: &str) -> Option<Value> {
+        let Value::Obj(i) = obj else { return None };
+        match self.heap.get_mut(*i as usize) {
+            Some(RObj::Object { ivars, .. }) => ivars.shift_remove(name),
+            Some(RObj::ClassRef(cls)) => {
+                let cls = cls.clone();
+                self.class_ivars.get_mut(&cls)?.shift_remove(name)
+            }
+            _ => self.obj_ivars.get_mut(i)?.shift_remove(name),
         }
     }
     /// The instance-variable names of `obj`, each with its `@` sigil restored.

@@ -1048,13 +1048,13 @@ fn b_setconst(vm: &mut VM, _: u8) -> Value {
             h.rename_struct(&cref, &name);
             // Also move any methods defined by a `Struct.new(...) do ... end` body.
             h.rename_class(&cref, &name);
-            h.class_ref(&name)
+            val.clone()
         }
         // `Foo = Class.new` / `Foo = Module.new` names the anonymous class/module
         // after the constant (MRI behavior), so `include Foo` resolves by name.
         Some(cref) if h.is_anon_class(&cref) => {
             h.rename_class(&cref, &name);
-            h.class_ref(&name)
+            val.clone()
         }
         _ => val.clone(),
     });
@@ -1890,6 +1890,54 @@ fn native_self_call(
     }
 }
 
+/// The instance-variable name `arg` spells, `@` stripped — `rb_check_id` plus
+/// `rb_is_instance_name`: a String or Symbol of `@` followed by an identifier
+/// that does not start with a digit or another `@`. Anything else raises the
+/// NameError (carrying `name`) or TypeError MRI does.
+fn ivar_name_arg(arg: &Value) -> Result<String, String> {
+    let Some(raw) = with_host(|h| h.as_str(arg).or_else(|| h.as_symbol(arg))) else {
+        let shown = with_host(|h| h.inspect(arg));
+        return Err(raise_exc(
+            "TypeError",
+            &format!("{shown} is not a symbol nor a string"),
+        ));
+    };
+    let ident = |c: char| c.is_alphanumeric() || c == '_' || !c.is_ascii();
+    let valid = raw.strip_prefix('@').is_some_and(|rest| {
+        rest.chars().next().is_some_and(|c| !c.is_ascii_digit())
+            && rest.chars().all(ident)
+    });
+    if valid {
+        return Ok(raw[1..].to_string());
+    }
+    Err(raise_exc_with(
+        "NameError",
+        &format!("'{raw}' is not allowed as an instance variable name"),
+        &[("name", arg.clone())],
+    ))
+}
+
+/// `respond_to?` for a method the reference interpreter DEFINES on one of the
+/// receiver's built-in ancestors: public ones answer true, private ones only
+/// when the second argument asks for the private surface. `None` when no
+/// built-in ancestor defines `name`, leaving the caller's other rules to decide.
+fn builtin_responds(recv: &Value, name: &str, include_all: Option<&Value>) -> Option<bool> {
+    let include_all = include_all.is_some_and(|a| with_host(|h| h.truthy(a)));
+    let Some(owner) = with_host(|h| h.builtin_owner(recv, name)) else {
+        // `Module`/`Class` instance methods are not on a plain value: only a
+        // class or module (or the top-level `main`, which forwards a few)
+        // answers them.
+        let module_only = ["Module", "Class"]
+            .iter()
+            .any(|o| crate::arity_table::lookup(o, name).is_some());
+        let plain_value = with_host(|h| h.classref_name(recv).is_none())
+            && !crate::host::is_main(recv)
+            && with_host(|h| h.find_method("Object", name).is_none());
+        return (module_only && plain_value).then_some(false);
+    };
+    Some(include_all || !crate::private_builtins::is_private(owner, name))
+}
+
 fn is_universal_object_method(name: &str) -> bool {
     matches!(
         name,
@@ -1897,6 +1945,7 @@ fn is_universal_object_method(name: &str) -> bool {
             | "instance_variable_set"
             | "instance_variables"
             | "instance_variable_defined?"
+            | "remove_instance_variable"
             | "send"
             | "__send__"
             | "public_send"
@@ -2381,9 +2430,17 @@ fn dispatch_resolved(
                 return Ok(Value::Bool(with_host(|h| h.is_a(&args[0], &cls))));
             }
             if let Some((re, _)) = with_host(|h| h.as_regex(recv)) {
-                return Ok(Value::Bool(
-                    re.is_match(&arg_str(&args[0])).unwrap_or(false),
-                ));
+                // `rb_reg_eqq`: a String or Symbol is matched and sets `$~`; any
+                // other operand clears `$~` and answers false.
+                let matchable = with_host(|h| {
+                    h.as_str(&args[0]).is_some() || h.as_symbol(&args[0]).is_some()
+                });
+                if !matchable {
+                    set_match_globals(None, &re, recv);
+                    return Ok(Value::Bool(false));
+                }
+                let hit = dispatch_regexp(recv, "=~", args, None)?;
+                return Ok(Value::Bool(!matches!(hit, Value::Undef)));
             }
             if let Some((lo, hi, excl)) = with_host(|h| h.as_range(recv)) {
                 let n = as_i(&args[0]);
@@ -2444,7 +2501,10 @@ fn dispatch_resolved(
                 Value::Undef => 4,
                 Value::Bool(false) => 0,
                 Value::Bool(true) => 20,
-                Value::Obj(h) => (*h as i64 + 1).wrapping_mul(8),
+                Value::Obj(h) => match with_host(|host| host.classref_name(recv)) {
+                    Some(class) => with_host(|host| host.class_object_id(&class)),
+                    None => (*h as i64 + 1).wrapping_mul(8),
+                },
                 Value::Float(f) => (f.to_bits() as i64) | 1,
                 _ => 8,
             };
@@ -2561,9 +2621,8 @@ fn dispatch_resolved(
         }
         "frozen?" => return Ok(Value::Bool(with_host(|h| h.is_frozen(recv)))),
         "instance_variable_get" => {
-            let raw = name_of(&args[0]);
-            let key = raw.strip_prefix('@').unwrap_or(&raw);
-            return Ok(with_host(|h| h.ivar_of(recv, key)));
+            let key = ivar_name_arg(&args[0])?;
+            return Ok(with_host(|h| h.ivar_of(recv, &key)));
         }
         "instance_variable_set" => {
             // A frozen object rejects ivar mutation. MRI names the receiver as
@@ -2577,8 +2636,7 @@ fn dispatch_resolved(
                     &[("receiver", recv.clone())],
                 ));
             }
-            let raw = name_of(&args[0]);
-            let key = raw.strip_prefix('@').unwrap_or(&raw).to_string();
+            let key = ivar_name_arg(&args[0])?;
             let val = args[1].clone();
             with_host(|h| h.set_ivar_of(recv, &key, val.clone()));
             return Ok(val);
@@ -2594,10 +2652,30 @@ fn dispatch_resolved(
             // True when the named ivar has been assigned on the receiver.
             // `ivar_names` reports them with the leading `@`, so normalize the
             // query (accepting `:@x` and `"@x"`) to the same form.
-            let raw = name_of(&args[0]);
-            let key = format!("@{}", raw.strip_prefix('@').unwrap_or(&raw));
+            let key = format!("@{}", ivar_name_arg(&args[0])?);
             let has = with_host(|h| h.ivar_names(recv).contains(&key));
             return Ok(Value::Bool(has));
+        }
+        // `remove_instance_variable`: unset the ivar and answer its value; an
+        // unset one raises NameError, a frozen receiver FrozenError.
+        "remove_instance_variable" if args.len() == 1 => {
+            let key = ivar_name_arg(&args[0])?;
+            if with_host(|h| h.is_frozen(recv)) {
+                let (cls, insp) = with_host(|h| (h.class_of(recv).to_string(), h.inspect(recv)));
+                return Err(raise_exc_with(
+                    "FrozenError",
+                    &format!("can't modify frozen {cls}: {insp}"),
+                    &[("receiver", recv.clone())],
+                ));
+            }
+            return match with_host(|h| h.remove_ivar_of(recv, &key)) {
+                Some(v) => Ok(v),
+                None => Err(raise_exc_with(
+                    "NameError",
+                    &format!("instance variable @{key} not defined"),
+                    &[("name", args[0].clone()), ("receiver", recv.clone())],
+                )),
+            };
         }
         // `Kernel#pretty_inspect`: `PP.pp(self, "")`, whose String output has
         // no `winsize`, so the width is `$COLUMNS` or 80, less one.
@@ -2869,9 +2947,13 @@ fn dispatch_resolved(
                         .get(1)
                         .map(|a| with_host(|h| h.truthy(a)))
                         .unwrap_or(false);
-                    let private = with_host(|h| h.method_visibility(&cls, &m))
-                        == crate::host::Visibility::Private;
-                    return Ok(Value::Bool(include_private || !private));
+                    // Protected methods are hidden from `respond_to?` too.
+                    let restricted = with_host(|h| h.method_visibility(&cls, &m))
+                        != crate::host::Visibility::Public;
+                    return Ok(Value::Bool(include_private || !restricted));
+                }
+                if let Some(answer) = builtin_responds(recv, &m, args.get(1)) {
+                    return Ok(Value::Bool(answer));
                 }
                 // A `respond_to_missing?` on the object's own singleton
                 // (`def obj.respond_to_missing?`) is found first, as MRI's method
@@ -3001,6 +3083,25 @@ fn dispatch_resolved(
             // singleton-class instance method, and the reflection surface count;
             // `respond_to_missing?` on the singleton class is the final say.
             if let Some(cname) = with_host(|h| h.classref_name(recv)) {
+                // `Class` undefines the Module methods that only make sense on a
+                // module, and a module has none of `Class`'s own.
+                let is_module = with_host(|h| h.is_module_name(&cname));
+                let absent: &[&str] = if is_module {
+                    &["new", "allocate", "superclass", "inherited", "subclasses"]
+                } else {
+                    &[
+                        "module_function",
+                        "refine",
+                        "append_features",
+                        "prepend_features",
+                        "extend_object",
+                    ]
+                };
+                if absent.contains(&m.as_str())
+                    && with_host(|h| h.find_class_method(&cname, &m).is_none())
+                {
+                    return Ok(Value::Bool(false));
+                }
                 if with_host(|h| h.class_responds_to(&cname, &m)) {
                     // A `private_class_method` does not respond unless the
                     // second argument asks for the private surface, exactly as
@@ -3012,6 +3113,9 @@ fn dispatch_resolved(
                     let private = with_host(|h| h.class_method_visibility(&cname, &m))
                         == crate::host::Visibility::Private;
                     return Ok(Value::Bool(include_private || !private));
+                }
+                if let Some(answer) = builtin_responds(recv, &m, args.get(1)) {
+                    return Ok(Value::Bool(answer));
                 }
                 // A `def self.respond_to_missing?` (or one inherited from a
                 // superclass's singleton, or from an `extend`ed module).
@@ -3064,6 +3168,9 @@ fn dispatch_resolved(
                 let permissive = with_host(|h| h.is_builtin_class(&cname))
                     && !matches!(cname.as_str(), "BasicObject" | "Object");
                 return Ok(Value::Bool(permissive));
+            }
+            if let Some(answer) = builtin_responds(recv, &m, args.get(1)) {
+                return Ok(Value::Bool(answer));
             }
             // Built-in receivers are otherwise permissive, but the pattern-match
             // deconstruction protocol must be accurate: only Arrays respond to
@@ -11707,37 +11814,65 @@ fn str_succ(s: &str) -> String {
     }
     let mut chars: Vec<char> = s.chars().collect();
     if chars.iter().any(|c| c.is_ascii_alphanumeric()) {
-        let mut idx = chars.len() as isize - 1;
-        let mut prepend: Option<char> = None;
-        loop {
-            while idx >= 0 && !chars[idx as usize].is_ascii_alphanumeric() {
-                idx -= 1;
+        // `rb_str_succ`: walk right to left over the ASCII alphanumerics,
+        // wrapping `9`/`z`/`Z` and carrying into the next one. The carry
+        // character is inserted AT the leftmost wrapped alphanumeric (so
+        // `"-9".succ` is `"-10"`, not `"1-0"`), and a separator between an
+        // alphabetic and a numeric run ends the carry (`"a-9".succ` is `"a-10"`).
+        let mut last_wrapped: Option<usize> = None;
+        let mut carry: Option<(usize, char)> = None;
+        let mut after_separator = false;
+        for idx in (0..chars.len()).rev() {
+            let c = chars[idx];
+            if after_separator {
+                if let Some(w) = last_wrapped {
+                    let prev = chars[w];
+                    let type_change = if prev.is_ascii_alphabetic() {
+                        c.is_ascii_digit()
+                    } else {
+                        c.is_ascii_alphabetic()
+                    };
+                    if type_change {
+                        break;
+                    }
+                }
             }
-            if idx < 0 {
-                break;
+            // A non-ASCII letter or digit counts as alphanumeric when its next
+            // code point still is one (`"aé".succ` is `"aê"`).
+            if !c.is_ascii() {
+                match char::from_u32(c as u32 + 1).filter(|n| c.is_alphanumeric() && n.is_alphanumeric()) {
+                    Some(n) => {
+                        chars[idx] = n;
+                        carry = None;
+                        break;
+                    }
+                    None => {
+                        after_separator = true;
+                        continue;
+                    }
+                }
             }
-            let c = chars[idx as usize];
-            let (next, carry) = match c {
-                '0'..='8' | 'a'..='y' | 'A'..='Y' => ((c as u8 + 1) as char, false),
-                '9' => ('0', true),
-                'z' => ('a', true),
-                'Z' => ('A', true),
-                _ => (c, false),
+            if !c.is_ascii_alphanumeric() {
+                after_separator = true;
+                continue;
+            }
+            after_separator = false;
+            let (next, carry_char) = match c {
+                '0'..='8' | 'a'..='y' | 'A'..='Y' => {
+                    chars[idx] = (c as u8 + 1) as char;
+                    carry = None;
+                    break;
+                }
+                '9' => ('0', '1'),
+                'z' => ('a', 'a'),
+                _ => ('A', 'A'),
             };
-            chars[idx as usize] = next;
-            if !carry {
-                prepend = None;
-                break;
-            }
-            prepend = Some(match c {
-                '0'..='9' => '1',
-                'a'..='z' => 'a',
-                _ => 'A',
-            });
-            idx -= 1;
+            chars[idx] = next;
+            last_wrapped = Some(idx);
+            carry = Some((idx, carry_char));
         }
-        if let Some(pc) = prepend {
-            chars.insert((idx + 1).max(0) as usize, pc);
+        if let Some((pos, ch)) = carry {
+            chars.insert(pos, ch);
         }
     } else {
         // No alphanumerics: increment the last code point, carrying leftward.
@@ -12794,10 +12929,20 @@ fn dispatch_array(
         "grep" | "grep_v" if !args.is_empty() => {
             let invert = name == "grep_v";
             let mut out = Vec::new();
+            // `grep_regexp_i`: a Regexp pattern with no block matches through
+            // `rb_reg_match_p`, which leaves `$~` alone; with a block, `===`
+            // runs and sets it. A non-String, non-Symbol element never matches.
+            let silent = block.is_none() && with_host(|h| h.as_regex(&args[0]).is_some());
             for x in &arr {
-                let m = dispatch(&args[0], "===", std::slice::from_ref(x), None)
-                    .map(|v| with_host(|h| h.truthy(&v)))
-                    .unwrap_or(false);
+                let test = if silent { "match?" } else { "===" };
+                let stringy = with_host(|h| h.as_str(x).is_some() || h.as_symbol(x).is_some());
+                let m = if silent && !stringy {
+                    false
+                } else {
+                    dispatch(&args[0], test, std::slice::from_ref(x), None)
+                        .map(|v| with_host(|h| h.truthy(&v)))
+                        .unwrap_or(false)
+                };
                 if m != invert {
                     match &block {
                         Some(b) => out.push(call_proc(b, std::slice::from_ref(x))?),
@@ -28251,7 +28396,15 @@ pub(crate) fn uncaught_detailed_message(exc: &Value) -> Option<String> {
 /// `equal?` — whether `a` and `b` are the same object.
 fn identical(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Obj(i), Value::Obj(j)) => i == j,
+        // A class is one object however many times its constant is read, but
+        // each read yields its own reference cell, so compare by class name.
+        (Value::Obj(i), Value::Obj(j)) => {
+            i == j
+                || with_host(|h| match (h.classref_name(a), h.classref_name(b)) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => false,
+                })
+        }
         (Value::Int(i), Value::Int(j)) => i == j,
         (Value::Float(i), Value::Float(j)) => i == j,
         (Value::Bool(i), Value::Bool(j)) => i == j,
