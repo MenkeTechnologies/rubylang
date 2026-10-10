@@ -37,7 +37,7 @@ Check syntax only: print
 .TP
 .BR \-w ", " \-W [\fIlevel\fR]
 Set the warning level in
-.BR $VERBOSE " (" \-W0 " \(-> nil, " \-w / \-W1 " \(-> false, " \-W2 " \(-> true)."
+.BR $VERBOSE " (" \-W0 " \(-> nil, " \-W1 " \(-> false, " \-w / \-W2 " \(-> true)."
 .TP
 .BR \-d ", " \-\-debug
 Set
@@ -91,7 +91,9 @@ Run it, then report which fusevm execution tier took each of its chunks.
 .B \-\-disasm " " \fIFILE\fR
 Print a fusevm bytecode disassembly listing and exit.
 .SH EXIT STATUS
-0 on success, 1 on a parse or runtime error (reported to stderr as
-.IR "ruby: <reason>" ).
+0 on success, 1 on failure. Option, load, and syntax errors are reported to
+stderr as
+.IR "ruby: <reason>" ;
+an uncaught Ruby exception is printed in MRI form without that prefix.
 .SH SEE ALSO
 Project: https://github.com/MenkeTechnologies/rubylang

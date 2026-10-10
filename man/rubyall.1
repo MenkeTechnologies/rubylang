@@ -64,7 +64,7 @@ exceptions, splat parameters, and the
 .B &:sym
 block\-pass shorthand \(em checked against reference
 .B ruby
-by a 35\-snippet differential parity harness. A persistent REPL runs on the same
+by a differential parity harness. A persistent REPL runs on the same
 host.
 .SH 3. ARCHITECTURE
 .EX
@@ -74,7 +74,7 @@ Ruby source \[->] lexer \[->] parser (AST) \[->] lower to fusevm bytecode \[->] 
 There is no bespoke VM or JIT; arithmetic lowers to native fusevm ops so the tracing
 JIT can compile hot loops, while Ruby object semantics are served by the
 .B RubyHost
-heap. The same fusevm engine hosts strykelang, zshrs, awkrs, vimlrs, and elisprs.
+heap. The same fusevm engine hosts other language frontends.
 A transparent rkyv bytecode cache and AOP intercepts ride on top.
 .SH 4. TOOLING
 .SS Language server (\-\-lsp)
