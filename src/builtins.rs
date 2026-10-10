@@ -27941,8 +27941,81 @@ fn dbl_complex_new_polar_pi(abs: f64, ang: f64) -> Value {
 }
 
 // MRI uses libm's `__cospi`/`__sinpi` where the platform has them (Apple's
-// libm), else `cos(M_PI * x)` — so the two builds round differently, and so
-// does this port, the same way.
+// libm), else `cos(M_PI * x)`. The latter rounds `M_PI * x` first, so
+// `cos(M_PI * (1/3))` is 0.5000000000000001 on glibc where Apple's `__cospi`
+// answers 0.5. Apple builds call `__cospi`/`__sinpi` as MRI does; elsewhere the
+// value is computed without the platform's transcendental functions: the
+// argument is reduced exactly to a quarter period and sin/cos of `PI * f` are
+// summed as Taylor series in double-double arithmetic, which is the correctly
+// rounded result (Apple's is within 1 ulp of it), so every non-Apple platform
+// produces identical digits.
+#[cfg(any(test, not(target_vendor = "apple")))]
+type Dd = (f64, f64);
+
+#[cfg(any(test, not(target_vendor = "apple")))]
+fn dd_add(a: Dd, b: Dd) -> Dd {
+    let s = a.0 + b.0;
+    let bb = s - a.0;
+    let e = (a.0 - (s - bb)) + (b.0 - bb) + a.1 + b.1;
+    let hi = s + e;
+    (hi, e - (hi - s))
+}
+
+#[cfg(any(test, not(target_vendor = "apple")))]
+fn dd_mul(a: Dd, b: Dd) -> Dd {
+    let p = a.0 * b.0;
+    let e = a.0.mul_add(b.0, -p) + a.0 * b.1 + a.1 * b.0;
+    let hi = p + e;
+    (hi, e - (hi - p))
+}
+
+/// `a / d` for a small exact integer `d`.
+#[cfg(any(test, not(target_vendor = "apple")))]
+fn dd_div_int(a: Dd, d: f64) -> Dd {
+    let q1 = a.0 / d;
+    let r = dd_add(a, (-q1 * d, -q1.mul_add(d, -(q1 * d))));
+    let q2 = r.0 / d;
+    let hi = q1 + q2;
+    (hi, q2 - (hi - q1))
+}
+
+/// `(sin z, cos z)` for a double-double `|z| <= PI/4`, by Taylor series.
+#[cfg(any(test, not(target_vendor = "apple")))]
+fn dd_sincos_small(z: Dd) -> (Dd, Dd) {
+    let z2 = dd_mul(z, z);
+    // sin z = z * (1 - z2/(2*3) * (1 - z2/(4*5) * ...)); cos likewise from 1.
+    let series = |first: f64| {
+        let mut acc: Dd = (1.0, 0.0);
+        let mut k = first + 24.0;
+        while k >= first {
+            let t = dd_div_int(dd_mul(z2, acc), k * (k + 1.0));
+            acc = dd_add((1.0, 0.0), (-t.0, -t.1));
+            k -= 2.0;
+        }
+        acc
+    };
+    (dd_mul(z, series(2.0)), series(1.0))
+}
+
+/// `(sin(PI * x), cos(PI * x))` for finite `x`, reducing by exact `fmod`
+/// and quarter-period steps so no rounding precedes the series.
+#[cfg(any(test, not(target_vendor = "apple")))]
+fn sincos_pi(x: f64) -> (f64, f64) {
+    const PI_DD: Dd = (std::f64::consts::PI, 1.224_646_799_147_353_2e-16);
+    let r = x.abs() % 2.0;
+    let n = (r * 2.0).round();
+    let f = r - n * 0.5;
+    let (s, c) = dd_sincos_small(dd_mul(PI_DD, (f, 0.0)));
+    let (s, c) = (s.0 + s.1, c.0 + c.1);
+    let (s, c) = match n as u8 % 4 {
+        0 => (s, c),
+        1 => (c, -s),
+        2 => (-s, -c),
+        _ => (-c, s),
+    };
+    (if x.is_sign_negative() { -s } else { s }, c)
+}
+
 #[cfg(target_vendor = "apple")]
 fn cospi(x: f64) -> f64 {
     extern "C" {
@@ -27959,11 +28032,19 @@ fn sinpi(x: f64) -> f64 {
 }
 #[cfg(not(target_vendor = "apple"))]
 fn cospi(x: f64) -> f64 {
-    (std::f64::consts::PI * x).cos()
+    if x.is_finite() {
+        sincos_pi(x).1
+    } else {
+        f64::NAN
+    }
 }
 #[cfg(not(target_vendor = "apple"))]
 fn sinpi(x: f64) -> f64 {
-    (std::f64::consts::PI * x).sin()
+    if x.is_finite() {
+        sincos_pi(x).0
+    } else {
+        f64::NAN
+    }
 }
 
 /// Raise a `NoMethodError` with the ruby-4.0 message form for `recv`:
@@ -30014,5 +30095,35 @@ fn struct_pos(members: &[String], key: &Value) -> Result<usize, String> {
         ))
     } else {
         Ok(i as usize)
+    }
+}
+
+#[cfg(test)]
+mod polar_pi_tests {
+    use super::sincos_pi;
+
+    /// `cos(M_PI * (1.0 / 3.0))` is 0.5000000000000001 and a one-rounding
+    /// `__cospi` answers 0.5; the double-double path must too.
+    #[test]
+    fn sincos_pi_rounds_the_pi_multiple_once() {
+        assert_eq!(sincos_pi(1.0 / 3.0).1, 0.5);
+        assert_eq!(sincos_pi(1.0 / 6.0).0, 0.5);
+        assert_eq!(sincos_pi(-1.0 / 3.0).1, 0.5);
+        assert_eq!(sincos_pi(-1.0 / 6.0).0, -0.5);
+        assert_eq!(sincos_pi(2.0).1, 1.0);
+        assert_eq!(sincos_pi(3.0).1, -1.0);
+        assert_eq!(sincos_pi(1.5).0, -1.0);
+        assert_eq!(sincos_pi(0.25).0, sincos_pi(0.25).1);
+    }
+
+    #[test]
+    fn sincos_pi_is_within_an_ulp_of_libm() {
+        let mut x = 0.0013_f64;
+        for _ in 0..5000 {
+            x = (x * 1.0007 + 0.0137) % 3.5;
+            let (s, c) = sincos_pi(x);
+            let (rs, rc) = (std::f64::consts::PI * x).sin_cos();
+            assert!((s - rs).abs() < 1e-14 && (c - rc).abs() < 1e-14, "x={x}");
+        }
     }
 }
