@@ -1904,8 +1904,7 @@ fn ivar_name_arg(arg: &Value) -> Result<String, String> {
     };
     let ident = |c: char| c.is_alphanumeric() || c == '_' || !c.is_ascii();
     let valid = raw.strip_prefix('@').is_some_and(|rest| {
-        rest.chars().next().is_some_and(|c| !c.is_ascii_digit())
-            && rest.chars().all(ident)
+        rest.chars().next().is_some_and(|c| !c.is_ascii_digit()) && rest.chars().all(ident)
     });
     if valid {
         return Ok(raw[1..].to_string());
@@ -2432,9 +2431,8 @@ fn dispatch_resolved(
             if let Some((re, _)) = with_host(|h| h.as_regex(recv)) {
                 // `rb_reg_eqq`: a String or Symbol is matched and sets `$~`; any
                 // other operand clears `$~` and answers false.
-                let matchable = with_host(|h| {
-                    h.as_str(&args[0]).is_some() || h.as_symbol(&args[0]).is_some()
-                });
+                let matchable =
+                    with_host(|h| h.as_str(&args[0]).is_some() || h.as_symbol(&args[0]).is_some());
                 if !matchable {
                     set_match_globals(None, &re, recv);
                     return Ok(Value::Bool(false));
@@ -5398,7 +5396,14 @@ fn dispatch_classref(
                     let sym = with_host(|h| h.new_symbol(name));
                     let mut mm_args = vec![sym];
                     mm_args.extend_from_slice(args);
-                    crate::host::call_class_method(recv, &def, "method_missing", cls, &mm_args, block)
+                    crate::host::call_class_method(
+                        recv,
+                        &def,
+                        "method_missing",
+                        cls,
+                        &mm_args,
+                        block,
+                    )
                 })
             };
             if explicit_recv {
@@ -5878,7 +5883,12 @@ fn dispatch_object(
         // objects: a plain user object's `name` must reach its own method or
         // `method_missing` (mustermann's Capture aliases `name` to `payload`, read
         // through a DelegateClass — an unguarded handler returned an empty Symbol).
-        "name" if matches!(exception_init_owner(cls), Some("NameError" | "NoMethodError")) => {
+        "name"
+            if matches!(
+                exception_init_owner(cls),
+                Some("NameError" | "NoMethodError")
+            ) =>
+        {
             // Set by `NameError.new` (nil included) or at the raise site.
             if let Some(stored) = with_host(|h| h.ivar_lookup(recv, "name")) {
                 return Ok(stored);
@@ -5898,12 +5908,13 @@ fn dispatch_object(
         // `KeyError#key`/`#receiver`, `NoMatchingPatternKeyError#key`/`#matchee`
         // and `NameError#receiver` (NoMethodError's and FrozenError's too)
         // raise when the exception carries none, as error.c's readers do.
-        "key" | "receiver" | "matchee"
-            if exception_reader_raises(cls, name) =>
-        {
+        "key" | "receiver" | "matchee" if exception_reader_raises(cls, name) => {
             match with_host(|h| (h.ivar_lookup(recv, name), h.is_initialized_exception(recv))) {
                 (Some(v), _) => Ok(v),
-                (None, true) => Err(raise_exc("ArgumentError", &format!("no {name} is available"))),
+                (None, true) => Err(raise_exc(
+                    "ArgumentError",
+                    &format!("no {name} is available"),
+                )),
                 // Raised by rubylang at a site that did not record the field.
                 (None, false) => Ok(Value::Undef),
             }
@@ -7118,7 +7129,9 @@ fn dispatch_number(
     // exact: `-5.divmod(Rational(2, 3))` is `[-8, (1/3)]`, not a Float pair.
     if !matches!(recv, Value::Float(_))
         && matches!(name, "%" | "modulo" | "div" | "divmod" | "remainder")
-        && args.first().is_some_and(|a| with_host(|h| h.class_of(a)) == "Rational")
+        && args
+            .first()
+            .is_some_and(|a| with_host(|h| h.class_of(a)) == "Rational")
     {
         let r = with_host(|h| h.as_rational(recv).map(|r| h.new_rational(r)));
         if let Some(r) = r {
@@ -7127,7 +7140,11 @@ fn dispatch_number(
     }
     // A real number divided by a Complex coerces to `Complex(self, 0)` (MRI
     // `rb_num_coerce_bin` through `Complex#coerce`); the numeric hook does that.
-    if name == "/" && args.first().is_some_and(|a| with_host(|h| h.complex_parts(a)).is_some()) {
+    if name == "/"
+        && args
+            .first()
+            .is_some_and(|a| with_host(|h| h.complex_parts(a)).is_some())
+    {
         return with_host(|h| h.num_op(fusevm::NumOp::Div, recv, &args[0]));
     }
     if matches!(name, "**" | "pow")
@@ -11112,7 +11129,10 @@ fn exception_reader_raises(cls: &str, name: &str) -> bool {
         (exception_init_owner(cls), name),
         (Some("KeyError" | "NoMatchingPatternKeyError"), "key")
             | (Some("NoMatchingPatternKeyError"), "matchee")
-            | (Some("KeyError" | "NameError" | "NoMethodError" | "FrozenError"), "receiver")
+            | (
+                Some("KeyError" | "NameError" | "NoMethodError" | "FrozenError"),
+                "receiver"
+            )
     )
 }
 
@@ -11120,7 +11140,9 @@ fn exception_reader_raises(cls: &str, name: &str) -> bool {
 /// in the keyword hash `kw` (`None` when absent). Any other key is MRI's
 /// `unknown keyword` ArgumentError.
 fn optional_kwargs(kw: Option<&Value>, names: &[&str]) -> Result<Vec<Option<Value>>, String> {
-    let map = kw.and_then(|k| with_host(|h| h.as_hash(k))).unwrap_or_default();
+    let map = kw
+        .and_then(|k| with_host(|h| h.as_hash(k)))
+        .unwrap_or_default();
     let mut unknown = Vec::new();
     for k in map.keys() {
         if !matches!(k, RKey::Sym(s) if names.contains(&s.as_str())) {
@@ -11185,7 +11207,10 @@ pub(crate) fn exception_initialize(exc: &Value, cls: &str, args: &[Value]) -> Re
             if pos.len() < 2 {
                 return Err(raise_exc(
                     "ArgumentError",
-                    &format!("wrong number of arguments (given {}, expected 2+)", pos.len()),
+                    &format!(
+                        "wrong number of arguments (given {}, expected 2+)",
+                        pos.len()
+                    ),
                 ));
             }
             let rest = pos.split_off(2);
@@ -11195,19 +11220,31 @@ pub(crate) fn exception_initialize(exc: &Value, cls: &str, args: &[Value]) -> Re
             pos = rest;
         }
         Some(owner @ ("KeyError" | "NoMatchingPatternKeyError")) => {
-            let first = if owner == "KeyError" { "receiver" } else { "matchee" };
+            let first = if owner == "KeyError" {
+                "receiver"
+            } else {
+                "matchee"
+            };
             let vals = optional_kwargs(kw, &[first, "key"])?;
             kwargs.extend([first, "key"].into_iter().zip(vals));
         }
         Some(owner @ ("NameError" | "NoMethodError")) => {
             if owner == "NoMethodError" {
                 let private = pos.len() > 3 && with_host(|h| h.truthy(&pos.pop().unwrap()));
-                let call_args = if pos.len() > 2 { pos.pop().unwrap() } else { Value::Undef };
+                let call_args = if pos.len() > 2 {
+                    pos.pop().unwrap()
+                } else {
+                    Value::Undef
+                };
                 set("args", call_args);
                 set("private_call?", Value::Bool(private));
             }
             let vals = optional_kwargs(kw, &["receiver"])?;
-            let name = if pos.len() > 1 { pos.pop().unwrap() } else { Value::Undef };
+            let name = if pos.len() > 1 {
+                pos.pop().unwrap()
+            } else {
+                Value::Undef
+            };
             set("name", name);
             kwargs.extend(["receiver"].into_iter().zip(vals));
         }
@@ -11222,7 +11259,10 @@ pub(crate) fn exception_initialize(exc: &Value, cls: &str, args: &[Value]) -> Re
     if pos.len() > 1 {
         return Err(raise_exc(
             "ArgumentError",
-            &format!("wrong number of arguments (given {}, expected 0..1)", pos.len()),
+            &format!(
+                "wrong number of arguments (given {}, expected 0..1)",
+                pos.len()
+            ),
         ));
     }
     // The message is kept as its `to_s`; nil stays unset, so `message`
@@ -11251,8 +11291,10 @@ pub(crate) fn exception_initialize(exc: &Value, cls: &str, args: &[Value]) -> Re
 // (libxcrypt) elsewhere.
 #[cfg_attr(not(target_vendor = "apple"), link(name = "crypt"))]
 extern "C" {
-    fn crypt(key: *const std::os::raw::c_char, salt: *const std::os::raw::c_char)
-        -> *mut std::os::raw::c_char;
+    fn crypt(
+        key: *const std::os::raw::c_char,
+        salt: *const std::os::raw::c_char,
+    ) -> *mut std::os::raw::c_char;
 }
 
 /// `String#crypt` — ported from string.c `rb_str_crypt`: the salt must hold two
@@ -11265,7 +11307,10 @@ fn str_crypt(key: &str, salt: &Value) -> Result<Value, String> {
     let salt = implicit_str(salt)?;
     let sb = salt.as_bytes();
     if sb.len() < 2 || sb[0] == 0 || sb[1] == 0 {
-        return Err(raise_exc("ArgumentError", "salt too short (need >=2 bytes)"));
+        return Err(raise_exc(
+            "ArgumentError",
+            "salt too short (need >=2 bytes)",
+        ));
     }
     let key = std::ffi::CString::new(key)
         .map_err(|_| raise_exc("ArgumentError", "string contains null byte"))?;
@@ -11288,7 +11333,9 @@ fn str_crypt(key: &str, salt: &Value) -> Result<Value, String> {
         ));
     }
     // SAFETY: a non-null crypt(3) result is a NUL-terminated string.
-    let out = unsafe { std::ffi::CStr::from_ptr(res) }.to_string_lossy().into_owned();
+    let out = unsafe { std::ffi::CStr::from_ptr(res) }
+        .to_string_lossy()
+        .into_owned();
     Ok(new_str(out))
 }
 
@@ -11840,7 +11887,9 @@ fn str_succ(s: &str) -> String {
             // A non-ASCII letter or digit counts as alphanumeric when its next
             // code point still is one (`"aé".succ` is `"aê"`).
             if !c.is_ascii() {
-                match char::from_u32(c as u32 + 1).filter(|n| c.is_alphanumeric() && n.is_alphanumeric()) {
+                match char::from_u32(c as u32 + 1)
+                    .filter(|n| c.is_alphanumeric() && n.is_alphanumeric())
+                {
                     Some(n) => {
                         chars[idx] = n;
                         carry = None;
@@ -14071,7 +14120,8 @@ fn cx_add(x: &Value, y: &Value) -> Result<Value, String> {
         if y_zero {
             return Ok(x.clone());
         }
-    } else if y_zero && (matches!(x, Value::Float(_)) || with_host(|h| h.class_of(x)) == "Rational") {
+    } else if y_zero && (matches!(x, Value::Float(_)) || with_host(|h| h.class_of(x)) == "Rational")
+    {
         return Ok(x.clone());
     }
     dispatch(x, "+", std::slice::from_ref(y), None)
@@ -14142,7 +14192,9 @@ fn complex_divide(re: &Value, im: &Value, other: &Value, fdiv: bool) -> Result<V
     };
     let new = |x: Value, y: Value| Ok(with_host(|h| h.new_complex(x, y)));
     if let Some((br, bi)) = with_host(|h| h.complex_parts(other)) {
-        let flo = [re, im, &br, &bi].iter().any(|v| matches!(v, Value::Float(_)));
+        let flo = [re, im, &br, &bi]
+            .iter()
+            .any(|v| matches!(v, Value::Float(_)));
         let abs = |v: &Value| dispatch(v, "abs", &[], None);
         let gt = dispatch(&abs(&br)?, ">", &[abs(&bi)?], None)?;
         let (x, y) = if with_host(|h| h.truthy(&gt)) {
@@ -14172,7 +14224,10 @@ fn complex_divide(re: &Value, im: &Value, other: &Value, fdiv: bool) -> Result<V
         return new(x, y);
     }
     let named = with_host(|h| h.coerce_operand_name(other));
-    Err(raise_exc("TypeError", &format!("{named} can't be coerced into Complex")))
+    Err(raise_exc(
+        "TypeError",
+        &format!("{named} can't be coerced into Complex"),
+    ))
 }
 
 /// complex.c `f_zero_p`: a numeric zero of any type (`-0.0` included).
@@ -14224,7 +14279,12 @@ fn cx_comp_mul(ar: &Value, ai: &Value, br: &Value, bi: &Value) -> Result<(Value,
         };
         cx_mul(&sign(a, az, bz), &sign(b, bz, az))
     };
-    let (arz, aiz, brz, biz) = (cx_zero_p(ar)?, cx_zero_p(ai)?, cx_zero_p(br)?, cx_zero_p(bi)?);
+    let (arz, aiz, brz, biz) = (
+        cx_zero_p(ar)?,
+        cx_zero_p(ai)?,
+        cx_zero_p(br)?,
+        cx_zero_p(bi)?,
+    );
     let re = cx_sub(&safe_mul(ar, br, arz, brz)?, &safe_mul(ai, bi, aiz, biz)?)?;
     let im = cx_add(&safe_mul(ar, bi, arz, biz)?, &safe_mul(ai, br, aiz, brz)?)?;
     Ok((re, im))
@@ -14288,14 +14348,22 @@ fn complex_arg(re: &Value, im: &Value) -> f64 {
         if !dx.is_sign_negative() {
             return dy;
         }
-        return if dy.is_sign_negative() { -std::f64::consts::PI } else { std::f64::consts::PI };
+        return if dy.is_sign_negative() {
+            -std::f64::consts::PI
+        } else {
+            std::f64::consts::PI
+        };
     }
     dy.atan2(dx)
 }
 
 /// complex.c `complex_pow_for_special_angle`: an Integer power of a Complex on
 /// one of the eight axis/diagonal directions stays exact. `None` = not special.
-fn complex_pow_special_angle(re: &Value, im: &Value, other: &Value) -> Result<Option<Value>, String> {
+fn complex_pow_special_angle(
+    re: &Value,
+    im: &Value,
+    other: &Value,
+) -> Result<Option<Value>, String> {
     if !is_integer_value(other) {
         return Ok(None);
     }
@@ -14323,7 +14391,12 @@ fn complex_pow_special_angle(re: &Value, im: &Value, other: &Value) -> Result<Op
     let zx = if dir % 2 == 0 {
         dispatch(&x, "**", std::slice::from_ref(other), None)?
     } else {
-        let two_x_sq = dispatch(&num(Mul, &Value::Int(2), &x)?, "*", std::slice::from_ref(&x), None)?;
+        let two_x_sq = dispatch(
+            &num(Mul, &Value::Int(2), &x)?,
+            "*",
+            std::slice::from_ref(&x),
+            None,
+        )?;
         let half = num(Div, other, &Value::Int(2))?;
         let z = dispatch(&two_x_sq, "**", &[half], None)?;
         if as_i(&num(Mod, other, &Value::Int(2))?) == 1 {
@@ -14332,8 +14405,21 @@ fn complex_pow_special_angle(re: &Value, im: &Value, other: &Value) -> Result<Op
             z
         }
     };
-    const DIRS: [(i8, i8); 8] = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)];
-    let z_dir = as_i(&num(Mod, &num(Mul, &Value::Int(dir), other)?, &Value::Int(8))?) as usize;
+    const DIRS: [(i8, i8); 8] = [
+        (1, 0),
+        (1, 1),
+        (0, 1),
+        (-1, 1),
+        (-1, 0),
+        (-1, -1),
+        (0, -1),
+        (1, -1),
+    ];
+    let z_dir = as_i(&num(
+        Mod,
+        &num(Mul, &Value::Int(dir), other)?,
+        &Value::Int(8),
+    )?) as usize;
     let zero_for = |v: &Value| match v {
         Value::Float(_) => Value::Float(0.0),
         _ if with_host(|h| h.class_of(v)) == "Rational" => {
@@ -14360,7 +14446,8 @@ fn rational_pow(
 ) -> Result<Value, String> {
     use num_bigint::BigInt;
     use num_traits::{One as _, Zero as _};
-    let rat = |n: BigInt, d: BigInt| with_host(|h| h.new_rational(num_rational::BigRational::new(n, d)));
+    let rat =
+        |n: BigInt, d: BigInt| with_host(|h| h.new_rational(num_rational::BigRational::new(n, d)));
     let one = || rat(BigInt::one(), BigInt::one());
     let class = with_host(|h| h.class_of(other));
     let numeric = matches!(class.as_str(), "Integer" | "Float" | "Rational" | "Complex");
@@ -14380,14 +14467,19 @@ fn rational_pow(
             return Ok(one());
         }
         if *r.numer() == -BigInt::one() && is_integer_value(&other) {
-            let odd = as_i(&with_host(|h| h.num_op(fusevm::NumOp::Mod, &other, &Value::Int(2)))?) == 1;
+            let odd = as_i(&with_host(|h| {
+                h.num_op(fusevm::NumOp::Mod, &other, &Value::Int(2))
+            })?) == 1;
             return Ok(rat(BigInt::from(if odd { -1 } else { 1 }), BigInt::one()));
         }
         if r.numer().is_zero() {
             // `rb_num_negative_p`: a value with no `<` (a Complex) cannot be
             // ranked against zero.
             let negative = if with_host(|h| h.complex_parts(&other)).is_some() {
-                return Err(raise_exc("ArgumentError", "comparison of Complex with 0 failed"));
+                return Err(raise_exc(
+                    "ArgumentError",
+                    "comparison of Complex with 0 failed",
+                ));
             } else {
                 let lt = dispatch(&other, "<", &[Value::Int(0)], None)?;
                 with_host(|h| h.truthy(&lt))
@@ -14422,7 +14514,12 @@ fn rational_pow(
         return Err(raise_exc("ArgumentError", "exponent is too large"));
     }
     if matches!(other, Value::Float(_)) || with_host(|h| h.class_of(&other)) == "Rational" {
-        return dispatch(&Value::Float(rational_to_f64(r)), "**", std::slice::from_ref(&other), None);
+        return dispatch(
+            &Value::Float(rational_to_f64(r)),
+            "**",
+            std::slice::from_ref(&other),
+            None,
+        );
     }
     // `rb_num_coerce_bin`: a Complex exponent promotes self to Complex.
     if with_host(|h| h.complex_parts(&other)).is_some() {
@@ -14430,7 +14527,10 @@ fn rational_pow(
         return complex_pow(&c, &other);
     }
     let named = with_host(|h| h.coerce_operand_name(&other));
-    Err(raise_exc("TypeError", &format!("{named} can't be coerced into Rational")))
+    Err(raise_exc(
+        "TypeError",
+        &format!("{named} can't be coerced into Rational"),
+    ))
 }
 
 /// Port of complex.c `rb_complex_pow`.
@@ -14516,7 +14616,10 @@ fn complex_pow(recv: &Value, other: &Value) -> Result<Value, String> {
         return complex_polar(nr, ntheta);
     }
     let named = with_host(|h| h.coerce_operand_name(&other));
-    Err(raise_exc("TypeError", &format!("{named} can't be coerced into Complex")))
+    Err(raise_exc(
+        "TypeError",
+        &format!("{named} can't be coerced into Complex"),
+    ))
 }
 
 fn dispatch_complex(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
@@ -14775,7 +14878,12 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
                 dispatch(&dispatch(recv, "/", args, None)?, "floor", &[], None)
             };
             let modulo = |q: &Value| -> Result<Value, String> {
-                dispatch(recv, "-", &[dispatch(y, "*", std::slice::from_ref(q), None)?], None)
+                dispatch(
+                    recv,
+                    "-",
+                    &[dispatch(y, "*", std::slice::from_ref(q), None)?],
+                    None,
+                )
             };
             match name {
                 "div" => div(),
@@ -19805,12 +19913,51 @@ fn dispatch_set(
 /// afterwards), `select`/`filter`/`reject`/`transform_values` (they iterate a
 /// copy of the receiver) and `merge`/`update` (they iterate their ARGUMENT).
 const HASH_BLOCK_ITERATORS: &[&str] = &[
-    "all?", "any?", "chunk_while", "collect", "collect_concat", "count", "delete_if",
-    "detect", "each", "each_cons", "each_entry", "each_key", "each_pair", "each_slice",
-    "each_value", "each_with_index", "each_with_object", "filter", "filter!", "filter_map",
-    "find", "find_all", "find_index", "flat_map", "group_by", "inject", "keep_if", "map",
-    "max", "max_by", "min", "min_by", "minmax", "minmax_by", "none?", "one?", "partition",
-    "reduce", "reject!", "select!", "slice_when", "sort_by", "sum", "to_h", "transform_keys",
+    "all?",
+    "any?",
+    "chunk_while",
+    "collect",
+    "collect_concat",
+    "count",
+    "delete_if",
+    "detect",
+    "each",
+    "each_cons",
+    "each_entry",
+    "each_key",
+    "each_pair",
+    "each_slice",
+    "each_value",
+    "each_with_index",
+    "each_with_object",
+    "filter",
+    "filter!",
+    "filter_map",
+    "find",
+    "find_all",
+    "find_index",
+    "flat_map",
+    "group_by",
+    "inject",
+    "keep_if",
+    "map",
+    "max",
+    "max_by",
+    "min",
+    "min_by",
+    "minmax",
+    "minmax_by",
+    "none?",
+    "one?",
+    "partition",
+    "reduce",
+    "reject!",
+    "select!",
+    "slice_when",
+    "sort_by",
+    "sum",
+    "to_h",
+    "transform_keys",
     "uniq",
 ];
 
@@ -19828,7 +19975,9 @@ fn dispatch_hash(
         let refused = match name {
             "[]=" | "store" if args.len() == 2 => {
                 let k = with_host(|h| h.hash_key(recv, &args[0]));
-                with_host(|h| h.hash_at(recv, &k)).flatten().is_none()
+                with_host(|h| h.hash_at(recv, &k))
+                    .flatten()
+                    .is_none()
                     .then_some("can't add a new key into hash during iteration")
             }
             // `update` stores pair by pair, so a new key among them is refused.
@@ -27972,7 +28121,9 @@ fn is_kernel_module_function_of(recv: &Value, name: &str) -> bool {
         // class it has no rows for (StringIO, Psych, …) implements methods the
         // table cannot see — `StringIO#gets` is not Kernel's — so the lookup is
         // trusted only when every class ahead of Kernel is core or user-written.
-        let base = h.classref_name(recv).unwrap_or_else(|| h.dispatch_class(recv));
+        let base = h
+            .classref_name(recv)
+            .unwrap_or_else(|| h.dispatch_class(recv));
         let opaque = h
             .class_ancestry(&base)
             .iter()
@@ -28006,11 +28157,12 @@ fn mark_explicit_class_call(cls: &str, name: &str, self_ok: bool) {
     let is_self = || with_host(|h| h.classref_name(&h.current_self())).as_deref() == Some(cls);
     // A built-in singleton of the same name ahead of Kernel (`IO.select`,
     // `Random.rand`) is public and may be served by the same Kernel code.
-    let resolves_to_kernel =
-        || with_host(|h| {
+    let resolves_to_kernel = || {
+        with_host(|h| {
             let recv = h.class_ref(cls);
             h.builtin_owner(&recv, name) == Some("Kernel")
-        });
+        })
+    };
     let mark = cls != "Kernel"
         && crate::arity_table::lookup("#<Class:Kernel>", name).is_some()
         && resolves_to_kernel()
@@ -28054,7 +28206,10 @@ fn check_kernel_private(recv: &Value, name: &str) -> Result<(), String> {
     }
     Err(raise_exc(
         "NoMethodError",
-        &format!("private method '{name}' called for {}", receiver_phrase(recv)),
+        &format!(
+            "private method '{name}' called for {}",
+            receiver_phrase(recv)
+        ),
     ))
 }
 
@@ -28135,7 +28290,10 @@ fn check_public_visibility(recv: &Value, name: &str) -> Result<(), String> {
     } else if is_kernel_module_function_of(recv, name) {
         return Err(raise_exc(
             "NoMethodError",
-            &format!("private method '{name}' called for {}", receiver_phrase(recv)),
+            &format!(
+                "private method '{name}' called for {}",
+                receiver_phrase(recv)
+            ),
         ));
     }
     let vis = receiver_visibility(recv, name);
@@ -28462,7 +28620,9 @@ fn exc_equal(recv: &Value, other: &Value) -> Result<bool, String> {
     if !rb_equal_d(&m1, &m2)? {
         return Ok(false);
     }
-    Ok(with_host(|h| h.exc_backtrace(recv) == h.exc_backtrace(&other)))
+    Ok(with_host(|h| {
+        h.exc_backtrace(recv) == h.exc_backtrace(&other)
+    }))
 }
 
 /// Whether comparing `v` with `==` can reach Ruby code: `v` is a plain user

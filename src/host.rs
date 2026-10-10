@@ -4324,11 +4324,13 @@ impl RubyHost {
             // A runtime `attr_*` (via `send`/`class_eval`, or on an anonymous
             // class) lives in the attribute registry, not the method table; the
             // class that registered it owns it.
-            None => self.runtime_attr_owner(recv, name, unbound).unwrap_or_else(|| {
-                self.classref_name(recv)
-                    .map(|c| format!("#<Class:{c}>"))
-                    .unwrap_or_else(|| self.dispatch_class(recv))
-            }),
+            None => self
+                .runtime_attr_owner(recv, name, unbound)
+                .unwrap_or_else(|| {
+                    self.classref_name(recv)
+                        .map(|c| format!("#<Class:{c}>"))
+                        .unwrap_or_else(|| self.dispatch_class(recv))
+                }),
         }
     }
     /// The class in `recv`'s ancestry whose runtime attribute registry defines
@@ -6255,7 +6257,8 @@ impl RubyHost {
     /// (matching MRI) and `include Foo` (resolved by name) finds it. Also moves any
     /// class variables / class-level ivars keyed by the old anonymous name.
     pub fn is_anon_class(&self, name: &str) -> bool {
-        (name.starts_with("#<Class:") || name.starts_with("#<Module:")) && self.classes.contains_key(name)
+        (name.starts_with("#<Class:") || name.starts_with("#<Module:"))
+            && self.classes.contains_key(name)
     }
     pub fn rename_class(&mut self, old: &str, new: &str) {
         if let Some(def) = self.classes_mut().shift_remove(old) {
@@ -7275,7 +7278,8 @@ impl RubyHost {
                     reader.into_iter().chain(writer)
                 });
                 let mut owned: Vec<String> = accessors.collect();
-                if let Some(attached) = n.strip_prefix("#<Class:").and_then(|s| s.strip_suffix('>')) {
+                if let Some(attached) = n.strip_prefix("#<Class:").and_then(|s| s.strip_suffix('>'))
+                {
                     if let Some(def) = self.classes.get(attached) {
                         owned.extend(def.class_methods.keys().cloned());
                     }
@@ -9391,7 +9395,9 @@ impl RubyHost {
                 Div if self.complex_parts(a).is_some() => {
                     return crate::builtins::dispatch(a, "/", std::slice::from_ref(b), None);
                 }
-                Div if matches!(a, Value::Int(_) | Value::Float(_)) || self.as_rational(a).is_some() => {
+                Div if matches!(a, Value::Int(_) | Value::Float(_))
+                    || self.as_rational(a).is_some() =>
+                {
                     let lhs = self.new_complex(a.clone(), Value::Int(0));
                     return crate::builtins::dispatch(&lhs, "/", std::slice::from_ref(b), None);
                 }
