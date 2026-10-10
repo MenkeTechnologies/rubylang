@@ -1111,6 +1111,17 @@ Honest limitations of this surface:
     non-UTF-8 byte-string substrate gap recorded in the fuzz baseline).
   - `Kernel#system`, backticks and `%x` do not exist, so a `<<~`CMD`` heredoc
     cannot run.
+  - A Range with an Integer begin and a Float end (`1..2.5`) is stored as a
+    Float range, so `Range.new(6, 2.5)` inspects as `6.0...2.5`, `to_a` raises
+    where MRI iterates `1, 2`, and `(1..)`-style Integer iteration is lost.
+  - An internally raised exception (`TypeError` from a bad `raise` operand) does
+    not pick up `$!` as its `cause`; only `raise` itself records one.
+  - Methods redefined under the same name later in a file, and classes reopened
+    inside a block, are hoisted at compile time, so every earlier call sees the
+    last definition.
+  - Fibers, `Thread`s and external `Enumerator#next` run on a 1 MiB native stack
+    (a debug build overflows it, aborting the process, at a few hundred nested
+    Ruby calls) while the frame-depth guard allows 2000 on the main thread.
 
 - **Equality runs the element's own `==` — fixed.** `Array#==`, `Hash#==`,
   `include?`, `index`/`rindex`, `count` and `delete` compare through a user

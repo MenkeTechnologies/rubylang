@@ -2884,7 +2884,16 @@ impl Parser {
         let dot_next = matches!(&self.toks[self.pos + 1].kind, Tok::Op(o) if o == ".");
         let mut singleton = false;
         let mut singleton_recv: Option<Box<Expr>> = None;
-        if dot_next {
+        // `def (expr).name` — a singleton method on the value of any expression.
+        if self.is_op("(") {
+            self.advance();
+            self.skip_nl();
+            let recv = self.expr()?;
+            self.skip_nl();
+            self.expect_op(")")?;
+            self.expect_op(".")?;
+            singleton_recv = Some(Box::new(recv));
+        } else if dot_next {
             match self.peek().clone() {
                 Tok::Keyword(k) if k == "self" => {
                     self.advance(); // self

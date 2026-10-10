@@ -1196,6 +1196,68 @@ fn gen_toplevelpriv(seed: u64) -> Vec<String> {
     })
 }
 
+/// Every `raise` argument shape, `Exception#exception`, `cause:`, and the
+/// Errno message composition.
+fn gen_raiseforms(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let msg = r.pick(&["\"m\"", "\"two words\"", "nil", ":sym", "5"]);
+    let cls = r.pick(&[
+        "RuntimeError",
+        "ArgumentError",
+        "TypeError",
+        "KeyError",
+        "IOError",
+        "Errno::ENOENT",
+        "Errno::EEXIST",
+        "SystemExit",
+    ]);
+    let shown = "[e.class, e.message]";
+    let guard = |body: &str| {
+        format!("begin\n  {body}\nrescue Exception => e\n  p {shown}\nelse\n  p :none\nend")
+    };
+    one(match r.below(14) {
+        0 => guard(&format!("raise {cls}")),
+        1 => guard(&format!("raise {cls}, {msg}")),
+        2 => guard(&format!("raise {cls}.new({msg})")),
+        3 => guard(&format!("raise {cls}.new, {msg}")),
+        4 => guard(&format!("raise {msg}")),
+        5 => guard(&format!("raise {}", r.pick(&["Class", "5", "nil", "Object.new", "String", ":sym", "[]"]))),
+        6 => guard(&format!("raise {cls}, {msg}, cause: {}", r.pick(&["nil", "RuntimeError.new(\"c\")"]))),
+        7 => guard("raise"),
+        8 => format!("e = {cls}.new({msg})\np [e.exception.equal?(e), e.exception(\"z\").message, e.exception(e).equal?(e)]"),
+        9 => format!("p {cls}.exception({msg}).message"),
+        10 => guard(&format!("raise {cls}, {msg}, [\"bt:1\"]")),
+        11 => guard(&format!("begin\n  raise \"in\"\nrescue\n  raise {cls}, {msg}\nend")).replace("p [e.class, e.message]", "p [e.class, e.message, e.cause&.message]"),
+        12 => format!("p Errno::{}.new({msg}).message", r.pick(&["ENOENT", "EACCES", "EEXIST", "EPIPE", "EINVAL", "ENOTDIR"])),
+        _ => guard(&format!("raise o = Object.new, {msg}; def o.exception(*a) = RuntimeError.new(\"obj\")")),
+    })
+}
+
+/// Range construction/query edge cases: empty ranges, nil ends, mixed
+/// numeric ends, bad endpoints, `count`/`size`, non-numeric `step`.
+fn gen_rangeedge(seed: u64) -> Vec<String> {
+    let r = &mut Rng::seed(seed);
+    let (a, b) = (r.range(-3, 6), r.range(-3, 6));
+    let op = r.pick(&["..", "..."]);
+    let guard = |body: &str| format!("p(begin; {body}; rescue => e; [e.class, e.message]; end)");
+    one(match r.below(14) {
+        0 => format!("p (({a}{op}{b}).min), (({a}{op}{b}).max), (({a}{op}{b}).minmax)"),
+        1 => format!("p (({a}{op}{b}).count), (({a}{op}{b}).count(&:even?)), (({a}{op}{b}).count({a}))"),
+        2 => format!("p (({a}{op}{b}).sum), (({a}{op}{b}).size), (({a}{op}{b}).to_a)"),
+        3 => format!("p (({a}{op}{b}).first), (({a}{op}{b}).last), (({a}{op}{b}).first(2)), (({a}{op}{b}).last(2))"),
+        4 => format!("p ({a}{op}nil).size, ({a}{op}nil).first(2), ({a}{op}nil).inspect, (nil{op}{b}).inspect"),
+        5 => guard(&format!("({a}..\"a\")")),
+        6 => guard(&format!("Range.new({a}, {}, {})", r.pick(&["nil", "\"a\"", "Object.new", "2.5"]), r.pick(&["true", "false"]))),
+        7 => format!("p (({a}..{b}) == ({a}..{b}.0)), (({a}..{b}).eql?({a}..{b})), (({a}..{b}).hash == ({a}..{b}).hash)"),
+        8 => format!("p (({a}{op}{b}).step(2).to_a), (({a}{op}{b}) % 3).to_a"),
+        9 => guard(&format!("({a}..{b}).step({})", r.pick(&["0", "-1", "0.5", "\"a\""]))),
+        10 => format!("p [1, 2, 3, 4, 5].chunk {{ |x| {} }}.to_a", r.pick(&["x > 3 ? :_separator : true", "x.even? ? nil : :odd", "x == 3 ? :_alone : :k", "x % 3"])),
+        11 => guard("[1, 2].chunk { :_other }.to_a"),
+        12 => format!("a = [1, 2, 3]\np a.fill({a}, {}, {})", r.range(0, 5), r.range(0, 3)),
+        _ => guard(&format!("a = [1, 2, 3]\na.insert({}, :x)\na", r.range(-6, 5))),
+    })
+}
+
 // Mode plumbing.
 // ---------------------------------------------------------------------------
 
@@ -1262,6 +1324,8 @@ enum Mode {
     Kwsplat,
     Heredoc,
     Toplevelpriv,
+    Raiseforms,
+    Rangeedge,
     /// Round-robin over every mode in `ALL_MODES`. Not itself a member of
     /// `ALL_MODES` (that would recurse), so adding a mode never changes any
     /// other mode's own seed→case mapping — but it DOES reshuffle which mode
@@ -1332,6 +1396,8 @@ const ALL_MODES: &[Mode] = &[
     Mode::Kwsplat,
     Mode::Heredoc,
     Mode::Toplevelpriv,
+    Mode::Raiseforms,
+    Mode::Rangeedge,
 ];
 
 fn gen_intmeth(seed: u64) -> Vec<String> {
@@ -2516,6 +2582,8 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Kwsplat => gen_kwsplat(seed),
         Mode::Heredoc => gen_heredoc(seed),
         Mode::Toplevelpriv => gen_toplevelpriv(seed),
+        Mode::Raiseforms => gen_raiseforms(seed),
+        Mode::Rangeedge => gen_rangeedge(seed),
         Mode::All => gen_case(seed, ALL_MODES[(seed as usize) % ALL_MODES.len()]),
     }
 }
@@ -3150,6 +3218,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Kwsplat => "kwsplat",
         Mode::Heredoc => "heredoc",
         Mode::Toplevelpriv => "toplevelpriv",
+        Mode::Raiseforms => "raiseforms",
+        Mode::Rangeedge => "rangeedge",
         Mode::All => "all",
     }
 }

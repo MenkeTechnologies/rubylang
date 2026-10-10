@@ -951,8 +951,10 @@ fn const_miss(encoded: &str) -> Result<Value, String> {
 /// a user `class` definition.
 fn is_builtin_exception(name: &str) -> bool {
     name.ends_with("Error")
-        || name == "Exception"
-        || name == "StopIteration"
+        || matches!(
+            name,
+            "Exception" | "StopIteration" | "SystemExit" | "SignalException" | "Interrupt"
+        )
         || name.starts_with("Errno::")
 }
 
@@ -971,7 +973,35 @@ fn builtin_exception_const(name: &str) -> bool {
 /// macOS and 39 on Linux, `ECONNREFUSED` 61 and 111, `EADDRINUSE` 48 and 98. A
 /// hardcoded table would name the wrong class on one of the two platforms
 /// rubylang targets, and would do it silently.
+/// The OS error number of the `Errno::X` class `cls` is, or inherits from.
+fn errno_of_class(cls: &str) -> Option<i32> {
+    let mut cur = Some(cls.to_string());
+    while let Some(name) = cur {
+        if name.starts_with("Errno::") {
+            return errno_table()
+                .iter()
+                .find(|(_, s)| *s == name)
+                .map(|(n, _)| *n);
+        }
+        cur = with_host(|h| h.superclass_of(&name));
+    }
+    None
+}
+
+/// The platform's `strerror` text for `code` (no `(os error N)` suffix).
+fn strerror_text(code: i32) -> String {
+    let text = std::io::Error::from_raw_os_error(code).to_string();
+    text.split(" (os error").next().unwrap_or(&text).to_string()
+}
+
 fn errno_class(code: i32) -> Option<&'static str> {
+    errno_table()
+        .iter()
+        .find(|(n, _)| *n == code)
+        .map(|(_, s)| *s)
+}
+
+fn errno_table() -> &'static [(i32, &'static str)] {
     const TABLE: &[(i32, &str)] = &[
         (libc::EPERM, "Errno::EPERM"),
         (libc::ENOENT, "Errno::ENOENT"),
@@ -1020,7 +1050,7 @@ fn errno_class(code: i32) -> Option<&'static str> {
         (libc::EINPROGRESS, "Errno::EINPROGRESS"),
         (libc::ENOTSOCK, "Errno::ENOTSOCK"),
     ];
-    TABLE.iter().find(|(n, _)| *n == code).map(|(_, s)| *s)
+    TABLE
 }
 /// Whether `cls` is an exception class — a builtin one, or a user class whose
 /// superclass chain reaches a builtin exception (e.g. `class MyErr < StandardError`).
@@ -1307,10 +1337,14 @@ pub(crate) fn make_range(lo: &Value, hi: &Value, excl: bool) -> Result<Value, St
     let numeric = |v: &Value| matches!(v, Value::Int(_) | Value::Float(_));
     let lo = &match lo {
         Value::Int(crate::host::RANGE_BEGINLESS) if !numeric(hi) => Value::Undef,
+        // An explicit `nil` begin opposite an Integer end is the beginless range.
+        Value::Undef if matches!(hi, Value::Int(_)) => Value::Int(crate::host::RANGE_BEGINLESS),
         _ => lo.clone(),
     };
     let hi = &match hi {
         Value::Int(crate::host::RANGE_ENDLESS) if !numeric(lo) => Value::Undef,
+        // ... and an explicit `nil` end after an Integer begin is the endless one.
+        Value::Undef if matches!(lo, Value::Int(_)) => Value::Int(crate::host::RANGE_ENDLESS),
         _ => hi.clone(),
     };
     // `1..Float::INFINITY` is an endless integer range; `-Float::INFINITY..n`
@@ -1346,7 +1380,17 @@ pub(crate) fn make_range(lo: &Value, hi: &Value, excl: bool) -> Result<Value, St
                 // Any other endpoints form a generic object-range over `<=>`-
                 // comparable values (IPAddr#to_range, custom Comparable). A nil
                 // endpoint is the beginless/endless form (`nil..nil` included).
-                _ => with_host(|h| h.new_obj_range(lo.clone(), hi.clone(), excl)),
+                _ => {
+                    // Both ends given: they must be comparable (`range_init`
+                    // checks `lo <=> hi` is not nil).
+                    if !matches!(lo, Value::Undef) && !matches!(hi, Value::Undef) {
+                        let cmp = probe_dispatch(lo, "<=>", std::slice::from_ref(hi));
+                        if matches!(cmp, None | Some(Value::Undef)) {
+                            return Err(raise_exc("ArgumentError", "bad value for range"));
+                        }
+                    }
+                    with_host(|h| h.new_obj_range(lo.clone(), hi.clone(), excl))
+                }
             }
         }
     })
@@ -1485,6 +1529,16 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
     // Inside a class method `self` is a class ref — `new` and class methods
     // dispatch on the class; anything else (raise, puts, …) is a Kernel call.
     let this = with_host(|h| h.current_self());
+    // `alias new old` at the top level aliases a top-level method (which lives
+    // in the flat method table) or, failing that, one of Object's.
+    if name == "alias_method" && args.len() >= 2 && crate::host::is_main(&this) {
+        let (new_name, old_name) = (name_of(&args[0]), name_of(&args[1]));
+        let done = with_host(|h| h.alias_top_level_method(&new_name, &old_name));
+        if !done {
+            with_host(|h| h.register_alias("Object", &new_name, &old_name));
+        }
+        return Ok(with_host(|h| h.new_symbol(&new_name)));
+    }
     // `autoload :Const, "path"` — register a lazy require, namespaced to the
     // current `self` when it is a module (`I18n::Backend`), else top-level.
     // `b_getconst` fires the require on first reference of the constant.
@@ -2841,12 +2895,34 @@ fn dispatch_resolved(
         // rubylang does not track method visibility, so `public_methods` mirrors
         // `methods`. `private_methods`/`protected_methods` return empty (used by
         // Delegator to exclude names from forwarding).
-        "methods" | "public_methods"
+        "methods" | "public_methods" | "private_methods" | "protected_methods"
             if args.is_empty() || matches!(args.first(), Some(Value::Bool(_))) =>
         {
+            use crate::host::Visibility::{Private, Protected, Public};
+            let want: &[crate::host::Visibility] = match name {
+                "methods" => &[Public, Protected],
+                "public_methods" => &[Public],
+                "private_methods" => &[Private],
+                _ => &[Protected],
+            };
+            // `methods(false)` lists only singleton methods; the other three
+            // take `false` to mean the receiver's own class without ancestors.
+            let all = args
+                .first()
+                .map(|a| with_host(|h| h.truthy(a)))
+                .unwrap_or(true);
+            if name == "methods" && !all {
+                return dispatch(recv, "singleton_methods", &[], None);
+            }
             if let Some(cls) = with_host(|h| h.object_class(recv)) {
                 return Ok(with_host(|h| {
-                    let names = h.instance_method_names(&cls, true);
+                    let mut names = h.instance_method_names_vis(&cls, all, want);
+                    // A top-level `def` is a private method of every object.
+                    if name == "private_methods" && all {
+                        names.extend(h.top_level_method_names());
+                    }
+                    let mut seen = std::collections::HashSet::new();
+                    names.retain(|n| seen.insert(n.clone()));
                     let syms: Vec<Value> = names.iter().map(|n| h.new_symbol(n)).collect();
                     h.new_array(syms)
                 }));
@@ -3429,15 +3505,18 @@ fn dispatch_resolved(
         }
         // `class_eval`/`module_eval` run with `self` = the class: a bare `def`
         // defines an instance method on it.
-        "class_eval" | "module_eval" if with_host(|h| h.classref_name(recv)).is_some() => {
+        "class_eval" | "module_eval" | "class_exec" | "module_exec"
+            if with_host(|h| h.classref_name(recv)).is_some() =>
+        {
             let target = eval_target(recv, false);
             if let Some(b) = block {
-                return crate::host::eval_block_scoped(
-                    &b,
-                    recv,
-                    target,
-                    std::slice::from_ref(recv),
-                );
+                // `class_eval` yields the class; `class_exec` passes its arguments.
+                let block_args: Vec<Value> = if name.ends_with("_exec") {
+                    args.to_vec()
+                } else {
+                    vec![recv.clone()]
+                };
+                return crate::host::eval_block_scoped(&b, recv, target, &block_args);
             }
             let src = arg_str(&args[0]);
             return crate::host::eval_string_scoped(&src, recv, target);
@@ -4580,6 +4659,25 @@ fn dispatch_classref(
         // `Proc.new { ... }` is the block itself, exactly like `Kernel#proc`.
         // Without this it fell through to the generic `new` and produced a plain
         // object of class Proc, which has no `call`.
+        // `Class#allocate`: an instance with no `initialize` run.
+        "allocate"
+            if args.is_empty()
+                && !with_host(|h| h.is_module_name(cls))
+                && !with_host(|h| h.is_struct_class(cls)) =>
+        {
+            Ok(with_host(|h| h.new_object(cls)))
+        }
+        // Integer, Float, Symbol, nil, true and false have no `new`; neither does
+        // a module (only `Module.new` itself is a constructor).
+        "new"
+            if matches!(
+                cls,
+                "Integer" | "Float" | "Symbol" | "NilClass" | "TrueClass" | "FalseClass"
+            ) || (cls != "Module" && with_host(|h| h.is_module_name(cls))) =>
+        {
+            let recv = with_host(|h| h.class_ref(cls));
+            Err(no_method_error(&recv, "new"))
+        }
         "new" if cls == "Proc" => {
             block.ok_or_else(|| String::from("tried to create Proc object without a block"))
         }
@@ -5035,6 +5133,12 @@ fn dispatch_classref(
         // on it register class-level members on `cls` (see the accessor check in
         // the `_` arm below). activesupport: `singleton_class.attr_accessor :x`.
         "singleton_class" => Ok(with_host(|h| h.class_ref(&format!("#<Class:{cls}>")))),
+        // `Errno::ENOENT::Errno` — the class's OS error number.
+        "Errno" if args.is_empty() && errno_of_class(cls).is_some() => {
+            Ok(Value::Int(i64::from(errno_of_class(cls).unwrap_or(0))))
+        }
+        // `ExceptionClass.exception(*args)` is `new`.
+        "exception" if is_exception_class(cls) => dispatch_classref(cls, "new", args, block),
         // `Module#refine(target) { … }`: the block's `def`s define the
         // refinement's methods; `using` activates them.
         "refine" if args.len() == 1 && with_host(|h| h.is_module_name(cls)) => {
@@ -5170,12 +5274,25 @@ fn dispatch_classref(
         // resolved under the fully-qualified path in the namespaced store.
         "const_get" => {
             let cname = name_of(&args[0]);
+            // Each `::` segment must be a constant name.
+            let segment_ok = |s: &str| s.starts_with(|c: char| c.is_ascii_uppercase());
+            if !cname.split("::").all(segment_ok) {
+                return Err(raise_exc_with(
+                    "NameError",
+                    &format!("wrong constant name {cname}"),
+                    &[("name", args[0].clone())],
+                ));
+            }
             match const_lookup_under(cls, &cname) {
                 Some(v) => Ok(v),
-                None => Err(raise_exc(
-                    "NameError",
-                    &format!("uninitialized constant {cname}"),
-                )),
+                None => {
+                    let key = if cls == "Object" {
+                        cname.clone()
+                    } else {
+                        format!("{cls}::{cname}")
+                    };
+                    const_miss(&key)
+                }
             }
         }
         // `Mod.const_set(sym, val)` — define a constant under the receiver's
@@ -6096,6 +6213,26 @@ fn dispatch_object(
         // `Exception#cause` — the exception that was being handled when this one
         // was raised (recorded by `raise`), or nil.
         "cause" if is_exception_class(cls) => Ok(with_host(|h| h.ivar_of(recv, "cause"))),
+        // `Exception#exception(msg = self)`: the receiver itself for no argument
+        // (or itself as the argument), else a copy carrying the new message.
+        "exception" if is_exception_class(cls) && args.len() <= 1 => match args.first() {
+            None => Ok(recv.clone()),
+            Some(a) if identical(a, recv) => Ok(recv.clone()),
+            Some(m) => {
+                let copy = with_host(|h| h.dup_value(recv));
+                with_host(|h| {
+                    // A nil message falls back to the class name.
+                    let sv = if matches!(m, Value::Undef) {
+                        Value::Undef
+                    } else {
+                        let s = h.to_s(m);
+                        h.new_string(s)
+                    };
+                    h.set_ivar_of(&copy, "message", sv);
+                });
+                Ok(copy)
+            }
+        },
         // `detailed_message(highlight: false)` — the message with the class
         // after its first line (`msg (ClassName)`).
         "detailed_message" if is_exception_class(cls) => {
@@ -11440,6 +11577,7 @@ pub(crate) fn exception_initialize(exc: &Value, cls: &str, args: &[Value]) -> Re
     // The message is kept as its `to_s`; nil stays unset, so `message`
     // answers the class name. UncaughtThrowError's `to_s` is
     // `format(message, tag)`, applied here once.
+    let orig_message = pos.last().cloned().unwrap_or(Value::Undef);
     let message = match pos.pop() {
         Some(m) if !matches!(m, Value::Undef) => {
             let text = with_host(|h| h.to_s(&m));
@@ -11449,6 +11587,26 @@ pub(crate) fn exception_initialize(exc: &Value, cls: &str, args: &[Value]) -> Re
             }
         }
         _ => Value::Undef,
+    };
+    // `Errno::X.new(detail = nil)`: the message is strerror(errno), followed by
+    // ` - detail` when one is given; `errno` answers the class's number.
+    let message = match errno_of_class(cls) {
+        Some(code) => {
+            set("errno", Value::Int(i64::from(code)));
+            let text = strerror_text(code);
+            match &message {
+                Value::Undef => new_str(text),
+                // The detail must be a String (`rb_str_to_str`).
+                _ if with_host(|h| h.as_str(&orig_message)).is_none() => {
+                    return Err(conv_error(&orig_message, "String"));
+                }
+                m => {
+                    let detail = with_host(|h| h.to_s(m));
+                    new_str(format!("{text} - {detail}"))
+                }
+            }
+        }
+        None => message,
     };
     set("message", message);
     for (name, v) in kwargs {
@@ -13730,7 +13888,7 @@ fn dispatch_array(
                 let mut i = start;
                 while i < end {
                     let idx = i as usize;
-                    if idx >= a.len() {
+                    while a.len() <= idx {
                         a.push(Value::Undef);
                     }
                     a[idx] = call_proc(bl, &[Value::Int(i)])?;
@@ -13749,10 +13907,17 @@ fn dispatch_array(
                     Some(l) => start + as_i(l),
                     None => len.max(start),
                 };
+                // An explicit length past the end grows the array even when it
+                // fills nothing (`[1, 2, 3].fill(0, 5, 0)` pads with nils).
+                if args.len() > 2 {
+                    while (a.len() as i64) < end {
+                        a.push(Value::Undef);
+                    }
+                }
                 let mut i = start;
                 while i < end {
                     let idx = i as usize;
-                    if idx >= a.len() {
+                    while a.len() <= idx {
                         a.push(Value::Undef);
                     }
                     a[idx] = val.clone();
@@ -13766,6 +13931,12 @@ fn dispatch_array(
             let mut a = arr;
             let idx = as_i(&args[0]);
             let vals = &args[1..];
+            if idx < 0 && a.len() as i64 + idx + 1 < 0 {
+                return Err(raise_exc(
+                    "IndexError",
+                    &format!("index {idx} too small for array; minimum: -{}", a.len() + 1),
+                ));
+            }
             let pos = if idx < 0 {
                 // Negative index inserts AFTER the referenced element.
                 (a.len() as i64 + idx + 1).max(0) as usize
@@ -13827,7 +13998,7 @@ fn dispatch_array(
             let mut a = arr;
             let len = a.len();
             let removed = match args {
-                [Value::Int(i)] => match norm_idx(*i, len) {
+                [Value::Int(i)] => match norm_idx(*i, len).filter(|k| *k < len) {
                     Some(k) => a.remove(k),
                     None => Value::Undef,
                 },
@@ -14022,6 +14193,29 @@ fn dispatch_array(
                 let mut group: Vec<Value> = Vec::new();
                 for x in &arr {
                     let k = call_proc(bl, std::slice::from_ref(x))?;
+                    // `nil` and `:_separator` drop the element and end the run;
+                    // `:_alone` makes the element a run of its own; any other
+                    // underscore symbol is reserved.
+                    let special = match &k {
+                        Value::Undef => Some("_separator".to_string()),
+                        other => with_host(|h| h.as_symbol(other)).filter(|s| s.starts_with('_')),
+                    };
+                    if let Some(s) = special {
+                        if let Some(pk) = cur_key.take() {
+                            out.push(new_arr(vec![pk, new_arr(std::mem::take(&mut group))]));
+                        }
+                        match s.as_str() {
+                            "_separator" => {}
+                            "_alone" => out.push(new_arr(vec![k, new_arr(vec![x.clone()])])),
+                            _ => {
+                                return Err(raise_exc(
+                                    "RuntimeError",
+                                    "symbols beginning with an underscore are reserved",
+                                ))
+                            }
+                        }
+                        continue;
+                    }
                     match &cur_key {
                         Some(pk) if with_host(|h| h.eq_values(pk, &k)) => group.push(x.clone()),
                         _ => {
@@ -16754,7 +16948,14 @@ fn sys_err(op: &str, path: &str, e: &std::io::Error) -> String {
         ),
         None => ("SystemCallError", Vec::new()),
     };
-    raise_exc_with(class, &format!("{op} - {path}: {e}"), &fields)
+    // MRI: `<strerror> @ <function> - <path>`. The callers name the function
+    // after an `@`; the error text is the platform's own for the errno.
+    let function = op.split_once(" @ ").map(|(_, f)| f);
+    let message = match (e.raw_os_error(), function) {
+        (Some(n), Some(f)) => format!("{} @ {f} - {path}", strerror_text(n)),
+        _ => format!("{op} - {path}"),
+    };
+    raise_exc_with(class, &message, &fields)
 }
 
 /// The `StopIteration` an exhausted Enumerator raises. `#result` is the value
@@ -20980,6 +21181,35 @@ fn dispatch_range(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    // `==` between numeric ranges compares the endpoints with `==`, so an
+    // Integer range equals the Float range with the same values.
+    if name == "==" && args.len() == 1 {
+        let parts = |v: &Value| -> Option<(Value, Value, bool)> {
+            with_host(|h| {
+                if let Some((lo, hi, excl)) = h.as_range(v) {
+                    let end = |n: i64, sentinel: i64| {
+                        if n == sentinel {
+                            Value::Undef
+                        } else {
+                            Value::Int(n)
+                        }
+                    };
+                    return Some((
+                        end(lo, crate::host::RANGE_BEGINLESS),
+                        end(hi, crate::host::RANGE_ENDLESS),
+                        excl,
+                    ));
+                }
+                h.as_float_range(v)
+                    .map(|(lo, hi, excl)| (Value::Float(lo), Value::Float(hi), excl))
+            })
+        };
+        if let (Some((l1, h1, e1)), Some((l2, h2, e2))) = (parts(recv), parts(&args[0])) {
+            return Ok(Value::Bool(
+                e1 == e2 && with_host(|h| h.eq_values(&l1, &l2) && h.eq_values(&h1, &h2)),
+            ));
+        }
+    }
     // Object ranges (IPAddr#to_range, custom Comparable): membership by `<=>`,
     // iteration by `succ`.
     if let Some((lo, hi, excl)) = with_host(|h| h.as_obj_range(recv)) {
@@ -21048,6 +21278,8 @@ fn dispatch_range(
                 let kind = derive_kind(name, args).unwrap();
                 return Ok(with_host(|h| h.new_endless_range_enumerator(lo, kind)));
             }
+            // An endless Integer range is infinitely long.
+            "size" if args.is_empty() => return Ok(Value::Float(f64::INFINITY)),
             _ if is_stream_consumer(name, args, block.is_some()) => {
                 return stream_consume(recv, Stream::Count(lo), name, args, block.as_ref());
             }
@@ -21114,9 +21346,23 @@ fn dispatch_range(
             recv,
             name,
         ),
+        // An empty range (`3..1`, `1...1`) has no minimum or maximum.
+        "min" | "max" if end <= lo => Ok(Value::Undef),
         "min" | "first" | "begin" => Ok(Value::Int(lo)),
-        "max" | "last" | "end" if name != "end" => Ok(Value::Int(if excl { hi - 1 } else { hi })),
-        "end" => Ok(Value::Int(hi)),
+        "max" => Ok(Value::Int(if excl { hi - 1 } else { hi })),
+        // `last` and `end` answer the written end, exclusive or not.
+        "last" | "end" => Ok(Value::Int(hi)),
+        // `count` with a block or a value is Enumerable's counting, not `size`.
+        "count" if !args.is_empty() || block.is_some() => remap_array_delegate(
+            dispatch_array(
+                &new_arr((lo..end).map(Value::Int).collect()),
+                name,
+                args,
+                block,
+            ),
+            recv,
+            name,
+        ),
         "size" | "count" | "length" => Ok(Value::Int((end - lo).max(0))),
         // The Gauss closed form is only valid for the plain integer sum. MRI
         // takes it under exactly those conditions (`int_range_sum`) and
@@ -21896,14 +22142,55 @@ fn dispatch_method(
     // class receiver is a class-method call. `arity`/`owner`/`parameters` resolve
     // to different methods for the two, so the tag has to travel with them.
     let unbound = with_host(|h| h.is_unbound_method(recv));
+    // The class whose definition this Method is pinned to: an UnboundMethod's is
+    // the class it was looked up on, when that class defines the method in Ruby.
+    let pinned = with_host(|h| h.method_via(recv)).or_else(|| {
+        if !unbound {
+            return None;
+        }
+        let cls = with_host(|h| h.classref_name(&mrecv))?;
+        let owner = with_host(|h| h.find_method_owner(&cls, &mname).map(|(_, o)| o))?;
+        Some(owner)
+    });
     match name {
-        "call" | "()" | "[]" | "yield" | "===" => call_bound(&mrecv, &mname, args, block),
+        "call" | "()" | "[]" | "yield" | "===" => match (&pinned, unbound) {
+            (Some(class), false) => {
+                crate::host::call_instance_method(mrecv.clone(), class, &mname, args, block)
+            }
+            _ => call_bound(&mrecv, &mname, args, block),
+        },
         // `Method#>>` / `#<<` compose `method_to_proc(self)`, a lambda, like `Proc#>>`.
         ">>" | "<<" if !unbound => compose(recv, name, args, true),
         // UnboundMethod (or Method) rebinding: `bind(obj)` yields a Method bound
-        // to `obj`; `bind_call(obj, *args)` binds and invokes in one step.
-        "bind" => Ok(with_host(|h| h.new_method(args[0].clone(), &mname))),
-        "bind_call" => call_bound(&args[0], &mname, &args[1..], block),
+        // to `obj`; `bind_call(obj, *args)` binds and invokes in one step. The
+        // bound method keeps running the definition it was looked up as.
+        "bind" => Ok(with_host(|h| {
+            h.new_method_via(args[0].clone(), &mname, pinned.clone())
+        })),
+        "bind_call" => match &pinned {
+            Some(class) => {
+                crate::host::call_instance_method(args[0].clone(), class, &mname, &args[1..], block)
+            }
+            None => call_bound(&args[0], &mname, &args[1..], block),
+        },
+        // `Method#super_method` — the method the receiver's definition overrides.
+        "super_method" if !unbound => {
+            let start = pinned
+                .clone()
+                .or_else(|| with_host(|h| h.object_class(&mrecv)))
+                .unwrap_or_else(|| with_host(|h| h.class_of(&mrecv)));
+            let owner = with_host(|h| h.find_method_owner(&start, &mname).map(|(_, o)| o));
+            let sup = owner.and_then(|o| {
+                with_host(|h| {
+                    let recv_class = h.object_class(&mrecv).unwrap_or_else(|| start.clone());
+                    h.find_super(&recv_class, &o, &mname).map(|(_, so)| so)
+                })
+            });
+            Ok(match sup {
+                Some(so) => with_host(|h| h.new_method_via(mrecv.clone(), &mname, Some(so))),
+                None => Value::Undef,
+            })
+        }
         // `Method#unbind` — drop the receiver, yielding an UnboundMethod. The
         // DEFINING class takes its place (which is what `Module#instance_method`
         // stores too), so the unbound method still describes itself; `bind` and
@@ -21920,7 +22207,10 @@ fn dispatch_method(
         // a built-in is rarely the receiver's own class (`3.method(:between?)` is
         // owned by `Comparable`, `3.method(:puts)` by `Kernel`).
         "owner" => Ok(with_host(|h| {
-            let owner = h.method_owner(&mrecv, &mname, unbound);
+            let owner = match h.method_via(recv) {
+                Some(class) => class,
+                None => h.method_owner(&mrecv, &mname, unbound),
+            };
             h.class_ref(&owner)
         })),
         "parameters" => Ok(parameters_array(with_host(|h| {
@@ -22873,7 +23163,10 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             // a user `initialize` (and its `super("msg")`) runs — otherwise fall
             // back to the default `new_exception(class, message)`.
             let build = |cls: &str, ctor_args: &[Value]| -> Result<Value, String> {
-                if with_host(|h| h.find_method(cls, "initialize")).is_some() {
+                if with_host(|h| h.find_method(cls, "initialize")).is_some()
+                    || errno_of_class(cls).is_some()
+                    || cls == "SystemExit"
+                {
                     dispatch_classref(cls, "new", ctor_args, None)
                 } else {
                     let message = match ctor_args.first() {
@@ -22883,37 +23176,103 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
                     Ok(with_host(|h| h.new_exception(cls, &message)))
                 }
             };
+            // A trailing `cause:` keyword is the exception's explicit cause.
+            let (args, explicit_cause) = match args.split_last() {
+                Some((last, rest)) if with_host(|h| h.is_kwargs(last)) => {
+                    let cause = with_host(|h| h.as_hash(last))
+                        .and_then(|m| m.get(&RKey::Sym("cause".into())).cloned());
+                    match cause {
+                        Some(c) => (rest, Some(c)),
+                        None => (args, None),
+                    }
+                }
+                _ => (args, None),
+            };
+            let not_an_exception = || raise_exc("TypeError", "exception class/object expected");
             let exc = match args {
                 // Bare `raise` re-raises the exception currently being handled
                 // (`$!`), set for the duration of a `rescue` clause; only when
                 // none is active does it raise a fresh `RuntimeError`. sinatra's
                 // `process_route` rescues, records params, then bare `raise`.
                 [] => match with_host(|h| h.get_global("!")) {
-                    Value::Undef => {
-                        with_host(|h| h.new_exception("RuntimeError", "unhandled exception"))
-                    }
+                    Value::Undef => with_host(|h| h.new_exception("RuntimeError", "")),
                     e => e,
                 },
-                [a] => {
-                    if let Some(cls) = with_host(|h| h.classref_name(a)) {
-                        build(&cls, &[])?
-                    } else if with_host(|h| h.object_class(a)).is_some() {
-                        // Re-raising an existing exception instance.
-                        a.clone()
-                    } else {
-                        let m = with_host(|h| h.to_s(a));
-                        with_host(|h| h.new_exception("RuntimeError", &m))
-                    }
+                [a] if with_host(|h| h.as_str(a)).is_some() => {
+                    let m = with_host(|h| h.to_s(a));
+                    with_host(|h| h.new_exception("RuntimeError", &m))
                 }
-                [cls, rest @ ..] => {
-                    if let Some(clsname) = with_host(|h| h.classref_name(cls)) {
-                        build(&clsname, rest)?
+                [first, rest @ ..] => {
+                    if rest.len() > 2 {
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            &format!(
+                                "wrong number of arguments (given {}, expected 0..3)",
+                                args.len()
+                            ),
+                        ));
+                    }
+                    let message = rest.first().cloned();
+                    if let Some(clsname) = with_host(|h| h.classref_name(first)) {
+                        // A class must be an Exception; MRI sends it `exception`.
+                        if !with_host(|h| h.is_exception_class(&clsname)) {
+                            return Err(not_an_exception());
+                        }
+                        let ctor: Vec<Value> = message.into_iter().collect();
+                        build(&clsname, &ctor)?
+                    } else if with_host(|h| h.object_class(first))
+                        .is_some_and(|c| with_host(|h| h.is_exception_class(&c)))
+                    {
+                        match message {
+                            // Re-raising an existing exception instance.
+                            None => first.clone(),
+                            // `raise exc, "msg"` is `exc.exception("msg")`: the
+                            // user's own `exception`, else a copy with the
+                            // message replaced.
+                            Some(m) => {
+                                let own = with_host(|h| {
+                                    h.object_class(first)
+                                        .and_then(|c| h.find_method_owner(&c, "exception"))
+                                });
+                                if own.is_some() {
+                                    dispatch(first, "exception", &[m], None)?
+                                } else {
+                                    let copy = with_host(|h| h.dup_value(first));
+                                    with_host(|h| {
+                                        let sv = if matches!(m, Value::Undef) {
+                                            Value::Undef
+                                        } else {
+                                            let s = h.to_s(&m);
+                                            h.new_string(s)
+                                        };
+                                        h.set_ivar_of(&copy, "message", sv);
+                                    });
+                                    copy
+                                }
+                            }
+                        }
                     } else {
-                        let m = with_host(|h| h.to_s(cls));
-                        with_host(|h| h.new_exception("RuntimeError", &m))
+                        // Any other object must answer `exception` itself.
+                        let ctor: Vec<Value> = message.into_iter().collect();
+                        match probe_dispatch(first, "exception", &ctor) {
+                            Some(e)
+                                if with_host(|h| {
+                                    h.object_class(&e).is_some_and(|c| h.is_exception_class(&c))
+                                }) =>
+                            {
+                                e
+                            }
+                            Some(_) => {
+                                return Err(raise_exc("TypeError", "exception object expected"))
+                            }
+                            None => return Err(not_an_exception()),
+                        }
                     }
                 }
             };
+            if let Some(c) = explicit_cause {
+                with_host(|h| h.set_ivar_of(&exc, "cause", c));
+            }
             // MRI records the exception being handled at raise time as the new
             // exception's `cause`, so `rescue => e; raise Wrapper` keeps the
             // original reachable. A re-raise of `$!` itself is not its own

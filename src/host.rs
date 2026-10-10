@@ -442,6 +442,10 @@ pub enum RObj {
         /// object. Both forms store a class, so only this flag says whether a
         /// class receiver means "its class method" or "its instance method".
         unbound: bool,
+        /// The class whose definition a call runs, set by `UnboundMethod#bind`
+        /// and `Method#super_method`: `Base.instance_method(:m).bind(sub)` runs
+        /// Base's `m` even though `sub`'s class overrides it.
+        via: Option<String>,
     },
     /// A user-defined object: its class name and its instance variables.
     Object {
@@ -3690,6 +3694,7 @@ impl RubyHost {
                 recv,
                 name,
                 unbound,
+                ..
             }) => Some(self.method_arity(recv, name, *unbound)),
             _ => None,
         }
@@ -3914,7 +3919,25 @@ impl RubyHost {
             recv,
             name: name.to_string(),
             unbound: false,
+            via: None,
         })
+    }
+    /// A bound `Method` that runs the definition found on `via` (and above)
+    /// rather than re-resolving `name` on the receiver's own class.
+    pub fn new_method_via(&mut self, recv: Value, name: &str, via: Option<String>) -> Value {
+        self.alloc(RObj::Method {
+            recv,
+            name: name.to_string(),
+            unbound: false,
+            via,
+        })
+    }
+    /// The class a `Method`'s call is pinned to, if it has one.
+    pub fn method_via(&self, v: &Value) -> Option<String> {
+        match self.obj(v) {
+            Some(RObj::Method { via, .. }) => via.clone(),
+            _ => None,
+        }
     }
     /// Allocate an `UnboundMethod` (`Module#instance_method`, `Method#unbind`):
     /// `owner` is the class the method is looked up on, not a receiver.
@@ -3923,6 +3946,7 @@ impl RubyHost {
             recv: owner,
             name: name.to_string(),
             unbound: true,
+            via: None,
         })
     }
     /// The (receiver, method-name) of a bound `Method` value (`None` otherwise).
@@ -4523,6 +4547,7 @@ impl RubyHost {
                 recv,
                 name,
                 unbound,
+                ..
             }) => self.method_parameters(recv, name, *unbound),
             _ => Vec::new(),
         }
@@ -5588,6 +5613,24 @@ impl RubyHost {
         }
         self.used_modules.retain(|m| m != module_name);
         self.used_modules.push(module_name.to_string());
+    }
+    /// `alias new old` among the top-level `def`s. False when `old` is not one.
+    pub fn alias_top_level_method(&mut self, new_name: &str, old_name: &str) -> bool {
+        match self.methods.get(old_name).cloned() {
+            Some(def) => {
+                self.methods.insert(new_name.to_string(), def);
+                true
+            }
+            None => false,
+        }
+    }
+    /// The names of the top-level `def`s (private methods of Object).
+    pub fn top_level_method_names(&self) -> Vec<String> {
+        self.methods
+            .keys()
+            .filter(|n| !n.starts_with("__"))
+            .cloned()
+            .collect()
     }
     /// `Module.used_modules`, newest first.
     pub fn used_modules(&self) -> Vec<String> {
@@ -8438,8 +8481,10 @@ impl RubyHost {
     pub fn is_exception_class(&self, class: &str) -> bool {
         fn builtin(n: &str) -> bool {
             n.ends_with("Error")
-                || n == "Exception"
-                || n == "StopIteration"
+                || matches!(
+                    n,
+                    "Exception" | "StopIteration" | "SystemExit" | "SignalException" | "Interrupt"
+                )
                 || n.starts_with("Errno::")
         }
         let mut cur = Some(class.to_string());
@@ -8683,6 +8728,7 @@ impl RubyHost {
                     recv,
                     name,
                     unbound,
+                    ..
                 }) => {
                     let tag = if unbound { "UnboundMethod" } else { "Method" };
                     format!(
@@ -9964,6 +10010,15 @@ impl RubyHost {
         if ca != cb && numeric(&ca) && numeric(&cb) {
             return false;
         }
+        // `eql?` on ranges is strict about the endpoints' classes: an Integer
+        // range is not `eql?` to the Float range with the same numbers.
+        if matches!(
+            (self.obj(a), self.obj(b)),
+            (Some(RObj::Range { .. }), Some(RObj::FloatRange { .. }))
+                | (Some(RObj::FloatRange { .. }), Some(RObj::Range { .. }))
+        ) {
+            return false;
+        }
         // Two user objects that `canon_user_keys` bound to one representative
         // were found `eql?` by their own `hash`/`eql?`.
         if let (Value::Obj(x), Value::Obj(y)) = (a, b) {
@@ -10119,6 +10174,27 @@ impl RubyHost {
         }
     }
 
+    /// `(begin, end, exclusive)` of an Integer or Float range as `f64`s, an open
+    /// end as infinity. Only meaningful for comparing two numeric ranges.
+    fn numeric_range_parts(&self, v: &Value) -> (f64, f64, bool) {
+        match self.obj(v) {
+            Some(RObj::Range { lo, hi, exclusive }) => (
+                if *lo == RANGE_BEGINLESS {
+                    f64::NEG_INFINITY
+                } else {
+                    *lo as f64
+                },
+                if *hi == RANGE_ENDLESS {
+                    f64::INFINITY
+                } else {
+                    *hi as f64
+                },
+                *exclusive,
+            ),
+            Some(RObj::FloatRange { lo, hi, exclusive }) => (*lo, *hi, *exclusive),
+            _ => (f64::NAN, f64::NAN, false),
+        }
+    }
     fn eq_values_uncycled(&self, a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => x == y,
@@ -10137,6 +10213,19 @@ impl RubyHost {
             }
             (Value::Bool(x), Value::Bool(y)) => x == y,
             (Value::Undef, Value::Undef) => true,
+            // An Integer range equals the Float range of the same numbers
+            // (`(1..3) == (1..3.0)`): the endpoints compare with `==`.
+            (Value::Obj(_), Value::Obj(_))
+                if matches!(
+                    (self.obj(a), self.obj(b)),
+                    (Some(RObj::Range { .. }), Some(RObj::FloatRange { .. }))
+                        | (Some(RObj::FloatRange { .. }), Some(RObj::Range { .. }))
+                ) =>
+            {
+                let (l1, h1, e1) = self.numeric_range_parts(a);
+                let (l2, h2, e2) = self.numeric_range_parts(b);
+                e1 == e2 && l1 == l2 && h1 == h2
+            }
             // Rational equality (also equal to an integer of the same value —
             // `as_rational` converts an Integer of either width, which is why
             // this arm comes BEFORE the BigInt one: `2**64 == Rational(2**64, 1)`
@@ -13665,8 +13754,13 @@ pub fn call_proc_self_ctx(
         // A bound `Method` used as a block/proc (`map(&obj.method(:m))`): re-dispatch
         // the stored method on its captured receiver, with the Kernel fallback so a
         // bound Kernel method (`method(:puts)`) works off the `main` object too.
-        Some(RObj::Method { recv, name, .. }) => {
-            return crate::builtins::call_bound(&recv, &name, args, None);
+        Some(RObj::Method {
+            recv, name, via, ..
+        }) => {
+            return match via {
+                Some(class) => call_instance_method(recv.clone(), &class, &name, args, None),
+                None => crate::builtins::call_bound(&recv, &name, args, None),
+            };
         }
         // The native `cycle` generator body: driven with a yielder (`args[0]`),
         // it pushes the captured elements round and round. The yielder returns a

@@ -7062,3 +7062,1027 @@ p d
 p 5<<-1, 5<<~1.succ - 1 rescue p $!.class
 x = 4
 p x<<2, [1]<<2
+#==#
+# ── Enumerable and Range methods (1) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { [1, 2, 3, 4].chunk_while { _2 == _1 + 1 }.to_a }
+t { [1, 2, 4, 9, 10, 11].slice_when { _2 > _1 + 1 }.to_a }
+t { [1, 2, 3, 4, 5].chunk { _1.odd? }.to_a }
+t { [1, 2, 3, 4, 5].chunk { _1 > 3 ? :_separator : true }.to_a }
+t { [1, 2, 3, 4, 5].chunk { _1.even? ? nil : :odd }.to_a }
+t { [1, 2, 3, 4, 5].chunk { _1 == 3 ? :_alone : :x }.to_a }
+t { (1..10).slice_before { _1 % 3 == 0 }.to_a }
+t { (1..10).slice_after { _1 % 3 == 0 }.to_a }
+t { %w[a b c].each_with_index.to_a }
+t { %w[a b c].each_with_index.map { |x, i| x * i } }
+t { [3, 1, 2].min(2) }
+t { [3, 1, 2].max(2) }
+t { [3, 1, 2].min_by(2) { -_1 } }
+t { [3, 1, 2].minmax }
+t { %w[aa b ccc].minmax_by(&:size) }
+t { [].min }
+t { [].min(2) }
+t { [].sum }
+t { [].max_by { _1 } }
+t { [1, 2, 3].inject(:+) }
+t { [1, 2, 3].inject(10, :+) }
+t { [1, 2, 3].inject(10) { |a, b| a * b } }
+t { [].inject(:+) }
+t { [5].inject(:+) }
+t { [1, 2, 3].inject { |a, b| a - b } }
+t { [1, 2, 3].reduce(1, :*) }
+t { [[1, 2], [3, 4]].to_h { |a, b| [b, a] } }
+t { [[1, 2], [3]].to_h }
+t { [1, 2, 3, 4].partition(&:even?) }
+t { %w[a bb c dd].group_by(&:size) }
+t { %w[a bb c dd].tally_by(&:size) }
+t { %w[a b a].tally }
+t { [1, 2, 3].each_cons(2).to_a }
+t { [1, 2, 3].each_slice(2).to_a }
+t { [1, 2, 3].each_cons(0) }
+t { [1, 2, 3].each_slice(0) }
+t { [1, 2, 3].zip([4, 5, 6], [7, 8, 9]) }
+t { [1, 2, 3].cycle.first(7) }
+t { [1, 2, 3].cycle(2).to_a }
+t { [1, 2, 3].find_index(2) }
+t { [1, 2, 3].find_index { _1 > 1 } }
+t { [1, 2, 3].take_while { _1 < 3 } }
+t { [1, 2, 3].drop_while { _1 < 2 } }
+t { [1, 2, 3].flat_map { [_1, _1 * 10] } }
+t { [[1, [2]], [3]].flatten(1) }
+#==#
+# ── Enumerable and Range methods (2) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { [[1, [2]], [3]].flatten }
+t { [1, 2, 3, 4].sum { _1.to_f } }
+t { [0.1] * 3 == [0.1, 0.1, 0.1] }
+t { ([0.1] * 3).sum }
+t { [0.1, 0.2, 0.3].sum }
+t { [1, 2].sum(0.0) }
+t { %w[a b].sum("") }
+t { [[1], [2]].sum([]) }
+t { [1, 2, 3].each_entry.to_a }
+t { [1, 2, 3].filter_map { _1 * 2 if _1.odd? } }
+t { [1, 2, 3, 4].each_with_object([]) { |x, a| a << x * 2 } }
+t { [4, 5].each.with_index(1).to_a }
+t { [4, 5].each_with_index.to_a }
+t { [4, 5].map.with_index { |x, i| x * i } }
+t { [4, 5].select.with_index { |x, i| i == 0 } }
+t { [1, 2, 3].lazy.map { _1 * 2 }.first(2) }
+t { [1, 2, 3, 4].one? { _1 > 3 } }
+t { [1, 2, 3, 4].none?(5..) }
+t { [nil, false].any? }
+t { [nil, 1].all? }
+t { [].all? }
+t { [].none? }
+t { [1, 1].one?(1) }
+t { %w[a b].include?("a") }
+t { [1, 2, 3].count(&:odd?) }
+t { [1, 1, 2].count(1) }
+t { [1, 2, 3].first(2) }
+t { [1, 2, 3].first(-1) }
+t { [1, 2, 3].last(5) }
+t { [3, 1, 2].sort { |a, b| b <=> a } }
+t { [3, 1, 2].sort_by { -_1 } }
+t { [3, 1, 2].max { |a, b| a <=> b } }
+t { %w[b a].sort! }
+t { [1, 2, 3].reverse_each.to_a }
+t { [1, 2, 3].step rescue $!.class }
+t { (1..10).step(3).to_a }
+t { (1..10) % 3 }
+t { ((1..10) % 3).to_a }
+t { 1.step(10, 4).to_a }
+t { (1.0..2.0).step(0.5).to_a }
+t { (1..2).step(0.5).to_a }
+t { ("a".."e").step(2).to_a }
+t { (1..).step(5).first(3) }
+t { (1..10).each_slice(4).map(&:sum) }
+t { (1...10).size }
+#==#
+# ── Enumerable and Range methods (3) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { (1..10).count(&:even?) }
+t { (1..0).to_a }
+t { (1..0).sum }
+t { (1..Float::INFINITY).lazy.map { _1 * 2 }.first(2) }
+t { (1..3).minmax }
+t { (3..1).min }
+t { ("a".."c").max }
+t { (1..3).reduce(:*) }
+t { (1..4).each_cons(2).to_a }
+t { Range.new(1, 3, true).to_a }
+t { (1..3).eql?(1..3) }
+t { (1..3).hash == (1..3).hash }
+t { (1..3) == (1..3.0) }
+t { (1..3).eql?(1..3.0) }
+t { (1..3).include?(2.5) }
+t { (1..3).cover?(1..2) }
+t { (1.5..3).to_a }
+t { (..3).include?(2) }
+t { (..3).to_a }
+t { (1..).first(2) }
+t { (1..).size }
+t { (..1).size }
+t { (1..3).sum { _1 * 2 } }
+t { ("a"..."c").to_a }
+t { ("az".."bc").to_a }
+t { ("08".."11").to_a }
+t { (:a..:c).to_a }
+t { (1..3).inspect }
+t { (1...3).to_s }
+t { (nil..nil).inspect }
+t { (1..nil).inspect }
+t { (nil..1).inspect }
+t { Range.new(1, "a") }
+t { (1..3).frozen? }
+t { (1..3).step(0) }
+t { (1..3).step(-1).to_a }
+t { 3.downto(1).to_a }
+t { 1.upto(3).size }
+t { 10.downto(7).select(&:even?) }
+t { 5.times.map { _1 * 2 } }
+t { 3.times.sum }
+#==#
+# ── Array methods (1) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { [1, 2, 3].product([4, 5]) }
+t { [1, 2].product }
+t { [1, 2].product([3], [4, 5]).size }
+t { [1, 2, 3].combination(2).to_a }
+t { [1, 2, 3].combination(0).to_a }
+t { [1, 2, 3].combination(4).to_a }
+t { [1, 2, 3].permutation(2).to_a.size }
+t { [1, 2, 3].permutation.first(2) }
+t { [1, 2].repeated_combination(2).to_a }
+t { [1, 2].repeated_permutation(2).to_a }
+t { [1, 2, 3, 4].bsearch { _1 >= 3 } }
+t { [1, 2, 3, 4].bsearch_index { _1 >= 3 } }
+t { [1, 2, 3].rotate }
+t { [1, 2, 3].rotate(-1) }
+t { [1, 2, 3].rotate(10) }
+t { [[1, 2], [3, 4]].transpose }
+t { [[1, 2], [3]].transpose }
+t { [1, 2, 3].fill(0) }
+t { [1, 2, 3].fill(0, 1) }
+t { [1, 2, 3].fill(0, 1, 1) }
+t { [1, 2, 3].fill { _1 * 2 } }
+t { [1, 2, 3].fill(9, 5, 2) }
+t { [1, 2, 3].fill(0, -2) }
+t { a = [1, 2, 3, 4]; [a.slice!(1, 2), a] }
+t { a = [1, 2, 3, 4]; [a.slice!(1..), a] }
+t { a = [1, 2, 3]; [a.slice!(5), a] }
+t { a = [1, 2, 3]; a.insert(1, :a, :b) }
+t { a = [1, 2, 3]; a.insert(-2, :x) }
+t { a = [1, 2, 3]; a.insert(5, :x) }
+t { a = [1, 2, 3]; a.insert(-5, :x) }
+t { [[1, :a], [2, :b]].assoc(2) }
+t { [[1, :a], [2, :b]].rassoc(:b) }
+t { [1, [2, [3, [4]]]].flatten(2) }
+t { a = [1, 2]; a << a; a.flatten }
+t { [1, 2, 3].values_at(0, 2, 5, -1) }
+t { [1, 2, 3].values_at(1..5) }
+t { [1, 2, 3].dig(0) }
+t { [[1, [2]]].dig(0, 1, 0) }
+t { [1, 2, 3].dig(0, 1) }
+t { [1, 2, 3, 4, 5][1..-2] }
+t { [1, 2, 3, 4, 5][-3..] }
+t { [1, 2, 3, 4, 5][5..] }
+t { [1, 2, 3, 4, 5][6..] }
+t { [1, 2, 3, 4, 5][1, 0] }
+t { [1, 2, 3][-4] }
+#==#
+# ── Array methods (2) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { a = [1, 2, 3]; a[5] = 9; a }
+t { a = [1, 2, 3]; a[1..1] = [7, 8]; a }
+t { a = [1, 2, 3]; a[0, 2] = []; a }
+t { a = [1, 2, 3]; a[-5] = 1 }
+t { a = [1, 2, 3]; a[1...1] = 9; a }
+t { [1, 2, 3] <=> [1, 2, 4] }
+t { [1, 2] <=> [1, 2, 3] }
+t { [1, 2] <=> 5 }
+t { [1, 2] & [2, 3] }
+t { [1, 2] | [2, 3] }
+t { [1, 2, 2, 3] - [2] }
+t { [1, 2] + [3] }
+t { [1, 2] * 2 }
+t { [1, 2] * "," }
+t { [1, 2] * -1 }
+t { [3, 5, 2].sort.reverse }
+t { [1, 2, 3].sum / [1, 2, 3].size.to_f }
+t { ["a", "b"].join }
+t { [1, [2, [3]]].join(",") }
+t { [1, nil, "a"].join("-") }
+t { [1, 2, 3].to_s }
+t { [nil, true].inspect }
+t { [1, 2, 3].pack("C*") }
+t { [65, 66].pack("U*") }
+t { [1, 2, 3].take(2) }
+t { [1, 2, 3].drop(5) }
+t { [1, 2, 3].take(-1) }
+t { [1, 2, 2, 3, 3, 3].uniq }
+t { [1, 2, 3, 4].uniq { _1 % 2 } }
+t { [1, 2, 3].delete(2) }
+t { [1, 2, 3].delete(5) { :nf } }
+t { [1, 2, 3].delete_if { _1 > 1 } }
+t { [3, 1, 2].sort!.first }
+t { [1, 2, 3].map!(&:to_s) }
+t { [1, nil].compact }
+t { [1, 2, 3].reject!(&:even?) }
+t { [1, 3].reject!(&:even?) }
+t { [1, 2].select! { true } }
+t { [1, 2, 3].keep_if(&:odd?) }
+t { [1, 2, 3].min_by { -_1 } }
+t { [1, 2, 3].each_slice(2).map(&:sum) }
+t { Array.new(3) { _1 * 2 } }
+t { Array.new(2, "x") }
+#==#
+# ── Array methods (3) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { Array.new(-1) }
+t { Array.new([1, 2]) }
+t { Array(nil) }
+t { Array([1]) }
+t { Array(1..3) }
+t { Array("a\nb") }
+t { Array({a: 1}) }
+t { Array.new(3).size }
+t { [1, 2, 3].first(2).frozen? }
+t { [0] * 3 }
+t { [[0] * 2] * 2 }
+t { a = [[0] * 2] * 2; a[0][0] = 1; a }
+t { [1, 2, 3].each_with_index.to_a.flatten }
+t { [1, 2, 3].zip }
+t { [1, 2].zip([3]) }
+t { [[1, 2], [3, 4]].sum([]) }
+t { [[1, 2], [3, 4]].each_with_index.map { |(a, b), i| a + b + i } }
+t { [1, 2, 3].intersect?([3]) }
+t { [1, 2, 3].intersection([2, 3], [3]) }
+t { [1, 2].union([3], [4]) }
+t { [1, 2, 3].difference([1], [2]) }
+t { [3, 1].minmax }
+t { %w[a b c].each_cons(2).map(&:join) }
+t { [1, 2, 3].sum { |x| x * 0.5 } }
+t { [1, 2, 3, 4, 5].each_slice(2).to_h { |a, b| [a, b] } }
+t { [[1, 2], [3, 4]].to_h }
+t { [1, 2, 3].to_h { [_1, _1 * 2] } }
+t { [1, 2, 3].each_entry.map { _1 } }
+t { [1, 2, 3, 4].find_all(&:even?) }
+t { %w[apple banana cherry].map(&:upcase).select { _1.include?("A") } }
+t { [1, 2, 3].reverse.map(&:to_s).join }
+t { [[1, 2], [3, 4]].map { |a, b| a * b } }
+t { [[1, [2, 3]]].map { |a, (b, c)| a + b + c } }
+t { [1, 2, 3].then { |a, *r| [a, r] } }
+t { a, (b, *c), d = 1, [2, 3, 4], 5; [a, b, c, d] }
+t { a, b = [1, 2], 3; [a, b] }
+t { *a, b = 1, 2, 3; [a, b] }
+t { a, = [5, 6]; a }
+t { a = *nil; a }
+t { a = *1; a }
+t { a = *[1, 2]; a }
+t { [*1..3, *"a".."c"] }
+t { [*nil] }
+t { [*{a: 1}] }
+#==#
+# ── String methods (1) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { "hello world".scan(/o/) }
+t { "hello world".scan(/(l)(.)/) }
+t { "a1b22c333".scan(/\d+/) { |m| print m } }
+t { "hello".gsub(/l/, "l" => "L") }
+t { "hello".gsub(/[el]/) { |m| m.upcase } }
+t { "hello".gsub("l") { $&.upcase } }
+t { "hello".gsub(/(?<x>l)/, '[\k<x>]') }
+t { "hello".gsub(/(l)/, '<\1>') }
+t { "hello".gsub(/l/, '\0\0') }
+t { "hello".gsub(/x/, "y") }
+t { "hello".sub(/(?<first>h)/) { $~[:first].upcase } }
+t { "hello".sub("l", '\\\\') }
+t { "a.b".gsub(".", "-") }
+t { "hello"=~/ll/ }
+t { "hello".match(/l+/)[0] }
+t { "hello".match(/l+/, 4) }
+t { "hello".match?(/ell/) }
+t { "hello".match(/(?<a>e)(?<b>l)/).named_captures }
+t { "hello".match(/(?<a>e)(?<b>l)/).deconstruct_keys([:a]) }
+t { "foo bar".split }
+t { "foo  bar".split(" ") }
+t { "foo  bar".split(/ /) }
+t { "a,b,,".split(",") }
+t { "a,b,,".split(",", -1) }
+t { "a,b,c".split(",", 2) }
+t { "abc".split("") }
+t { "a b".split(/(\s)/) }
+t { " a b ".split }
+t { "abc".partition("b") }
+t { "abc".rpartition("c") }
+t { "abc".partition(/x/) }
+t { "hello"[1..3] }
+t { "hello"[-3, 2] }
+t { "hello"[/l+/] }
+t { "hello"[/(h)(e)/, 2] }
+t { "hello"["ell"] }
+t { "hello"[10] }
+t { "hello".slice(1..) }
+t { "héllo".byteslice(1, 2) }
+t { "hello".chars.each_slice(2).map(&:join) }
+t { "hello world".center(21, "*") }
+t { "ab".ljust(5, "12") }
+t { "ab".rjust(5, "12") }
+t { "  hi  ".strip }
+t { "\t\n hi \0".strip }
+#==#
+# ── String methods (2) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { "xxhixx".delete_prefix("xx").delete_suffix("xx") }
+t { "hello".tr("el", "ip") }
+t { "hello".tr("a-y", "b-z") }
+t { "hello".tr("^l", "*") }
+t { "hello".tr_s("l", "r") }
+t { "hello".delete("l") }
+t { "hello".squeeze }
+t { "aaabbb".squeeze("a") }
+t { "hello".count("lo") }
+t { "hello".index("l") }
+t { "hello".index("l", 3) }
+t { "hello".rindex("l") }
+t { "hello".index(/l+/) }
+t { "hello".start_with?(/he/) }
+t { "hello".end_with?("lo", "x") }
+t { "Hello".swapcase }
+t { "hello world".capitalize }
+t { "HELLO".downcase }
+t { "hello".succ }
+t { "az".succ }
+t { "zz".succ }
+t { "a9".succ }
+t { "Zz".succ }
+t { "-9".succ }
+t { "1.9".succ }
+t { "".succ }
+t { "hello".ord }
+t { "".ord }
+t { "hello".sum }
+t { "hello".hash == "hello".hash }
+t { "abc".unpack("C*") }
+t { "abc".unpack1("a2") }
+t { "\x01\x02".unpack("S") }
+t { "abc".each_char.to_a }
+t { "a\nb\n".lines }
+t { "a\nb".each_line.to_a }
+t { "a\r\nb".lines(chomp: true) }
+t { "a\nb\n".each_line(chomp: true).to_a }
+t { "hello\n".chomp }
+t { "hello".chomp("llo") }
+t { "hello".chop }
+t { "hello\r\n".chop }
+t { "abc" <=> "abd" }
+t { "a" * 3 }
+#==#
+# ── String methods (3) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { "a" + "b" }
+t { "a" "b" }
+t { "abc".eql?("abc") }
+t { "abc".equal?("abc") }
+t { "abc".casecmp("ABD") }
+t { "abc".casecmp?("ABC") }
+t { "abc".between?("abb", "abd") }
+t { "10" + 5 }
+t { "10".to_i + 5 }
+t { "0x1f".hex }
+t { "777".oct }
+t { "0b11".to_i(0) }
+t { "12abc".to_i }
+t { "abc".to_i }
+t { "1e3".to_f }
+t { "1_000".to_i }
+t { " 12 ".to_i }
+t { "3.7".to_r }
+t { "1/3".to_r }
+t { "1+2i".to_c }
+t { "abc".to_sym }
+t { "hello world".to_sym }
+t { "abc".freeze.frozen? }
+t { "abc".dup << "d" }
+t { "ab".concat("c", "d") }
+t { "ab".prepend("x", "y") }
+t { "abc".replace("x") }
+t { "abc".insert(1, "X") }
+t { "abc".insert(-1, "X") }
+t { "hello world".each_char.select { "aeiou".include?(_1) }.size }
+t { "abc".reverse }
+t { "abc".include?("b") }
+t { "abc".empty? }
+t { "".empty? }
+t { " ".empty? }
+t { "abc".length }
+t { "ab̀".length }
+t { "ab̀".unicode_normalize.length }
+t { "abc".upto("abe").to_a }
+t { "a".upto("e", true).to_a }
+t { "9".upto("11").to_a }
+t { "abc".encoding.to_s }
+t { "abc".force_encoding("ASCII-8BIT").encoding.to_s }
+t { "abc".valid_encoding? }
+t { "abc".ascii_only? }
+#==#
+# ── String methods (4) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { "é".ascii_only? }
+t { "abc".b.encoding.to_s }
+t { "%s %p" % ["a", "a"] }
+t { "%05.1f%%" % 3.14159 }
+t { "%-5s|" % "ab" }
+t { "%+d" % 5 }
+t { "%x" % 255 }
+t { "%o" % 8 }
+t { "%e" % 12345.6789 }
+t { "%b" % 10 }
+t { "%08.3f" % 3.14159 }
+t { "%s" % nil }
+t { "%d" % 3.99 }
+t { "%c" % 65 }
+t { "%5.2s|" % "abcdef" }
+t { "%<a>d-%<b>s" % {a: 1, b: "x"} }
+t { "%{a}-%{b}" % {a: 1, b: "x"} }
+t { "abc".to_s.equal?("abc") }
+t { "a-b_c d".split(/[-_ ]/) }
+t { "CamelCaseString".gsub(/([A-Z])/) { "_" + $1.downcase }.sub(/^_/, "") }
+t { "snake_case_word".split("_").map.with_index { |w, i| i.zero? ? w : w.capitalize }.join }
+t { "The quick brown fox".split.map(&:length) }
+t { "hello world".split.map(&:capitalize).join(" ") }
+t { "abc".each_char.with_index.map { |c, i| c * (i + 1) }.join("-") }
+t { "ruby" <=> "rubx" }
+t { "text: %s" % "x" }
+t { "tab\there".expand_tabs rescue $!.class }
+t { "line1\nline2".lines.map(&:chomp) }
+t { "abc".unpack("a1 a1 a1") }
+t { "hello %s, you are %d" % ["Bob", 30] }
+t { "ab".ljust(1) }
+t { "abc".slice(0) }
+t { "abc".slice(0, 0) }
+t { "abc".slice(3) }
+t { "abc".slice(3, 1) }
+t { "abc".slice(4, 1) }
+t { "abc"[1..-1] }
+t { "abc"[3..] }
+t { "abc"[4..] }
+t { "hello world".delete("lo") }
+t { "hello".each_grapheme_cluster.to_a.size }
+t { "hello" =~ /(?<v>[aeiou])/; $~[:v] }
+t { "ab12".match(/(\d)(\d)/).captures.map(&:to_i) }
+t { "2024-01-15".match(/(\d+)-(\d+)-(\d+)/).to_a }
+t { "k=v; k2=v2".scan(/(\w+)=(\w+)/).to_h }
+#==#
+# ── String methods (5) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { "aAbB".swapcase }
+t { "i".upcase }
+t { "ǅ".downcase }
+#==#
+# ── raise forms and exception classes (1) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+class MyErr < StandardError; def initialize(msg = "custom default") = super; end
+class Err2 < StandardError; def message = "overridden"; end
+class Err3 < StandardError; def initialize(a, b) = (super("#{a}-#{b}")); end
+t { raise MyErr }
+t { raise MyErr, "given" }
+t { raise MyErr.new("obj") }
+t { raise Err2 }
+t { raise Err3.new(1, 2) }
+t { raise Err3, "x" }
+t { raise "plain" }
+t { raise }
+t { raise Class }
+t { raise 5 }
+t { raise nil }
+t { raise StandardError.new("a"), "b" }
+t { raise TypeError, "a", [] }
+t { begin; raise "a"; rescue => e; e.message; end }
+t { begin; raise MyErr; rescue => e; e.inspect; end }
+t { begin; raise MyErr, "a\nb"; rescue => e; e.inspect; end }
+t { StandardError.new.message }
+t { StandardError.new(nil).message }
+t { StandardError.new(5).message }
+t { StandardError.new("a").inspect }
+t { RuntimeError.new("").inspect }
+t { StandardError.new("a") == StandardError.new("a") }
+t { StandardError.new("a").detailed_message }
+t { StandardError.new("a").detailed_message(highlight: false) }
+t { MyErr.new.detailed_message }
+t { begin; begin; raise "inner"; rescue => e; raise TypeError, "outer"; end; rescue => e2; [e2.message, e2.cause.message]; end }
+t { begin; begin; raise "a"; ensure; puts "ens"; end; rescue; :rescued; end }
+t { begin; raise "x"; rescue ArgumentError, RuntimeError => e; e.class; end }
+t { begin; Integer("z"); rescue ArgumentError => e; e.message; end }
+t { begin; nil.foo; rescue NoMethodError => e; [e.name, e.receiver, e.message]; end }
+t { begin; foo_undefined; rescue NameError => e; [e.name, e.class, e.message]; end }
+t { begin; 1 / 0; rescue ZeroDivisionError => e; e.message; end }
+t { begin; [].fetch(1); rescue IndexError => e; e.message; end }
+t { begin; {a: 1}.fetch(:b); rescue KeyError => e; [e.message, e.key, e.receiver]; end }
+t { begin; Float("x"); rescue => e; e.message; end }
+t { begin; "a" + 1; rescue => e; [e.class, e.message]; end }
+t { begin; 1 + "a"; rescue => e; [e.class, e.message]; end }
+t { begin; [1].first("a"); rescue => e; [e.class, e.message]; end }
+t { begin; :a.unknown; rescue => e; e.message; end }
+t { begin; Object.new.instance_eval { foo }; rescue NameError => e; e.message =~ /undefined local variable or method 'foo' for an instance of Object/; end }
+t { begin; raise Exception, "x"; rescue => e; :std; rescue Exception => e; :exc; end }
+t { begin; loop { raise StopIteration, "done" }; end }
+t { catch(:x) { throw :x, 5 } }
+#==#
+# ── raise forms and exception classes (2) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+class MyErr < StandardError; def initialize(msg = "custom default") = super; end
+class Err2 < StandardError; def message = "overridden"; end
+class Err3 < StandardError; def initialize(a, b) = (super("#{a}-#{b}")); end
+t { catch { |tag| throw tag, 7 } }
+t { begin; throw :nope; rescue UncaughtThrowError => e; e.message; end }
+t { x = begin; Integer("5"); rescue; 0; else; 100; ensure; 200; end; x }
+t { r = [1, 2, 3].each { |x| break x * 10 if x == 2 }; r }
+t { n = 0; begin; n += 1; raise "r" if n < 3; n; rescue; retry; end }
+t { (raise "a" rescue "rescued") }
+t { v = Integer("q") rescue -1; v }
+t { exit_code = begin; exit 3; rescue SystemExit => e; e.status; end; exit_code }
+t { begin; exit; rescue SystemExit => e; [e.status, e.success?, e.message]; end }
+t { begin; abort("bye"); rescue SystemExit => e; [e.status, e.message]; end }
+t { begin; Process.exit(false); rescue SystemExit => e; e.status; end }
+t { e = RuntimeError.new("a"); e.exception.equal?(e) }
+t { e = RuntimeError.new("a"); e.exception("b").message }
+t { RuntimeError.exception("z").message }
+t { Class.new(StandardError).new.message =~ /#<Class:0x/ }
+t { Class.new(StandardError) { def message = "m" }.new.message }
+t { StandardError.ancestors.take(3) }
+t { [ArgumentError, TypeError, ZeroDivisionError, FloatDomainError, KeyError, StopIteration, FrozenError].map(&:superclass) }
+t { [NoMethodError, NameError, LoadError, NotImplementedError, Interrupt, SystemExit].map(&:superclass) }
+t { Errno::ENOENT.new.message }
+t { Errno::ENOENT.new("path").message }
+t { Errno::ENOENT::Errno }
+t { Errno::EACCES.new.errno }
+t { Integer("12", 1) rescue [$!.class, $!.message] }
+t { [1, 2].first(-1) rescue [$!.class, $!.message] }
+t { "abc".center rescue [$!.class, $!.message] }
+t { raise ArgumentError rescue $!.message }
+t { raise ArgumentError.new rescue $!.message }
+t { ->(a) {}.call rescue $!.message }
+t { proc { |a| }.call(1, 2); :ok }
+t { raise "a" rescue $!.class }
+t { begin; raise "a"; rescue; $!.message; end }
+t { begin; raise "a"; rescue; end; $! }
+#==#
+# ── raise forms and exception classes (3) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+class MyErr < StandardError; def initialize(msg = "custom default") = super; end
+class Err2 < StandardError; def message = "overridden"; end
+class Err3 < StandardError; def initialize(a, b) = (super("#{a}-#{b}")); end
+t { Comparable.instance_method(:clamp).owner }
+t { begin; Integer.new; rescue NoMethodError => e; e.message; end }
+t { begin; Rational(1, 0); rescue ZeroDivisionError => e; e.message; end }
+t { begin; Math.sqrt(-1); rescue Math::DomainError => e; e.message; end }
+t { begin; "abc".to_sym.call; rescue NoMethodError => e; e.message; end }
+t { begin; [3, "a"].sort; rescue ArgumentError => e; e.message; end }
+t { begin; [3, nil].max; rescue ArgumentError, NoMethodError => e; e.message; end }
+t { begin; Struct.new(:a).new(1, 2); rescue ArgumentError => e; e.message; end }
+t { begin; Hash.new(1) { }; rescue ArgumentError => e; e.message; end }
+t { begin; "x".freeze << "y"; rescue FrozenError => e; [e.message, e.receiver]; end }
+t { begin; def (Object.new.freeze).x; end; rescue FrozenError => e; e.class; end }
+t { begin; Object.new.send(:initialize, 1); rescue ArgumentError => e; e.message; end }
+t { begin; Module.new.new; rescue NoMethodError => e; e.message =~ /undefined method 'new' for module/; end }
+#==#
+# ── object model and reflection (1) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+module Greet; def hi = "hi from #{self.class}"; end
+class Kid < Base; include Greet; def who = "kid>" + super; end
+t { Kid.new.who }
+t { Kid.new.hi }
+t { Kid.ancestors.take(4) }
+t { Kid.instance_method(:who).owner }
+t { Kid.instance_method(:hi).owner }
+t { Kid.new.method(:who).super_method.owner }
+t { Kid.superclass }
+t { Kid.include?(Greet) }
+t { Kid < Base }
+t { Base <= Base }
+t { Kid <=> Base }
+t { Base <=> Kid }
+t { Kid.instance_methods(false) }
+t { Kid.public_method_defined?(:who) }
+t { Kid.new.respond_to?(:hi) }
+t { Kid.new.is_a?(Greet) }
+t { Greet === Kid.new }
+t { Kid.new.singleton_methods }
+t { Kid.name }
+t { Kid.to_s }
+t { Kid.class }
+t { Kid.singleton_class.inspect }
+t { Greet.instance_methods }
+t { Greet.class }
+t { Kid.method_defined?(:extra) }
+t { Kid.new.public_send(:who) }
+t { Kid.new.then { _1.class } }
+t { Kid.allocate.class }
+t { Kid.new.instance_variables }
+t { o = Kid.new; o.instance_variable_set(:@z, 1); o.instance_variables }
+t { o = Kid.new; o.instance_variable_set(:@z, 1); o.instance_variable_get(:@z) }
+t { Kid.new.frozen? }
+t { Kid.new.dup.class }
+t { Kid.class_variable_set(:@@c, 1); Kid.class_variable_get(:@@c) }
+t { Kid.class_variables }
+t { Kid.const_set(:K, 5); Kid::K }
+t { Kid.constants }
+t { Kid.const_defined?(:K) }
+t { Object.const_defined?(:Kid) }
+t { c = Class.new(Base) { def who = "anon>" + super }; c.new.who }
+t { c = Class.new { attr_accessor :a, :b }; o = c.new; o.a = 1; o.b = 2; [o.a, o.b] }
+t { c = Class.new { define_method(:m) { |x = 2| x * 2 } }; [c.new.m, c.new.m(5)] }
+t { c = Class.new { def method_missing(n, *a) = n.to_s.start_with?("x_") ? [n, a] : super; def respond_to_missing?(n, p = false) = n.to_s.start_with?("x_") || super }; o = c.new; [o.x_foo(1), o.respond_to?(:x_a), o.respond_to?(:y)] }
+t { o = Object.new; class << o; def sing = 1; end; o.singleton_methods }
+#==#
+# ── object model and reflection (2) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+module Greet; def hi = "hi from #{self.class}"; end
+class Kid < Base; include Greet; def who = "kid>" + super; end
+t { o = Object.new; o.define_singleton_method(:q) { 7 }; o.q }
+t { o = Object.new; o.extend(Greet); o.hi }
+t { o = Object.new; o.extend(Greet); o.singleton_class.include?(Greet) }
+t { o = Object.new; o.singleton_class.ancestors.first(2).last }
+t { Object.new.singleton_class.instance_methods(false) }
+t { m = Module.new { def mm = 1 }; c = Class.new { include m }; c.new.mm }
+t { Module.new.name }
+t { Comparable.instance_methods.sort }
+t { Kernel.respond_to?(:puts, true) }
+t { 5.instance_of?(Integer) }
+t { 5.kind_of?(Comparable) }
+t { Integer.ancestors.include?(Comparable) }
+t { Integer.ancestors.first(3) }
+t { String.ancestors.first(3) }
+t { Array.ancestors.first(3) }
+t { Hash.ancestors.first(3) }
+t { NilClass.ancestors }
+t { Class.ancestors.first(3) }
+t { Module.instance_method(:name).class }
+t { BasicObject.superclass }
+t { Object.superclass }
+t { Class.superclass }
+t { Module.superclass }
+t { Integer.superclass }
+t { Float.superclass }
+t { Exception.superclass }
+t { StandardError.superclass }
+t { Kid.instance_methods(false).sort }
+t { Kid.private_instance_methods(false) }
+t { Kid.new.sec }
+t { Kid.new.pro }
+t { Kid.new.send(:sec) }
+t { Kid.new.respond_to?(:sec) }
+t { Kid.new.respond_to?(:sec, true) }
+t { Kid.private_method_defined?(:sec) }
+t { Kid.new.methods.include?(:pub) }
+t { Kid.new.private_methods.include?(:sec) }
+t { Kid.new.public_methods(false).sort }
+t { Kid.new.protected_methods }
+t { Kid.instance_method(:pub).bind(Kid.new).call }
+t { Kid.instance_method(:pub).bind_call(Kid.new) }
+t { Base.instance_method(:who).bind(Kid.new).call }
+t { Kid.instance_method(:who).arity }
+t { Kid.new.method(:who).unbind.class }
+#==#
+# ── object model and reflection (3) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+module Greet; def hi = "hi from #{self.class}"; end
+class Kid < Base; include Greet; def who = "kid>" + super; end
+t { Kid.new.method(:who).owner }
+t { Kid.new.method(:who).receiver.class }
+t { Kid.new.method(:who).name }
+t { Kid.new.method(:nope) }
+t { Kid.instance_method(:nope) }
+t { Kid.new.method(:pub).to_proc.call }
+t { Kid.new.method(:pub).to_proc.lambda? }
+t { %w[a b].map(&Kid.new.method(:then)) rescue $!.class }
+t { [1, 2].map(&10.method(:+)) }
+t { 10.method(:+).call(5) }
+t { 10.method(:+).owner }
+t { 10.method(:+).arity }
+t { [].method(:push).arity }
+t { "".method(:sub).arity }
+t { [].method(:map).arity }
+t { 1.method(:between?).arity }
+t { method(:puts).owner }
+t { method(:puts).arity }
+t { method(:p).receiver.inspect }
+t { define_method(:dm) { 1 } rescue $!.class }
+t { self.class.send(:define_method, :dm2) { 2 }; dm2 }
+t { self.to_s }
+t { self.inspect }
+t { self.class }
+t { binding.local_variable_defined?(:zzz) }
+t { binding.local_variables.class }
+t { defined?(foo) }
+t { defined?(puts) }
+t { defined?(String) }
+t { defined?(@x) }
+t { defined?(x = 1) }
+t { defined?(3 + 3) }
+t { defined?(yield) }
+t { defined?(super) }
+t { defined?(nil) }
+t { defined?(self) }
+t { defined?(@@a) }
+t { defined?($stdout) }
+t { defined?(Nope::X) }
+#==#
+# ── object model and reflection (4) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+module Greet; def hi = "hi from #{self.class}"; end
+class Kid < Base; include Greet; def who = "kid>" + super; end
+t { defined?([].size) }
+t { defined?(Kernel.puts) }
+t { instance_variable_get(:@nothing) }
+t { Object.new.instance_exec(5) { |x| x * 2 } }
+t { Object.new.instance_eval { self.class } }
+t { eval("1 + 2") }
+t { x = 10; eval("x * 2") }
+t { x = 10; binding.eval("x + 1") }
+t { b = binding; y = 3; b.local_variable_get(:y) }
+t { b = binding; b.local_variable_set(:nw, 8); b.local_variable_get(:nw) }
+t { Class.new(Struct.new(:a)).new(1).a }
+#==#
+# ── String encodings and case mapping (1) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { "héllo".bytes.size }
+t { "héllo".encoding }
+t { "héllo".force_encoding("ASCII-8BIT").length }
+t { "héllo".b.inspect }
+t { "héllo".encode("US-ASCII") }
+t { "héllo".encode("US-ASCII", undef: :replace) }
+t { "a\xFFb".length }
+t { "é".unpack("C*") }
+t { "é".unpack("U*") }
+t { [233].pack("U").encoding }
+t { [233].pack("C").encoding }
+t { [233].pack("U").bytes }
+t { [0x1F600].pack("U") }
+t { "😀".bytes }
+t { "😀".length }
+t { "😀".bytesize }
+t { "😀".codepoints }
+t { "😀".ord }
+t { "😀".inspect }
+t { "\e\a\b\f\v".inspect }
+t { "\u0001".inspect }
+t { "\u007f".inspect }
+t { " ".inspect }
+t { "​".inspect }
+t { "#{1}\#{x}".inspect }
+t { '#{x} #$x #@x'.inspect }
+t { "#".inspect + '#{'.inspect + '#$'.inspect }
+t { :"a b".inspect }
+t { :"é".inspect }
+t { :"9".inspect }
+t { :"a=".inspect }
+t { :"a?b".inspect }
+t { :"[]=".inspect }
+t { :"!".inspect }
+t { :"!=".inspect }
+t { :"=".inspect }
+t { :"@a".inspect }
+t { :"@@a".inspect }
+t { :"$a".inspect }
+t { :"@1".inspect }
+t { :"A".inspect }
+t { :"".inspect }
+t { :"a-b".inspect }
+t { "ab".encoding.name }
+t { "ab".encode("UTF-16LE").encode("UTF-8") }
+#==#
+# ── String encodings and case mapping (2) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { "\xE9".force_encoding("ISO-8859-1").encode("UTF-8") }
+t { Encoding.default_external }
+t { Encoding::ASCII_8BIT.inspect }
+t { Encoding::US_ASCII.inspect }
+t { "é" + "é".b }
+t { "é" + "a".b }
+t { ("a".b + "é").encoding }
+t { ("é" + "a".b).encoding }
+t { "é".b + "é" }
+t { "é" == "é".b }
+t { "a" == "a".b }
+t { "é".eql?("é".b) }
+t { "é".hash == "é".b.hash }
+t { "a".hash == "a".b.hash }
+t { "é" <=> "é".b }
+t { "a".force_encoding("US-ASCII") == "a" }
+t { "a".force_encoding("US-ASCII").encoding }
+t { "abc".force_encoding("US-ASCII") + "é" }
+t { ("abc".force_encoding("US-ASCII") + "é").encoding }
+t { "é".force_encoding("US-ASCII").valid_encoding? }
+t { "é".force_encoding("US-ASCII").inspect }
+t { "é".b.force_encoding("UTF-8") == "é" }
+t { "abc".unpack("a2") }
+t { "abc".unpack1("@1a") }
+t { "abc".sum }
+t { "abc".unpack("C*").pack("C*").encoding }
+t { "é".bytes.pack("C*").force_encoding("UTF-8") }
+t { "é".byteslice(0, 2) }
+t { "aé".byteslice(1..) }
+t { "aéb".byteindex("b") }
+t { "aéb".byteindex("b", 1) }
+t { "aéb".byterindex("b") }
+t { "aéb".bytesplice(1, 2, "x") }
+t { "aéb".index("b") }
+t { "aéb".rindex("é") }
+t { "aéb".each_grapheme_cluster.to_a }
+t { "é".grapheme_clusters.length }
+t { "é".length }
+t { "é".unicode_normalize(:nfc).length }
+t { "é".unicode_normalize(:nfd).length }
+t { "ｱ".unicode_normalize(:nfkc) }
+t { "ß".upcase }
+t { "İ".downcase.bytes }
+t { "ß".casecmp("SS") }
+#==#
+# ── String encodings and case mapping (3) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { "é".casecmp?("É") }
+t { "é".upcase(:ascii) }
+t { "ÀÉ".swapcase }
+t { "àé".capitalize }
+t { "ﬁ".upcase }
+t { "Σ".downcase }
+t { "é".succ }
+t { "z".succ }
+t { "".succ }
+t { "é".center(5, "è") }
+t { "é".ljust(3, "ab") }
+t { "日本語".center(9, "*") }
+t { "日本語".reverse }
+t { "日本語"[1] }
+t { "日本語"[1..] }
+t { "日本語".slice(0, 2) }
+t { "日本語".start_with?("日") }
+t { "日本語".tr("日", "月") }
+t { "日本語".delete("本") }
+t { "日本語".squeeze }
+t { "日本語".count("日本") }
+t { "日本語".sub(/本/) { $&.ord.to_s } }
+t { "日本語" =~ /本/ }
+t { $~.pre_match + "|" + $~.post_match }
+t { "日本語".scan(/./) }
+t { "日本語".unpack("U*") }
+t { "日本語".each_char.to_a }
+t { "日本語".partition("本") }
+t { "日本語".ljust(5, "。") }
+t { "日本語".unpack("a3") }
+t { "日本語".chars.map(&:ord) }
+t { "日本語".to_sym.inspect }
+t { "日本語".hash == "日本語".dup.hash }
+t { "日本語" <=> "日本" }
+t { "日本語".between?("日", "本") }
+t { "%s" % "日本語" }
+t { "%5s|" % "日本" }
+t { "%-5s|" % "日本" }
+t { "%.1s" % "日本" }
+t { "%c" % "日本" }
+t { "%c" % 26085 }
+t { "日本語".inspect.encoding }
+t { "日本語".to_s.encoding }
+t { "".encoding }
+t { String.new("").encoding }
+#==#
+# ── String encodings and case mapping (4) ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { [1].pack("C").encoding }
+t { ["a"].pack("a").encoding }
+t { ["a"].pack("A").encoding }
+t { ["é"].pack("a*").encoding }
+t { ["é"].pack("U*") rescue $!.class }
+t { "".b.encoding }
+t { "é".b.encoding }
+t { 65.chr.encoding }
+t { 200.chr.encoding }
+t { 300.chr(Encoding::UTF_8).encoding }
+t { __ENCODING__ }
+t { "abc".unpack("U*").pack("U*").encoding }
+t { "a".succ.encoding }
+t { "%d" % 1 }
+t { ("%d" % 1).encoding }
+t { "a#{1}".encoding }
+t { "a".b.inspect }
+t { "é".b.inspect }
+t { "é".b.to_s.encoding }
+t { "é".b.hash == "é".hash }
+t { "é".b[0] }
+t { "é".b.chars }
+t { "é".b.upcase.bytes }
+t { "é".b =~ /\xC3/n }
+t { "\xC3\xA9".force_encoding("ISO-8859-1").encode("UTF-8") }
