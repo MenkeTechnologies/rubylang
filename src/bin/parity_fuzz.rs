@@ -892,16 +892,56 @@ fn gen_objmodel(seed: u64) -> Vec<String> {
     let r = &mut Rng::seed(seed);
     let cname = r.pick(&["Alpha", "Beta", "Gamma9", "Delta_x"]);
     let ivname = r.pick(&[
-        "\"@a\"", ":@a", "\"a\"", "\"@\"", "\"@@a\"", "\"@1\"", ":\"@a b\"", "\"@\\u00e9\"", "3",
+        "\"@a\"",
+        ":@a",
+        "\"a\"",
+        "\"@\"",
+        "\"@@a\"",
+        "\"@1\"",
+        ":\"@a b\"",
+        "\"@\\u00e9\"",
+        "3",
     ]);
-    let recv = r.pick(&["Object.new", "3", "\"s\"", "[]", "nil", "Class.new", "Comparable"]);
+    let recv = r.pick(&[
+        "Object.new",
+        "3",
+        "\"s\"",
+        "[]",
+        "nil",
+        "Class.new",
+        "Comparable",
+    ]);
     let meth = r.pick(&[
-        ":puts", ":initialize", ":freeze", ":to_s", ":format", ":instance_variable_get", ":extend",
-        ":new", ":attr_accessor", ":module_function", ":respond_to_missing?", ":binding",
+        ":puts",
+        ":initialize",
+        ":freeze",
+        ":to_s",
+        ":format",
+        ":instance_variable_get",
+        ":extend",
+        ":new",
+        ":attr_accessor",
+        ":module_function",
+        ":respond_to_missing?",
+        ":binding",
     ]);
     let succ = r.pick(&[
-        "-9", "a-9", "-a", "1.9.9", "9.9", "z.z", "Az-9", "$9", "1-9", "a--9", "zz99", "<<koala>>",
-        "a!9", "9z", "--", "a.9",
+        "-9",
+        "a-9",
+        "-a",
+        "1.9.9",
+        "9.9",
+        "z.z",
+        "Az-9",
+        "$9",
+        "1-9",
+        "a--9",
+        "zz99",
+        "<<koala>>",
+        "a!9",
+        "9z",
+        "--",
+        "a.9",
     ]);
     one(match r.below(9) {
         0 => format!(
@@ -922,10 +962,9 @@ fn gen_objmodel(seed: u64) -> Vec<String> {
              begin\n    p [m, o.send(m, {ivname})]\n  rescue NameError, TypeError => e\n    \
              p [m, e.class, e.message]\n  end\nend\np o.instance_variables"
         ),
-        4 => format!(
-            "o = Object.new\no.freeze\nbegin\n  o.remove_instance_variable(:@a)\nrescue => e\n  \
+        4 => "o = Object.new\no.freeze\nbegin\n  o.remove_instance_variable(:@a)\nrescue => e\n  \
              p e.class\nend"
-        ),
+            .to_string(),
         5 => format!("p [{recv}.respond_to?({meth}), {recv}.respond_to?({meth}, true)]"),
         6 => "p [String.equal?(String), Object.object_id == Object.object_id, String.object_id == Object.object_id]".to_string(),
         7 => format!("p {succ:?}.succ"),
