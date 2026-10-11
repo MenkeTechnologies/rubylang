@@ -2236,19 +2236,19 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     (
         "force_encoding",
         "String",
-        "no-op shim returning self",
+        "relabel the bytes with another encoding; an unknown name raises ArgumentError",
         "\"abc\".force_encoding(\"UTF-8\")   # => \"abc\"",
     ),
     (
         "encode",
         "String",
-        "no-op shim returning a copy",
+        "transcode to another encoding; unconvertible characters raise unless undef:/invalid: replace them",
         "\"abc\".encode(\"UTF-8\")   # => \"abc\"",
     ),
     (
         "encoding",
         "String",
-        "the Encoding object (always UTF-8)",
+        "the Encoding object (UTF-8, ASCII-8BIT or US-ASCII)",
         "\"abc\".encoding.name   # => \"UTF-8\"",
     ),
     (

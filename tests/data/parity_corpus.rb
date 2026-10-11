@@ -8115,3 +8115,55 @@ t { "\"\\u00e9\".force_encoding(\"ASCII-8BIT\")".undump }
 t { "\"a\".force_encoding(\"NOPE\")".undump }
 t { "é".b.dump.undump.encoding }
 t { s = "multi\nline \u2603 \e[0m \#{x}"; s.dump.undump == s }
+#==#
+# ── Encoding objects: one per encoding, every MRI constant and alias ──
+p Encoding::UTF_8.equal?("a".encoding), Encoding.find("utf-8").equal?(Encoding::UTF_8), "a".b.encoding.equal?(Encoding::BINARY)
+p Encoding::CP65001, Encoding::ANSI_X3_4_1968, Encoding::ASCII, Encoding::SJIS, Encoding::CP932, Encoding::PCK, Encoding::CsWindows31J
+p Encoding::Shift_JIS, Encoding::SHIFT_JIS, Encoding::EUCJP, Encoding::EucJP, Encoding::ISO8859_1, Encoding::CP1252
+p Encoding::UTF_8.names, Encoding::BINARY.names, Encoding::US_ASCII.names, Encoding::EUC_JP.names
+p Encoding::BINARY.to_s, Encoding::BINARY.inspect, Encoding::ASCII_8BIT.name, Encoding::US_ASCII.name
+p Encoding::UTF_16.dummy?, Encoding::UTF_8.dummy?, Encoding::UTF_16LE.ascii_compatible?, Encoding::BINARY.ascii_compatible?
+begin; Encoding::Utf_8; rescue NameError => e; p e.class; end
+#==#
+# ── Encoding#inspect: (dummy), and (autoload) until something loads it ──
+p Encoding::UTF_16, Encoding::UTF_7, Encoding::ISO_2022_JP
+e = Encoding::EUC_JP; p e; e.name; p e; e.names; p e
+g = Encoding::GBK; g.ascii_compatible?; p g
+w = Encoding::Windows_1252; Encoding.find("cp1252"); p w
+k = Encoding::Big5; p Encoding.compatible?(k, 1), k
+x = Encoding::GB18030; "a".force_encoding(x); p x
+p Encoding.list.count(&:dummy?), Encoding.list.count { _1.inspect.include?("autoload") } > 0
+#==#
+# ── Encoding.find ──
+p Encoding.find("binary"), Encoding.find("ASCII"), Encoding.find("eucjp"), Encoding.find("cp65001"), Encoding.find("Ascii-8bit")
+p Encoding.find("locale"), Encoding.find("external"), Encoding.find("filesystem"), Encoding.find("internal")
+p Encoding.find(Encoding::UTF_8)
+begin; Encoding.find("nope"); rescue => e; p e; end
+begin; Encoding.find(:utf_8); rescue => e; p e; end
+begin; Encoding.find(1); rescue => e; p e; end
+#==#
+# ── Encoding.list / name_list / aliases / defaults ──
+p Encoding.list.size == Encoding.list.uniq.size, Encoding.list.first(3), Encoding.list.all?(Encoding)
+p Encoding.name_list.size >= Encoding.list.size, Encoding.name_list.last(4), Encoding.name_list.include?("BINARY")
+p Encoding.aliases["BINARY"], Encoding.aliases["SJIS"], Encoding.aliases["locale"], Encoding.aliases["CP65001"]
+p Encoding.aliases.values.all? { Encoding.name_list.include?(_1) }
+p Encoding.default_internal, Encoding.default_external
+#==#
+# ── Encoding.compatible? (enc_compatible_latter) ──
+p Encoding.compatible?("a", "b".b), Encoding.compatible?("é", "é".b), Encoding.compatible?("é", "x".b), Encoding.compatible?("", "é".b), Encoding.compatible?("é".b, "")
+p Encoding.compatible?(1, 2), Encoding.compatible?("a", :b), Encoding.compatible?(Encoding::UTF_8, Encoding::US_ASCII), Encoding.compatible?(Encoding::UTF_16LE, "a"), Encoding.compatible?(:a, "é".b)
+p Encoding.compatible?(/a/, "é"), Encoding.compatible?(/é/, "a".b), Encoding.compatible?("é".b, /a/), Encoding.compatible?(/é/, "é".b), Encoding.compatible?(/a/, :a)
+p Encoding.compatible?(:"é", "a".b), Encoding.compatible?("a".b, :"é"), Encoding.compatible?(Encoding::UTF_8, "a".b), Encoding.compatible?("a".b, Encoding::UTF_8)
+p Encoding.compatible?(Encoding::UTF_8, Encoding::BINARY), Encoding.compatible?(Encoding::US_ASCII, Encoding::BINARY), Encoding.compatible?(Encoding::EUC_JP, Encoding::UTF_16LE)
+#==#
+# ── Symbol#encoding, Regexp#encoding / #fixed_encoding? ──
+p :a.encoding, :"é".encoding
+p /a/.encoding, /é/.encoding, /a/u.encoding, /a/n.encoding, /é/.encoding, /\xc3\xa9/.encoding, /\p{Alpha}/.encoding
+p /\x41/.encoding, /\xff/n.encoding, /\x41/n.encoding, /(a)\1/.encoding, /#{"é"}/.encoding, /\\x80/.encoding
+p Regexp.new("é").encoding, Regexp.new("é".b).encoding, Regexp.new("a".b).encoding, Regexp.new("\\u00e9").encoding
+p Regexp.new(/é/).encoding, Regexp.new(/a/u).encoding, Regexp.new(/\xff/n).encoding, Regexp.new(/a/i).casefold?, Regexp.union("é").encoding, Regexp.union.encoding
+p /\xff/n.fixed_encoding?, /a/n.fixed_encoding?, /é/.fixed_encoding?, /\p{Alpha}/.fixed_encoding?, Regexp.new("é".b).fixed_encoding?, /a/.fixed_encoding?, /a/u.fixed_encoding?
+#==#
+# ── force_encoding resolves names through the encoding table ──
+p "x".force_encoding("ascii").encoding, "x".force_encoding("Binary").encoding, "x".force_encoding("utf-8").encoding
+begin; "x".force_encoding("nope"); rescue => e; p e; end

@@ -7,6 +7,8 @@
 //! that iterator methods can run block bodies as nested VMs without holding the
 //! host borrow across the re-entry.
 
+use crate::encoding_table::{EncodingInfo, ALIASES, ENCODINGS, NAME_LIST};
+use crate::host::encoding_info;
 use crate::host::ops;
 use crate::host::{
     call_instance_method, call_method, call_proc, current_block, has_pending_signal,
@@ -4153,30 +4155,13 @@ fn dispatch_classref(
             _ => {}
         }
     }
-    // `Etc` (from `require "etc"`, a C-ext stdlib) — only the CPU-count surface
-    // gems actually use for pool sizing.
-    // `Encoding::UTF_8` / `::ASCII_8BIT` / … — the encoding constants. We carry
-    // only UTF-8 semantically, but name each object as requested so identity/name
-    // checks pass.
+    // `Encoding` class surface: the `Encoding::` constants, `find`,
+    // `compatible?`, `list`, `name_list`, `aliases`, and the defaults. Every
+    // encoding MRI defines is a row of the generated `encoding_table`; string
+    // CONTENT is only ever modelled as UTF-8, ASCII-8BIT or US-ASCII.
     if cls == "Encoding" {
-        let enc_name = match name {
-            "UTF_8" => Some("UTF-8"),
-            "ASCII_8BIT" | "BINARY" => Some("ASCII-8BIT"),
-            "US_ASCII" | "ASCII" => Some("US-ASCII"),
-            "UTF_16" => Some("UTF-16"),
-            "UTF_16LE" => Some("UTF-16LE"),
-            "UTF_16BE" => Some("UTF-16BE"),
-            "GB18030" => Some("GB18030"),
-            "GBK" => Some("GBK"),
-            "SHIFT_JIS" | "SJIS" => Some("Shift_JIS"),
-            "EUC_JP" => Some("EUC-JP"),
-            "ISO_2022_JP" => Some("ISO-2022-JP"),
-            "ISO_8859_1" | "ISO8859_1" => Some("ISO-8859-1"),
-            "Windows_1252" | "WINDOWS_1252" => Some("Windows-1252"),
-            _ => None,
-        };
-        if let Some(en) = enc_name {
-            return Ok(encoding_object(en));
+        if let Some(info) = ENCODINGS.iter().find(|e| e.constants.contains(&name)) {
+            return Ok(encoding_value(info));
         }
         // `Encoding`'s nested exception classes, so `rescue
         // Encoding::CompatibilityError` resolves the constant rather than
@@ -4190,19 +4175,64 @@ fn dispatch_classref(
         ) {
             return Ok(with_host(|h| h.class_ref(&format!("Encoding::{name}"))));
         }
-        if name == "default_external" || name == "default_internal" {
-            return Ok(encoding_object("UTF-8"));
-        }
-        // rubylang is UTF-8 throughout, so setting the default external/internal
-        // encoding is a no-op that echoes the assigned value (Rails' bootstrap
-        // sets `Encoding.default_external = Encoding::UTF_8`).
-        if name == "default_external=" || name == "default_internal=" {
-            return Ok(args.first().cloned().unwrap_or(Value::Undef));
-        }
-        if name == "list" || name == "name_list" {
-            return Ok(with_host(|h| h.new_array(vec![])));
+        match name {
+            "default_external" => return Ok(encoding_object("UTF-8")),
+            // MRI has no default internal encoding unless one is set.
+            "default_internal" => return Ok(Value::Undef),
+            // rubylang is UTF-8 throughout, so setting the default
+            // external/internal encoding is a no-op that echoes the assigned
+            // value (Rails' bootstrap sets `Encoding.default_external =
+            // Encoding::UTF_8`).
+            "default_external=" | "default_internal=" => {
+                return Ok(args.first().cloned().unwrap_or(Value::Undef));
+            }
+            // `enc_find`: an Encoding answers itself; anything else must be a
+            // String (`StringValue`). `"internal"` is nil while there is no
+            // default internal encoding.
+            "find" if args.len() == 1 => {
+                if with_host(|h| h.class_of(&args[0])) == "Encoding" {
+                    return Ok(args[0].clone());
+                }
+                let raw = implicit_str(&args[0])?;
+                if raw.eq_ignore_ascii_case("internal") {
+                    return Ok(Value::Undef);
+                }
+                let Some(info) = encoding_info(&raw) else {
+                    return Err(raise_exc(
+                        "ArgumentError",
+                        &format!("unknown encoding name - {raw}"),
+                    ));
+                };
+                with_host(|h| h.load_encoding(info));
+                return Ok(encoding_value(info));
+            }
+            "compatible?" if args.len() == 2 => return encoding_compatible(&args[0], &args[1]),
+            "list" => {
+                let all: Vec<Value> = ENCODINGS.iter().map(encoding_value).collect();
+                return Ok(new_arr(all));
+            }
+            "name_list" => {
+                let names = NAME_LIST
+                    .iter()
+                    .chain(&["locale", "external", "filesystem", "internal"])
+                    .map(|n| new_str(n.to_string()))
+                    .collect();
+                return Ok(new_arr(names));
+            }
+            "aliases" => {
+                let mut map = IndexMap::new();
+                let specials = ["locale", "external", "filesystem"].map(|a| (a, "UTF-8"));
+                for (a, n) in ALIASES.iter().copied().chain(specials) {
+                    let k = with_host(|h| h.value_to_key(&new_str(a.to_string())));
+                    map.insert(k, new_str(n.to_string()));
+                }
+                return Ok(with_host(|h| h.new_hash(map)));
+            }
+            _ => {}
         }
     }
+    // `Etc` (from `require "etc"`, a C-ext stdlib) — only the CPU-count surface
+    // gems actually use for pool sizing.
     if cls == "Etc" {
         match name {
             "nprocessors" => {
@@ -4267,17 +4297,28 @@ fn dispatch_classref(
     if cls == "Regexp" {
         match name {
             "new" | "compile" => {
-                let src = match with_host(|h| h.as_regex(&args[0])) {
-                    Some((_, s)) => s,
-                    None => arg_str(&args[0]),
-                };
+                // A Regexp argument is copied with its own options (MRI ignores
+                // the second argument then).
+                if let Some((_, s)) = with_host(|h| h.as_regex(&args[0])) {
+                    let flags = with_host(|h| h.regex_flags(&args[0])).unwrap_or_default();
+                    return with_host(|h| h.new_regex(&s, &flags));
+                }
+                let src = arg_str(&args[0]);
                 // A truthy second arg means case-insensitive (Regexp::IGNORECASE
                 // is 1); the full option bitset is not modeled.
-                let flags = match args.get(1) {
+                let mut flags = match args.get(1) {
                     Some(Value::Bool(true)) | Some(Value::Int(_)) => "i",
                     _ => "",
-                };
-                return with_host(|h| h.new_regex(&src, flags));
+                }
+                .to_string();
+                // A non-ASCII ASCII-8BIT source makes a BINARY Regexp, which
+                // `regexp_encoding` reads off the `n` flag.
+                if !src.is_ascii()
+                    && with_host(|h| h.string_encoding(&args[0])) == Some("ASCII-8BIT")
+                {
+                    flags.push('n');
+                }
+                return with_host(|h| h.new_regex(&src, &flags));
             }
             "escape" | "quote" => return Ok(new_str(regex_escape(&arg_str(&args[0])))),
             // `Regexp.timeout` / `Regexp.timeout=` (Ruby 3.2 ReDoS guard). Rails 8
@@ -6019,15 +6060,13 @@ fn dispatch_object(
     if cls == "StringIO" {
         return stringio_method(recv, name, args, block);
     }
-    // Encoding object (from `String#encoding`): `name` reports "UTF-8" (the only
-    // encoding we carry). `to_s`/`inspect` are handled by the host formatters,
-    // which the universal dispatch reaches before this arm.
-    if cls == "Encoding" && name == "name" {
-        return Ok(with_host(|h| {
-            let v = h.ivar_of(recv, "name");
-            let s = h.to_s(&v);
-            h.new_string(s)
-        }));
+    // An Encoding object. `inspect` is the host formatter's; `name`/`to_s` do
+    // not load an autoload encoding, while `names`, `dummy?` and
+    // `ascii_compatible?` do (MRI's `must_encoding` on the receiver).
+    if cls == "Encoding" {
+        if let Some(r) = encoding_method(recv, name)? {
+            return Ok(r);
+        }
     }
     // Random instance: its own reproducible PRNG stream (state in the `state` ivar).
     if cls == "Random" {
@@ -9826,6 +9865,15 @@ fn dispatch_string_body(
                 Value::Undef => arg_str(&args[0]),
                 nm => arg_str(&nm),
             };
+            // `rb_to_encoding`: an unknown name is an ArgumentError, and naming an
+            // encoding loads it.
+            let Some(info) = encoding_info(&raw) else {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!("unknown encoding name - {raw}"),
+                ));
+            };
+            with_host(|h| h.load_encoding(info));
             let target = match normalize_encoding_name(&raw).as_deref() {
                 Some("ASCII-8BIT") => Some("ASCII-8BIT"),
                 Some("US-ASCII") => Some("US-ASCII"),
@@ -10890,7 +10938,9 @@ fn undump_string(
                 return Err(invalid_format());
             }
             if utf8 {
-                return Err(rt("dumped string contained Unicode escape but used force_encoding"));
+                return Err(rt(
+                    "dumped string contained Unicode escape but used force_encoding",
+                ));
             }
             let rest = &rest[FORCE.len()..];
             let Some(q) = rest.find('"') else {
@@ -22089,6 +22139,12 @@ fn dispatch_symbol(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
     let s = with_host(|h| h.as_symbol(recv).unwrap_or_default());
     match name {
         "to_s" | "id2name" | "name" => Ok(new_str(s)),
+        // A Symbol whose name is 7-bit is US-ASCII, as MRI interns it.
+        "encoding" => Ok(encoding_object(if s.is_ascii() {
+            "US-ASCII"
+        } else {
+            "UTF-8"
+        })),
         // `to_sym` returns self; `itself`/`intern` are Ruby aliases in this context.
         "to_sym" | "intern" => Ok(recv.clone()),
         // `=~`/`match` operate on the symbol's name (Journey's visitors do
@@ -22450,16 +22506,16 @@ fn curry_arity_error(n: i64, min: i64, max: Option<i64>) -> String {
     )
 }
 
-/// An `Encoding` object named `name` (`String#encoding`, `Encoding::UTF_8`, …).
-/// Canonicalize a `force_encoding` argument (a name string or an `Encoding`
-/// object) to `"ASCII-8BIT"` for the binary aliases, otherwise the raw name.
-/// Only the binary tag is tracked; every other name maps to non-binary.
+/// Canonicalize an encoding argument (a name string, or an `Encoding`
+/// object's name) through the encoding table, so every alias (`"binary"`,
+/// `"ascii"`, `"utf-8"`) reaches its canonical name; a name the table does not
+/// know comes back upper-cased.
 fn normalize_encoding_name(raw: &str) -> Option<String> {
-    let name = raw.trim().to_ascii_uppercase();
-    match name.as_str() {
-        "ASCII-8BIT" | "ASCII_8BIT" | "BINARY" => Some("ASCII-8BIT".to_string()),
-        other => Some(other.to_string()),
-    }
+    let raw = raw.trim();
+    Some(match encoding_info(raw) {
+        Some(info) => info.name.to_string(),
+        None => raw.to_ascii_uppercase(),
+    })
 }
 
 /// A best-effort `Thread::Backtrace::Location` for `caller_locations`. Carries
@@ -22666,11 +22722,203 @@ fn cgi_unescape_html(s: &str) -> String {
         .replace("&#39;", "'")
 }
 
+/// The `Encoding` object named `name` (a canonical name or alias).
 fn encoding_object(name: &str) -> Value {
-    let enc = with_host(|h| h.new_object("Encoding"));
-    let nm = new_str(name.to_string());
-    with_host(|h| h.set_ivar_of(&enc, "name", nm));
-    enc
+    let info = encoding_info(name).expect("rubylang only names encodings MRI defines");
+    encoding_value(info)
+}
+
+/// The one `Encoding` object for the table row `info`.
+fn encoding_value(info: &'static EncodingInfo) -> Value {
+    with_host(|h| h.encoding_value(info))
+}
+
+/// The table row an `Encoding` object stands for.
+fn encoding_of_object(v: &Value) -> Option<&'static EncodingInfo> {
+    let name = with_host(|h| {
+        let n = h.ivar_of(v, "name");
+        h.to_s(&n)
+    });
+    encoding_info(&name)
+}
+
+/// `Encoding` instance methods; `None` for a name handled elsewhere.
+fn encoding_method(recv: &Value, name: &str) -> Result<Option<Value>, String> {
+    let Some(info) = encoding_of_object(recv) else {
+        return Ok(None);
+    };
+    let load = || with_host(|h| h.load_encoding(info));
+    Ok(Some(match name {
+        "name" | "to_s" => new_str(info.name.to_string()),
+        // MRI lists the locale pseudo-names after the real ones, on the
+        // encoding they currently denote — UTF-8 here, always.
+        "names" => {
+            load();
+            let pseudo: &[&str] = if info.name == "UTF-8" {
+                &["locale", "external", "filesystem"]
+            } else {
+                &[]
+            };
+            new_arr(
+                info.names
+                    .iter()
+                    .chain(pseudo)
+                    .map(|n| new_str(n.to_string()))
+                    .collect(),
+            )
+        }
+        "dummy?" => {
+            load();
+            Value::Bool(info.dummy)
+        }
+        "ascii_compatible?" => {
+            load();
+            Value::Bool(info.ascii_compatible)
+        }
+        _ => return Ok(None),
+    }))
+}
+
+/// One operand of `Encoding.compatible?`: its encoding, and — for a String —
+/// whether its content is 7-bit (MRI's `ENC_CODERANGE_7BIT`) and whether it is
+/// empty. `None` for an object that carries no encoding (`enc_capable`).
+struct EncOperand {
+    enc: &'static EncodingInfo,
+    string: Option<(bool, bool)>,
+}
+
+fn enc_operand(v: &Value) -> Result<Option<EncOperand>, String> {
+    if let Some(s) = with_host(|h| h.as_str(v)) {
+        let enc = encoding_object(with_host(|h| h.string_encoding(v)).unwrap_or("UTF-8"));
+        return Ok(Some(EncOperand {
+            enc: encoding_of_object(&enc).unwrap(),
+            string: Some((s.is_ascii(), s.is_empty())),
+        }));
+    }
+    let class = with_host(|h| h.class_of(v));
+    if class == "Encoding" {
+        return Ok(encoding_of_object(v).map(|enc| EncOperand { enc, string: None }));
+    }
+    // A Symbol or Regexp carries an encoding without being a String: ask it.
+    if class == "Symbol" || class == "Regexp" {
+        let e = dispatch(v, "encoding", &[], None)?;
+        return Ok(encoding_of_object(&e).map(|enc| EncOperand { enc, string: None }));
+    }
+    Ok(None)
+}
+
+/// `Encoding.compatible?` — port of MRI's `enc_compatible_p` and
+/// `enc_compatible_latter`: the encoding the two operands' concatenation
+/// would carry, or nil when they cannot be combined.
+fn encoding_compatible(a: &Value, b: &Value) -> Result<Value, String> {
+    let (Some(o1), Some(o2)) = (enc_operand(a)?, enc_operand(b)?) else {
+        return Ok(Value::Undef);
+    };
+    // Reading an operand's encoding index (`rb_enc_get_index`) loads it.
+    with_host(|h| {
+        h.load_encoding(o1.enc);
+        h.load_encoding(o2.enc);
+    });
+    let found = |e: &'static EncodingInfo| Ok(encoding_value(e));
+    if std::ptr::eq(o1.enc, o2.enc) {
+        return found(o1.enc);
+    }
+    if let Some((_, true)) = o2.string {
+        return found(o1.enc);
+    }
+    if let (Some((_, true)), Some((ascii2, _))) = (o1.string, o2.string) {
+        return found(if o1.enc.ascii_compatible && ascii2 {
+            o1.enc
+        } else {
+            o2.enc
+        });
+    }
+    if !o1.enc.ascii_compatible || !o2.enc.ascii_compatible {
+        return Ok(Value::Undef);
+    }
+    // Objects whose encoding is the same as their contents.
+    if o2.string.is_none() && o2.enc.name == "US-ASCII" {
+        return found(o1.enc);
+    }
+    if o1.string.is_none() && o1.enc.name == "US-ASCII" {
+        return found(o2.enc);
+    }
+    // MRI swaps the operands so the String comes first, but not `enc1`/`enc2`:
+    // the answers below name the encodings in their original order.
+    let (enc1, enc2) = (o1.enc, o2.enc);
+    let (s1, s2) = if o1.string.is_none() {
+        (o2.string, o1.string)
+    } else {
+        (o1.string, o2.string)
+    };
+    if let Some((ascii1, _)) = s1 {
+        if let Some((ascii2, _)) = s2 {
+            if ascii1 != ascii2 {
+                return found(if ascii1 { enc2 } else { enc1 });
+            }
+            if ascii2 {
+                return found(enc1);
+            }
+        }
+        if ascii1 {
+            return found(enc2);
+        }
+    }
+    Ok(Value::Undef)
+}
+
+/// A Regexp's encoding — MRI's `rb_reg_preprocess` / `unescape_nonascii`
+/// outcome for a UTF-8 source: `u` fixes UTF-8; under `n` (`NOENCODING`) a
+/// pattern with non-ASCII bytes is ASCII-8BIT and any other is US-ASCII;
+/// otherwise a literal non-ASCII character, a `\u` escape, a `\x`/octal escape
+/// above 0x7F, or a `\p{…}` property fixes UTF-8, and an all-ASCII pattern is
+/// US-ASCII.
+fn regexp_encoding(source: &str, flags: &str) -> &'static str {
+    if flags.contains('u') {
+        return "UTF-8";
+    }
+    let b = source.as_bytes();
+    let (mut nonascii, mut fixed) = (!source.is_ascii(), false);
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' || i + 1 >= b.len() {
+            i += 1;
+            continue;
+        }
+        let digits = |from: usize, max: usize, radix: u32| {
+            let n = b[from..]
+                .iter()
+                .take(max)
+                .take_while(|c| (**c as char).is_digit(radix))
+                .count();
+            let v = u32::from_str_radix(&source[from..from + n], radix).unwrap_or(0);
+            (n, v)
+        };
+        match b[i + 1] {
+            b'u' => fixed = true,
+            b'p' | b'P' => fixed = true,
+            b'x' => {
+                let (n, v) = digits(i + 2, 2, 16);
+                nonascii |= n > 0 && v > 0x7F;
+                i += n;
+            }
+            b'0'..=b'7' => {
+                let (n, v) = digits(i + 1, 3, 8);
+                nonascii |= v > 0o177;
+                i += n - 1;
+            }
+            _ => {}
+        }
+        i += 2;
+    }
+    if flags.contains('n') {
+        return if nonascii { "ASCII-8BIT" } else { "US-ASCII" };
+    }
+    if nonascii || fixed {
+        "UTF-8"
+    } else {
+        "US-ASCII"
+    }
 }
 
 /// Escape regex metacharacters in `s` (`Regexp.escape`/`quote`), matching MRI's
@@ -22855,6 +23103,15 @@ fn dispatch_regexp(
         "casefold?" => {
             let flags = with_host(|h| h.regex_flags(recv)).unwrap_or_default();
             Ok(Value::Bool(flags.contains('i')))
+        }
+        "encoding" => {
+            let flags = with_host(|h| h.regex_flags(recv)).unwrap_or_default();
+            Ok(encoding_object(regexp_encoding(&source, &flags)))
+        }
+        // MRI's `KCODE_FIXED`: every Regexp but a US-ASCII one is fixed.
+        "fixed_encoding?" => {
+            let flags = with_host(|h| h.regex_flags(recv)).unwrap_or_default();
+            Ok(Value::Bool(regexp_encoding(&source, &flags) != "US-ASCII"))
         }
         // `named_captures` — `{ "name" => [group_index, …] }`; `names` — the
         // capture names in order. Parsed from the source (`(?<name>…)`).

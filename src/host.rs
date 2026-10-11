@@ -1412,6 +1412,12 @@ pub struct RubyHost {
     /// MRI does for a non-UTF-8 string, without a representation change.
     /// Absent = UTF-8 (the default).
     string_encodings: HashMap<u32, &'static str>,
+    /// The one `Encoding` object per encoding, by canonical name, so
+    /// `Encoding::UTF_8.equal?("a".encoding)` holds as in MRI.
+    encoding_objects: HashMap<&'static str, Value>,
+    /// Encodings loaded since boot that were not loaded AT boot (see
+    /// `encoding_table::EncodingInfo::preloaded`).
+    loaded_encodings: HashSet<&'static str>,
     signal: Option<Signal>,
     /// The tags of the `catch` blocks currently on the stack, innermost last.
     ///
@@ -2304,6 +2310,8 @@ impl RubyHost {
             exc_backtrace_locations: HashMap::new(),
             string_backtraces: HashSet::new(),
             string_encodings: HashMap::new(),
+            encoding_objects: HashMap::new(),
+            loaded_encodings: HashSet::new(),
             signal: None,
             catch_tags: Vec::new(),
             active_scope: None,
@@ -3545,7 +3553,7 @@ impl RubyHost {
             Ok(re) => Ok(self.alloc(RObj::Regexp {
                 source: source.to_string(),
                 re,
-                flags: flags.chars().filter(|c| "imx".contains(*c)).collect(),
+                flags: flags.chars().filter(|c| "imxun".contains(*c)).collect(),
             })),
             Err(e) => Err(e),
         }
@@ -8301,6 +8309,26 @@ impl RubyHost {
             _ => None,
         }
     }
+    /// The `Encoding` object for the encoding table row `info` — one per
+    /// encoding for the life of the VM, as MRI keeps one per encoding index.
+    pub fn encoding_value(&mut self, info: &'static crate::encoding_table::EncodingInfo) -> Value {
+        if let Some(v) = self.encoding_objects.get(info.name) {
+            return v.clone();
+        }
+        let enc = self.new_object("Encoding");
+        let nm = self.new_string(info.name.to_string());
+        self.set_ivar_of(&enc, "name", nm);
+        self.encoding_objects.insert(info.name, enc.clone());
+        enc
+    }
+    /// Whether `info` has been loaded — at boot, or since by an operation
+    /// that loads it (MRI's `must_encindex` / `rb_enc_from_index` callers).
+    pub fn encoding_loaded(&self, info: &crate::encoding_table::EncodingInfo) -> bool {
+        info.preloaded || self.loaded_encodings.contains(info.name)
+    }
+    pub fn load_encoding(&mut self, info: &'static crate::encoding_table::EncodingInfo) {
+        self.loaded_encodings.insert(info.name);
+    }
     /// Tag a String heap object as ASCII-8BIT/BINARY (`String#b`,
     /// `force_encoding("BINARY")`).
     pub fn mark_binary_string(&mut self, v: &Value) {
@@ -8949,19 +8977,28 @@ impl RubyHost {
                         format!("#<{class}: {msg}>")
                     }
                 }
-                // `Encoding#inspect`: `#<Encoding:UTF-8>`. The binary encoding
-                // inspects as `#<Encoding:BINARY (ASCII-8BIT)>` (MRI names the
-                // object BINARY with its ASCII-8BIT alias in parens).
+                // `Encoding#inspect` — MRI's `enc_inspect`: `#<Encoding:UTF-8>`, the
+                // binary encoding as `BINARY (ASCII-8BIT)`, then ` (dummy)` for a
+                // dummy encoding and ` (autoload)` for one not loaded yet.
                 Some(RObj::Object { class, ivars }) if class == "Encoding" => {
                     let name = ivars
                         .get("name")
                         .map(|n| self.to_s(&n.clone()))
                         .unwrap_or_default();
-                    if name == "ASCII-8BIT" {
-                        "#<Encoding:BINARY (ASCII-8BIT)>".to_string()
+                    let shown = if name == "ASCII-8BIT" {
+                        "BINARY (ASCII-8BIT)"
                     } else {
-                        format!("#<Encoding:{name}>")
-                    }
+                        &name
+                    };
+                    let (dummy, autoload) = match encoding_info(&name) {
+                        Some(info) => (info.dummy, !self.encoding_loaded(info)),
+                        None => (false, false),
+                    };
+                    format!(
+                        "#<Encoding:{shown}{}{}>",
+                        if dummy { " (dummy)" } else { "" },
+                        if autoload { " (autoload)" } else { "" }
+                    )
                 }
                 // `OpenStruct#inspect`: `#<OpenStruct a=1, b=2>` (ivars in order).
                 Some(RObj::Object { class, ivars }) if class == "OpenStruct" => {
@@ -10507,6 +10544,22 @@ pub fn symbol_key_needs_quote(s: &str) -> bool {
     s.ends_with([
         '+', '-', '*', '/', '`', '%', '^', '&', '|', ']', '<', '=', '>', '~', '@',
     ])
+}
+
+/// The encoding a name or alias denotes, matched case-insensitively as MRI's
+/// encoding name table is (`"utf-8"`, `"eucjp"`, `"binary"`). The
+/// locale-dependent pseudo-names `locale`/`external`/`filesystem` resolve to
+/// UTF-8, rubylang's fixed default external encoding; `internal` (no default
+/// internal encoding) resolves to nothing.
+pub fn encoding_info(name: &str) -> Option<&'static crate::encoding_table::EncodingInfo> {
+    use crate::encoding_table::ENCODINGS;
+    let name = match name.to_ascii_lowercase().as_str() {
+        "locale" | "external" | "filesystem" => "UTF-8",
+        _ => name,
+    };
+    ENCODINGS
+        .iter()
+        .find(|e| e.names.iter().any(|n| n.eq_ignore_ascii_case(name)))
 }
 
 pub fn inspect_string(s: &str) -> String {

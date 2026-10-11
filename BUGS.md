@@ -1105,10 +1105,24 @@ Honest limitations of this surface:
     interned, so `equal?` across two of them is false.
   - `Hash#rehash` cannot see a mutated Array key (keys are snapshotted at
     insertion), and string keys read back from `Hash#keys` are not frozen.
-  - `Encoding` has no `find`/`names`/`compatible?`/`dummy?`/`ascii_compatible?`,
-    `:é` is not a lexable symbol, and
-    `Integer`/`Symbol`/`nil#to_s` report UTF-8 rather than US-ASCII (the
-    non-UTF-8 byte-string substrate gap recorded in the fuzz baseline).
+  - **`Encoding` — fixed.** Every encoding MRI defines is a row of
+    `src/encoding_table.rs`, generated from the reference interpreter by
+    `tools/gen_encoding_table.rb` (name, aliases, dummy / ASCII-compatible
+    flags, boot-loaded state, `Encoding::` constants). Each encoding is ONE
+    object (`Encoding::UTF_8.equal?("a".encoding)`), every MRI constant and
+    alias resolves (`Encoding::SJIS` is Windows-31J), and `find`, `list`,
+    `name_list`, `aliases`, `compatible?` (a port of `enc_compatible_latter`),
+    `#names`, `#dummy?`, `#ascii_compatible?` and `inspect`'s ` (dummy)` /
+    ` (autoload)` suffixes answer as MRI does, autoload state included.
+    `default_internal` is nil, `Symbol#encoding` and `Regexp#encoding` /
+    `#fixed_encoding?` follow MRI, and `force_encoding` with an unknown name
+    raises `ArgumentError: unknown encoding name - …`. Still open: string
+    CONTENT is only modelled as UTF-8, ASCII-8BIT or US-ASCII, so
+    `"x".force_encoding("EUC-JP").encoding` answers UTF-8 where MRI answers
+    EUC-JP; `Encoding.new` / `#dup` succeed where MRI raises; `:é` is not a
+    lexable symbol; and `Integer`/`Symbol`/`nil#to_s` report UTF-8 rather than
+    US-ASCII (the non-UTF-8 byte-string substrate gap recorded in the fuzz
+    baseline).
   - **`String#dump` / `#undump` — fixed.** Ported from MRI's `rb_str_dump` and
     `str_undump`: every non-printable-ASCII character is escaped (`\uXXXX` /
     `\u{X}` for UTF-8, `\xNN` per byte otherwise), and `undump` reads the
@@ -1249,12 +1263,16 @@ Honest limitations of this surface:
   A Regexp is also a VALUE, not just a matcher: `==`/`eql?`/`hash` compare its
   source and its normalized option bitmask, so `/a/ == /a/` and
   `/a/im == /a/mi` are true while `/a/ == /a/i` is false, and a Regexp works as
-  a Hash key and collapses under `uniq`/`-`/`include?`/`Set`. (MRI also compares
-  the encoding; there is no per-Regexp encoding modelled here.) Still missing on
-  Regexp, though the arity table declares them: `encoding`, `fixed_encoding?`,
-  `initialize_copy` and `~`. `Regexp.new(/a/i)` also drops the source regexp's
-  flags, and its integer-options argument only decodes IGNORECASE, never
-  EXTENDED or MULTILINE.
+  a Hash key and collapses under `uniq`/`-`/`include?`/`Set`. `encoding` and
+  `fixed_encoding?` follow `rb_reg_preprocess`: `/u` or a non-ASCII character,
+  `\u` escape, `\x`/octal escape above 0x7F or `\p{…}` fixes UTF-8, `/n` with
+  non-ASCII bytes is ASCII-8BIT, and anything else is US-ASCII. (MRI's `==`
+  also compares the encoding and `options` reports the `FIXEDENCODING` /
+  `NOENCODING` bits; neither does here, and `inspect` drops `/n`.) Still
+  missing on Regexp, though the arity table declares them: `initialize_copy`
+  and `~`. `Regexp.new(/a/i)` copies the source regexp's flags; its
+  integer-options argument only decodes IGNORECASE, never EXTENDED or
+  MULTILINE. An octal escape (`/\101/`) fails to compile.
 - **`Object#class` returns a Class object** (a class reference): `p obj.class`
   prints the bare name, `obj.class == SomeClass` and `Integer == Integer`
   compare by class identity, and `obj.class.name` / `.to_s` give the name.
