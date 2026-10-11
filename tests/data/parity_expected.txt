@@ -6395,3 +6395,25 @@ false
 [195, 169]
 0
 "Ã©"
+#==#
+"\"a\""
+"\"\\u00E9\\n\\t\\\"\\\\\\\#@x\\\#$y\\\#{z}#a\\x01\\x7F\""
+"\"\\u{1F600}a\\u0300\""
+"\"\\xC3\\xA9\""
+[#<Encoding:UTF-8>, #<Encoding:BINARY (ASCII-8BIT)>]
+"é\n"
+"é"
+"😀A"
+"a\\qb#"
+RuntimeError: invalid dumped string; not wrapped with '"' nor '"...".force_encoding("...")' form
+RuntimeError: non-ASCII character detected
+RuntimeError: unterminated dumped string
+RuntimeError: hex escape and Unicode escape are mixed
+RuntimeError: invalid Unicode codepoint (too large)
+RuntimeError: invalid Unicode codepoint
+RuntimeError: invalid hex escape
+["\xC3\xA9", #<Encoding:BINARY (ASCII-8BIT)>]
+RuntimeError: dumped string contained Unicode escape but used force_encoding
+RuntimeError: dumped string has unknown encoding name
+#<Encoding:BINARY (ASCII-8BIT)>
+true

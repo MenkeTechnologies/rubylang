@@ -1106,9 +1106,18 @@ Honest limitations of this surface:
   - `Hash#rehash` cannot see a mutated Array key (keys are snapshotted at
     insertion), and string keys read back from `Hash#keys` are not frozen.
   - `Encoding` has no `find`/`names`/`compatible?`/`dummy?`/`ascii_compatible?`,
-    `String#dump`/`undump` are missing, `:é` is not a lexable symbol, and
+    `:é` is not a lexable symbol, and
     `Integer`/`Symbol`/`nil#to_s` report UTF-8 rather than US-ASCII (the
     non-UTF-8 byte-string substrate gap recorded in the fuzz baseline).
+  - **`String#dump` / `#undump` — fixed.** Ported from MRI's `rb_str_dump` and
+    `str_undump`: every non-printable-ASCII character is escaped (`\uXXXX` /
+    `\u{X}` for UTF-8, `\xNN` per byte otherwise), and `undump` reads the
+    result back byte by byte with MRI's exact RuntimeError messages, the
+    `.force_encoding("…")` epilogue, and the receiver's encoding carried to
+    the result. Still open: an undumped byte run that is not valid UTF-8 reads
+    back lossily in a UTF-8 result, and a `"\xff"` LITERAL is stored as
+    U+00FF, so `"\xff".b.dump` answers `"\xC3\xBF"` (the lexer's non-UTF-8
+    byte-literal gap, not `dump`'s).
   - `Kernel#system`, backticks and `%x` do not exist, so a `<<~`CMD`` heredoc
     cannot run.
   - A Range with an Integer begin and a Float end (`1..2.5`) is stored as a

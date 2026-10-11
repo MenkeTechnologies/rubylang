@@ -9708,14 +9708,37 @@ fn dispatch_string_body(
             with_host(|h| h.freeze_value(&v));
             Ok(v)
         }
-        // `undump` is the inverse of `inspect`: it reads back the quoted,
-        // escaped form. Anything that is not a complete `"…"` is a RuntimeError.
+        // `dump` — port of MRI's `rb_str_dump`: the double-quoted form with
+        // EVERY non-printable-ASCII character escaped, so the result is pure
+        // ASCII. A UTF-8 receiver writes a valid multibyte character as
+        // `\uXXXX` (`\u{X…}` above U+FFFF); any other encoding writes each
+        // non-ASCII byte as `\xNN`.
+        "dump" => {
+            let utf8 = with_host(|h| h.string_encoding(recv)).is_none();
+            Ok(new_str(if utf8 {
+                dump_string(s.chars().map(|c| c as u32), true)
+            } else {
+                dump_string(string_byte_view(recv, &s).into_iter().map(u32::from), false)
+            }))
+        }
+        // `undump` is the inverse of `dump`; see [`undump_string`]. Bytes that
+        // are not valid UTF-8 in a UTF-8 result read back lossily, the same
+        // limit every byte write into a Rust `String` has (see `setbyte`).
         "undump" => {
-            let inner = s
-                .strip_prefix('"')
-                .and_then(|r| r.strip_suffix('"'))
-                .ok_or_else(|| raise_exc("RuntimeError", "invalid dumped string"))?;
-            Ok(new_str(unescape_dumped(inner)?))
+            let recv_enc = with_host(|h| h.string_encoding(recv));
+            let (bytes, enc) = undump_string(&s, recv_enc)?;
+            Ok(match enc {
+                Some(enc) => {
+                    let v = new_str(if enc == "ASCII-8BIT" {
+                        bytes_to_binstr(&bytes)
+                    } else {
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    });
+                    with_host(|h| h.set_string_encoding(&v, enc));
+                    v
+                }
+                None => new_str(String::from_utf8_lossy(&bytes).into_owned()),
+            })
         }
         // The scrubbing methods replace invalid byte sequences. Every String
         // here is already valid UTF-8 (it is a Rust `String`), so there is
@@ -10772,69 +10795,218 @@ fn str_index_set(recv: &Value, s: &str, args: &[Value]) -> Result<Value, String>
     Ok(repl[0].clone())
 }
 
-/// Read back the escapes `String#dump`/`#inspect` write, for `String#undump`.
-///
-/// This is the inverse of the dumped form only — the escapes `dump` actually
-/// emits — not of Ruby's whole double-quoted literal syntax. An unrecognized
-/// escape is the character itself, which is what a Ruby literal does too.
-fn unescape_dumped(s: &str) -> Result<String, String> {
-    let mut out = String::with_capacity(s.len());
-    let mut c = s.chars().peekable();
-    while let Some(ch) = c.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-        match c.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('0') => out.push('\0'),
-            Some('a') => out.push('\u{7}'),
-            Some('b') => out.push('\u{8}'),
-            Some('f') => out.push('\u{c}'),
-            Some('v') => out.push('\u{b}'),
-            Some('e') => out.push('\u{1b}'),
-            Some('s') => out.push(' '),
-            // `\xNN` — one raw byte, written by `dump` for non-UTF-8 data.
-            Some('x') => {
-                let mut hex = String::new();
-                while hex.len() < 2 && c.peek().is_some_and(|h| h.is_ascii_hexdigit()) {
-                    hex.push(c.next().unwrap());
+/// The body of `String#dump` (MRI `rb_str_dump`), given the receiver as code
+/// points (`utf8`) or as raw bytes (every other encoding).
+fn dump_string(units: impl Iterator<Item = u32>, utf8: bool) -> String {
+    let units: Vec<u32> = units.collect();
+    let mut out = String::with_capacity(units.len() + 2);
+    out.push('"');
+    for (i, &c) in units.iter().enumerate() {
+        match c {
+            0x22 => out.push_str("\\\""),
+            0x5c => out.push_str("\\\\"),
+            0x0a => out.push_str("\\n"),
+            0x0d => out.push_str("\\r"),
+            0x09 => out.push_str("\\t"),
+            0x0c => out.push_str("\\f"),
+            0x0b => out.push_str("\\v"),
+            0x08 => out.push_str("\\b"),
+            0x07 => out.push_str("\\a"),
+            0x1b => out.push_str("\\e"),
+            0x23 => {
+                if matches!(units.get(i + 1), Some(0x24 | 0x40 | 0x7b)) {
+                    out.push('\\');
                 }
-                let n = u32::from_str_radix(&hex, 16)
-                    .map_err(|_| raise_exc("RuntimeError", "invalid dumped string"))?;
-                out.push(char::from_u32(n).unwrap_or('\u{fffd}'));
+                out.push('#');
             }
-            // `\u{...}` and `\uNNNN` — a code point.
-            Some('u') => {
-                let mut hex = String::new();
-                if c.peek() == Some(&'{') {
-                    c.next();
-                    while let Some(&h) = c.peek() {
-                        c.next();
-                        if h == '}' {
-                            break;
-                        }
-                        hex.push(h);
-                    }
-                } else {
-                    while hex.len() < 4 && c.peek().is_some_and(|h| h.is_ascii_hexdigit()) {
-                        hex.push(c.next().unwrap());
-                    }
-                }
-                let n = u32::from_str_radix(&hex, 16)
-                    .map_err(|_| raise_exc("RuntimeError", "invalid dumped string"))?;
-                out.push(
-                    char::from_u32(n)
-                        .ok_or_else(|| raise_exc("RuntimeError", "invalid dumped string"))?,
-                );
-            }
-            Some(other) => out.push(other),
-            None => return Err(raise_exc("RuntimeError", "invalid dumped string")),
+            0x20..=0x7e => out.push(c as u8 as char),
+            c if utf8 && c > 0x7f && c <= 0xffff => out.push_str(&format!("\\u{c:04X}")),
+            c if utf8 && c > 0xffff => out.push_str(&format!("\\u{{{c:X}}}")),
+            c => out.push_str(&format!("\\x{c:02X}")),
         }
     }
-    Ok(out)
+    out.push('"');
+    out
+}
+
+/// `String#undump` — port of MRI's `str_undump` / `undump_after_backslash`.
+///
+/// Builds the result BYTE by byte, so a run of `\xNN` escapes that spells a
+/// UTF-8 sequence (`"\xC3\xA9"`) reads back as that character. Answers the
+/// bytes plus their encoding (`None` is UTF-8): the one a
+/// `.force_encoding("…")` epilogue named, else the receiver's (`recv_enc`)
+/// unless a `\u` escape switched the result to UTF-8.
+fn undump_string(
+    s: &str,
+    recv_enc: Option<&'static str>,
+) -> Result<(Vec<u8>, Option<&'static str>), String> {
+    let rt = |m: &str| raise_exc("RuntimeError", m);
+    if !s.is_ascii() {
+        return Err(rt("non-ASCII character detected"));
+    }
+    if s.contains('\0') {
+        return Err(rt("string contains null byte"));
+    }
+    let invalid_format = || {
+        rt("invalid dumped string; not wrapped with '\"' nor '\"...\".force_encoding(\"...\")' form")
+    };
+    let b = s.as_bytes();
+    if b.len() < 2 || b[0] != b'"' {
+        return Err(invalid_format());
+    }
+    let hex_digits = |from: usize, max: usize| -> (u32, usize) {
+        let mut n = 0u32;
+        let mut len = 0;
+        while len < max && from + len < b.len() && b[from + len].is_ascii_hexdigit() {
+            n = n * 16 + (b[from + len] as char).to_digit(16).unwrap();
+            len += 1;
+        }
+        (n, len)
+    };
+    let push_cp = |out: &mut Vec<u8>, c: u32| {
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(char::from_u32(c).unwrap().encode_utf8(&mut buf).as_bytes());
+    };
+    let (mut utf8, mut binary) = (false, false);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 1;
+    loop {
+        if i >= b.len() {
+            return Err(rt("unterminated dumped string"));
+        }
+        if b[i] == b'"' {
+            i += 1;
+            if i == b.len() {
+                // The result keeps the receiver's encoding unless a `\u` escape
+                // switched it to UTF-8.
+                return Ok((out, if utf8 { None } else { recv_enc }));
+            }
+            let mut rest = &s[i..];
+            if rest.len() > 4 && rest.starts_with(".dup") {
+                rest = &rest[4..];
+            }
+            const FORCE: &str = ".force_encoding(\"";
+            if rest.len() <= FORCE.len() || !rest.starts_with(FORCE) {
+                return Err(invalid_format());
+            }
+            if utf8 {
+                return Err(rt("dumped string contained Unicode escape but used force_encoding"));
+            }
+            let rest = &rest[FORCE.len()..];
+            let Some(q) = rest.find('"') else {
+                return Err(invalid_format());
+            };
+            if &rest[q..] != "\")" {
+                return Err(invalid_format());
+            }
+            let enc = match rest[..q].to_ascii_uppercase().as_str() {
+                "ASCII-8BIT" | "BINARY" => Some("ASCII-8BIT"),
+                "US-ASCII" | "ASCII" => Some("US-ASCII"),
+                "UTF-8" => None,
+                _ => return Err(rt("dumped string has unknown encoding name")),
+            };
+            return Ok((out, enc));
+        }
+        if b[i] != b'\\' {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= b.len() {
+            return Err(rt("invalid escape"));
+        }
+        match b[i] {
+            b'\\' | b'"' | b'#' => {
+                out.push(b[i]);
+                i += 1;
+            }
+            c @ (b'n' | b'r' | b't' | b'f' | b'v' | b'b' | b'a' | b'e') => {
+                out.push(match c {
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'f' => 0x0c,
+                    b'v' => 0x0b,
+                    b'b' => 0x08,
+                    b'a' => 0x07,
+                    _ => 0x1b,
+                });
+                i += 1;
+            }
+            b'u' => {
+                if binary {
+                    return Err(rt("hex escape and Unicode escape are mixed"));
+                }
+                utf8 = true;
+                i += 1;
+                if i >= b.len() {
+                    return Err(rt("invalid Unicode escape"));
+                }
+                if b[i] == b'{' {
+                    i += 1;
+                    loop {
+                        if i >= b.len() {
+                            return Err(rt("unterminated Unicode escape"));
+                        }
+                        if b[i] == b'}' {
+                            i += 1;
+                            break;
+                        }
+                        if b[i].is_ascii_whitespace() || b[i] == 0x0b {
+                            i += 1;
+                            continue;
+                        }
+                        let (c, len) = hex_digits(i, usize::MAX);
+                        if len == 0 || len > 6 {
+                            return Err(rt("invalid Unicode escape"));
+                        }
+                        if c > 0x10ffff {
+                            return Err(rt("invalid Unicode codepoint (too large)"));
+                        }
+                        if (0xd800..=0xdfff).contains(&c) {
+                            return Err(rt("invalid Unicode codepoint"));
+                        }
+                        push_cp(&mut out, c);
+                        i += len;
+                    }
+                } else {
+                    let (c, len) = hex_digits(i, 4);
+                    if len != 4 {
+                        return Err(rt("invalid Unicode escape"));
+                    }
+                    if (0xd800..=0xdfff).contains(&c) {
+                        return Err(rt("invalid Unicode codepoint"));
+                    }
+                    push_cp(&mut out, c);
+                    i += len;
+                }
+            }
+            b'x' => {
+                i += 1;
+                if i >= b.len() {
+                    return Err(rt("invalid hex escape"));
+                }
+                let (c, len) = hex_digits(i, 2);
+                if len != 2 {
+                    return Err(rt("invalid hex escape"));
+                }
+                if c > 0x7f {
+                    if utf8 {
+                        return Err(rt("hex escape and Unicode escape are mixed"));
+                    }
+                    binary = true;
+                }
+                out.push(c as u8);
+                i += len;
+            }
+            // An escape `dump` never writes is kept verbatim, backslash and all.
+            other => {
+                out.extend_from_slice(&[b'\\', other]);
+                i += 1;
+            }
+        }
+    }
 }
 
 /// The compiled regex for a value that is a Regexp, else `None`.

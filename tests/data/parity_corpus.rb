@@ -8086,3 +8086,32 @@ t { "é".b.chars }
 t { "é".b.upcase.bytes }
 t { "é".b =~ /\xC3/n }
 t { "\xC3\xA9".force_encoding("ISO-8859-1").encode("UTF-8") }
+#==#
+# ── String#dump / #undump ──
+def t
+  r = yield
+  p r
+rescue Exception => e
+  puts "#{e.class}: #{e.message}"
+end
+t { "a".dump }
+t { "é\n\t\"\\\#@x\#$y\#{z}#a\x01\x7f".dump }
+t { "😀a\u0300".dump }
+t { "é".b.dump }
+t { ["é".dump.encoding, "é".b.dump.encoding] }
+t { "\"\\u00E9\\n\"".undump }
+t { "\"\\xC3\\xA9\"".undump }
+t { "\"\\u{1F600 41}\"".undump }
+t { "\"a\\qb\\#\"".undump }
+t { "abc".undump }
+t { "\"é\"".undump }
+t { "\"ab".undump }
+t { "\"\\xff\\u0041\"".undump }
+t { "\"\\u{110000}\"".undump }
+t { "\"\\uD800\"".undump }
+t { "\"\\x4\"".undump }
+t { u = "\"\\xC3\\xA9\".force_encoding(\"ASCII-8BIT\")".undump; [u, u.encoding] }
+t { "\"\\u00e9\".force_encoding(\"ASCII-8BIT\")".undump }
+t { "\"a\".force_encoding(\"NOPE\")".undump }
+t { "é".b.dump.undump.encoding }
+t { s = "multi\nline \u2603 \e[0m \#{x}"; s.dump.undump == s }
