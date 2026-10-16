@@ -1183,6 +1183,8 @@ pub enum RKey {
     Range(i64, i64, bool),
     StrRange(String, String, bool),
     FloatRange(u64, u64, bool),
+    /// A Range with arbitrary endpoints (`1..2.5`), keyed by its two endpoint keys.
+    ObjRange(Box<RKey>, Box<RKey>, bool),
     /// A Regexp, keyed by `(source, options)` — the same pair `==` compares —
     /// so `/a/` and `/a/` are one Hash key and collapse under `uniq`.
     Regexp(String, u8),
@@ -9138,6 +9140,12 @@ impl RubyHost {
                 if *excl { "..." } else { ".." },
                 fmt_float(f64::from_bits(*hi))
             ),
+            RKey::ObjRange(lo, hi, excl) => format!(
+                "{}{}{}",
+                self.key_inspect(lo),
+                if *excl { "..." } else { ".." },
+                self.key_inspect(hi)
+            ),
             RKey::Identity(i) => self.inspect(&Value::Obj(*i)),
             // Hash/Set/BigInt/Rational/Complex keys have no shorthand rendering
             // of their own — rebuild the value and use the one `inspect`.
@@ -9338,6 +9346,14 @@ impl RubyHost {
                 Some(RObj::FloatRange { lo, hi, exclusive }) => {
                     RKey::FloatRange(lo.to_bits(), hi.to_bits(), *exclusive)
                 }
+                Some(RObj::ObjRange { lo, hi, exclusive }) => {
+                    let (lo, hi, exclusive) = (lo.clone(), hi.clone(), *exclusive);
+                    RKey::ObjRange(
+                        Box::new(self.to_key_seen(&lo, seen)),
+                        Box::new(self.to_key_seen(&hi, seen)),
+                        exclusive,
+                    )
+                }
                 // A Struct/Data instance compares and hashes BY VALUE in Ruby —
                 // two `P.new(1, 2)` are the same hash key and report the same
                 // `hash` — so key it on its class plus its members.
@@ -9409,6 +9425,10 @@ impl RubyHost {
             }
             RKey::Range(lo, hi, excl) => self.new_range(*lo, *hi, *excl),
             RKey::StrRange(lo, hi, excl) => self.new_str_range(lo.clone(), hi.clone(), *excl),
+            RKey::ObjRange(lo, hi, excl) => {
+                let (lo, hi) = (self.key_to_value(lo), self.key_to_value(hi));
+                self.new_obj_range(lo, hi, *excl)
+            }
             RKey::FloatRange(lo, hi, excl) => {
                 self.new_float_range(f64::from_bits(*lo), f64::from_bits(*hi), *excl)
             }
@@ -10056,6 +10076,9 @@ impl RubyHost {
         ) {
             return false;
         }
+        if let Some(((l1, h1, e1), (l2, h2, e2))) = self.obj_range_pair(a, b) {
+            return e1 == e2 && self.eql_values(&l1, &l2) && self.eql_values(&h1, &h2);
+        }
         // Two user objects that `canon_user_keys` bound to one representative
         // were found `eql?` by their own `hash`/`eql?`.
         if let (Value::Obj(x), Value::Obj(y)) = (a, b) {
@@ -10213,6 +10236,23 @@ impl RubyHost {
 
     /// `(begin, end, exclusive)` of an Integer or Float range as `f64`s, an open
     /// end as infinity. Only meaningful for comparing two numeric ranges.
+    /// Endpoints of a Range whose endpoints are objects (`1..2.5` keeps its
+    /// Integer begin), paired with the other range value when it is any Range kind.
+    fn obj_range_pair(&self, a: &Value, b: &Value) -> Option<((Value, Value, bool), (Value, Value, bool))> {
+        let is_obj = |v: &Value| matches!(self.obj(v), Some(RObj::ObjRange { .. }));
+        if !is_obj(a) && !is_obj(b) {
+            return None;
+        }
+        let parts = |v: &Value| match self.obj(v) {
+            Some(RObj::ObjRange { lo, hi, exclusive }) => Some((lo.clone(), hi.clone(), *exclusive)),
+            Some(RObj::FloatRange { lo, hi, exclusive }) => {
+                Some((Value::Float(*lo), Value::Float(*hi), *exclusive))
+            }
+            Some(RObj::Range { lo, hi, exclusive }) => Some((Value::Int(*lo), Value::Int(*hi), *exclusive)),
+            _ => None,
+        };
+        Some((parts(a)?, parts(b)?))
+    }
     fn numeric_range_parts(&self, v: &Value) -> (f64, f64, bool) {
         match self.obj(v) {
             Some(RObj::Range { lo, hi, exclusive }) => (
@@ -10262,6 +10302,10 @@ impl RubyHost {
                 let (l1, h1, e1) = self.numeric_range_parts(a);
                 let (l2, h2, e2) = self.numeric_range_parts(b);
                 e1 == e2 && l1 == l2 && h1 == h2
+            }
+            (Value::Obj(_), Value::Obj(_)) if self.obj_range_pair(a, b).is_some() => {
+                let ((l1, h1, e1), (l2, h2, e2)) = self.obj_range_pair(a, b).unwrap();
+                e1 == e2 && self.eq_values(&l1, &l2) && self.eq_values(&h1, &h2)
             }
             // Rational equality (also equal to an integer of the same value —
             // `as_rational` converts an Integer of either width, which is why

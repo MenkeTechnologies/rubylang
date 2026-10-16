@@ -11150,3 +11150,38 @@ fn public_method_singleton_method_and_included_modules() {
         "[[Comparable, M, Kernel], [], [Comparable, Kernel]]",
     );
 }
+
+// Reference answers below were read from MRI 4.0.7 and are stable back to 2.6.
+
+#[test]
+fn mixed_integer_float_range_keeps_its_integer_endpoint() {
+    eq("Range.new(0, 2.5, true)", "0...2.5");
+    eq("r = (1..2.5); [r.begin, r.end, r.to_a, r.size, r.min, r.max]", "[1, 2.5, [1, 2], 2, 1, 2.5]");
+    eq("(1..2.5).step(0.5).to_a", "[1.0, 1.5, 2.0, 2.5]");
+    eq("(1..2.5) == (1.0..2.5)", "true");
+    eq("[(1..2.5).eql?(1..2.5), (1..2.5).eql?(1.0..2.5)]", "[true, false]");
+    eq("(1..2.5).hash == (1..2.5).hash", "true");
+    eq("{(1..2.5) => :v}[1..2.5]", ":v");
+    raises("(1.5..3).to_a", "TypeError", "can't iterate from Float");
+    raises("(1...2.5).max", "TypeError", "cannot exclude non Integer end value");
+}
+
+#[test]
+fn immediate_to_s_and_inspect_are_us_ascii() {
+    eq(
+        "[nil, true, 1, 2**70, 1.5, :a, 3r, Object].map { |v| [v.to_s.encoding.to_s, v.inspect.encoding.to_s] }.flatten.uniq",
+        "[\"US-ASCII\"]",
+    );
+    eq("[[1, :a, nil].inspect.encoding.to_s, [1, \"a\"].inspect.encoding.to_s]", "[\"US-ASCII\", \"UTF-8\"]");
+    eq(":\"\u{e9}\".to_s.encoding.to_s", "\"UTF-8\"");
+    eq("(1.to_s + \"\u{e9}\").encoding.to_s", "\"UTF-8\"");
+}
+
+#[test]
+fn runtime_raised_error_carries_the_handled_exception_as_cause() {
+    eq(
+        "begin; raise 'in'; rescue; begin; Integer('z'); rescue => e; e.cause.message; end; end",
+        "\"in\"",
+    );
+    eq("begin; raise 'a'; rescue; end; begin; Integer('z'); rescue => e; e.cause; end", "nil");
+}

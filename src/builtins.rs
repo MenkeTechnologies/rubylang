@@ -1366,12 +1366,14 @@ pub(crate) fn make_range(lo: &Value, hi: &Value, excl: bool) -> Result<Value, St
     }
     Ok(match (lo, hi) {
         (Value::Int(a), Value::Int(b)) => with_host(|h| h.new_range(*a, *b, excl)),
-        // A Float endpoint (on either side) makes a Float range; a mixed
-        // Int/Float range coerces the Integer bound to Float, matching Ruby.
-        (Value::Float(_) | Value::Int(_), Value::Float(_) | Value::Int(_))
-            if matches!(lo, Value::Float(_)) || matches!(hi, Value::Float(_)) =>
-        {
+        // Two Float endpoints make a Float range. A MIXED Int/Float range keeps
+        // each endpoint as given (`1..2.5` prints, reads back and iterates from
+        // the Integer `1`), so it is a generic object range.
+        (Value::Float(_), Value::Float(_)) => {
             with_host(|h| h.new_float_range(as_f(lo), as_f(hi), excl))
+        }
+        (Value::Float(_) | Value::Int(_), Value::Float(_) | Value::Int(_)) => {
+            with_host(|h| h.new_obj_range(lo.clone(), hi.clone(), excl))
         }
         _ => {
             // String endpoints (`'a'..'e'`) produce a String range.
@@ -2316,8 +2318,66 @@ pub(crate) fn dispatch(
             with_host(|h| h.take_pending_exc());
             kernel(name, args, block)
         }
-        r => r,
+        r => tag_ascii_repr(r, recv, name),
     }
+}
+
+/// Receiver classes whose `to_s`/`inspect` MRI builds as US-ASCII Strings.
+const ASCII_REPR_CLASSES: &[&str] = &[
+    "NilClass",
+    "TrueClass",
+    "FalseClass",
+    "Integer",
+    "Float",
+    "Symbol",
+    "Rational",
+    "Complex",
+    "Class",
+    "Module",
+];
+
+/// Whether `to_s`/`inspect` of `v` is built US-ASCII: a scalar of an
+/// [`ASCII_REPR_CLASSES`] class, or an Array/Hash/Integer-or-Float Range whose
+/// every element is one (MRI starts those results as US-ASCII and appends the
+/// elements' text, so a String element makes the result UTF-8).
+fn ascii_repr_receiver(h: &RubyHost, v: &Value, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    if ASCII_REPR_CLASSES.contains(&h.class_of(v).as_str()) {
+        return true;
+    }
+    if let Some(items) = h.as_array(v) {
+        return items.iter().all(|e| ascii_repr_receiver(h, e, depth + 1));
+    }
+    if let Some(map) = h.as_hash(v) {
+        return map.iter().all(|(k, e)| {
+            matches!(
+                k,
+                RKey::Int(_) | RKey::FloatBits(_) | RKey::Bool(_) | RKey::Nil | RKey::Sym(_)
+            )
+                && ascii_repr_receiver(h, e, depth + 1)
+        });
+    }
+    h.as_range(v).is_some() || h.as_float_range(v).is_some()
+}
+
+/// `nil.to_s`, `1.to_s`, `1.5.inspect`, `:a.to_s`, `Object.name`, … answer a
+/// US-ASCII String when 7-bit (MRI builds them with `rb_usascii_str_new`); a
+/// non-ASCII result (`:"é".to_s`) stays UTF-8.
+fn tag_ascii_repr(r: Result<Value, String>, recv: &Value, name: &str) -> Result<Value, String> {
+    if !matches!(name, "to_s" | "inspect" | "name") {
+        return r;
+    }
+    if let Ok(v) = &r {
+        with_host(|h| {
+            let ascii = h.as_str(v).is_some_and(|s| s.is_ascii());
+            if ascii && h.string_encoding(v).is_none() && ascii_repr_receiver(h, recv, 0) {
+                h.set_string_encoding(v, "US-ASCII");
+            }
+        });
+    }
+    r
 }
 
 fn dispatch_resolved(
@@ -21422,6 +21482,9 @@ fn dispatch_range(
                         excl,
                     ));
                 }
+                if let Some(parts) = h.as_obj_range(v) {
+                    return Some(parts);
+                }
                 h.as_float_range(v)
                     .map(|(lo, hi, excl)| (Value::Float(lo), Value::Float(hi), excl))
             })
@@ -21866,6 +21929,15 @@ fn dispatch_float_range(
     }
 }
 
+/// An Integer or Float endpoint as `f64`.
+fn numeric_f(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
+    }
+}
+
 /// A Range over arbitrary `<=>`-comparable objects. Membership uses `<=>`;
 /// iteration (materialized to an Array for the Enumerable methods) uses `succ`.
 fn dispatch_obj_range(
@@ -21920,6 +21992,34 @@ fn dispatch_obj_range(
                 return Ok(new_arr(out));
             }
             "max" | "last" if args.is_empty() && !excl => return Ok(bigint_to_value(g.clone())),
+            _ => {}
+        }
+    }
+    // Mixed Integer/Float endpoints (`1..2.5`, `1.5..3`): Float arithmetic for
+    // the numeric queries; a Float begin cannot be walked with `succ`.
+    if let (Some(l), Some(g)) = (numeric_f(&lo), numeric_f(&hi)) {
+        let lo_is_float = matches!(lo, Value::Float(_));
+        let empty = l > g || (excl && l == g);
+        match name {
+            "size" if args.is_empty() => {
+                if lo_is_float {
+                    return Err(raise_exc("TypeError", "can't iterate from Float"));
+                }
+                let top = if excl && g.fract() == 0.0 { g - 1.0 } else { g.floor() };
+                return Ok(Value::Int((top - l + 1.0).max(0.0) as i64));
+            }
+            "min" if args.is_empty() && block.is_none() => {
+                return Ok(if empty { Value::Undef } else { lo });
+            }
+            "max" if args.is_empty() && block.is_none() => {
+                if excl {
+                    return Err(raise_exc("TypeError", "cannot exclude non Integer end value"));
+                }
+                return Ok(if empty { Value::Undef } else { hi });
+            }
+            "step" | "%" => {
+                return dispatch_float_range(_recv, name, args, block, l, g, excl);
+            }
             _ => {}
         }
     }
@@ -22021,6 +22121,9 @@ fn dispatch_obj_range(
     }
     // Everything else materializes the range by walking `succ` from lo to hi,
     // then delegates to the eager Array implementation (Enumerable methods).
+    if matches!(lo, Value::Float(_)) {
+        return Err(raise_exc("TypeError", "can't iterate from Float"));
+    }
     let mut elems = Vec::new();
     let mut cur = lo.clone();
     // Bound the walk so a pathological/huge object range can't hang the VM.
@@ -28967,8 +29070,21 @@ fn stringio_method(
     }
 }
 
+/// An exception raised by the runtime itself (`Integer("z")`, a failed
+/// conversion) gets the exception being handled (`$!`) as its `cause`, as
+/// `raise` does for a user-raised one.
+fn attach_handling_cause(exc: &Value) {
+    with_host(|h| {
+        let handling = h.get_global("!");
+        if !matches!(handling, Value::Undef) {
+            h.set_ivar_of(exc, "cause", handling);
+        }
+    });
+}
+
 pub(crate) fn raise_exc(class: &str, msg: &str) -> String {
     let exc = with_host(|h| h.new_exception(class, msg));
+    attach_handling_cause(&exc);
     with_host(|h| h.set_pending_exc(exc));
     msg.to_string()
 }
@@ -28979,6 +29095,7 @@ pub(crate) fn raise_exc(class: &str, msg: &str) -> String {
 /// `rescue` bodies branch, and a string audit cannot see them missing.
 pub(crate) fn raise_exc_with(class: &str, msg: &str, fields: &[(&str, Value)]) -> String {
     let exc = with_host(|h| h.new_exception(class, msg));
+    attach_handling_cause(&exc);
     with_host(|h| {
         for (k, v) in fields {
             h.set_ivar_of(&exc, k, v.clone());

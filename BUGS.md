@@ -1120,9 +1120,9 @@ Honest limitations of this surface:
     CONTENT is only modelled as UTF-8, ASCII-8BIT or US-ASCII, so
     `"x".force_encoding("EUC-JP").encoding` answers UTF-8 where MRI answers
     EUC-JP; `Encoding.new` / `#dup` succeed where MRI raises; `:é` is not a
-    lexable symbol; and `Integer`/`Symbol`/`nil#to_s` report UTF-8 rather than
-    US-ASCII (the non-UTF-8 byte-string substrate gap recorded in the fuzz
-    baseline).
+    lexable symbol; and `Object#to_s` / `Proc#inspect` report UTF-8 where MRI answers
+    ASCII-8BIT (`nil`, `Integer`, `Symbol`, `Float`, `Class` and the Array/Hash/
+    Range forms built from them already answer US-ASCII).
   - **`String#dump` / `#undump` — fixed.** Ported from MRI's `rb_str_dump` and
     `str_undump`: every non-printable-ASCII character is escaped (`\uXXXX` /
     `\u{X}` for UTF-8, `\xNN` per byte otherwise), and `undump` reads the
@@ -1134,11 +1134,6 @@ Honest limitations of this surface:
     byte-literal gap, not `dump`'s).
   - `Kernel#system`, backticks and `%x` do not exist, so a `<<~`CMD`` heredoc
     cannot run.
-  - A Range with an Integer begin and a Float end (`1..2.5`) is stored as a
-    Float range, so `Range.new(6, 2.5)` inspects as `6.0...2.5`, `to_a` raises
-    where MRI iterates `1, 2`, and `(1..)`-style Integer iteration is lost.
-  - An internally raised exception (`TypeError` from a bad `raise` operand) does
-    not pick up `$!` as its `cause`; only `raise` itself records one.
   - Methods redefined under the same name later in a file, and classes reopened
     inside a block, are hoisted at compile time, so every earlier call sees the
     last definition.
@@ -1682,7 +1677,8 @@ Honest limitations of this surface:
   `Exception#cause` is recorded by `raise`: raising inside a `rescue` links the
   new exception to the one being handled (`$!`), so `rescue => e; raise Wrapper`
   keeps the original reachable and `e.cause.cause` walks the chain. A bare
-  re-raise is not its own cause, and an already-set cause is never overwritten.
+  re-raise is not its own cause, and an already-set cause is never overwritten. An exception the runtime raises itself
+  (`Integer("z")`, a bad `raise` operand) links `$!` the same way.
   So `#is_a?`,
   `Class#superclass` and `Module#ancestors` agree with MRI, and a bare `rescue`
   catches `StandardError` and nothing above it — `SystemExit`, `ScriptError` and
