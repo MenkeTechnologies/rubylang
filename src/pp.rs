@@ -17,7 +17,7 @@
 //! object), so such an object prints through its `inspect`.
 
 use crate::builtins::{defines_own, inspect_of};
-use crate::host::{with_host, RANGE_BEGINLESS, RANGE_ENDLESS};
+use crate::host::with_host;
 use fusevm::Value;
 use std::collections::VecDeque;
 
@@ -497,28 +497,7 @@ impl Printer {
 
     /// The two ends of a Range (nil for an open side) and its exclusivity.
     fn range_bounds(&self, v: &Value) -> Option<(Value, Value, bool)> {
-        with_host(|h| {
-            if let Some((lo, hi, ex)) = h.as_obj_range(v) {
-                return Some((lo, hi, ex));
-            }
-            if let Some((lo, hi, ex)) = h.as_range(v) {
-                let end = |n: i64, open: i64| {
-                    if n == open {
-                        Value::Undef
-                    } else {
-                        Value::Int(n)
-                    }
-                };
-                return Some((end(lo, RANGE_BEGINLESS), end(hi, RANGE_ENDLESS), ex));
-            }
-            if let Some((lo, hi, ex)) = h.as_float_range(v) {
-                return Some((Value::Float(lo), Value::Float(hi), ex));
-            }
-            if let Some((lo, hi, ex)) = h.as_str_range(v) {
-                return Some((h.new_string(lo), h.new_string(hi), ex));
-            }
-            None
-        })
+        crate::builtins::range_endpoints(v)
     }
 
     /// `Range#pretty_print`.

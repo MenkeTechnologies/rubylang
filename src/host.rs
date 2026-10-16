@@ -12404,7 +12404,21 @@ pub fn run_begin(begin_id: usize) -> Result<Value, String> {
 
     if let Some(eid) = bd.ensure {
         // `ensure` always runs; an exception it raises supersedes the result.
-        run_template(eid, &[])?;
+        // While an exception is propagating through it, `$!` is that exception.
+        let in_flight = if result.is_err() && with_host(|h| h.signal.is_none()) {
+            with_host(|h| h.pending_exc.clone())
+        } else {
+            None
+        };
+        let prev_bang = with_host(|h| h.get_global("!"));
+        if let Some(exc) = &in_flight {
+            with_host(|h| h.set_global("!", exc.clone()));
+        }
+        let ran = run_template(eid, &[]);
+        if in_flight.is_some() {
+            with_host(|h| h.set_global("!", prev_bang));
+        }
+        ran?;
     }
     result
 }

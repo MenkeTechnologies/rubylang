@@ -11173,6 +11173,7 @@ fn immediate_to_s_and_inspect_are_us_ascii() {
         "[\"US-ASCII\"]",
     );
     eq("[[1, :a, nil].inspect.encoding.to_s, [1, \"a\"].inspect.encoding.to_s]", "[\"US-ASCII\", \"UTF-8\"]");
+    eq("(1..2.5).inspect.encoding.to_s", "\"US-ASCII\"");
     eq(":\"\u{e9}\".to_s.encoding.to_s", "\"UTF-8\"");
     eq("(1.to_s + \"\u{e9}\").encoding.to_s", "\"UTF-8\"");
 }
@@ -11184,4 +11185,43 @@ fn runtime_raised_error_carries_the_handled_exception_as_cause() {
         "\"in\"",
     );
     eq("begin; raise 'a'; rescue; end; begin; Integer('z'); rescue => e; e.cause; end", "nil");
+}
+
+#[test]
+fn range_overlap_and_minmax() {
+    eq(
+        "[(1..5).overlap?(5..7), (1...5).overlap?(5..7), (1.0..2.0).overlap?(1.5..3), \
+         (\"a\"..\"c\").overlap?(\"c\"..\"d\"), (1..).overlap?(..1), (1...1).overlap?(1..2), (3..1).overlap?(1..5)]",
+        "[true, false, true, true, true, false, false]",
+    );
+    raises("(1..2).overlap?(1)", "TypeError", "wrong argument type Integer (expected Range)");
+    eq(
+        "[(1..5).minmax, (1.0..2.0).minmax, (1..2.5).minmax, (5..1).minmax, (\"a\"..\"c\").minmax]",
+        "[[1, 5], [1.0, 2.0], [1, 2.5], [nil, nil], [\"a\", \"c\"]]",
+    );
+    eq(
+        "[(1.0..5.0).cover?(2..3), (1.0..5.0).cover?(1.0...5.0), (1.0...5.0).cover?(1.0..5.0), (1.0..5.0).cover?(3..2)]",
+        "[true, true, false, false]",
+    );
+}
+
+#[test]
+fn array_slice_fill_and_float_ended_range_indexes() {
+    eq("[1, 2, 3, 4].slice(1, 2)", "[2, 3]");
+    eq("[1, 2, 3, 4].slice(1..2)", "[2, 3]");
+    eq("a = [1, 2, 3, 4]; [a[1..2.5], a[0...2.5], \"hello\"[1..2.5], a.values_at(1..2.5)]", "[[2, 3], [1, 2], \"el\", [2, 3]]");
+    eq("[1, 2, 3, 4].fill(0, 1..2)", "[1, 0, 0, 4]");
+    eq("[1, 2, 3, 4].fill(7, -2..)", "[1, 2, 7, 7]");
+    eq("[1, 2, 3, 4].fill(1..2) { 9 }", "[1, 9, 9, 4]");
+    eq("[1, 2, 3].fill(0, 5..6)", "[1, 2, 3, nil, nil, 0, 0]");
+    raises("[1, 2, 3].fill(0, -5..1)", "RangeError", "-5..1 out of range");
+}
+
+#[test]
+fn ensure_sees_the_propagating_exception_in_dollar_bang() {
+    eq(
+        "def g; yield; ensure; $saw = $!&.message; end; begin; g { raise 'k' }; rescue; end; [$saw, $!]",
+        "[\"k\", nil]",
+    );
+    eq("def h; yield; ensure; $saw = $!; end; h { 1 }; $saw", "nil");
 }

@@ -2359,6 +2359,9 @@ fn ascii_repr_receiver(h: &RubyHost, v: &Value, depth: usize) -> bool {
                 && ascii_repr_receiver(h, e, depth + 1)
         });
     }
+    if let Some((lo, hi, _)) = h.as_obj_range(v) {
+        return ascii_repr_receiver(h, &lo, depth + 1) && ascii_repr_receiver(h, &hi, depth + 1);
+    }
     h.as_range(v).is_some() || h.as_float_range(v).is_some()
 }
 
@@ -9394,6 +9397,9 @@ fn dispatch_string(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    if let Some(args) = int_index_args(name, args) {
+        return dispatch_string(recv, name, &args, block);
+    }
     // The borrowed names answer from a BORROW and return an Int or a Bool, so
     // nothing below can change their answer: `propagate_string_encoding` only
     // tags a String, and none of them is a `STRING_MUTATORS` entry, so the
@@ -12639,12 +12645,34 @@ fn range_beg_len(
     Ok((beg, (end - beg).max(0)))
 }
 
+/// Index-taking Array/String methods read a Range argument's endpoints through
+/// `to_int`, so `a[1..2.5]` slices `1..2`. Returns the arguments with every
+/// mixed Integer/Float Range replaced by its truncated Integer Range, or `None`
+/// when there is nothing to rewrite.
+fn int_index_args(name: &str, args: &[Value]) -> Option<Vec<Value>> {
+    if !matches!(name, "[]" | "slice" | "slice!" | "[]=" | "values_at" | "fill") {
+        return None;
+    }
+    let truncated = |v: &Value| -> Option<Value> {
+        let (lo, hi, excl) = with_host(|h| h.as_obj_range(v))?;
+        let (lo, hi) = (numeric_f(&lo)?, numeric_f(&hi)?);
+        Some(with_host(|h| h.new_range(lo.trunc() as i64, hi.trunc() as i64, excl)))
+    };
+    if !args.iter().any(|a| truncated(a).is_some()) {
+        return None;
+    }
+    Some(args.iter().map(|a| truncated(a).unwrap_or_else(|| a.clone())).collect())
+}
+
 fn dispatch_array(
     recv: &Value,
     name: &str,
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    if let Some(args) = int_index_args(name, args) {
+        return dispatch_array(recv, name, &args, block);
+    }
     frozen_guard(recv, name, ARRAY_MUTATORS)?;
     // Answer the methods that appear inside loops over big arrays before the
     // read-out below, which clones the whole backing `Vec` for *every* method
@@ -13816,7 +13844,7 @@ fn dispatch_array(
         "min_by" | "max_by" | "sort_by" | "minmax_by" => {
             sort_by_family(recv, name, &arr, &block, args, None)
         }
-        "[]" => arr_index(&arr, args),
+        "[]" | "slice" => arr_index(&arr, args),
         "fetch" => {
             let len = arr.len();
             let raw = to_int(&args[0])?;
@@ -14155,18 +14183,20 @@ fn dispatch_array(
         "fill" => {
             let mut a = arr;
             let len = a.len() as i64;
+            // A Range in the start slot (`fill(0, 1..2)`, `fill(1..2) { }`) is
+            // MRI `rb_range_beg_len(…, err = 1)`.
+            let ranged = fill_range_span(args.get(usize::from(block.is_none())), len)?;
             if let Some(bl) = &block {
                 // fill { |index| ... } / fill(start) { } / fill(start, length) { }
-                let start = args.first().map(as_i).unwrap_or(0);
-                let start = if start < 0 {
-                    (start + len).max(0)
-                } else {
-                    start
-                };
-                let end = match args.get(1) {
-                    Some(l) => start + as_i(l),
-                    None => len,
-                };
+                let (start, end) = ranged.unwrap_or_else(|| {
+                    let start = args.first().map(as_i).unwrap_or(0);
+                    let start = if start < 0 { (start + len).max(0) } else { start };
+                    let end = match args.get(1) {
+                        Some(l) => start + as_i(l),
+                        None => len,
+                    };
+                    (start, end)
+                });
                 let mut i = start;
                 while i < end {
                     let idx = i as usize;
@@ -14179,19 +14209,18 @@ fn dispatch_array(
             } else {
                 // fill(value) / fill(value, start) / fill(value, start, length)
                 let val = args[0].clone();
-                let start = args.get(1).map(as_i).unwrap_or(0);
-                let start = if start < 0 {
-                    (start + len).max(0)
-                } else {
-                    start
-                };
-                let end = match args.get(2) {
-                    Some(l) => start + as_i(l),
-                    None => len.max(start),
-                };
+                let (start, end) = ranged.unwrap_or_else(|| {
+                    let start = args.get(1).map(as_i).unwrap_or(0);
+                    let start = if start < 0 { (start + len).max(0) } else { start };
+                    let end = match args.get(2) {
+                        Some(l) => start + as_i(l),
+                        None => len.max(start),
+                    };
+                    (start, end)
+                });
                 // An explicit length past the end grows the array even when it
                 // fills nothing (`[1, 2, 3].fill(0, 5, 0)` pads with nils).
-                if args.len() > 2 {
+                if args.len() > 2 || ranged.is_some() {
                     while (a.len() as i64) < end {
                         a.push(Value::Undef);
                     }
@@ -21457,6 +21486,69 @@ fn dispatch_hash_body(
 
 // ---- Range ----------------------------------------------------------------
 
+/// The two ends of any Range kind (nil for an open side) and its exclusivity.
+pub(crate) fn range_endpoints(v: &Value) -> Option<(Value, Value, bool)> {
+    with_host(|h| {
+        if let Some(parts) = h.as_obj_range(v) {
+            return Some(parts);
+        }
+        if let Some((lo, hi, ex)) = h.as_range(v) {
+            let end = |n: i64, open: i64| {
+                if n == open {
+                    Value::Undef
+                } else {
+                    Value::Int(n)
+                }
+            };
+            return Some((
+                end(lo, crate::host::RANGE_BEGINLESS),
+                end(hi, crate::host::RANGE_ENDLESS),
+                ex,
+            ));
+        }
+        if let Some((lo, hi, ex)) = h.as_float_range(v) {
+            return Some((Value::Float(lo), Value::Float(hi), ex));
+        }
+        if let Some((lo, hi, ex)) = h.as_str_range(v) {
+            return Some((h.new_string(lo), h.new_string(hi), ex));
+        }
+        None
+    })
+}
+
+/// `a <=> b` as an ordering sign, `None` when the pair is incomparable.
+fn range_cmp(a: &Value, b: &Value) -> Result<Option<i64>, String> {
+    Ok(match dispatch(a, "<=>", std::slice::from_ref(b), None)? {
+        Value::Int(n) => Some(n),
+        _ => None,
+    })
+}
+
+/// MRI `range_overlap`: both ranges non-empty, and each begins no later than
+/// the other ends (strictly before when that end is excluded).
+fn range_overlap(a: (Value, Value, bool), b: (Value, Value, bool)) -> Result<bool, String> {
+    let open = |v: &Value| matches!(v, Value::Undef);
+    let empty = |r: &(Value, Value, bool)| -> Result<bool, String> {
+        if open(&r.0) || open(&r.1) {
+            return Ok(false);
+        }
+        Ok(match range_cmp(&r.0, &r.1)? {
+            Some(c) => c > 0 || (c == 0 && r.2),
+            None => true,
+        })
+    };
+    let begins_before_end = |begin: &Value, end: &Value, excl: bool| -> Result<bool, String> {
+        if open(begin) || open(end) {
+            return Ok(true);
+        }
+        Ok(matches!(range_cmp(begin, end)?, Some(c) if c < 0 || (c == 0 && !excl)))
+    };
+    if empty(&a)? || empty(&b)? {
+        return Ok(false);
+    }
+    Ok(begins_before_end(&a.0, &b.1, b.2)? && begins_before_end(&b.0, &a.1, a.2)?)
+}
+
 fn dispatch_range(
     recv: &Value,
     name: &str,
@@ -21466,34 +21558,30 @@ fn dispatch_range(
     // `==` between numeric ranges compares the endpoints with `==`, so an
     // Integer range equals the Float range with the same values.
     if name == "==" && args.len() == 1 {
-        let parts = |v: &Value| -> Option<(Value, Value, bool)> {
-            with_host(|h| {
-                if let Some((lo, hi, excl)) = h.as_range(v) {
-                    let end = |n: i64, sentinel: i64| {
-                        if n == sentinel {
-                            Value::Undef
-                        } else {
-                            Value::Int(n)
-                        }
-                    };
-                    return Some((
-                        end(lo, crate::host::RANGE_BEGINLESS),
-                        end(hi, crate::host::RANGE_ENDLESS),
-                        excl,
-                    ));
-                }
-                if let Some(parts) = h.as_obj_range(v) {
-                    return Some(parts);
-                }
-                h.as_float_range(v)
-                    .map(|(lo, hi, excl)| (Value::Float(lo), Value::Float(hi), excl))
-            })
-        };
-        if let (Some((l1, h1, e1)), Some((l2, h2, e2))) = (parts(recv), parts(&args[0])) {
+        if let (Some((l1, h1, e1)), Some((l2, h2, e2))) =
+            (range_endpoints(recv), range_endpoints(&args[0]))
+        {
             return Ok(Value::Bool(
                 e1 == e2 && with_host(|h| h.eq_values(&l1, &l2) && h.eq_values(&h1, &h2)),
             ));
         }
+    }
+    if name == "overlap?" && args.len() == 1 {
+        let Some(other) = range_endpoints(&args[0]) else {
+            let cls = with_host(|h| h.class_of(&args[0]));
+            return Err(raise_exc(
+                "TypeError",
+                &format!("wrong argument type {cls} (expected Range)"),
+            ));
+        };
+        let this = range_endpoints(recv).expect("dispatch_range receiver is a Range");
+        return Ok(Value::Bool(range_overlap(this, other)?));
+    }
+    // `minmax` is `[min, max]` of the receiver; the block form is Enumerable's.
+    if name == "minmax" && args.is_empty() && block.is_none() {
+        let min = dispatch(recv, "min", &[], None)?;
+        let max = dispatch(recv, "max", &[], None)?;
+        return Ok(new_arr(vec![min, max]));
     }
     // Object ranges (IPAddr#to_range, custom Comparable): membership by `<=>`,
     // iteration by `succ`.
@@ -21895,6 +21983,17 @@ fn dispatch_float_range(
             }
         }
         "exclude_end?" => Ok(Value::Bool(excl)),
+        // MRI `r_cover_range_p`: the argument range is non-empty, begins inside
+        // the receiver, and does not end past it.
+        "cover?" if args.len() == 1 && range_endpoints(&args[0]).is_some() => {
+            let (vb, ve, vexcl) = range_endpoints(&args[0]).expect("checked by the guard");
+            let (Some(vb), Some(ve)) = (numeric_f(&vb), numeric_f(&ve)) else {
+                return Ok(Value::Bool(false));
+            };
+            let val_empty = vb > ve || (vb == ve && vexcl);
+            let ends_inside = if excl && !vexcl { hi > ve } else { hi >= ve };
+            Ok(Value::Bool(!val_empty && contains(vb) && ends_inside))
+        }
         "include?" | "member?" | "cover?" | "===" => Ok(Value::Bool(contains(as_f(&args[0])))),
         "step" | "%" => {
             let by = args.first().map(as_f).unwrap_or(1.0);
@@ -30627,6 +30726,38 @@ fn parse_leading_float(s: &str) -> f64 {
 /// Resolve a range `lo..hi` to a `[start, end)` half-open slice range over a
 /// collection of `len` elements, honoring negative indices, exclusivity, and the
 /// beginless/endless sentinels. Returns `None` when the start is out of range.
+/// `(start, end)` for `Array#fill`'s Range argument against an array of `len`,
+/// or `None` when `arg` is not an Integer Range. Unlike a slice, the span may
+/// run past the array (`fill` grows it); a begin left of the array is a
+/// `RangeError`.
+fn fill_range_span(arg: Option<&Value>, len: i64) -> Result<Option<(i64, i64)>, String> {
+    use crate::host::{RANGE_BEGINLESS, RANGE_ENDLESS};
+    let Some(arg) = arg else { return Ok(None) };
+    let Some((lo, hi, excl)) = with_host(|h| h.as_range(arg)) else {
+        return Ok(None);
+    };
+    let mut start = if lo == RANGE_BEGINLESS { 0 } else { lo };
+    if start < 0 {
+        start += len;
+        if start < 0 {
+            let shown = with_host(|h| h.inspect(arg));
+            return Err(raise_exc("RangeError", &format!("{shown} out of range")));
+        }
+    }
+    let mut end = if hi == RANGE_ENDLESS {
+        len
+    } else {
+        let e = if hi < 0 { hi + len } else { hi };
+        if excl {
+            e
+        } else {
+            e + 1
+        }
+    };
+    end = end.max(start);
+    Ok(Some((start, end)))
+}
+
 fn range_bounds(lo: i64, hi: i64, excl: bool, len: usize) -> Option<(usize, usize)> {
     use crate::host::{RANGE_BEGINLESS, RANGE_ENDLESS};
     let start = if lo == RANGE_BEGINLESS {
