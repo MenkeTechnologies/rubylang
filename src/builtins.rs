@@ -3818,7 +3818,7 @@ fn object_space_each_object(args: &[Value], block: Option<Value>) -> Result<Valu
 /// host's own clock ids.
 fn process_clock_gettime(args: &[Value]) -> Result<Value, String> {
     let einval = || {
-        let clock = args.first().map(|c| arg_str(c)).unwrap_or_default();
+        let clock = args.first().map(arg_str).unwrap_or_default();
         sys_err(
             "Invalid argument",
             &format!("clock_gettime({clock})"),
