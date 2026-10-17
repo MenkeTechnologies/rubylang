@@ -2355,8 +2355,7 @@ fn ascii_repr_receiver(h: &RubyHost, v: &Value, depth: usize) -> bool {
             matches!(
                 k,
                 RKey::Int(_) | RKey::FloatBits(_) | RKey::Bool(_) | RKey::Nil | RKey::Sym(_)
-            )
-                && ascii_repr_receiver(h, e, depth + 1)
+            ) && ascii_repr_receiver(h, e, depth + 1)
         });
     }
     if let Some((lo, hi, _)) = h.as_obj_range(v) {
@@ -12650,18 +12649,27 @@ fn range_beg_len(
 /// mixed Integer/Float Range replaced by its truncated Integer Range, or `None`
 /// when there is nothing to rewrite.
 fn int_index_args(name: &str, args: &[Value]) -> Option<Vec<Value>> {
-    if !matches!(name, "[]" | "slice" | "slice!" | "[]=" | "values_at" | "fill") {
+    if !matches!(
+        name,
+        "[]" | "slice" | "slice!" | "[]=" | "values_at" | "fill"
+    ) {
         return None;
     }
     let truncated = |v: &Value| -> Option<Value> {
         let (lo, hi, excl) = with_host(|h| h.as_obj_range(v))?;
         let (lo, hi) = (numeric_f(&lo)?, numeric_f(&hi)?);
-        Some(with_host(|h| h.new_range(lo.trunc() as i64, hi.trunc() as i64, excl)))
+        Some(with_host(|h| {
+            h.new_range(lo.trunc() as i64, hi.trunc() as i64, excl)
+        }))
     };
     if !args.iter().any(|a| truncated(a).is_some()) {
         return None;
     }
-    Some(args.iter().map(|a| truncated(a).unwrap_or_else(|| a.clone())).collect())
+    Some(
+        args.iter()
+            .map(|a| truncated(a).unwrap_or_else(|| a.clone()))
+            .collect(),
+    )
 }
 
 fn dispatch_array(
@@ -14190,7 +14198,11 @@ fn dispatch_array(
                 // fill { |index| ... } / fill(start) { } / fill(start, length) { }
                 let (start, end) = ranged.unwrap_or_else(|| {
                     let start = args.first().map(as_i).unwrap_or(0);
-                    let start = if start < 0 { (start + len).max(0) } else { start };
+                    let start = if start < 0 {
+                        (start + len).max(0)
+                    } else {
+                        start
+                    };
                     let end = match args.get(1) {
                         Some(l) => start + as_i(l),
                         None => len,
@@ -14211,7 +14223,11 @@ fn dispatch_array(
                 let val = args[0].clone();
                 let (start, end) = ranged.unwrap_or_else(|| {
                     let start = args.get(1).map(as_i).unwrap_or(0);
-                    let start = if start < 0 { (start + len).max(0) } else { start };
+                    let start = if start < 0 {
+                        (start + len).max(0)
+                    } else {
+                        start
+                    };
                     let end = match args.get(2) {
                         Some(l) => start + as_i(l),
                         None => len.max(start),
@@ -22104,7 +22120,11 @@ fn dispatch_obj_range(
                 if lo_is_float {
                     return Err(raise_exc("TypeError", "can't iterate from Float"));
                 }
-                let top = if excl && g.fract() == 0.0 { g - 1.0 } else { g.floor() };
+                let top = if excl && g.fract() == 0.0 {
+                    g - 1.0
+                } else {
+                    g.floor()
+                };
                 return Ok(Value::Int((top - l + 1.0).max(0.0) as i64));
             }
             "min" if args.is_empty() && block.is_none() => {
@@ -22112,7 +22132,10 @@ fn dispatch_obj_range(
             }
             "max" if args.is_empty() && block.is_none() => {
                 if excl {
-                    return Err(raise_exc("TypeError", "cannot exclude non Integer end value"));
+                    return Err(raise_exc(
+                        "TypeError",
+                        "cannot exclude non Integer end value",
+                    ));
                 }
                 return Ok(if empty { Value::Undef } else { hi });
             }

@@ -11156,14 +11156,24 @@ fn public_method_singleton_method_and_included_modules() {
 #[test]
 fn mixed_integer_float_range_keeps_its_integer_endpoint() {
     eq("Range.new(0, 2.5, true)", "0...2.5");
-    eq("r = (1..2.5); [r.begin, r.end, r.to_a, r.size, r.min, r.max]", "[1, 2.5, [1, 2], 2, 1, 2.5]");
+    eq(
+        "r = (1..2.5); [r.begin, r.end, r.to_a, r.size, r.min, r.max]",
+        "[1, 2.5, [1, 2], 2, 1, 2.5]",
+    );
     eq("(1..2.5).step(0.5).to_a", "[1.0, 1.5, 2.0, 2.5]");
     eq("(1..2.5) == (1.0..2.5)", "true");
-    eq("[(1..2.5).eql?(1..2.5), (1..2.5).eql?(1.0..2.5)]", "[true, false]");
+    eq(
+        "[(1..2.5).eql?(1..2.5), (1..2.5).eql?(1.0..2.5)]",
+        "[true, false]",
+    );
     eq("(1..2.5).hash == (1..2.5).hash", "true");
     eq("{(1..2.5) => :v}[1..2.5]", ":v");
     raises("(1.5..3).to_a", "TypeError", "can't iterate from Float");
-    raises("(1...2.5).max", "TypeError", "cannot exclude non Integer end value");
+    raises(
+        "(1...2.5).max",
+        "TypeError",
+        "cannot exclude non Integer end value",
+    );
 }
 
 #[test]
@@ -11172,7 +11182,10 @@ fn immediate_to_s_and_inspect_are_us_ascii() {
         "[nil, true, 1, 2**70, 1.5, :a, 3r, Object].map { |v| [v.to_s.encoding.to_s, v.inspect.encoding.to_s] }.flatten.uniq",
         "[\"US-ASCII\"]",
     );
-    eq("[[1, :a, nil].inspect.encoding.to_s, [1, \"a\"].inspect.encoding.to_s]", "[\"US-ASCII\", \"UTF-8\"]");
+    eq(
+        "[[1, :a, nil].inspect.encoding.to_s, [1, \"a\"].inspect.encoding.to_s]",
+        "[\"US-ASCII\", \"UTF-8\"]",
+    );
     eq("(1..2.5).inspect.encoding.to_s", "\"US-ASCII\"");
     eq(":\"\u{e9}\".to_s.encoding.to_s", "\"UTF-8\"");
     eq("(1.to_s + \"\u{e9}\").encoding.to_s", "\"UTF-8\"");
@@ -11184,7 +11197,10 @@ fn runtime_raised_error_carries_the_handled_exception_as_cause() {
         "begin; raise 'in'; rescue; begin; Integer('z'); rescue => e; e.cause.message; end; end",
         "\"in\"",
     );
-    eq("begin; raise 'a'; rescue; end; begin; Integer('z'); rescue => e; e.cause; end", "nil");
+    eq(
+        "begin; raise 'a'; rescue; end; begin; Integer('z'); rescue => e; e.cause; end",
+        "nil",
+    );
 }
 
 #[test]
@@ -11194,7 +11210,11 @@ fn range_overlap_and_minmax() {
          (\"a\"..\"c\").overlap?(\"c\"..\"d\"), (1..).overlap?(..1), (1...1).overlap?(1..2), (3..1).overlap?(1..5)]",
         "[true, false, true, true, true, false, false]",
     );
-    raises("(1..2).overlap?(1)", "TypeError", "wrong argument type Integer (expected Range)");
+    raises(
+        "(1..2).overlap?(1)",
+        "TypeError",
+        "wrong argument type Integer (expected Range)",
+    );
     eq(
         "[(1..5).minmax, (1.0..2.0).minmax, (1..2.5).minmax, (5..1).minmax, (\"a\"..\"c\").minmax]",
         "[[1, 5], [1.0, 2.0], [1, 2.5], [nil, nil], [\"a\", \"c\"]]",
@@ -11209,12 +11229,19 @@ fn range_overlap_and_minmax() {
 fn array_slice_fill_and_float_ended_range_indexes() {
     eq("[1, 2, 3, 4].slice(1, 2)", "[2, 3]");
     eq("[1, 2, 3, 4].slice(1..2)", "[2, 3]");
-    eq("a = [1, 2, 3, 4]; [a[1..2.5], a[0...2.5], \"hello\"[1..2.5], a.values_at(1..2.5)]", "[[2, 3], [1, 2], \"el\", [2, 3]]");
+    eq(
+        "a = [1, 2, 3, 4]; [a[1..2.5], a[0...2.5], \"hello\"[1..2.5], a.values_at(1..2.5)]",
+        "[[2, 3], [1, 2], \"el\", [2, 3]]",
+    );
     eq("[1, 2, 3, 4].fill(0, 1..2)", "[1, 0, 0, 4]");
     eq("[1, 2, 3, 4].fill(7, -2..)", "[1, 2, 7, 7]");
     eq("[1, 2, 3, 4].fill(1..2) { 9 }", "[1, 9, 9, 4]");
     eq("[1, 2, 3].fill(0, 5..6)", "[1, 2, 3, nil, nil, 0, 0]");
-    raises("[1, 2, 3].fill(0, -5..1)", "RangeError", "-5..1 out of range");
+    raises(
+        "[1, 2, 3].fill(0, -5..1)",
+        "RangeError",
+        "-5..1 out of range",
+    );
 }
 
 #[test]

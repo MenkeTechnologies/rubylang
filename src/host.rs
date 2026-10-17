@@ -10238,17 +10238,25 @@ impl RubyHost {
     /// end as infinity. Only meaningful for comparing two numeric ranges.
     /// Endpoints of a Range whose endpoints are objects (`1..2.5` keeps its
     /// Integer begin), paired with the other range value when it is any Range kind.
-    fn obj_range_pair(&self, a: &Value, b: &Value) -> Option<((Value, Value, bool), (Value, Value, bool))> {
+    fn obj_range_pair(
+        &self,
+        a: &Value,
+        b: &Value,
+    ) -> Option<((Value, Value, bool), (Value, Value, bool))> {
         let is_obj = |v: &Value| matches!(self.obj(v), Some(RObj::ObjRange { .. }));
         if !is_obj(a) && !is_obj(b) {
             return None;
         }
         let parts = |v: &Value| match self.obj(v) {
-            Some(RObj::ObjRange { lo, hi, exclusive }) => Some((lo.clone(), hi.clone(), *exclusive)),
+            Some(RObj::ObjRange { lo, hi, exclusive }) => {
+                Some((lo.clone(), hi.clone(), *exclusive))
+            }
             Some(RObj::FloatRange { lo, hi, exclusive }) => {
                 Some((Value::Float(*lo), Value::Float(*hi), *exclusive))
             }
-            Some(RObj::Range { lo, hi, exclusive }) => Some((Value::Int(*lo), Value::Int(*hi), *exclusive)),
+            Some(RObj::Range { lo, hi, exclusive }) => {
+                Some((Value::Int(*lo), Value::Int(*hi), *exclusive))
+            }
             _ => None,
         };
         Some((parts(a)?, parts(b)?))
