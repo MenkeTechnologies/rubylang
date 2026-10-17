@@ -7106,6 +7106,15 @@ impl RubyHost {
                 }
             })
     }
+    /// Names of the classes (and, with `modules`, the modules) the program has
+    /// defined, anonymous and singleton classes excluded, in definition order.
+    pub fn defined_class_names(&self, modules: bool) -> Vec<String> {
+        self.classes
+            .iter()
+            .filter(|(k, d)| !k.starts_with("#<") && (modules || !d.is_module))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
     /// Immediate subclasses of `class` — every registered class whose direct
     /// superclass is `class` (`Class#subclasses`, Ruby 3.1+). Anonymous helper
     /// classes (`#<Class:N>`) are excluded, matching how Rails filters them.

@@ -3778,6 +3778,87 @@ pub(crate) fn coerce_block_arg(block: Option<Value>) -> Result<Option<Value>, St
 }
 
 /// Methods on a class reference: `new` (allocate + `initialize`), `name`.
+/// `ObjectSpace.each_object(Class | Module | X.singleton_class)`: walks the
+/// classes and modules the program has defined, yields each as a class value
+/// and answers the count; without a block the values come back as an
+/// Enumerator. Built-in classes and plain instances are not enumerable here, so
+/// any other argument visits nothing.
+fn object_space_each_object(args: &[Value], block: Option<Value>) -> Result<Value, String> {
+    let found: Vec<Value> = with_host(|h| {
+        let names: Vec<String> = match args.first().and_then(|a| h.classref_name(a)).as_deref() {
+            Some("Class") => h.defined_class_names(false),
+            Some("Module") => h.defined_class_names(true),
+            Some(n) => match crate::host::RubyHost::metaclass_attached(n) {
+                Some(base) => std::iter::once(base.to_string())
+                    .chain(h.all_descendants(base))
+                    .collect(),
+                None => Vec::new(),
+            },
+            None => h.defined_class_names(true),
+        };
+        names.iter().map(|n| h.class_ref(n)).collect()
+    });
+    let Some(bl) = block else {
+        return Ok(with_host(|h| h.new_enumerator(found, "each_object")));
+    };
+    let count = found.len() as i64;
+    for c in found {
+        call_proc(&bl, &[c])?;
+        if has_pending_signal() {
+            break;
+        }
+    }
+    Ok(Value::Int(count))
+}
+
+/// `Process.clock_gettime(clock, unit = :float_second)` (process.c
+/// `rb_clock_gettime`): reads the named POSIX clock. The clock ids are the
+/// `Process::CLOCK_*` values the prelude defines (0 realtime, 1 monotonic,
+/// 2 process CPU time, 3 thread CPU time, 4 monotonic raw), mapped here to the
+/// host's own clock ids.
+fn process_clock_gettime(args: &[Value]) -> Result<Value, String> {
+    let einval = || {
+        let clock = args.first().map(|c| arg_str(c)).unwrap_or_default();
+        sys_err(
+            "Invalid argument",
+            &format!("clock_gettime({clock})"),
+            &std::io::Error::from_raw_os_error(libc::EINVAL),
+        )
+    };
+    let id = match args.first() {
+        Some(Value::Int(0)) => libc::CLOCK_REALTIME,
+        Some(Value::Int(1)) => libc::CLOCK_MONOTONIC,
+        Some(Value::Int(2)) => libc::CLOCK_PROCESS_CPUTIME_ID,
+        Some(Value::Int(3)) => libc::CLOCK_THREAD_CPUTIME_ID,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Some(Value::Int(4)) => libc::CLOCK_MONOTONIC_RAW,
+        _ => return Err(einval()),
+    };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(id, &mut ts) } != 0 {
+        return Err(einval());
+    }
+    let ns = ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128;
+    let unit = match args.get(1) {
+        None => None,
+        Some(Value::Undef) => return Err(einval()),
+        Some(u) => Some(name_of(u)),
+    };
+    Ok(match unit.as_deref() {
+        Some("nanosecond") => Value::Int(ns as i64),
+        Some("microsecond") => Value::Int((ns / 1_000) as i64),
+        Some("millisecond") => Value::Int((ns / 1_000_000) as i64),
+        Some("second") => Value::Int((ns / 1_000_000_000) as i64),
+        Some("float_millisecond") => Value::Float(ns as f64 / 1e6),
+        Some("float_microsecond") => Value::Float(ns as f64 / 1e3),
+        Some("float_second") | None => Value::Float(ns as f64 / 1e9),
+        Some(_) => return Err(einval()),
+    })
+}
+
 fn dispatch_classref(
     cls: &str,
     name: &str,
@@ -3904,13 +3985,13 @@ fn dispatch_classref(
             )),
         };
     }
-    // `ObjectSpace` — the heap is not enumerable by class here, so the
-    // enumeration surface returns 0/empty rather than pretending to walk objects.
+    // `ObjectSpace` — the heap is not walked: `each_object` visits only the
+    // classes and modules the program defined; `count_objects` answers empty.
     if cls == "ObjectSpace" {
         match name {
             "garbage_collect" => return Ok(Value::Undef),
             "count_objects" => return Ok(with_host(|h| h.new_hash(IndexMap::new()))),
-            "each_object" => return Ok(Value::Int(0)),
+            "each_object" => return object_space_each_object(args, block),
             // Finalizers fire at object collection, which rubylang does not expose;
             // accept the registration/removal as a no-op (mustermann registers one
             // to prune its cache; the cache simply never auto-prunes).
@@ -4311,26 +4392,8 @@ fn dispatch_classref(
     if cls == "Process" {
         match name {
             "pid" => return Ok(Value::Int(std::process::id() as i64)),
-            "ppid" => return Ok(Value::Int(0)),
-            // `clock_gettime(clock, unit = :float_second)`: rubylang returns a
-            // wall-clock reading in the requested unit (the specific clock id is
-            // ignored — sufficient for elapsed-time measurement).
-            "clock_gettime" => {
-                let secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0);
-                let unit = args.get(1).map(name_of);
-                return Ok(match unit.as_deref() {
-                    Some("nanosecond") => Value::Int((secs * 1e9) as i64),
-                    Some("microsecond") => Value::Int((secs * 1e6) as i64),
-                    Some("millisecond") => Value::Int((secs * 1e3) as i64),
-                    Some("second") => Value::Int(secs as i64),
-                    Some("float_millisecond") => Value::Float(secs * 1e3),
-                    Some("float_microsecond") => Value::Float(secs * 1e6),
-                    _ => Value::Float(secs),
-                });
-            }
+            "ppid" => return Ok(Value::Int(unsafe { libc::getppid() } as i64)),
+            "clock_gettime" => return process_clock_gettime(args),
             _ => {}
         }
     }

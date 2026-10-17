@@ -309,8 +309,8 @@ class Thread
 end
 
 module Process
-  # clock_gettime clock ids (values match Linux; rubylang ignores the specific
-  # clock and returns a wall-clock reading — enough for timing/instrumentation).
+  # clock_gettime clock ids; `Process.clock_gettime` maps each to the host's own
+  # POSIX clock (realtime, monotonic, process/thread CPU time, monotonic raw).
   CLOCK_REALTIME = 0
   CLOCK_MONOTONIC = 1
   CLOCK_PROCESS_CPUTIME_ID = 2
