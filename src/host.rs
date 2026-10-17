@@ -10247,11 +10247,7 @@ impl RubyHost {
     /// end as infinity. Only meaningful for comparing two numeric ranges.
     /// Endpoints of a Range whose endpoints are objects (`1..2.5` keeps its
     /// Integer begin), paired with the other range value when it is any Range kind.
-    fn obj_range_pair(
-        &self,
-        a: &Value,
-        b: &Value,
-    ) -> Option<((Value, Value, bool), (Value, Value, bool))> {
+    fn obj_range_pair(&self, a: &Value, b: &Value) -> Option<(RangeEnds, RangeEnds)> {
         let is_obj = |v: &Value| matches!(self.obj(v), Some(RObj::ObjRange { .. }));
         if !is_obj(a) && !is_obj(b) {
             return None;
@@ -14533,3 +14529,6 @@ const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<RubyHost>();
 };
+
+/// A Range's begin, end and exclude-end flag.
+type RangeEnds = (Value, Value, bool);
