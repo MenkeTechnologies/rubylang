@@ -13,8 +13,8 @@ use crate::host::ops;
 use crate::host::{
     call_instance_method, call_method, call_proc, current_block, has_pending_signal,
     raise_signal_break, raise_signal_next, raise_signal_redo, raise_signal_retry,
-    raise_signal_return, raise_signal_throw, take_break, take_throw, with_host, Derive, RKey,
-    RubyHost,
+    raise_signal_return, raise_signal_throw, take_break, take_throw, with_host, Derive, GenSize,
+    RKey, RubyHost,
 };
 use fusevm::{Value, VM};
 use indexmap::IndexMap;
@@ -842,6 +842,17 @@ fn b_setcvar(vm: &mut VM, _: u8) -> Value {
 }
 fn b_getgvar(vm: &mut VM, _: u8) -> Value {
     let name = name_of(&vm.pop());
+    // `$@` is `$!.backtrace` (nil while no exception is being handled).
+    if name == "@" {
+        let bang = with_host(|h| h.get_global("!"));
+        if matches!(bang, Value::Undef) {
+            return Value::Undef;
+        }
+        return match dispatch(&bang, "backtrace", &[], None) {
+            Ok(v) => v,
+            Err(e) => abort(vm, e),
+        };
+    }
     with_host(|h| h.get_global(&name))
 }
 fn b_setgvar(vm: &mut VM, _: u8) -> Value {
@@ -1993,6 +2004,47 @@ fn ivar_name_arg(arg: &Value) -> Result<String, String> {
     ))
 }
 
+/// Core classes whose `respond_to?` answers from MRI's method table plus the
+/// program's own reopenings (see the `respond_to?` arm).
+const ACCURATE_RESPOND_CLASSES: &[&str] = &[
+    "Integer",
+    "Float",
+    "Rational",
+    "Complex",
+    "String",
+    "Symbol",
+    "Array",
+    "Hash",
+    "Range",
+    "Regexp",
+    "MatchData",
+    "Set",
+];
+
+/// Libraries that add instance methods to core classes natively, so that
+/// neither MRI's core table nor a user class body records them.
+const CORE_EXTENDING_LIBS: &[&str] = &[
+    "json",
+    "json/ext",
+    "bigdecimal",
+    "bigdecimal/util",
+    "csv",
+    "shellwords",
+    "yaml",
+    "psych",
+    "date",
+    "time",
+    "prime",
+    "abbrev",
+    "active_support",
+    "erb",
+    "cgi",
+    "uri",
+    "optparse",
+    "io/console",
+    "pathname",
+];
+
 /// `respond_to?` for a method the reference interpreter DEFINES on one of the
 /// receiver's built-in ancestors: public ones answer true, private ones only
 /// when the second argument asks for the private surface. `None` when no
@@ -2879,13 +2931,11 @@ fn dispatch_resolved(
             if method == "each" && rest.is_empty() {
                 if let Some((lo, hi, _)) = with_host(|h| h.as_range(recv)) {
                     if hi == crate::host::RANGE_ENDLESS {
-                        return Ok(with_host(|h| {
-                            h.new_endless_range_enumerator(lo, Derive::Each)
-                        }));
+                        return Ok(endless_range_enum(recv, lo, "to_enum", &[], Derive::Each));
                     }
                 }
                 if let Some(gb) = with_host(|h| h.generator_block(recv)) {
-                    return Ok(with_host(|h| h.new_derived_enumerator(gb, Derive::Each)));
+                    return Ok(derived_enum(recv, gb, "to_enum", &[], Derive::Each));
                 }
             }
             let sink = with_host(|h| h.new_enum_sink());
@@ -2912,7 +2962,11 @@ fn dispatch_resolved(
         }
         // `.lazy` wraps an enumerable in a lazy pipeline. A range (possibly
         // endless) stays a range source; anything else materializes to an array.
-        "lazy" if with_host(|h| h.lazy_parts(recv)).is_none() => {
+        // A Float range builds its own (see `dispatch_float_range`): it cannot
+        // be materialized, only forced into the TypeError iterating it raises.
+        "lazy"
+            if with_host(|h| h.lazy_parts(recv).is_none() && h.as_float_range(recv).is_none()) =>
+        {
             // An `Enumerator::ArithmeticSequence` is lazy over the enumerator (or,
             // when endless, the generator) it wraps. Materializing the sequence
             // itself is what the `else` branch below would do, and for an endless
@@ -3496,6 +3550,32 @@ fn dispatch_resolved(
                             | "to_proc"
                     );
                 return Ok(Value::Bool(known));
+            }
+            // A core value whose whole method surface is MRI's table (consulted
+            // by `builtin_responds` above) plus what the program itself adds by
+            // reopening a class in its ancestry: a name in neither is absent,
+            // as `5.respond_to?(:each)` is in MRI. A loaded library that
+            // extends core classes natively (json's `to_json`, csv's
+            // `parse_csv`, …) puts names in neither place, so its presence keeps
+            // the permissive answer.
+            let cls = with_host(|h| h.dispatch_class(recv));
+            if ACCURATE_RESPOND_CLASSES.contains(&cls.as_str())
+                && !CORE_EXTENDING_LIBS
+                    .iter()
+                    .any(|l| with_host(|h| h.builtin_lib_loaded(l)))
+            {
+                let m = name_of(&args[0]);
+                let chain = crate::arity_table::ancestry(&cls).unwrap_or(&[]);
+                let user_defined = std::iter::once(cls.as_str())
+                    .chain(chain.iter().copied())
+                    .any(|c| {
+                        with_host(|h| {
+                            h.find_method_owner(c, &m).is_some()
+                                || h.find_define_method(c, &m).is_some()
+                                || h.find_alias(c, &m).is_some()
+                        })
+                    });
+                return Ok(Value::Bool(user_defined));
             }
             return Ok(Value::Bool(true));
         }
@@ -4217,7 +4297,16 @@ fn dispatch_classref(
     if cls == "Enumerator" && name == "produce" {
         let b = block.ok_or_else(|| raise_exc("ArgumentError", "no block given"))?;
         let init = args.first().cloned();
-        return Ok(with_host(|h| h.new_produce_enumerator(init, b)));
+        return Ok(with_host(|h| {
+            let e = h.new_produce_enumerator(init, b);
+            let label = format!(
+                "#<Enumerator: #<Enumerator::Producer:{}>:each>",
+                h.object_address(&e)
+            );
+            h.set_generator_size(&e, GenSize::Fixed(Value::Float(f64::INFINITY)));
+            h.set_generator_label(&e, label);
+            e
+        }));
     }
     if cls == "Enumerator" && name == "new" {
         let b = block.ok_or_else(|| {
@@ -4226,7 +4315,42 @@ fn dispatch_classref(
                 "tried to create Proc object without a block",
             )
         })?;
-        return Ok(with_host(|h| h.new_generator(b)));
+        // `Enumerator.new(size) { … }`: `size` is what `#size` answers — nil,
+        // a callable asked on every call, `Float::INFINITY`, or anything else
+        // converted by `to_int` up front (`enumerator_initialize`).
+        let size = match args.first() {
+            None | Some(Value::Undef) => GenSize::Fixed(Value::Undef),
+            Some(Value::Float(f)) if *f == f64::INFINITY => GenSize::Fixed(Value::Float(*f)),
+            Some(v @ Value::Int(_)) => GenSize::Fixed(v.clone()),
+            Some(v) if with_host(|h| h.as_bigint(v)).is_some() => GenSize::Fixed(v.clone()),
+            Some(v)
+                if probe_dispatch(v, "respond_to?", &[with_host(|h| h.new_symbol("call"))])
+                    .is_some_and(|r| with_host(|h| h.truthy(&r))) =>
+            {
+                GenSize::Call(v.clone())
+            }
+            Some(v @ Value::Float(_)) => GenSize::Fixed(dispatch(v, "to_i", &[], None)?),
+            Some(v)
+                if probe_dispatch(v, "respond_to?", &[with_host(|h| h.new_symbol("to_int"))])
+                    .is_some_and(|r| with_host(|h| h.truthy(&r))) =>
+            {
+                GenSize::Fixed(dispatch(v, "to_int", &[], None)?)
+            }
+            Some(v) => {
+                return Err(raise_exc(
+                    "TypeError",
+                    &format!(
+                        "no implicit conversion of {} into Integer",
+                        conv_operand_name(v)
+                    ),
+                ))
+            }
+        };
+        return Ok(with_host(|h| {
+            let e = h.new_generator(b);
+            h.set_generator_size(&e, size);
+            e
+        }));
     }
     // `Fiber.new { |first| ... }` — a stackful coroutine. `Fiber.yield(v)`
     // suspends the currently running fiber.
@@ -4484,13 +4608,32 @@ fn dispatch_classref(
     // `Set.new(enum)` / `Set[a, b, c]` — a deduplicated collection.
     if cls == "Set" {
         match name {
+            // `Set.new(enum = nil) { |o| … }`: any `each_entry`-able source,
+            // each element mapped through the block when one is given.
             "new" => {
-                let items = match args.first() {
-                    Some(v) => with_host(|h| h.as_array(v))
-                        .or_else(|| with_host(|h| h.as_set(v)))
-                        .unwrap_or_default(),
-                    None => Vec::new(),
+                let mut items = match args.first() {
+                    None | Some(Value::Undef) => Vec::new(),
+                    Some(v) => match with_host(|h| h.as_array(v).or_else(|| h.as_set(v))) {
+                        Some(items) => items,
+                        None if probe_dispatch(
+                            v,
+                            "respond_to?",
+                            &[with_host(|h| h.new_symbol("each_entry"))],
+                        )
+                        .is_some_and(|r| with_host(|h| h.truthy(&r))) =>
+                        {
+                            let a = dispatch(v, "to_a", &[], None)?;
+                            with_host(|h| h.as_array(&a)).unwrap_or_default()
+                        }
+                        None => return Err(raise_exc("ArgumentError", "value must be enumerable")),
+                    },
                 };
+                if let Some(b) = &block {
+                    items = items
+                        .iter()
+                        .map(|v| call_proc(b, std::slice::from_ref(v)))
+                        .collect::<Result<_, _>>()?;
+                }
                 return Ok(with_host(|h| h.new_set(items)));
             }
             "[]" => return Ok(with_host(|h| h.new_set(args.to_vec()))),
@@ -13391,7 +13534,7 @@ fn dispatch_array(
             if !cur.is_empty() {
                 chunks.push(new_arr(cur));
             }
-            Ok(with_host(|h| h.new_enumerator(chunks, "each")))
+            Ok(with_host(|h| h.new_chunk_enumerator(chunks)))
         }
         "minmax" => {
             if arr.is_empty() {
@@ -14501,7 +14644,7 @@ fn dispatch_array(
             if !cur.is_empty() {
                 chunks.push(new_arr(cur));
             }
-            Ok(with_host(|h| h.new_enumerator(chunks, "each")))
+            Ok(with_host(|h| h.new_chunk_enumerator(chunks)))
         }
         "to_h" => {
             let mut m = IndexMap::new();
@@ -14553,7 +14696,21 @@ fn dispatch_array(
                         }
                         Ok(with_host(|h| h.new_enumerator(out, "each")))
                     }
-                    None => Ok(with_host(|h| h.new_cycle_enumerator(arr.clone()))),
+                    None => {
+                        let label = enum_label(recv, "cycle", &[]);
+                        Ok(with_host(|h| {
+                            let e = h.new_cycle_enumerator(arr.clone());
+                            // `rb_ary_cycle_size`: endless unless there is nothing to repeat.
+                            let size = if arr.is_empty() {
+                                Value::Int(0)
+                            } else {
+                                Value::Float(f64::INFINITY)
+                            };
+                            h.set_generator_size(&e, GenSize::Fixed(size));
+                            h.set_generator_label(&e, label);
+                            e
+                        }))
+                    }
                 };
             };
             match args.first() {
@@ -14639,7 +14796,7 @@ fn dispatch_array(
                     out.push(new_arr(vec![pk, new_arr(group)]));
                 }
             }
-            Ok(with_host(|h| h.new_enumerator(out, "each")))
+            Ok(with_host(|h| h.new_chunk_enumerator(out)))
         }
         _ => Err(no_method_error(recv, name)),
     }
@@ -15847,6 +16004,9 @@ fn dispatch_lazy(
                         Some(Value::Float(f64::INFINITY))
                     }
                     Some(_) => Some(dispatch(&source, "size", &[], None)?),
+                    None if with_host(|h| h.generator_size(&source)).is_some() => {
+                        Some(generator_size(&source)?).filter(|v| !matches!(v, Value::Undef))
+                    }
                     None => None,
                 },
             };
@@ -15868,6 +16028,14 @@ fn dispatch_lazy(
                             cut
                         })
                     }
+                    // `enum_each_slice_size` / `enum_each_cons_size`.
+                    (LazyOp::EachSlice(k), Some(Value::Int(n))) => {
+                        Some(Value::Int((n + *k as i64 - 1) / *k as i64))
+                    }
+                    (LazyOp::EachCons(k), Some(Value::Int(n))) => {
+                        Some(Value::Int((n - *k as i64 + 1).max(0)))
+                    }
+                    (LazyOp::EachSlice(_) | LazyOp::EachCons(_), s) => s,
                     (LazyOp::Drop(n), Some(s)) => {
                         let left = dispatch(&s, "-", &[Value::Int(*n)], None)?;
                         let neg = dispatch(&left, "<", &[Value::Int(0)], None)?;
@@ -16674,6 +16842,11 @@ fn dispatch_enumerator(
             match with_host(|h| h.enum_size_fn(recv)) {
                 Some((Some(f), a)) => call_proc(&f, &a),
                 Some((None, _)) => Ok(Value::Undef),
+                None if with_host(|h| h.enum_method(recv))
+                    .is_some_and(|m| unsized_enum_method(&m)) =>
+                {
+                    Ok(Value::Undef)
+                }
                 None => Ok(Value::Int(buf.len() as i64)),
             }
         }
@@ -17134,6 +17307,93 @@ fn yield_pair(block: &Value, k: Value, v: Value) -> Result<Value, String> {
 /// Block-less `map`/`select`/`reject`/… all re-yield the element sequence
 /// unchanged in MRI — the block is what would transform it, and there is none —
 /// so they all map to `Derive::Each`.
+/// `#<Enumerator: RECV:METH(ARGS)>` — how MRI inspects an Enumerator built by
+/// calling `meth` block-less on `recv`.
+fn enum_label(recv: &Value, meth: &str, args: &[Value]) -> String {
+    with_host(|h| {
+        let r = h.inspect(recv);
+        if args.is_empty() {
+            return format!("#<Enumerator: {r}:{meth}>");
+        }
+        let a: Vec<String> = args.iter().map(|v| h.inspect(v)).collect();
+        format!("#<Enumerator: {r}:{meth}({})>", a.join(", "))
+    })
+}
+
+/// The methods whose block-less Enumerator MRI builds with no size function
+/// (`RETURN_ENUMERATOR`, not `RETURN_SIZED_ENUMERATOR`): their `size` is nil
+/// whatever the source's is.
+fn unsized_enum_method(name: &str) -> bool {
+    matches!(
+        name,
+        "to_enum" | "enum_for" | "take_while" | "drop_while" | "find" | "detect" | "find_index"
+    )
+}
+
+/// The derived generator a block-less `name(*args)` answers on `src` (a
+/// generator, or an endless range whose element sequence is `src_block`): lazy
+/// over the source, inspected and sized as MRI's `enumerator.c` does.
+fn derived_enum(src: &Value, src_block: Value, name: &str, args: &[Value], kind: Derive) -> Value {
+    // `to_enum` / `enum_for` with no method name enumerate `each`.
+    let shown = if matches!(name, "to_enum" | "enum_for") {
+        "each"
+    } else {
+        name
+    };
+    let label = enum_label(src, shown, args);
+    with_host(|h| {
+        let size = if unsized_enum_method(name) {
+            GenSize::Fixed(Value::Undef)
+        } else {
+            GenSize::Of(src.clone(), kind.clone())
+        };
+        let e = h.new_derived_enumerator(src_block, kind);
+        h.set_generator_size(&e, size);
+        h.set_generator_label(&e, label);
+        e
+    })
+}
+
+/// [`derived_enum`] over the endless Range `range` (`lo..`), whose element
+/// sequence is `lo, lo+1, …`.
+fn endless_range_enum(range: &Value, lo: i64, name: &str, args: &[Value], kind: Derive) -> Value {
+    let seq = with_host(|h| {
+        let base = h.new_endless_range_enumerator(lo, Derive::Each);
+        h.generator_block(&base).expect("a generator")
+    });
+    derived_enum(range, seq, name, args, kind)
+}
+
+/// `Enumerator#size` of a generator: fixed, called, or derived from its
+/// source's size (`each_slice(n)` is `ceil(size / n)`, `each_cons(n)` is
+/// `size - n + 1` floored at 0; `Infinity` and nil pass through).
+fn generator_size(recv: &Value) -> Result<Value, String> {
+    let Some(size) = with_host(|h| h.generator_size(recv)) else {
+        // An endless Range source.
+        return dispatch(recv, "size", &[], None);
+    };
+    let (src, kind) = match size {
+        GenSize::Fixed(v) => return Ok(v),
+        GenSize::Call(f) => return dispatch(&f, "call", &[], None),
+        GenSize::Of(src, kind) => (src, kind),
+    };
+    let n = generator_size(&src)?;
+    let per = match kind {
+        Derive::Slice(k) => k as i64,
+        Derive::Cons(k) => {
+            return Ok(match n {
+                Value::Int(n) => Value::Int((n - k as i64 + 1).max(0)),
+                other => other,
+            })
+        }
+        _ => return Ok(n),
+    };
+    Ok(match n {
+        Value::Int(n) => Value::Int((n + per - 1) / per),
+        other => other,
+    })
+}
+
 fn derive_kind(name: &str, args: &[Value]) -> Option<Derive> {
     Some(match name {
         "each" | "each_entry" | "to_enum" | "enum_for" | "map" | "collect" | "select"
@@ -19303,16 +19563,13 @@ fn dispatch_generator(
             with_host(|h| h.generator_rewind(recv));
             Ok(recv.clone())
         }
-        // MRI returns nil for a generator's size (unknown without running it).
-        "size" => Ok(Value::Undef),
+        "size" if args.is_empty() => generator_size(recv),
         // A block-less enumerator-returning method answers with ANOTHER
         // generator wrapping this one, so an infinite source is never pulled:
         // `gen.each_slice(2).first(2)` draws four elements, not all of them.
         _ if block.is_none() && derive_kind(name, args).is_some() => {
             let kind = derive_kind(name, args).unwrap();
-            Ok(with_host(|h| {
-                h.new_derived_enumerator(gblock.clone(), kind)
-            }))
+            Ok(derived_enum(recv, gblock.clone(), name, args, kind))
         }
         // Everything else (`sort`, `sum`, `to_a`, a call WITH a block, …) needs
         // every element: materialize and delegate to Array. Faithful for finite
@@ -20632,12 +20889,30 @@ fn dispatch_datetime(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
     }
 }
 
+/// Explicit (non-`!`) Set mutators guarded against a frozen receiver.
+const SET_MUTATORS: &[&str] = &[
+    "add",
+    "<<",
+    "add?",
+    "delete",
+    "delete?",
+    "clear",
+    "merge",
+    "subtract",
+    "keep_if",
+    "delete_if",
+    "replace",
+    "reset",
+    "compare_by_identity",
+];
+
 fn dispatch_set(
     recv: &Value,
     name: &str,
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    frozen_guard(recv, name, SET_MUTATORS)?;
     let items = with_host(|h| h.as_set(recv).unwrap_or_default());
     // The other operand's elements, for set-algebra methods.
     let other = || -> Vec<Value> {
@@ -20767,6 +21042,172 @@ fn dispatch_set(
         "intersect?" => {
             let o = other();
             Ok(Value::Bool(items.iter().any(|v| set_member(&o, v))))
+        }
+        // In-place filters: `select!`/`filter!`/`reject!` answer nil when
+        // nothing was removed, `keep_if`/`delete_if` always the receiver.
+        "select!" | "filter!" | "keep_if" | "reject!" | "delete_if" | "map!" | "collect!"
+        | "classify" | "divide"
+            if block.is_none() =>
+        {
+            Ok(with_host(|h| {
+                h.new_enumerator_of(items, name, recv.clone())
+            }))
+        }
+        "select!" | "filter!" | "keep_if" | "reject!" | "delete_if" => {
+            let bl = block.unwrap();
+            let keep_truthy = matches!(name, "select!" | "filter!" | "keep_if");
+            let mut removed = false;
+            for v in &items {
+                let r = call_proc(&bl, std::slice::from_ref(v))?;
+                if has_pending_signal() {
+                    return Ok(take_break().unwrap_or(Value::Undef));
+                }
+                if with_host(|h| h.truthy(&r)) != keep_truthy {
+                    with_host(|h| h.set_remove(recv, v));
+                    removed = true;
+                }
+            }
+            Ok(if removed || matches!(name, "keep_if" | "delete_if") {
+                recv.clone()
+            } else {
+                Value::Undef
+            })
+        }
+        "map!" | "collect!" => {
+            let bl = block.unwrap();
+            let mut out = Vec::with_capacity(items.len());
+            for v in &items {
+                out.push(call_proc(&bl, std::slice::from_ref(v))?);
+                if has_pending_signal() {
+                    return Ok(take_break().unwrap_or(Value::Undef));
+                }
+            }
+            with_host(|h| h.set_replace(recv, out));
+            Ok(recv.clone())
+        }
+        // `reset` re-hashes after elements mutated; keys here are recomputed
+        // from the values.
+        "reset" if args.is_empty() => {
+            with_host(|h| h.set_replace(recv, items));
+            Ok(recv.clone())
+        }
+        "subtract" if args.len() == 1 => {
+            for v in dispatch(&args[0], "to_a", &[], None)
+                .ok()
+                .and_then(|a| with_host(|h| h.as_array(&a)))
+                .unwrap_or_default()
+            {
+                with_host(|h| h.set_remove(recv, &v));
+            }
+            Ok(recv.clone())
+        }
+        // `classify { |o| key }` — a Hash of key => Set of the elements with it.
+        "classify" => {
+            let bl = block.unwrap();
+            let mut groups: IndexMap<RKey, (Value, Vec<Value>)> = IndexMap::new();
+            for v in &items {
+                let k = call_proc(&bl, std::slice::from_ref(v))?;
+                if has_pending_signal() {
+                    return Ok(take_break().unwrap_or(Value::Undef));
+                }
+                let key = with_host(|h| h.value_to_key(&k));
+                groups
+                    .entry(key)
+                    .or_insert_with(|| (k, vec![]))
+                    .1
+                    .push(v.clone());
+            }
+            let mut m = IndexMap::new();
+            for (key, (_, vs)) in groups {
+                m.insert(key, with_host(|h| h.new_set(vs)));
+            }
+            Ok(with_host(|h| h.new_hash(m)))
+        }
+        // `divide` — a Set of the classes: by the block's key (arity 1), or
+        // (arity 2) joining `a` and `b` whenever `block(a, b)` and then
+        // `block(b, a)` both hold, over every pair in order.
+        "divide" => {
+            let bl = block.unwrap();
+            let arity = match dispatch(&bl, "arity", &[], None)? {
+                Value::Int(n) => n,
+                _ => 1,
+            };
+            if arity != 2 {
+                let h = dispatch_set(recv, "classify", &[], Some(bl))?;
+                let classes = with_host(|hh| hh.as_hash(&h)).unwrap_or_default();
+                let sets: Vec<Value> = classes.values().cloned().collect();
+                return Ok(with_host(|hh| hh.new_set(sets)));
+            }
+            let n = items.len();
+            let mut root: Vec<usize> = (0..n).collect();
+            fn find(root: &mut [usize], mut i: usize) -> usize {
+                while root[i] != i {
+                    root[i] = root[root[i]];
+                    i = root[i];
+                }
+                i
+            }
+            for i in 0..n {
+                for j in i + 1..n {
+                    let ab = call_proc(&bl, &[items[i].clone(), items[j].clone()])?;
+                    if !with_host(|h| h.truthy(&ab)) {
+                        continue;
+                    }
+                    let ba = call_proc(&bl, &[items[j].clone(), items[i].clone()])?;
+                    if with_host(|h| h.truthy(&ba)) {
+                        let (ri, rj) = (find(&mut root, i), find(&mut root, j));
+                        root[rj.max(ri)] = rj.min(ri);
+                    }
+                }
+            }
+            let mut groups: IndexMap<usize, Vec<Value>> = IndexMap::new();
+            for (i, v) in items.iter().enumerate() {
+                let r = find(&mut root, i);
+                groups.entry(r).or_default().push(v.clone());
+            }
+            let sets: Vec<Value> = groups
+                .into_values()
+                .map(|vs| with_host(|h| h.new_set(vs)))
+                .collect();
+            Ok(with_host(|h| h.new_set(sets)))
+        }
+        // `flatten` merges nested SETS (an Array element stays an element);
+        // `flatten!` answers nil when there was nothing to flatten.
+        "flatten" | "flatten!" => {
+            fn walk(
+                items: &[Value],
+                out: &mut Vec<Value>,
+                seen: &mut Vec<Value>,
+            ) -> Result<(), String> {
+                for v in items {
+                    match with_host(|h| h.as_set(v)) {
+                        Some(inner) => {
+                            if seen.iter().any(|s| identical(s, v)) {
+                                return Err(raise_exc(
+                                    "ArgumentError",
+                                    "tried to flatten recursive Set",
+                                ));
+                            }
+                            seen.push(v.clone());
+                            walk(&inner, out, seen)?;
+                            seen.pop();
+                        }
+                        None => out.push(v.clone()),
+                    }
+                }
+                Ok(())
+            }
+            let nested = items.iter().any(|v| with_host(|h| h.as_set(v)).is_some());
+            let mut out = Vec::new();
+            walk(&items, &mut out, &mut vec![recv.clone()])?;
+            if name == "flatten" {
+                return Ok(with_host(|h| h.new_set(out)));
+            }
+            if !nested {
+                return Ok(Value::Undef);
+            }
+            with_host(|h| h.set_replace(recv, out));
+            Ok(recv.clone())
         }
         "each" if block.is_some() => {
             let bl = block.unwrap();
@@ -21746,7 +22187,7 @@ fn dispatch_range(
             // materialize the range.
             _ if block.is_none() && derive_kind(name, args).is_some() => {
                 let kind = derive_kind(name, args).unwrap();
-                return Ok(with_host(|h| h.new_endless_range_enumerator(lo, kind)));
+                return Ok(endless_range_enum(recv, lo, name, args, kind));
             }
             // An endless Integer range is infinitely long.
             "size" if args.is_empty() => return Ok(Value::Float(f64::INFINITY)),
@@ -22046,6 +22487,31 @@ fn float_range_step(lo: f64, hi: f64, excl: bool, by: f64) -> Vec<Value> {
     out
 }
 
+/// Whether block-less `name(*args)` answers an Enumerator rather than
+/// iterating (`each_slice(2)`, `map`, `find`, … but not `to_a`, `zip`, `sum`).
+fn blockless_enum_method(name: &str, args: &[Value]) -> bool {
+    match name {
+        "each" | "reverse_each" | "each_entry" | "map" | "collect" | "flat_map"
+        | "collect_concat" | "select" | "filter" | "find_all" | "reject" | "filter_map"
+        | "partition" | "group_by" | "sort_by" | "min_by" | "max_by" | "minmax_by"
+        | "take_while" | "drop_while" | "find" | "detect" | "each_with_index" | "cycle"
+        | "each_slice" | "each_cons" | "each_with_object" => true,
+        "find_index" => args.is_empty(),
+        _ => false,
+    }
+}
+
+/// The Enumerator a block-less iterator answers on a Float range: shaped and
+/// sized like any other, but raising `can't iterate from Float` once driven.
+fn float_range_enum(range: &Value, name: &str, args: &[Value]) -> Value {
+    let block = with_host(|h| {
+        let base = h.new_raising_enumerator("TypeError", "can't iterate from Float");
+        h.generator_block(&base).expect("a generator")
+    });
+    let kind = derive_kind(name, args).unwrap_or(Derive::Each);
+    derived_enum(range, block, name, args, kind)
+}
+
 /// `Float` range methods. Ruby forbids iterating a Float range directly, so
 /// `each`/`to_a`/`map`/… raise `TypeError`; the endpoints, containment
 /// predicates, and `step` are supported.
@@ -22066,9 +22532,10 @@ fn dispatch_float_range(
         }
     };
     match name {
-        "begin" | "first" | "min" if args.is_empty() => Ok(Value::Float(lo)),
+        "begin" | "first" if args.is_empty() => Ok(Value::Float(lo)),
+        "min" if args.is_empty() && block.is_none() => Ok(Value::Float(lo)),
         "end" | "last" if args.is_empty() => Ok(Value::Float(hi)),
-        "max" if args.is_empty() => {
+        "max" if args.is_empty() && block.is_none() => {
             if excl {
                 // Ruby raises for `(1.0...2.0).max` — no well-defined float max.
                 Err(raise_exc(
@@ -22117,8 +22584,28 @@ fn dispatch_float_range(
         }
         "to_s" | "inspect" => Ok(new_str(with_host(|h| h.to_s(recv)))),
         // Iterating a Float range directly is a TypeError in Ruby.
-        "each" | "to_a" | "to_ary" | "map" | "collect" | "select" | "filter" | "reject" | "sum"
-        | "reduce" | "inject" | "each_with_index" | "each_with_object" | "count" | "size" => {
+        "to_a" | "to_ary" | "sum" | "reduce" | "inject" | "count" | "size" => {
+            Err(raise_exc("TypeError", "can't iterate from Float"))
+        }
+        // `min`/`max`/`minmax` with a block compare by iterating.
+        "min" | "max" | "minmax" if block.is_some() => {
+            Err(raise_exc("TypeError", "can't iterate from Float"))
+        }
+        // `Enumerator::Lazy` over the range iterates nothing until forced.
+        "lazy" if args.is_empty() => {
+            let src = float_range_enum(recv, "each", &[]);
+            Ok(with_host(|h| h.new_lazy_of(src, vec![], recv.clone())))
+        }
+        // Everything Enumerable reaches through `Range#each`, which refuses a
+        // Float start. A block-less iterator still answers its Enumerator; it is
+        // iterating THAT which raises (`range_each` → `rb_raise`).
+        _ if name == "each"
+            || name == "reverse_each"
+            || (crate::arity_table::lookup("Enumerable", name).is_some() && name != "chain") =>
+        {
+            if block.is_none() && blockless_enum_method(name, args) {
+                return Ok(float_range_enum(recv, name, args));
+            }
             Err(raise_exc("TypeError", "can't iterate from Float"))
         }
         _ => Err(no_method_error(recv, name)),
@@ -24317,7 +24804,15 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
                     }
                 }
             }
-            Ok(Value::Undef)
+            // Block-less `loop` is an endless Enumerator yielding nothing (each
+            // step hands its block nil), sized `Float::INFINITY`.
+            let label = enum_label(&with_host(|h| h.current_self()), "loop", &[]);
+            Ok(with_host(|h| {
+                let e = h.new_cycle_enumerator(vec![Value::Undef]);
+                h.set_generator_size(&e, GenSize::Fixed(Value::Float(f64::INFINITY)));
+                h.set_generator_label(&e, label);
+                e
+            }))
         }
         "catch" => {
             // `catch(tag) { |tag| … }` runs the block, yielding the tag to it, and

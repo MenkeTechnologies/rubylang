@@ -258,6 +258,20 @@ pub enum Derive {
     WithObject(Value),
 }
 
+/// What a `Generator`'s `Enumerator#size` answers. MRI keeps the size apart
+/// from the values: `Enumerator.new(3) { }` is size 3 whatever it yields, an
+/// endless `cycle`/`loop`/`produce` is `Infinity`, and a derived enumerator
+/// (`e.each_slice(2)`) asks its source each time (`enumerator.c`'s size fn).
+#[derive(Debug, Clone)]
+pub enum GenSize {
+    /// A fixed answer; `Value::Undef` is nil (unknown).
+    Fixed(Value),
+    /// A callable (`Enumerator.new(-> { n })`), called on every `size`.
+    Call(Value),
+    /// The source enumerator's size, reshaped by the derivation.
+    Of(Value, Derive),
+}
+
 /// A heap object — the Ruby reference types.
 /// A `Generator`'s external-iteration state — MRI's `enumerator.c` fiber model.
 ///
@@ -398,6 +412,14 @@ pub enum RObj {
     /// with a yielder, it repeats the captured elements forever. The yielder's
     /// limit bounds it for `first(n)`/`take(n)` exactly like a `loop {}` generator.
     CycleProc(Vec<Value>),
+    /// A native generator body that raises `class` with `message` the moment it
+    /// is driven: the Enumerator a block-less iterator answers on a receiver
+    /// that cannot be iterated (`(1.0..2.0).each_slice(2)` is an Enumerator;
+    /// iterating it is `TypeError: can't iterate from Float`).
+    RaiseProc {
+        class: String,
+        message: String,
+    },
     /// A native generator body yielding `lo, lo+1, lo+2, …` forever: the driving
     /// block of the Enumerator an endless Range (`(1..)`) answers a block-less
     /// enumerator method with. Bounded by the consumer, like `CycleProc`.
@@ -540,6 +562,11 @@ pub enum RObj {
         block: Value,
         materialized: Option<(Vec<Value>, usize)>,
         ext: Option<GenExt>,
+        /// What `Enumerator#size` answers (see [`GenSize`]).
+        size: GenSize,
+        /// The `inspect` form when it is not the default
+        /// `#<Enumerator: #<Enumerator::Generator:0x…>:each>`.
+        label: Option<String>,
     },
     /// The native `Enumerator::Yielder` passed to a generator block as `|y|`.
     /// `<<`/`yield` push into the collector `enum_sinks[sink]`; once the buffer
@@ -1515,6 +1542,9 @@ pub struct RubyHost {
     /// `to_enum`/`enum_for` Enumerators by heap id: the size block and the
     /// method arguments it is called with (no block: `size` is nil).
     enum_size_fns: std::collections::HashMap<u32, (Option<Value>, Vec<Value>)>,
+    /// The `inspect` of an Enumerator MRI builds over an `Enumerator::Generator`
+    /// (`chunk_while`, `slice_when`, …), which rubylang materializes.
+    enum_labels: std::collections::HashMap<u32, String>,
     struct_counter: u32,
     /// `refine Target do … end` definitions: the refining module → its
     /// `(target class, refinement class)` pairs. A refinement's methods live in
@@ -2343,6 +2373,7 @@ impl RubyHost {
             embedded_stdlib_loaded: std::collections::HashSet::new(),
             builtin_libs_loaded: std::collections::HashSet::new(),
             enum_size_fns: std::collections::HashMap::new(),
+            enum_labels: std::collections::HashMap::new(),
             struct_counter: 0,
             refinement_defs: IndexMap::new(),
             active_refinements: Vec::new(),
@@ -2870,6 +2901,17 @@ impl RubyHost {
             false
         }
     }
+    /// Replace the set's elements in place (deduplicated, in order).
+    pub fn set_replace(&mut self, set: &Value, items: Vec<Value>) {
+        let mut fresh = IndexMap::new();
+        for v in items {
+            let k = self.value_to_key(&v);
+            fresh.entry(k).or_insert(v);
+        }
+        if let Some(RObj::Set(map)) = self.obj_mut(set) {
+            *map = fresh;
+        }
+    }
     /// Remove `item` from the set in place; returns `true` if it was present.
     pub fn set_remove(&mut self, set: &Value, item: &Value) -> bool {
         let k = self.value_to_key(item);
@@ -3109,7 +3151,27 @@ impl RubyHost {
             block,
             materialized: None,
             ext: None,
+            size: GenSize::Fixed(Value::Undef),
+            label: None,
         })
+    }
+    /// Set what a generator's `Enumerator#size` answers.
+    pub fn set_generator_size(&mut self, v: &Value, s: GenSize) {
+        if let Some(RObj::Generator { size, .. }) = self.obj_mut(v) {
+            *size = s;
+        }
+    }
+    pub fn generator_size(&self, v: &Value) -> Option<GenSize> {
+        match self.obj(v) {
+            Some(RObj::Generator { size, .. }) => Some(size.clone()),
+            _ => None,
+        }
+    }
+    /// Set a generator's `inspect` form (`#<Enumerator: [1, 2]:cycle>`).
+    pub fn set_generator_label(&mut self, v: &Value, s: String) {
+        if let Some(RObj::Generator { label, .. }) = self.obj_mut(v) {
+            *label = Some(s);
+        }
     }
     /// The `Enumerator::Yielder` for a generator running on an external-iteration
     /// fiber (its `<<` suspends the fiber instead of buffering).
@@ -3164,6 +3226,14 @@ impl RubyHost {
     /// A block-less endless `cycle` Enumerator: a `Generator` whose body is a
     /// native `CycleProc` repeating `buf` forever (bounded by the consumer via
     /// `first(n)`/`take(n)`).
+    /// A generator whose driving raises `class`: see `RObj::RaiseProc`.
+    pub fn new_raising_enumerator(&mut self, class: &str, message: &str) -> Value {
+        let block = self.alloc(RObj::RaiseProc {
+            class: class.to_string(),
+            message: message.to_string(),
+        });
+        self.new_generator(block)
+    }
     pub fn new_cycle_enumerator(&mut self, buf: Vec<Value>) -> Value {
         let block = self.alloc(RObj::CycleProc(buf));
         self.new_generator(block)
@@ -4773,6 +4843,7 @@ impl RubyHost {
             Some(RObj::Proc { .. })
                 | Some(RObj::SymProc(_))
                 | Some(RObj::CycleProc(_))
+                | Some(RObj::RaiseProc { .. })
                 | Some(RObj::SeqProc(_))
                 | Some(RObj::StepProc { .. })
                 | Some(RObj::ProduceProc { .. })
@@ -5785,6 +5856,22 @@ impl RubyHost {
             }
         }
         true
+    }
+    /// The Enumerator MRI builds over an `Enumerator::Generator` for the
+    /// chunking methods (`chunk_while`, `slice_when`, `chunk`, `slice_before`,
+    /// `slice_after`): materialized here, but sized nil and inspected as
+    /// `#<Enumerator: #<Enumerator::Generator:0x…>:each>` as MRI does.
+    pub fn new_chunk_enumerator(&mut self, chunks: Vec<Value>) -> Value {
+        let e = self.new_enumerator(chunks, "each");
+        self.set_enum_size_fn(&e, None, vec![]);
+        let label = format!(
+            "#<Enumerator: #<Enumerator::Generator:{}>:each>",
+            self.object_address(&e)
+        );
+        if let Value::Obj(id) = e {
+            self.enum_labels.insert(id, label);
+        }
+        e
     }
     /// Record that Enumerator `e` came from `to_enum`, whose `size` is what
     /// `size_fn` answers for `args` (nil without one).
@@ -8698,6 +8785,12 @@ impl RubyHost {
                     source,
                     ..
                 }) => {
+                    if let Some(l) = match v {
+                        Value::Obj(id) => self.enum_labels.get(id),
+                        _ => None,
+                    } {
+                        return l.clone();
+                    }
                     // MRI shows `#<Enumerator: <receiver>:<method>>`. The receiver
                     // is the recorded source when there is one; otherwise the
                     // materialized values stand in for it (they match for the
@@ -8709,9 +8802,11 @@ impl RubyHost {
                     format!("#<Enumerator: {recv}:{method}>")
                 }
                 Some(RObj::ArithSeq(s)) => s.desc.clone(),
-                Some(RObj::Generator { .. }) => {
-                    "#<Enumerator: #<Enumerator::Generator>:each>".to_string()
-                }
+                Some(RObj::Generator { label: Some(l), .. }) => l,
+                Some(RObj::Generator { .. }) => format!(
+                    "#<Enumerator: #<Enumerator::Generator:{}>:each>",
+                    self.object_address(v)
+                ),
                 Some(RObj::Yielder { .. }) | Some(RObj::FiberYielder) => {
                     "#<Enumerator::Yielder>".to_string()
                 }
@@ -8756,6 +8851,7 @@ impl RubyHost {
                 Some(RObj::Proc { .. })
                 | Some(RObj::SymProc(_))
                 | Some(RObj::CycleProc(_))
+                | Some(RObj::RaiseProc { .. })
                 | Some(RObj::SeqProc(_))
                 | Some(RObj::StepProc { .. })
                 | Some(RObj::ProduceProc { .. })
@@ -9216,6 +9312,7 @@ impl RubyHost {
                 Some(RObj::Proc { .. })
                 | Some(RObj::SymProc(_))
                 | Some(RObj::CycleProc(_))
+                | Some(RObj::RaiseProc { .. })
                 | Some(RObj::SeqProc(_))
                 | Some(RObj::StepProc { .. })
                 | Some(RObj::ProduceProc { .. })
@@ -13885,6 +13982,9 @@ pub fn call_proc_self_ctx(
                 Some(class) => call_instance_method(recv.clone(), &class, &name, args, None),
                 None => crate::builtins::call_bound(&recv, &name, args, None),
             };
+        }
+        Some(RObj::RaiseProc { class, message }) => {
+            return Err(crate::builtins::raise_exc(&class, &message));
         }
         // The native `cycle` generator body: driven with a yielder (`args[0]`),
         // it pushes the captured elements round and round. The yielder returns a

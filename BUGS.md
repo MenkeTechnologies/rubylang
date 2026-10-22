@@ -1000,13 +1000,18 @@ Honest limitations of this surface:
   inherited methods, included/prepended-module methods, `define_method` blocks,
   `alias_method` aliases, and per-object singleton methods), then
   `respond_to_missing?` (an override can call `super` for the default `false`, the
-  same as `Object#respond_to_missing?`), then Struct/OpenStruct attributes. For builtin receivers
-  (`String`, `Integer`, `Array`, `Hash`, `Symbol`, …) `respond_to?` returns
-  `true` for any name except the pattern-match deconstruction protocol, because
-  there is no enumerable registry of the builtin method surface — so
-  `"s".respond_to?(:no_such)` is `true` where MRI is `false`. Accurate builtin
-  `respond_to?` needs a per-type method-name registry (deep substrate, not yet
-  built). A *class or module* receiver is the exception and reports accurately:
+  same as `Object#respond_to_missing?`), then Struct/OpenStruct attributes. The
+  core values (`Integer`, `Float`, `Rational`, `Complex`, `String`, `Symbol`,
+  `Array`, `Hash`, `Range`, `Regexp`, `MatchData`, `Set`) answer from MRI's own
+  method table (`src/arity_table.rs`) plus whatever the program adds by
+  reopening a class in their ancestry, so `5.respond_to?(:each)` and
+  `"s".respond_to?(:no_such)` are `false` as in MRI. Once a library that extends
+  core classes natively is loaded (`json`, `csv`, `bigdecimal`, `date`,
+  `shellwords`, … — `CORE_EXTENDING_LIBS` in `src/builtins.rs`) an unknown
+  name is again answered `true`: those methods are in neither table, and
+  without a per-library registry that is the only answer that never denies a
+  method the call would reach. Other builtin receivers (`Proc`, `Time`, `IO`,
+  …) stay permissive for an unknown name. A *class or module* receiver is the exception and reports accurately:
   its registered class methods, singleton methods and aliases, the `Class`/
   `Module` reflection surface, then `respond_to_missing?` on its singleton class.
   `Object`/`BasicObject` report an unknown name as absent (Rails walks
@@ -1027,6 +1032,10 @@ Honest limitations of this surface:
   Integers never reaches dispatch), `to_s` refinements honored by string
   interpolation, and a refinement being active inside its own `refine` block
   before any `using`.
+- **`Module#method_added` never fires.** A `def self.method_added(m)` hook is
+  accepted but not called for later `def`s (MRI: `[:foo, :bar]` for a class and
+  its subclass's definitions). Methods are installed when the program loads
+  (the hoisting above), so there is no runtime definition point to fire from.
 
 ## Lexer
 
@@ -2015,6 +2024,14 @@ Honest limitations of this surface:
   carrying `key` and `matchee`. With two or more clauses the message is the
   matchee alone, as in MRI. `in ^x` matches with `===`, like any value
   pattern, so a pinned Range or Class tests coverage / membership.
+- **`Enumerator::Chain` is a plain materialized Enumerator.** `e.chain(*enums)`
+  answers an `Enumerator` over the receiver's elements followed by each
+  argument AS AN ELEMENT unless it is an Array (`[1].chain(4..5).to_a` is
+  `[1, 4..5]`, MRI `[1, 4, 5]`); its class, `inspect`
+  (`#<Enumerator::Chain: [...]>`) and `size` differ, it answers `next` where
+  MRI raises NoMethodError, and `Enumerator#+` is missing. A Float range
+  answers `chain` with NoMethodError. Needs a lazy Chain object over the
+  sources (MRI's `enum_chain`), and `Enumerator::Chain` in the reference table.
 
 ## `min(n)` / `max(n)` tie order past 7 survivors
 

@@ -8167,3 +8167,59 @@ p /\xff/n.fixed_encoding?, /a/n.fixed_encoding?, /é/.fixed_encoding?, /\p{Alpha
 # ── force_encoding resolves names through the encoding table ──
 p "x".force_encoding("ascii").encoding, "x".force_encoding("Binary").encoding, "x".force_encoding("utf-8").encoding
 begin; "x".force_encoding("nope"); rescue => e; p e; end
+#==#
+# ── Enumerator#size of endless / sized / derived enumerators (enumerator.c size fns) ──
+p [1, 2].cycle.size, [].cycle.size, loop.size, (1..).each.size, (1..).each_slice(2).size, (1..).map.size, (1..).find.size, (1..).to_enum.size
+p Enumerator.produce(1) { _1 }.size, Enumerator.new(3) {}.size, Enumerator.new(Float::INFINITY) {}.size, Enumerator.new(-> { 7 }) {}.size, Enumerator.new(2.5) {}.size, Enumerator.new(nil) {}.size
+e = Enumerator.new(5) { |y| y << 1 }
+p e.size, e.to_a, e.each_slice(2).size, e.each_cons(2).size, e.each_cons(9).size, e.map.size, e.with_index.size, e.find.size, e.take_while.size, e.each_with_object([]).size
+p [1, 2].cycle.select.size, [1, 2].cycle.find.size, [1, 2].cycle.each_slice(3).size, Enumerator.new(-> { 9 }) {}.each_slice(2).size
+begin; Enumerator.new("x") {}; rescue TypeError => x; p x.message; end
+a = [1, 2, 3, 4, 5]
+p a.find.size, a.each.find.size, a.take_while.size, a.drop_while.size, a.find_index.size, a.chunk_while { }.size, a.slice_when { }.size, a.chunk { }.size, a.slice_before(1).size
+p a.lazy.each_slice(2).size, (1..).lazy.each_cons(2).size, [1].lazy.each_cons(3).size, [1, 2].cycle.lazy.size
+p loop.first(2), loop.take(1), loop.next
+#==#
+# ── Enumerator#inspect of generator-backed enumerators ──
+p [1, 2].cycle, (1..).each, (1..).each_slice(2), (1..).map, [1].cycle.each_slice(2), (1..).each.with_index(1), (1..).to_enum, loop
+p Enumerator.new {}.inspect.sub(/0x\h+/, "X"), Enumerator.produce(1) { _1 }.inspect.sub(/0x\h+/, "X"), [1, 2].chunk_while { }.inspect.sub(/0x\h+/, "X"), [1].slice_when { }.inspect.sub(/0x\h+/, "X")
+#==#
+# ── a Float range: Enumerable answers its Enumerator, iterating raises (range_each) ──
+r = 1.0..2.0
+p r.each_slice(2), r.map, r.each, r.find, r.each_with_object([]), r.lazy, r.lazy.map { _1 }, r.min, r.max, r.minmax
+[-> { r.each_slice(2).to_a }, -> { r.first(1) }, -> { r.zip }, -> { r.tally }, -> { r.sort }, -> { r.entries }, -> { r.to_set }, -> { r.uniq }, -> { r.take(1) }, -> { r.to_h },
+ -> { r.any? }, -> { r.min { 0 } }, -> { r.max { 0 } }, -> { r.minmax { 0 } }, -> { r.each_slice(1).size }, -> { r.each.next }, -> { r.lazy.first(2) }, -> { r.cycle.first(1) }, -> { r.each {} }].each { |f| p(begin; f.(); rescue => x; x; end) }
+#==#
+# ── Set mutators, classify/divide, flatten, Set.new(enum) { }, frozen Set ──
+s = Set[1, 2, 3, 4]
+p s.select! { true }, s.filter! { _1 < 4 }, s, s.reject! { false }, s.reject! { _1 == 3 }, s, s.keep_if { true }, s.delete_if { false }
+s = Set[1, 2, 3]
+p s.map! { _1 * 2 }, s.collect! { _1 }, s, s.subtract([2, 9]), s.subtract(Set[4]), s.reset
+p Set[1, 2, 3].classify(&:odd?), Set[1, 2, 3, 4].divide(&:odd?), Set[1, 2, 4, 5, 9].divide { |a, b| (a - b).abs == 1 }
+calls = []; p Set[1, 2, 3, 4].divide { |a, b| calls << [a, b]; a + b != 5 && (a - b).abs != 2 }, calls
+p Set[1, Set[2, Set[3]]].flatten, Set[1, [2]].flatten, Set[1, Set[2]].flatten!, Set[1].flatten!
+p Set[1, 2].select!.class, Set[1].map!.class, Set.new([1, 2]) { _1 * 3 }, Set.new(nil), Set.new(1..3), Set.new({a: 1})
+begin; Set.new(5); rescue ArgumentError => x; p x.message; end
+f = Set[1].freeze
+[-> { f << 2 }, -> { f.delete(1) }, -> { f.select! { true } }, -> { f.map! { _1 } }, -> { f.merge([3]) }, -> { f.clear }, -> { f.subtract([1]) }, -> { f.add?(9) }].each { |l| p(begin; l.(); rescue => x; x; end) }
+#==#
+# ── respond_to? on core values answers from MRI's surface plus reopened classes ──
+p 5.respond_to?(:map), 5.respond_to?(:zzz), "a".respond_to?(:each), :a.respond_to?(:each), 1.5.respond_to?(:each), [].respond_to?(:each), "a".respond_to?(:upcase), (1..2).respond_to?(:upcase), /a/.respond_to?(:each)
+class String; def shout = upcase + "!"; end
+module RtExt; def ext_m = 1; end
+class Integer; include RtExt; end
+class Object; def rt_everywhere = 1; end
+class Array; alias_method :rt_size, :size; end
+p "a".respond_to?(:shout), 5.respond_to?(:ext_m), [].respond_to?(:rt_everywhere), [].respond_to?(:rt_size), {}.respond_to?(:shout), Set[1].respond_to?(:upcase), 5.respond_to?(:puts), 5.respond_to?(:puts, true)
+#==#
+# ── $@ is $!.backtrace ──
+p $@
+begin; raise "a"; rescue => e; p $@.class, $@ == e.backtrace; end
+p $@, (raise "q" rescue $@.class)
+#==#
+# ── multiple-assignment targets are locals while the values are evaluated ──
+a, b = b, a; p a, b
+c, *d = d; p c, d
+def masgn_m; x, y = y, 1; [x, y]; end; p masgn_m
+[1].each { e1, f1 = f1, 2; p [e1, f1] }
+g, (h, i) = i, [1, h]; p g, h, i

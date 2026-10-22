@@ -1987,6 +1987,16 @@ impl Compiler {
         targets: &[Expr],
         values: &[Expr],
     ) -> Result<(), String> {
+        // The targets are locals from the left-hand side on, so the values
+        // already read them as variables (nil before any assignment):
+        // `a, b = b, a` swaps two nils rather than calling a method `b`.
+        let mut names = Vec::new();
+        targets
+            .iter()
+            .for_each(|t| for_locals_target(t, &mut names));
+        if let Some(scope) = self.scope_locals.last_mut() {
+            scope.extend(names);
+        }
         // rhs = the coerced value list. A lone `*x` value (`a, b = *x`) is `x`
         // splatted — `to_a` — so it goes through `Array`; any other lone value
         // is destructured only if it is array-LIKE (`to_ary`), which a Hash, a
