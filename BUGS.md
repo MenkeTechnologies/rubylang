@@ -1911,36 +1911,40 @@ Honest limitations of this surface:
   `to_s` (MRI's default `Object#to_json`), so those are excluded from the exact
   parity corpus.
 - **`ERB` (dependency-free templating).** `require "erb"` is a no-op; the class is
-  always available. `ERB.new(template, trim_mode: "-")` compiles the template into
-  a `_erbout`-building Ruby program (kept in the `@src` ivar, exposed by `#src`
-  like MRI) using a hand-written scanner over `<% %>` tags: `<%= e %>` →
-  `_erbout << (e).to_s`, `<% c %>` emits `c` verbatim (so loops/conditionals
-  wrap the appends), `<%# … %>` is dropped, literal text is embedded in a
-  double-quoted Ruby string, and `<%%` yields a literal `<%`. Because text is
-  embedded in a real Ruby double-quoted string, `#{…}` in template text
-  interpolates — matching MRI 6.x byte-for-byte, not "literal passthrough".
-  `#result` / `#result(binding)` evaluates the compiled program via the host
-  `eval_in_place` machinery **in the caller's current scope**, so the template
-  sees the caller's top-level locals, instance variables (`<%= @x %>`), and
-  methods; this matches MRI at top level (where the default binding's `self` is
-  also `main`). `#result_with_hash(hash)` evaluates in a fresh, isolated scope
-  with the hash keys pre-bound as template locals (self is a blank object, so it
-  does not see or pollute caller state). Trim mode: `"-"` is implemented —
-  `-%>` chomps the immediately following newline, `<%-` strips leading blanks on
-  its line; `dash_trim` is enabled when the mode string contains `-`. All the
-  above are verified byte-for-byte against MRI (`ruby -rerb`). An explicit
+  always available. `ERB.new(template, trim_mode:)` compiles the template with a
+  port of MRI's `ERB::Compiler` (`src/erb.rs`, from erb 6.0.7's `compiler.rb`):
+  the `SimpleScanner`, `ExplicitScanner` and `TrimScanner` tokenisers, every
+  trim mode (`nil`/`0`, `1`/`">"`, `2`/`"<>"`, `"-"`, and the `"%"` line prefix
+  in any combination), the `<%%`/`%%>` escapes (so a literal `%>` CAN sit inside
+  a tag body), the `coding:`/`frozen_string_literal:` magic comments, and the
+  `Buffer` that joins commands with `; ` and keeps one generated line per
+  template line so a diagnostic reports the template's line. `#src` is therefore
+  MRI's byte for byte on an ASCII template —
+  `#coding:UTF-8\n_erbout = +''; _erbout.<< "text".freeze; _erbout.<<((e).to_s); …; _erbout`
+  — and template text is `dump`ed, so `#{…}` in text stays literal as in MRI
+  (the previous hand-written scanner embedded it in a live double-quoted string
+  and interpolated it). An unrecognised mode compiles plainly after MRI's
+  `Invalid ERB trim mode: …` warning. `#result` / `#result(binding)` evaluates
+  the compiled program via the host `eval_in_place` machinery **in the caller's
+  current scope**, so the template sees the caller's top-level locals, instance
+  variables (`<%= @x %>`), and methods; this matches MRI at top level (where the
+  default binding's `self` is also `main`). `#result_with_hash(hash)` evaluates
+  in a fresh, isolated scope with the hash keys pre-bound as template locals
+  (self is a blank object, so it does not see or pollute caller state). All the
+  above are verified byte-for-byte against MRI (`ruby -rerb`); `tests/erb.rs`
+  pins the rendered output of every mode and the exact `#src`. An explicit
   `Binding` argument to `#result` evaluates in that Binding's scope (its locals
   and `self`). **Limitations:** (1) without one, inside a method body, `#result`
   sees that method's scope rather than a fresh top-level binding, which is
-  broader access than MRI's default `new_toplevel_binding`. (2) The other MRI
-  trim modes (`">"`, `"<>"`, `"%"`) are not implemented — only `"-"` (and the
-  default no-trim). (3) The `%%>` → `%>` escape is not special-cased: `%%>` in
-  template text stays literal (which is what MRI 6.x does in text); inside a tag
-  the first `%>` closes it, so a literal `%>` cannot be embedded in a tag body.
+  broader access than MRI's default `new_toplevel_binding`. (2) MRI compiles the
+  template as bytes (`String#b`) and `dump`s them, so its `#src` spells a
+  non-ASCII character as `\xNN` escapes; rubylang keeps the character itself —
+  the rendered result is identical. (3) The invalid-trim-mode warning is printed
+  as `warning: …` without the `file:line:` prefix MRI's `uplevel:` adds.
   (4) `#result_with_hash` binds arbitrary runtime values directly (no
   serialization), so any object works as a template local. (5) Legacy positional
   `safe_level`/`eoutvar` args to `ERB.new` are ignored; the deprecated positional
-  trim-mode (3rd arg) is still honored.
+  trim-mode (3rd arg) is still honored, where erb 6 raises `ArgumentError`.
 - **`StringIO` (dependency-free).** `require "stringio"` is a no-op; the class is
   always available. `StringIO.new(initial = "")` is a String-backed IO: the
   buffer and read cursor live in the object's `buf`/`pos` ivars. `#string`

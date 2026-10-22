@@ -4592,21 +4592,39 @@ fn dispatch_classref(
     // instance. `#result`/`#result_with_hash` later evaluate that program.
     if cls == "ERB" && name == "new" {
         let template = arg_str(&args[0]);
-        // The trim mode may arrive as a `trim_mode:` keyword (modern form) or as
-        // the deprecated 2nd/3rd positional string. Dash-trim is on when the mode
-        // string contains '-'.
+        // The trim mode may arrive as a `trim_mode:` keyword (the modern form) or
+        // as the deprecated 3rd positional argument: nil, 0, 1, 2 or a String of
+        // `%`, `-`, `>`, `<>`. Anything else compiles plainly after MRI's warning.
         let mode = args
             .iter()
             .skip(1)
             .find_map(|a| {
                 with_host(|h| h.as_hash(a))
                     .and_then(|m| m.get(&RKey::Sym("trim_mode".into())).cloned())
-                    .and_then(|v| with_host(|h| h.as_str(&v)))
             })
-            .or_else(|| args.get(2).and_then(|a| with_host(|h| h.as_str(a))))
-            .unwrap_or_default();
-        let dash_trim = mode.contains('-');
-        let src = erb_compile(&template, dash_trim);
+            .or_else(|| args.get(2).cloned())
+            .unwrap_or(Value::Undef);
+        let mode = match &mode {
+            Value::Undef => crate::erb::TrimArg::Nil,
+            Value::Int(n) => crate::erb::TrimArg::Int(*n),
+            v => match with_host(|h| h.as_str(v)) {
+                Some(s) => crate::erb::TrimArg::Str(s),
+                None => crate::erb::TrimArg::Other(with_host(|h| h.inspect(v))),
+            },
+        };
+        let (spec, warning) = crate::erb::prepare_trim_mode(&mode);
+        if let Some(warning) = warning {
+            crate::host::write_stderr(&format!("warning: {warning}\n"));
+        }
+        // A `coding:` magic comment goes through `Encoding.find`.
+        let find_encoding = |name: &str| {
+            encoding_info(name)
+                .map(|e| e.name.to_string())
+                .ok_or_else(|| {
+                    raise_exc("ArgumentError", &format!("unknown encoding name - {name}"))
+                })
+        };
+        let src = crate::erb::compile(&template, spec, &find_encoding)?;
         let src_val = new_str(src);
         let obj = with_host(|h| h.new_object("ERB"));
         with_host(|h| h.set_ivar_of(&obj, "src", src_val));
@@ -27090,129 +27108,6 @@ fn erb_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Value>,
         }
         _ => Ok(None),
     }
-}
-
-/// Compile an ERB template into Ruby source that builds a `_erbout` buffer and
-/// evaluates to it. Each literal run becomes `_erbout << "..."`, each `<%= e %>`
-/// becomes `_erbout << (e).to_s`, and each `<% c %>` emits `c` verbatim (so
-/// loops/conditionals wrap the appends). `<%# ... %>` is dropped and `<%%`
-/// yields a literal `<%`.
-///
-/// `dash_trim` enables the `"-"` trim mode: `-%>` chomps the following newline
-/// and `<%-` strips leading blanks on its line. Template text is embedded in a
-/// double-quoted Ruby string, so `#{...}` in text interpolates — matching MRI.
-fn erb_compile(template: &str, dash_trim: bool) -> String {
-    enum Tag {
-        Expr,
-        Comment,
-        Code,
-        CodeTrimLead,
-    }
-
-    /// Flush pending literal `text` as an `_erbout << "..."` append, escaping the
-    /// characters that are special inside a Ruby double-quoted string. `#` is
-    /// left unescaped so `#{...}` in template text interpolates (MRI behavior).
-    fn flush(out: &mut String, text: &mut String) {
-        if text.is_empty() {
-            return;
-        }
-        out.push_str("_erbout << \"");
-        for ch in text.chars() {
-            match ch {
-                '\\' => out.push_str("\\\\"),
-                '"' => out.push_str("\\\""),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                c => out.push(c),
-            }
-        }
-        out.push_str("\"\n");
-        text.clear();
-    }
-
-    let mut out = String::from("_erbout = +\"\"\n");
-    let mut text = String::new();
-    let bytes = template.as_bytes();
-    let n = bytes.len();
-    let mut i = 0;
-
-    while i < n {
-        let rest = &template[i..];
-        // `<%%` is an escaped literal `<%`.
-        if rest.starts_with("<%%") {
-            text.push_str("<%");
-            i += 3;
-            continue;
-        }
-        if rest.starts_with("<%") {
-            let mut p = i + 2;
-            let tag = match bytes.get(p) {
-                Some(b'=') => {
-                    p += 1;
-                    Tag::Expr
-                }
-                Some(b'#') => {
-                    p += 1;
-                    Tag::Comment
-                }
-                Some(b'-') if dash_trim => {
-                    p += 1;
-                    Tag::CodeTrimLead
-                }
-                _ => Tag::Code,
-            };
-            // `<%-` trims trailing blanks accumulated on the current line.
-            if matches!(tag, Tag::CodeTrimLead) {
-                while text.ends_with(' ') || text.ends_with('\t') {
-                    text.pop();
-                }
-            }
-            // Find the closing `%>`; if absent, treat the remainder as literal text.
-            let Some(rel) = template[p..].find("%>") else {
-                flush(&mut out, &mut text);
-                text.push_str(&template[i..]);
-                break;
-            };
-            let close = p + rel;
-            let (content_end, trailing_trim) = if dash_trim && close > p && bytes[close - 1] == b'-'
-            {
-                (close - 1, true)
-            } else {
-                (close, false)
-            };
-            let content = template[p..content_end].trim();
-            flush(&mut out, &mut text);
-            match tag {
-                Tag::Expr => {
-                    out.push_str("_erbout << (");
-                    out.push_str(content);
-                    out.push_str(").to_s\n");
-                }
-                Tag::Comment => {}
-                Tag::Code | Tag::CodeTrimLead => {
-                    out.push_str(content);
-                    out.push('\n');
-                }
-            }
-            i = close + 2;
-            // `-%>` chomps the immediately following newline.
-            if trailing_trim {
-                if template[i..].starts_with("\r\n") {
-                    i += 2;
-                } else if template[i..].starts_with('\n') {
-                    i += 1;
-                }
-            }
-            continue;
-        }
-        let ch = rest.chars().next().unwrap();
-        text.push(ch);
-        i += ch.len_utf8();
-    }
-    flush(&mut out, &mut text);
-    out.push_str("_erbout\n");
-    out
 }
 
 // ---- JSON (dependency-free, hand-written over the host value model) ---------

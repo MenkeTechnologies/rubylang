@@ -17,6 +17,7 @@ pub mod cli;
 pub mod compiler;
 pub mod dap;
 pub mod encoding_table;
+pub mod erb;
 pub mod host;
 pub mod intercepts;
 pub mod lexer;
