@@ -14,35 +14,6 @@
 #
 # ---------------------------------------------------------------------------
 #
-# A byte string whose bytes are not valid UTF-8 loses them on the way back to a
-# UTF-8 label, and a `"\xNN"` literal never had them in the first place:
-#
-#   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p [11, 169].pack("C*").force_encoding("UTF-8")'
-#   "\v\xA9"
-#   $ ./target/debug/ruby            -e 'p [11, 169].pack("C*").force_encoding("UTF-8")'
-#   "\v�"
-#
-#   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["\xff".bytes, "\xff".valid_encoding?]'
-#   [[255], false]
-#   $ ./target/debug/ruby            -e 'p ["\xff".bytes, "\xff".valid_encoding?]'
-#   [[195, 191], true]
-#
-# Cause: `RObj::Str` is a Rust `String`, so it cannot hold invalid UTF-8 at all.
-# The byte-string representation invariant (see `builtins.rs`) buys back every
-# byte string that stays LABELLED as one — its storage is one character per byte,
-# so `#bytes`, `#bytesize`, `#length`, `#[]`, `#inspect` and the `pack`/`unpack`
-# round trip all answer MRI's byte-oriented result. What it cannot buy back is a
-# string that MRI labels UTF-8 while holding bytes that are not UTF-8: there is
-# no representation for it here, and the conversion is lossy.
-#
-# This is the whole of the residual gap, and it is bounded by that description.
-# Closing it needs `RObj::Str` to become a byte buffer with a separate encoding
-# field — MRI's own representation — which is a change to the object model, not
-# to any String method.
-p [N, N].pack(W).force_encoding(W)
-#
-# ---------------------------------------------------------------------------
-#
 # The rendering of a non-String object is UTF-8 here and US-ASCII in MRI:
 #
 #   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p nil.to_s.encoding.to_s'
