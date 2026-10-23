@@ -8473,3 +8473,20 @@ p :"a\xffb"
 #==#
 # ── a "…": label spelling bytes that are not UTF-8 is a SyntaxError ──
 p({"\xff": 1})
+#==#
+# ── a broken UTF-8 String's character view stays exact next to genuine U+10FF80..U+10FFFF characters ──
+s = "\u{10FFA0}x\xff"
+p s, s.length, s.bytes, s.chars, s.reverse.bytes, s[0].bytes, s.dump, s.center(7, "*").bytes, (s + "\u{10FFFF}").length
+t = "a\xfe" + "\u{10FF80}"; p t.length, t.chars.map(&:bytes), t.index("\u{10FF80}"), t.include?("\u{10FF80}")
+r = []; s.each_char { |c| r << c.bytes }; p r, s.sub("x", "\u{10FFFE}").bytes, s.gsub("x") { "\u{10FFAA}" }.bytes
+p "﷐", "￾", "\u{1FFFF}", "\u{10FFFE}", "͸", "\u{E000}", "­"
+#==#
+# ── a fixed-encoding Regexp refuses a String of another encoding holding non-ASCII ──
+def rt; r = yield; p r; rescue => e; p e; end
+rt { /é/ =~ "é".b }; rt { /é/ =~ "a".b }; rt { /a/ =~ "é".b }; rt { "é".b =~ /é/ }; rt { "é".b.scan(/é/) }; rt { "é".b.gsub(/é/, "x") }
+rt { "é".b.split(/é/) }; rt { "é".b[/é/] }; rt { /\xff/n =~ "é" }; rt { /\xff/n =~ "a" }; rt { /é/ =~ "é".force_encoding("ISO-8859-1") }
+rt { /é/ === "é".b }; rt { case "é".b; when /é/ then 1; end }; rt { /é/.match?("é".b) }
+#==#
+# ── Lazy#each { } answers the source's each without stages, nil with one, the prior Lazy after each_slice ──
+p((1..3).lazy.each { }, [1, 2].lazy.each { }, [1, 2].lazy.map { _1 }.each { }, (1..3).lazy.each_slice(2).each { }, {a: 1}.lazy.each { })
+p(Enumerator.new { |y| y << 1; :gen }.lazy.each { }, [1, 2].each_slice(1).lazy.each { }, [1, 2].lazy.each, [1, 2].lazy.with_index.each { })

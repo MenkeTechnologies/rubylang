@@ -754,7 +754,7 @@ pub enum ProcKind {
     /// String's character view: it hands the user's block each String argument
     /// as the bytes it stands for, and gives the method back the user's String
     /// answer as character-view text (`crate::builtins::dispatch_broken_utf8`).
-    BrokenUnits(Box<Value>),
+    BrokenUnits(Box<Value>, UnitView),
     /// The block a block-less `gsub` Enumerator's iteration receives: the
     /// `next`-th call sets `$~` to the `next`-th match, then runs the user's
     /// block (`"a1b2".gsub(/\d/).map { $~.pre_match }`).
@@ -1521,6 +1521,9 @@ pub struct RubyHost {
     /// The definition each UnboundMethod (and the Methods bound from it)
     /// captured when it was made, by heap id.
     method_snapshots: HashMap<u32, (MethodDef, String)>,
+    /// Whether any `/…/n` Regexp exists — the cheap test that lets a UTF-8
+    /// String's methods skip the binary-Regexp compatibility check.
+    binary_regexps: bool,
     /// `Enumerator#feed` state by Enumerator heap id: the value waiting for
     /// the next resume, and (for a buffered Enumerator) what each element got.
     enum_feeds: HashMap<u32, (Option<Value>, Vec<Value>)>,
@@ -2466,6 +2469,7 @@ impl RubyHost {
             shadowed_defs: HashMap::new(),
             method_snapshots: HashMap::new(),
             enum_feeds: HashMap::new(),
+            binary_regexps: false,
             consts: IndexMap::new(),
             autoloads: IndexMap::new(),
             methods: IndexMap::new(),
@@ -3842,6 +3846,9 @@ impl RubyHost {
     /// `\Z`/`\G`), `\h`/`\H`, named groups, and POSIX classes are all supported
     /// by its parser, so patterns pass through unrewritten.
     pub fn new_regex(&mut self, source: &str, flags: &str) -> Result<Value, String> {
+        if flags.contains('n') {
+            self.binary_regexps = true;
+        }
         // Ruby's `^` and `$` are LINE anchors always — there is no flag that
         // turns that off, and `\A`/`\z` are the string anchors. fancy-regex
         // follows Perl, where `^`/`$` bind to the whole haystack unless `m` is
@@ -3996,7 +4003,7 @@ impl RubyHost {
                 | ProcKind::MethodCurried { .. }
                 | ProcKind::Composed { .. } => Some(-1),
                 ProcKind::Collect(_) | ProcKind::Around(_) => Some(1),
-                ProcKind::BrokenUnits(inner) => self.proc_arity(inner),
+                ProcKind::BrokenUnits(inner, _) => self.proc_arity(inner),
                 ProcKind::SetsMatch { inner, .. } => self.proc_arity(inner),
                 ProcKind::Normal => Some(
                     ArityFacts::of_block(
@@ -4053,7 +4060,7 @@ impl RubyHost {
                     | ProcKind::Composed { .. }
                     | ProcKind::Collect(_)
                     | ProcKind::Around(_)
-                    | ProcKind::BrokenUnits(_)
+                    | ProcKind::BrokenUnits(..)
                     | ProcKind::SetsMatch { .. } => return Some(v.clone()),
                     ProcKind::Normal => match requested {
                         Some(n) => n,
@@ -4211,7 +4218,7 @@ impl RubyHost {
     }
     /// Wrap `block` for a method running over a broken UTF-8 String's character
     /// view (see [`ProcKind::BrokenUnits`]).
-    pub fn new_broken_units_block(&mut self, block: Value) -> Value {
+    pub fn new_broken_units_block(&mut self, block: Value, view: UnitView) -> Value {
         let is_lambda = matches!(
             self.obj(&block),
             Some(RObj::Proc {
@@ -4224,7 +4231,7 @@ impl RubyHost {
             template: 0,
             scope,
             is_lambda,
-            kind: ProcKind::BrokenUnits(Box::new(block)),
+            kind: ProcKind::BrokenUnits(Box::new(block), view),
             home: None,
         })
     }
@@ -8923,6 +8930,10 @@ impl RubyHost {
     pub fn any_tagged_strings(&self) -> bool {
         !self.string_encodings.is_empty()
     }
+    /// Whether a `/…/n` Regexp has been made (see `binary_regexps`).
+    pub fn any_binary_regexps(&self) -> bool {
+        self.binary_regexps
+    }
     /// Whether `v` is a [`BROKEN_UTF8`] String.
     pub fn is_broken_utf8(&self, v: &Value) -> bool {
         self.string_encoding(v) == Some(BROKEN_UTF8)
@@ -9455,7 +9466,9 @@ impl RubyHost {
                 // (`"\xFF"`), not by codepoint (`"ÿ"`) — MRI picks the
                 // form from the encoding, so `#inspect` has to consult the tag.
                 Some(RObj::Str(s)) if self.string_encoding(v) == Some(BROKEN_UTF8) => {
-                    inspect_broken_utf8(&broken_units(&crate::builtins::binstr_to_bytes(&s)))
+                    let bytes = crate::builtins::binstr_to_bytes(&s);
+                    let view = UnitView::for_operands(&[&bytes], &[]);
+                    inspect_broken_utf8(&view.units(&bytes), view)
                 }
                 Some(RObj::Str(s)) if self.string_encoding(v).is_some() => inspect_string_bytes(&s),
                 Some(RObj::Str(s)) => inspect_string(&s),
@@ -11268,66 +11281,110 @@ pub fn encoding_info(name: &str) -> Option<&'static crate::encoding_table::Encod
 }
 
 pub fn inspect_string(s: &str) -> String {
-    inspect_string_with(s, false)
+    inspect_string_with(s, None)
 }
 
 /// `String#inspect` of a UTF-8 String whose bytes are not all UTF-8, given as
-/// its [`broken_units`]: the characters as `inspect_string` renders them, each
-/// invalid byte as `\xNN` (`"a\xFFé"`).
-pub fn inspect_broken_utf8(units: &str) -> String {
-    inspect_string_with(units, true)
+/// its character view under `view`: the characters as `inspect_string` renders
+/// them, each invalid byte as `\xNN` (`"a\xFFé"`).
+pub fn inspect_broken_utf8(units: &str, view: UnitView) -> String {
+    inspect_string_with(units, Some(view))
 }
 
 /// The tag of a String MRI labels UTF-8 whose bytes are NOT valid UTF-8
 /// (`"\xff"`, `"\xff".b.force_encoding("UTF-8")`). Such a String keeps the
 /// byte storage every tagged String has (one character per byte); an untagged
 /// String is always valid UTF-8 text. Byte-oriented methods read the storage
-/// as any tagged String's; character methods see [`broken_units`].
+/// as any tagged String's; character methods see a [`UnitView`].
 pub const BROKEN_UTF8: &str = "UTF-8";
 
-/// Where an invalid byte sits while character methods run over a broken UTF-8
-/// String: byte `NN` (always 0x80..=0xFF — ASCII is never invalid) is the
-/// character `U+10FFNN`, so MRI's character view, in which every invalid byte
-/// is one character and every valid sequence is its character, is plain text.
-/// A genuine `U+10FF80..=U+10FFFF` inside such a string reads back as a byte.
-const BROKEN_UNIT_BASE: u32 = 0x10_FF00;
-
-/// The character view of the bytes of a broken UTF-8 String.
-pub fn broken_units(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len());
-    for chunk in bytes.utf8_chunks() {
-        out.push_str(chunk.valid());
-        out.extend(
-            chunk
-                .invalid()
-                .iter()
-                .filter_map(|&b| char::from_u32(BROKEN_UNIT_BASE + u32::from(b))),
-        );
-    }
-    out
+/// The character view of UTF-8 bytes some of which are invalid, in which —
+/// as in MRI — every invalid byte is one character and every valid sequence is
+/// its character: the bytes as plain text, with invalid byte `NN` (always
+/// 0x80..=0xFF, ASCII is never invalid) parked at the codepoint `base + NN`.
+///
+/// The view has to be read back unambiguously, so `base` is chosen per use to
+/// be a 256-codepoint block that no character of any operand falls in
+/// ([`UnitView::for_operands`]): a genuine `U+10FFA0` in the string then stays
+/// a character, because the parking block is another one. A collision is only
+/// possible for operands holding a character in every one of the 4096
+/// supplementary blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnitView {
+    base: u32,
 }
 
-/// The invalid byte a [`broken_units`] character stands for.
-pub fn broken_unit_byte(c: char) -> Option<u8> {
-    let v = u32::from(c);
-    (BROKEN_UNIT_BASE + 0x80..=BROKEN_UNIT_BASE + 0xFF)
-        .contains(&v)
-        .then(|| (v - BROKEN_UNIT_BASE) as u8)
-}
-
-/// The bytes a [`broken_units`] text denotes.
-pub fn units_to_bytes(text: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len());
-    for c in text.chars() {
-        match broken_unit_byte(c) {
-            Some(b) => out.push(b),
-            None => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+impl UnitView {
+    /// A view whose parking block holds no character of `byte_operands` (as
+    /// UTF-8 bytes, invalid ones included) or `text_operands`.
+    pub fn for_operands(byte_operands: &[&[u8]], text_operands: &[&str]) -> Self {
+        let mut used = std::collections::HashSet::new();
+        let mut mark = |s: &str| {
+            for c in s.chars() {
+                let v = u32::from(c);
+                if v >= 0x1_0000 {
+                    used.insert(v & !0xFF);
+                }
+            }
+        };
+        for b in byte_operands {
+            for chunk in b.utf8_chunks() {
+                mark(chunk.valid());
+            }
         }
+        for t in text_operands {
+            mark(t);
+        }
+        let base = (0x100..=0x10FF)
+            .rev()
+            .map(|block: u32| block << 8)
+            .find(|b| !used.contains(b))
+            .unwrap_or(0x10_FF00);
+        UnitView { base }
     }
-    out
+    /// The character view of `bytes`.
+    pub fn units(self, bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len());
+        for chunk in bytes.utf8_chunks() {
+            out.push_str(chunk.valid());
+            out.extend(
+                chunk
+                    .invalid()
+                    .iter()
+                    .filter_map(|&b| char::from_u32(self.base + u32::from(b))),
+            );
+        }
+        out
+    }
+    /// The invalid byte a view character stands for.
+    pub fn byte(self, c: char) -> Option<u8> {
+        let v = u32::from(c);
+        (self.base + 0x80..=self.base + 0xFF)
+            .contains(&v)
+            .then(|| (v - self.base) as u8)
+    }
+    /// The bytes a view text denotes.
+    pub fn to_bytes(self, text: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(text.len());
+        for c in text.chars() {
+            match self.byte(c) {
+                Some(b) => out.push(b),
+                None => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+            }
+        }
+        out
+    }
 }
 
-fn inspect_string_with(s: &str, broken_units: bool) -> String {
+/// Whether `c` is unassigned in Unicode (General_Category `Cn`, which takes in
+/// the noncharacters) — what MRI's `inspect` escapes rather than prints.
+fn is_unassigned(c: char) -> bool {
+    static CN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    CN.get_or_init(|| regex::Regex::new(r"^\p{Cn}$").expect("valid class"))
+        .is_match(c.encode_utf8(&mut [0; 4]))
+}
+
+fn inspect_string_with(s: &str, view: Option<UnitView>) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     let mut chars = s.chars().peekable();
@@ -11357,8 +11414,20 @@ fn inspect_string_with(s: &str, broken_units: bool) -> String {
             c if (c as u32) < 0x20 || matches!(c as u32, 0x7f..=0x9f | 0x2028 | 0x2029) => {
                 out.push_str(&format!("\\u{:04X}", c as u32));
             }
-            c if broken_units && broken_unit_byte(c).is_some() => {
-                out.push_str(&format!("\\x{:02X}", broken_unit_byte(c).unwrap_or(0)));
+            c if view.and_then(|v| v.byte(c)).is_some() => {
+                out.push_str(&format!(
+                    "\\x{:02X}",
+                    view.and_then(|v| v.byte(c)).unwrap_or(0)
+                ));
+            }
+            // An unassigned codepoint (noncharacters included) is not printable
+            // either: `\uXXXX`, or `\u{X}` past the BMP.
+            c if !c.is_ascii() && is_unassigned(c) => {
+                if (c as u32) <= 0xFFFF {
+                    out.push_str(&format!("\\u{:04X}", c as u32));
+                } else {
+                    out.push_str(&format!("\\u{{{:X}}}", c as u32));
+                }
             }
             c => out.push(c),
         }
@@ -14900,13 +14969,13 @@ pub fn call_proc_self_ctx(
             });
             return call_proc(&inner, args);
         }
-        ProcKind::BrokenUnits(inner) => {
+        ProcKind::BrokenUnits(inner, view) => {
             let mapped: Vec<Value> = args
                 .iter()
-                .map(|a| crate::builtins::bytes_of_units(a, 2))
+                .map(|a| crate::builtins::bytes_of_units(a, 2, view))
                 .collect();
             let r = call_proc(&inner, &mapped)?;
-            return Ok(crate::builtins::units_of_bytes(&r, 2));
+            return Ok(crate::builtins::units_of_bytes(&r, 2, view));
         }
         ProcKind::Around(idx) => {
             // A native around block: `yield` in an around handler re-runs the

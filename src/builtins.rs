@@ -9852,6 +9852,14 @@ fn dispatch_string(
     // directly: the work below reads the receiver's content (a copy) and every
     // argument's tag, which on a long string would cost more than the method.
     let Some(enc) = with_host(|h| h.string_encoding(recv)) else {
+        // A binary Regexp (`/\xff/n`) refuses a UTF-8 String holding non-ASCII.
+        if with_host(|h| h.any_binary_regexps())
+            && args
+                .first()
+                .is_some_and(|a| with_host(|h| h.class_of(a)) == "Regexp")
+        {
+            regexp_match_compat(&args[0], recv)?;
+        }
         // Text given a broken UTF-8 argument joins it by bytes.
         if !args.is_empty()
             && !BROKEN_UTF8_BYTE_METHODS.contains(&name)
@@ -9877,6 +9885,12 @@ fn dispatch_string_tagged(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    if let Some(re) = args
+        .first()
+        .filter(|a| with_host(|h| h.class_of(a)) == "Regexp")
+    {
+        regexp_match_compat(re, recv)?;
+    }
     let enc = with_host(|h| h.string_encoding(recv)).unwrap_or("UTF-8");
     if ENCODING_NOT_INHERITED.contains(&name) {
         return dispatch_string_body(recv, name, args, block);
@@ -10051,7 +10065,7 @@ fn broken_utf8_refusal(name: &str, args: &[Value]) -> Option<String> {
 
 /// A broken UTF-8 String (see [`crate::host::BROKEN_UTF8`]): the methods that
 /// know the bytes are invalid, the byte methods on the storage, and every other
-/// method run over the character view ([`crate::host::broken_units`]) — each
+/// method run over the character view ([`crate::host::UnitView`]) — each
 /// invalid byte one character, each valid sequence its character — with the
 /// String results and any change to the receiver mapped back to bytes.
 fn dispatch_broken_utf8(
@@ -10087,14 +10101,13 @@ fn dispatch_broken_utf8(
         }
         "encode" | "encode!" => return encode_broken_utf8(recv, name, &bytes, args),
         "dump" => {
-            let units = crate::host::broken_units(&bytes);
+            let view = crate::host::UnitView::for_operands(&[&bytes], &[]);
+            let units = view.units(&bytes);
             return Ok(new_str(dump_string(
-                units
-                    .chars()
-                    .map(|c| match crate::host::broken_unit_byte(c) {
-                        Some(b) => DUMP_INVALID_BYTE | u32::from(b),
-                        None => u32::from(c),
-                    }),
+                units.chars().map(|c| match view.byte(c) {
+                    Some(b) => DUMP_INVALID_BYTE | u32::from(b),
+                    None => u32::from(c),
+                }),
                 true,
             )));
         }
@@ -10125,7 +10138,8 @@ fn dispatch_utf8_char_view(
         "start_with?" | "end_with?"
             if args.iter().all(|a| with_host(|h| h.as_str(a).is_some())) =>
         {
-            let units = |b: &[u8]| crate::host::broken_units(b);
+            let view = crate::host::UnitView::for_operands(&[&bytes], &[]);
+            let units = |b: &[u8]| view.units(b);
             let whole = units(&bytes);
             let hit = args.iter().any(|a| {
                 let p = with_host(|h| h.string_bytes(a));
@@ -10174,10 +10188,23 @@ fn dispatch_utf8_char_view(
         }
         _ => {}
     }
-    let units = crate::host::broken_units(&bytes);
+    // The parking block for invalid bytes avoids every character of the
+    // receiver and of the String arguments, so the view reads back exactly.
+    let operand_bytes: Vec<Vec<u8>> = args
+        .iter()
+        .filter(|a| with_host(|h| h.as_str(a).is_some()))
+        .map(|a| with_host(|h| h.string_bytes(a)))
+        .collect();
+    let mut operands: Vec<&[u8]> = vec![&bytes];
+    operands.extend(operand_bytes.iter().map(Vec::as_slice));
+    let unit_view = crate::host::UnitView::for_operands(&operands, &[]);
+    let units = unit_view.units(&bytes);
     let view = new_str(units.clone());
-    let block = block.map(|b| with_host(|h| h.new_broken_units_block(b)));
-    let args: Vec<Value> = args.iter().map(|a| units_of_bytes(a, 1)).collect();
+    let block = block.map(|b| with_host(|h| h.new_broken_units_block(b, unit_view)));
+    let args: Vec<Value> = args
+        .iter()
+        .map(|a| units_of_bytes(a, 1, unit_view))
+        .collect();
     let out = dispatch_string(&view, name, &args, block)?;
     // An Enumerator over the view iterates the receiver.
     if with_host(|h| h.enum_source(&out)).is_some_and(|s| s == view) {
@@ -10187,32 +10214,38 @@ fn dispatch_utf8_char_view(
     let after = with_host(|h| h.as_str(&view).unwrap_or_default());
     if after != units {
         frozen_guard(recv, name, STRING_MUTATORS)?;
-        with_host(|h| h.set_utf8_bytes(recv, crate::host::units_to_bytes(&after)));
+        with_host(|h| h.set_utf8_bytes(recv, unit_view.to_bytes(&after)));
     }
     if out == view {
         return Ok(recv.clone());
     }
-    Ok(bytes_of_units(&out, 2))
+    Ok(bytes_of_units(&out, 2, unit_view))
 }
 
 /// A value computed over a broken String's character view, as the user sees
 /// it: each String in it (to `depth` Array levels) that holds a view character
 /// becomes a String of the bytes it stands for. Anything else is unchanged.
-pub(crate) fn bytes_of_units(v: &Value, depth: u8) -> Value {
+pub(crate) fn bytes_of_units(v: &Value, depth: u8, view: crate::host::UnitView) -> Value {
     if let Some(s) = with_host(|h| h.as_str(v).filter(|_| h.string_encoding(v).is_none())) {
-        if s.chars()
-            .any(|c| crate::host::broken_unit_byte(c).is_some())
-        {
-            return with_host(|h| h.new_utf8_from_bytes(crate::host::units_to_bytes(&s)));
+        if s.chars().any(|c| view.byte(c).is_some()) {
+            return with_host(|h| h.new_utf8_from_bytes(view.to_bytes(&s)));
         }
         return v.clone();
     }
     if depth > 0 {
         if let Some(items) = with_host(|h| h.as_array(v)) {
-            return new_arr(items.iter().map(|x| bytes_of_units(x, depth - 1)).collect());
+            return new_arr(
+                items
+                    .iter()
+                    .map(|x| bytes_of_units(x, depth - 1, view))
+                    .collect(),
+            );
         }
         if let Some(buf) = with_host(|h| h.enum_buf(v)) {
-            let mapped = buf.iter().map(|x| bytes_of_units(x, depth - 1)).collect();
+            let mapped = buf
+                .iter()
+                .map(|x| bytes_of_units(x, depth - 1, view))
+                .collect();
             with_host(|h| h.set_enum_buf(v, mapped));
         }
     }
@@ -10222,13 +10255,18 @@ pub(crate) fn bytes_of_units(v: &Value, depth: u8) -> Value {
 /// The inverse of [`bytes_of_units`]: a user value handed back to a method
 /// running over a broken String's character view, with each broken String in
 /// it as view text.
-pub(crate) fn units_of_bytes(v: &Value, depth: u8) -> Value {
+pub(crate) fn units_of_bytes(v: &Value, depth: u8, view: crate::host::UnitView) -> Value {
     if with_host(|h| h.is_broken_utf8(v)) {
-        return new_str(crate::host::broken_units(&with_host(|h| h.string_bytes(v))));
+        return new_str(view.units(&with_host(|h| h.string_bytes(v))));
     }
     if depth > 0 {
         if let Some(items) = with_host(|h| h.as_array(v)) {
-            return new_arr(items.iter().map(|x| units_of_bytes(x, depth - 1)).collect());
+            return new_arr(
+                items
+                    .iter()
+                    .map(|x| units_of_bytes(x, depth - 1, view))
+                    .collect(),
+            );
         }
     }
     v.clone()
@@ -17025,6 +17063,17 @@ fn dispatch_lazy(
             }
         }
         "force" | "to_a" | "entries" => Ok(new_arr(lazy_pull(&source, &ops, usize::MAX)?)),
+        // Without a block `each` answers the Lazy itself.
+        "each" if block.is_none() && args.is_empty() => Ok(recv.clone()),
+        // With no stage it is the source's own `each`, and answers what that
+        // does (the Array, the Range, a generator body's value).
+        "each" if block.is_some() && ops.is_empty() => {
+            let origin = with_host(|h| h.lazy_origin(recv)).unwrap_or_else(|| source.clone());
+            dispatch(&origin, "each", args, block)
+        }
+        // A stage MRI runs through `lazy_super` (`each_slice`, `each_cons`,
+        // `chunk_while`, `slice_when`) answers the Lazy it was added to; every
+        // other stage's `each` answers nil.
         "each" if block.is_some() => {
             let bl = block.unwrap();
             lazy_pull_with(&source, &ops, usize::MAX, &mut |out| {
@@ -17036,7 +17085,15 @@ fn dispatch_lazy(
                 }
                 Ok(true)
             })?;
-            Ok(recv.clone())
+            Ok(match ops.last() {
+                Some(LazyOp::EachSlice(_) | LazyOp::EachCons(_) | LazyOp::ChunkWhile(..)) => {
+                    with_host(|h| {
+                        let origin = h.lazy_origin(recv).unwrap_or_else(|| source.clone());
+                        h.new_lazy_of(source.clone(), ops[..ops.len() - 1].to_vec(), origin)
+                    })
+                }
+                _ => Value::Undef,
+            })
         }
         // Every remaining Enumerable method is a TERMINAL one — `sum`, `reduce`,
         // `min`, `count`, `sort`, `group_by`, … — which MRI answers by running
@@ -25812,6 +25869,45 @@ fn get_pat(v: &Value) -> Result<Value, String> {
     }
 }
 
+/// `rb_reg_prepare_enc`: a Regexp whose encoding is fixed (non-ASCII content,
+/// `/u`, or a binary `/\xNN/n`) matches only a String of that encoding once the
+/// String holds non-ASCII; any other pairing is an `Encoding::CompatibilityError`.
+fn regexp_match_compat(re: &Value, s: &Value) -> Result<(), String> {
+    let (source, flags) = with_host(|h| {
+        (
+            h.as_regex(re).map(|(_, src)| src).unwrap_or_default(),
+            h.regex_flags(re).unwrap_or_default(),
+        )
+    });
+    let re_enc = regexp_encoding(&source, &flags);
+    if re_enc == "US-ASCII" {
+        return Ok(());
+    }
+    let (ascii, str_enc) = with_host(|h| {
+        (
+            h.str_ref(s).is_some_and(str::is_ascii),
+            h.string_encoding(s)
+                .filter(|e| *e != crate::host::BROKEN_UTF8)
+                .unwrap_or("UTF-8"),
+        )
+    });
+    if ascii || re_enc == str_enc {
+        return Ok(());
+    }
+    let shown = |e: &str| match e {
+        "ASCII-8BIT" => "BINARY (ASCII-8BIT)".to_string(),
+        other => other.to_string(),
+    };
+    Err(raise_exc(
+        "Encoding::CompatibilityError",
+        &format!(
+            "incompatible encoding regexp match ({} regexp with {} string)",
+            shown(re_enc),
+            shown(str_enc)
+        ),
+    ))
+}
+
 fn dispatch_regexp(
     recv: &Value,
     name: &str,
@@ -25819,6 +25915,14 @@ fn dispatch_regexp(
     block: Option<Value>,
 ) -> Result<Value, String> {
     let (re, source) = with_host(|h| h.as_regex(recv)).unwrap();
+    if matches!(name, "match?" | "=~" | "match" | "===") {
+        if let Some(s) = args
+            .first()
+            .filter(|a| with_host(|h| h.as_str(a).is_some()))
+        {
+            regexp_match_compat(recv, s)?;
+        }
+    }
     match name {
         "source" => Ok(new_str(source)),
         "match?" => {
@@ -30448,7 +30552,7 @@ fn do_require(args: &[Value], mode: ReqMode) -> Result<Value, String> {
 // `force_encoding("UTF-8")` on arbitrary bytes, a `setbyte`) keep this byte
 // storage under the tag [`crate::host::BROKEN_UTF8`]; every untagged String is
 // valid text. Such a String answers its byte methods from the storage and its
-// character methods over [`crate::host::broken_units`] — see
+// character methods over a [`crate::host::UnitView`] — see
 // `dispatch_broken_utf8`.
 
 /// The UTF-8 text `s` re-stored as a byte string (each UTF-8 byte becomes one

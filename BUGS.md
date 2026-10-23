@@ -1129,10 +1129,16 @@ Honest limitations of this surface:
   parsing, as MRI's SyntaxError "invalid symbol". The `ruby` command reports a script that
   does not parse as `<script>: <message> (SyntaxError)`. Output writes a
   String's bytes (`puts "\xff"` writes 0xFF; `IO#write` counts bytes).
-  Residue: a genuine `U+10FF80..U+10FFFF` character inside a String that also
-  holds invalid bytes reads back as a byte (the character view parks invalid
-  bytes there); matching a fixed-encoding UTF-8 Regexp against a non-ASCII
-  ASCII-8BIT String does not raise `Encoding::CompatibilityError`.
+  The character view parks each invalid byte in a 256-codepoint block chosen
+  per operation to hold no character of any operand, so a genuine
+  `U+10FFA0` beside invalid bytes stays a character. A Regexp of fixed
+  encoding (non-ASCII, `/u`, binary `/\xNN/n`) matched against a String of
+  another encoding holding non-ASCII raises `Encoding::CompatibilityError`
+  (`incompatible encoding regexp match (UTF-8 regexp with BINARY (ASCII-8BIT)
+  string)`). `inspect` escapes unassigned codepoints (`"\u0378"`,
+  `"\u{10FFFF}"`), going by the regex crate's Unicode tables, which may trail
+  MRI's Unicode 17. Residue: the warning MRI prints for a `/…/n` Regexp
+  matched against a non-ASCII UTF-8 String is not printed.
   `File.read` keeps a file's invalid bytes the same way, `File.binread(path,
   length, offset)` answers ASCII-8BIT, and `File.write`/`binwrite` write a
   String's bytes.
@@ -1222,7 +1228,10 @@ Honest limitations of this surface:
   still answers `first`/`find`/`lazy`. `next`/`peek`/`feed` are undefined on the
   class, as in enumerator.c. `Enumerator::Lazy#chain`/`+` answer a Lazy over the
   chain, and `Lazy#each { }` walks its pipeline one element at a time, so an
-  endless one stops at a `break`.
+  endless one stops at a `break`. It answers what MRI's does: the source's
+  own `each` result with no stage, the Lazy before an `each_slice`/
+  `each_cons`/`chunk_while`/`slice_when` stage, nil after any other; without
+  a block, the Lazy itself.
 
 - **Argument counts on built-ins are checked once, from a measured table.** Every
   built-in dispatch arm reads its arguments positionally (`args[0]`), so a call

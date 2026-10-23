@@ -7284,4 +7284,52 @@ true
 "SS"
 #==#
 <error>#==#
-<error>
+<error>#==#
+"􏾠x\xFF"
+3
+[244, 143, 190, 160, 120, 255]
+["􏾠", "x", "\xFF"]
+[255, 120, 244, 143, 190, 160]
+[244, 143, 190, 160]
+"\"\\u{10FFA0}x\\xFF\""
+[42, 42, 244, 143, 190, 160, 120, 255, 42, 42]
+4
+3
+[[97], [254], [244, 143, 190, 128]]
+2
+true
+[[244, 143, 190, 160], [120], [255]]
+[244, 143, 190, 160, 244, 143, 191, 190, 255]
+[244, 143, 190, 160, 244, 143, 190, 170, 255]
+"\uFDD0"
+"\uFFFE"
+"\u{1FFFF}"
+"\u{10FFFE}"
+"\u0378"
+""
+"­"
+#==#
+#<Encoding::CompatibilityError: incompatible encoding regexp match (UTF-8 regexp with BINARY (ASCII-8BIT) string)>
+nil
+nil
+#<Encoding::CompatibilityError: incompatible encoding regexp match (UTF-8 regexp with BINARY (ASCII-8BIT) string)>
+#<Encoding::CompatibilityError: incompatible encoding regexp match (UTF-8 regexp with BINARY (ASCII-8BIT) string)>
+#<Encoding::CompatibilityError: incompatible encoding regexp match (UTF-8 regexp with BINARY (ASCII-8BIT) string)>
+#<Encoding::CompatibilityError: incompatible encoding regexp match (UTF-8 regexp with BINARY (ASCII-8BIT) string)>
+#<Encoding::CompatibilityError: incompatible encoding regexp match (UTF-8 regexp with BINARY (ASCII-8BIT) string)>
+#<Encoding::CompatibilityError: incompatible encoding regexp match (BINARY (ASCII-8BIT) regexp with UTF-8 string)>
+nil
+#<Encoding::CompatibilityError: incompatible encoding regexp match (UTF-8 regexp with ISO-8859-1 string)>
+#<Encoding::CompatibilityError: incompatible encoding regexp match (UTF-8 regexp with BINARY (ASCII-8BIT) string)>
+#<Encoding::CompatibilityError: incompatible encoding regexp match (UTF-8 regexp with BINARY (ASCII-8BIT) string)>
+#<Encoding::CompatibilityError: incompatible encoding regexp match (UTF-8 regexp with BINARY (ASCII-8BIT) string)>
+#==#
+1..3
+[1, 2]
+nil
+#<Enumerator::Lazy: 1..3>
+{a: 1}
+:gen
+[1, 2]
+#<Enumerator::Lazy: [1, 2]>
+nil
