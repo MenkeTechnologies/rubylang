@@ -1545,6 +1545,8 @@ pub struct RubyHost {
     /// The `inspect` of an Enumerator MRI builds over an `Enumerator::Generator`
     /// (`chunk_while`, `slice_when`, …), which rubylang materializes.
     enum_labels: std::collections::HashMap<u32, String>,
+    /// `IO#lineno` per `io_handles` index.
+    io_linenos: std::collections::HashMap<u32, i64>,
     struct_counter: u32,
     /// `refine Target do … end` definitions: the refining module → its
     /// `(target class, refinement class)` pairs. A refinement's methods live in
@@ -2374,6 +2376,7 @@ impl RubyHost {
             builtin_libs_loaded: std::collections::HashSet::new(),
             enum_size_fns: std::collections::HashMap::new(),
             enum_labels: std::collections::HashMap::new(),
+            io_linenos: std::collections::HashMap::new(),
             struct_counter: 0,
             refinement_defs: IndexMap::new(),
             active_refinements: Vec::new(),
@@ -5796,6 +5799,18 @@ impl RubyHost {
     /// The opening of a Struct/Data instance's inspect: `#<struct Point` /
     /// `#<data D`. An instance of a class never bound to a constant (still
     /// `Struct:N`) has no name to show, so MRI prints just `#<struct` / `#<data`.
+    /// A whole Struct/Data inspect from its `member=value` parts, spaced as
+    /// `rb_struct_inspect` / `rb_data_inspect` space it: `#<struct S a=1>`,
+    /// `#<struct a=1>`, `#<struct S>`, and `#<struct >` for an anonymous one
+    /// with no members.
+    pub fn struct_inspect(&self, class: &str, parts: &[String]) -> String {
+        let head = self.struct_inspect_head(class);
+        let named = !class.starts_with("#<");
+        match (parts.is_empty(), named) {
+            (true, true) => format!("{head}>"),
+            _ => format!("{head} {}>", parts.join(", ")),
+        }
+    }
     pub fn struct_inspect_head(&self, class: &str) -> String {
         let kind = if self.is_data_class(class) {
             "data"
@@ -8917,7 +8932,7 @@ impl RubyHost {
                                 format!("{m}={}", self.inspect(&v))
                             })
                             .collect();
-                        format!("{} {}>", self.struct_inspect_head(&class), parts.join(", "))
+                        self.struct_inspect(&class, &parts)
                     } else {
                         match ivars.get("message") {
                             Some(m) => self.to_s(&m.clone()),
@@ -13530,6 +13545,43 @@ pub fn io_read_all(v: &Value) -> Result<String, String> {
             None => Err("not an IO".to_string()),
         }
     })
+}
+
+/// Run `op` on the open `std::fs::File` behind a `File` handle. A closed file is
+/// `closed stream`; a standard stream or socket is not seekable here.
+pub fn io_with_file<T>(
+    v: &Value,
+    op: impl FnOnce(&mut std::fs::File) -> std::io::Result<T>,
+) -> Result<T, String> {
+    let id = io_id(v).ok_or("not an IO")?;
+    with_host(|h| match h.io_handles.get_mut(id as usize) {
+        Some(IoCell::File { file: Some(f), .. }) => op(f).map_err(|e| e.to_string()),
+        Some(IoCell::File { file: None, .. }) => Err("closed stream".to_string()),
+        _ => Err("Illegal seek".to_string()),
+    })
+}
+
+/// `IO#read(length)`: up to `length` bytes from the current position.
+pub fn io_read_bytes(v: &Value, length: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    io_with_file(v, |f| {
+        let mut buf = Vec::with_capacity(length);
+        f.take(length as u64).read_to_end(&mut buf)?;
+        Ok(buf)
+    })
+}
+
+/// The `IO#lineno` counter of a handle (lines read by `gets` and friends).
+pub fn io_lineno(v: &Value) -> i64 {
+    io_id(v)
+        .map(|id| with_host(|h| h.io_linenos.get(&id).copied().unwrap_or(0)))
+        .unwrap_or(0)
+}
+
+pub fn io_set_lineno(v: &Value, n: i64) {
+    if let Some(id) = io_id(v) {
+        with_host(|h| h.io_linenos.insert(id, n));
+    }
 }
 
 /// `IO#gets`: read one line up to and including the next `\n` (or EOF). Returns

@@ -337,11 +337,28 @@ module RbConfig
   }
 end
 
+class IO
+  SEEK_SET = 0
+  SEEK_CUR = 1
+  SEEK_END = 2
+end
+
 class File
   SEPARATOR = "/"
   ALT_SEPARATOR = nil
   PATH_SEPARATOR = ":"
   Separator = "/"
+  # MRI reaches these through `File < IO`; File here does not inherit IO's.
+  SEEK_SET = 0
+  SEEK_CUR = 1
+  SEEK_END = 2
+  FNM_NOESCAPE = 1
+  FNM_PATHNAME = 2
+  FNM_DOTMATCH = 4
+  FNM_CASEFOLD = 8
+  FNM_EXTGLOB = 16
+  FNM_SYSCASE = 0
+  FNM_SHORTNAME = 0
 end
 
 class Regexp

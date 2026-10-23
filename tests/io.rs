@@ -297,3 +297,47 @@ fn puts_flattens_arrays_the_same_on_every_stream() {
         "\"1\\n\"",
     );
 }
+
+/// Positioning and the byte/char readers on a File (`rb_io_tell`/`seek`/
+/// `rewind`/`eof`/`getc`/`getbyte`, `read(length)`), and `lineno` counting
+/// every line read. Expected values from ruby 4.0.7.
+#[test]
+fn io_positioning_lineno_and_partial_reads() {
+    let d = tmp();
+    let p = d.path().join("pos.txt");
+    let p = p.to_str().unwrap();
+    eq(
+        &format!(
+            r#"File.write({p:?}, "a\nb\nc\n"); File.open({p:?}) {{ |f| [f.gets, f.lineno, f.readline, f.pos, f.eof?, f.read(1), f.read(0), f.read(10), f.read(1), f.eof?, (f.readline rescue $!.class), f.rewind, f.lineno, f.getc, f.getbyte, f.seek(-2, IO::SEEK_END), f.read, f.seek(1), f.tell, (f.pos = 4), f.readchar, (f.read(-1) rescue $!.message)] }}"#
+        ),
+        r#"["a\n", 1, "b\n", 4, false, "c", "", "\n", nil, true, EOFError, 0, 0, "a", 10, 0, "c\n", 0, 1, 4, "c", "negative length -1 given"]"#,
+    );
+    eq(
+        &format!(
+            r#"File.write({p:?}, "a\nb\nc\n"); File.open({p:?}) {{ |f| f.each_line {{ }}; a = f.lineno; f.rewind; f.readlines; b = f.lineno; f.lineno = 9; f.rewind; f.gets; [a, b, f.lineno] }}"#
+        ),
+        "[3, 3, 1]",
+    );
+    // `getc` reads a whole UTF-8 character; `read(n)` is binary bytes.
+    eq(
+        &format!(
+            r#"File.write({p:?}, "héy"); File.open({p:?}) {{ |f| [f.getc, f.read(1).bytes, f.read(1).encoding.to_s, (f.readbyte rescue $!.class), f.getc, f.getbyte, (f.readchar rescue $!.class)] }}"#
+        ),
+        r#"["h", [195], "ASCII-8BIT", 121, nil, nil, EOFError]"#,
+    );
+}
+
+/// `File.ftype`/`split`/`path`/`mtime`/`identical?`/`rename`/`new`, `access(2)`
+/// predicates, an Array argument to `File.join`, and `Dir.children`/
+/// `each_child`/`empty?`. Expected values from ruby 4.0.7.
+#[test]
+fn file_and_dir_class_surface() {
+    let d = tmp();
+    let d = d.path().to_str().unwrap().to_string();
+    eq(
+        &format!(
+            r#"File.write("{d}/x.txt", "1"); Dir.mkdir("{d}/sub"); [File.ftype("{d}/x.txt"), File.ftype("{d}/sub"), File.split("{d}/x.txt").last, File.split("a"), File.join("a", ["b", ["c"]]), File.mtime("{d}/x.txt").class, File.identical?("{d}/x.txt", "{d}/x.txt"), File.identical?("{d}/x.txt", "{d}/sub"), File.path("{d}/x.txt") == "{d}/x.txt", File.executable?("{d}/x.txt"), File.readable?("{d}/x.txt"), File.rename("{d}/x.txt", "{d}/y.txt"), File.exist?("{d}/x.txt"), Dir.children("{d}").sort, Dir.each_child("{d}").to_a.sort, Dir.empty?("{d}/sub"), File.new("{d}/y.txt").read, (File.ftype("{d}/nope") rescue $!.class), (Dir.empty?("{d}/nope") rescue $!.class)]"#
+        ),
+        r#"["file", "directory", "x.txt", [".", "a"], "a/b/c", Time, true, false, true, false, true, 0, false, ["sub", "y.txt"], ["sub", "y.txt"], true, "1", Errno::ENOENT, Errno::ENOENT]"#,
+    );
+}

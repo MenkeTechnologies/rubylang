@@ -4175,8 +4175,15 @@ fn dispatch_classref(
                 Ok(o)
             }
             "rand" => random_rand(Gen::Default, args),
+            "random_number" => random_number(Gen::Default, args),
+            "bytes" => random_bytes(Gen::Default, args),
             "srand" => random_srand(args),
             "new_seed" => Ok(with_host(|h| h.new_bigint(crate::random::new_seed()))),
+            // `Random::DEFAULT` was removed in Ruby 3.2: a missing constant.
+            _ if name.starts_with(|c: char| c.is_ascii_uppercase()) => Err(raise_exc(
+                "NameError",
+                &format!("uninitialized constant Random::{name}"),
+            )),
             _ => Err(raise_exc(
                 "NoMethodError",
                 &format!("undefined method '{name}' for class Random"),
@@ -6181,8 +6188,7 @@ fn struct_method(
                 .zip(values())
                 .map(|(m, v)| format!("{m}={}", with_host(|h| h.inspect(&v))))
                 .collect();
-            let head = with_host(|h| h.struct_inspect_head(cls));
-            new_str(format!("{head} {}>", parts.join(", ")))
+            new_str(with_host(|h| h.struct_inspect(cls, &parts)))
         }
         // `Data#with(**changes)` — a copy of the receiver with the named members
         // replaced (unknown keys raise ArgumentError, as in MRI). Result frozen.
@@ -17967,6 +17973,8 @@ fn dispatch_file_class(
             }
         }
         "open" => return Some(file_open(args, block)),
+        // `File.new(path, mode = "r")` opens like a block-less `File.open`.
+        "new" if !args.is_empty() => return Some(file_open(args, None)),
         "exist?" | "exists?" => Ok(Value::Bool(
             std::path::Path::new(&str_arg(args, 0)).exists(),
         )),
@@ -17982,9 +17990,111 @@ fn dispatch_file_class(
                 .map(|m| m.file_type().is_symlink())
                 .unwrap_or(false),
         )),
-        "readable?" | "writable?" | "executable?" => Ok(Value::Bool(
-            std::path::Path::new(&str_arg(args, 0)).exists(),
-        )),
+        // `File.ftype` names the entry's type from `lstat` (a symlink is a
+        // "link"), the strings `rb_file_ftype` answers.
+        "ftype" => {
+            use std::os::unix::fs::FileTypeExt;
+            let path = str_arg(args, 0);
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) => {
+                    let t = m.file_type();
+                    Ok(new_str(
+                        if t.is_file() {
+                            "file"
+                        } else if t.is_dir() {
+                            "directory"
+                        } else if t.is_symlink() {
+                            "link"
+                        } else if t.is_char_device() {
+                            "characterSpecial"
+                        } else if t.is_block_device() {
+                            "blockSpecial"
+                        } else if t.is_fifo() {
+                            "fifo"
+                        } else if t.is_socket() {
+                            "socket"
+                        } else {
+                            "unknown"
+                        }
+                        .to_string(),
+                    ))
+                }
+                Err(e) => Err(sys_err(
+                    "No such file or directory @ rb_file_s_ftype",
+                    &path,
+                    &e,
+                )),
+            }
+        }
+        // `File.rename(from, to)` answers 0; a failure names both paths.
+        "rename" if args.len() == 2 => {
+            let (from, to) = (str_arg(args, 0), str_arg(args, 1));
+            match std::fs::rename(&from, &to) {
+                Ok(()) => Ok(Value::Int(0)),
+                Err(e) => Err(sys_err(
+                    "No such file or directory @ rb_file_s_rename",
+                    &format!("({from}, {to})"),
+                    &e,
+                )),
+            }
+        }
+        "split" => {
+            let path = str_arg(args, 0);
+            Ok(new_arr(vec![
+                new_str(path_dirname(&path)),
+                new_str(path_basename(&path, None)),
+            ]))
+        }
+        // `File.path(x)`: the path String of a String or of anything with
+        // `to_path`.
+        "path" if args.len() == 1 => match with_host(|h| h.as_str(&args[0])) {
+            Some(s) => Ok(new_str(s)),
+            None => dispatch(&args[0], "to_path", &[], None),
+        },
+        // `access(2)` against the effective ids, as `rb_eaccess` checks.
+        "readable?" | "writable?" | "executable?" => {
+            let mode = match name {
+                "readable?" => libc::R_OK,
+                "writable?" => libc::W_OK,
+                _ => libc::X_OK,
+            };
+            let ok = std::ffi::CString::new(str_arg(args, 0))
+                .map(|c| unsafe { libc::access(c.as_ptr(), mode) } == 0)
+                .unwrap_or(false);
+            Ok(Value::Bool(ok))
+        }
+        // `File.mtime`/`atime`/`ctime`: the stat time as a local `Time`.
+        "mtime" | "atime" | "ctime" => {
+            use std::os::unix::fs::MetadataExt;
+            let path = str_arg(args, 0);
+            match std::fs::metadata(&path) {
+                Ok(m) => {
+                    let (s, ns) = match name {
+                        "mtime" => (m.mtime(), m.mtime_nsec()),
+                        "atime" => (m.atime(), m.atime_nsec()),
+                        _ => (m.ctime(), m.ctime_nsec()),
+                    };
+                    let unit = with_host(|h| h.new_symbol("nanosecond"));
+                    return time_class_method("at", &[Value::Int(s), Value::Int(ns), unit]);
+                }
+                Err(e) => Err(sys_err(
+                    &format!("No such file or directory @ rb_file_s_{name}"),
+                    &path,
+                    &e,
+                )),
+            }
+        }
+        "identical?" if args.len() == 2 => {
+            use std::os::unix::fs::MetadataExt;
+            let id = |v: &Value| {
+                std::fs::metadata(with_host(|h| h.as_str(v)).unwrap_or_default())
+                    .ok()
+                    .map(|m| (m.dev(), m.ino()))
+            };
+            Ok(Value::Bool(
+                matches!((id(&args[0]), id(&args[1])), (Some(a), Some(b)) if a == b),
+            ))
+        }
         "size?" => {
             let path = str_arg(args, 0);
             Ok(match std::fs::metadata(&path) {
@@ -18029,18 +18139,7 @@ fn dispatch_file_class(
             let pattern = str_arg(args, 0);
             let path = str_arg(args, 1);
             let flags = args.get(2).map(as_i).unwrap_or(0);
-            let case_insensitive = flags & 0x08 != 0; // FNM_CASEFOLD
-            let re_src = format!("(?s){}", fnmatch_to_regex(&pattern));
-            let re_src = if case_insensitive {
-                format!("(?i){re_src}")
-            } else {
-                re_src
-            };
-            let matched = fancy_regex::Regex::new(&re_src)
-                .ok()
-                .and_then(|re| re.is_match(&path).ok())
-                .unwrap_or(false);
-            Ok(Value::Bool(matched))
+            Ok(Value::Bool(file_fnmatch(&pattern, &path, flags)))
         }
         "dirname" => Ok(new_str(path_dirname(&str_arg(args, 0)))),
         "extname" => Ok(new_str(path_extname(&str_arg(args, 0)))),
@@ -18117,6 +18216,29 @@ fn file_open(args: &[Value], block: Option<Value>) -> Result<Value, String> {
 
 /// Instance methods on an `IO`/`File` handle (from `File.open`, or `$stdout`
 /// et al.).
+/// One UTF-8 character from a `File` (`IO#getc`), nil at end of file. A byte
+/// that cannot start a character is answered on its own.
+fn io_read_char(recv: &Value) -> Result<Option<Value>, String> {
+    let first = crate::host::io_read_bytes(recv, 1).map_err(|e| io_err(&e))?;
+    let Some(&b0) = first.first() else {
+        return Ok(None);
+    };
+    let len = match b0 {
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    };
+    let mut bytes = vec![b0];
+    if len > 1 {
+        bytes.extend(crate::host::io_read_bytes(recv, len - 1).map_err(|e| io_err(&e))?);
+    }
+    Ok(Some(match String::from_utf8(bytes.clone()) {
+        Ok(s) => new_str(s),
+        Err(_) => new_str(bytes_to_binstr(&bytes)),
+    }))
+}
+
 fn dispatch_io(
     recv: &Value,
     name: &str,
@@ -18171,20 +18293,144 @@ fn dispatch_io(
             }
             Ok(Value::Undef)
         }
+        // `read(length)` reads at most `length` bytes as a binary String (nil
+        // at end of file); `read` / `read(nil)` reads the rest as text.
+        "read" if args.first().is_some_and(|a| !matches!(a, Value::Undef)) => {
+            let n = to_int(&args[0])?;
+            if n < 0 {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!("negative length {n} given"),
+                ));
+            }
+            let bytes = crate::host::io_read_bytes(recv, n as usize).map_err(|e| io_err(&e))?;
+            if bytes.is_empty() && n > 0 {
+                return Ok(Value::Undef);
+            }
+            let s = new_str(bytes_to_binstr(&bytes));
+            with_host(|h| h.set_string_encoding(&s, "ASCII-8BIT"));
+            Ok(s)
+        }
+        "gets" | "readline" => {
+            let line = crate::host::io_gets(recv).map_err(|e| io_err(&e))?;
+            if matches!(line, Value::Undef) {
+                return if name == "readline" {
+                    Err(raise_exc("EOFError", "end of file reached"))
+                } else {
+                    Ok(line)
+                };
+            }
+            crate::host::io_set_lineno(recv, crate::host::io_lineno(recv) + 1);
+            Ok(line)
+        }
+        "lineno" if args.is_empty() => Ok(Value::Int(crate::host::io_lineno(recv))),
+        "lineno=" if args.len() == 1 => {
+            crate::host::io_set_lineno(recv, to_int(&args[0])?);
+            Ok(args[0].clone())
+        }
+        // Positioning (`rb_io_tell` / `rb_io_seek` / `rb_io_rewind`).
+        "pos" | "tell" if args.is_empty() => {
+            use std::io::Seek;
+            let p =
+                crate::host::io_with_file(recv, |f| f.stream_position()).map_err(|e| io_err(&e))?;
+            Ok(Value::Int(p as i64))
+        }
+        "pos=" | "seek" if !args.is_empty() => {
+            use std::io::{Seek, SeekFrom};
+            let off = to_int(&args[0])?;
+            let whence = match args.get(1) {
+                None => 0,
+                Some(Value::Int(w)) => *w,
+                Some(w) => match name_of(w).as_str() {
+                    "SET" => 0,
+                    "CUR" => 1,
+                    "END" => 2,
+                    other => {
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            &format!("unknown whence: {other}"),
+                        ))
+                    }
+                },
+            };
+            let to = match whence {
+                0 => SeekFrom::Start(off.max(0) as u64),
+                1 => SeekFrom::Current(off),
+                2 => SeekFrom::End(off),
+                w => return Err(raise_exc("ArgumentError", &format!("invalid whence {w}"))),
+            };
+            crate::host::io_with_file(recv, |f| f.seek(to)).map_err(|e| io_err(&e))?;
+            Ok(if name == "seek" {
+                Value::Int(0)
+            } else {
+                args[0].clone()
+            })
+        }
+        "rewind" if args.is_empty() => {
+            use std::io::Seek;
+            crate::host::io_with_file(recv, |f| f.rewind()).map_err(|e| io_err(&e))?;
+            crate::host::io_set_lineno(recv, 0);
+            Ok(Value::Int(0))
+        }
+        "eof?" | "eof" if args.is_empty() => {
+            use std::io::Seek;
+            let at_end = crate::host::io_with_file(recv, |f| {
+                let pos = f.stream_position()?;
+                Ok(pos >= f.metadata()?.len())
+            })
+            .map_err(|e| io_err(&e))?;
+            Ok(Value::Bool(at_end))
+        }
+        // One byte / one character (`rb_io_getbyte` / `rb_io_getc`); the
+        // `read*` forms raise EOFError where these answer nil.
+        "getbyte" | "readbyte" if args.is_empty() => {
+            let b = crate::host::io_read_bytes(recv, 1).map_err(|e| io_err(&e))?;
+            match b.first() {
+                Some(b) => Ok(Value::Int(i64::from(*b))),
+                None if name == "readbyte" => Err(raise_exc("EOFError", "end of file reached")),
+                None => Ok(Value::Undef),
+            }
+        }
+        "getc" | "readchar" if args.is_empty() => match io_read_char(recv)? {
+            Some(c) => Ok(c),
+            None if name == "readchar" => Err(raise_exc("EOFError", "end of file reached")),
+            None => Ok(Value::Undef),
+        },
+        "each_char" | "each_byte" if block.is_some() => {
+            let bl = block.unwrap();
+            loop {
+                let next = if name == "each_char" {
+                    io_read_char(recv)?
+                } else {
+                    crate::host::io_read_bytes(recv, 1)
+                        .map_err(|e| io_err(&e))?
+                        .first()
+                        .map(|b| Value::Int(i64::from(*b)))
+                };
+                let Some(v) = next else { break };
+                call_proc(&bl, &[v])?;
+                if has_pending_signal() {
+                    break;
+                }
+            }
+            Ok(recv.clone())
+        }
         "read" => {
             let s = crate::host::io_read_all(recv).map_err(|e| io_err(&e))?;
             Ok(new_str(s))
         }
-        "gets" => crate::host::io_gets(recv).map_err(|e| io_err(&e)),
-        "readlines" => Ok(new_arr(chomp_lines(
-            crate::host::io_readlines(recv).map_err(|e| io_err(&e))?,
-            chomp_opt(args),
-        ))),
+        "readlines" => {
+            let lines = crate::host::io_readlines(recv).map_err(|e| io_err(&e))?;
+            crate::host::io_set_lineno(recv, crate::host::io_lineno(recv) + lines.len() as i64);
+            Ok(new_arr(chomp_lines(lines, chomp_opt(args))))
+        }
         "each_line" | "each" => {
             let lines = chomp_lines(
                 crate::host::io_readlines(recv).map_err(|e| io_err(&e))?,
                 chomp_opt(args),
             );
+            // Every line read counts toward `lineno`, as `gets` does.
+            crate::host::io_set_lineno(recv, crate::host::io_lineno(recv) + lines.len() as i64);
             match block {
                 Some(bl) => {
                     for l in &lines {
@@ -19160,6 +19406,47 @@ fn dispatch_dir_class(
                 )),
             }
         }
+        // `children` / `each_child`: the entries without `.` and `..`, in
+        // directory order; `empty?` is whether there are none.
+        "children" | "each_child" | "empty?" => {
+            let path = str_arg(args, 0);
+            let names: Vec<Value> = match std::fs::read_dir(&path) {
+                Ok(rd) => rd
+                    .flatten()
+                    .map(|e| new_str(e.file_name().to_string_lossy().into_owned()))
+                    .collect(),
+                Err(e) if name == "empty?" => {
+                    return Some(Err(sys_err(
+                        "No such file or directory @ rb_dir_s_empty_p",
+                        &path,
+                        &e,
+                    )))
+                }
+                Err(e) => {
+                    return Some(Err(sys_err(
+                        "No such file or directory @ dir_initialize",
+                        &path,
+                        &e,
+                    )))
+                }
+            };
+            match (name, block) {
+                ("empty?", _) => Ok(Value::Bool(names.is_empty())),
+                ("each_child", Some(b)) => {
+                    for n in names {
+                        if let Err(e) = call_proc(&b, &[n]) {
+                            return Some(Err(e));
+                        }
+                        if has_pending_signal() {
+                            break;
+                        }
+                    }
+                    Ok(Value::Undef)
+                }
+                ("each_child", None) => Ok(with_host(|h| h.new_enumerator(names, "each"))),
+                _ => Ok(new_arr(names)),
+            }
+        }
         "exist?" | "exists?" => Ok(Value::Bool(
             std::path::Path::new(&str_arg(args, 0)).is_dir(),
         )),
@@ -19302,45 +19589,293 @@ fn brace_expand(pattern: &str) -> Vec<String> {
     out
 }
 
-/// Anchored regex source for a `File.fnmatch` glob: `*`→`.*`, `?`→`.`, `[…]`
-/// character classes pass through, everything else is escaped literally.
-fn fnmatch_to_regex(pattern: &str) -> String {
-    let mut out = String::from("\\A");
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '*' => out.push_str(".*"),
-            '?' => out.push('.'),
+// ---- File.fnmatch: a port of dir.c's `fnmatch` / `fnmatch_helper` / `bracket` ----
+
+const FNM_NOESCAPE: i64 = 1;
+const FNM_PATHNAME: i64 = 2;
+const FNM_DOTMATCH: i64 = 4;
+const FNM_CASEFOLD: i64 = 8;
+const FNM_EXTGLOB: i64 = 16;
+
+/// The character at `i`, NUL past the end (dir.c walks NUL-terminated strings).
+fn fnm_at(v: &[char], i: usize) -> char {
+    v.get(i).copied().unwrap_or('\0')
+}
+
+fn fnm_upper(c: char) -> char {
+    c.to_uppercase().next().unwrap_or(c)
+}
+
+/// `bracket`: match `s[si]` against the class opening at `p[pi]` (just past
+/// `[`). The index just past the closing `]` on a match.
+fn fnm_bracket(p: &[char], mut pi: usize, s: &[char], si: usize, flags: i64) -> Option<usize> {
+    let nocase = flags & FNM_CASEFOLD != 0;
+    let escape = flags & FNM_NOESCAPE == 0;
+    let (mut ok, mut not) = (false, false);
+    if pi >= p.len() {
+        return None;
+    }
+    if matches!(p[pi], '!' | '^') {
+        not = true;
+        pi += 1;
+    }
+    let c = fnm_at(s, si);
+    while fnm_at(p, pi) != ']' {
+        let mut t1 = pi;
+        if escape && fnm_at(p, t1) == '\\' {
+            t1 += 1;
+        }
+        if fnm_at(p, t1) == '\0' {
+            return None;
+        }
+        pi = t1 + 1;
+        if pi >= p.len() {
+            return None;
+        }
+        if fnm_at(p, pi) == '-' && fnm_at(p, pi + 1) != ']' {
+            let mut t2 = pi + 1;
+            if escape && fnm_at(p, t2) == '\\' {
+                t2 += 1;
+            }
+            if fnm_at(p, t2) == '\0' {
+                return None;
+            }
+            pi = t2 + 1;
+            if ok {
+                continue;
+            }
+            if p[t1] == c || p[t2] == c {
+                ok = true;
+                continue;
+            }
+            let fold = |x: char| if nocase { fnm_upper(x) } else { x };
+            let c1 = fold(c);
+            if c1 < fold(p[t1]) || c1 > fold(p[t2]) {
+                continue;
+            }
+        } else {
+            if ok {
+                continue;
+            }
+            if p[t1] == c {
+                ok = true;
+                continue;
+            }
+            // dir.c compares against the character AFTER `t1` here (`p` has
+            // already moved on), so `File.fnmatch("[!a]*", "ABC", FNM_CASEFOLD)`
+            // is true in MRI; kept as the reference behaves.
+            if !nocase || fnm_upper(c) != fnm_upper(fnm_at(p, pi)) {
+                continue;
+            }
+        }
+        ok = true;
+    }
+    (ok != not).then_some(pi + 1)
+}
+
+/// `fnmatch_helper`: match one path segment (the whole string without
+/// `FNM_PATHNAME`), advancing `pi`/`si` past what it consumed.
+fn fnm_helper(p: &[char], pi: &mut usize, s: &[char], si: &mut usize, flags: i64) -> bool {
+    let period = flags & FNM_DOTMATCH == 0;
+    let pathname = flags & FNM_PATHNAME != 0;
+    let escape = flags & FNM_NOESCAPE == 0;
+    let nocase = flags & FNM_CASEFOLD != 0;
+    let is_end = |v: &[char], i: usize| i >= v.len() || (pathname && v[i] == '/');
+    let unescape = |i: usize| {
+        if escape && fnm_at(p, i) == '\\' {
+            i + 1
+        } else {
+            i
+        }
+    };
+    let (mut ptmp, mut stmp): (Option<usize>, Option<usize>) = (None, None);
+    let (mut pc, mut sc) = (*pi, *si);
+    let ret = |pc: usize, sc: usize, pi: &mut usize, si: &mut usize, r: bool| {
+        *pi = pc;
+        *si = sc;
+        r
+    };
+    if period && fnm_at(s, sc) == '.' && fnm_at(p, unescape(pc)) != '.' {
+        return ret(pc, sc, pi, si, false);
+    }
+    loop {
+        let mut failed = false;
+        match fnm_at(p, pc) {
+            '*' => {
+                while fnm_at(p, pc) == '*' {
+                    pc += 1;
+                }
+                if is_end(p, unescape(pc)) {
+                    return ret(unescape(pc), sc, pi, si, true);
+                }
+                if is_end(s, sc) {
+                    return ret(pc, sc, pi, si, false);
+                }
+                ptmp = Some(pc);
+                stmp = Some(sc);
+                continue;
+            }
+            '?' => {
+                if is_end(s, sc) {
+                    return ret(pc, sc, pi, si, false);
+                }
+                pc += 1;
+                sc += 1;
+                continue;
+            }
             '[' => {
-                out.push('[');
-                // Copy the character class verbatim up to the closing `]`.
-                if matches!(chars.peek(), Some('!')) {
-                    chars.next();
-                    out.push('^');
+                if is_end(s, sc) {
+                    return ret(pc, sc, pi, si, false);
                 }
-                for cc in chars.by_ref() {
-                    out.push(cc);
-                    if cc == ']' {
-                        break;
+                match fnm_bracket(p, pc + 1, s, sc, flags) {
+                    Some(t) => {
+                        pc = t;
+                        sc += 1;
+                        continue;
                     }
+                    None => failed = true,
                 }
             }
-            '\\' => {
-                if let Some(n) = chars.next() {
-                    out.push('\\');
-                    out.push(n);
-                }
+            _ => {}
+        }
+        if !failed {
+            pc = unescape(pc);
+            if is_end(s, sc) {
+                let r = is_end(p, pc);
+                return ret(pc, sc, pi, si, r);
             }
-            // Escape regex metacharacters that are literal in a glob.
-            '.' | '(' | ')' | '+' | '^' | '$' | '{' | '}' | '|' => {
-                out.push('\\');
-                out.push(c);
+            let same = !is_end(p, pc)
+                && (p[pc] == s[sc] || (nocase && fnm_upper(p[pc]) == fnm_upper(s[sc])));
+            if same {
+                pc += 1;
+                sc += 1;
+                continue;
             }
-            _ => out.push(c),
+        }
+        // failed: try the next position for the last `*`.
+        match (ptmp, stmp) {
+            (Some(pt), Some(st)) => {
+                pc = pt;
+                stmp = Some(st + 1);
+                sc = st + 1;
+            }
+            _ => return ret(pc, sc, pi, si, false),
         }
     }
-    out.push_str("\\z");
+}
+
+/// `fnmatch`: with `FNM_PATHNAME` the pattern is matched segment by segment
+/// and `**/` spans any number of directories.
+fn fnm_match(p: &[char], s: &[char], flags: i64) -> bool {
+    let period = flags & FNM_DOTMATCH == 0;
+    let (mut pi, mut si) = (0, 0);
+    if flags & FNM_PATHNAME == 0 {
+        return fnm_helper(p, &mut pi, s, &mut si, flags);
+    }
+    let (mut ptmp, mut stmp): (Option<usize>, Option<usize>) = (None, None);
+    loop {
+        if fnm_at(p, pi) == '*' && fnm_at(p, pi + 1) == '*' && fnm_at(p, pi + 2) == '/' {
+            while fnm_at(p, pi) == '*' && fnm_at(p, pi + 1) == '*' && fnm_at(p, pi + 2) == '/' {
+                pi += 3;
+            }
+            ptmp = Some(pi);
+            stmp = Some(si);
+        }
+        if fnm_helper(p, &mut pi, s, &mut si, flags) {
+            while si < s.len() && s[si] != '/' {
+                si += 1;
+            }
+            if pi < p.len() && si < s.len() {
+                pi += 1;
+                si += 1;
+                continue;
+            }
+            if pi >= p.len() && si >= s.len() {
+                return true;
+            }
+        }
+        // failed: let the last `**/` swallow one more directory.
+        if let (Some(pt), Some(mut st)) = (ptmp, stmp) {
+            if !(period && fnm_at(s, st) == '.') {
+                while st < s.len() && s[st] != '/' {
+                    st += 1;
+                }
+                if st < s.len() {
+                    pi = pt;
+                    st += 1;
+                    stmp = Some(st);
+                    si = st;
+                    continue;
+                }
+            }
+        }
+        return false;
+    }
+}
+
+/// `ruby_brace_expand`: every alternative of the first top-level `{a,b}`
+/// group, recursively (escapes are kept and skip the next character).
+fn fnm_brace_expand(p: &str, escape: bool) -> Vec<String> {
+    let cs: Vec<char> = p.chars().collect();
+    let (mut lbrace, mut rbrace, mut nest, mut i) = (None, None, 0, 0);
+    while i < cs.len() {
+        match cs[i] {
+            '{' => {
+                if nest == 0 {
+                    lbrace = Some(i);
+                }
+                nest += 1;
+            }
+            '}' if lbrace.is_some() => {
+                nest -= 1;
+                if nest == 0 {
+                    rbrace = Some(i);
+                    break;
+                }
+            }
+            '\\' if escape => i += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    let (Some(l), Some(r)) = (lbrace, rbrace) else {
+        return vec![p.to_string()];
+    };
+    let head: String = cs[..l].iter().collect();
+    let tail: String = cs[r + 1..].iter().collect();
+    let mut out = Vec::new();
+    let (mut start, mut depth, mut j) = (l + 1, 0, l + 1);
+    while j <= r {
+        let c = cs[j];
+        if c == '\\' && escape {
+            j += 2;
+            continue;
+        }
+        if c == '{' {
+            depth += 1;
+        } else if c == '}' && depth > 0 {
+            depth -= 1;
+        } else if (c == ',' && depth == 0) || j == r {
+            let alt: String = cs[start..j].iter().collect();
+            out.extend(fnm_brace_expand(&format!("{head}{alt}{tail}"), escape));
+            start = j + 1;
+        }
+        j += 1;
+    }
     out
+}
+
+/// `File.fnmatch(pattern, path, flags = 0)`.
+fn file_fnmatch(pattern: &str, path: &str, flags: i64) -> bool {
+    let s: Vec<char> = path.chars().collect();
+    let patterns = if flags & FNM_EXTGLOB != 0 {
+        fnm_brace_expand(pattern, flags & FNM_NOESCAPE == 0)
+    } else {
+        vec![pattern.to_string()]
+    };
+    patterns
+        .iter()
+        .any(|p| fnm_match(&p.chars().collect::<Vec<_>>(), &s, flags))
 }
 
 // ---- pure path helpers (File.basename/dirname/extname/join/expand_path) ----
@@ -19422,10 +19957,18 @@ fn path_dirname(path: &str) -> String {
 /// `File.join(*parts)` — join with `/`, collapsing so exactly one slash sits
 /// between adjacent parts. No parts → `""`.
 fn path_join(parts: &[Value]) -> String {
-    let strs: Vec<String> = parts
-        .iter()
-        .map(|p| with_host(|h| h.as_str(p)).unwrap_or_default())
-        .collect();
+    // An Array argument contributes its elements, nested Arrays included
+    // (`File.join("a", ["b", ["c"]])` is "a/b/c").
+    fn flat(parts: &[Value], out: &mut Vec<String>, depth: usize) {
+        for p in parts {
+            match with_host(|h| h.as_array(p)) {
+                Some(items) if depth < 64 => flat(&items, out, depth + 1),
+                _ => out.push(with_host(|h| h.as_str(p)).unwrap_or_default()),
+            }
+        }
+    }
+    let mut strs = Vec::new();
+    flat(parts, &mut strs, 0);
     let mut it = strs.into_iter();
     let mut s = match it.next() {
         Some(first) => first,
@@ -25435,6 +25978,17 @@ fn random_rand(g: Gen, args: &[Value]) -> Result<Value, String> {
     if with_host(|h| h.as_bigint(v)).is_some() {
         return random_int(g, &random_int_arg(v)?, true).ok_or_else(invalid);
     }
+    // Anything else Integer-like (`rb_check_to_int`: a Rational, a user
+    // `to_int`) is drawn as that Integer; a Float is a Float bound below.
+    if !matches!(v, Value::Float(_) | Value::Int(_)) && with_host(|h| h.as_range(v).is_none()) {
+        if let Some(i) = probe_dispatch(v, "respond_to?", &[with_host(|h| h.new_symbol("to_int"))])
+            .filter(|r| with_host(|h| h.truthy(r)))
+            .map(|_| dispatch(v, "to_int", &[], None))
+        {
+            let i = i?;
+            return random_int(g, &random_int_arg(&i)?, true).ok_or_else(invalid);
+        }
+    }
     if let Value::Float(max) = v {
         if !max.is_finite() {
             return Err(raise_exc("Errno::EDOM", "Numerical argument out of domain"));
@@ -25449,6 +26003,47 @@ fn random_rand(g: Gen, args: &[Value]) -> Result<Value, String> {
         Some(Value::Undef) => Err(invalid()),
         Some(r) => Ok(r),
         None => Err(conv_error(v, "Integer")),
+    }
+}
+
+/// `Random#bytes(n)` (`rand_mt_get_bytes`): whole 32-bit draws laid down
+/// little-endian, then the low bytes of one more draw for a tail.
+fn random_bytes(g: Gen, args: &[Value]) -> Result<Value, String> {
+    let n = to_int(args.first().unwrap_or(&Value::Int(0)))?;
+    if n < 0 {
+        return Err(raise_exc(
+            "ArgumentError",
+            "negative string size (or size too big)",
+        ));
+    }
+    let n = n as usize;
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        let word = crate::random::int32(g).to_le_bytes();
+        let take = (n - out.len()).min(4);
+        out.extend_from_slice(&word[..take]);
+    }
+    let s = new_str(bytes_to_binstr(&out));
+    with_host(|h| h.set_string_encoding(&s, "ASCII-8BIT"));
+    Ok(s)
+}
+
+/// `Random::Formatter#random_number(n = 0)` (`rand_random_number`): `rand(n)`,
+/// except that where `rand` has no answer for the argument (nil, a
+/// non-positive Integer, a negative Float) it is a Float in `[0, 1)`.
+fn random_number(g: Gen, args: &[Value]) -> Result<Value, String> {
+    let float = || Ok(Value::Float(crate::random::real(g, true)));
+    match args.first() {
+        None | Some(Value::Undef) => float(),
+        Some(Value::Int(n)) if *n <= 0 => float(),
+        Some(v)
+            if with_host(|h| h.as_bigint(v))
+                .is_some_and(|b| b.sign() == num_bigint::Sign::Minus) =>
+        {
+            float()
+        }
+        Some(Value::Float(f)) if *f < 0.0 => float(),
+        _ => random_rand(g, args),
     }
 }
 
@@ -25764,6 +26359,8 @@ fn condvar_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Val
 fn random_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<Value>, String> {
     match name {
         "rand" => random_rand(random_gen(Some(recv)), args).map(Some),
+        "random_number" => random_number(random_gen(Some(recv)), args).map(Some),
+        "bytes" => random_bytes(random_gen(Some(recv)), args).map(Some),
         "seed" => Ok(Some(with_host(|h| h.ivar_of(recv, "seed")))),
         _ => Ok(None),
     }

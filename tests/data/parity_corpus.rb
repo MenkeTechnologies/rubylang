@@ -8264,3 +8264,19 @@ p 3.times, 3.times.each { }, 1.upto(3), 1.upto(3).each { }, 3.downto(1), 3.downt
 p (1..3).each, (1..3).each.next, (1..3).each.size, (1..3).each.each { }, ("a".."c").each, ("a".."c").each.size, ("a".."e").step(2), ("a".."e").step(2).size, ("a".."e").step(2).to_a
 p [1, 2].each.with_index(1), [1, 2].map.with_index, [1, 2].each_with_index.with_index, [1, 2].each.each_with_index, [1, 2].each.with_object(1)
 o = Object.new; def o.each; yield 1; end; p o.to_enum.inspect.sub(/0x\h+/, "X"), [1, 2].to_enum(:map), [1, 2, 3].to_enum(:each_slice, 2), {a: 1}.to_enum
+#==#
+# ── File.fnmatch: dir.c's fnmatch over every flag (leading dot, PATHNAME, **/, classes, EXTGLOB, CASEFOLD quirk) ──
+pats = ["*", "*.txt", ".*", "?", "[a-c]*", "[!a]*", "[^a]*", "a\\*b", "**/*.rb", "**/c.rb", "a/*/c.rb", "*/c.rb", "{a,b}*", "a[-]b", "[]]", "[a-]", "A*", "*/", "a/**/b", "**", "c?t", "*.{rb,py}", "\\[x]", "[\\]]"]
+strs = ["a.txt", ".hidden", "a/b/c.rb", "abc", "b", "a*b", "a-b", "]", "-", "ABC", "a/b", "c.rb", "a/.x/c.rb", "cat", "c/t", "x.py", "[x]", "a", "dir/", "a/x/y/b", "a/b/"]
+flags = [0, File::FNM_PATHNAME, File::FNM_DOTMATCH, File::FNM_CASEFOLD, File::FNM_EXTGLOB, File::FNM_NOESCAPE, File::FNM_PATHNAME | File::FNM_DOTMATCH, File::FNM_EXTGLOB | File::FNM_PATHNAME]
+pats.each { |pa| puts strs.map { |s| flags.map { |f| File.fnmatch(pa, s, f) ? 1 : 0 }.join }.join(" ") }
+p File.fnmatch?("*", "x"), File.fnmatch("cat", "CAT", File::FNM_CASEFOLD), IO::SEEK_SET, IO::SEEK_CUR, IO::SEEK_END, File::SEEK_END, File::FNM_SYSCASE
+#==#
+# ── Random#bytes / random_number, rand(Rational), Random::DEFAULT is gone ──
+p Random.new(3).bytes(5).bytes, Random.new(3).bytes(8).bytes, Random.new(3).bytes(0), Random.new(4).bytes(3).encoding, (Random.new(1).bytes(-1) rescue $!)
+p Random.new(1).rand(1r), Random.new(1).rand(7.5r), Random.new(2).random_number(10), Random.new(2).random_number, Random.new(2).random_number(1.5), Random.new(2).random_number(0), Random.new(2).random_number(-3), Random.new(2).random_number(nil)
+p Random.random_number(3).class, Random.bytes(3).size, (Random::DEFAULT rescue $!), (Random.nope rescue $!)
+#==#
+# ── Struct / Data inspect spacing (rb_struct_inspect / rb_data_inspect) ──
+EmptyD = Data.define; EmptyS = Struct.new; OneS = Struct.new(:a)
+p EmptyD.new, EmptyS.new, Data.define.new, EmptyD.new.to_s, Struct.new.new, Struct.new(:a).new(1), OneS.new(2), Data.define(:z).new(z: 1), EmptyS.new.to_s

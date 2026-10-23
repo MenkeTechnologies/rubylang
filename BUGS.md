@@ -1988,7 +1988,7 @@ Honest limitations of this surface:
   which run MRI's own `rb_ary_shuffle_bang` / `ary_sample` over it, honouring
   `random:` — answers exactly what `ruby` answers. Unseeded generators start
   from a fresh 128-bit seed, as MRI's do. Not covered: a Range with Bignum or
-  non-numeric endpoints, `Random#bytes`, and a `random:` object that is not a
+  non-numeric endpoints and a `random:` object that is not a
   `Random` (MRI calls its `rand`; this uses the default stream). `SecureRandom`
   still draws from a separate SplitMix64.
 - **Method surface.** The Enumerable/String/Hash/Range surface is broad but not
@@ -2189,8 +2189,9 @@ too)/`close`/`closed?`/`flush`/`inspect`
   errno outside that set still raises a plain `SystemCallError` with the number
   attached. Pinned by
   `tests/eval.rs::a_filesystem_failure_raises_its_specific_errno_class`.
-- **`Errno::ENOENT::Errno`** (the per-class errno constant) is unimplemented;
-  read the number off an instance's `#errno` instead.
+- ~~**`Errno::ENOENT::Errno`** (the per-class errno constant) is unimplemented.~~
+  **Closed** — `Errno::ENOENT::Errno` is 2 and `Errno::EACCES::Errno` 13, as in
+  MRI.
 - **`IO#to_s` returns the `inspect` form** (`#<IO:<STDOUT>>`, `#<File:/path>`)
   rather than MRI's non-deterministic address form (`#<IO:0x0000…>`). Chosen for
   a deterministic, testable string; `#inspect` itself is exact.
@@ -2200,8 +2201,19 @@ too)/`close`/`closed?`/`flush`/`inspect`
 - **`gets` reads byte-at-a-time** (one syscall per byte) — correct, not tuned
   for large-file line iteration.
 - **No pipe/command IO** (`open("|cmd")`), no `File.chmod`/`symlink`/`stat`
-  struct, no `IO.select`/`seek`/`pos`/`rewind`/`tell`, no separator/limit args
-  to `gets`/`readlines`. `File`/`IO`/`Dir` are not user-subclassable.
+  struct, no `IO.select`, no separator/limit args to `gets`/`readlines`.
+  Positioning and the small readers exist on a File: `pos`/`tell`/`pos=`/
+  `seek(off, whence)` (`IO::SEEK_*` or `:SET`/`:CUR`/`:END`)/`rewind`/`eof?`,
+  `read(length)` (binary, nil at end of file), `readline`, `getc`/`readchar`,
+  `getbyte`/`readbyte`, `each_char`/`each_byte`, and `lineno` counting every
+  line read. A block-less `each_line` still reads the rest of the file up
+  front, so `f.each_line.first(2)` leaves the position at the end (MRI: after
+  the second line). `File.ftype`/`split`/`path`/`mtime`/`atime`/`ctime`/
+  `identical?`/`rename`/`new` and `Dir.children`/`each_child`/`empty?` exist;
+  `readable?`/`writable?`/`executable?` ask `access(2)`. `File.fnmatch` is a
+  port of dir.c's matcher (every `FNM_*` flag, `**/`, the leading-dot rule).
+  `File.superclass` is `Object`, not `IO`.
+ `File`/`IO`/`Dir` are not user-subclassable.
 - **`.localtime`/timezones** are unmodeled elsewhere (see Runtime); file mtimes
   are not surfaced as `Time` objects.
 
