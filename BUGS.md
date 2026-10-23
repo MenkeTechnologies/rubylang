@@ -1129,8 +1129,15 @@ Honest limitations of this surface:
   Residue: a genuine `U+10FF80..U+10FFFF` character inside a String that also
   holds invalid bytes reads back as a byte (the character view parks invalid
   bytes there); matching a fixed-encoding UTF-8 Regexp against a non-ASCII
-  ASCII-8BIT String does not raise `Encoding::CompatibilityError`;
-  `Regexp::FIXEDENCODING` is undefined.
+  ASCII-8BIT String does not raise `Encoding::CompatibilityError`.
+  `File.read` keeps a file's invalid bytes the same way, `File.binread(path,
+  length, offset)` answers ASCII-8BIT, and `File.write`/`binwrite` write a
+  String's bytes.
+- **Case mapping is per character, with titlecase and `:turkic` — fixed.**
+  `capitalize` gives the first character its TITLECASE (`ǆ` → `ǅ`, `ﬃ` →
+  `Ffi`), `swapcase` splits a titlecase digraph (`ǅ` → `dŽ`), `:turkic` maps
+  the dotted and dotless i, and `downcase` has no Greek final-sigma context
+  (`"ΣΑΣ".downcase` is `"σασ"`, as Onigmo maps it).
 
 ## Runtime / methods
 
@@ -1324,13 +1331,14 @@ Honest limitations of this surface:
   a Hash key and collapses under `uniq`/`-`/`include?`/`Set`. `encoding` and
   `fixed_encoding?` follow `rb_reg_preprocess`: `/u` or a non-ASCII character,
   `\u` escape, `\x`/octal escape above 0x7F or `\p{…}` fixes UTF-8, `/n` with
-  non-ASCII bytes is ASCII-8BIT, and anything else is US-ASCII. (MRI's `==`
-  also compares the encoding and `options` reports the `FIXEDENCODING` /
-  `NOENCODING` bits; neither does here, and `inspect` drops `/n`.) Still
+  non-ASCII bytes is ASCII-8BIT, and anything else is US-ASCII. `options` adds
+  `FIXEDENCODING` (16, `/u`) and `NOENCODING` (32, `/n`), `inspect` shows `/n`,
+  and `==` tells `/a/u` from `/a/` (but not `/a/n`, as MRI). Still
   missing on Regexp, though the arity table declares them: `initialize_copy`
-  and `~`. `Regexp.new(/a/i)` copies the source regexp's flags; its
-  integer-options argument only decodes IGNORECASE, never EXTENDED or
-  MULTILINE. An octal escape (`/\101/`) fails to compile.
+  and `~`. `Regexp.new(/a/i)` copies the source regexp's flags; an Integer
+  options argument is the bit set (`7` is `/mix`, 16/32 the encoding bits), a
+  String the option letters (anything else is `unknown regexp option`), any
+  other truthy value IGNORECASE. An octal escape (`/\101/`) fails to compile.
 - **`Object#class` returns a Class object** (a class reference): `p obj.class`
   prints the bare name, `obj.class == SomeClass` and `Integer == Integer`
   compare by class identity, and `obj.class.name` / `.to_s` give the name.

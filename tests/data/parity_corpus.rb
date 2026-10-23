@@ -8453,3 +8453,17 @@ def outer_m; def inner_m; end; end; outer_m
 class Object; def self.method_added(m) = puts("again #{m}"); end
 def later_m; end
 class Object; class << self; remove_method :method_added; end; end
+#==#
+# ── File.read keeps invalid bytes, File.binread answers ASCII-8BIT (length/offset), File.write/binwrite write bytes ──
+path = "/tmp/rubylang_parity_bin_#{Process.pid}.txt"
+p File.write(path, "a\xffé"), File.binread(path), File.binread(path).encoding, File.binread(path, 2), File.binread(path, 2, 1), File.read(path), File.read(path).valid_encoding?
+p File.binwrite(path, 255.chr + "x"), File.binread(path).bytes, File.read(path).bytes
+File.delete(path)
+#==#
+# ── Regexp options: FIXEDENCODING / NOENCODING bits, Regexp.new with Integer / String / truthy options, the n flag in inspect ──
+p Regexp::FIXEDENCODING, Regexp::NOENCODING, /a/n.options, /a/u.options, /a/nix.options, /a/nix, /a/n, /a/n.to_s, /a/n == /a/, /a/u == /a/
+p Regexp.new("a", 7), Regexp.new("a", 16).options, Regexp.new("a", 32), Regexp.new("a", "mi"), Regexp.new("a", :x), Regexp.new("a", nil), (Regexp.new("a", "q") rescue $!), Regexp.new("a", Regexp::FIXEDENCODING).fixed_encoding?
+#==#
+# ── case mapping per character: titlecase digraphs and ligatures, :turkic, no final-sigma context ──
+p "ǆemal".capitalize, "ǳ".capitalize, "ǈ".upcase, "ǈ".downcase, "ǈ".swapcase, "ǅ".swapcase, "ﬃ".capitalize, "ﬅa".capitalize, "եւ".capitalize
+p "İI".downcase(:turkic), "iı".upcase(:turkic), "ii".capitalize(:turkic), "İ".downcase, "ΣΑΣ".downcase, "ΣΑΣ".capitalize, "ΣΑΣ".swapcase, "ß".upcase

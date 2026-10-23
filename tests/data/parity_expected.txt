@@ -7234,3 +7234,51 @@ obj+ toplvl
 obj+ outer_m
 obj+ inner_m
 again later_m
+#==#
+4
+"a\xFF\xC3\xA9"
+#<Encoding:BINARY (ASCII-8BIT)>
+"a\xFF"
+"\xFF\xC3"
+"a\xFFé"
+false
+2
+[255, 120]
+[255, 120]
+#==#
+16
+32
+32
+16
+35
+/a/ixn
+/a/n
+"(?-mix:a)"
+true
+false
+/a/mix
+16
+/a/n
+/a/mi
+/a/i
+/a/
+#<ArgumentError: unknown regexp option: q>
+true
+#==#
+"ǅemal"
+"ǲ"
+"Ǉ"
+"ǉ"
+"lJ"
+"dŽ"
+"Ffi"
+"Sta"
+"Եւ"
+"iı"
+"İI"
+"İi"
+"i̇"
+"σασ"
+"Σασ"
+"σασ"
+"SS"

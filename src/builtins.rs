@@ -4722,13 +4722,27 @@ fn dispatch_classref(
                     return with_host(|h| h.new_regex(&s, &flags));
                 }
                 let src = arg_str(&args[0]);
-                // A truthy second arg means case-insensitive (Regexp::IGNORECASE
-                // is 1); the full option bitset is not modeled.
+                // `rb_reg_initialize_m`: an Integer is the option bits, a String
+                // the option letters, any other truthy value IGNORECASE.
                 let mut flags = match args.get(1) {
-                    Some(Value::Bool(true)) | Some(Value::Int(_)) => "i",
-                    _ => "",
-                }
-                .to_string();
+                    None | Some(Value::Undef) | Some(Value::Bool(false)) => String::new(),
+                    Some(Value::Int(bits)) => [(1, 'i'), (2, 'x'), (4, 'm'), (16, 'u'), (32, 'n')]
+                        .iter()
+                        .filter(|(b, _)| bits & b != 0)
+                        .map(|(_, c)| *c)
+                        .collect(),
+                    Some(o) if with_host(|h| h.as_str(o).is_some()) => {
+                        let s = arg_str(o);
+                        if s.chars().any(|c| !"imx".contains(c)) {
+                            return Err(raise_exc(
+                                "ArgumentError",
+                                &format!("unknown regexp option: {s}"),
+                            ));
+                        }
+                        s
+                    }
+                    Some(_) => "i".to_string(),
+                };
                 // A non-ASCII ASCII-8BIT source makes a BINARY Regexp, which
                 // `regexp_encoding` reads off the `n` flag.
                 if !src.is_ascii()
@@ -10426,21 +10440,28 @@ fn dispatch_string_body(
         "upcase" => Ok(new_str(if is_ascii_case_opt(args) {
             s.to_ascii_uppercase()
         } else {
-            s.to_uppercase()
+            s.chars()
+                .map(|c| case_up(c, is_turkic_case_opt(args)))
+                .collect()
         })),
         "downcase" => Ok(new_str(if is_ascii_case_opt(args) {
             s.to_ascii_lowercase()
         } else {
-            s.to_lowercase()
+            downcase_str(&s, is_turkic_case_opt(args))
         })),
+        // A titlecase digraph (`ǅ`) swaps to its lower half then upper half
+        // (`dŽ`), as Onigmo's case folding does.
         "swapcase" => {
+            let turkic = is_turkic_case_opt(args);
             let out: String = s
                 .chars()
                 .map(|c| {
-                    if c.is_uppercase() {
-                        c.to_lowercase().collect::<String>()
+                    if let Some(pair) = titlecase_swap(c) {
+                        pair.to_string()
+                    } else if c.is_uppercase() {
+                        case_down(c, turkic)
                     } else if c.is_lowercase() {
-                        c.to_uppercase().collect::<String>()
+                        case_up(c, turkic)
                     } else {
                         c.to_string()
                     }
@@ -10448,10 +10469,15 @@ fn dispatch_string_body(
                 .collect();
             Ok(new_str(out))
         }
+        // The first character goes to TITLECASE (`ǆ` → `ǅ`, not `Ǆ`).
         "capitalize" => {
+            let turkic = is_turkic_case_opt(args);
             let mut c = s.chars();
             let out = match c.next() {
-                Some(f) => f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+                Some(f) => {
+                    let head = titlecase(f).map_or_else(|| case_up(f, turkic), String::from);
+                    head + &downcase_str(c.as_str(), turkic)
+                }
                 None => String::new(),
             };
             Ok(new_str(out))
@@ -13271,6 +13297,71 @@ fn is_ascii_case_opt(args: &[Value]) -> bool {
     args.first()
         .and_then(|v| with_host(|h| h.as_symbol(v)))
         .is_some_and(|s| s == "ascii")
+}
+
+/// Whether a case-mapping call passed `:turkic` (dotted/dotless i).
+fn is_turkic_case_opt(args: &[Value]) -> bool {
+    args.iter()
+        .any(|v| with_host(|h| h.as_symbol(v)).is_some_and(|s| s == "turkic"))
+}
+
+/// `c` upcased, with the Turkic `i` → `İ` when asked.
+fn case_up(c: char, turkic: bool) -> String {
+    match c {
+        'i' if turkic => "İ".to_string(),
+        _ => c.to_uppercase().collect(),
+    }
+}
+
+/// `s` downcased character by character, as Onigmo maps it — with no Greek
+/// final-sigma context (`"ΣΑΣ".downcase` is `"σασ"`).
+fn downcase_str(s: &str, turkic: bool) -> String {
+    s.chars().map(|c| case_down(c, turkic)).collect()
+}
+
+/// `c` downcased, with the Turkic `I` → `ı` and `İ` → `i` when asked.
+fn case_down(c: char, turkic: bool) -> String {
+    match c {
+        'I' if turkic => "ı".to_string(),
+        'İ' if turkic => "i".to_string(),
+        _ => c.to_lowercase().collect(),
+    }
+}
+
+/// The titlecase form of a character whose titlecase is not its uppercase
+/// (Unicode's SpecialCasing/UnicodeData titlecase fields): the Latin digraphs
+/// (`ǆ` → `ǅ`) and the Latin and Armenian ligatures (`ﬃ` → `Ffi`).
+fn titlecase(c: char) -> Option<&'static str> {
+    Some(match c {
+        'Ǆ' | 'ǅ' | 'ǆ' => "ǅ",
+        'Ǉ' | 'ǈ' | 'ǉ' => "ǈ",
+        'Ǌ' | 'ǋ' | 'ǌ' => "ǋ",
+        'Ǳ' | 'ǲ' | 'ǳ' => "ǲ",
+        'ﬀ' => "Ff",
+        'ﬁ' => "Fi",
+        'ﬂ' => "Fl",
+        'ﬃ' => "Ffi",
+        'ﬄ' => "Ffl",
+        'ﬅ' | 'ﬆ' => "St",
+        'ﬓ' => "Մն",
+        'ﬔ' => "Մե",
+        'ﬕ' => "Մի",
+        'ﬖ' => "Վն",
+        'ﬗ' => "Մխ",
+        'և' => "Եւ",
+        _ => return None,
+    })
+}
+
+/// What `swapcase` makes of a titlecase digraph: its lower half then its upper.
+fn titlecase_swap(c: char) -> Option<&'static str> {
+    match c {
+        'ǅ' => Some("dŽ"),
+        'ǈ' => Some("lJ"),
+        'ǋ' => Some("nJ"),
+        'ǲ' => Some("dZ"),
+        _ => None,
+    }
 }
 
 fn expand_tr_spec(spec: &str, allow_neg: bool) -> Result<(bool, Vec<char>), String> {
@@ -18805,17 +18896,41 @@ fn dispatch_file_class(
     block: Option<Value>,
 ) -> Option<Result<Value, String>> {
     Some(match name {
+        // The file's bytes: UTF-8 text when they are, else a UTF-8 String
+        // holding invalid bytes.
         "read" => {
             let path = str_arg(args, 0);
-            match std::fs::read_to_string(&path) {
-                Ok(s) => Ok(new_str(s)),
+            match std::fs::read(&path) {
+                Ok(b) => Ok(with_host(|h| h.new_utf8_from_bytes(b))),
                 Err(e) => Err(sys_err("No such file or directory @ rb_sysopen", &path, &e)),
             }
         }
-        "write" => {
+        // `binread(path, length = nil, offset = 0)`: the bytes as ASCII-8BIT.
+        "binread" => {
             let path = str_arg(args, 0);
-            let data = str_arg(args, 1);
-            match std::fs::write(&path, data.as_bytes()) {
+            match std::fs::read(&path) {
+                Ok(b) => {
+                    let off = args
+                        .get(2)
+                        .map_or(0, |v| as_i(v).max(0) as usize)
+                        .min(b.len());
+                    let end = match args.get(1) {
+                        Some(Value::Undef) | None => b.len(),
+                        Some(l) => (off + as_i(l).max(0) as usize).min(b.len()),
+                    };
+                    let s = new_str(bytes_to_binstr(&b[off..end]));
+                    with_host(|h| h.set_string_encoding(&s, "ASCII-8BIT"));
+                    Ok(s)
+                }
+                Err(e) => Err(sys_err("No such file or directory @ rb_sysopen", &path, &e)),
+            }
+        }
+        // A String writes its bytes, anything else its `to_s`; answers the
+        // byte count.
+        "write" | "binwrite" => {
+            let path = str_arg(args, 0);
+            let data = args.get(1).map(out_bytes).unwrap_or_default();
+            match std::fs::write(&path, &data) {
                 Ok(()) => Ok(Value::Int(data.len() as i64)),
                 Err(e) => Err(sys_err("open", &path, &e)),
             }
@@ -25754,9 +25869,15 @@ fn dispatch_regexp(
         }
         // `options` — the Ruby flag bitmask: IGNORECASE=1, EXTENDED=2, MULTILINE=4.
         // Shares its encoder with Regexp equality, which compares this bitmask.
+        // The letter options' bits plus FIXEDENCODING (16, `u`) and NOENCODING
+        // (32, `n`).
         "options" => {
             let flags = with_host(|h| h.regex_flags(recv)).unwrap_or_default();
-            Ok(Value::Int(crate::host::regex_option_bits(&flags) as i64))
+            let enc =
+                if flags.contains('u') { 16 } else { 0 } | if flags.contains('n') { 32 } else { 0 };
+            Ok(Value::Int(
+                crate::host::regex_option_bits(&flags) as i64 | enc,
+            ))
         }
         "casefold?" => {
             let flags = with_host(|h| h.regex_flags(recv)).unwrap_or_default();

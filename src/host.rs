@@ -9498,7 +9498,8 @@ impl RubyHost {
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash { map, .. }) => self.inspect_hash(&map),
                 Some(RObj::Regexp { source, flags, .. }) => {
-                    let f: String = "mix".chars().filter(|c| flags.contains(*c)).collect();
+                    // `n` (NOENCODING) follows the letter options; `u` is not shown.
+                    let f: String = "mixn".chars().filter(|c| flags.contains(*c)).collect();
                     format!("/{source}/{f}")
                 }
                 // `Time#inspect` shows a fractional second (unlike `#to_s`).
@@ -11060,7 +11061,11 @@ impl RubyHost {
                             flags: yf,
                             ..
                         }),
-                    ) => xs == ys && regex_option_bits(xf) == regex_option_bits(yf),
+                    ) => {
+                        xs == ys
+                            && regex_option_bits(xf) == regex_option_bits(yf)
+                            && xf.contains('u') == yf.contains('u')
+                    }
                     // Two Encoding objects are equal when they name the same
                     // encoding — MRI's encodings are shared singletons, so `==`
                     // compares by identity; we carry a fresh object per call and
