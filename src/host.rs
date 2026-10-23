@@ -273,8 +273,9 @@ pub enum Derive {
 pub enum GenSize {
     /// A fixed answer; `Value::Undef` is nil (unknown).
     Fixed(Value),
-    /// A callable (`Enumerator.new(-> { n })`), called on every `size`.
-    Call(Value),
+    /// A callable (`Enumerator.new(-> { n })`, a `to_enum` size block), called
+    /// with these arguments on every `size`.
+    Call(Value, Vec<Value>),
     /// The source enumerator's size, reshaped by the derivation.
     Of(Value, Derive),
 }
@@ -1520,6 +1521,9 @@ pub struct RubyHost {
     /// The definition each UnboundMethod (and the Methods bound from it)
     /// captured when it was made, by heap id.
     method_snapshots: HashMap<u32, (MethodDef, String)>,
+    /// `Enumerator#feed` state by Enumerator heap id: the value waiting for
+    /// the next resume, and (for a buffered Enumerator) what each element got.
+    enum_feeds: HashMap<u32, (Option<Value>, Vec<Value>)>,
     /// The matches behind a block-less `gsub` Enumerator's elements, by its heap id.
     enum_matches: HashMap<u32, Vec<Value>>,
     consts: IndexMap<String, Value>,
@@ -1701,11 +1705,12 @@ pub struct RubyHost {
     /// ActiveSupport's `attr_internal` builds `view_runtime`/`view_runtime=` this
     /// way: `attr_writer :_view_runtime; alias_method :view_runtime=, :_view_runtime=`.
     attr_aliases: IndexMap<String, IndexMap<String, (String, bool)>>,
-    /// `(class, hook)` for a `def self.method_added` / `singleton_method_added`
-    /// the compiler hoisted into a class whose body has not yet reached it.
-    /// MRI has no such method until that line runs, so the hook stays inert
-    /// until the body announces it (`activate_hoisted_hook`).
-    hoisted_hooks: HashSet<(String, String)>,
+    /// The `def self.method_added` / `singleton_method_added` bodies the
+    /// compiler hoisted out of class bodies, by `(class, hook)` in body order.
+    /// MRI has no such method until that line runs, so each is installed only
+    /// when its body announces it (`activate_hoisted_hook`) — which also keeps a
+    /// later reopening's hook from replacing an earlier one before its time.
+    hoisted_hooks: HashMap<(String, String), std::collections::VecDeque<MethodDef>>,
     /// `define_method`-created instance methods: class → name → block Proc.
     define_methods: IndexMap<String, IndexMap<String, Value>>,
     /// Per-object singleton methods (`def obj.m`, `class << obj`, and bare `def`
@@ -2333,8 +2338,8 @@ pub fn eval_in_place(src: &str) -> Result<Value, String> {
                 }
             }
         }
-        for (name, def) in prog.classes {
-            h.note_hoisted_hooks(&name, &def);
+        for (name, mut def) in prog.classes {
+            h.note_hoisted_hooks(&name, &mut def);
             merge_class(&mut h.classes, name, def);
         }
         h.begins.extend(prog.begins);
@@ -2460,6 +2465,7 @@ impl RubyHost {
             enum_matches: HashMap::new(),
             shadowed_defs: HashMap::new(),
             method_snapshots: HashMap::new(),
+            enum_feeds: HashMap::new(),
             consts: IndexMap::new(),
             autoloads: IndexMap::new(),
             methods: IndexMap::new(),
@@ -2518,7 +2524,7 @@ impl RubyHost {
             class_object_ids: IndexMap::new(),
             attr_accessors: IndexMap::new(),
             attr_aliases: IndexMap::new(),
-            hoisted_hooks: HashSet::new(),
+            hoisted_hooks: HashMap::new(),
             define_methods: IndexMap::new(),
             singleton_methods: IndexMap::new(),
             object_extends: HashMap::new(),
@@ -2595,26 +2601,30 @@ impl RubyHost {
         }
     }
 
-    /// Record the method hooks a compiled class definition hoisted.
-    fn note_hoisted_hooks(&mut self, class: &str, def: &ClassDef) {
+    /// Set aside the method hooks a compiled class definition hoisted.
+    fn note_hoisted_hooks(&mut self, class: &str, def: &mut ClassDef) {
         for hook in ["method_added", "singleton_method_added"] {
-            if def.class_methods.contains_key(hook) {
+            if let Some(m) = def.class_methods.shift_remove(hook) {
                 self.hoisted_hooks
-                    .insert((class.to_string(), hook.to_string()));
+                    .entry((class.to_string(), hook.to_string()))
+                    .or_default()
+                    .push_back(m);
             }
         }
     }
-    /// The class body has reached the hoisted `def self.<name>`: it is live now.
+    /// The class body has reached a hoisted `def self.<name>`: install it.
     pub fn activate_hoisted_hook(&mut self, class: &str, name: &str) {
-        self.hoisted_hooks
-            .remove(&(class.to_string(), name.to_string()));
-    }
-    /// Whether `class`'s `hook` is hoisted and not yet reached by its body.
-    pub fn hoisted_hook_pending(&self, class: &str, hook: &str) -> bool {
-        !self.hoisted_hooks.is_empty()
-            && self
-                .hoisted_hooks
-                .contains(&(class.to_string(), hook.to_string()))
+        if self.hoisted_hooks.is_empty() {
+            return;
+        }
+        let key = (class.to_string(), name.to_string());
+        if let Some(m) = self.hoisted_hooks.get_mut(&key).and_then(|q| q.pop_front()) {
+            self.classes
+                .entry(class.to_string())
+                .or_default()
+                .class_methods
+                .insert(name.to_string(), m);
+        }
     }
     /// Install compiled methods, classes, begin-blocks, and block templates
     /// before running main.
@@ -2628,8 +2638,8 @@ impl RubyHost {
         for (name, def) in methods {
             self.methods.insert(name, def);
         }
-        for (name, def) in classes {
-            self.note_hoisted_hooks(&name, &def);
+        for (name, mut def) in classes {
+            self.note_hoisted_hooks(&name, &mut def);
             merge_class(&mut self.classes, name, def);
         }
         // Append, never replace: a `require`/`load` (or each REPL line) merges a
@@ -3531,6 +3541,9 @@ impl RubyHost {
     }
     /// Reset a materialized generator's external-iteration cursor.
     pub fn generator_rewind(&mut self, v: &Value) {
+        if let Value::Obj(id) = v {
+            self.enum_feeds.remove(id);
+        }
         if let Some(RObj::Generator {
             materialized, ext, ..
         }) = self.obj_mut(v)
@@ -3574,10 +3587,61 @@ impl RubyHost {
             None
         }
     }
+    /// How many elements `next` has handed out of a buffered Enumerator.
+    pub fn enum_cursor(&self, v: &Value) -> usize {
+        match self.obj(v) {
+            Some(RObj::Enumerator { cursor, .. }) => *cursor,
+            _ => 0,
+        }
+    }
+    /// `Enumerator#feed`: the value the element `next` last handed out answers
+    /// to the iteration underneath. False when one is already waiting.
+    pub fn enum_feed(&mut self, v: &Value, value: Value) -> bool {
+        let Value::Obj(id) = v else { return false };
+        let slot = &mut self.enum_feeds.entry(*id).or_default().0;
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(value);
+        true
+    }
+    /// Take the waiting `feed` value, if any.
+    pub fn enum_take_feed(&mut self, v: &Value) -> Option<Value> {
+        match v {
+            Value::Obj(id) if !self.enum_feeds.is_empty() => {
+                self.enum_feeds.get_mut(id).and_then(|f| f.0.take())
+            }
+            _ => None,
+        }
+    }
+    /// Record what element `idx` of a buffered Enumerator was fed.
+    pub fn enum_record_feed(&mut self, v: &Value, idx: usize, value: Value) {
+        if let Value::Obj(id) = v {
+            let fed = &mut self.enum_feeds.entry(*id).or_default().1;
+            if fed.len() <= idx {
+                fed.resize(idx + 1, Value::Undef);
+            }
+            fed[idx] = value;
+        }
+    }
+    /// The values a buffered Enumerator's elements were fed, by position.
+    pub fn enum_fed_values(&self, v: &Value) -> Vec<Value> {
+        match v {
+            Value::Obj(id) => self
+                .enum_feeds
+                .get(id)
+                .map(|f| f.1.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
     /// Reset an `Enumerator`'s external-iteration cursor to the start.
     pub fn enum_rewind(&mut self, v: &Value) {
         if let Some(RObj::Enumerator { cursor, .. }) = self.obj_mut(v) {
             *cursor = 0;
+        }
+        if let Value::Obj(id) = v {
+            self.enum_feeds.remove(id);
         }
     }
     pub fn new_rtime(&mut self, t: crate::rtime::RTime) -> Value {
@@ -10487,6 +10551,9 @@ impl RubyHost {
                     None => Value::Undef,
                 });
             }
+        }
+        if matches!(op, Add) && self.class_name(a) == "Enumerator::Lazy" {
+            return crate::builtins::dispatch(a, "+", std::slice::from_ref(b), None);
         }
         // `Enumerator#+` (enumerator_plus): an `Enumerator::Chain` of both.
         if matches!(op, Add)

@@ -401,7 +401,9 @@ end
 /// Compile and run [`PRELUDE`] on the current host. Silent and fast; runs once per
 /// fresh VM before requires and the program.
 fn run_prelude() -> Result<(), String> {
-    run_compiled(compile(PRELUDE)?).map(|_| ())
+    run_compiled(compile(PRELUDE)?)?;
+    builtins::install_file_constants();
+    Ok(())
 }
 
 /// Run each `-r LIB` on the current host before the program. Requires share the

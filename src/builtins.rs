@@ -1171,6 +1171,11 @@ fn b_define_method_dyn(vm: &mut VM, _: u8) -> Value {
         if let Err(e) = fired {
             return abort(vm, e);
         }
+    } else if crate::host::is_main(&with_host(|h| h.current_self())) {
+        // A top-level `def` is a (private) method of Object.
+        if let Err(e) = fire_added_on("Object", &name) {
+            return abort(vm, e);
+        }
     }
     with_host(|h| h.new_symbol(&name))
 }
@@ -1201,24 +1206,16 @@ fn b_method_hook(vm: &mut VM, argc: u8) -> Value {
 
 /// Fire `hook` (`method_added` / `singleton_method_added`) for the method
 /// `name` just defined on `target`, as `rb_method_added` / `rb_singleton_method_
-/// added` do. A class or module runs its class method `hook`, passing over a
-/// hoisted definition whose class body has not reached it yet (MRI would not
-/// have defined it at this point). Any other object runs its singleton
+/// added` do. A class or module runs its class method `hook` (a hoisted one only
+/// once its class body has reached it — see `activate_hoisted_hook`). Any other
+/// object runs its singleton
 /// `singleton_method_added`. The builtin hooks are no-ops, so a hook nobody
 /// defined does nothing.
 pub(crate) fn fire_method_hook(target: &Value, hook: &str, name: &str) -> Result<(), String> {
     let sym = with_host(|h| h.new_symbol(name));
     if let Some(cls) = with_host(|h| h.classref_name(target)) {
-        let mut start = Some(cls);
-        while let Some((def, owner)) =
-            start.and_then(|s| with_host(|h| h.find_class_method_owner(&s, hook)))
-        {
-            if with_host(|h| h.hoisted_hook_pending(&owner, hook)) {
-                start = with_host(|h| h.superclass_of(&owner));
-                continue;
-            }
+        if let Some((def, owner)) = with_host(|h| h.find_class_method_owner(&cls, hook)) {
             crate::host::call_class_method(target.clone(), &def, hook, &owner, &[sym], None)?;
-            break;
         }
     } else if hook == "singleton_method_added"
         && with_host(|h| h.find_singleton_method(target, hook)).is_some()
@@ -2244,6 +2241,10 @@ pub(crate) fn dispatch_by_type(
     if name == "chain" && CHAIN_RECEIVERS.contains(&class) {
         return Ok(make_enum_chain(recv, args));
     }
+    // `Enumerator::Lazy#chain` / `#+` stay lazy: a Lazy over the chain.
+    if class == "Enumerator::Lazy" && (name == "chain" || (name == "+" && args.len() == 1)) {
+        return dispatch(&make_enum_chain(recv, args), "lazy", &[], None);
+    }
     if name == "+"
         && args.len() == 1
         && matches!(
@@ -3070,7 +3071,7 @@ fn dispatch_resolved(
             let ruby_defined = user_method.is_some()
                 || with_host(|h| h.object_class(recv).is_some())
                 || with_host(|h| h.find_singleton_method(recv, &method).is_some());
-            if ruby_defined && (block.is_none() || rest.is_empty()) {
+            if ruby_defined {
                 let gen = crate::host::eval_erb_with_locals(
                     "Enumerator.new { |y| __recv.__send__(__meth, *__args) { |*x| y.yield(*x) } }",
                     vec![
@@ -3082,7 +3083,7 @@ fn dispatch_resolved(
                 let label = enum_label(recv, &method, &rest);
                 with_host(|h| {
                     let size = match &block {
-                        Some(b) => GenSize::Call(b.clone()),
+                        Some(b) => GenSize::Call(b.clone(), rest.clone()),
                         None => GenSize::Fixed(Value::Undef),
                     };
                     h.set_generator_size(&gen, size);
@@ -4495,7 +4496,7 @@ fn dispatch_classref(
                 if probe_dispatch(v, "respond_to?", &[with_host(|h| h.new_symbol("call"))])
                     .is_some_and(|r| with_host(|h| h.truthy(&r))) =>
             {
-                GenSize::Call(v.clone())
+                GenSize::Call(v.clone(), Vec::new())
             }
             Some(v @ Value::Float(_)) => GenSize::Fixed(dispatch(v, "to_i", &[], None)?),
             Some(v)
@@ -16935,9 +16936,15 @@ fn dispatch_lazy(
         "force" | "to_a" | "entries" => Ok(new_arr(lazy_pull(&source, &ops, usize::MAX)?)),
         "each" if block.is_some() => {
             let bl = block.unwrap();
-            for v in lazy_pull(&source, &ops, usize::MAX)? {
-                call_proc(&bl, std::slice::from_ref(&v))?;
-            }
+            lazy_pull_with(&source, &ops, usize::MAX, &mut |out| {
+                for v in out.drain(..) {
+                    call_proc(&bl, std::slice::from_ref(&v))?;
+                    if has_pending_signal() {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })?;
             Ok(recv.clone())
         }
         // Every remaining Enumerable method is a TERMINAL one — `sum`, `reduce`,
@@ -17216,6 +17223,19 @@ fn lazy_pull(
     ops: &[crate::host::LazyOp],
     limit: usize,
 ) -> Result<Vec<Value>, String> {
+    lazy_pull_with(source, ops, limit, &mut |_| Ok(true))
+}
+
+/// [`lazy_pull`] handing the outputs to `sink` as they are produced: after
+/// every source element it gets the outputs collected so far (to drain them),
+/// and answering false stops the pull. `Lazy#each { }` runs its block this way,
+/// so an endless pipeline is walked one element at a time.
+fn lazy_pull_with(
+    source: &Value,
+    ops: &[crate::host::LazyOp],
+    limit: usize,
+    sink: &mut dyn FnMut(&mut Vec<Value>) -> Result<bool, String>,
+) -> Result<Vec<Value>, String> {
     use crate::host::LazyOp;
     let mut out: Vec<Value> = Vec::new();
     let mut state: Vec<LazyState> = ops
@@ -17241,6 +17261,10 @@ fn lazy_pull(
                 exhausted = false;
                 break;
             }
+            if !sink(&mut out)? {
+                exhausted = false;
+                break;
+            }
         }
         if exhausted {
             lazy_flush(ops, &mut state, 0, &mut out, limit)?;
@@ -17259,6 +17283,9 @@ fn lazy_pull(
                 break;
             }
             if !lazy_feed(ops, &mut state, 0, Value::Int(n), &mut out, limit)? {
+                break;
+            }
+            if !sink(&mut out)? {
                 break;
             }
             n += 1;
@@ -17283,11 +17310,15 @@ fn lazy_pull(
             if !lazy_feed(ops, &mut state, 0, elem, &mut out, limit)? {
                 break;
             }
+            if !sink(&mut out)? {
+                break;
+            }
         }
         if exhausted {
             lazy_flush(ops, &mut state, 0, &mut out, limit)?;
         }
     }
+    sink(&mut out)?;
     Ok(out)
 }
 
@@ -17847,6 +17878,11 @@ fn dispatch_enumerator_inner(
     let buf = with_host(|h| h.enum_buf(recv).unwrap_or_default());
     match name {
         "next" if args.is_empty() && block.is_none() => {
+            // A value fed to the element handed out last is that element's answer.
+            if let Some(v) = with_host(|h| h.enum_take_feed(recv)) {
+                let at = with_host(|h| h.enum_cursor(recv)).saturating_sub(1);
+                with_host(|h| h.enum_record_feed(recv, at, v));
+            }
             match with_host(|h| h.enum_next(recv, true)) {
                 Some(v) => Ok(v),
                 None => Err(stop_iteration(recv)),
@@ -17862,6 +17898,7 @@ fn dispatch_enumerator_inner(
             with_host(|h| h.enum_rewind(recv));
             Ok(recv.clone())
         }
+        "feed" if args.len() == 1 => feed_enumerator(recv, &args[0]),
         "size" | "length" if args.is_empty() && block.is_none() => {
             match with_host(|h| h.enum_size_fn(recv)) {
                 Some((Some(f), a)) => call_proc(&f, &a),
@@ -18464,7 +18501,7 @@ fn generator_size(recv: &Value) -> Result<Value, String> {
     };
     let (src, kind) = match size {
         GenSize::Fixed(v) => return Ok(v),
-        GenSize::Call(f) => return dispatch(&f, "call", &[], None),
+        GenSize::Call(f, a) => return dispatch(&f, "call", &a, None),
         GenSize::Of(src, kind) => (src, kind),
     };
     let n = generator_size(&src)?;
@@ -18716,6 +18753,15 @@ fn sys_err(op: &str, path: &str, e: &std::io::Error) -> String {
     raise_exc_with(class, &message, &fields)
 }
 
+/// `Enumerator#feed(value)`: one value per element handed out.
+fn feed_enumerator(recv: &Value, v: &Value) -> Result<Value, String> {
+    if with_host(|h| h.enum_feed(recv, v.clone())) {
+        Ok(Value::Undef)
+    } else {
+        Err(raise_exc("TypeError", "feed value already set"))
+    }
+}
+
 /// The `StopIteration` an exhausted Enumerator raises. `#result` is the value
 /// the underlying `each` answered, which for a collection-backed Enumerator is
 /// the collection:
@@ -18725,6 +18771,23 @@ fn sys_err(op: &str, path: &str, e: &std::io::Error) -> String {
 /// [1]
 /// ```
 fn stop_iteration(recv: &Value) -> String {
+    // A `map`/`collect` Enumerator's iteration answers what each element was
+    // fed (nil for one that was not), as the block's results.
+    let mapped =
+        with_host(|h| h.enum_method(recv)).is_some_and(|m| matches!(m.as_str(), "map" | "collect"));
+    if mapped {
+        let len = with_host(|h| h.enum_buf(recv)).map_or(0, |b| b.len());
+        if let Some(v) = with_host(|h| h.enum_take_feed(recv)) {
+            with_host(|h| h.enum_record_feed(recv, len.saturating_sub(1), v));
+        }
+        let mut fed = with_host(|h| h.enum_fed_values(recv));
+        fed.resize(len, Value::Undef);
+        return raise_exc_with(
+            "StopIteration",
+            "iteration reached an end",
+            &[("result", new_arr(fed))],
+        );
+    }
     let result = with_host(|h| h.enum_source(recv))
         .unwrap_or_else(|| new_arr(with_host(|h| h.enum_buf(recv)).unwrap_or_default()));
     raise_exc_with(
@@ -18993,15 +19056,79 @@ fn dispatch_file_class(
     })
 }
 
+/// `File::Constants` members whose values are the platform's own (`open(2)`
+/// flags, `flock(2)` operations), installed natively so they match what the
+/// OS takes. IO includes the module, so `File::X` and `IO::X` name them too.
+pub(crate) fn install_file_constants() {
+    let consts: [(&str, i64); 18] = [
+        ("RDONLY", libc::O_RDONLY as i64),
+        ("WRONLY", libc::O_WRONLY as i64),
+        ("RDWR", libc::O_RDWR as i64),
+        ("APPEND", libc::O_APPEND as i64),
+        ("CREAT", libc::O_CREAT as i64),
+        ("EXCL", libc::O_EXCL as i64),
+        ("NONBLOCK", libc::O_NONBLOCK as i64),
+        ("TRUNC", libc::O_TRUNC as i64),
+        ("NOCTTY", libc::O_NOCTTY as i64),
+        ("SYNC", libc::O_SYNC as i64),
+        ("DSYNC", libc::O_DSYNC as i64),
+        ("NOFOLLOW", libc::O_NOFOLLOW as i64),
+        ("BINARY", 0),
+        ("SHARE_DELETE", 0),
+        ("LOCK_SH", libc::LOCK_SH as i64),
+        ("LOCK_EX", libc::LOCK_EX as i64),
+        ("LOCK_NB", libc::LOCK_NB as i64),
+        ("LOCK_UN", libc::LOCK_UN as i64),
+    ];
+    with_host(|h| {
+        for (name, v) in consts {
+            for ns in ["File::Constants", "File", "IO"] {
+                h.set_const(&format!("{ns}::{name}"), Value::Int(v));
+            }
+        }
+    });
+}
+
 /// `File.open(path, mode="r")`. With a block: yields the IO, closes it on exit,
 /// returns the block's value. Without: returns the open IO.
 fn file_open(args: &[Value], block: Option<Value>) -> Result<Value, String> {
     let path = str_arg(args, 0);
+    let mut opts = std::fs::OpenOptions::new();
+    // An Integer mode is `open(2)` flags (`File::WRONLY | File::CREAT`), with the
+    // permission bits for a created file as the next argument.
+    if let Some(Value::Int(flags)) = args.get(1) {
+        let flags = *flags as libc::c_int;
+        let acc = flags & libc::O_ACCMODE;
+        opts.read(acc == libc::O_RDONLY || acc == libc::O_RDWR)
+            .write(acc == libc::O_WRONLY || acc == libc::O_RDWR);
+        if flags & libc::O_APPEND != 0 {
+            opts.append(true);
+        }
+        if flags & libc::O_TRUNC != 0 {
+            opts.truncate(true);
+        }
+        if flags & libc::O_CREAT != 0 {
+            if flags & libc::O_EXCL != 0 {
+                opts.create_new(true);
+            } else {
+                opts.create(true);
+            }
+        }
+        use std::os::unix::fs::OpenOptionsExt;
+        let rest = libc::O_ACCMODE | libc::O_APPEND | libc::O_TRUNC | libc::O_CREAT | libc::O_EXCL;
+        opts.custom_flags(flags & !rest);
+        if let Some(Value::Int(perm)) = args.get(2) {
+            opts.mode(*perm as u32);
+        }
+        let file = opts
+            .open(&path)
+            .map_err(|e| sys_err("No such file or directory @ rb_sysopen", &path, &e))?;
+        return file_open_with(crate::host::io_alloc_file(file, path), block);
+    }
     let mode = args
         .get(1)
         .and_then(|a| with_host(|h| h.as_str(a)))
         .unwrap_or_else(|| "r".to_string());
-    let mut opts = std::fs::OpenOptions::new();
     match mode.trim_end_matches('b') {
         "r" | "r+" => {
             opts.read(true).write(mode.contains('+'));
@@ -19022,7 +19149,12 @@ fn file_open(args: &[Value], block: Option<Value>) -> Result<Value, String> {
     let file = opts
         .open(&path)
         .map_err(|e| sys_err("No such file or directory @ rb_sysopen", &path, &e))?;
-    let io = crate::host::io_alloc_file(file, path);
+    file_open_with(crate::host::io_alloc_file(file, path), block)
+}
+
+/// `File.open` once the file is open: run the block over it and close it, or
+/// answer it.
+fn file_open_with(io: Value, block: Option<Value>) -> Result<Value, String> {
     match block {
         Some(bl) => {
             let r = call_proc(&bl, std::slice::from_ref(&io));
@@ -19079,6 +19211,25 @@ fn dispatch_io(
         "fileno" | "to_i" => Ok(Value::Int(
             crate::host::io_fd_info(recv).map_err(|e| io_err(&e))?.0,
         )),
+        // `flock(op)` (`File::LOCK_EX` | `File::LOCK_NB` …): 0, or false when a
+        // non-blocking lock is held elsewhere.
+        "flock" if args.len() == 1 => {
+            let fd = crate::host::io_fd_info(recv).map_err(|e| io_err(&e))?.0 as libc::c_int;
+            let op = as_i(&args[0]) as libc::c_int;
+            // SAFETY: `fd` is this File's open descriptor; flock takes no pointers.
+            if unsafe { libc::flock(fd, op) } == 0 {
+                return Ok(Value::Int(0));
+            }
+            let e = std::io::Error::last_os_error();
+            if op & libc::LOCK_NB != 0 && e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(Value::Bool(false));
+            }
+            Err(sys_err(
+                "flock @ rb_file_flock",
+                &with_host(|h| h.inspect(recv)),
+                &e,
+            ))
+        }
         "tty?" | "isatty" => Ok(Value::Bool(
             crate::host::io_fd_info(recv).map_err(|e| io_err(&e))?.1,
         )),
@@ -20890,7 +21041,11 @@ fn generator_external_next(recv: &Value, gblock: &Value, advance: bool) -> Resul
     // The first resume carries the `Enumerator::Yielder` that becomes the
     // block's `|y|` parameter; later ones carry nothing.
     let (fiber, arg) = match with_host(|h| h.generator_ext_fiber(recv)) {
-        Some(f) => (f, Value::Undef),
+        // A later resume answers the body's pending `y.yield` with the fed value.
+        Some(f) => (
+            f,
+            with_host(|h| h.enum_take_feed(recv)).unwrap_or(Value::Undef),
+        ),
         None => {
             let f = crate::host::new_fiber(gblock.clone());
             with_host(|h| h.generator_ext_start(recv, f.clone()));
@@ -21205,6 +21360,7 @@ fn dispatch_generator(
             with_host(|h| h.generator_rewind(recv));
             Ok(recv.clone())
         }
+        "feed" if args.len() == 1 => feed_enumerator(recv, &args[0]),
         "size" if args.is_empty() => generator_size(recv),
         // A block-less enumerator-returning method answers with ANOTHER
         // generator wrapping this one, so an infinite source is never pulled:

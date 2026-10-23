@@ -7188,3 +7188,49 @@ DmU
 1
 2
 "memo(8)"
+#==#
+1
+[:fed, :x]
+2
+[:fed2, nil]
+:done
+1
+2
+3
+[:a, :b, :c]
+#<TypeError: feed value already set>
+#==#
+#<Enumerator::Lazy: #<Enumerator::Chain: [#<Enumerator::Lazy: [1]>, [2]]>>
+[3, 6]
+[1, 2, 3, 4]
+#<Enumerator::Lazy: #<Enumerator::Chain: [#<Enumerator::Lazy: [1]>, [2]]>>
+[1, 2]
+6
+60
+#==#
+made
+run
+run
+30
+[0, 1, 2]
+[0, 1]
+#==#
+0
+1
+2
+1
+2
+4
+8
+true
+true
+Integer
+"hi"
+"hi!"
+0
+Errno::EEXIST
+#==#
+obj+ toplvl
+obj+ outer_m
+obj+ inner_m
+again later_m

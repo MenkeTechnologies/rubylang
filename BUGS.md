@@ -294,8 +294,11 @@ smaller thread stack and prove nothing about `ruby -e`.
   answers `first(n)`, `take_while`, `lazy` and `next`. Inside a generator,
   `y.yield` answers what the consumer handed back: the block's value under
   `each`, nil under `next` and collecting walks (`<<` still answers the
-  yielder). Residue: `Enumerator#feed` is not implemented, and a `to_enum`
-  given both a size block and method arguments is still collected eagerly.
+  yielder). `Enumerator#feed` answers the pending `y.yield` of a generator,
+  and for a buffered `map`/`collect` Enumerator becomes that element's block
+  result (the `StopIteration#result`); feeding twice is a TypeError. A
+  `to_enum` given method arguments and a size block is lazy too, and the size
+  block receives the arguments.
 - **A bare undefined CONSTANT raises `NameError` — fixed.** `p Nope` raises
   `uninitialized constant Nope` (qualified by the lexical class inside a
   namespace: `A::Foo::Bar`), with `#name` and `#receiver` set, after
@@ -1050,8 +1053,9 @@ Honest limitations of this surface:
   reach only a superclass's hook. `define_method` and `def` replace each other
   in definition order (a hoisted `def` reclaims its name at its position), and
   an UnboundMethod keeps the definition it was made from, so the
-  wrap-in-`method_added` memoization idiom works. Residue: a top-level `def`
-  does not fire `Object.method_added`.
+  wrap-in-`method_added` memoization idiom works. A top-level `def` (or one
+  run with `self` = main) fires `Object.method_added`, and a hook defined again
+  by a later reopening takes over only at that reopening's position.
 
 ## Lexer
 
@@ -1206,8 +1210,9 @@ Honest limitations of this surface:
   `each` runs each part's own `each`, `rewind` rewinds them in reverse, and the
   rest of Enumerable walks the parts one element at a time, so an endless part
   still answers `first`/`find`/`lazy`. `next`/`peek`/`feed` are undefined on the
-  class, as in enumerator.c. Residue: `Enumerator::Lazy#chain`/`+` (MRI keeps
-  them lazy) answer an eager chain.
+  class, as in enumerator.c. `Enumerator::Lazy#chain`/`+` answer a Lazy over the
+  chain, and `Lazy#each { }` walks its pipeline one element at a time, so an
+  endless one stops at a `break`.
 
 - **Argument counts on built-ins are checked once, from a measured table.** Every
   built-in dispatch arm reads its arguments positionally (`args[0]`), so a call
@@ -2192,9 +2197,11 @@ class-level one-shot `hexdigest`/`digest`/`base64digest`.
 
 - **`File < IO` — fixed.** `File.superclass` is `IO`, both carry
   `File::Constants` and `Enumerable` in their ancestry, and a File is `is_a?(IO)`
-  and `IO === file`. `File::Constants` holds the `FNM_*` flags and `NULL`; the
-  platform-specific open/lock flags (`RDONLY`, `CREAT`, `LOCK_EX`, …) are not
-  modelled.
+  and `IO === file`. `File::Constants` holds the `FNM_*` flags, `NULL`, and the
+  platform's own `open(2)`/`flock(2)` values (`RDONLY`, `CREAT`, `EXCL`,
+  `LOCK_EX`, …), also reachable as `File::X` and `IO::X`. `File.open` takes
+  Integer flags (and permission bits), and `File#flock` locks (false for a
+  held non-blocking lock).
 - **`puts`, `printf`, `putc`, `fileno`, `tty?` — fixed.** One renderer serves
   every `puts` (Kernel, IO, TCPSocket, StringIO): an empty Array writes
   nothing (MRI 4), a self-holding Array prints `[...]`, and `StringIO#puts`

@@ -8423,3 +8423,33 @@ class Memo
   def calc(x) = x * 2
 end
 p Memo.new.calc(4)
+#==#
+# ── Enumerator#feed answers the pending yield (generators) or the element's block result (map) ──
+e = Enumerator.new { |y| r = y.yield(1); p [:fed, r]; r2 = y.yield(2); p [:fed2, r2]; :done }
+p e.next; e.feed(:x); p e.next; p((e.next rescue $!.result))
+o = [1, 2, 3].map; p o.next; o.feed(:a); p o.next; o.feed(:b); p o.next; o.feed(:c); p((o.next rescue $!.result))
+e2 = [1].each; e2.next; e2.feed(1); p((e2.feed(2) rescue $!))
+#==#
+# ── Enumerator::Lazy#chain / #+ stay lazy; Lazy#each { } walks an endless pipeline one element at a time ──
+p [1].lazy + [2], ([1].lazy + [2]).map { _1 * 3 }.to_a, [1].lazy.chain([2], 3..4).to_a, [1].lazy.chain([2]), (1..).lazy.chain([0]).first(2)
+a = (1..).lazy.map { _1 * 2 }.each { |x| break x if x > 4 }; b = (1..).lazy.select(&:even?).each { |x| break x * 10 if x > 5 }; p a, b
+#==#
+# ── to_enum with arguments and a size block: lazy, and the size block gets the arguments ──
+def gsz(n); return to_enum(:gsz, n) { |k| k * 10 } unless block_given?; puts "run"; n.times { yield _1 }; end
+e = gsz(3); puts "made"; p e.size, e.to_a, e.first(2)
+#==#
+# ── File::Constants open/lock flags, File.open with Integer flags, File#flock ──
+p File::RDONLY, File::WRONLY, File::RDWR, File::LOCK_SH, File::LOCK_EX, File::LOCK_NB, File::LOCK_UN, File::Constants::CREAT == File::CREAT, IO::TRUNC == File::TRUNC, File::CREAT.class
+path = "/tmp/rubylang_parity_flags_#{Process.pid}.txt"
+File.open(path, File::WRONLY | File::CREAT | File::TRUNC, 0o644) { |f| f.write("hi") }; p File.read(path)
+File.open(path, File::WRONLY | File::APPEND) { |f| f.write("!") }; p File.read(path), File.open(path) { |f| f.flock(File::LOCK_EX) }
+p (File.open(path, File::WRONLY | File::CREAT | File::EXCL) rescue $!.class)
+File.delete(path)
+#==#
+# ── a top-level def fires Object.method_added; each reopening's hook takes over at its own position ──
+class Object; def self.method_added(m) = puts("obj+ #{m}"); end
+def toplvl; end
+def outer_m; def inner_m; end; end; outer_m
+class Object; def self.method_added(m) = puts("again #{m}"); end
+def later_m; end
+class Object; class << self; remove_method :method_added; end; end
