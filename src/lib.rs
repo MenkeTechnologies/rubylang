@@ -344,6 +344,18 @@ class IO
 end
 
 class File
+  # The module IO includes (so File inherits it); only its platform-neutral
+  # members are modelled.
+  module Constants
+    FNM_NOESCAPE = 1
+    FNM_PATHNAME = 2
+    FNM_DOTMATCH = 4
+    FNM_CASEFOLD = 8
+    FNM_EXTGLOB = 16
+    FNM_SYSCASE = 0
+    FNM_SHORTNAME = 0
+    NULL = "/dev/null"
+  end
   SEPARATOR = "/"
   ALT_SEPARATOR = nil
   PATH_SEPARATOR = ":"

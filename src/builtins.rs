@@ -29,6 +29,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::MARK_KWARGS, b_mark_kwargs);
     vm.register_builtin(ops::KWSPLAT_ARGS, b_kwsplat_args);
     vm.register_builtin(ops::BITNOT, b_bitnot);
+    vm.register_builtin(ops::METHOD_HOOK, b_method_hook);
     vm.register_builtin(ops::SETLOCAL, b_setlocal);
     vm.register_builtin(ops::GETIVAR, b_getivar);
     vm.register_builtin(ops::SETIVAR, b_setivar);
@@ -1139,6 +1140,9 @@ fn b_define_singleton(vm: &mut VM, _: u8) -> Value {
             h.add_singleton_method(id, &name, def);
         }
     });
+    if let Err(e) = fire_method_hook(&recv, "singleton_method_added", &name) {
+        return abort(vm, e);
+    }
     with_host(|h| h.new_symbol(&name))
 }
 
@@ -1148,8 +1152,90 @@ fn b_define_singleton(vm: &mut VM, _: u8) -> Value {
 fn b_define_method_dyn(vm: &mut VM, _: u8) -> Value {
     let synth = name_of(&vm.pop());
     let name = name_of(&vm.pop());
-    crate::host::apply_def_target(&name, &synth);
+    if let Some(target) = crate::host::apply_def_target(&name, &synth) {
+        let fired = match target {
+            crate::host::DefTarget::Instance(c) => fire_added_on(&c, &name),
+            crate::host::DefTarget::ClassMethod(c) => {
+                let recv = with_host(|h| h.class_ref(&c));
+                fire_method_hook(&recv, "singleton_method_added", &name)
+            }
+            crate::host::DefTarget::Singleton(id) => {
+                fire_method_hook(&Value::Obj(id), "singleton_method_added", &name)
+            }
+            crate::host::DefTarget::None => Ok(()),
+        };
+        if let Err(e) = fired {
+            return abort(vm, e);
+        }
+    }
     with_host(|h| h.new_symbol(&name))
+}
+
+/// `[hook, *names]`: the methods a class-body statement registered up front,
+/// announced on the running body's `self` at that statement's position. A
+/// hoisted hook method goes live here, before its own announcement fires (MRI
+/// calls `singleton_method_added(:singleton_method_added)`).
+fn b_method_hook(vm: &mut VM, argc: u8) -> Value {
+    let vals = pop_n(vm, argc as usize);
+    let hook = name_of(&vals[0]);
+    let target = with_host(|h| h.current_self());
+    let names: Vec<String> = vals[1..].iter().map(name_of).collect();
+    if hook == "singleton_method_added" {
+        if let Some(cls) = with_host(|h| h.classref_name(&target)) {
+            with_host(|h| names.iter().for_each(|n| h.activate_hoisted_hook(&cls, n)));
+        }
+    }
+    for n in &names {
+        if let Err(e) = fire_method_hook(&target, &hook, n) {
+            return abort(vm, e);
+        }
+    }
+    Value::Undef
+}
+
+/// Fire `hook` (`method_added` / `singleton_method_added`) for the method
+/// `name` just defined on `target`, as `rb_method_added` / `rb_singleton_method_
+/// added` do. A class or module runs its class method `hook`, passing over a
+/// hoisted definition whose class body has not reached it yet (MRI would not
+/// have defined it at this point). Any other object runs its singleton
+/// `singleton_method_added`. The builtin hooks are no-ops, so a hook nobody
+/// defined does nothing.
+pub(crate) fn fire_method_hook(target: &Value, hook: &str, name: &str) -> Result<(), String> {
+    let sym = with_host(|h| h.new_symbol(name));
+    if let Some(cls) = with_host(|h| h.classref_name(target)) {
+        let mut start = Some(cls);
+        while let Some((def, owner)) =
+            start.and_then(|s| with_host(|h| h.find_class_method_owner(&s, hook)))
+        {
+            if with_host(|h| h.hoisted_hook_pending(&owner, hook)) {
+                start = with_host(|h| h.superclass_of(&owner));
+                continue;
+            }
+            crate::host::call_class_method(target.clone(), &def, hook, &owner, &[sym], None)?;
+            break;
+        }
+    } else if hook == "singleton_method_added"
+        && with_host(|h| h.find_singleton_method(target, hook)).is_some()
+    {
+        dispatch(target, hook, &[sym], None)?;
+    }
+    Ok(())
+}
+
+/// A method `name` was just added to the class or module `cls` at run time: an
+/// instance method fires `method_added` on it, one on a singleton class
+/// `#<Class:X>` fires `singleton_method_added` on `X`.
+fn fire_added_on(cls: &str, name: &str) -> Result<(), String> {
+    match crate::host::RubyHost::metaclass_attached(cls) {
+        Some(attached) => {
+            let recv = with_host(|h| h.class_ref(attached));
+            fire_method_hook(&recv, "singleton_method_added", name)
+        }
+        None => {
+            let recv = with_host(|h| h.class_ref(cls));
+            fire_method_hook(&recv, "method_added", name)
+        }
+    }
 }
 
 /// `inherited`/`included`/`extended`/`prepended` hook: stack is
@@ -1609,12 +1695,14 @@ fn dispatch_call(name: &str, args: &[Value], block: Option<Value>) -> Result<Val
                 let attached = attached.to_string();
                 with_host(|h| h.remove_class_method(&attached, &mname));
             }
+            fire_added_on(&cls, &mname)?;
             return Ok(with_host(|h| h.new_symbol(&mname)));
         }
         // `alias_method(:new, :old)` — register an alias on the class.
         if name == "alias_method" && args.len() >= 2 {
             let (new_name, old_name) = (name_of(&args[0]), name_of(&args[1]));
             with_host(|h| h.register_alias(&cls, &new_name, &old_name));
+            fire_added_on(&cls, &new_name)?;
             return Ok(with_host(|h| h.new_symbol(&new_name)));
         }
         // A bare `include`/`prepend`/`extend M` in a class body (e.g. a
@@ -2051,6 +2139,10 @@ const CORE_EXTENDING_LIBS: &[&str] = &[
 /// built-in ancestor defines `name`, leaving the caller's other rules to decide.
 fn builtin_responds(recv: &Value, name: &str, include_all: Option<&Value>) -> Option<bool> {
     let include_all = include_all.is_some_and(|a| with_host(|h| h.truthy(a)));
+    // enumerator.c undefines external iteration on `Enumerator::Chain`.
+    if CHAIN_UNDEFINED.contains(&name) && with_host(|h| h.enum_chain_parts(recv).is_some()) {
+        return Some(false);
+    }
     let Some(owner) = with_host(|h| h.builtin_owner(recv, name)) else {
         // `Module`/`Class` instance methods are not on a plain value: only a
         // class or module (or the top-level `main`, which forwards a few)
@@ -2132,6 +2224,18 @@ pub(crate) fn dispatch_by_type(
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
+    if name == "chain" && CHAIN_RECEIVERS.contains(&class) {
+        return Ok(make_enum_chain(recv, args));
+    }
+    if name == "+"
+        && args.len() == 1
+        && matches!(
+            class,
+            "Enumerator" | "Enumerator::ArithmeticSequence" | "Enumerator::Chain"
+        )
+    {
+        return Ok(make_enum_chain(recv, args));
+    }
     match class {
         "Integer" | "Float" => dispatch_number(recv, name, args, block),
         "String" => dispatch_string(recv, name, args, block),
@@ -2152,6 +2256,7 @@ pub(crate) fn dispatch_by_type(
         "DateTime" => dispatch_datetime(recv, name, args),
         "Enumerator" => dispatch_enumerator(recv, name, args, block),
         "Enumerator::ArithmeticSequence" => dispatch_arith_seq(recv, name, args, block),
+        "Enumerator::Chain" => dispatch_enum_chain(recv, name, args, block),
         "Fiber" => dispatch_fiber(recv, name, args),
         "Thread" => dispatch_thread(recv, name, args),
         "IO" | "File" => dispatch_io(recv, name, args, block),
@@ -2938,10 +3043,37 @@ fn dispatch_resolved(
                     return Ok(derived_enum(recv, gb, "to_enum", &[], Derive::Each));
                 }
             }
-            let sink = with_host(|h| h.new_enum_sink());
             // The method is invoked as `send` would: a top-level `def gen`
             // (private on Object) enumerates through `to_enum(:gen)`.
             let user_method = top_level_method_for(recv, &method);
+            // Over Ruby code, the enumerator runs the method only when it is
+            // iterated, and one element at a time (enumerator.c): building it
+            // has no side effects, and a method that yields forever still
+            // answers `first(n)`, `lazy` and `next`.
+            let ruby_defined = user_method.is_some()
+                || with_host(|h| h.object_class(recv).is_some())
+                || with_host(|h| h.find_singleton_method(recv, &method).is_some());
+            if ruby_defined && (block.is_none() || rest.is_empty()) {
+                let gen = crate::host::eval_erb_with_locals(
+                    "Enumerator.new { |y| __recv.__send__(__meth, *__args) { |*x| y.yield(*x) } }",
+                    vec![
+                        ("__recv".to_string(), recv.clone()),
+                        ("__meth".to_string(), with_host(|h| h.new_symbol(&method))),
+                        ("__args".to_string(), new_arr(rest.clone())),
+                    ],
+                )?;
+                let label = enum_label(recv, &method, &rest);
+                with_host(|h| {
+                    let size = match &block {
+                        Some(b) => GenSize::Call(b.clone()),
+                        None => GenSize::Fixed(Value::Undef),
+                    };
+                    h.set_generator_size(&gen, size);
+                    h.set_generator_label(&gen, label);
+                });
+                return Ok(gen);
+            }
+            let sink = with_host(|h| h.new_enum_sink());
             let ret = if let Some(def) = &user_method {
                 crate::host::run_top_method(def, recv.clone(), &method, &rest, Some(sink))?
             } else {
@@ -2974,7 +3106,10 @@ fn dispatch_resolved(
             // when endless, the generator) it wraps. Materializing the sequence
             // itself is what the `else` branch below would do, and for an endless
             // one that never returns.
-            let source = if let Some(seq) = with_host(|h| h.arith_seq(recv)) {
+            // A chain is lazy over the generator walking its parts.
+            let source = if let Some(parts) = with_host(|h| h.enum_chain_parts(recv)) {
+                enum_chain_generator(recv, parts)?
+            } else if let Some(seq) = with_host(|h| h.arith_seq(recv)) {
                 if with_host(|h| h.generator_block(&seq.inner).is_some()) {
                     seq.inner
                 } else {
@@ -3601,11 +3736,13 @@ fn dispatch_resolved(
             // so an id-keyed singleton would be lost on the next `Klass.m` call).
             if let Some(cls) = with_host(|h| h.classref_name(recv)) {
                 with_host(|h| h.add_class_define_method(&cls, &mname, proc));
+                fire_method_hook(recv, "singleton_method_added", &mname)?;
                 return Ok(with_host(|h| h.new_symbol(&mname)));
             }
             if let Value::Obj(id) = recv {
                 with_host(|h| h.add_singleton_define_method(*id, &mname, proc));
             }
+            fire_method_hook(recv, "singleton_method_added", &mname)?;
             return Ok(with_host(|h| h.new_symbol(&mname)));
         }
         // `obj.extend(M, …)` — mix each module's instance methods into the
@@ -4304,6 +4441,10 @@ fn dispatch_classref(
     // block computes the next value from the previous one, rather than driving a
     // yielder. Without an `init` the block is called once with nil for the first
     // value. Raising `StopIteration` inside the block ends the sequence.
+    // `Enumerator::Chain.new(*enums)` (enum_chain_initialize).
+    if cls == "Enumerator::Chain" && name == "new" {
+        return Ok(with_host(|h| h.new_enum_chain(args.to_vec())));
+    }
     if cls == "Enumerator" && name == "produce" {
         let b = block.ok_or_else(|| raise_exc("ArgumentError", "no block given"))?;
         let init = args.first().cloned();
@@ -5710,12 +5851,14 @@ fn dispatch_classref(
                 let attached = attached.to_string();
                 with_host(|h| h.remove_class_method(&attached, &mname));
             }
+            fire_added_on(cls, &mname)?;
             Ok(with_host(|h| h.new_symbol(&mname)))
         }
         // `Klass.alias_method(:new, :old)` — register an alias on the class.
         "alias_method" if args.len() >= 2 => {
             let (new_name, old_name) = (name_of(&args[0]), name_of(&args[1]));
             with_host(|h| h.register_alias(cls, &new_name, &old_name));
+            fire_added_on(cls, &new_name)?;
             Ok(with_host(|h| h.new_symbol(&new_name)))
         }
         _ => {
@@ -6878,6 +7021,10 @@ fn enumerable_method(
     if !ENUMERABLE_METHODS.contains(&name) {
         return Ok(None);
     }
+    // `chain` keeps the receiver itself as the first part, not its elements.
+    if name == "chain" {
+        return Ok(Some(make_enum_chain(recv, args)));
+    }
     let elems = enum_to_vec(recv)?;
     let arr = with_host(|h| h.new_array(elems));
     let out = enum_delegate(&arr, name, args, block)?;
@@ -6917,6 +7064,15 @@ fn conv_operand_name(v: &Value) -> String {
 /// raising the TypeError Ruby raises. Argument positions MRI converts with
 /// `to_int` go through here so a type error is an error rather than a wrong
 /// answer. Floats truncate, matching `Float#to_int`.
+/// `Enumerator#with_index`'s offset (`enumerator_with_index`): nil or absent is
+/// 0, anything else converts like `NUM2LONG`.
+fn with_index_offset(args: &[Value]) -> Result<i64, String> {
+    match args.first() {
+        None | Some(Value::Undef) => Ok(0),
+        Some(v) => to_int(v),
+    }
+}
+
 fn to_int(v: &Value) -> Result<i64, String> {
     match v {
         Value::Int(n) => Ok(*n),
@@ -13922,18 +14078,6 @@ fn dispatch_array(
                 Ok(with_host(|h| h.new_enumerator_of(arr, name, recv.clone())))
             }
         }
-        // `chain(*enums)` returns an Enumerator over the receiver followed by each
-        // argument's elements (MRI: `[1,2,3].chain([4,5]).to_a`→`[1,2,3,4,5]`).
-        "chain" => {
-            let mut chained = arr.clone();
-            for a in args {
-                match with_host(|h| h.as_array(a)) {
-                    Some(xs) => chained.extend(xs),
-                    None => chained.push(a.clone()),
-                }
-            }
-            Ok(with_host(|h| h.new_enumerator(chained, "each")))
-        }
         "reverse_each" => {
             if let Some(b) = &block {
                 for x in arr.iter().rev() {
@@ -16734,6 +16878,123 @@ fn make_endless_arith_seq(desc: String, begin: Value, step: Value, float: bool) 
     })
 }
 
+/// Classes whose instances answer `Enumerable#chain` natively, and the
+/// Enumerator classes that also answer `Enumerator#+` (`enum_chain` /
+/// `enumerator_plus` in enumerator.c). `Enumerator::Lazy` overrides both to stay
+/// lazy and is not modelled here.
+const CHAIN_RECEIVERS: &[&str] = &[
+    "Array",
+    "Hash",
+    "Range",
+    "Set",
+    "Struct",
+    "Enumerator",
+    "Enumerator::ArithmeticSequence",
+    "Enumerator::Chain",
+];
+
+/// The Enumerator methods enumerator.c undefines on `Enumerator::Chain`.
+const CHAIN_UNDEFINED: &[&str] = &["feed", "next", "next_values", "peek", "peek_values"];
+
+/// `Enumerable#chain(*enums)` / `Enumerator#+(enum)`: an `Enumerator::Chain`
+/// over the receiver followed by each argument, which are kept as given (MRI
+/// does not convert them until iteration).
+fn make_enum_chain(recv: &Value, args: &[Value]) -> Value {
+    let mut parts = vec![recv.clone()];
+    parts.extend_from_slice(args);
+    with_host(|h| h.new_enum_chain(parts))
+}
+
+/// A generator walking the chain `recv`'s parts in order (`enum_chain_each`):
+/// each part's own `each` feeds the yielder, so a part that never ends is pulled
+/// lazily and the values a part yields together arrive together. It carries the
+/// chain's size, and the label of the `enum_for(:each)` MRI derives every other
+/// enumerator from, so a derived one inspects one level deeper than the chain.
+fn enum_chain_generator(recv: &Value, parts: Vec<Value>) -> Result<Value, String> {
+    let size = enum_chain_size(&parts)?;
+    let label = format!("#<Enumerator: {}:each>", with_host(|h| h.inspect(recv)));
+    let gen = crate::host::eval_erb_with_locals(
+        "Enumerator.new { |y| __chain_parts.each { |e| e.each { |*x| y.yield(*x) } } }",
+        vec![("__chain_parts".to_string(), new_arr(parts))],
+    )?;
+    with_host(|h| {
+        h.set_generator_size(&gen, GenSize::Fixed(size));
+        h.set_generator_label(&gen, label);
+    });
+    Ok(gen)
+}
+
+/// `enum_chain_total_size`: the sum of every part's `size`. A part without
+/// `size`, or one whose size is nil or infinite, decides the answer; any other
+/// non-Integer size makes it nil.
+fn enum_chain_size(parts: &[Value]) -> Result<Value, String> {
+    let size_sym = with_host(|h| h.new_symbol("size"));
+    let mut total = Value::Int(0);
+    for p in parts {
+        let responds = dispatch(p, "respond_to?", std::slice::from_ref(&size_sym), None)?;
+        if !with_host(|h| h.truthy(&responds)) {
+            return Ok(Value::Undef);
+        }
+        let s = dispatch(p, "size", &[], None)?;
+        match s {
+            Value::Undef => return Ok(s),
+            Value::Float(f) if f.is_infinite() => return Ok(s),
+            Value::Int(_) => total = dispatch(&total, "+", &[s], None)?,
+            _ if with_host(|h| h.class_of(&s)) == "Integer" => {
+                total = dispatch(&total, "+", &[s], None)?
+            }
+            _ => return Ok(Value::Undef),
+        }
+    }
+    Ok(total)
+}
+
+/// `Enumerator::Chain`. It answers `each`/`size`/`rewind`/`inspect` itself, as
+/// enumerator.c defines them on the class; external iteration (`next`, `peek`,
+/// `next_values`, `peek_values`, `feed`) is undefined there, and everything
+/// else is Enumerable over a generator walking the parts.
+fn dispatch_enum_chain(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    let Some(parts) = with_host(|h| h.enum_chain_parts(recv)) else {
+        return Err(no_method_error(recv, name));
+    };
+    match name {
+        "inspect" | "to_s" if args.is_empty() => Ok(new_str(with_host(|h| h.inspect(recv)))),
+        "size" if args.is_empty() => enum_chain_size(&parts),
+        _ if CHAIN_UNDEFINED.contains(&name) => Err(no_method_error(recv, name)),
+        // `enum_chain_rewind` rewinds the parts in reverse, each that can be.
+        "rewind" if args.is_empty() => {
+            let rewind_sym = with_host(|h| h.new_symbol("rewind"));
+            for p in parts.iter().rev() {
+                let responds = dispatch(p, "respond_to?", std::slice::from_ref(&rewind_sym), None)?;
+                if with_host(|h| h.truthy(&responds)) {
+                    dispatch(p, "rewind", &[], None)?;
+                }
+            }
+            Ok(recv.clone())
+        }
+        // `each` with a block runs every part's own `each` and answers the chain.
+        "each" if block.is_some() => {
+            for p in &parts {
+                dispatch(p, "each", args, block.clone())?;
+                if has_pending_signal() {
+                    break;
+                }
+            }
+            Ok(recv.clone())
+        }
+        _ => {
+            let gen = enum_chain_generator(recv, parts)?;
+            let r = dispatch(&gen, name, args, block)?;
+            Ok(if r == gen { recv.clone() } else { r })
+        }
+    }
+}
+
 /// `Enumerator::ArithmeticSequence`. Answers the sequence-specific surface MRI
 /// gives the class — `begin`/`end`/`step`/`exclude_end?`/`inspect` and the
 /// value-based `==`/`eql?`/`hash` — and forwards everything else to the
@@ -17110,9 +17371,10 @@ fn dispatch_enumerator(
         {
             let method = with_host(|h| h.enum_method(recv)).unwrap_or_default();
             let source = with_host(|h| h.enum_source(recv)).unwrap_or(Value::Undef);
-            let offset = match (name, args.first()) {
-                ("with_index", Some(v)) => to_int(v)?,
-                _ => 0,
+            let offset = if name == "with_index" {
+                with_index_offset(args)?
+            } else {
+                0
             };
             hash_reattach_with_index(&source, &method, block.as_ref().unwrap(), offset)
         }
@@ -17132,10 +17394,7 @@ fn dispatch_enumerator(
             let source = with_host(|h| h.enum_source(recv)).unwrap_or(Value::Undef);
             let index = match name {
                 "each" => None,
-                "with_index" => Some(match args.first() {
-                    Some(Value::Int(n)) => *n,
-                    _ => 0,
-                }),
+                "with_index" => Some(with_index_offset(args)?),
                 _ => Some(0),
             };
             array_bang_iterate(&source, &method, &buf, &block.unwrap(), index)
@@ -17153,9 +17412,10 @@ fn dispatch_enumerator(
         {
             let method = with_host(|h| h.enum_method(recv)).unwrap_or_default();
             let source = with_host(|h| h.enum_source(recv)).unwrap_or_else(|| new_arr(buf.clone()));
-            let offset = match (name, args.first()) {
-                ("with_index", Some(Value::Int(n))) => *n,
-                _ => 0,
+            let offset = if name == "with_index" {
+                with_index_offset(args)?
+            } else {
+                0
             };
             if ARRAY_YIELD_METHODS.contains(&method.as_str()) {
                 array_yield_method(&source, &method, &buf, &block.unwrap(), Some(offset))
@@ -17170,9 +17430,10 @@ fn dispatch_enumerator(
         // else) runs for side effects and returns the receiver's elements.
         // `Enumerator#each_with_index` is `with_index(0)` (enumerator.c).
         "with_index" | "each_with_index" if block.is_some() => {
-            let offset = match (name, args.first()) {
-                ("with_index", Some(Value::Int(n))) => *n,
-                _ => 0,
+            let offset = if name == "with_index" {
+                with_index_offset(args)?
+            } else {
+                0
             };
             let b = block.unwrap();
             let method = with_host(|h| h.enum_method(recv).unwrap_or_default());
@@ -17258,20 +17519,21 @@ fn dispatch_enumerator(
         }
         // `with_index` without a block yields `[elem, offset+index]` pairs.
         "with_index" if block.is_none() => {
-            let offset = match args.first() {
-                Some(Value::Int(n)) => *n,
-                _ => 0,
-            };
+            let offset = with_index_offset(args)?;
             let pairs: Vec<Value> = buf
                 .iter()
                 .enumerate()
                 .map(|(i, x)| new_arr(vec![x.clone(), Value::Int(offset + i as i64)]))
                 .collect();
-            let label = enum_label(recv, name, args);
+            // Tagged with the call that built it, over this enumerator, so its
+            // `each { }` re-runs `with_index(offset) { }` here (and answers
+            // what that answers) and its block gets both yielded values.
+            let tag = match args.first() {
+                Some(a) => format!("with_index({})", with_host(|h| h.inspect(a))),
+                None => "with_index".to_string(),
+            };
             Ok(with_host(|h| {
-                let e = h.new_enumerator(pairs, "each");
-                h.set_enum_label(&e, label);
-                e
+                h.new_enumerator_of(pairs, &tag, recv.clone())
             }))
         }
         // `each` runs the block over the buffered values and answers the OBJECT
@@ -17294,6 +17556,23 @@ fn dispatch_enumerator(
             let method = with_host(|h| h.enum_method(recv)).unwrap_or_default();
             let source = with_host(|h| h.enum_source(recv)).unwrap();
             dispatch(&source, &method, &[], block)
+        }
+        // `e.with_index(offset).each { }` is `e.with_index(offset) { }`.
+        "each"
+            if args.is_empty()
+                && block.is_some()
+                && with_host(|h| h.enum_method(recv))
+                    .is_some_and(|m| m.split('(').next() == Some("with_index"))
+                && with_host(|h| h.enum_source(recv)).is_some() =>
+        {
+            let tag = with_host(|h| h.enum_method(recv)).unwrap_or_default();
+            let offset = tag
+                .strip_prefix("with_index(")
+                .and_then(|s| s.strip_suffix(')'))
+                .and_then(|s| s.parse::<f64>().ok())
+                .map_or(0, |f| f as i64);
+            let source = with_host(|h| h.enum_source(recv)).unwrap();
+            dispatch(&source, "with_index", &[Value::Int(offset)], block)
         }
         "each" | "each_entry" if args.is_empty() && block.is_some() => {
             let b = block.unwrap();
@@ -17352,7 +17631,19 @@ fn enum_each_result(recv: &Value, buf: Vec<Value>) -> Value {
             return memo;
         }
     }
-    with_host(|h| h.enum_source(recv)).unwrap_or_else(|| new_arr(buf))
+    // `e.with_index(n)` / `e.each_with_index` answer what `e.each { }` answers,
+    // so over another Enumerator the answer is that one's, not the Enumerator.
+    let reruns_source = with_host(|h| h.enum_method(recv))
+        .is_some_and(|m| matches!(m.split('(').next(), Some("with_index" | "each_with_index")));
+    if let Some(src) = with_host(|h| h.enum_source(recv)) {
+        if reruns_source && with_host(|h| h.generator_block(&src).is_none()) {
+            if let Some(src_buf) = with_host(|h| h.enum_buf(&src)) {
+                return enum_each_result(&src, src_buf);
+            }
+        }
+        return src;
+    }
+    new_arr(buf)
 }
 
 /// One element's verdict for `any?`/`all?`/`none?`/`one?`: `pattern === x` when
@@ -17391,16 +17682,18 @@ fn dispatch_yielder(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
             // On the external-iteration path the block runs inside a Fiber:
             // suspend it with this value so `Enumerator#next` gets exactly one
             // element and the block stops right here until the next `next`.
-            if with_host(|h| h.is_fiber_yielder(recv)) {
-                crate::host::fiber_yield(v)?;
-                return Ok(recv.clone());
-            }
-            if with_host(|h| h.yielder_push(recv, v)) {
-                raise_signal_break(Value::Undef);
-            }
-            // `<<` returns the yielder (so `y << 1 << 2` chains); `yield` returns
-            // nil in MRI, but generator blocks discard it, so `recv` is faithful.
-            Ok(recv.clone())
+            // `<<` answers the yielder (so `y << 1 << 2` chains); `yield` answers
+            // what the consumer handed back — the block's value for `each`, the
+            // `feed` value for `next` (nil unless fed), nil for a collecting walk.
+            let answer = if with_host(|h| h.is_fiber_yielder(recv)) {
+                crate::host::fiber_yield(v)?
+            } else {
+                if with_host(|h| h.yielder_push(recv, v)) {
+                    raise_signal_break(Value::Undef);
+                }
+                Value::Undef
+            };
+            Ok(if name == "<<" { recv.clone() } else { answer })
         }
         _ => Err(no_method_error(recv, name)),
     }
@@ -20113,6 +20406,9 @@ enum Stream {
         started: bool,
         /// What the generator body evaluated to, once it has returned.
         result: Option<Value>,
+        /// What the body's pending `y.yield` answers when it is next resumed:
+        /// the consumer block's value for `each`, nil for every other walk.
+        feed: Value,
     },
     Count(i64),
 }
@@ -20123,6 +20419,14 @@ impl Stream {
             fiber: crate::host::new_fiber(gblock.clone()),
             started: false,
             result: None,
+            feed: Value::Undef,
+        }
+    }
+
+    /// Hand the body's pending `y.yield` its answer for the next resume.
+    fn feed(&mut self, v: Value) {
+        if let Stream::Gen { feed, .. } = self {
+            *feed = v;
         }
     }
 
@@ -20141,10 +20445,11 @@ impl Stream {
                 fiber,
                 started,
                 result,
+                feed,
             } => {
                 // The first resume carries the yielder that becomes `|y|`.
                 let arg = if *started {
-                    Value::Undef
+                    std::mem::replace(feed, Value::Undef)
                 } else {
                     *started = true;
                     with_host(|h| h.new_fiber_yielder())
@@ -20211,8 +20516,11 @@ fn stream_consume(
     let mut hits = 0usize;
     while let Some(x) = src.pull()? {
         let decided = match name {
+            // `y.yield` inside the body answers what the block answered.
             "each" | "each_entry" => {
-                block.map(|b| call(b, &x)).transpose()?;
+                if let Some(r) = block.map(|b| call(b, &x)).transpose()? {
+                    src.feed(r);
+                }
                 None
             }
             "each_with_index" => {

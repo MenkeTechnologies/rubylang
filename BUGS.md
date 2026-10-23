@@ -288,7 +288,14 @@ smaller thread stack and prove nothing about `ruby -e`.
   `require "comparable"`/`"enumerable"` now raise `LoadError` as in MRI.
 - **`to_enum` Enumerators: `size` is nil (or the size block's answer) and
   `each`/`StopIteration#result` answer the user method's return value — fixed.**
-  The method still runs eagerly when `to_enum` is called.
+  Over Ruby code (a user object, a singleton `each`, a top-level method) the
+  method runs only when the Enumerator is iterated, one element at a time, so
+  building one has no side effects and a method that yields forever still
+  answers `first(n)`, `take_while`, `lazy` and `next`. Inside a generator,
+  `y.yield` answers what the consumer handed back: the block's value under
+  `each`, nil under `next` and collecting walks (`<<` still answers the
+  yielder). Residue: `Enumerator#feed` is not implemented, and a `to_enum`
+  given both a size block and method arguments is still collected eagerly.
 - **A bare undefined CONSTANT raises `NameError` — fixed.** `p Nope` raises
   `uninitialized constant Nope` (qualified by the lexical class inside a
   namespace: `A::Foo::Bar`), with `#name` and `#receiver` set, after
@@ -1032,10 +1039,18 @@ Honest limitations of this surface:
   Integers never reaches dispatch), `to_s` refinements honored by string
   interpolation, and a refinement being active inside its own `refine` block
   before any `using`.
-- **`Module#method_added` never fires.** A `def self.method_added(m)` hook is
-  accepted but not called for later `def`s (MRI: `[:foo, :bar]` for a class and
-  its subclass's definitions). Methods are installed when the program loads
-  (the hoisting above), so there is no runtime definition point to fire from.
+- **`method_added` / `singleton_method_added` fire where each method is
+  defined — fixed.** The methods a class body hoists (`def`, `def self.m`,
+  `private def`, `attr_*`, the `def`s of `class << self`) are announced by a
+  statement the compiler leaves at their position, so the hook runs in source
+  order between the body's other statements; `define_method`, `alias_method`/
+  `alias`, `class_eval { def }`, `define_singleton_method`, `def obj.m` and
+  `instance_eval { def }` fire at run time. A hoisted hook method is inert until
+  its own announcement (MRI has not defined it yet), so a body's earlier `def`s
+  reach only a superclass's hook. Residue: a `define_method` does not replace a
+  same-named `def` of the same class (the `def` keeps winning), which defeats
+  the wrap-in-`method_added` memoization idiom; a top-level `def` does not fire
+  `Object.method_added`.
 
 ## Lexer
 
@@ -1085,6 +1100,18 @@ Honest limitations of this surface:
   value that follows is a keyword or constant (`x:true`, `k:String`,
   `keyword_init:true`) is a label colon, not a symbol start. Expression-start and
   spaced-command-arg symbols (`:foo`, `p :bar`, `[:a, :b]`) are unaffected.
+- **Open: a run of byte escapes is one character per byte.** MRI builds a
+  string literal from bytes, so `"\xE3\x81\x82"` is `"あ"` (one character) and
+  `"\xC3\xA9"` is `"é"`; rubylang stores each `\xNN`/`\NNN` as U+00NN, giving
+  three and two characters. Decoding the valid runs in the lexer is easy, but
+  not on its own: a run that is NOT valid UTF-8 (`"\xE9"`) still has to be
+  stored somehow, and the only spelling available is U+00E9 — identical to a
+  decoded `"\xC3\xA9"`. `force_encoding("ISO-8859-1")` then has two strings
+  with the same storage and different MRI answers (`"é"` vs `"Ã©"`), and the
+  parity corpus pins both. The fix needs a representation for an invalid
+  UTF-8 string (bytes, not codepoints), with `ISO-8859-1` as a byte-storage
+  encoding beside `ASCII-8BIT`. The same holds for `\xHH` runs in a Regexp
+  literal (`/\xC3\xA9/ =~ "é"` is nil; MRI 0).
 
 ## Runtime / methods
 
@@ -1159,6 +1186,15 @@ Honest limitations of this surface:
   `Enumerable` also derives `to_set`, `each_entry`, `compact`, `minmax_by`,
   `slice_after`, `slice_before`, `cycle` and `chain`; `Array#join` converts
   elements through `to_str`/`to_ary`/`to_s`.
+- **`Enumerator::Chain` — fixed.** `Enumerator#+` and `Enumerable#chain` (on
+  Array, Hash, Range, Set, Struct, Enumerator, ArithmeticSequence, a chain, and
+  user `Enumerable`s) answer an `Enumerator::Chain` that keeps its parts as
+  given: `inspect` shows them, `size` sums their sizes (nil or Infinity decide),
+  `each` runs each part's own `each`, `rewind` rewinds them in reverse, and the
+  rest of Enumerable walks the parts one element at a time, so an endless part
+  still answers `first`/`find`/`lazy`. `next`/`peek`/`feed` are undefined on the
+  class, as in enumerator.c. Residue: `Enumerator::Lazy#chain`/`+` (MRI keeps
+  them lazy) answer an eager chain.
 
 - **Argument counts on built-ins are checked once, from a measured table.** Every
   built-in dispatch arm reads its arguments positionally (`args[0]`), so a call
@@ -1500,9 +1536,15 @@ Honest limitations of this surface:
   front and `$~` is not set per element, so a block run over it reads
   whatever `$~`/`$&` held before
   (`"a1b2".gsub(/\d/).map { $&.to_i * 2 }` is `[0, 0]`, MRI `[2, 4]`).
-- **Open: `with_index` re-attached, then `each { }`.** `[1, 2].each.with_index(1)
-  .each { }` answers the `[elem, index]` pairs; MRI answers what the inner
-  `each` does (`[1, 2]`).
+  Underneath it: `STDOUT` is one interpreter-wide slot rather than frame-local, so
+  a match inside a called method is still visible to the caller afterwards
+  (`def f; "x" =~ /x/; end; f; p STDOUT` prints the MatchData; MRI prints nil).
+- **`with_index` re-attached, then `each { }` — fixed.** A block-less
+  `e.with_index(n)` records `e` and its offset, so its `each { }` is
+  `e.with_index(n) { }`: `[1, 2].each.with_index(1).each { }` is `[1, 2]`,
+  `map.with_index(1).each { |x, i| x * i }` maps, and a `with_index` stacked on
+  another answers the innermost iteration's result. The offset converts as
+  `NUM2LONG` (`1.5` is 1, nil is 0).
 - **Multi-value Enumerator yields.** `each_with_index`, `each_with_object` and a
   generator's `y.yield a, b` yield TWO values per iteration, not one packed pair.
   The buffer keeps them packed (that is what `to_a` and `each_entry` see) and the
@@ -2140,6 +2182,11 @@ class-level one-shot `hexdigest`/`digest`/`base64digest`.
 
 ## File / IO / Dir
 
+- **`File < IO` — fixed.** `File.superclass` is `IO`, both carry
+  `File::Constants` and `Enumerable` in their ancestry, and a File is `is_a?(IO)`
+  and `IO === file`. `File::Constants` holds the `FNM_*` flags and `NULL`; the
+  platform-specific open/lock flags (`RDONLY`, `CREAT`, `LOCK_EX`, …) are not
+  modelled.
 - **`puts`, `printf`, `putc`, `fileno`, `tty?` — fixed.** One renderer serves
   every `puts` (Kernel, IO, TCPSocket, StringIO): an empty Array writes
   nothing (MRI 4), a self-holding Array prints `[...]`, and `StringIO#puts`

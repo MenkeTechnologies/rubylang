@@ -6893,3 +6893,135 @@ Integer
 #<struct OneS a=2>
 #<data z=1>
 "#<struct EmptyS>"
+#==#
+#<Enumerator::Chain: [#<Enumerator: [1, 2]:each>, [3]]>
+Enumerator::Chain
+Enumerator
+true
+3
+[1, 2, 3]
+[2, 4, 6]
+#<Enumerator::Chain: [#<Enumerator: [1, 2]:each>, [3]]>
+42
+#<Enumerator::Chain: [[1, 2], [3], 4..5]>
+[1, 2, 3, 4, 5]
+4
+[[:a, 1], 2]
+0
+Infinity
+[1, 1, 2]
+6
+[2, 2, 4]
+nil
+[1, 2, 3]
+#<Enumerator::Chain: [#<Enumerator::Chain: [#<Enumerator: [1, 2]:each>, [3]]>, [9]]>
+[1, 2, 3, 9]
+#<Enumerator::Chain: [#<Enumerator: [1, 2]:each>, [3]]>
+#<Enumerator: #<Enumerator: #<Enumerator::Chain: [#<Enumerator: [1, 2]:each>, [3]]>:each>:with_index>
+[[1, 0], [2, 1], [3, 2]]
+#<Enumerator: #<Enumerator: #<Enumerator::Chain: [#<Enumerator: [1, 2]:each>, [3]]>:each>:each_slice(2)>
+[[1, 2], [3]]
+[[1, 0], [2, 1], [3, 2]]
+[[1, 0], [9, 9]]
+NoMethodError
+false
+false
+true
+NoMethodError
+[5, 1]
+#<Enumerator::Chain: [((1..3).step(1)), [1]]>
+#==#
+[1, 2]
+[1, 2]
+[1, 2]
+[1, 2]
+1..2
+{a: 1}
+[1, 2]
+[1, 2]
+#<Enumerator: #<Enumerator: [10, 20]:each>:with_index(1)>
+[]
+[10, 20]
+[[1, 1], [2, 2]]
+[[1, 0]]
+[1, 1]
+[2, 2]
+[1, 2]
+[2, 4]
+[1, 4]
+[2]
+[1, 3]
+#==#
+A.+ singleton_method_added
+start
+A+ x HookA
+A+ y HookA
+A+ y= HookA
+A+ z HookA
+A+ w HookA
+A+ v HookA
+A.+ k
+A.+ j
+A+ q HookA
+end
+A+ b HookB
+A+ late HookA
+A+ dm HookA
+A.+ dsm
+A.+ scd
+M+ aw=
+o+ singleton_method_added
+o+ foo
+o+ ie
+o+ ds
+P early HookK
+K later
+P later HookK
+Base after
+Base. singleton_method_added
+Base. cm
+:last
+#==#
+IO
+[File, IO, File::Constants, Enumerable, Object, Kernel, BasicObject]
+[IO, File::Constants, Enumerable, Object, Kernel, BasicObject]
+true
+true
+true
+File::Constants
+Module
+8
+"/dev/null"
+IO
+true
+true
+true
+true
+#==#
+made
+run
+run
+run
+run
+nil
+[1, [2, 3]]
+:ret
+1
+[2, 3]
+[StopIteration, :ret]
+[nil, 3]
+[2, 4, 6]
+[1, 2]
+[1, 2]
+1
+[:ret, 9]
+[1]
+[2]
+42
+7
+7
+nil
+7
+[1]
+nil
+:fin

@@ -8280,3 +8280,81 @@ p Random.random_number(3).class, Random.bytes(3).size, (Random::DEFAULT rescue $
 # ── Struct / Data inspect spacing (rb_struct_inspect / rb_data_inspect) ──
 EmptyD = Data.define; EmptyS = Struct.new; OneS = Struct.new(:a)
 p EmptyD.new, EmptyS.new, Data.define.new, EmptyD.new.to_s, Struct.new.new, Struct.new(:a).new(1), OneS.new(2), Data.define(:z).new(z: 1), EmptyS.new.to_s
+#==#
+# ── Enumerator::Chain: Enumerator#+ and Enumerable#chain keep their parts, sum sizes, walk lazily ──
+e = [1, 2].each + [3]
+p e, e.class, e.class.superclass, e.is_a?(Enumerator), e.size, e.to_a, e.map { _1 * 2 }, e.each { }, e.each { break 42 }
+p [1, 2].chain([3], 4..5), [1, 2].chain([3], 4..5).to_a, (1..3).chain([4]).size, {a: 1}.chain([2]).to_a, [].chain.size
+p [1].chain(1..).size, [1].chain(1..).first(3), [1].chain(1..).find { _1 > 5 }, [1].chain(1..).lazy.map { _1 * 2 }.first(3)
+p Enumerator.new { }.chain([1]).size, Enumerator::Chain.new([1], 2..3).to_a, e + [9], (e + [9]).to_a, e.rewind
+p e.with_index, e.with_index.to_a, e.each_slice(2), e.each_slice(2).to_a, e.each_with_index.to_a, [1].each_with_index.chain([[9, 9]]).map { |a, b| [a, b] }
+p (e.next rescue $!.class), e.respond_to?(:next), e.respond_to?(:peek), e.respond_to?(:size), ([1].chain(3).to_a rescue $!.class)
+class ChainEach; include Enumerable; def each; yield 5; end; end
+p ChainEach.new.chain([1]).to_a, (1..3).step(1) + [1]
+#==#
+# ── e.with_index(n).each { } is e.with_index(n) { }: the underlying iteration's answer ──
+p [1, 2].each.with_index(1).each { }, [1, 2].each.with_index.each { }, [1, 2].map.with_index(1).each { _1 }, [1, 2].each.with_index(1).with_index.each { }
+p (1..2).each.with_index.each { }, {a: 1}.each.with_index.each { }, [1, 2].select.with_index.each { true }, [1, 2].each_with_index.with_index(2).each { }
+p [10, 20].each.with_index(1), [10, 20].each.with_index(1).select { |x| x == 10 }, [10, 20].each.with_index(1).map { |x| x }, [1, 2].each.with_index(1.5).to_a, [1].each.with_index(nil).to_a
+p [1, 2].each.with_index(1).each { |x, i| p [x, i] }, [1, 2].each.with_index(1).with_object([]).each { |(x, i), m| m << x + i }
+p [1, 2].map.with_index(1).each { |x, i| x * i }, [1, 2].select.with_index(1).each { |x, i| i > 1 }, [3, 1].sort_by.with_index.each { |x, i| -i }
+#==#
+# ── method_added / singleton_method_added fire where each method is defined ──
+class HookA
+  def self.method_added(m) = puts("A+ #{m} #{self}")
+  def self.singleton_method_added(m) = puts("A.+ #{m}")
+  puts "start"
+  def x; end
+  attr_accessor :y
+  define_method(:z) { }
+  alias_method :w, :x
+  alias v x
+  def self.k; end
+  class << self
+    def j; end
+  end
+  private def q; end
+  puts "end"
+end
+class HookB < HookA; def b; end; end
+HookA.class_eval { def late; end }
+HookA.define_method(:dm) { }
+HookA.define_singleton_method(:dsm) { }
+HookA.singleton_class.define_method(:scd) { }
+module HookM; def self.method_added(m) = puts("M+ #{m}"); attr_writer :aw; end
+o = Object.new
+def o.singleton_method_added(m) = puts("o+ #{m}")
+def o.foo; end
+o.instance_eval { def ie; end }
+o.define_singleton_method(:ds) { }
+class HookP; def self.method_added(m) = puts("P #{m} #{self}"); end
+class HookK < HookP
+  def early; end
+  def self.method_added(m)
+    puts "K #{m}"
+    super
+  end
+  def later; end
+end
+class HookBase
+  def before; end
+  def self.method_added(m) = puts("Base #{m}")
+  def after; end
+end
+class HookBase; def self.singleton_method_added(m) = puts("Base. #{m}"); def self.cm; end; end
+p(class HookC; def self.method_added(m); end; def last; end; end)
+#==#
+# ── File < IO: the superclass, the ancestry through File::Constants, is_a?/=== ──
+p File.superclass, File.ancestors, IO.ancestors, File < IO, IO.include?(File::Constants), File.include?(Enumerable)
+p File::Constants, File::Constants.class, File::Constants::FNM_CASEFOLD, File::Constants::NULL, File.instance_method(:read).owner
+File.open(File::NULL) { |f| p f.is_a?(IO), IO === f, f.kind_of?(File::Constants), f.is_a?(Enumerable) }
+#==#
+# ── to_enum over Ruby code runs the method only when iterated, one element at a time; y.yield answers the consumer ──
+o = Object.new; def o.each; puts "run"; yield 1; yield 2, 3; :ret; end
+e = o.to_enum; puts "made"; p e.size, e.to_a, e.each { }, e.next, e.next, (e.next rescue [$!.class, $!.result]), e.map { |a, b| b }
+o2 = Object.new; def o2.each; i = 0; loop { yield i += 1 }; end
+p o2.to_enum.lazy.map { _1 * 2 }.first(3), o2.to_enum.first(2), o2.to_enum.take_while { _1 < 3 }, o2.enum_for.next
+def ygen; return to_enum(:ygen) unless block_given?; r = yield 1; [:ret, r]; end
+p ygen.each { 9 }, ygen.to_a, ygen.map { 2 }, o.to_enum { 42 }.size
+p Enumerator.new { |y| p y.yield(1); p y.yield(3, 4) }.each { 7 }, Enumerator.new { |y| p y.yield(1) }.to_a
+e = Enumerator.new { |y| p y.yield(1); :fin }; e.next; (e.next rescue p $!.result)

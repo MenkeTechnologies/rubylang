@@ -2570,6 +2570,16 @@ impl Compiler {
         args: &[Expr],
         block: &Option<Block>,
     ) -> Result<(), String> {
+        if recv.is_none() && name == METHOD_HOOK_CALL {
+            for a in args {
+                self.compile_expr(b, a)?;
+            }
+            b.emit(
+                Op::CallBuiltin(ops::METHOD_HOOK, argc(args.len())?),
+                self.cur_line,
+            );
+            return Ok(());
+        }
         // A pass-through block (`&expr` / `...` forwarding) carries its value
         // expression rather than a proc body: emit that value as the block operand
         // directly. `MkProc` builds a real Proc for an ordinary block literal.
@@ -3126,6 +3136,16 @@ impl Compiler {
                 Expr::SingletonClass { recv: Some(_), .. } => init_body.push(stmt.clone()),
                 _ => init_body.push(stmt.clone()),
             }
+            // The methods this statement registered up front announce
+            // themselves here, at the statement's position in the body. A
+            // hoisted `def self.method_added` is only live from its own
+            // announcement on (see `fire_method_hook`).
+            let (inst, sing) = hoisted_method_names(stmt);
+            for (hook, names) in [("method_added", inst), ("singleton_method_added", sing)] {
+                if !names.is_empty() {
+                    init_body.push(method_hook_stmt(hook, names, stmt.line));
+                }
+            }
         }
         // Compile the leftover body as a synthetic class method so it can run with
         // `self` = the class. Each class opening (including reopenings of the same
@@ -3485,6 +3505,100 @@ fn block_pass_expr(block: &Block) -> Option<&Expr> {
         },
         _ => None,
     }
+}
+
+/// The pseudo-call a class body runs where a statement the compiler hoisted
+/// defined methods; it lowers to `METHOD_HOOK`. `<` cannot begin a Ruby method
+/// name, so no source program can spell a call to it.
+const METHOD_HOOK_CALL: &str = "<method-hook>";
+
+/// The `METHOD_HOOK_CALL` statement firing `hook` for `names`.
+fn method_hook_stmt(hook: &str, names: Vec<String>, line: u32) -> Stmt {
+    let mut args = vec![Expr::Str(vec![StrPart::Lit(hook.to_string())])];
+    args.extend(names.into_iter().map(Expr::Symbol));
+    Stmt {
+        expr: Expr::Call {
+            recv: None,
+            name: METHOD_HOOK_CALL.to_string(),
+            args,
+            block: None,
+        },
+        line,
+    }
+}
+
+/// The methods a class-body statement defines at compile time (so the class
+/// has them before its body runs), as (instance methods, singleton methods) in
+/// definition order: a `def`, a `def` under a visibility modifier, `attr_*`,
+/// and the `def`s and `attr_*` of a `class << self`.
+fn hoisted_method_names(stmt: &Stmt) -> (Vec<String>, Vec<String>) {
+    fn attrs(m: &str, args: &[Expr], out: &mut Vec<String>) {
+        for field in args.iter().filter_map(sym_name) {
+            if m != "attr_writer" {
+                out.push(field.clone());
+            }
+            if m != "attr_reader" {
+                out.push(format!("{field}="));
+            }
+        }
+    }
+    fn is_attr(m: &str) -> bool {
+        matches!(m, "attr_accessor" | "attr_reader" | "attr_writer")
+    }
+    let mut inst = Vec::new();
+    let mut sing = Vec::new();
+    let mut def_of = |e: &Expr| {
+        if let Expr::Def {
+            name,
+            singleton,
+            singleton_recv: None,
+            ..
+        } = e
+        {
+            if *singleton {
+                sing.push(name.clone());
+            } else {
+                inst.push(name.clone());
+            }
+        }
+    };
+    match &stmt.expr {
+        e @ Expr::Def { .. } => def_of(e),
+        Expr::Call {
+            recv: None,
+            name: m,
+            args,
+            ..
+        } if matches!(
+            m.as_str(),
+            "private" | "public" | "protected" | "module_function"
+        ) && args.len() == 1 =>
+        {
+            def_of(&args[0])
+        }
+        Expr::Call {
+            recv: None,
+            name: m,
+            args,
+            ..
+        } if is_attr(m) => attrs(m, args, &mut inst),
+        Expr::SingletonClass { recv: None, body } => {
+            for s in body {
+                match &s.expr {
+                    Expr::Def { name, .. } => sing.push(name.clone()),
+                    Expr::Call {
+                        recv: None,
+                        name: m,
+                        args,
+                        ..
+                    } if is_attr(m) => attrs(m, args, &mut sing),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    (inst, sing)
 }
 
 fn sym_name(e: &Expr) -> Option<String> {

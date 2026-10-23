@@ -179,6 +179,9 @@ pub mod ops {
                                      // argument at all, as in MRI, rather than a positional `{}`.
     pub const KWSPLAT_ARGS: u16 = 59; // [kwargs hash] -> [] or [hash]
     pub const BITNOT: u16 = 60; // [v] -> ~v (native Int, else the `~` method)
+                                // `method_added` / `singleton_method_added` for methods a class body
+                                // defines at compile time, fired at the definition's position.
+    pub const METHOD_HOOK: u16 = 61; // [hook, skip_own, *names] -> nil
 }
 
 /// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried
@@ -549,6 +552,11 @@ pub enum RObj {
     /// elements, so `map`/`select`/`next`/`lazy`/… behave exactly as they
     /// already did and only the sequence-specific methods are answered here.
     ArithSeq(Box<ArithSeq>),
+    /// An `Enumerator::Chain` (`e + other`, `Enumerable#chain`): the enumerables
+    /// it walks in order, kept as given so `inspect` and `size` read each one.
+    /// Iteration goes through a generator over those parts, built per call, so
+    /// an endless part is pulled one element at a time.
+    EnumChain(Vec<Value>),
     /// A block-based generator (`Enumerator.new { |y| ... }`): the user block
     /// that drives it by sending `<<`/`yield` to a yielder. Bulk operations
     /// (`to_a`/`first`/`take`/`lazy`) re-run the block from the start each time
@@ -1579,6 +1587,11 @@ pub struct RubyHost {
     /// ActiveSupport's `attr_internal` builds `view_runtime`/`view_runtime=` this
     /// way: `attr_writer :_view_runtime; alias_method :view_runtime=, :_view_runtime=`.
     attr_aliases: IndexMap<String, IndexMap<String, (String, bool)>>,
+    /// `(class, hook)` for a `def self.method_added` / `singleton_method_added`
+    /// the compiler hoisted into a class whose body has not yet reached it.
+    /// MRI has no such method until that line runs, so the hook stays inert
+    /// until the body announces it (`activate_hoisted_hook`).
+    hoisted_hooks: HashSet<(String, String)>,
     /// `define_method`-created instance methods: class → name → block Proc.
     define_methods: IndexMap<String, IndexMap<String, Value>>,
     /// Per-object singleton methods (`def obj.m`, `class << obj`, and bare `def`
@@ -2033,21 +2046,18 @@ thread_local! {
 }
 
 /// Register a runtime `def` (identified by its real name and the synthetic name
-/// its body was stashed under) onto the active eval target, if any.
-pub fn apply_def_target(real: &str, synth: &str) {
-    let target = DEF_TARGET.with(|t| t.borrow().last().cloned());
-    let Some(target) = target else {
-        return;
-    };
-    let Some(def) = with_host(|h| h.method_def(synth)) else {
-        return;
-    };
-    with_host(|h| match target {
-        DefTarget::Instance(c) => h.add_instance_method(&c, real, def),
-        DefTarget::ClassMethod(c) => h.add_class_method(&c, real, def),
-        DefTarget::Singleton(id) => h.add_singleton_method(id, real, def),
+/// its body was stashed under) onto the active eval target, if any. Answers the
+/// target it registered on.
+pub fn apply_def_target(real: &str, synth: &str) -> Option<DefTarget> {
+    let target = DEF_TARGET.with(|t| t.borrow().last().cloned())?;
+    let def = with_host(|h| h.method_def(synth))?;
+    with_host(|h| match &target {
+        DefTarget::Instance(c) => h.add_instance_method(c, real, def),
+        DefTarget::ClassMethod(c) => h.add_class_method(c, real, def),
+        DefTarget::Singleton(id) => h.add_singleton_method(*id, real, def),
         DefTarget::None => {}
     });
+    Some(target)
 }
 
 /// Run a block with `self` rebound to `self_val` and `target` as the active
@@ -2210,6 +2220,7 @@ pub fn eval_in_place(src: &str) -> Result<Value, String> {
             }
         }
         for (name, def) in prog.classes {
+            h.note_hoisted_hooks(&name, &def);
             merge_class(&mut h.classes, name, def);
         }
         h.begins.extend(prog.begins);
@@ -2387,6 +2398,7 @@ impl RubyHost {
             class_object_ids: IndexMap::new(),
             attr_accessors: IndexMap::new(),
             attr_aliases: IndexMap::new(),
+            hoisted_hooks: HashSet::new(),
             define_methods: IndexMap::new(),
             singleton_methods: IndexMap::new(),
             object_extends: HashMap::new(),
@@ -2463,6 +2475,27 @@ impl RubyHost {
         }
     }
 
+    /// Record the method hooks a compiled class definition hoisted.
+    fn note_hoisted_hooks(&mut self, class: &str, def: &ClassDef) {
+        for hook in ["method_added", "singleton_method_added"] {
+            if def.class_methods.contains_key(hook) {
+                self.hoisted_hooks
+                    .insert((class.to_string(), hook.to_string()));
+            }
+        }
+    }
+    /// The class body has reached the hoisted `def self.<name>`: it is live now.
+    pub fn activate_hoisted_hook(&mut self, class: &str, name: &str) {
+        self.hoisted_hooks
+            .remove(&(class.to_string(), name.to_string()));
+    }
+    /// Whether `class`'s `hook` is hoisted and not yet reached by its body.
+    pub fn hoisted_hook_pending(&self, class: &str, hook: &str) -> bool {
+        !self.hoisted_hooks.is_empty()
+            && self
+                .hoisted_hooks
+                .contains(&(class.to_string(), hook.to_string()))
+    }
     /// Install compiled methods, classes, begin-blocks, and block templates
     /// before running main.
     pub fn load_program(
@@ -2476,6 +2509,7 @@ impl RubyHost {
             self.methods.insert(name, def);
         }
         for (name, def) in classes {
+            self.note_hoisted_hooks(&name, &def);
             merge_class(&mut self.classes, name, def);
         }
         // Append, never replace: a `require`/`load` (or each REPL line) merges a
@@ -3121,6 +3155,17 @@ impl RubyHost {
     pub fn arith_seq(&self, v: &Value) -> Option<ArithSeq> {
         match self.obj(v) {
             Some(RObj::ArithSeq(s)) => Some((**s).clone()),
+            _ => None,
+        }
+    }
+    /// Build an `Enumerator::Chain` over `parts`.
+    pub fn new_enum_chain(&mut self, parts: Vec<Value>) -> Value {
+        self.alloc(RObj::EnumChain(parts))
+    }
+    /// The enumerables an `Enumerator::Chain` walks.
+    pub fn enum_chain_parts(&self, v: &Value) -> Option<Vec<Value>> {
+        match self.obj(v) {
+            Some(RObj::EnumChain(p)) => Some(p.clone()),
             _ => None,
         }
     }
@@ -6871,6 +6916,7 @@ impl RubyHost {
                     | "Enumerator"
                     | "Enumerator::Lazy"
                     | "Enumerator::ArithmeticSequence"
+                    | "Enumerator::Chain"
             )
         {
             return true;
@@ -6879,7 +6925,7 @@ impl RubyHost {
         if class == "Enumerator"
             && matches!(
                 actual.as_str(),
-                "Enumerator::Lazy" | "Enumerator::ArithmeticSequence"
+                "Enumerator::Lazy" | "Enumerator::ArithmeticSequence" | "Enumerator::Chain"
             )
         {
             return true;
@@ -7066,9 +7112,12 @@ impl RubyHost {
             // `Enumerator::Lazy` and `Enumerator::ArithmeticSequence` are
             // Enumerator SUBCLASSES in MRI, so both carry Enumerator (and
             // through it Enumerable) in their chain.
-            "Enumerator::Lazy" | "Enumerator::ArithmeticSequence" => {
+            "Enumerator::Lazy" | "Enumerator::ArithmeticSequence" | "Enumerator::Chain" => {
                 own(&["Enumerator", "Enumerable"])
             }
+            // `File < IO`, and IO includes `File::Constants` and Enumerable.
+            "IO" => own(&["File::Constants", "Enumerable"]),
+            "File" => own(&["IO", "File::Constants", "Enumerable"]),
             // A user-defined `module M`: prepends, itself, then its includes.
             // A module has no superclass, so the `Object`/`Kernel`/`BasicObject`
             // tail a class carries must not appear — `module B; include A; end`
@@ -7306,6 +7355,7 @@ impl RubyHost {
                 // constant names what `.class` answers.
                 | "Enumerator::Lazy"
                 | "Enumerator::ArithmeticSequence"
+                | "Enumerator::Chain"
                 | "Enumerator::Yielder"
                 | "Time"
                 | "Date"
@@ -8823,6 +8873,9 @@ impl RubyHost {
                     format!("#<Enumerator: {recv}:{method}>")
                 }
                 Some(RObj::ArithSeq(s)) => s.desc.clone(),
+                Some(RObj::EnumChain(parts)) => {
+                    format!("#<Enumerator::Chain: {}>", self.inspect_array(&parts))
+                }
                 Some(RObj::Generator { label: Some(l), .. }) => l,
                 Some(RObj::Generator { .. }) => format!(
                     "#<Enumerator: #<Enumerator::Generator:{}>:each>",
@@ -9305,6 +9358,7 @@ impl RubyHost {
                 Some(RObj::Lazy { .. }) => "Enumerator::Lazy",
                 Some(RObj::Enumerator { .. }) => "Enumerator",
                 Some(RObj::ArithSeq(_)) => "Enumerator::ArithmeticSequence",
+                Some(RObj::EnumChain(_)) => "Enumerator::Chain",
                 Some(RObj::Generator { .. }) => "Enumerator",
                 Some(RObj::Yielder { .. }) | Some(RObj::FiberYielder) => "Enumerator::Yielder",
                 Some(RObj::Fiber { .. }) => "Fiber",
@@ -10047,6 +10101,15 @@ impl RubyHost {
                     None => Value::Undef,
                 });
             }
+        }
+        // `Enumerator#+` (enumerator_plus): an `Enumerator::Chain` of both.
+        if matches!(op, Add)
+            && matches!(
+                self.class_name(a),
+                "Enumerator" | "Enumerator::ArithmeticSequence" | "Enumerator::Chain"
+            )
+        {
+            return Ok(self.new_enum_chain(vec![a.clone(), b.clone()]));
         }
         // Set `+` (union) and `-` (difference) arrive as native Add/Sub; the
         // bitwise-named set operators (`|`/`&`/`^`) route through method dispatch.
