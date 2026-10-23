@@ -85,6 +85,7 @@ fn run() -> ExitCode {
         warn_level: cli.warn_level,
         debug: cli.debug,
         frozen_string_literal: cli.frozen_string_literal,
+        report_syntax_errors: true,
     };
 
     // `-e` one-liners: MRI joins repeated `-e` with newlines.

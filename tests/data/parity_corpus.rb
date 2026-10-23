@@ -8467,3 +8467,9 @@ p Regexp.new("a", 7), Regexp.new("a", 16).options, Regexp.new("a", 32), Regexp.n
 # ── case mapping per character: titlecase digraphs and ligatures, :turkic, no final-sigma context ──
 p "ǆemal".capitalize, "ǳ".capitalize, "ǈ".upcase, "ǈ".downcase, "ǈ".swapcase, "ǅ".swapcase, "ﬃ".capitalize, "ﬅa".capitalize, "եւ".capitalize
 p "İI".downcase(:turkic), "iı".upcase(:turkic), "ii".capitalize(:turkic), "İ".downcase, "ΣΑΣ".downcase, "ΣΑΣ".capitalize, "ΣΑΣ".swapcase, "ß".upcase
+#==#
+# ── a :"…" symbol literal spelling bytes that are not UTF-8 is a SyntaxError ──
+p :"a\xffb"
+#==#
+# ── a "…": label spelling bytes that are not UTF-8 is a SyntaxError ──
+p({"\xff": 1})

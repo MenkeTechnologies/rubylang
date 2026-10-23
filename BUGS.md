@@ -1124,7 +1124,10 @@ Honest limitations of this surface:
   `setbyte`, `bytesplice` and `undump` produce one rather than replacing bytes
   with U+FFFD. ISO-8859-1 is a byte encoding beside ASCII-8BIT, so
   `"\xC3\xA9".force_encoding("ISO-8859-1").encode("UTF-8")` is `"Ã©"`. A Regexp's
-  `\xHH` runs are bytes too: `/\xC3\xA9/ =~ "é"` is 0. Output writes a
+  `\xHH` runs are bytes too: `/\xC3\xA9/ =~ "é"` is 0. A symbol literal or a
+  quoted label spelling invalid bytes (`:"\xff"`, `"\xff": 1`) is refused while
+  parsing, as MRI's SyntaxError "invalid symbol". The `ruby` command reports a script that
+  does not parse as `<script>: <message> (SyntaxError)`. Output writes a
   String's bytes (`puts "\xff"` writes 0xFF; `IO#write` counts bytes).
   Residue: a genuine `U+10FF80..U+10FFFF` character inside a String that also
   holds invalid bytes reads back as a byte (the character view parks invalid

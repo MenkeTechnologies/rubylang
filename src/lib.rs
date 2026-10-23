@@ -88,6 +88,10 @@ pub struct RunConfig {
     /// `--enable`/`--disable-frozen-string-literal`: what a file with no
     /// `# frozen_string_literal:` comment compiles as. MRI's default is off.
     pub frozen_string_literal: bool,
+    /// Report a script that does not parse the way the `ruby` command does —
+    /// `<script>: <message> (SyntaxError)` — rather than as the bare parser
+    /// message an embedder gets.
+    pub report_syntax_errors: bool,
 }
 
 impl Default for RunConfig {
@@ -100,6 +104,7 @@ impl Default for RunConfig {
             warn_level: DEFAULT_WARN_LEVEL,
             debug: false,
             frozen_string_literal: false,
+            report_syntax_errors: false,
         }
     }
 }
@@ -224,7 +229,9 @@ pub fn eval_str_cfg(src: &str, cfg: &RunConfig) -> Result<Value, String> {
         seed_verbosity(cfg);
         run_prelude()?;
         run_requires(&cfg.requires)?;
-        end_program(run_compiled(compile(src)?))
+        end_program(run_compiled(
+            compile(src).map_err(|e| syntax_report(cfg, &name, e))?,
+        ))
     })
 }
 
@@ -500,8 +507,21 @@ pub fn eval_file_cfg(path: &str, cfg: &RunConfig) -> Result<Value, String> {
         if let Some(prog) = cache::load_file(&abs.to_string_lossy(), &src) {
             return end_program(run_compiled(prog));
         }
-        end_program(run_compiled(compile(&src)?))
+        end_program(run_compiled(
+            compile(&src).map_err(|e| syntax_report(cfg, path, e))?,
+        ))
     })
+}
+
+/// How a script that does not parse is reported: MRI names the script and ends
+/// the line with the exception class (`-e: … (SyntaxError)`), which is what
+/// says the run failed with a SyntaxError rather than some other error.
+fn syntax_report(cfg: &RunConfig, script: &str, msg: String) -> String {
+    if cfg.report_syntax_errors {
+        format!("{script}: {msg} (SyntaxError)")
+    } else {
+        msg
+    }
 }
 
 /// Read and run a `.rb` file under the DAP debugger: compile with per-statement

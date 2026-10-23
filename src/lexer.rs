@@ -1111,7 +1111,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     Tok::DSymbol(body)
                 } else if quote == b'"' {
                     // No interpolation: decode the double-quote escapes now.
-                    Tok::Symbol(decode_dquote_escapes(&body))
+                    match decode_dquote_escapes(&body) {
+                        Some(name) => Tok::Symbol(name),
+                        None => return Err(format!("invalid symbol at line {line}")),
+                    }
                 } else {
                     Tok::Symbol(body)
                 };
@@ -1480,7 +1483,7 @@ fn op_symbol_at(s: &str) -> Option<&'static str> {
 
 /// Decode a non-interpolating `:"…"` symbol body with the same escapes as a
 /// double-quoted string.
-fn decode_dquote_escapes(body: &str) -> String {
+fn decode_dquote_escapes(body: &str) -> Option<String> {
     crate::parser::decode_dquote_body(body)
 }
 

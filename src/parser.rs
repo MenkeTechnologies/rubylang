@@ -3347,6 +3347,13 @@ impl Parser {
         } else {
             vec![StrPart::Lit(s)]
         };
+        // A literal label spelling bytes that are not UTF-8 is refused while
+        // parsing, as MRI refuses `:"\xff"`.
+        if !parts.iter().any(|p| matches!(p, StrPart::Interp(_)))
+            && parts.iter().any(|p| matches!(p, StrPart::Bytes(_)))
+        {
+            return Err(format!("invalid symbol at line {}", self.line()));
+        }
         if parts.iter().all(|p| matches!(p, StrPart::Lit(_))) {
             let name: String = parts
                 .into_iter()
@@ -3526,18 +3533,21 @@ fn parse_interp_fragment(src: &str) -> Result<(Vec<Stmt>, ImplicitParams), Strin
 }
 
 /// A double-quoted body with no interpolation, its escapes decoded exactly as
-/// a string literal's (the lexer's non-interpolating `:"…"` symbols).
-pub(crate) fn decode_dquote_body(raw: &str) -> String {
+/// a string literal's (the lexer's non-interpolating `:"…"` symbols). `None`
+/// when the escapes spell bytes that are not UTF-8: MRI refuses such a symbol
+/// literal at parse time (`invalid symbol`).
+pub(crate) fn decode_dquote_body(raw: &str) -> Option<String> {
     let mut no_interp = |_: &str| -> Result<Vec<Stmt>, String> { Ok(Vec::new()) };
     match scan_interp_with(raw, &mut no_interp, true) {
         Ok(parts) => parts
             .into_iter()
-            .filter_map(|p| match p {
+            .map(|p| match p {
                 StrPart::Lit(s) => Some(s),
-                _ => None,
+                StrPart::Bytes(_) => None,
+                StrPart::Interp(_) => Some(String::new()),
             })
             .collect(),
-        Err(_) => raw.to_string(),
+        Err(_) => Some(raw.to_string()),
     }
 }
 
