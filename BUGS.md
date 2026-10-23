@@ -1047,10 +1047,11 @@ Honest limitations of this surface:
   `alias`, `class_eval { def }`, `define_singleton_method`, `def obj.m` and
   `instance_eval { def }` fire at run time. A hoisted hook method is inert until
   its own announcement (MRI has not defined it yet), so a body's earlier `def`s
-  reach only a superclass's hook. Residue: a `define_method` does not replace a
-  same-named `def` of the same class (the `def` keeps winning), which defeats
-  the wrap-in-`method_added` memoization idiom; a top-level `def` does not fire
-  `Object.method_added`.
+  reach only a superclass's hook. `define_method` and `def` replace each other
+  in definition order (a hoisted `def` reclaims its name at its position), and
+  an UnboundMethod keeps the definition it was made from, so the
+  wrap-in-`method_added` memoization idiom works. Residue: a top-level `def`
+  does not fire `Object.method_added`.
 
 ## Lexer
 

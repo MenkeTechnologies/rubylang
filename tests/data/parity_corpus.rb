@@ -8403,3 +8403,23 @@ p "a1b2".gsub(/\d/).map { $~.pre_match }, "a1b2".gsub(/\d/).map { $&.to_i * 2 },
 p "ab".gsub(/(.)/).each_with_index.map { |m, i| [m, i, $1] }, "a1b2".gsub(/\d/).select { $~.post_match.empty? }, "a1b2".gsub("1").map { $~[0] }
 r = []; "ab".gsub(/./).each { r << $~[0] }; p r, "x1y2".gsub(/\d/).size, "x1y2".gsub(/\d/).to_a
 def gk; "a1".gsub(/\d/).each { return $~[0] }; end; p gk
+#==#
+# ── define_method and def replace each other by definition order; an UnboundMethod keeps the definition it was made from ──
+class DmX; def a = 1; define_method(:a) { 2 }; end; p DmX.new.a
+class DmY; def a = 1; end; DmY.send(:define_method, :a) { 3 }; p DmY.new.a
+class DmZ; define_method(:a) { 2 }; def a = 1; end; p DmZ.new.a
+class DmW; define_method(:a) { 2 }; end; class DmW; def a = 5; end; p DmW.new.a
+class DmV; def a = 1; end; DmV.class_eval { define_method(:a) { 7 } }; p DmV.new.a; DmV.class_eval { def a = 8 }; p DmV.new.a
+class DmU; def a = 1; define_method(:a) { 2 }; def a = 3; end; p DmU.new.a, DmU.instance_method(:a).owner
+class DmM; def c = 1; end; um = DmM.instance_method(:c); class DmM; define_method(:c) { 2 }; end; p um.bind_call(DmM.new), um.bind(DmM.new).call, DmM.new.c
+class Memo
+  def self.method_added(name)
+    return if @adding
+    @adding = true
+    orig = instance_method(name)
+    define_method(name) { |*a| "memo(#{orig.bind(self).call(*a)})" }
+    @adding = false
+  end
+  def calc(x) = x * 2
+end
+p Memo.new.calc(4)

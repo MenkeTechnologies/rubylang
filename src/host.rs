@@ -1514,6 +1514,12 @@ pub struct RubyHost {
     last_match: Value,
     match_owner: u64,
     parked_matches: HashMap<u64, Value>,
+    /// `def`s a later `define_method` of the same name replaced, by
+    /// `(class, name)` — see [`RubyHost::reassert_hoisted_def`].
+    shadowed_defs: HashMap<(String, String), MethodDef>,
+    /// The definition each UnboundMethod (and the Methods bound from it)
+    /// captured when it was made, by heap id.
+    method_snapshots: HashMap<u32, (MethodDef, String)>,
     /// The matches behind a block-less `gsub` Enumerator's elements, by its heap id.
     enum_matches: HashMap<u32, Vec<Value>>,
     consts: IndexMap<String, Value>,
@@ -2452,6 +2458,8 @@ impl RubyHost {
             match_owner: u64::MAX,
             parked_matches: HashMap::new(),
             enum_matches: HashMap::new(),
+            shadowed_defs: HashMap::new(),
+            method_snapshots: HashMap::new(),
             consts: IndexMap::new(),
             autoloads: IndexMap::new(),
             methods: IndexMap::new(),
@@ -4247,12 +4255,36 @@ impl RubyHost {
     /// Allocate an `UnboundMethod` (`Module#instance_method`, `Method#unbind`):
     /// `owner` is the class the method is looked up on, not a receiver.
     pub fn new_unbound_method(&mut self, owner: Value, name: &str) -> Value {
-        self.alloc(RObj::Method {
+        // The definition is captured now, as MRI's method entry is: a later
+        // `define_method` of the name does not change what this one runs.
+        let snapshot = self
+            .classref_name(&owner)
+            .and_then(|c| self.find_method_owner(&c, name));
+        let m = self.alloc(RObj::Method {
             recv: owner,
             name: name.to_string(),
             unbound: true,
             via: None,
-        })
+        });
+        if let (Some(s), Value::Obj(id)) = (snapshot, &m) {
+            self.method_snapshots.insert(*id, s);
+        }
+        m
+    }
+    /// The `(definition, owner)` a Method captured when it was made.
+    pub fn method_snapshot(&self, m: &Value) -> Option<(MethodDef, String)> {
+        match m {
+            Value::Obj(id) if !self.method_snapshots.is_empty() => {
+                self.method_snapshots.get(id).cloned()
+            }
+            _ => None,
+        }
+    }
+    /// Give the Method `to` the definition `from` captured.
+    pub fn copy_method_snapshot(&mut self, from: &Value, to: &Value) {
+        if let (Some(s), Value::Obj(id)) = (self.method_snapshot(from), to) {
+            self.method_snapshots.insert(*id, s);
+        }
     }
     /// The (receiver, method-name) of a bound `Method` value (`None` otherwise).
     pub fn as_method(&self, v: &Value) -> Option<(Value, String)> {
@@ -6571,14 +6603,48 @@ impl RubyHost {
     }
     /// Register an instance method on a class at runtime (`class_eval { def m }`).
     pub fn add_instance_method(&mut self, class: &str, name: &str, def: MethodDef) {
+        // A `def` replaces a `define_method` of the same name on this class.
+        self.drop_define_method(class, name);
+        self.shadowed_defs
+            .remove(&(class.to_string(), name.to_string()));
         self.classes
             .entry(class.to_string())
             .or_default()
             .methods
             .insert(name.to_string(), def);
     }
+    fn drop_define_method(&mut self, class: &str, name: &str) {
+        if let Some(m) = self.define_methods.get_mut(class) {
+            m.shift_remove(name);
+        }
+    }
+    /// The class body has reached the hoisted `def name`: it replaces a
+    /// `define_method` of that name the body ran earlier, and comes back if one
+    /// had set it aside. (A hoisted method is installed before its body runs,
+    /// so which of the two is newer is decided here, in source order.)
+    pub fn reassert_hoisted_def(&mut self, class: &str, name: &str) {
+        let key = (class.to_string(), name.to_string());
+        if let Some(def) = self.shadowed_defs.remove(&key) {
+            self.drop_define_method(class, name);
+            if let Some(c) = self.classes.get_mut(class) {
+                c.methods.insert(name.to_string(), def);
+            }
+        } else if self.has_own_define_method(class, name) {
+            self.drop_define_method(class, name);
+        }
+    }
     /// Register a `define_method`-created instance method (a block Proc) on a class.
     pub fn add_define_method(&mut self, class: &str, name: &str, proc: Value) {
+        // It replaces a `def` of the same name on this class, which is set
+        // aside in case a later hoisted `def` of the name reclaims it.
+        if let Some(def) = self
+            .classes
+            .get_mut(class)
+            .and_then(|c| c.methods.shift_remove(name))
+        {
+            self.shadowed_defs
+                .insert((class.to_string(), name.to_string()), def);
+        }
         self.define_methods
             .entry(class.to_string())
             .or_default()
@@ -12454,6 +12520,25 @@ pub fn call_method(name: &str, args: &[Value], block: Option<Value>) -> Result<V
 
 /// Invoke an instance method `name` on `recv` (an object of class `class`),
 /// resolving it through the ancestor chain.
+/// Run the captured definition `def` (owned by `owner`) as `name` on `recv`.
+pub fn call_method_def(
+    recv: Value,
+    def: &MethodDef,
+    owner: &str,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    run_method(
+        def,
+        recv,
+        args,
+        block,
+        Some(name.into()),
+        Some(owner.into()),
+    )
+}
+
 pub fn call_instance_method(
     recv: Value,
     class: &str,

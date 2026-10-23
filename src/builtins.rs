@@ -1188,6 +1188,8 @@ fn b_method_hook(vm: &mut VM, argc: u8) -> Value {
         if let Some(cls) = with_host(|h| h.classref_name(&target)) {
             with_host(|h| names.iter().for_each(|n| h.activate_hoisted_hook(&cls, n)));
         }
+    } else if let Some(cls) = with_host(|h| h.classref_name(&target)) {
+        with_host(|h| names.iter().for_each(|n| h.reassert_hoisted_def(&cls, n)));
     }
     for n in &names {
         if let Err(e) = fire_method_hook(&target, &hook, n) {
@@ -24859,8 +24861,16 @@ fn dispatch_method(
         let owner = with_host(|h| h.find_method_owner(&cls, &mname).map(|(_, o)| o))?;
         Some(owner)
     });
+    // The definition captured when the UnboundMethod was made runs, whatever
+    // the class has defined under the name since.
+    let snapshot = with_host(|h| h.method_snapshot(recv));
+    let pinned = pinned.or_else(|| snapshot.as_ref().map(|(_, owner)| owner.clone()));
     match name {
         "call" | "()" | "[]" | "yield" | "===" => match (&pinned, unbound) {
+            (Some(_), false) if snapshot.is_some() => {
+                let (def, owner) = snapshot.clone().unwrap();
+                crate::host::call_method_def(mrecv.clone(), &def, &owner, &mname, args, block)
+            }
             (Some(class), false) => {
                 crate::host::call_instance_method(mrecv.clone(), class, &mname, args, block)
             }
@@ -24872,9 +24882,22 @@ fn dispatch_method(
         // to `obj`; `bind_call(obj, *args)` binds and invokes in one step. The
         // bound method keeps running the definition it was looked up as.
         "bind" => Ok(with_host(|h| {
-            h.new_method_via(args[0].clone(), &mname, pinned.clone())
+            let m = h.new_method_via(args[0].clone(), &mname, pinned.clone());
+            h.copy_method_snapshot(recv, &m);
+            m
         })),
         "bind_call" => match &pinned {
+            Some(_) if snapshot.is_some() => {
+                let (def, owner) = snapshot.clone().unwrap();
+                crate::host::call_method_def(
+                    args[0].clone(),
+                    &def,
+                    &owner,
+                    &mname,
+                    &args[1..],
+                    block,
+                )
+            }
             Some(class) => {
                 crate::host::call_instance_method(args[0].clone(), class, &mname, &args[1..], block)
             }
