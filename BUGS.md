@@ -1543,14 +1543,14 @@ Honest limitations of this surface:
   `Hash#each_with_index` answers one as well, and `Enumerator#each` on a GENERATOR
   answers what the generator body evaluated to, as MRI does — usually the
   `Yielder`, since `y << v` answers the yielder so `y << 1 << 2` chains.
-- **Open: `$~` inside a block-less `gsub` Enumerator.** `str.gsub(re)` answers
-  an Enumerator over the matched strings, but the matches are collected up
-  front and `$~` is not set per element, so a block run over it reads
-  whatever `$~`/`$&` held before
-  (`"a1b2".gsub(/\d/).map { $&.to_i * 2 }` is `[0, 0]`, MRI `[2, 4]`).
-  Underneath it: `STDOUT` is one interpreter-wide slot rather than frame-local, so
-  a match inside a called method is still visible to the caller afterwards
-  (`def f; "x" =~ /x/; end; f; p STDOUT` prints the MatchData; MRI prints nil).
+- **`$~` is per method frame, and set per element by a block-less `gsub`
+  Enumerator — fixed.** Each method activation has its own `$~` (a callee's
+  match is invisible to its caller and gone when it returns); a block shares
+  the `$~` of the frame it was written in, including when another method
+  yields to it. `$&`, `` $` ``, `$'`, `$+` and `$1`.. are read off `$~`, so
+  `defined?($&)` follows it. `str.gsub(re)` without a block answers an
+  Enumerator whose blocks see each element's match as `$~` (also through
+  `each_with_index`/`with_index`/`with_object`), and whose `size` is nil.
 - **`with_index` re-attached, then `each { }` — fixed.** A block-less
   `e.with_index(n)` records `e` and its offset, so its `each { }` is
   `e.with_index(n) { }`: `[1, 2].each.with_index(1).each { }` is `[1, 2]`,

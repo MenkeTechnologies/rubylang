@@ -754,6 +754,14 @@ pub enum ProcKind {
     /// as the bytes it stands for, and gives the method back the user's String
     /// answer as character-view text (`crate::builtins::dispatch_broken_utf8`).
     BrokenUnits(Box<Value>),
+    /// The block a block-less `gsub` Enumerator's iteration receives: the
+    /// `next`-th call sets `$~` to the `next`-th match, then runs the user's
+    /// block (`"a1b2".gsub(/\d/).map { $~.pre_match }`).
+    SetsMatch {
+        inner: Box<Value>,
+        matches: Vec<Value>,
+        next: usize,
+    },
 }
 
 /// A user-defined class: its optional superclass, its instance methods, the
@@ -1497,6 +1505,17 @@ pub struct RubyHost {
     heap: Vec<RObj>,
     frames: Vec<Frame>,
     globals: IndexMap<String, Value>,
+    /// `$~` of the frame `match_owner` (MRI's per-frame backref svar). Each
+    /// method activation has its own; a block shares the one of the frame it
+    /// was written in, which is the `frame_id` of the scope it runs in. Other
+    /// frames' values wait in `parked_matches` while they are not running, and
+    /// the slot follows the running scope on every access (`sync_match_owner`).
+    /// The other match globals (`$&`, `` $` ``, `$'`, `$+`, `$1`..) are read off it.
+    last_match: Value,
+    match_owner: u64,
+    parked_matches: HashMap<u64, Value>,
+    /// The matches behind a block-less `gsub` Enumerator's elements, by its heap id.
+    enum_matches: HashMap<u32, Vec<Value>>,
     consts: IndexMap<String, Value>,
     // `autoload :Const, "path"`: a constant registered to lazily `require "path"`
     // on first reference. Keyed by the constant's fully-qualified name
@@ -2429,6 +2448,10 @@ impl RubyHost {
                 line: 0,
             }],
             globals: IndexMap::new(),
+            last_match: Value::Undef,
+            match_owner: u64::MAX,
+            parked_matches: HashMap::new(),
+            enum_matches: HashMap::new(),
             consts: IndexMap::new(),
             autoloads: IndexMap::new(),
             methods: IndexMap::new(),
@@ -3902,6 +3925,7 @@ impl RubyHost {
                 | ProcKind::Composed { .. } => Some(-1),
                 ProcKind::Collect(_) | ProcKind::Around(_) => Some(1),
                 ProcKind::BrokenUnits(inner) => self.proc_arity(inner),
+                ProcKind::SetsMatch { inner, .. } => self.proc_arity(inner),
                 ProcKind::Normal => Some(
                     ArityFacts::of_block(
                         &self.procs[*template].arity,
@@ -3957,7 +3981,8 @@ impl RubyHost {
                     | ProcKind::Composed { .. }
                     | ProcKind::Collect(_)
                     | ProcKind::Around(_)
-                    | ProcKind::BrokenUnits(_) => return Some(v.clone()),
+                    | ProcKind::BrokenUnits(_)
+                    | ProcKind::SetsMatch { .. } => return Some(v.clone()),
                     ProcKind::Normal => match requested {
                         Some(n) => n,
                         None => self.proc_min_max(v).map_or(0, |(min, _)| min as usize),
@@ -4075,6 +4100,42 @@ impl RubyHost {
             kind: ProcKind::Collect(idx),
             home: None,
         })
+    }
+    /// Wrap `block` so each call first sets `$~` to the next of `matches` (see
+    /// [`ProcKind::SetsMatch`]).
+    pub fn new_match_setting_block(&mut self, block: Value, matches: Vec<Value>) -> Value {
+        let is_lambda = matches!(
+            self.obj(&block),
+            Some(RObj::Proc {
+                is_lambda: true,
+                ..
+            })
+        );
+        let scope = self.cur_scope().clone();
+        self.alloc(RObj::Proc {
+            template: 0,
+            scope,
+            is_lambda,
+            kind: ProcKind::SetsMatch {
+                inner: Box::new(block),
+                matches,
+                next: 0,
+            },
+            home: None,
+        })
+    }
+    /// Record the per-element matches of a block-less `gsub` Enumerator.
+    pub fn set_enum_matches(&mut self, e: &Value, matches: Vec<Value>) {
+        if let Value::Obj(id) = e {
+            self.enum_matches.insert(*id, matches);
+        }
+    }
+    /// The per-element matches of a block-less `gsub` Enumerator.
+    pub fn enum_matches(&self, e: &Value) -> Option<Vec<Value>> {
+        match e {
+            Value::Obj(id) if !self.enum_matches.is_empty() => self.enum_matches.get(id).cloned(),
+            _ => None,
+        }
     }
     /// Wrap `block` for a method running over a broken UTF-8 String's character
     /// view (see [`ProcKind::BrokenUnits`]).
@@ -5402,9 +5463,76 @@ impl RubyHost {
         false
     }
     pub fn get_global(&self, name: &str) -> Value {
+        if name == "~" {
+            return self.last_match.clone();
+        }
         self.globals.get(name).cloned().unwrap_or(Value::Undef)
     }
+    /// A match global read off `$~`: `Some` for `$~`, `$&`, `` $` ``, `$'`, `$+`
+    /// and `$1`.. (nil without a match, or for a group that did not take
+    /// part), `None` for every other name.
+    pub fn match_global(&mut self, name: &str) -> Option<Value> {
+        let digits = !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) && name != "0";
+        if !(digits || matches!(name, "~" | "&" | "`" | "'" | "+")) {
+            return None;
+        }
+        self.sync_match_owner();
+        let md = self.last_match.clone();
+        if name == "~" {
+            return Some(md);
+        }
+        let Some((groups, _, pre, post)) = self.as_matchdata(&md) else {
+            return Some(Value::Undef);
+        };
+        let text = match name {
+            "&" => groups.first().cloned().flatten(),
+            "`" => Some(pre),
+            "'" => Some(post),
+            "+" => groups.iter().skip(1).rev().find_map(|g| g.clone()),
+            _ => name
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| groups.get(i).cloned().flatten()),
+        };
+        Some(text.map_or(Value::Undef, |t| self.new_string(t)))
+    }
+    /// Point the `$~` slot at the frame whose code is running: park the slot's
+    /// value under its previous owner and take the running frame's.
+    fn sync_match_owner(&mut self) {
+        let owner = match self
+            .active_scope
+            .as_ref()
+            .or(self.frames.last().map(|f| &f.scope))
+        {
+            Some(s) => s.frame_id,
+            None => return,
+        };
+        if owner == self.match_owner {
+            return;
+        }
+        let live = std::mem::replace(&mut self.last_match, Value::Undef);
+        if self.match_owner != u64::MAX && !matches!(live, Value::Undef) {
+            self.parked_matches.insert(self.match_owner, live);
+        }
+        self.last_match = self.parked_matches.remove(&owner).unwrap_or(Value::Undef);
+        self.match_owner = owner;
+    }
+    /// The method activation `frame_id` has returned: its `$~` is gone.
+    pub fn drop_frame_match(&mut self, frame_id: u64) {
+        if self.match_owner == frame_id {
+            self.last_match = Value::Undef;
+            self.match_owner = u64::MAX;
+        }
+        if !self.parked_matches.is_empty() {
+            self.parked_matches.remove(&frame_id);
+        }
+    }
     pub fn set_global(&mut self, name: &str, v: Value) {
+        if name == "~" {
+            self.sync_match_owner();
+            self.last_match = v;
+            return;
+        }
         self.globals.insert(name.to_string(), v);
     }
 
@@ -12246,6 +12374,8 @@ fn run_method(
     let sig = with_host(|h| {
         h.frames.pop();
         h.active_scope = saved_active;
+        // This activation's `$~` dies with it.
+        h.drop_frame_match(frame_id);
         h.signal.take()
     });
     let result = match sig {
@@ -14593,6 +14723,25 @@ pub fn call_proc_self_ctx(
             };
             with_host(|h| h.enum_sinks[idx].push(elem));
             return Ok(Value::Undef);
+        }
+        ProcKind::SetsMatch {
+            inner,
+            matches,
+            next,
+        } => {
+            with_host(|h| {
+                if let Some(RObj::Proc {
+                    kind: ProcKind::SetsMatch { next: n, .. },
+                    ..
+                }) = h.obj_mut(proc_val)
+                {
+                    *n += 1;
+                }
+                if let Some(md) = matches.get(next) {
+                    h.set_global("~", md.clone());
+                }
+            });
+            return call_proc(&inner, args);
         }
         ProcKind::BrokenUnits(inner) => {
             let mapped: Vec<Value> = args

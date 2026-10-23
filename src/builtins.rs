@@ -158,8 +158,11 @@ fn b_defined_desc(vm: &mut VM, _: u8) -> Value {
         // the stores are asked whether the name is present.
         "ivar" => with_host(|h| set(h.get_ivar(&name)) || h.ivar_defined(&name))
             .then_some("instance-variable"),
-        "gvar" => with_host(|h| set(h.get_global(&name)) || h.global_defined(&name))
-            .then_some("global-variable"),
+        "gvar" => with_host(|h| match h.match_global(&name) {
+            Some(v) => set(v),
+            None => set(h.get_global(&name)) || h.global_defined(&name),
+        })
+        .then_some("global-variable"),
         "cvar" => with_host(|h| {
             let this = h.current_self();
             h.cvar_owner(&this)
@@ -855,7 +858,7 @@ fn b_getgvar(vm: &mut VM, _: u8) -> Value {
             Err(e) => abort(vm, e),
         };
     }
-    with_host(|h| h.get_global(&name))
+    with_host(|h| h.match_global(&name).unwrap_or_else(|| h.get_global(&name)))
 }
 fn b_setgvar(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
@@ -4759,7 +4762,7 @@ fn dispatch_classref(
                 return with_host(|h| h.new_regex(&parts.join("|"), ""));
             }
             "last_match" => {
-                let m = with_host(|h| h.get_global("~"));
+                let m = with_host(|h| h.match_global("~").unwrap_or(Value::Undef));
                 return match args.first() {
                     Some(idx) => dispatch(&m, "[]", std::slice::from_ref(idx), None),
                     None => Ok(m),
@@ -11214,15 +11217,24 @@ fn dispatch_string_body(
                         .map_err(|e| raise_exc("RegexpError", &e.to_string()))?,
                 ),
             };
-            let found: Vec<Value> = re
-                .find_iter(&s)
-                .filter_map(|m| m.ok())
-                .map(|m| new_str(m.as_str().to_string()))
-                .collect();
+            // Each element carries its match: a block run over the Enumerator sees
+            // `$~` (and `$&`, `$1`, …) for the element it is handed, as MRI's
+            // `str_gsub` sets them before every yield. The size is unknown.
+            let (found, mds): (Vec<Value>, Vec<Value>) = re
+                .captures_iter(&s)
+                .filter_map(|c| c.ok())
+                .map(|c| {
+                    let whole = new_str(c.get(0).map_or("", |m| m.as_str()).to_string());
+                    let md = with_host(|h| build_matchdata(h, &c, &s, &re, &args[0]));
+                    (whole, md)
+                })
+                .unzip();
             let label = enum_label(recv, "gsub", args);
             Ok(with_host(|h| {
                 let e = h.new_enumerator_of(found, "gsub", recv.clone());
                 h.set_enum_label(&e, label);
+                h.set_enum_size_fn(&e, None, vec![]);
+                h.set_enum_matches(&e, mds);
                 e
             }))
         }
@@ -12135,73 +12147,52 @@ fn capture_name_map(re: &fancy_regex::Regex) -> Vec<(String, usize)> {
         .collect()
 }
 
-/// Set the Ruby match globals from a set of captures (or clear them to `nil` on a
-/// failed match), and return the corresponding `MatchData` value (or `nil`).
-/// Ruby names these `$~` (the MatchData), `$&` (whole match), `` $` ``/`$'`
-/// (pre/post text), `$+` (last matched group), and `$1`..`$9` (numbered groups).
+/// Set `$~` from a set of captures (or to `nil` on a failed match), and return
+/// that `MatchData` (or `nil`). The other match globals — `$&` (whole match),
+/// `` $` ``/`$'` (pre/post text), `$+` (last matched group), `$1`.. — are read
+/// off it (`RubyHost::match_global`).
 fn set_match_globals(
     m: Option<(&fancy_regex::Captures, &str)>,
     re: &fancy_regex::Regex,
     re_val: &Value,
 ) -> Value {
     with_host(|h| {
-        // Clear the numbered globals first so a failed match leaves no stale
-        // captures behind.
-        for n in 1..=9 {
-            h.set_global(&n.to_string(), Value::Undef);
-        }
         let Some((c, s)) = m else {
-            for g in ["~", "&", "`", "'", "+"] {
-                h.set_global(g, Value::Undef);
-            }
+            h.set_global("~", Value::Undef);
             return Value::Undef;
         };
-        let whole = c.get(0).unwrap();
-        let groups: Vec<Option<String>> = (0..c.len())
-            .map(|i| c.get(i).map(|g| g.as_str().to_string()))
-            .collect();
-        // Build each global's string value first, then store — never borrow the
-        // host mutably twice in one expression.
-        let to_val = |h: &mut RubyHost, o: &Option<String>| -> Value {
-            o.clone().map(|s| h.new_string(s)).unwrap_or(Value::Undef)
-        };
-        // The BYTE span of every group, kept alongside the text: `#begin` and
-        // friends cannot be answered from the captured text alone, because two
-        // equal substrings differ only in where they sat.
-        let offsets: Vec<Option<(usize, usize)>> = (0..c.len())
-            .map(|i| c.get(i).map(|g| (g.start(), g.end())))
-            .collect();
-        let pre = s[..whole.start()].to_string();
-        let post = s[whole.end()..].to_string();
-        let md = h.new_matchdata(
-            groups.clone(),
-            capture_name_map(re),
-            offsets,
-            pre.clone(),
-            post.clone(),
-            re_val.clone(),
-        );
+        let md = build_matchdata(h, c, s, re, re_val);
         h.set_global("~", md.clone());
-        let g0 = to_val(h, groups.first().unwrap_or(&None));
-        h.set_global("&", g0);
-        let pre_v = h.new_string(pre);
-        h.set_global("`", pre_v);
-        let post_v = h.new_string(post);
-        h.set_global("'", post_v);
-        // `$+` is the last group that actually matched.
-        let last = groups
-            .iter()
-            .skip(1)
-            .rposition(|g| g.is_some())
-            .map(|i| i + 1);
-        let plus = to_val(h, last.and_then(|i| groups.get(i)).unwrap_or(&None));
-        h.set_global("+", plus);
-        for i in 1..=9 {
-            let v = to_val(h, groups.get(i).unwrap_or(&None));
-            h.set_global(&i.to_string(), v);
-        }
         md
     })
+}
+
+/// The `MatchData` for one match of `re` in `s`.
+fn build_matchdata(
+    h: &mut crate::host::RubyHost,
+    c: &fancy_regex::Captures,
+    s: &str,
+    re: &fancy_regex::Regex,
+    re_val: &Value,
+) -> Value {
+    let whole = c.get(0).unwrap();
+    let groups: Vec<Option<String>> = (0..c.len())
+        .map(|i| c.get(i).map(|g| g.as_str().to_string()))
+        .collect();
+    // The BYTE span of every group, kept alongside the text: `#begin` and
+    // friends cannot be answered from the captured text alone, because two
+    // equal substrings differ only in where they sat.
+    let offsets: Vec<Option<(usize, usize)>> = (0..c.len())
+        .map(|i| c.get(i).map(|g| (g.start(), g.end())))
+        .collect();
+    h.new_matchdata(
+        groups,
+        capture_name_map(re),
+        offsets,
+        s[..whole.start()].to_string(),
+        s[whole.end()..].to_string(),
+        re_val.clone(),
+    )
 }
 
 /// `MatchData#[n]`, `#pre_match`, `#post_match`, `#to_a`, `#captures`, `#to_s`.
@@ -17812,7 +17803,32 @@ fn hash_reattach_with_index(
     }
 }
 
+/// `Enumerator#…`. A block-less `gsub` Enumerator's per-element matches follow
+/// it into the Enumerators that walk the same elements one for one
+/// (`each_with_index`, `with_index`, `with_object`), so their blocks see `$~` too.
 fn dispatch_enumerator(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    let out = dispatch_enumerator_inner(recv, name, args, block)?;
+    if out != *recv
+        && matches!(
+            name,
+            "each_with_index" | "with_index" | "with_object" | "each_with_object" | "each_entry"
+        )
+    {
+        if let Some(mds) = with_host(|h| h.enum_matches(recv)) {
+            if with_host(|h| h.enum_buf(&out)).is_some_and(|b| b.len() == mds.len()) {
+                with_host(|h| h.set_enum_matches(&out, mds));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn dispatch_enumerator_inner(
     recv: &Value,
     name: &str,
     args: &[Value],
@@ -17821,6 +17837,11 @@ fn dispatch_enumerator(
     if let Some(gblock) = with_host(|h| h.generator_block(recv)) {
         return dispatch_generator(recv, &gblock, name, args, block);
     }
+    // A block-less `gsub` Enumerator hands each block call its match as `$~`.
+    let block = match (block, with_host(|h| h.enum_matches(recv))) {
+        (Some(b), Some(mds)) => Some(with_host(|h| h.new_match_setting_block(b, mds))),
+        (b, _) => b,
+    };
     let buf = with_host(|h| h.enum_buf(recv).unwrap_or_default());
     match name {
         "next" if args.is_empty() && block.is_none() => {
@@ -25941,7 +25962,7 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
                     names.push(format!("${g}"));
                 }
             }
-            let md = h.get_global("~");
+            let md = h.match_global("~").unwrap_or(Value::Undef);
             let ngroups = h.as_matchdata(&md).map_or(0, |(groups, ..)| groups.len());
             names.extend((1..ngroups).map(|i| format!("${i}")));
             let syms: Vec<Value> = names.iter().map(|n| h.new_symbol(n)).collect();

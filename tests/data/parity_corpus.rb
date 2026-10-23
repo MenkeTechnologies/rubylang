@@ -8387,3 +8387,19 @@ p(/\xC3\xA9/ =~ "é", /[\xC3\xA9x]/ =~ "é", /a\x41\xe3\x81\x82/ =~ "aAあ", /\x
 # ── Digest / Base64 read a String's bytes, not its storage's UTF-8 ──
 require "digest"; require "base64"
 p Digest::MD5.hexdigest("\xff"), Digest::SHA256.hexdigest(255.chr), Digest::SHA1.hexdigest("é".b), Base64.strict_encode64("\xff\xfe"), Base64.strict_encode64("é".b), Digest::MD5.hexdigest("é")
+#==#
+# ── $~ belongs to the method frame: a callee's match stays in the callee, a block shares its home frame's ──
+def mf; "x" =~ /x/; $~[0]; end
+"abc" =~ /b/; p mf, $~[0], $&, $`, $', $1
+def mg; p $~; "q" =~ /(q)/; p $1; end; mg; p $1, $~ && $~[0]
+"zz" =~ /(z)(y)?/; p $+, $2, defined?($1), defined?($2), defined?($&)
+"nomatch" =~ /x/; p $~, $&, defined?($&)
+[1].each { "w" =~ /w/ }; p $&
+def mh; [1].each { "k" =~ /k/ }; $&; end; p mh, $&
+"q" =~ /q/; def my; "other" =~ /o/; yield; end; my { p $& }; p $&
+#==#
+# ── a block-less gsub Enumerator sets $~ for each element its block is handed ──
+p "a1b2".gsub(/\d/).map { $~.pre_match }, "a1b2".gsub(/\d/).map { $&.to_i * 2 }, "a1b22".gsub(/\d+/).map { [$&, $~.begin(0), $`] }
+p "ab".gsub(/(.)/).each_with_index.map { |m, i| [m, i, $1] }, "a1b2".gsub(/\d/).select { $~.post_match.empty? }, "a1b2".gsub("1").map { $~[0] }
+r = []; "ab".gsub(/./).each { r << $~[0] }; p r, "x1y2".gsub(/\d/).size, "x1y2".gsub(/\d/).to_a
+def gk; "a1".gsub(/\d/).each { return $~[0] }; end; p gk

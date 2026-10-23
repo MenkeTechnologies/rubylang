@@ -7140,3 +7140,38 @@ false
 "//4="
 "w6k="
 "66ddcd97cfdeabb2f6fb8a999b4bc76f"
+#==#
+"x"
+"b"
+"b"
+"a"
+"c"
+nil
+nil
+"q"
+nil
+"b"
+"z"
+nil
+"global-variable"
+nil
+"global-variable"
+nil
+nil
+nil
+"w"
+"k"
+"w"
+"q"
+"q"
+#==#
+["a", "a1b"]
+[2, 4]
+[["1", 1, "a"], ["22", 3, "a1b"]]
+[["a", 0, "a"], ["b", 1, "b"]]
+["2"]
+["1"]
+["a", "b"]
+nil
+["1", "2"]
+"1"
