@@ -8223,3 +8223,44 @@ c, *d = d; p c, d
 def masgn_m; x, y = y, 1; [x, y]; end; p masgn_m
 [1].each { e1, f1 = f1, 2; p [e1, f1] }
 g, (h, i) = i, [1, h]; p g, h, i
+#==#
+# ── String#[] / slice / slice! with a Regexp and a group (rb_str_subpat): $~, names, negative groups ──
+s = "Hello, World"
+p s[/W(or)/], $~, $1, s[/zz/], $~
+p s[/(?<first>\w+), (?<second>\w+)/, "second"], s[/(?<a>W)/, :a], s[/(H)(e)/, -1], s[/(H)(e)/, -2], s[/(H)(e)/, -3], s[/(H)(e)/, 3], s[/(H)(e)/, 2.9], s[/(H)?x|W/, 1]
+begin; s[/(?<a>W)/, "b"]; rescue IndexError => e; p e.message; end
+p s.slice(/l(l)/, 1), s.slice(/(?<q>o)/, "q"), :sym[/(y)/, 1], :sym[/(?<z>m)/, "z"]
+t = +"abcb"; p t.slice!(/(b)c/, 1), t, t.slice!(/q/), t, t.slice!(/(?<x>b)$/, :x), t
+#==#
+# ── $~ from start_with?(re) / byteindex(re); each_line's separator; gsub(pattern) Enumerator ──
+"abc".start_with?(/ab/); p $~
+"xab".start_with?(/ab/); p $~
+"abcb".byteindex(/b/); p $~.begin(0)
+"abab".byterindex(/b/); p $~.begin(0)
+[-> { "a".lines(1) }, -> { "a".each_line(:x) { } }, -> { "a".lines(/x/) }].each { |l| p(begin; l.(); rescue TypeError => e; e; end) }
+p "a\nb".each_line, "ab".each_line("b"), "a\nb".each_line.size, "a\nb".lines(nil), "a\nb".lines(chomp: true)
+p "hello".gsub(/l/), "hello".gsub("l"), "hello".gsub(/l/).to_a, "hello".gsub(/l/).with_index.map { |m, i| "#{m}#{i}" }, "hello".gsub("l").count, "hello".gsub(/x*/).to_a
+g = +"aa"; p g.gsub!(/a/), g, ((+"a").freeze.gsub!(/a/) rescue $!)
+#==#
+# ── block-less Hash mutators answer Enumerators and leave the Hash alone; given a block back, they write ──
+%i[delete_if keep_if select! reject! filter! transform_values transform_keys transform_values! transform_keys!].each do |m|
+  h = {a: 1, b: 2}
+  e = h.send(m)
+  puts "#{m}: #{e.inspect} #{e.size.inspect} #{h}"
+end
+h = {a: 1, b: 2}; p h.delete_if.each { |k, v| v > 1 }, h
+h = {a: 1, b: 2}; p h.select!.each { |k, v| v > 1 }, h
+h = {a: 1, b: 2}; p h.transform_values.each { _1 * 10 }, h, h.transform_keys!.each(&:to_s), h
+h = {a: 1, b: 2}; p h.reject!.each { false }, h, h.transform_values.with_index { |v, i| v * i }, h.transform_keys.with_index { |k, i| "#{k}#{i}" }
+h = {a: 1, b: 2}; p h.delete_if.with_index { |(k, v), i| i == 0 }, h, h.keep_if.with_index(1) { |(k, v), i| i > 5 }, h
+#==#
+# ── block-less Enumerators record their receiver: inspect, each's answer, size ──
+s = "ab"
+p s.each_char, s.each_byte, s.each_grapheme_cluster, s.each_codepoint, s.upto("ad"), s.each_char.each { }, s.each_char.with_index.to_a, s.upto("ad").size, s.upto("ad").each { }
+a = [1, 2, 3]
+p a.combination(2), a.combination(2).to_a, a.combination(2).size, a.combination(2).each { }, a.combination(2).next, a.permutation, a.permutation(2).count, a.repeated_combination(1), a.repeated_permutation(1).to_a
+p a.cycle(2), a.cycle(2).size, a.cycle(2).each { }, a.cycle(2).to_a, a.cycle(2).with_index.to_a.last
+p 3.times, 3.times.each { }, 1.upto(3), 1.upto(3).each { }, 3.downto(1), 3.downto(1).to_a
+p (1..3).each, (1..3).each.next, (1..3).each.size, (1..3).each.each { }, ("a".."c").each, ("a".."c").each.size, ("a".."e").step(2), ("a".."e").step(2).size, ("a".."e").step(2).to_a
+p [1, 2].each.with_index(1), [1, 2].map.with_index, [1, 2].each_with_index.with_index, [1, 2].each.each_with_index, [1, 2].each.with_object(1)
+o = Object.new; def o.each; yield 1; end; p o.to_enum.inspect.sub(/0x\h+/, "X"), [1, 2].to_enum(:map), [1, 2, 3].to_enum(:each_slice, 2), {a: 1}.to_enum

@@ -5861,6 +5861,12 @@ impl RubyHost {
     /// chunking methods (`chunk_while`, `slice_when`, `chunk`, `slice_before`,
     /// `slice_after`): materialized here, but sized nil and inspected as
     /// `#<Enumerator: #<Enumerator::Generator:0x…>:each>` as MRI does.
+    /// Override how Enumerator `e` inspects.
+    pub fn set_enum_label(&mut self, e: &Value, label: String) {
+        if let Value::Obj(id) = e {
+            self.enum_labels.insert(*id, label);
+        }
+    }
     pub fn new_chunk_enumerator(&mut self, chunks: Vec<Value>) -> Value {
         let e = self.new_enumerator(chunks, "each");
         self.set_enum_size_fn(&e, None, vec![]);

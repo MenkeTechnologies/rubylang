@@ -2958,6 +2958,9 @@ fn dispatch_resolved(
             if user_method.is_some() || with_host(|h| h.object_class(recv)).is_some() {
                 with_host(|h| h.set_enum_source(&e, ret));
             }
+            // It inspects as the receiver and method, whatever `each` answers.
+            let label = enum_label(recv, &method, &rest);
+            with_host(|h| h.set_enum_label(&e, label));
             return Ok(e);
         }
         // `.lazy` wraps an enumerable in a lazy pipeline. A range (possibly
@@ -7753,7 +7756,7 @@ fn dispatch_number(
                 // `n.times.to_a`/`.map` all work.
                 Ok(with_host(|h| {
                     let items: Vec<Value> = (0..n.max(0)).map(Value::Int).collect();
-                    h.new_enumerator(items, "each")
+                    h.new_enumerator_of(items, "times", recv.clone())
                 }))
             }
         }
@@ -8168,8 +8171,18 @@ fn dispatch_number(
             }
             Ok(recv.clone())
         }
-        "upto" => iter_int_range(recv, as_i(&args[0]), 1, &block),
-        "downto" => iter_int_range(recv, as_i(&args[0]), -1, &block),
+        "upto" => own_enum(
+            iter_int_range(recv, as_i(&args[0]), 1, &block),
+            recv,
+            name,
+            args,
+        ),
+        "downto" => own_enum(
+            iter_int_range(recv, as_i(&args[0]), -1, &block),
+            recv,
+            name,
+            args,
+        ),
         "to_s" => {
             // `Integer#to_s(base)` renders in the given radix (2..=36); anything
             // else is refused, not silently rendered in base 10.
@@ -9713,6 +9726,14 @@ fn dispatch_string_body(
     block: Option<Value>,
 ) -> Result<Value, String> {
     frozen_guard(recv, name, STRING_MUTATORS)?;
+    // Block-less `gsub!(pattern)` (on a String it may modify) modifies
+    // nothing: it is the Enumerator `gsub` answers, labelled `gsub!`.
+    if name == "gsub!" && args.len() == 1 && block.is_none() {
+        let e = dispatch_string_body(recv, "gsub", args, None)?;
+        let label = enum_label(recv, "gsub!", args);
+        with_host(|h| h.set_enum_label(&e, label));
+        return Ok(e);
+    }
     let s = with_host(|h| h.as_str(recv).unwrap_or_default());
     match name {
         // In-place bang variants delegate to the non-bang transform, write the
@@ -9850,7 +9871,7 @@ fn dispatch_string_body(
                 let gs: Vec<Value> = UnicodeSegmentation::graphemes(s.as_str(), true)
                     .map(|g| new_str(g.to_string()))
                     .collect();
-                Ok(with_host(|h| h.new_enumerator(gs, "each")))
+                Ok(with_host(|h| h.new_enumerator_of(gs, name, recv.clone())))
             }
         }
         // Unicode normalization to NFC (default), NFD, NFKC, or NFKD.
@@ -9904,7 +9925,7 @@ fn dispatch_string_body(
                     }
                     Ok(recv.clone())
                 }
-                None => Ok(with_host(|h| h.new_enumerator(cps, "each"))),
+                None => Ok(with_host(|h| h.new_enumerator_of(cps, name, recv.clone()))),
             }
         }
         // `String#unpack(fmt)` / `#unpack1(fmt)` — the inverse of `Array#pack`.
@@ -9936,7 +9957,9 @@ fn dispatch_string_body(
                     .into_iter()
                     .map(|b| Value::Int(b as i64))
                     .collect();
-                Ok(with_host(|h| h.new_enumerator(bytes, "each")))
+                Ok(with_host(|h| {
+                    h.new_enumerator_of(bytes, name, recv.clone())
+                }))
             }
         },
         // Byte at index `i` (supports negatives); nil when out of range.
@@ -9965,11 +9988,15 @@ fn dispatch_string_body(
                         .filter_map(Result::ok)
                         .map(|m| m.start())
                         .collect();
-                    if from_end {
+                    let hit = if from_end {
                         hits.into_iter().rfind(|&i| i as i64 <= start.max(0))
                     } else {
                         hits.into_iter().find(|&i| i as i64 >= start)
-                    }
+                    };
+                    // The match found is `$~`, as for `index`.
+                    let caps = hit.and_then(|i| re.captures_from_pos(&s, i).ok().flatten());
+                    set_match_globals(caps.as_ref().map(|c| (c, s.as_str())), &re, &args[0]);
+                    hit
                 }
                 None => {
                     let pat = arg_str(&args[0]);
@@ -10258,6 +10285,14 @@ fn dispatch_string_body(
         // (`""`) split on single newlines, and `nil` (no separator at all) still
         // split on them. See `split_lines_sep` for the measured semantics.
         "lines" | "each_line" => {
+            // The separator is a String (or nil); anything else is refused as
+            // `rb_str_each_line`'s `StringValue` does.
+            if let Some(sep) = args.first().filter(|a| {
+                !matches!(a, Value::Undef)
+                    && with_host(|h| h.as_str(a).is_none() && h.as_hash(a).is_none())
+            }) {
+                return Err(conv_error(sep, "String"));
+            }
             let lines = split_lines_sep(&s, args);
             if name == "lines" {
                 return Ok(new_arr(lines.into_iter().map(new_str).collect()));
@@ -10276,7 +10311,17 @@ fn dispatch_string_body(
                 }
                 None => {
                     let lines: Vec<Value> = lines.into_iter().map(new_str).collect();
-                    Ok(with_host(|h| h.new_enumerator(lines, "each")))
+                    let plain = args.iter().all(|a| with_host(|h| h.as_hash(a)).is_none());
+                    let label = plain.then(|| enum_label(recv, "each_line", args));
+                    Ok(with_host(|h| {
+                        let e = h.new_enumerator(lines, "each");
+                        // `rb_str_each_line` enumerates with no size function.
+                        h.set_enum_size_fn(&e, None, vec![]);
+                        if let Some(l) = label {
+                            h.set_enum_label(&e, l);
+                        }
+                        e
+                    }))
                 }
             }
         }
@@ -10384,13 +10429,17 @@ fn dispatch_string_body(
         }
         "start_with?" => Ok(Value::Bool(args.iter().any(|a| {
             match str_regex(a) {
-                // A Regexp prefix matches when it matches at the very start.
-                Some(re) => re
-                    .find(&s)
-                    .ok()
-                    .flatten()
-                    .map(|m| m.start() == 0)
-                    .unwrap_or(false),
+                // A Regexp prefix matches when it matches at the very start, and
+                // that match (or nil) is `$~` (`rb_reg_start_with_p`).
+                Some(re) => {
+                    let caps = re
+                        .captures(&s)
+                        .ok()
+                        .flatten()
+                        .filter(|c| c.get(0).is_some_and(|m| m.start() == 0));
+                    set_match_globals(caps.as_ref().map(|c| (c, s.as_str())), &re, a);
+                    caps.is_some()
+                }
                 None => s.starts_with(&arg_str(a)),
             }
         }))),
@@ -10496,6 +10545,28 @@ fn dispatch_string_body(
                 }
             };
             Ok(new_arr(parts.into_iter().map(new_str).collect()))
+        }
+        // Block-less `gsub(pattern)` is an Enumerator over the matched strings
+        // (`#<Enumerator: "hello":gsub(/l/)>`).
+        "gsub" if args.len() == 1 && block.is_none() => {
+            let re = match str_regex(&args[0]) {
+                Some(re) => re,
+                None => std::sync::Arc::new(
+                    fancy_regex::Regex::new(&regex_escape(&arg_str(&args[0])))
+                        .map_err(|e| raise_exc("RegexpError", &e.to_string()))?,
+                ),
+            };
+            let found: Vec<Value> = re
+                .find_iter(&s)
+                .filter_map(|m| m.ok())
+                .map(|m| new_str(m.as_str().to_string()))
+                .collect();
+            let label = enum_label(recv, "gsub", args);
+            Ok(with_host(|h| {
+                let e = h.new_enumerator_of(found, "gsub", recv.clone());
+                h.set_enum_label(&e, label);
+                e
+            }))
         }
         "sub" | "gsub" => {
             let all = name == "gsub";
@@ -10641,7 +10712,9 @@ fn dispatch_string_body(
                 // Block-less: an Enumerator over the characters, so external
                 // iteration (`next`) and chained Enumerable calls work.
                 let chars: Vec<Value> = s.chars().map(one).collect();
-                Ok(with_host(|h| h.new_enumerator(chars, "each")))
+                Ok(with_host(|h| {
+                    h.new_enumerator_of(chars, name, recv.clone())
+                }))
             }
         }
         "[]" => str_index(&s, args),
@@ -10654,6 +10727,21 @@ fn dispatch_string_body(
                 .unwrap_or(false),
         )),
         // `slice!` removes the sliced portion in place and returns it.
+        // A Regexp selector (optionally with a group) removes that group of
+        // the first match, setting `$~` as `[]` does.
+        "slice!"
+            if !args.is_empty()
+                && args.len() <= 2
+                && with_host(|h| h.as_regex(&args[0])).is_some() =>
+        {
+            match str_regex_group(&s, &args[0], args.get(1))? {
+                Some((a, b)) => {
+                    with_host(|h| h.set_str(recv, format!("{}{}", &s[..a], &s[b..])));
+                    Ok(new_str(s[a..b].to_string()))
+                }
+                None => Ok(Value::Undef),
+            }
+        }
         "slice!" => match str_slice_remove(&s, args) {
             Some((removed, rest)) => {
                 with_host(|h| h.set_str(recv, rest));
@@ -10801,7 +10889,17 @@ fn dispatch_string_body(
                     }
                     Ok(recv.clone())
                 }
-                None => Ok(with_host(|h| h.new_enumerator(vals, "each"))),
+                // `rb_str_upto` enumerates with no size function.
+                None => own_enum(
+                    Ok(with_host(|h| {
+                        let e = h.new_enumerator(vals, "each");
+                        h.set_enum_size_fn(&e, None, vec![]);
+                        e
+                    })),
+                    recv,
+                    name,
+                    args,
+                ),
             }
         }
         "insert" => {
@@ -12650,6 +12748,57 @@ fn str_slice_remove(s: &str, args: &[Value]) -> Option<(String, String)> {
     }
 }
 
+/// `s[/re/]` / `s[/re/, capture]` (`rb_str_subpat`): match, set `$~`, and
+/// answer the selected group — by number (negative counts back from the last
+/// group, `rb_reg_nth_match`) or by name (a String or Symbol; an unknown name
+/// is an IndexError).
+fn str_regex_index(s: &str, re_val: &Value, capture: Option<&Value>) -> Result<Value, String> {
+    Ok(match str_regex_group(s, re_val, capture)? {
+        Some((a, b)) => new_str(s[a..b].to_string()),
+        None => Value::Undef,
+    })
+}
+
+/// The byte span of the group [`str_regex_index`] selects, `None` when the
+/// match or the group is absent.
+fn str_regex_group(
+    s: &str,
+    re_val: &Value,
+    capture: Option<&Value>,
+) -> Result<Option<(usize, usize)>, String> {
+    let (re, _) = with_host(|h| h.as_regex(re_val)).expect("a Regexp selector");
+    let caps = re.captures(s).ok().flatten();
+    set_match_globals(caps.as_ref().map(|c| (c, s)), &re, re_val);
+    let nth = match capture {
+        None => 0,
+        Some(v) if with_host(|h| h.as_str(v).is_some() || h.as_symbol(v).is_some()) => {
+            let nm = arg_str(v);
+            match re.capture_names().position(|n| n == Some(nm.as_str())) {
+                Some(i) => i as i64,
+                None => {
+                    return Err(raise_exc(
+                        "IndexError",
+                        &format!("undefined group name reference: {nm}"),
+                    ))
+                }
+            }
+        }
+        Some(v) => to_int(v)?,
+    };
+    let Some(caps) = caps else {
+        return Ok(None);
+    };
+    let n = if nth < 0 {
+        nth + caps.len() as i64
+    } else {
+        nth
+    };
+    if n < 0 || (nth < 0 && n == 0) {
+        return Ok(None);
+    }
+    Ok(caps.get(n as usize).map(|m| (m.start(), m.end())))
+}
+
 fn str_index(s: &str, args: &[Value]) -> Result<Value, String> {
     let chars: Vec<char> = s.chars().collect();
     Ok(match args {
@@ -12677,13 +12826,8 @@ fn str_index(s: &str, args: &[Value]) -> Result<Value, String> {
                     Some((start, e)) => new_str(chars[start..e].iter().collect()),
                     None => Value::Undef,
                 }
-            } else if let Some((re, _)) = with_host(|h| h.as_regex(rng)) {
-                // `s[/re/]` — the whole match, or nil.
-                re.find(s)
-                    .ok()
-                    .flatten()
-                    .map(|m| new_str(m.as_str().to_string()))
-                    .unwrap_or(Value::Undef)
+            } else if with_host(|h| h.as_regex(rng)).is_some() {
+                str_regex_index(s, rng, None)?
             } else if let Some(sub) = with_host(|h| h.as_str(rng)) {
                 // `s["sub"]` — the substring itself if present, else nil.
                 if s.contains(&sub) {
@@ -12701,16 +12845,9 @@ fn str_index(s: &str, args: &[Value]) -> Result<Value, String> {
                     .unwrap_or(Value::Undef)
             }
         }
-        // `s[/re/, n]` — the nth capture group of the match (0 = whole match).
-        [re, Value::Int(n)] if with_host(|h| h.as_regex(re)).is_some() => {
-            let (re, _) = with_host(|h| h.as_regex(re)).unwrap();
-            match re.captures(s).ok().flatten() {
-                Some(caps) => caps
-                    .get((*n).max(0) as usize)
-                    .map(|m| new_str(m.as_str().to_string()))
-                    .unwrap_or(Value::Undef),
-                None => Value::Undef,
-            }
+        // `s[/re/, capture]` — one group of the match.
+        [re, capture] if with_host(|h| h.as_regex(re)).is_some() => {
+            str_regex_index(s, re, Some(capture))?
         }
         _ => Value::Undef,
     })
@@ -14325,9 +14462,12 @@ fn dispatch_array(
                 }
                 Ok(recv.clone())
             } else {
-                // No Enumerator type: return the combinations array directly so
-                // `.to_a`/`.map`/`.each` all work.
-                Ok(new_arr(out))
+                own_enum(
+                    Ok(with_host(|h| h.new_enumerator(out, "each"))),
+                    recv,
+                    name,
+                    args,
+                )
             }
         }
         "permutation" => {
@@ -14343,7 +14483,12 @@ fn dispatch_array(
                 }
                 Ok(recv.clone())
             } else {
-                Ok(new_arr(out))
+                own_enum(
+                    Ok(with_host(|h| h.new_enumerator(out, "each"))),
+                    recv,
+                    name,
+                    args,
+                )
             }
         }
         "repeated_combination" | "repeated_permutation" => {
@@ -14363,9 +14508,12 @@ fn dispatch_array(
                 }
                 Ok(recv.clone())
             } else {
-                // No Enumerator type here: the rows array itself answers
-                // `.to_a`/`.each`/`.map`, matching `combination`/`permutation`.
-                Ok(new_arr(out))
+                own_enum(
+                    Ok(with_host(|h| h.new_enumerator(out, "each"))),
+                    recv,
+                    name,
+                    args,
+                )
             }
         }
         // `shuffle`/`shuffle!`/`sample` draw from the `random:` generator (the
@@ -14694,7 +14842,15 @@ fn dispatch_array(
                         for _ in 0..times {
                             out.extend(arr.iter().cloned());
                         }
-                        Ok(with_host(|h| h.new_enumerator(out, "each")))
+                        // Inspected as `cycle(n)`; NOT sourced at the receiver, as
+                        // `cycle` itself answers nil (so does its `each { }`).
+                        let label = enum_label(recv, name, args);
+                        Ok(with_host(|h| {
+                            let e = h.new_enumerator(out, "each");
+                            h.set_enum_label(&e, label);
+                            h.set_enum_source(&e, Value::Undef);
+                            e
+                        }))
                     }
                     None => {
                         let label = enum_label(recv, "cycle", &[]);
@@ -16811,6 +16967,81 @@ fn array_yield_method(
     })
 }
 
+/// The Hash iterators whose block-less Enumerator, given a block again, writes
+/// back into (or rebuilds from) the Hash it came from.
+const HASH_REATTACH_METHODS: &[&str] = &[
+    "delete_if",
+    "keep_if",
+    "select!",
+    "filter!",
+    "reject!",
+    "transform_values",
+    "transform_values!",
+    "transform_keys",
+    "transform_keys!",
+];
+
+/// `h.delete_if.with_index { |(k, v), i| … }` and friends: run Hash `method`
+/// over `src` with the block also handed each element's index from `offset`.
+/// The filters see the `[key, value]` pair, `transform_values` the value and
+/// `transform_keys` the key.
+fn hash_reattach_with_index(
+    src: &Value,
+    method: &str,
+    block: &Value,
+    offset: i64,
+) -> Result<Value, String> {
+    let map = with_host(|h| h.as_hash(src)).unwrap_or_default();
+    let mut results = Vec::with_capacity(map.len());
+    for (i, (k, v)) in map.iter().enumerate() {
+        let key = with_host(|h| h.key_value(k));
+        let item = match method {
+            "transform_values" | "transform_values!" => v.clone(),
+            "transform_keys" | "transform_keys!" => key.clone(),
+            _ => new_arr(vec![key.clone(), v.clone()]),
+        };
+        let r = call_proc(block, &[item, Value::Int(offset + i as i64)])?;
+        if has_pending_signal() {
+            return Ok(take_break().unwrap_or(Value::Undef));
+        }
+        results.push((k.clone(), key, v.clone(), r));
+    }
+    match method {
+        "transform_values" | "transform_values!" | "transform_keys" | "transform_keys!" => {
+            let mut out = IndexMap::new();
+            for (k, _, v, r) in results {
+                if method.starts_with("transform_values") {
+                    out.insert(k, r);
+                } else {
+                    let nk = with_host(|h| h.hash_key(src, &r));
+                    out.insert(nk, v);
+                }
+            }
+            let fresh = with_host(|h| h.new_hash(out));
+            if method.ends_with('!') {
+                dispatch(src, "replace", &[fresh], None)
+            } else {
+                Ok(fresh)
+            }
+        }
+        _ => {
+            let keep_truthy = matches!(method, "keep_if" | "select!" | "filter!");
+            let mut changed = false;
+            for (k, _, _, r) in results {
+                if with_host(|h| h.truthy(&r)) != keep_truthy {
+                    with_host(|h| h.hash_remove(src, &k));
+                    changed = true;
+                }
+            }
+            Ok(if changed || matches!(method, "delete_if" | "keep_if") {
+                src.clone()
+            } else {
+                Value::Undef
+            })
+        }
+    }
+}
+
 fn dispatch_enumerator(
     recv: &Value,
     name: &str,
@@ -16849,6 +17080,35 @@ fn dispatch_enumerator(
                 }
                 None => Ok(Value::Int(buf.len() as i64)),
             }
+        }
+        // The same for the Hash iterators that write back (`h.delete_if.each {
+        // … }` deletes from `h`) or build from the receiver (`transform_values`).
+        "each"
+            if block.is_some()
+                && args.is_empty()
+                && with_host(|h| h.enum_method(recv))
+                    .is_some_and(|m| HASH_REATTACH_METHODS.contains(&m.as_str()))
+                && with_host(|h| h.enum_source(recv))
+                    .is_some_and(|s| with_host(|h| h.as_hash(&s)).is_some()) =>
+        {
+            let method = with_host(|h| h.enum_method(recv)).unwrap_or_default();
+            let source = with_host(|h| h.enum_source(recv)).unwrap_or(Value::Undef);
+            dispatch(&source, &method, &[], block)
+        }
+        "with_index" | "each_with_index"
+            if block.is_some()
+                && with_host(|h| h.enum_method(recv))
+                    .is_some_and(|m| HASH_REATTACH_METHODS.contains(&m.as_str()))
+                && with_host(|h| h.enum_source(recv))
+                    .is_some_and(|s| with_host(|h| h.as_hash(&s)).is_some()) =>
+        {
+            let method = with_host(|h| h.enum_method(recv)).unwrap_or_default();
+            let source = with_host(|h| h.enum_source(recv)).unwrap_or(Value::Undef);
+            let offset = match (name, args.first()) {
+                ("with_index", Some(v)) => to_int(v)?,
+                _ => 0,
+            };
+            hash_reattach_with_index(&source, &method, block.as_ref().unwrap(), offset)
         }
         // Re-attaching a block to `a.map!` / `a.select!` / … runs the in-place
         // method itself, writing back into the Array that built the Enumerator:
@@ -17001,7 +17261,12 @@ fn dispatch_enumerator(
                 .enumerate()
                 .map(|(i, x)| new_arr(vec![x.clone(), Value::Int(offset + i as i64)]))
                 .collect();
-            Ok(with_host(|h| h.new_enumerator(pairs, "each")))
+            let label = enum_label(recv, name, args);
+            Ok(with_host(|h| {
+                let e = h.new_enumerator(pairs, "each");
+                h.set_enum_label(&e, label);
+                e
+            }))
         }
         // `each` runs the block over the buffered values and answers the OBJECT
         // being iterated — `[1, 2, 3, 4].each_slice(2).each { }` is `[1, 2, 3, 4]`,
@@ -21409,7 +21674,9 @@ fn dispatch_hash_body(
         // answered `[]`, `{}` or the receiver, so `h.map.with_index { … }` was a
         // NoMethodError on Array and `h.each.next` had nothing to step.
         "map" | "collect" | "each" | "each_pair" | "find" | "detect" | "select" | "filter"
-        | "reject" | "each_key" | "each_value"
+        | "reject" | "each_key" | "each_value" | "delete_if" | "keep_if" | "select!"
+        | "filter!" | "reject!" | "transform_values" | "transform_values!" | "transform_keys"
+        | "transform_keys!"
             if block.is_none() && args.is_empty() =>
         {
             let buf: Vec<Value> = with_host(|h| {
@@ -22393,6 +22660,12 @@ fn dispatch_range(
                 ))
             }
         }
+        "each" if block.is_none() => {
+            let vals: Vec<Value> = (lo..end).map(Value::Int).collect();
+            Ok(with_host(|h| {
+                h.new_enumerator_of(vals, "each", recv.clone())
+            }))
+        }
         "each" => {
             if let Some(b) = &block {
                 for i in lo..end {
@@ -22485,6 +22758,28 @@ fn float_range_step(lo: f64, hi: f64, excl: bool, by: f64) -> Vec<Value> {
         i += 1.0;
     }
     out
+}
+
+/// Record that the materialized Enumerator `e` came from block-less
+/// `recv.name(*args)`: `each` then answers `recv`, and it inspects as
+/// `#<Enumerator: recv:name(args)>`. Anything that is not an Enumerator passes
+/// through untouched.
+fn own_enum(
+    r: Result<Value, String>,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    if let Ok(e) = &r {
+        if with_host(|h| h.enum_buf(e)).is_some() {
+            let label = enum_label(recv, name, args);
+            with_host(|h| {
+                h.set_enum_source(e, recv.clone());
+                h.set_enum_label(e, label);
+            });
+        }
+    }
+    r
 }
 
 /// Whether block-less `name(*args)` answers an Enumerator rather than
@@ -22882,6 +23177,13 @@ fn dispatch_str_range(
             };
             Ok(Value::Bool(s.as_str() >= lo.as_str() && upper))
         }
+        // Block-less: an Enumerator with no size function (`range_enum_size`
+        // is nil for a String range).
+        "each" if block.is_none() => Ok(with_host(|h| {
+            let e = h.new_enumerator_of(elems(), "each", recv.clone());
+            h.set_enum_size_fn(&e, None, vec![]);
+            e
+        })),
         "each" => {
             if let Some(b) = &block {
                 for e in elems() {
@@ -22914,7 +23216,16 @@ fn dispatch_str_range(
                     }
                     Ok(recv.clone())
                 }
-                None => Ok(with_host(|h| h.new_enumerator(vals, "each"))),
+                None => own_enum(
+                    Ok(with_host(|h| {
+                        let e = h.new_enumerator(vals, "each");
+                        h.set_enum_size_fn(&e, None, vec![]);
+                        e
+                    })),
+                    recv,
+                    name,
+                    args,
+                ),
             }
         }
         // Enumerable fallback over the materialized elements.

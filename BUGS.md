@@ -1495,6 +1495,14 @@ Honest limitations of this surface:
   `Hash#each_with_index` answers one as well, and `Enumerator#each` on a GENERATOR
   answers what the generator body evaluated to, as MRI does — usually the
   `Yielder`, since `y << v` answers the yielder so `y << 1 << 2` chains.
+- **Open: `$~` inside a block-less `gsub` Enumerator.** `str.gsub(re)` answers
+  an Enumerator over the matched strings, but the matches are collected up
+  front and `$~` is not set per element, so a block run over it reads
+  whatever `$~`/`$&` held before
+  (`"a1b2".gsub(/\d/).map { $&.to_i * 2 }` is `[0, 0]`, MRI `[2, 4]`).
+- **Open: `with_index` re-attached, then `each { }`.** `[1, 2].each.with_index(1)
+  .each { }` answers the `[elem, index]` pairs; MRI answers what the inner
+  `each` does (`[1, 2]`).
 - **Multi-value Enumerator yields.** `each_with_index`, `each_with_object` and a
   generator's `y.yield a, b` yield TWO values per iteration, not one packed pair.
   The buffer keeps them packed (that is what `to_a` and `each_entry` see) and the
@@ -1659,6 +1667,11 @@ Honest limitations of this surface:
   answers instead of materializing first. A call that genuinely needs every
   element (`sort`, `sum`, `to_a`, `map` with a block) still runs forever on an
   infinite source — exactly as MRI does.
+  `size` follows MRI's size functions rather than counting: an endless
+  `cycle`, `loop` or `produce` is `Infinity` (`[].cycle` is 0),
+  `Enumerator.new(n) { }` answers `n` (or calls it), and a derived enumerator
+  reshapes its source's size (`each_slice(k)` is the ceiling of `n / k`) while
+  `find`/`take_while`/`chunk_while`/a String range answer nil.
 - **Hash through Enumerable.** MRI derives Hash's Enumerable surface from
   `Hash#each`, and `each` yields the whole `[k, v]` pair as ONE value
   (`hash.c` `each_pair_i`) — so a one-parameter block sees the pair, not the key.
