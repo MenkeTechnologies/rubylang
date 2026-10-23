@@ -3569,7 +3569,21 @@ fn scan_interp_with(
     let mut i = 0;
     let mut parts = Vec::new();
     let mut lit = String::new();
+    // The bytes of a run of `\xHH` / `\NNN` escapes in a string literal. MRI
+    // builds the literal from bytes, so a run spelling UTF-8 (`"\xE3\x81\x82"`)
+    // is that one character, and one that does not stays bytes.
+    let mut bytes: Vec<u8> = Vec::new();
     while i < b.len() {
+        let byte_escape = string
+            && b[i] == b'\\'
+            && match b.get(i + 1) {
+                Some(d) if (b'0'..=b'7').contains(d) => true,
+                Some(b'x') => b.get(i + 2).is_some_and(u8::is_ascii_hexdigit),
+                _ => false,
+            };
+        if !byte_escape {
+            flush_escaped_bytes(&mut lit, &mut bytes, &mut parts);
+        }
         if b[i] == b'\\' && i + 1 < b.len() {
             let n = b[i + 1];
             // `\NNN` — one to three octal digits → a byte (`"\101"` is `"A"`).
@@ -3580,7 +3594,7 @@ fn scan_interp_with(
                     val = val * 8 + u32::from(b[j] - b'0');
                     j += 1;
                 }
-                lit.push(char::from_u32(val & 0xff).unwrap_or('\u{fffd}'));
+                bytes.push((val & 0xff) as u8);
                 i = j;
                 continue;
             }
@@ -3609,7 +3623,11 @@ fn scan_interp_with(
                         count += 1;
                     }
                     if count > 0 {
-                        lit.push(char::from_u32(val).unwrap_or('\u{fffd}'));
+                        if string {
+                            bytes.push(val as u8);
+                        } else {
+                            lit.push(char::from_u32(val).unwrap_or('\u{fffd}'));
+                        }
                         i = j;
                         continue;
                     }
@@ -3731,10 +3749,31 @@ fn scan_interp_with(
         lit.push_str(&raw[i..i + clen]);
         i += clen;
     }
+    flush_escaped_bytes(&mut lit, &mut bytes, &mut parts);
     if !lit.is_empty() || parts.is_empty() {
         parts.push(StrPart::Lit(lit));
     }
     Ok(parts)
+}
+
+/// Settle a run of escaped bytes: the stretches that are UTF-8 join the text as
+/// their characters, the bytes that are not become a [`StrPart::Bytes`] (after
+/// the text so far), merged with a `Bytes` part right before it.
+fn flush_escaped_bytes(lit: &mut String, bytes: &mut Vec<u8>, parts: &mut Vec<StrPart>) {
+    for chunk in bytes.utf8_chunks() {
+        lit.push_str(chunk.valid());
+        if chunk.invalid().is_empty() {
+            continue;
+        }
+        if !lit.is_empty() {
+            parts.push(StrPart::Lit(std::mem::take(lit)));
+        }
+        match parts.last_mut() {
+            Some(StrPart::Bytes(prev)) => prev.extend_from_slice(chunk.invalid()),
+            _ => parts.push(StrPart::Bytes(chunk.invalid().to_vec())),
+        }
+    }
+    bytes.clear();
 }
 
 /// Whether a double-quoted body carries a `#@ivar` / `#@@cvar` / `#$gvar`

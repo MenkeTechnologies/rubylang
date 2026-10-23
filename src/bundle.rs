@@ -331,6 +331,7 @@ fn literal_str(e: &Expr) -> Option<String> {
                 match p {
                     StrPart::Lit(t) => s.push_str(t),
                     StrPart::Interp(_) => return None,
+                    StrPart::Bytes(_) => return None,
                 }
             }
             Some(s)

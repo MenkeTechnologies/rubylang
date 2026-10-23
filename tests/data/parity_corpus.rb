@@ -8358,3 +8358,32 @@ def ygen; return to_enum(:ygen) unless block_given?; r = yield 1; [:ret, r]; end
 p ygen.each { 9 }, ygen.to_a, ygen.map { 2 }, o.to_enum { 42 }.size
 p Enumerator.new { |y| p y.yield(1); p y.yield(3, 4) }.each { 7 }, Enumerator.new { |y| p y.yield(1) }.to_a
 e = Enumerator.new { |y| p y.yield(1); :fin }; e.next; (e.next rescue p $!.result)
+#==#
+# ── "\xNN" / "\NNN" escape runs are bytes: a UTF-8 run is its character, the rest stay invalid bytes ──
+p "\xe3\x81\x82", "\xC3\xA9t\xC3\xA9", "\343\201\202", "a\x41\x42b", "\xE3\x81\x82".length, "x\xe3\x81\x82#{1}\xc3\xa9", "\x7f"
+p "\xff", "\xff".encoding, "\xff".valid_encoding?, "\xff".bytes, "a\xffé".length, "a\xffé".bytes, "x#{1}\xff".bytes, "\xe3\x81" + "\x82"
+#==#
+# ── a UTF-8 String holding invalid bytes: byte methods read bytes, character methods count each invalid byte as one ──
+m = "a\xffé b"
+p m, m.length, m.chars, m.reverse, m[1], m[1, 2], m.index("é"), m.include?("é"), m.center(9, "*"), m.chop, m.succ, m.ord, m.sum, m.b, m.scrub, m.scrub("?")
+p m.dump, (m.dump.undump rescue $!), "a\xff".dump.undump, "a\xff".dump.undump.valid_encoding?, m.inspect, m.byteslice(1, 2), m.byteslice(0, 1).valid_encoding?, m.grapheme_clusters, m.partition("é")
+p (m.upcase rescue $!), (m.split rescue $!), (m.strip rescue $!), (m =~ /b/ rescue $!), (m.count("a") rescue $!), (m.to_sym rescue $!), (m.tr("a", "b") rescue $!)
+p m.sub("a", "x"), m.gsub("é", "E"), m.include?("\xff"), m.index("\xff"), (m.sub("\xff", "X") rescue $!), m.start_with?("a\xff"), "\xE3\x81\x82\xE3".start_with?("\xE3")
+r = []; m.each_char { |c| r << [c, c.valid_encoding?] }; p r, m.each_char.to_a.size, m * 2, m.insert(1, "Z"), m
+s = +"é"; s << "\xff"; t = +"ab"; t.setbyte(0, 0xff); u = +"ab"; u.setbyte(0, 0x41)
+p s, s.length, t, t.valid_encoding?, u, u.valid_encoding?, "é" + "\xff", ("é" + "\xff").encoding, "#{"\xff"}é".valid_encoding?
+p [11, 169].pack("C*").force_encoding("UTF-8"), "\xff".b.force_encoding("UTF-8").valid_encoding?, "\xff".force_encoding("BINARY").encoding
+p ("\xff".encode("UTF-16") rescue $!), "\xff".encode("UTF-8"), ("\xff".encode("ISO-8859-1") rescue $!), "\xff".encode("UTF-8", invalid: :replace), "a\xff".scrub { |b| "<#{b.bytes}>" }
+p "\xff" == "\xff".b, "\xff" == "\xff", 255.chr == "ÿ", 255.chr.hash == "ÿ".hash, {255.chr => 1}["ÿ"], {"\xff" => 1}.key?("\xff".b), [255.chr, "ÿ", "\xff"].uniq.size
+#==#
+# ── ISO-8859-1 is a byte label; force_encoding keeps the bytes, encode maps them to their codepoints ──
+p "\xE9".force_encoding("ISO-8859-1").encode("UTF-8"), "\xC3\xA9".force_encoding("ISO-8859-1").encode("UTF-8"), "\xff".force_encoding("ISO-8859-1").encode("UTF-8")
+b = "é".encode("ISO-8859-1"); p b, b.bytes, b.encoding, b.length, b.encode("UTF-8"), ("€".encode("ISO-8859-1") rescue $!), "abc".encode("ISO-8859-1").encoding
+p ("é".b.encode("ISO-8859-1") rescue $!), ("\xE9".force_encoding("ISO-8859-1").encode("BINARY") rescue $!), ("\xE9".force_encoding("ISO-8859-1").encode("US-ASCII") rescue $!)
+#==#
+# ── a Regexp's \xHH escapes are bytes: a UTF-8 run matches its character ──
+p(/\xC3\xA9/ =~ "é", /[\xC3\xA9x]/ =~ "é", /a\x41\xe3\x81\x82/ =~ "aAあ", /\xC3\xA9{2}/ =~ "éé", $~[0], /\xC3\xA9/.source, Regexp.new('\xC3\xA9') =~ "é", /\\xC3/ =~ "\\xC3")
+#==#
+# ── Digest / Base64 read a String's bytes, not its storage's UTF-8 ──
+require "digest"; require "base64"
+p Digest::MD5.hexdigest("\xff"), Digest::SHA256.hexdigest(255.chr), Digest::SHA1.hexdigest("é".b), Base64.strict_encode64("\xff\xfe"), Base64.strict_encode64("é".b), Digest::MD5.hexdigest("é")

@@ -7025,3 +7025,118 @@ nil
 [1]
 nil
 :fin
+#==#
+"あ"
+"été"
+"あ"
+"aABb"
+1
+"xあ1é"
+"\u007F"
+"\xFF"
+#<Encoding:UTF-8>
+false
+[255]
+3
+[97, 255, 195, 169]
+[120, 49, 255]
+"あ"
+#==#
+"a\xFFé b"
+5
+["a", "\xFF", "é", " ", "b"]
+"b é\xFFa"
+"\xFF"
+"\xFFé"
+2
+true
+"**a\xFFé b**"
+"a\xFFé "
+"a\xFFé c"
+97
+846
+"a\xFF\xC3\xA9 b"
+"a�é b"
+"a?é b"
+"\"a\\xFF\\u00E9 b\""
+#<RuntimeError: hex escape and Unicode escape are mixed>
+"a\xFF"
+false
+"\"a\\xFFé b\""
+"\xFF\xC3"
+true
+["a", "\xFF", "é", " ", "b"]
+["a\xFF", "é", " b"]
+#<ArgumentError: input string invalid>
+#<ArgumentError: invalid byte sequence in UTF-8>
+#<Encoding::CompatibilityError: invalid byte sequence in UTF-8>
+#<ArgumentError: invalid byte sequence in UTF-8>
+#<ArgumentError: invalid byte sequence in UTF-8>
+#<EncodingError: invalid symbol in encoding UTF-8 :"a\xFFé b">
+#<ArgumentError: invalid byte sequence in UTF-8>
+"x\xFFé b"
+"a\xFFE b"
+false
+nil
+#<RegexpError: invalid multibyte character: /\xFF/>
+true
+false
+[["a", true], ["\xFF", false], ["é", true], [" ", true], ["b", true]]
+5
+"a\xFFé ba\xFFé b"
+"aZ\xFFé b"
+"aZ\xFFé b"
+"é\xFF"
+2
+"\xFFb"
+false
+"Ab"
+true
+"é\xFF"
+#<Encoding:UTF-8>
+false
+"\v\xA9"
+false
+#<Encoding:BINARY (ASCII-8BIT)>
+#<Encoding::InvalidByteSequenceError: "\xFF" on UTF-8>
+"\xFF"
+#<Encoding::InvalidByteSequenceError: "\xFF" on UTF-8>
+"�"
+"a<[255]>"
+false
+true
+false
+false
+nil
+false
+3
+#==#
+"é"
+"Ã©"
+"ÿ"
+"\xE9"
+[233]
+#<Encoding:ISO-8859-1>
+1
+"é"
+#<Encoding::UndefinedConversionError: U+20AC from UTF-8 to ISO-8859-1>
+#<Encoding:ISO-8859-1>
+#<Encoding::UndefinedConversionError: "\xC3" to UTF-8 in conversion from ASCII-8BIT to UTF-8 to ISO-8859-1>
+#<Encoding::UndefinedConversionError: U+00E9 to ASCII-8BIT in conversion from ISO-8859-1 to UTF-8 to ASCII-8BIT>
+#<Encoding::UndefinedConversionError: U+00E9 to US-ASCII in conversion from ISO-8859-1 to UTF-8 to US-ASCII>
+#==#
+0
+0
+0
+0
+"éé"
+"\\xC3\\xA9"
+0
+0
+#==#
+"00594fd4f42ba43fc1ca0427a0576295"
+"a8100ae6aa1940d0b663bb31cd466142ebbdbd5187131b92d93818987832eb89"
+"bf15be717ac1b080b4f1c456692825891ff5073d"
+"//4="
+"w6k="
+"66ddcd97cfdeabb2f6fb8a999b4bc76f"

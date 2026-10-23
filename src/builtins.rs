@@ -30,6 +30,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::KWSPLAT_ARGS, b_kwsplat_args);
     vm.register_builtin(ops::BITNOT, b_bitnot);
     vm.register_builtin(ops::METHOD_HOOK, b_method_hook);
+    vm.register_builtin(ops::MKBSTR, b_mkbstr);
     vm.register_builtin(ops::SETLOCAL, b_setlocal);
     vm.register_builtin(ops::GETIVAR, b_getivar);
     vm.register_builtin(ops::SETIVAR, b_setivar);
@@ -1372,6 +1373,17 @@ fn b_call_method_blk(vm: &mut VM, argc: u8) -> Value {
 
 fn b_mkstr(vm: &mut VM, argc: u8) -> Value {
     let parts = pop_n(vm, argc as usize);
+    // A byte String interpolated into the literal joins it as BYTES, under the
+    // encoding negotiation `+` makes.
+    if parts
+        .iter()
+        .any(|p| with_host(|h| h.as_str(p).is_some() && h.string_encoding(p).is_some()))
+    {
+        return match join_string_bytes(&parts) {
+            Ok(v) => v,
+            Err(e) => abort(vm, e),
+        };
+    }
     let mut s = String::new();
     for p in &parts {
         s.push_str(&display(p));
@@ -9762,6 +9774,13 @@ const ENCODING_NOT_INHERITED: &[&str] = &[
 fn propagate_string_encoding(v: &Value, enc: &'static str, may_upgrade: bool, depth: u8) {
     match with_host(|h| h.as_str(v)) {
         Some(s) => {
+            // A broken UTF-8 receiver's byte methods can produce valid UTF-8
+            // (`"\xffab".byteslice(1, 2)`), which is text again.
+            if enc == crate::host::BROKEN_UTF8 {
+                let bytes = binstr_to_bytes(&s);
+                with_host(|h| h.set_utf8_bytes(v, bytes));
+                return;
+            }
             if may_upgrade && !s.is_ascii() {
                 return;
             }
@@ -9813,8 +9832,32 @@ fn dispatch_string(
     // directly: the work below reads the receiver's content (a copy) and every
     // argument's tag, which on a long string would cost more than the method.
     let Some(enc) = with_host(|h| h.string_encoding(recv)) else {
+        // Text given a broken UTF-8 argument joins it by bytes.
+        if !args.is_empty()
+            && !BROKEN_UTF8_BYTE_METHODS.contains(&name)
+            && with_host(|h| h.any_tagged_strings() && args.iter().any(|a| h.is_broken_utf8(a)))
+        {
+            let bytes = with_host(|h| h.string_bytes(recv));
+            return dispatch_utf8_char_view(recv, bytes, name, args, block);
+        }
         return dispatch_string_body(recv, name, args, block);
     };
+    if enc == crate::host::BROKEN_UTF8 {
+        return dispatch_broken_utf8(recv, name, args, block);
+    }
+    dispatch_string_tagged(recv, name, args, block)
+}
+
+/// A String method on a receiver tagged with a non-UTF-8 encoding (or on a
+/// broken UTF-8 one, for the byte methods): the method's String results carry
+/// the receiver's encoding.
+fn dispatch_string_tagged(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    let enc = with_host(|h| h.string_encoding(recv)).unwrap_or("UTF-8");
     if ENCODING_NOT_INHERITED.contains(&name) {
         return dispatch_string_body(recv, name, args, block);
     }
@@ -9828,6 +9871,443 @@ fn dispatch_string(
     });
     let out = dispatch_string_body(recv, name, args, block)?;
     propagate_string_encoding(&out, enc, recv_ascii && !byte_string_arg, 2);
+    Ok(out)
+}
+
+/// The parts of an interpolated literal joined as BYTES and labelled the way
+/// `+` labels a concatenation: by the encoding of the parts holding non-ASCII
+/// (UTF-8 when none does), an `Encoding::CompatibilityError` when two of them
+/// disagree. Text and a broken UTF-8 String are both UTF-8.
+fn join_string_bytes(parts: &[Value]) -> Result<Value, String> {
+    let mut bytes = Vec::new();
+    let mut label: Option<Option<&'static str>> = None;
+    for p in parts {
+        let (b, enc) = with_host(|h| {
+            h.as_str(p)
+                .map(|_| (h.string_bytes(p), h.string_encoding(p)))
+        })
+        .unwrap_or_else(|| (display(p).into_bytes(), None));
+        let enc = enc.filter(|e| *e != crate::host::BROKEN_UTF8);
+        if !b.is_ascii() {
+            match label {
+                None => label = Some(enc),
+                Some(l) if l != enc => {
+                    let name = |e: Option<&str>| match e {
+                        Some("ASCII-8BIT") => "BINARY (ASCII-8BIT)".to_string(),
+                        Some(n) => n.to_string(),
+                        None => "UTF-8".to_string(),
+                    };
+                    return Err(raise_exc(
+                        "Encoding::CompatibilityError",
+                        &format!(
+                            "incompatible character encodings: {} and {}",
+                            name(l),
+                            name(enc)
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        bytes.extend(b);
+    }
+    Ok(match label.flatten() {
+        Some(enc) => {
+            let v = new_str(bytes_to_binstr(&bytes));
+            with_host(|h| h.set_string_encoding(&v, enc));
+            v
+        }
+        None => with_host(|h| h.new_utf8_from_bytes(bytes)),
+    })
+}
+
+/// `MKBSTR`: a string literal holding bytes that are not UTF-8. The parts are
+/// joined as BYTES — text as its UTF-8, a `B` part as the bytes its
+/// one-char-per-byte storage spells, an interpolated value as the bytes it
+/// renders to — and the result is UTF-8 text when they happen to be valid.
+fn b_mkbstr(vm: &mut VM, argc: u8) -> Value {
+    let vals = pop_n(vm, argc as usize);
+    let kinds = name_of(&vals[0]);
+    let mut bytes = Vec::new();
+    for (kind, part) in kinds.chars().skip(1).zip(&vals[1..]) {
+        match kind {
+            'B' => bytes.extend(binstr_to_bytes(&name_of(part))),
+            'I' if with_host(|h| h.as_str(part).is_some()) => {
+                bytes.extend(with_host(|h| h.string_bytes(part)))
+            }
+            _ => bytes.extend(display(part).into_bytes()),
+        }
+    }
+    let s = with_host(|h| h.new_utf8_from_bytes(bytes));
+    if kinds.starts_with('F') {
+        with_host(|h| h.freeze_value(&s));
+    }
+    s
+}
+
+/// The String methods a broken UTF-8 receiver answers through its byte
+/// storage, exactly as any tagged String does: they read or relabel bytes and
+/// never ask where a character ends.
+const BROKEN_UTF8_BYTE_METHODS: &[&str] = &[
+    "bytes",
+    "bytesize",
+    "each_byte",
+    "getbyte",
+    "setbyte",
+    "byteslice",
+    "b",
+    "force_encoding",
+    "encoding",
+    "unpack",
+    "unpack1",
+    "hash",
+    "eql?",
+    "==",
+    "===",
+    "!=",
+    "ascii_only?",
+    "empty?",
+    "freeze",
+    "frozen?",
+    "dup",
+    "clone",
+    "+@",
+    "-@",
+    "to_s",
+    "to_str",
+    "itself",
+    "sum",
+    "to_i",
+    "to_f",
+    "to_r",
+    "to_c",
+    "hex",
+    "oct",
+    "crypt",
+];
+
+/// What MRI refuses on a String whose bytes are not valid UTF-8, and how. The
+/// case mappers check the whole string up front; the methods built on
+/// character classes or regexps fail scanning it. A regexp argument is the
+/// trigger for the pattern methods, which a String pattern does not reach.
+fn broken_utf8_refusal(name: &str, args: &[Value]) -> Option<String> {
+    let regexp_arg = || {
+        args.first()
+            .is_some_and(|a| with_host(|h| h.class_of(a)) == "Regexp")
+    };
+    let invalid = || raise_exc("ArgumentError", "invalid byte sequence in UTF-8");
+    match name {
+        "upcase" | "downcase" | "capitalize" | "swapcase" | "upcase!" | "downcase!"
+        | "capitalize!" | "swapcase!" => Some(raise_exc("ArgumentError", "input string invalid")),
+        "codepoints"
+        | "each_codepoint"
+        | "split"
+        | "squeeze"
+        | "squeeze!"
+        | "unicode_normalize"
+        | "unicode_normalize!"
+        | "unicode_normalized?"
+        | "tr"
+        | "tr!"
+        | "tr_s"
+        | "tr_s!"
+        | "delete"
+        | "delete!"
+        | "count" => Some(invalid()),
+        "=~" | "match" | "match?" | "scan" => Some(invalid()),
+        "sub" | "gsub" | "sub!" | "gsub!" | "index" | "rindex" | "partition" | "rpartition"
+        | "start_with?" | "slice" | "slice!" | "[]"
+            if regexp_arg() =>
+        {
+            Some(invalid())
+        }
+        "strip" | "strip!" | "lstrip" | "lstrip!" | "rstrip" | "rstrip!" => Some(raise_exc(
+            "Encoding::CompatibilityError",
+            "invalid byte sequence in UTF-8",
+        )),
+        _ => None,
+    }
+}
+
+/// A broken UTF-8 String (see [`crate::host::BROKEN_UTF8`]): the methods that
+/// know the bytes are invalid, the byte methods on the storage, and every other
+/// method run over the character view ([`crate::host::broken_units`]) — each
+/// invalid byte one character, each valid sequence its character — with the
+/// String results and any change to the receiver mapped back to bytes.
+fn dispatch_broken_utf8(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    if let Some(e) = broken_utf8_refusal(name, args) {
+        return Err(e);
+    }
+    let bytes = with_host(|h| h.string_bytes(recv));
+    match name {
+        "valid_encoding?" => return Ok(Value::Bool(false)),
+        "inspect" => return Ok(new_str(with_host(|h| h.inspect(recv)))),
+        "to_sym" | "intern" => {
+            return Err(raise_exc(
+                "EncodingError",
+                &format!(
+                    "invalid symbol in encoding UTF-8 :{}",
+                    with_host(|h| h.inspect(recv))
+                ),
+            ))
+        }
+        "scrub" | "scrub!" => {
+            let fixed = scrub_utf8(&bytes, args.first(), block.as_ref())?;
+            if name == "scrub" {
+                return Ok(new_str(fixed));
+            }
+            frozen_guard(recv, name, STRING_MUTATORS)?;
+            with_host(|h| h.set_utf8_bytes(recv, fixed.into_bytes()));
+            return Ok(recv.clone());
+        }
+        "encode" | "encode!" => return encode_broken_utf8(recv, name, &bytes, args),
+        "dump" => {
+            let units = crate::host::broken_units(&bytes);
+            return Ok(new_str(dump_string(
+                units
+                    .chars()
+                    .map(|c| match crate::host::broken_unit_byte(c) {
+                        Some(b) => DUMP_INVALID_BYTE | u32::from(b),
+                        None => u32::from(c),
+                    }),
+                true,
+            )));
+        }
+        _ if BROKEN_UTF8_BYTE_METHODS.contains(&name) => {
+            return dispatch_string_tagged(recv, name, args, block);
+        }
+        _ => {}
+    }
+    dispatch_utf8_char_view(recv, bytes, name, args, block)
+}
+
+/// A String method on UTF-8 bytes some of which are not UTF-8 — a broken
+/// receiver, or a text receiver given a broken argument (`"ab" << "\xff"`):
+/// it runs over the character view, each invalid byte one character, with the
+/// String results and any change to the receiver mapped back to bytes. The
+/// rules that hinge on a broken argument come first.
+fn dispatch_utf8_char_view(
+    recv: &Value,
+    bytes: Vec<u8>,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
+    match name {
+        // A prefix/suffix test compares bytes, and the cut has to fall between
+        // characters: a broken argument matches the same bytes in the receiver
+        // (`"\xffa".start_with?("\xff")`), half a character does not.
+        "start_with?" | "end_with?"
+            if args.iter().all(|a| with_host(|h| h.as_str(a).is_some())) =>
+        {
+            let units = |b: &[u8]| crate::host::broken_units(b);
+            let whole = units(&bytes);
+            let hit = args.iter().any(|a| {
+                let p = with_host(|h| h.string_bytes(a));
+                if name == "start_with?" {
+                    bytes.starts_with(&p) && whole == units(&p) + &units(&bytes[p.len()..])
+                } else {
+                    bytes.ends_with(&p)
+                        && whole == units(&bytes[..bytes.len() - p.len()]) + &units(&p)
+                }
+            });
+            return Ok(Value::Bool(hit));
+        }
+        // A broken NEEDLE is never found (`rb_strseq_index` refuses a broken
+        // substring), and a broken String pattern cannot become a Regexp.
+        "include?" | "index" | "rindex" | "partition" | "rpartition" | "sub" | "gsub" | "sub!"
+        | "gsub!"
+            if args
+                .first()
+                .is_some_and(|a| with_host(|h| h.is_broken_utf8(a))) =>
+        {
+            let dup = || with_host(|h| h.new_utf8_from_bytes(bytes.clone()));
+            return match name {
+                "include?" => Ok(Value::Bool(false)),
+                "index" | "rindex" => Ok(Value::Undef),
+                "partition" => Ok(new_arr(vec![
+                    dup(),
+                    new_str(String::new()),
+                    new_str(String::new()),
+                ])),
+                "rpartition" => Ok(new_arr(vec![
+                    new_str(String::new()),
+                    new_str(String::new()),
+                    dup(),
+                ])),
+                _ => {
+                    let shown = with_host(|h| h.inspect(&args[0]));
+                    Err(raise_exc(
+                        "RegexpError",
+                        &format!(
+                            "invalid multibyte character: /{}/",
+                            &shown[1..shown.len() - 1]
+                        ),
+                    ))
+                }
+            };
+        }
+        _ => {}
+    }
+    let units = crate::host::broken_units(&bytes);
+    let view = new_str(units.clone());
+    let block = block.map(|b| with_host(|h| h.new_broken_units_block(b)));
+    let args: Vec<Value> = args.iter().map(|a| units_of_bytes(a, 1)).collect();
+    let out = dispatch_string(&view, name, &args, block)?;
+    // An Enumerator over the view iterates the receiver.
+    if with_host(|h| h.enum_source(&out)).is_some_and(|s| s == view) {
+        with_host(|h| h.set_enum_source(&out, recv.clone()));
+    }
+    // A method that changed its receiver changed the view: carry it back.
+    let after = with_host(|h| h.as_str(&view).unwrap_or_default());
+    if after != units {
+        frozen_guard(recv, name, STRING_MUTATORS)?;
+        with_host(|h| h.set_utf8_bytes(recv, crate::host::units_to_bytes(&after)));
+    }
+    if out == view {
+        return Ok(recv.clone());
+    }
+    Ok(bytes_of_units(&out, 2))
+}
+
+/// A value computed over a broken String's character view, as the user sees
+/// it: each String in it (to `depth` Array levels) that holds a view character
+/// becomes a String of the bytes it stands for. Anything else is unchanged.
+pub(crate) fn bytes_of_units(v: &Value, depth: u8) -> Value {
+    if let Some(s) = with_host(|h| h.as_str(v).filter(|_| h.string_encoding(v).is_none())) {
+        if s.chars()
+            .any(|c| crate::host::broken_unit_byte(c).is_some())
+        {
+            return with_host(|h| h.new_utf8_from_bytes(crate::host::units_to_bytes(&s)));
+        }
+        return v.clone();
+    }
+    if depth > 0 {
+        if let Some(items) = with_host(|h| h.as_array(v)) {
+            return new_arr(items.iter().map(|x| bytes_of_units(x, depth - 1)).collect());
+        }
+        if let Some(buf) = with_host(|h| h.enum_buf(v)) {
+            let mapped = buf.iter().map(|x| bytes_of_units(x, depth - 1)).collect();
+            with_host(|h| h.set_enum_buf(v, mapped));
+        }
+    }
+    v.clone()
+}
+
+/// The inverse of [`bytes_of_units`]: a user value handed back to a method
+/// running over a broken String's character view, with each broken String in
+/// it as view text.
+pub(crate) fn units_of_bytes(v: &Value, depth: u8) -> Value {
+    if with_host(|h| h.is_broken_utf8(v)) {
+        return new_str(crate::host::broken_units(&with_host(|h| h.string_bytes(v))));
+    }
+    if depth > 0 {
+        if let Some(items) = with_host(|h| h.as_array(v)) {
+            return new_arr(items.iter().map(|x| units_of_bytes(x, depth - 1)).collect());
+        }
+    }
+    v.clone()
+}
+
+/// `String#scrub` over UTF-8 bytes: each maximal invalid subsequence becomes
+/// `repl` (U+FFFD by default), or what the block answers for it.
+fn scrub_utf8(bytes: &[u8], repl: Option<&Value>, block: Option<&Value>) -> Result<String, String> {
+    let mut out = String::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        out.push_str(chunk.valid());
+        if chunk.invalid().is_empty() {
+            continue;
+        }
+        match (block, repl) {
+            (Some(b), _) => {
+                let bad = with_host(|h| h.new_utf8_from_bytes(chunk.invalid().to_vec()));
+                out.push_str(&display(&call_proc(b, &[bad])?));
+            }
+            (None, Some(r)) if !matches!(r, Value::Undef) => out.push_str(&arg_str(r)),
+            _ => out.push('\u{FFFD}'),
+        }
+    }
+    Ok(out)
+}
+
+/// `encode` / `encode!` of a broken UTF-8 String. Re-encoding to UTF-8 is no
+/// conversion at all and keeps the bytes; any other target has to read the
+/// characters and fails at the first invalid byte — unless `invalid: :replace`
+/// asked for those bytes to be replaced (`replace:`, else U+FFFD into UTF-8
+/// and `?` otherwise).
+fn encode_broken_utf8(
+    recv: &Value,
+    name: &str,
+    bytes: &[u8],
+    args: &[Value],
+) -> Result<Value, String> {
+    // The NAME decides whether this is a conversion at all: every target but
+    // UTF-8 has to read the characters, modelled or not.
+    let utf8_target = match args
+        .first()
+        .filter(|a| with_host(|h| h.as_hash(a)).is_none())
+    {
+        None => true,
+        Some(a) => {
+            let raw = match with_host(|h| h.ivar_of(a, "name")) {
+                Value::Undef => arg_str(a),
+                nm => arg_str(&nm),
+            };
+            normalize_encoding_name(&raw).as_deref() == Some("UTF-8")
+        }
+    };
+    let replace = encode_replaces(args, "invalid");
+    let dest = |b: Vec<u8>| -> Value {
+        if name == "encode!" {
+            with_host(|h| h.set_utf8_bytes(recv, b));
+            recv.clone()
+        } else {
+            with_host(|h| h.new_utf8_from_bytes(b))
+        }
+    };
+    if utf8_target && !replace {
+        return Ok(dest(bytes.to_vec()));
+    }
+    if !replace {
+        let bad = bytes.utf8_chunks().find(|c| !c.invalid().is_empty());
+        let shown: String = bad
+            .map(|c| c.invalid().iter().map(|b| format!("\\x{b:02X}")).collect())
+            .unwrap_or_default();
+        return Err(raise_exc(
+            "Encoding::InvalidByteSequenceError",
+            &format!("\"{shown}\" on UTF-8"),
+        ));
+    }
+    let repl = args
+        .iter()
+        .find_map(|a| {
+            with_host(|h| h.as_hash(a))
+                .and_then(|hh| hh.get(&RKey::Sym("replace".to_string())).cloned())
+        })
+        .filter(|v| !matches!(v, Value::Undef));
+    let default = new_str(if utf8_target { "\u{FFFD}" } else { "?" }.to_string());
+    let text = scrub_utf8(bytes, Some(repl.as_ref().unwrap_or(&default)), None)?;
+    if utf8_target {
+        return Ok(dest(text.into_bytes()));
+    }
+    let clean = new_str(text);
+    let out = dispatch_string(&clean, "encode", &args[..1], None)?;
+    if name == "encode!" {
+        let (s, enc) = with_host(|h| (h.as_str(&out).unwrap_or_default(), h.string_encoding(&out)));
+        with_host(|h| {
+            h.set_str(recv, s);
+            match enc {
+                Some(e) => h.set_string_encoding(recv, e),
+                None => h.clear_string_encoding(recv),
+            }
+        });
+        return Ok(recv.clone());
+    }
     Ok(out)
 }
 
@@ -9864,6 +10344,10 @@ fn dispatch_string_borrowed(recv: &Value, name: &str, args: &[Value]) -> Option<
         // A non-String receiver reaches `dispatch_string_body` only through a
         // path that reads it as empty; matching that keeps this total for the
         // names above, which is what lets them leave the big match.
+        // A broken UTF-8 String counts characters over its character view.
+        if matches!(name, "length" | "size") && h.is_broken_utf8(recv) {
+            return None;
+        }
         let s = h.str_ref(recv).unwrap_or("");
         Some(match name {
             "length" | "size" => Value::Int(s.chars().count() as i64),
@@ -10180,23 +10664,22 @@ fn dispatch_string_body(
         "bytesplice" => {
             let off = as_i(&args[0]).max(0) as usize;
             let len = as_i(&args[1]).max(0) as usize;
-            let repl = arg_str(&args[2]);
-            let b = s.as_bytes();
+            let repl = with_host(|h| h.string_bytes(&args[2]));
+            let view = string_byte_view(recv, &s);
+            let b = view.as_slice();
             let off = off.min(b.len());
             let end = (off + len).min(b.len());
             let mut out = Vec::with_capacity(b.len() + repl.len());
             out.extend_from_slice(&b[..off]);
-            out.extend_from_slice(repl.as_bytes());
+            out.extend_from_slice(&repl);
             out.extend_from_slice(&b[end..]);
-            let new = String::from_utf8_lossy(&out).into_owned();
-            with_host(|h| h.set_str(recv, new));
+            store_bytes(recv, out);
             Ok(recv.clone())
         }
         // `setbyte(index, byte)` writes one byte in place and answers the BYTE
         // that was written, not the receiver.
         "setbyte" => {
             let raw = as_i(&args[0]);
-            let binary = with_host(|h| h.string_encoding(recv)).is_some();
             let mut b = string_byte_view(recv, &s);
             let idx = if raw < 0 { raw + b.len() as i64 } else { raw };
             if idx < 0 || idx >= b.len() as i64 {
@@ -10207,15 +10690,8 @@ fn dispatch_string_body(
             }
             let byte = as_i(&args[1]);
             b[idx as usize] = (byte & 0xff) as u8;
-            // A byte string's storage is the byte sequence itself, so the write
-            // lands exactly; only a UTF-8 receiver can be left invalid by it, and
-            // there the lossy read is the best a Rust `String` can hold.
-            let new = if binary {
-                bytes_to_binstr(&b)
-            } else {
-                String::from_utf8_lossy(&b).into_owned()
-            };
-            with_host(|h| h.set_str(recv, new));
+            // A UTF-8 receiver left invalid by the write becomes a broken one.
+            store_bytes(recv, b);
             Ok(Value::Int(byte))
         }
         // `dedup` (and its operator spelling `-@`) answers a FROZEN copy — the
@@ -10254,7 +10730,7 @@ fn dispatch_string_body(
                     with_host(|h| h.set_string_encoding(&v, enc));
                     v
                 }
-                None => new_str(String::from_utf8_lossy(&bytes).into_owned()),
+                None => with_host(|h| h.new_utf8_from_bytes(bytes)),
             })
         }
         // The scrubbing methods replace invalid byte sequences. Every String
@@ -10299,11 +10775,11 @@ fn dispatch_string_body(
                 (st as usize, ((st + len).min(blen)) as usize)
             };
             let slice = &bytes[start..end];
-            Ok(new_str(if binary {
-                bytes_to_binstr(slice)
+            Ok(if binary {
+                new_str(bytes_to_binstr(slice))
             } else {
-                String::from_utf8_lossy(slice).into_owned()
-            }))
+                with_host(|h| h.new_utf8_from_bytes(slice.to_vec()))
+            })
         }
         // `b` answers an ASCII-8BIT copy. Per the byte-string representation
         // invariant the copy stores one character per byte, so the receiver's
@@ -10355,6 +10831,7 @@ fn dispatch_string_body(
             let target = match normalize_encoding_name(&raw).as_deref() {
                 Some("ASCII-8BIT") => Some("ASCII-8BIT"),
                 Some("US-ASCII") => Some("US-ASCII"),
+                Some("ISO-8859-1") => Some("ISO-8859-1"),
                 _ => None,
             };
             retag_string(recv, &s, target);
@@ -10391,6 +10868,25 @@ fn dispatch_string_body(
             let from = with_host(|h| h.string_encoding(recv)).unwrap_or("UTF-8");
             let to = encode_target(args).unwrap_or(from);
             let target = (to != "UTF-8").then_some(to);
+            // ISO-8859-1's bytes ARE the codepoints U+0000..U+00FF, which is how
+            // its byte storage already holds them, so it converts to and from
+            // UTF-8 by relabelling — unless a UTF-8 character has no Latin-1 byte.
+            if matches!(
+                (from, to),
+                ("ISO-8859-1", "UTF-8") | ("UTF-8", "ISO-8859-1")
+            ) && s.chars().all(|c| u32::from(c) < 0x100)
+            {
+                let dest = if name == "encode!" {
+                    recv.clone()
+                } else {
+                    new_str(s.clone())
+                };
+                with_host(|h| match target {
+                    Some(e) => h.set_string_encoding(&dest, e),
+                    None => h.clear_string_encoding(&dest),
+                });
+                return Ok(dest);
+            }
             let mut replaced = None;
             if !s.is_ascii() && to != from {
                 let waiver = if from == "US-ASCII" {
@@ -10578,7 +11074,7 @@ fn dispatch_string_body(
         //   $ /opt/homebrew/opt/ruby/bin/ruby -e 'p ["abc".sum, "abc".sum(8), "abc".sum(1), "abc".sum(0)]'
         //   [294, 38, 0, 294]
         "sum" => {
-            let total: i64 = s.bytes().map(i64::from).sum();
+            let total: i64 = string_byte_view(recv, &s).into_iter().map(i64::from).sum();
             let bits = match args.first() {
                 Some(a) => to_int(a)?,
                 None => 16,
@@ -11394,12 +11890,19 @@ fn str_index_set(recv: &Value, s: &str, args: &[Value]) -> Result<Value, String>
 
 /// The body of `String#dump` (MRI `rb_str_dump`), given the receiver as code
 /// points (`utf8`) or as raw bytes (every other encoding).
+/// Marks a [`dump_string`] unit that is an invalid byte of a broken UTF-8 String
+/// rather than a codepoint: it dumps as `\xNN` where the codepoints around it
+/// dump as `\uNNNN` (`"a\xFFé".dump` is `"a\xFF\u00E9"`).
+const DUMP_INVALID_BYTE: u32 = 0x8000_0000;
+
 fn dump_string(units: impl Iterator<Item = u32>, utf8: bool) -> String {
     let units: Vec<u32> = units.collect();
     let mut out = String::with_capacity(units.len() + 2);
     out.push('"');
     for (i, &c) in units.iter().enumerate() {
         match c {
+            // An invalid byte of a broken UTF-8 String (see `DUMP_INVALID_BYTE`).
+            c if c & DUMP_INVALID_BYTE != 0 => out.push_str(&format!("\\x{:02X}", c & 0xff)),
             0x22 => out.push_str("\\\""),
             0x5c => out.push_str("\\\\"),
             0x0a => out.push_str("\\n"),
@@ -18559,22 +19062,22 @@ fn dispatch_io(
         "write" => {
             let mut total = 0usize;
             for a in args {
-                let s = display(a);
-                total += crate::host::io_write_str(recv, &s).map_err(|e| io_err(&e))?;
+                let s = out_bytes(a);
+                total += crate::host::io_write_bytes(recv, &s).map_err(|e| io_err(&e))?;
             }
             Ok(Value::Int(total as i64))
         }
         "<<" => {
-            let s = display(&args[0]);
-            crate::host::io_write_str(recv, &s).map_err(|e| io_err(&e))?;
+            let s = out_bytes(&args[0]);
+            crate::host::io_write_bytes(recv, &s).map_err(|e| io_err(&e))?;
             Ok(recv.clone())
         }
         "print" => {
-            let mut out = String::new();
+            let mut out = Vec::new();
             for a in args {
-                out.push_str(&display(a));
+                out.extend(out_bytes(a));
             }
-            crate::host::io_write_str(recv, &out).map_err(|e| io_err(&e))?;
+            crate::host::io_write_bytes(recv, &out).map_err(|e| io_err(&e))?;
             Ok(Value::Undef)
         }
         "puts" => {
@@ -19558,9 +20061,9 @@ fn dispatch_fiddle_pointer(recv: &Value, name: &str, args: &[Value]) -> Result<V
 /// scalars get a trailing `\n` only if their string form lacks one. An empty
 /// Array writes nothing: `puts []` is silent in MRI 4, where it was one newline.
 fn io_puts_arg(recv: &Value, v: &Value) -> Result<(), String> {
-    let mut s = String::new();
-    puts_text(v, &mut s, &mut Vec::new());
-    crate::host::io_write_str(recv, &s).map_err(|e| io_err(&e))?;
+    let mut s = Vec::new();
+    puts_bytes(v, &mut s, &mut Vec::new());
+    crate::host::io_write_bytes(recv, &s).map_err(|e| io_err(&e))?;
     Ok(())
 }
 
@@ -25480,7 +25983,7 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
                         crate::host::write_stdout(s);
                     }
                 }
-                crate::host::write_stdout(&display(a));
+                crate::host::write_stdout_bytes(&out_bytes(a));
             }
             if let Some(t) = &term {
                 crate::host::write_stdout(t);
@@ -26114,9 +26617,18 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
 }
 
 fn puts_one(v: &Value) {
-    let mut s = String::new();
-    puts_text(v, &mut s, &mut Vec::new());
-    crate::host::write_stdout(&s);
+    let mut out = Vec::new();
+    puts_bytes(v, &mut out, &mut Vec::new());
+    crate::host::write_stdout_bytes(&out);
+}
+
+/// The bytes a value writes to an output stream: a String's own bytes (a byte
+/// String's are not its storage's UTF-8), anything else its `to_s` text.
+fn out_bytes(v: &Value) -> Vec<u8> {
+    match with_host(|h| h.as_str(v).is_some().then(|| h.string_bytes(v))) {
+        Some(b) => b,
+        None => display(v).into_bytes(),
+    }
 }
 
 /// What `puts` writes for ONE argument — every `puts` (Kernel, IO, TCPSocket,
@@ -26125,26 +26637,33 @@ fn puts_one(v: &Value) {
 /// Array that holds itself renders the reentry as `[...]`. Anything else is its
 /// `to_s` plus a newline unless it already ends in one.
 fn puts_text(v: &Value, out: &mut String, seen: &mut Vec<u32>) {
+    let mut bytes = Vec::new();
+    puts_bytes(v, &mut bytes, seen);
+    out.push_str(&String::from_utf8_lossy(&bytes));
+}
+
+/// [`puts_text`] as the BYTES it writes, which a byte String needs.
+fn puts_bytes(v: &Value, out: &mut Vec<u8>, seen: &mut Vec<u32>) {
     if let Some(arr) = with_host(|h| h.as_array(v)) {
         if let Value::Obj(id) = v {
             if seen.contains(id) {
-                out.push_str("[...]\n");
+                out.extend_from_slice(b"[...]\n");
                 return;
             }
             seen.push(*id);
         }
         for e in &arr {
-            puts_text(e, out, seen);
+            puts_bytes(e, out, seen);
         }
         if matches!(v, Value::Obj(_)) {
             seen.pop();
         }
         return;
     }
-    let s = display(v);
-    out.push_str(&s);
-    if !s.ends_with('\n') {
-        out.push('\n');
+    let s = out_bytes(v);
+    out.extend_from_slice(&s);
+    if !s.ends_with(b"\n") {
+        out.push(b'\n');
     }
 }
 
@@ -27080,11 +27599,12 @@ fn zlib_adler32(data: &[u8], init: u32) -> u32 {
 }
 
 fn dispatch_stdlib_module(cls: &str, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    // A String argument is its BYTES: a byte String's are not its storage's UTF-8.
     let str_arg = |i: usize| -> Vec<u8> {
         args.get(i)
-            .and_then(|a| with_host(|h| h.as_str(a)))
+            .filter(|a| with_host(|h| h.as_str(a).is_some()))
+            .map(|a| with_host(|h| h.string_bytes(a)))
             .unwrap_or_default()
-            .into_bytes()
     };
     match cls {
         // `Digest` namespace: `Digest::MD5` etc. resolve to the sub-module ref.
@@ -29601,23 +30121,19 @@ fn do_require(args: &[Value], mode: ReqMode) -> Result<Value, String> {
 //              `#byteslice`, `#unpack` — all read [`string_byte_view`], never
 //              the storage bytes directly
 //   exit       `force_encoding`/`encode!` back to UTF-8 reverses it
-//              ([`byte_storage_to_text`])
+//              ([`crate::host::RubyHost::set_utf8_bytes`])
 //
-// Residual gap: a byte string whose bytes are not valid UTF-8 cannot survive
-// `force_encoding("UTF-8")`, because the result is not expressible as a Rust
-// `String`. MRI keeps the bytes and answers `valid_encoding? == false`; the
-// conversion here is lossy. See `tests/data/parity_fuzz_baseline.txt`.
+// Bytes MRI labels UTF-8 that are NOT valid UTF-8 (a `"\xff"` literal,
+// `force_encoding("UTF-8")` on arbitrary bytes, a `setbyte`) keep this byte
+// storage under the tag [`crate::host::BROKEN_UTF8`]; every untagged String is
+// valid text. Such a String answers its byte methods from the storage and its
+// character methods over [`crate::host::broken_units`] — see
+// `dispatch_broken_utf8`.
 
 /// The UTF-8 text `s` re-stored as a byte string (each UTF-8 byte becomes one
 /// character). The entry point to the byte-string representation invariant.
 fn text_to_byte_storage(s: &str) -> String {
     bytes_to_binstr(s.as_bytes())
-}
-
-/// A byte string's storage read back as UTF-8 text — the inverse of
-/// [`text_to_byte_storage`], lossy when the bytes are not valid UTF-8.
-fn byte_storage_to_text(s: &str) -> String {
-    String::from_utf8_lossy(&binstr_to_bytes(s)).into_owned()
 }
 
 /// The byte sequence the String `recv` denotes: its characters' low bytes when
@@ -29639,13 +30155,9 @@ fn retag_string(recv: &Value, s: &str, target: Option<&'static str>) {
                 h.set_string_encoding(recv, enc);
             });
         }
-        (true, None) => {
-            let storage = byte_storage_to_text(s);
-            with_host(|h| {
-                h.set_str(recv, storage);
-                h.clear_string_encoding(recv);
-            });
-        }
+        // Bytes that are not UTF-8 stay bytes, labelled UTF-8 (MRI keeps them
+        // and answers `valid_encoding? == false`).
+        (true, None) => with_host(|h| h.set_utf8_bytes(recv, binstr_to_bytes(s))),
         // Both sides byte-oriented (ASCII-8BIT <-> US-ASCII) or both UTF-8: the
         // storage already holds the right representation, only the name moves.
         (true, Some(enc)) => with_host(|h| h.set_string_encoding(recv, enc)),
@@ -29686,6 +30198,7 @@ fn encode_target(args: &[Value]) -> Option<&'static str> {
     match normalize_encoding_name(&raw).as_deref() {
         Some("ASCII-8BIT") => Some("ASCII-8BIT"),
         Some("US-ASCII") => Some("US-ASCII"),
+        Some("ISO-8859-1") => Some("ISO-8859-1"),
         _ => Some("UTF-8"),
     }
 }
@@ -29727,17 +30240,34 @@ fn encode_conversion_error(s: &str, from: &str, to: &str) -> String {
             "Encoding::InvalidByteSequenceError",
             &format!("\"\\x{b:02X}\" on US-ASCII"),
         ),
-        // ASCII-8BIT reaches US-ASCII only by way of UTF-8, and the message
-        // names the whole chain rather than the endpoints.
-        (_, "US-ASCII") => raise_exc(
+        // ISO-8859-1 reads every byte, as the character of that codepoint, and
+        // reaches anything but UTF-8 by way of UTF-8; the message names the
+        // whole chain and the character that has no place at its end.
+        ("ISO-8859-1", _) => raise_exc(
             "Encoding::UndefinedConversionError",
-            &format!("\"\\x{b:02X}\" to UTF-8 in conversion from ASCII-8BIT to UTF-8 to US-ASCII"),
+            &format!("U+{b:04X} to {to} in conversion from ISO-8859-1 to UTF-8 to {to}"),
+        ),
+        // ASCII-8BIT reaches anything but UTF-8 only by way of UTF-8, and the
+        // message names the whole chain rather than the endpoints.
+        (_, t) if t != "UTF-8" => raise_exc(
+            "Encoding::UndefinedConversionError",
+            &format!("\"\\x{b:02X}\" to UTF-8 in conversion from ASCII-8BIT to UTF-8 to {to}"),
         ),
         _ => raise_exc(
             "Encoding::UndefinedConversionError",
             &format!("\"\\x{b:02X}\" from ASCII-8BIT to {to}"),
         ),
     }
+}
+
+/// Write `bytes` into the String `recv` under its own label: a non-UTF-8
+/// byte String keeps one character per byte, a UTF-8 one becomes text or, when
+/// the bytes are not UTF-8, a broken UTF-8 String.
+fn store_bytes(recv: &Value, bytes: Vec<u8>) {
+    with_host(|h| match h.string_encoding(recv) {
+        Some(enc) if enc != crate::host::BROKEN_UTF8 => h.set_str(recv, bytes_to_binstr(&bytes)),
+        _ => h.set_utf8_bytes(recv, bytes),
+    })
 }
 
 fn string_byte_view(recv: &Value, s: &str) -> Vec<u8> {
@@ -29749,7 +30279,7 @@ fn string_byte_view(recv: &Value, s: &str) -> Vec<u8> {
 }
 
 /// Encode a byte slice as a Latin-1 binary string (`byte b` -> `char U+00xx`).
-fn bytes_to_binstr(bytes: &[u8]) -> String {
+pub(crate) fn bytes_to_binstr(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| b as char).collect()
 }
 
@@ -29763,7 +30293,7 @@ fn bigint_low_u64(b: &num_bigint::BigInt) -> u64 {
 }
 
 /// Decode a binary string to its byte sequence (each codepoint's low 8 bits).
-fn binstr_to_bytes(s: &str) -> Vec<u8> {
+pub(crate) fn binstr_to_bytes(s: &str) -> Vec<u8> {
     s.chars().map(|c| (c as u32 & 0xff) as u8).collect()
 }
 

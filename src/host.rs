@@ -181,7 +181,11 @@ pub mod ops {
     pub const BITNOT: u16 = 60; // [v] -> ~v (native Int, else the `~` method)
                                 // `method_added` / `singleton_method_added` for methods a class body
                                 // defines at compile time, fired at the definition's position.
-    pub const METHOD_HOOK: u16 = 61; // [hook, skip_own, *names] -> nil
+    pub const METHOD_HOOK: u16 = 61; // [hook, *names] -> nil
+                                     // A string literal holding bytes that are not UTF-8 (`"a\xff"`): the first
+                                     // operand spells each part's kind (`L` text, `B` bytes in one-char-per-
+                                     // byte storage, `I` an interpolated value), led by `F` when it is frozen.
+    pub const MKBSTR: u16 = 62; // [kinds, parts...] -> heap String
 }
 
 /// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried
@@ -745,6 +749,11 @@ pub enum ProcKind {
     /// un-advised. `usize` indexes the host's `around_stack`. Never escapes to
     /// user code as a normal proc.
     Around(usize),
+    /// The block a String method receives while it runs over a broken UTF-8
+    /// String's character view: it hands the user's block each String argument
+    /// as the bytes it stands for, and gives the method back the user's String
+    /// answer as character-view text (`crate::builtins::dispatch_broken_utf8`).
+    BrokenUnits(Box<Value>),
 }
 
 /// A user-defined class: its optional superclass, its instance methods, the
@@ -966,6 +975,8 @@ fn compiled_regex(
 /// `(?im:…)` and the `(?-mix:…)` that `Regexp#to_s` emits all keep their Ruby
 /// meaning.
 fn ruby_regex_to_fancy(source: &str, extended: bool) -> String {
+    let decoded = decode_regex_byte_escapes(source);
+    let source = decoded.as_ref();
     // The unnamed-group rule is keyed on the pattern containing a named group
     // ANYWHERE — the trigger in regcomp.c is `scan_env.num_named > 0` over the
     // whole regex, with no locality — so the first pass reports it for the
@@ -977,6 +988,78 @@ fn ruby_regex_to_fancy(source: &str, extended: bool) -> String {
     let mut out = String::with_capacity(source.len() + 16);
     scan_regex_groups(source, extended, Some(&mut out), scan.named);
     out
+}
+
+/// Onigmo reads `\xHH` in a pattern as a BYTE, so a run of them spelling UTF-8
+/// (`/\xC3\xA9/`) matches that character, and a quantifier after it repeats
+/// the whole character. fancy-regex reads `\xHH` as a codepoint, so each such
+/// run is rewritten to the character it spells. An ASCII byte, and a byte that
+/// does not complete a character, keep their escape. The pattern's `source`
+/// is untouched; only what is compiled changes.
+fn decode_regex_byte_escapes(source: &str) -> std::borrow::Cow<'_, str> {
+    if !source.contains("\\x") {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let b = source.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16);
+    // One `\xH` / `\xHH` escape at `i`: its byte and its length.
+    let escape_at = |i: usize| -> Option<(u8, usize)> {
+        if b.get(i) != Some(&b'\\') || b.get(i + 1) != Some(&b'x') {
+            return None;
+        }
+        let d1 = hex(*b.get(i + 2)?)?;
+        match b.get(i + 3).and_then(|&c| hex(c)) {
+            Some(d2) => Some(((d1 * 16 + d2) as u8, 4)),
+            None => Some((d1 as u8, 3)),
+        }
+    };
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            if escape_at(i).is_none() {
+                // Any other escape, `\\` included, passes through whole.
+                let len = 1 + source[i + 1..].chars().next().map_or(0, char::len_utf8);
+                out.push_str(&source[i..i + len]);
+                i += len;
+                continue;
+            }
+            let start = i;
+            let mut run = Vec::new();
+            let mut ends = Vec::new();
+            while let Some((byte, len)) = escape_at(i) {
+                run.push(byte);
+                i += len;
+                ends.push(i);
+            }
+            // Re-emit the run: valid multibyte characters as themselves, every
+            // other byte as the escape that spelled it.
+            let mut at = start;
+            let mut k = 0;
+            for chunk in run.utf8_chunks() {
+                for c in chunk.valid().chars() {
+                    let n = c.len_utf8();
+                    if c.is_ascii() {
+                        out.push_str(&source[at..ends[k]]);
+                    } else {
+                        out.push(c);
+                    }
+                    at = ends[k + n - 1];
+                    k += n;
+                }
+                for _ in chunk.invalid() {
+                    out.push_str(&source[at..ends[k]]);
+                    at = ends[k];
+                    k += 1;
+                }
+            }
+            continue;
+        }
+        let len = source[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&source[i..i + len]);
+        i += len;
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// What the detection pass of [`scan_regex_groups`] found.
@@ -1188,6 +1271,12 @@ thread_local! {
 pub enum RKey {
     Int(i64),
     Str(String),
+    /// A byte String (tagged, so one character per byte) holding non-ASCII:
+    /// its storage with its label, since the same storage under another label
+    /// — or as text — denotes different bytes (`255.chr` vs `"ÿ"`) or bytes MRI
+    /// does not compare (`"\xff"` vs `"\xff".b`). ASCII content keys as `Str`,
+    /// where every label agrees.
+    ByteStr(String, &'static str),
     Sym(String),
     Bool(bool),
     Nil,
@@ -3186,6 +3275,12 @@ impl RubyHost {
             *source = Some(src);
         }
     }
+    /// Replace a buffered Enumerator's elements.
+    pub fn set_enum_buf(&mut self, v: &Value, elems: Vec<Value>) {
+        if let Some(RObj::Enumerator { buf, .. }) = self.obj_mut(v) {
+            *buf = elems;
+        }
+    }
     /// The object an Enumerator iterates, when it recorded one.
     pub fn enum_source(&self, v: &Value) -> Option<Value> {
         match self.obj(v) {
@@ -3806,6 +3901,7 @@ impl RubyHost {
                 | ProcKind::MethodCurried { .. }
                 | ProcKind::Composed { .. } => Some(-1),
                 ProcKind::Collect(_) | ProcKind::Around(_) => Some(1),
+                ProcKind::BrokenUnits(inner) => self.proc_arity(inner),
                 ProcKind::Normal => Some(
                     ArityFacts::of_block(
                         &self.procs[*template].arity,
@@ -3860,7 +3956,8 @@ impl RubyHost {
                     ProcKind::MethodCurried { .. }
                     | ProcKind::Composed { .. }
                     | ProcKind::Collect(_)
-                    | ProcKind::Around(_) => return Some(v.clone()),
+                    | ProcKind::Around(_)
+                    | ProcKind::BrokenUnits(_) => return Some(v.clone()),
                     ProcKind::Normal => match requested {
                         Some(n) => n,
                         None => self.proc_min_max(v).map_or(0, |(min, _)| min as usize),
@@ -3976,6 +4073,25 @@ impl RubyHost {
             scope,
             is_lambda: false,
             kind: ProcKind::Collect(idx),
+            home: None,
+        })
+    }
+    /// Wrap `block` for a method running over a broken UTF-8 String's character
+    /// view (see [`ProcKind::BrokenUnits`]).
+    pub fn new_broken_units_block(&mut self, block: Value) -> Value {
+        let is_lambda = matches!(
+            self.obj(&block),
+            Some(RObj::Proc {
+                is_lambda: true,
+                ..
+            })
+        );
+        let scope = self.cur_scope().clone();
+        self.alloc(RObj::Proc {
+            template: 0,
+            scope,
+            is_lambda,
+            kind: ProcKind::BrokenUnits(Box::new(block)),
             home: None,
         })
     }
@@ -5322,19 +5438,21 @@ impl RubyHost {
     /// Write program output: into the capture buffer when capturing, else to the
     /// native stream `stderr` selects. `s` is written verbatim — `puts` has
     /// already decided about the trailing newline.
-    pub fn write_out(&mut self, s: &str, stderr: bool) {
+    pub fn write_out(&mut self, s: &[u8], stderr: bool) {
+        // The capture buffer is text; bytes that are not UTF-8 read into it
+        // lossily, while the native streams get them as they are.
         if let Some(buf) = &mut self.capture {
-            buf.push_str(s);
+            buf.push_str(&String::from_utf8_lossy(s));
             return;
         }
         use std::io::Write;
         if stderr {
             let mut o = std::io::stderr();
-            let _ = o.write_all(s.as_bytes());
+            let _ = o.write_all(s);
             let _ = o.flush();
         } else {
             let mut o = std::io::stdout();
-            let _ = o.write_all(s.as_bytes());
+            let _ = o.write_all(s);
             let _ = o.flush();
         }
     }
@@ -8507,6 +8625,54 @@ impl RubyHost {
     pub fn unmark_binary_string(&mut self, v: &Value) {
         self.clear_string_encoding(v);
     }
+    /// The bytes a String denotes: a tagged String's storage is one character
+    /// per byte, an untagged one is its own UTF-8 text.
+    pub fn string_bytes(&self, v: &Value) -> Vec<u8> {
+        let s = self.str_ref(v).unwrap_or("");
+        if self.string_encoding(v).is_some() {
+            crate::builtins::binstr_to_bytes(s)
+        } else {
+            s.as_bytes().to_vec()
+        }
+    }
+    /// A UTF-8 String holding `bytes`: plain text when they are valid UTF-8,
+    /// else a [`BROKEN_UTF8`] byte String.
+    pub fn new_utf8_from_bytes(&mut self, bytes: Vec<u8>) -> Value {
+        match String::from_utf8(bytes) {
+            Ok(text) => self.new_string(text),
+            Err(e) => {
+                let v = self.new_string(crate::builtins::bytes_to_binstr(e.as_bytes()));
+                self.set_string_encoding(&v, BROKEN_UTF8);
+                v
+            }
+        }
+    }
+    /// Re-store the UTF-8 String `v` as `bytes` (text when valid, else broken).
+    pub fn set_utf8_bytes(&mut self, v: &Value, bytes: Vec<u8>) {
+        match String::from_utf8(bytes) {
+            Ok(text) => {
+                self.set_str(v, text);
+                self.clear_string_encoding(v);
+            }
+            Err(e) => {
+                self.set_str(v, crate::builtins::bytes_to_binstr(e.as_bytes()));
+                self.set_string_encoding(v, BROKEN_UTF8);
+            }
+        }
+    }
+    /// Whether any String carries an encoding tag at all — the cheap test that
+    /// lets the common all-text program skip asking about each argument.
+    pub fn any_tagged_strings(&self) -> bool {
+        !self.string_encodings.is_empty()
+    }
+    /// Whether `v` is a [`BROKEN_UTF8`] String.
+    pub fn is_broken_utf8(&self, v: &Value) -> bool {
+        self.string_encoding(v) == Some(BROKEN_UTF8)
+    }
+    /// Whether the String `v` is UTF-8 by label: text, or a broken byte String.
+    fn utf8_labelled(&self, v: &Value) -> bool {
+        matches!(self.string_encoding(v), None | Some(BROKEN_UTF8))
+    }
     /// Whether a String heap object is tagged ASCII-8BIT/BINARY.
     pub fn is_binary_string(&self, v: &Value) -> bool {
         self.string_encoding(v) == Some("ASCII-8BIT")
@@ -9030,6 +9196,9 @@ impl RubyHost {
                 // A string tagged with a non-UTF-8 encoding escapes by byte
                 // (`"\xFF"`), not by codepoint (`"ÿ"`) — MRI picks the
                 // form from the encoding, so `#inspect` has to consult the tag.
+                Some(RObj::Str(s)) if self.string_encoding(v) == Some(BROKEN_UTF8) => {
+                    inspect_broken_utf8(&broken_units(&crate::builtins::binstr_to_bytes(&s)))
+                }
                 Some(RObj::Str(s)) if self.string_encoding(v).is_some() => inspect_string_bytes(&s),
                 Some(RObj::Str(s)) => inspect_string(&s),
                 Some(RObj::Symbol(s)) => {
@@ -9257,6 +9426,10 @@ impl RubyHost {
         match k {
             RKey::Int(n) => n.to_string(),
             RKey::Str(s) => inspect_string(s),
+            RKey::ByteStr(s, enc) => {
+                let v = self.key_to_value(&RKey::ByteStr(s.clone(), enc));
+                self.inspect(&v)
+            }
             RKey::Sym(s) if plain_symbol_name(s) => format!(":{s}"),
             RKey::Sym(s) => format!(":{}", inspect_string(s)),
             RKey::Bool(b) => b.to_string(),
@@ -9471,7 +9644,10 @@ impl RubyHost {
             Value::Undef => RKey::Nil,
             Value::Str(s) => RKey::Str(s.to_string()),
             Value::Obj(_) => match self.obj(v) {
-                Some(RObj::Str(s)) => RKey::Str(s.clone()),
+                Some(RObj::Str(s)) => match self.string_encoding(v) {
+                    Some(enc) if !s.is_ascii() => RKey::ByteStr(s.clone(), enc),
+                    _ => RKey::Str(s.clone()),
+                },
                 Some(RObj::Symbol(s)) => RKey::Sym(s.clone()),
                 Some(RObj::ClassRef(n)) => RKey::Class(n.clone()),
                 Some(RObj::Array(items)) => {
@@ -9567,6 +9743,11 @@ impl RubyHost {
         match k {
             RKey::Int(n) => Value::Int(*n),
             RKey::Str(s) => self.new_string(s.clone()),
+            RKey::ByteStr(s, enc) => {
+                let v = self.new_string(s.clone());
+                self.set_string_encoding(&v, enc);
+                v
+            }
             RKey::Sym(s) => self.intern(s),
             RKey::Bool(b) => Value::Bool(*b),
             RKey::Nil => Value::Undef,
@@ -9913,6 +10094,17 @@ impl RubyHost {
             // `"a" + 1` answer `"a1"` where Ruby raises a TypeError.
             (Some(RObj::Str(s)), Add) => {
                 let s = s.clone();
+                // A broken UTF-8 operand joins another UTF-8 one by BYTES; the
+                // result is text again when the two halves complete each other.
+                if (self.is_broken_utf8(a) || self.is_broken_utf8(b))
+                    && self.as_str(b).is_some()
+                    && self.utf8_labelled(a)
+                    && self.utf8_labelled(b)
+                {
+                    let mut bytes = self.string_bytes(a);
+                    bytes.extend(self.string_bytes(b));
+                    return Ok(self.new_utf8_from_bytes(bytes));
+                }
                 return match self.as_str(b) {
                     Some(bs) => {
                         self.check_encoding_compatible(a, b)?;
@@ -10554,7 +10746,16 @@ impl RubyHost {
             _ => {
                 let (oa, ob) = (self.obj(a), self.obj(b));
                 match (oa, ob) {
-                    (Some(RObj::Str(x)), Some(RObj::Str(y))) => x == y,
+                    // The same storage is the same bytes only under the same
+                    // representation: a tagged (byte) String and a UTF-8 one
+                    // holding non-ASCII never denote the same bytes, and two
+                    // byte Strings under different labels are not comparable
+                    // (`rb_str_comparable`), so `255.chr == "ÿ"` and
+                    // `"\xff" == "\xff".b` are both false.
+                    (Some(RObj::Str(x)), Some(RObj::Str(y))) => {
+                        x == y
+                            && (x.is_ascii() || self.string_encoding(a) == self.string_encoding(b))
+                    }
                     (Some(RObj::Symbol(x)), Some(RObj::Symbol(y))) => x == y,
                     (Some(RObj::Array(x)), Some(RObj::Array(y))) => {
                         // Element-wise through `rb_equal`, not `==`: MRI compares
@@ -10801,6 +11002,66 @@ pub fn encoding_info(name: &str) -> Option<&'static crate::encoding_table::Encod
 }
 
 pub fn inspect_string(s: &str) -> String {
+    inspect_string_with(s, false)
+}
+
+/// `String#inspect` of a UTF-8 String whose bytes are not all UTF-8, given as
+/// its [`broken_units`]: the characters as `inspect_string` renders them, each
+/// invalid byte as `\xNN` (`"a\xFFé"`).
+pub fn inspect_broken_utf8(units: &str) -> String {
+    inspect_string_with(units, true)
+}
+
+/// The tag of a String MRI labels UTF-8 whose bytes are NOT valid UTF-8
+/// (`"\xff"`, `"\xff".b.force_encoding("UTF-8")`). Such a String keeps the
+/// byte storage every tagged String has (one character per byte); an untagged
+/// String is always valid UTF-8 text. Byte-oriented methods read the storage
+/// as any tagged String's; character methods see [`broken_units`].
+pub const BROKEN_UTF8: &str = "UTF-8";
+
+/// Where an invalid byte sits while character methods run over a broken UTF-8
+/// String: byte `NN` (always 0x80..=0xFF — ASCII is never invalid) is the
+/// character `U+10FFNN`, so MRI's character view, in which every invalid byte
+/// is one character and every valid sequence is its character, is plain text.
+/// A genuine `U+10FF80..=U+10FFFF` inside such a string reads back as a byte.
+const BROKEN_UNIT_BASE: u32 = 0x10_FF00;
+
+/// The character view of the bytes of a broken UTF-8 String.
+pub fn broken_units(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        out.push_str(chunk.valid());
+        out.extend(
+            chunk
+                .invalid()
+                .iter()
+                .filter_map(|&b| char::from_u32(BROKEN_UNIT_BASE + u32::from(b))),
+        );
+    }
+    out
+}
+
+/// The invalid byte a [`broken_units`] character stands for.
+pub fn broken_unit_byte(c: char) -> Option<u8> {
+    let v = u32::from(c);
+    (BROKEN_UNIT_BASE + 0x80..=BROKEN_UNIT_BASE + 0xFF)
+        .contains(&v)
+        .then(|| (v - BROKEN_UNIT_BASE) as u8)
+}
+
+/// The bytes a [`broken_units`] text denotes.
+pub fn units_to_bytes(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    for c in text.chars() {
+        match broken_unit_byte(c) {
+            Some(b) => out.push(b),
+            None => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+        }
+    }
+    out
+}
+
+fn inspect_string_with(s: &str, broken_units: bool) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     let mut chars = s.chars().peekable();
@@ -10829,6 +11090,9 @@ pub fn inspect_string(s: &str) -> String {
             // otherwise break the line it is printed on.
             c if (c as u32) < 0x20 || matches!(c as u32, 0x7f..=0x9f | 0x2028 | 0x2029) => {
                 out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c if broken_units && broken_unit_byte(c).is_some() => {
+                out.push_str(&format!("\\x{:02X}", broken_unit_byte(c).unwrap_or(0)));
             }
             c => out.push(c),
         }
@@ -13510,6 +13774,11 @@ pub fn io_closed(v: &Value) -> bool {
 /// Write `s` as program output on stdout — the funnel `puts`/`print`/`p` and
 /// the other Kernel writers use, so an embedder's capture catches them all.
 pub fn write_stdout(s: &str) {
+    write_stdout_bytes(s.as_bytes());
+}
+
+/// [`write_stdout`] for output that is bytes rather than text (a byte String).
+pub fn write_stdout_bytes(s: &[u8]) {
     if !redirected_write("stdout", s) {
         with_host(|h| h.write_out(s, false));
     }
@@ -13517,8 +13786,8 @@ pub fn write_stdout(s: &str) {
 
 /// Write `s` as program output on stderr (`warn`, `$stderr.write`).
 pub fn write_stderr(s: &str) {
-    if !redirected_write("stderr", s) {
-        with_host(|h| h.write_out(s, true));
+    if !redirected_write("stderr", s.as_bytes()) {
+        with_host(|h| h.write_out(s.as_bytes(), true));
     }
 }
 
@@ -13542,37 +13811,43 @@ pub fn is_standard_stream(global: &str) -> bool {
 /// usual output-capture idiom) or any object with `write`, the text is sent
 /// there. Answers false when the global still holds a standard stream, which
 /// the caller then writes itself.
-fn redirected_write(global: &str, s: &str) -> bool {
+fn redirected_write(global: &str, s: &[u8]) -> bool {
     if is_standard_stream(global) {
         return false;
     }
     let target = with_host(|h| h.get_global(global));
-    let text = with_host(|h| h.new_string(s.to_string()));
+    let text = with_host(|h| h.new_utf8_from_bytes(s.to_vec()));
     let _ = crate::builtins::dispatch(&target, "write", &[text], None);
     true
 }
 
 /// `IO#write` for one already-stringified chunk; returns the byte count written.
 pub fn io_write_str(v: &Value, s: &str) -> Result<usize, String> {
+    io_write_bytes(v, s.as_bytes())
+}
+
+/// [`io_write_str`] for bytes; answers the byte count written.
+pub fn io_write_bytes(v: &Value, s: &[u8]) -> Result<usize, String> {
     use std::io::Write;
     let id = io_id(v).ok_or("not an IO")?;
     // The standard streams route through the host's output funnel rather than
     // the process fds, so a capturing embedder sees them.
     if with_host(|h| matches!(h.io_handles.get(id as usize), Some(IoCell::Stdout))) {
-        write_stdout(s);
+        write_stdout_bytes(s);
         return Ok(s.len());
     }
     if with_host(|h| matches!(h.io_handles.get(id as usize), Some(IoCell::Stderr))) {
-        write_stderr(s);
+        if !redirected_write("stderr", s) {
+            with_host(|h| h.write_out(s, true));
+        }
         return Ok(s.len());
     }
     with_host(|h| match h.io_handles.get_mut(id as usize) {
         Some(IoCell::Stdout) | Some(IoCell::Stderr) => unreachable!("handled above"),
         Some(IoCell::Stdin) => Err("not opened for writing".to_string()),
-        Some(IoCell::File { file: Some(f), .. }) => f
-            .write_all(s.as_bytes())
-            .map(|_| s.len())
-            .map_err(|e| e.to_string()),
+        Some(IoCell::File { file: Some(f), .. }) => {
+            f.write_all(s).map(|_| s.len()).map_err(|e| e.to_string())
+        }
         Some(IoCell::File { file: None, .. }) => Err("closed stream".to_string()),
         Some(IoCell::TcpListener { .. }) | Some(IoCell::TcpStream { .. }) => {
             Err("not an IO".to_string())
@@ -14318,6 +14593,14 @@ pub fn call_proc_self_ctx(
             };
             with_host(|h| h.enum_sinks[idx].push(elem));
             return Ok(Value::Undef);
+        }
+        ProcKind::BrokenUnits(inner) => {
+            let mapped: Vec<Value> = args
+                .iter()
+                .map(|a| crate::builtins::bytes_of_units(a, 2))
+                .collect();
+            let r = call_proc(&inner, &mapped)?;
+            return Ok(crate::builtins::units_of_bytes(&r, 2));
         }
         ProcKind::Around(idx) => {
             // A native around block: `yield` in an around handler re-runs the

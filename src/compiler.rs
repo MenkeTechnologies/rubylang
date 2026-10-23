@@ -1262,11 +1262,38 @@ impl Compiler {
             Expr::Float(f) => {
                 b.emit(Op::LoadFloat(*f), 0);
             }
+            Expr::Str(parts) if parts.iter().any(|p| matches!(p, StrPart::Bytes(_))) => {
+                let all_literal = parts.iter().all(|p| !matches!(p, StrPart::Interp(_)));
+                let mut kinds = String::from(if frozen_string_literals() && all_literal {
+                    "F"
+                } else {
+                    "-"
+                });
+                for p in parts {
+                    kinds.push(match p {
+                        StrPart::Lit(_) => 'L',
+                        StrPart::Bytes(_) => 'B',
+                        StrPart::Interp(_) => 'I',
+                    });
+                }
+                self.kstr(b, &kinds);
+                for p in parts {
+                    match p {
+                        StrPart::Lit(s) => self.kstr(b, s),
+                        StrPart::Bytes(bytes) => {
+                            self.kstr(b, &bytes.iter().map(|&x| char::from(x)).collect::<String>())
+                        }
+                        StrPart::Interp(e) => self.compile_expr(b, e)?,
+                    }
+                }
+                b.emit(Op::CallBuiltin(ops::MKBSTR, argc(parts.len() + 1)?), 0);
+            }
             Expr::Str(parts) => {
                 for p in parts {
                     match p {
                         StrPart::Lit(s) => self.kstr(b, s),
                         StrPart::Interp(e) => self.compile_expr(b, e)?,
+                        StrPart::Bytes(_) => unreachable!("lowered by the arm above"),
                     }
                 }
                 // Under `# frozen_string_literal: true`, a *non-interpolated*

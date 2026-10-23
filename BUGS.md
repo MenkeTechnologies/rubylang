@@ -1100,18 +1100,32 @@ Honest limitations of this surface:
   value that follows is a keyword or constant (`x:true`, `k:String`,
   `keyword_init:true`) is a label colon, not a symbol start. Expression-start and
   spaced-command-arg symbols (`:foo`, `p :bar`, `[:a, :b]`) are unaffected.
-- **Open: a run of byte escapes is one character per byte.** MRI builds a
-  string literal from bytes, so `"\xE3\x81\x82"` is `"あ"` (one character) and
-  `"\xC3\xA9"` is `"é"`; rubylang stores each `\xNN`/`\NNN` as U+00NN, giving
-  three and two characters. Decoding the valid runs in the lexer is easy, but
-  not on its own: a run that is NOT valid UTF-8 (`"\xE9"`) still has to be
-  stored somehow, and the only spelling available is U+00E9 — identical to a
-  decoded `"\xC3\xA9"`. `force_encoding("ISO-8859-1")` then has two strings
-  with the same storage and different MRI answers (`"é"` vs `"Ã©"`), and the
-  parity corpus pins both. The fix needs a representation for an invalid
-  UTF-8 string (bytes, not codepoints), with `ISO-8859-1` as a byte-storage
-  encoding beside `ASCII-8BIT`. The same holds for `\xHH` runs in a Regexp
-  literal (`/\xC3\xA9/ =~ "é"` is nil; MRI 0).
+- **Byte escapes are bytes — fixed.** A run of `\xNN`/`\NNN` escapes in a
+  string literal is built from bytes: a run spelling UTF-8 is its character
+  (`"\xE3\x81\x82"` is `"あ"`), and bytes that are not UTF-8 make a UTF-8
+  String holding invalid bytes, as MRI keeps them (`"\xff".valid_encoding?` is
+  false, `.bytes` is `[255]`). Such a String keeps one-character-per-byte
+  storage under a `UTF-8` label: its byte methods (`bytes`, `bytesize`,
+  `byteslice`, `getbyte`/`setbyte`, `b`, `force_encoding`, `unpack`, `hash`,
+  `==`) read bytes; its character methods see each invalid byte as one
+  character and each valid sequence as its character (`"a\xffé".length` is 3,
+  `chars`, `reverse`, `[]`, `index`, `center`, `each_char` with a block, …);
+  `inspect`/`dump` show invalid bytes as `\xNN`; `scrub` replaces them; and the
+  methods MRI refuses on such a String raise as MRI does (`upcase` "input
+  string invalid", `split`/`tr`/`count`/a Regexp match "invalid byte sequence in
+  UTF-8", `strip` CompatibilityError, `to_sym` EncodingError). A broken String
+  joins text by bytes (`+`, `<<`, interpolation), and a broken needle is never
+  found (`include?` false, `index` nil). `force_encoding("UTF-8")` on bytes,
+  `setbyte`, `bytesplice` and `undump` produce one rather than replacing bytes
+  with U+FFFD. ISO-8859-1 is a byte encoding beside ASCII-8BIT, so
+  `"\xC3\xA9".force_encoding("ISO-8859-1").encode("UTF-8")` is `"Ã©"`. A Regexp's
+  `\xHH` runs are bytes too: `/\xC3\xA9/ =~ "é"` is 0. Output writes a
+  String's bytes (`puts "\xff"` writes 0xFF; `IO#write` counts bytes).
+  Residue: a genuine `U+10FF80..U+10FFFF` character inside a String that also
+  holds invalid bytes reads back as a byte (the character view parks invalid
+  bytes there); matching a fixed-encoding UTF-8 Regexp against a non-ASCII
+  ASCII-8BIT String does not raise `Encoding::CompatibilityError`;
+  `Regexp::FIXEDENCODING` is undefined.
 
 ## Runtime / methods
 
@@ -1164,10 +1178,8 @@ Honest limitations of this surface:
     `\u{X}` for UTF-8, `\xNN` per byte otherwise), and `undump` reads the
     result back byte by byte with MRI's exact RuntimeError messages, the
     `.force_encoding("…")` epilogue, and the receiver's encoding carried to
-    the result. Still open: an undumped byte run that is not valid UTF-8 reads
-    back lossily in a UTF-8 result, and a `"\xff"` LITERAL is stored as
-    U+00FF, so `"\xff".b.dump` answers `"\xC3\xBF"` (the lexer's non-UTF-8
-    byte-literal gap, not `dump`'s).
+    the result. An undumped byte run that is not UTF-8 is kept as bytes, and
+    `"\xff".b.dump` is `"\xFF"`.
   - `Kernel#system`, backticks and `%x` do not exist, so a `<<~`CMD`` heredoc
     cannot run.
   - Methods redefined under the same name later in a file, and classes reopened
@@ -1934,10 +1946,8 @@ Honest limitations of this surface:
    it already has, and anything else raises
    `Encoding::UndefinedConversionError` (or `Encoding::InvalidByteSequenceError`
    for a byte the SOURCE cannot read) unless `undef:`/`invalid:` asks for the
-   unit to be replaced instead. The one divergence left is a string MRI labels UTF-8 while
-   holding bytes that are not UTF-8 — a `"\xff"` literal, or
-   `force_encoding("UTF-8")` on arbitrary bytes — which a Rust `String` cannot
-   represent at all; see `tests/data/parity_fuzz_baseline.txt`.
+   unit to be replaced instead. A string MRI labels UTF-8 while holding bytes that are not
+   UTF-8 is modelled too (see "Byte escapes are bytes" under Lexer).
 - **`defined?`.** The `defined?(expr)` / `defined? expr` operator returns the
   Ruby description string (`"local-variable"`, `"instance-variable"`,
   `"global-variable"`, `"constant"`, `"method"`, `"assignment"`, `"expression"`,
@@ -2172,11 +2182,8 @@ Dependency-free, verified against the reference `ruby`.
   MRI), `inspect`/`to_s` (`#<OpenStruct a=1, b=2>`), and
   attribute-wise `==` (order-independent, also inside Arrays/Hashes).
 
-**Limitations.** (1) `Digest`/`Base64`/`SecureRandom` operate on a String's UTF-8
-bytes. rubylang stores a `"\xNN"` source escape as the Unicode code point U+00NN
-(UTF-8-encoded), not a single raw byte like MRI's ASCII-8BIT, so hashing/encoding
-a string built from non-ASCII byte escapes differs from MRI. Pure ASCII/UTF-8
-text is byte-exact. (2) The streaming `Digest` instance API
+**Limitations.** (1) `Digest`/`Base64` read a String's bytes, so a byte String
+(`255.chr`, `"é".b`, `"\xff"`) hashes and encodes as in MRI. (2) The streaming `Digest` instance API
 (`Digest::MD5.new.update(...).hexdigest`) is implemented alongside the
 class-level one-shot `hexdigest`/`digest`/`base64digest`.
 

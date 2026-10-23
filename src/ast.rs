@@ -316,6 +316,10 @@ pub enum HashRest {
 pub enum StrPart {
     Lit(String),
     Interp(Box<Expr>),
+    /// A run of `\xHH` / `\NNN` escapes whose bytes are not valid UTF-8. MRI
+    /// keeps such bytes in a UTF-8 String (`"\xff".valid_encoding?` is false),
+    /// so the literal is built from bytes rather than text.
+    Bytes(Vec<u8>),
 }
 
 /// A method parameter: name, an optional default expression, whether it is a

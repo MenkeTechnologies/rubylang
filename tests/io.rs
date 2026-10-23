@@ -341,3 +341,24 @@ fn file_and_dir_class_surface() {
         r#"["file", "directory", "x.txt", [".", "a"], "a/b/c", Time, true, false, true, false, true, 0, false, ["sub", "y.txt"], ["sub", "y.txt"], true, "1", Errno::ENOENT, Errno::ENOENT]"#,
     );
 }
+
+/// A String whose bytes are not its storage's UTF-8 — a byte String, or a
+/// UTF-8 one holding invalid bytes — writes its own bytes: `IO#write`,
+/// `print`, `<<` and `puts` all emit `0xFF` for `"\xff"` and `255.chr`, not
+/// the UTF-8 of U+00FF, and `write` counts bytes. Expected bytes from ruby 4.0.7.
+#[test]
+fn byte_strings_write_their_own_bytes() {
+    let d = tmp();
+    let p = d.path().join("bytes.bin");
+    let p = p.to_str().unwrap();
+    eq(
+        &format!(
+            r#"File.open({p:?}, "w") {{ |f| [f.write("\xff\xC3\xA9", 255.chr), f.print("é".b), (f << "\xfe").class, f.puts("\xfd")] }}"#
+        ),
+        "[4, nil, File, nil]",
+    );
+    assert_eq!(
+        std::fs::read(p).unwrap(),
+        [255, 195, 169, 255, 195, 169, 254, 253, 10]
+    );
+}
