@@ -1950,6 +1950,9 @@ struct FiberContext {
     frames: Vec<Frame>,
     enum_sinks: Vec<Vec<Value>>,
     around_stack: Vec<AroundCall>,
+    /// The live call sites (`CALL_SITES`): a fiber's backtrace begins at its own
+    /// block, as in MRI, and never sees the resumer's calls.
+    call_sites: Vec<CallSite>,
 }
 
 /// One object heap per running program, protected by that program's GVL mutex.
@@ -2096,6 +2099,7 @@ pub fn reset_host() {
     VM_POOL.with(|p| p.borrow_mut().clear());
     BLOCK_HOMES.with(|s| s.borrow_mut().clear());
     BLOCK_CTX.with(|s| s.borrow_mut().clear());
+    CALL_SITES.with(|s| s.borrow_mut().clear());
     LEXICAL_BREAK.with(|c| c.set(false));
     // Fibers moved off the host into a thread-local, so clear them explicitly.
     FIBERS.with(|f| f.borrow_mut().clear());
@@ -7792,6 +7796,9 @@ impl RubyHost {
                 // no-op here; ObjectSpace's heap enumeration is limited).
                 | "GC"
                 | "ObjectSpace"
+                // `Warning` — the category switches and the hook `Kernel#warn`
+                // writes through (`dispatch_warning`).
+                | "Warning"
                 // `Zlib` and its stream classes — DEFLATE/zlib/gzip via `flate2`,
                 // dispatched through `dispatch_classref`.
                 | "Zlib"
@@ -8704,12 +8711,38 @@ impl RubyHost {
         // entered (see `enter_block_ctx`) together with the frame depth at that
         // moment, so a method CALLED from inside the block, which does push a
         // frame, is correctly the innermost one instead.
-        if let Some((depth, label)) = BLOCK_CTX.with(|s| s.borrow().last().cloned()) {
-            if depth >= self.frames.len() {
+        let blocks = BLOCK_CTX.with(|s| s.borrow().len());
+        self.context_at(self.frames.len(), blocks)
+    }
+
+    /// The label of the frame that was innermost when `frames` method frames
+    /// and `blocks` block bodies were live — `innermost_context` as of an
+    /// earlier moment, which is how each frame of `caller` is named.
+    pub fn context_at(&self, frames: usize, blocks: usize) -> String {
+        let block = BLOCK_CTX.with(|s| {
+            let s = s.borrow();
+            blocks.checked_sub(1).and_then(|i| s.get(i).cloned())
+        });
+        if let Some((depth, label)) = block {
+            if depth >= frames {
                 return label;
             }
         }
-        self.scope_context(self.frames.last().map(|f| &f.scope))
+        let frame = frames.checked_sub(1).and_then(|i| self.frames.get(i));
+        self.scope_context(frame.map(|f| &f.scope))
+    }
+
+    /// MRI's label for a built-in method's own frame: `Array#each`, named for
+    /// the module that defines it, or `Integer.sqrt` for a class method.
+    pub fn builtin_frame_label(&self, recv: &Value, name: &str) -> String {
+        if let Some(RObj::ClassRef(cls)) = self.obj(recv) {
+            return format!("{cls}.{name}");
+        }
+        let owner = self
+            .builtin_owner(recv, name)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.class_of(recv));
+        format!("{owner}#{name}")
     }
 
     /// MRI's context label for one scope: `<main>` at the top level, `C#m` in an
@@ -13320,6 +13353,7 @@ impl RubyHost {
         std::mem::swap(&mut self.frames, &mut c.frames);
         std::mem::swap(&mut self.enum_sinks, &mut c.enum_sinks);
         std::mem::swap(&mut self.around_stack, &mut c.around_stack);
+        CALL_SITES.with(|s| std::mem::swap(&mut *s.borrow_mut(), &mut c.call_sites));
         c
     }
 }
@@ -15330,6 +15364,113 @@ thread_local! {
     static LEXICAL_BREAK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+// ---- the live call stack (`caller`, `caller_locations`, `warn uplevel:`) ----
+
+/// One call op that is still running: where it is in the source and what was
+/// live when it started. Every Ruby frame that is waiting on a call has
+/// exactly one of these on top of it, so the stack of them, read innermost
+/// first, is the program's backtrace at this instant — the same list MRI
+/// walks for `caller`.
+struct CallSite {
+    /// Depth of `FILE_PATH_STACK` at the call — the file is read back only if
+    /// a backtrace is asked for, so the hot path never copies a path.
+    file_depth: usize,
+    line: u32,
+    /// `frames.len()` and `BLOCK_CTX` depth at the call; together they name
+    /// the frame the call was made FROM (see `RubyHost::context_at`).
+    frames: usize,
+    blocks: usize,
+    /// For a call that passes a block: the receiver and method name. When the
+    /// callee turns out to be a built-in that yields, MRI shows the built-in
+    /// as a frame of its own (`-e:1:in 'Array#each'`), labelled from these.
+    yielder: Option<(Value, String)>,
+}
+
+thread_local! {
+    /// The live call sites, outermost first. Thread-local, which also makes
+    /// it per-Fiber: a Fiber runs on its own thread with its own stack.
+    static CALL_SITES: RefCell<Vec<CallSite>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Record a call op at `line` that is about to dispatch. Returns the depth to
+/// hand back to [`leave_call_site`] once the call is done. `yielder` is the
+/// receiver and method name of a call that carries a block.
+pub fn enter_call_site(line: u32, yielder: Option<(Value, String)>) -> usize {
+    let file_depth = FILE_PATH_STACK.with(|s| s.borrow().len());
+    let blocks = BLOCK_CTX.with(|s| s.borrow().len());
+    let frames = with_host(|h| h.frames.len());
+    CALL_SITES.with(|s| {
+        let mut s = s.borrow_mut();
+        let depth = s.len();
+        s.push(CallSite {
+            file_depth,
+            line,
+            frames,
+            blocks,
+            yielder,
+        });
+        depth
+    })
+}
+
+/// Drop the call site [`enter_call_site`] recorded at `depth` — and any a
+/// `throw`/`break` unwound past without leaving — once its call returns.
+pub fn leave_call_site(depth: usize) {
+    CALL_SITES.with(|s| s.borrow_mut().truncate(depth));
+}
+
+/// One frame of the live backtrace: path, line, MRI label.
+pub struct LiveFrame {
+    pub path: String,
+    pub line: u32,
+    pub label: String,
+}
+
+/// The backtrace at this instant, innermost first, as MRI's `caller(0)`
+/// reports it: frame 0 is the call op that asked for it (the line of the
+/// `caller` / `warn` call itself, labelled with the frame it was made in).
+///
+/// A built-in called with a block that is running that block right now gets a
+/// frame of its own, at the line of the call that invoked it, as in MRI. A
+/// built-in that reaches Ruby code some other way (`sort` calling a user
+/// `<=>`, `send`) has no call site of its own and is not listed.
+pub fn live_backtrace() -> Vec<LiveFrame> {
+    let paths = FILE_PATH_STACK.with(|s| s.borrow().clone());
+    let path_at = |depth: usize| {
+        depth
+            .checked_sub(1)
+            .and_then(|i| paths.get(i).cloned())
+            .unwrap_or_else(|| "-e".into())
+    };
+    CALL_SITES.with(|sites| {
+        let sites = sites.borrow();
+        let mut out = Vec::with_capacity(sites.len());
+        for (i, site) in sites.iter().enumerate().rev() {
+            let path = path_at(site.file_depth);
+            // The call above this one ran inside a block, without a method frame
+            // in between: the callee here is a built-in yielding to that block.
+            let yielding = sites
+                .get(i + 1)
+                .is_some_and(|inner| inner.frames == site.frames && inner.blocks > site.blocks);
+            if let (true, Some((recv, name))) = (yielding, &site.yielder) {
+                let label = with_host(|h| h.builtin_frame_label(recv, name));
+                out.push(LiveFrame {
+                    path: path.clone(),
+                    line: site.line,
+                    label,
+                });
+            }
+            let label = with_host(|h| h.context_at(site.frames, site.blocks));
+            out.push(LiveFrame {
+                path,
+                line: site.line,
+                label,
+            });
+        }
+        out
+    })
+}
+
 /// Record that the break now being raised is the `break` keyword's.
 pub fn mark_lexical_break() {
     LEXICAL_BREAK.with(|c| c.set(true));
@@ -15411,3 +15552,49 @@ const _: fn() = || {
 
 /// A Range's begin, end and exclude-end flag.
 type RangeEnds = (Value, Value, bool);
+
+// ---- `Warning` categories ----------------------------------------------------
+
+/// The warning categories MRI defines, in `Warning.categories` order.
+pub const WARNING_CATEGORIES: &[&str] = &[
+    "deprecated",
+    "experimental",
+    "performance",
+    "strict_unused_block",
+];
+
+/// Which `WARNING_CATEGORIES` are enabled, one bit each. Process-wide, as in
+/// MRI, so every Thread and Fiber sees one `Warning[:deprecated]`.
+static WARNING_ENABLED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// MRI's start-up switches for warning level `level` (`-W0`..`-W2`): `-W0`
+/// turns every category off, the default level leaves only `experimental`
+/// on, and `-w`/`-W2` turns `deprecated` on as well.
+pub fn reset_warning_categories(level: u8) {
+    let bits = match level {
+        0 => 0,
+        1 => 0b10,
+        _ => 0b11,
+    };
+    WARNING_ENABLED.store(bits, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `Warning[category]` for a known category name.
+pub fn warning_enabled(category: &str) -> bool {
+    WARNING_CATEGORIES
+        .iter()
+        .position(|c| *c == category)
+        .is_some_and(|i| WARNING_ENABLED.load(std::sync::atomic::Ordering::Relaxed) & (1 << i) != 0)
+}
+
+/// `Warning[category] = on` for a known category name.
+pub fn set_warning_enabled(category: &str, on: bool) {
+    if let Some(i) = WARNING_CATEGORIES.iter().position(|c| *c == category) {
+        let bit = 1 << i;
+        if on {
+            WARNING_ENABLED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            WARNING_ENABLED.fetch_and(!bit, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}

@@ -125,6 +125,8 @@ pub(crate) fn is_kernel_function(name: &str) -> bool {
             | "throw"
             | "eval"
             | "block_given?"
+            | "caller"
+            | "caller_locations"
             | "Integer"
             | "Float"
             | "String"
@@ -268,7 +270,7 @@ fn b_call_arr(vm: &mut VM, _: u8) -> Value {
     let arr = vm.pop();
     let name = name_of(&vm.pop());
     let args = with_host(|h| h.as_array(&arr).unwrap_or_default());
-    match dispatch_call(&name, &args, None) {
+    match at_call_site(vm, None, || dispatch_call(&name, &args, None)) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
@@ -296,7 +298,10 @@ fn b_call_arr_blk(vm: &mut VM, _: u8) -> Value {
     let home = owns
         .then(|| crate::host::enter_block_home(block.as_ref()))
         .flatten();
-    let out = dispatch_call(&name, &args, block);
+    let site = block
+        .as_ref()
+        .map(|_| (with_host(|h| h.current_self()), name.as_str()));
+    let out = at_call_site(vm, site, || dispatch_call(&name, &args, block));
     crate::host::leave_block_home(home);
     match out {
         Ok(v) => finish_block_call(vm, owns, v),
@@ -319,7 +324,8 @@ fn b_call_method_arr_blk(vm: &mut VM, _: u8) -> Value {
     let home = owns
         .then(|| crate::host::enter_block_home(block.as_ref()))
         .flatten();
-    let out = dispatch(&recv, &name, &args, block);
+    let site = block.as_ref().map(|_| (recv.clone(), name.as_str()));
+    let out = at_call_site(vm, site, || dispatch(&recv, &name, &args, block));
     crate::host::leave_block_home(home);
     match out {
         Ok(v) => finish_block_call(vm, owns, v),
@@ -336,7 +342,7 @@ fn b_call_method_arr(vm: &mut VM, _: u8) -> Value {
     if let Err(e) = check_visibility(&recv, &name) {
         return abort(vm, e);
     }
-    match dispatch(&recv, &name, &args, None) {
+    match at_call_site(vm, None, || dispatch(&recv, &name, &args, None)) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
@@ -348,14 +354,14 @@ fn b_getself(_vm: &mut VM, _: u8) -> Value {
 
 fn b_super(vm: &mut VM, argc: u8) -> Value {
     let args = pop_n(vm, argc as usize);
-    match crate::host::call_super(Some(args)) {
+    match at_call_site(vm, None, || crate::host::call_super(Some(args))) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
 }
 
 fn b_super_fwd(vm: &mut VM, _: u8) -> Value {
-    match crate::host::call_super(None) {
+    match at_call_site(vm, None, || crate::host::call_super(None)) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
@@ -366,7 +372,7 @@ fn b_super_blk(vm: &mut VM, argc: u8) -> Value {
     let block = block_operand(vm.pop());
     let owns = crate::host::take_block_literal();
     let args = pop_n(vm, argc.saturating_sub(1) as usize);
-    match crate::host::call_super_blk(Some(args), block) {
+    match at_call_site(vm, None, || crate::host::call_super_blk(Some(args), block)) {
         Ok(v) => finish_block_call(vm, owns, v),
         Err(e) => abort(vm, e),
     }
@@ -376,7 +382,7 @@ fn b_super_blk(vm: &mut VM, argc: u8) -> Value {
 fn b_super_fwd_blk(vm: &mut VM, _: u8) -> Value {
     let block = block_operand(vm.pop());
     let owns = crate::host::take_block_literal();
-    match crate::host::call_super_blk(None, block) {
+    match at_call_site(vm, None, || crate::host::call_super_blk(None, block)) {
         Ok(v) => finish_block_call(vm, owns, v),
         Err(e) => abort(vm, e),
     }
@@ -509,19 +515,33 @@ fn abort(vm: &mut VM, e: String) -> Value {
     // Record this frame on the in-flight exception (if any) for the MRI-format
     // uncaught printer: the source line of the raising op plus the file. Frames
     // arrive innermost-first as the error unwinds through each chunk's `abort`.
-    // The VM pre-increments `ip` before dispatching an op, so the raising op is
-    // at `ip - 1`.
-    let line = vm
-        .chunk
-        .lines
-        .get(vm.ip.wrapping_sub(1))
-        .copied()
-        .unwrap_or(0);
+    let line = op_line(vm);
     let src = crate::host::current_file_path().unwrap_or_else(|| "-e".into());
     with_host(|h| h.record_backtrace_frame(&src, line));
     with_host(|h| h.error = Some(e));
     vm.ip = vm.chunk.ops.len();
     Value::Undef
+}
+
+/// The source line of the op now running. The VM pre-increments `ip` before
+/// dispatching an op, so that op is at `ip - 1`.
+fn op_line(vm: &VM) -> u32 {
+    vm.chunk
+        .lines
+        .get(vm.ip.wrapping_sub(1))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Run a call op's dispatch with the op recorded as a live call site, so
+/// `caller` and `warn(uplevel:)` can see every frame waiting on a call.
+/// `yielder` is the receiver and name of a call that carries a block.
+fn at_call_site<T>(vm: &VM, yielder: Option<(Value, &str)>, call: impl FnOnce() -> T) -> T {
+    let yielder = yielder.map(|(recv, name)| (recv, name.to_string()));
+    let depth = crate::host::enter_call_site(op_line(vm), yielder);
+    let out = call();
+    crate::host::leave_call_site(depth);
+    out
 }
 
 fn name_of(v: &Value) -> String {
@@ -626,6 +646,16 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
         }
         _ => {}
     }
+    // The call is a call site like any other (see `at_call_site`); `vm` is
+    // needed inside for `abort`, so the site is entered and left by hand.
+    let depth = crate::host::enter_call_site(op_line(vm), None);
+    let out = bareword_call(vm, name);
+    crate::host::leave_call_site(depth);
+    out
+}
+
+/// A bare name that is not a local, called as a method (`b_getlocal`).
+fn bareword_call(vm: &mut VM, name: String) -> Value {
     // A bare name that is not a local is a zero-arg call: a method on `self` /
     // top-level method (errors propagate), else a Kernel function (`puts`, …).
     // An unknown bare name reads as nil, matching rubylang's lenient behaviour.
@@ -1319,7 +1349,7 @@ fn b_fire_hook(vm: &mut VM, _: u8) -> Value {
 fn b_call(vm: &mut VM, argc: u8) -> Value {
     let mut vals = pop_n(vm, argc as usize);
     let name = name_of(&vals.remove(0));
-    match dispatch_call(&name, &vals, None) {
+    match at_call_site(vm, None, || dispatch_call(&name, &vals, None)) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
@@ -1332,7 +1362,10 @@ fn b_call_blk(vm: &mut VM, argc: u8) -> Value {
     let home = owns
         .then(|| crate::host::enter_block_home(block.as_ref()))
         .flatten();
-    let out = dispatch_call(&name, &vals, block);
+    let site = block
+        .as_ref()
+        .map(|_| (with_host(|h| h.current_self()), name.as_str()));
+    let out = at_call_site(vm, site, || dispatch_call(&name, &vals, block));
     crate::host::leave_block_home(home);
     match out {
         Ok(v) => finish_block_call(vm, owns, v),
@@ -1346,7 +1379,7 @@ fn b_call_method(vm: &mut VM, argc: u8) -> Value {
     if let Err(e) = check_visibility(&recv, &name) {
         return abort(vm, e);
     }
-    match dispatch(&recv, &name, &vals, None) {
+    match at_call_site(vm, None, || dispatch(&recv, &name, &vals, None)) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
@@ -1363,7 +1396,8 @@ fn b_call_method_blk(vm: &mut VM, argc: u8) -> Value {
     let home = owns
         .then(|| crate::host::enter_block_home(block.as_ref()))
         .flatten();
-    let out = dispatch(&recv, &name, &vals, block);
+    let site = block.as_ref().map(|_| (recv.clone(), name.as_str()));
+    let out = at_call_site(vm, site, || dispatch(&recv, &name, &vals, block));
     crate::host::leave_block_home(home);
     match out {
         Ok(v) => finish_block_call(vm, owns, v),
@@ -1551,7 +1585,7 @@ fn b_yield(vm: &mut VM, argc: u8) -> Value {
         );
         return abort(vm, e);
     };
-    match call_proc(&block, &args) {
+    match at_call_site(vm, None, || call_proc(&block, &args)) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
@@ -1573,7 +1607,7 @@ fn b_tostr(vm: &mut VM, _: u8) -> Value {
 fn b_index_get(vm: &mut VM, argc: u8) -> Value {
     let mut vals = pop_n(vm, argc as usize);
     let recv = vals.remove(0);
-    match dispatch(&recv, "[]", &vals, None) {
+    match at_call_site(vm, None, || dispatch(&recv, "[]", &vals, None)) {
         Ok(v) => v,
         Err(e) => abort(vm, e),
     }
@@ -1581,7 +1615,7 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
 fn b_index_set(vm: &mut VM, argc: u8) -> Value {
     let mut vals = pop_n(vm, argc as usize);
     let recv = vals.remove(0);
-    match dispatch(&recv, "[]=", &vals, None) {
+    match at_call_site(vm, None, || dispatch(&recv, "[]=", &vals, None)) {
         Ok(v) => v,
         Err(e) => abort(vm, e),
     }
@@ -4205,6 +4239,9 @@ fn dispatch_classref(
     if cls == "ENV" {
         return dispatch_env(name, args, block);
     }
+    if cls == "Warning" {
+        return dispatch_warning(name, args);
+    }
     // `GC` — rubylang has no user-visible GC to drive, so the control surface is
     // accepted as no-ops returning MRI-shaped values.
     if cls == "GC" {
@@ -4917,18 +4954,28 @@ fn dispatch_classref(
     // building Ruby program (stored in the `@src` ivar) and return an ERB
     // instance. `#result`/`#result_with_hash` later evaluate that program.
     if cls == "ERB" && name == "new" {
-        let template = arg_str(&args[0]);
-        // The trim mode may arrive as a `trim_mode:` keyword (the modern form) or
-        // as the deprecated 3rd positional argument: nil, 0, 1, 2 or a String of
-        // `%`, `-`, `>`, `<>`. Anything else compiles plainly after MRI's warning.
-        let mode = args
-            .iter()
-            .skip(1)
-            .find_map(|a| {
-                with_host(|h| h.as_hash(a))
-                    .and_then(|m| m.get(&RKey::Sym("trim_mode".into())).cloned())
-            })
-            .or_else(|| args.get(2).cloned())
+        // erb 6 is `initialize(str, trim_mode: nil, eoutvar: "_erbout")`: the
+        // positional `safe_level, trim_mode, eoutvar` of older erb are gone, so
+        // a second positional argument is an arity error.
+        let (positional, kw) = match args.split_last() {
+            Some((last, rest)) if with_host(|h| h.is_kwargs(last)) => (rest, Some(last)),
+            _ => (args, None),
+        };
+        if positional.len() != 1 {
+            return Err(raise_exc(
+                "ArgumentError",
+                &format!(
+                    "wrong number of arguments (given {}, expected 1)",
+                    positional.len()
+                ),
+            ));
+        }
+        let template = arg_str(&positional[0]);
+        // The trim mode: nil, 0, 1, 2 or a String of `%`, `-`, `>`, `<>`.
+        // Anything else compiles plainly after MRI's warning.
+        let mode = kw
+            .and_then(|k| with_host(|h| h.as_hash(k)))
+            .and_then(|m| m.get(&RKey::Sym("trim_mode".into())).cloned())
             .unwrap_or(Value::Undef);
         let mode = match &mode {
             Value::Undef => crate::erb::TrimArg::Nil,
@@ -4939,8 +4986,17 @@ fn dispatch_classref(
             },
         };
         let (spec, warning) = crate::erb::prepare_trim_mode(&mode);
+        // erb warns with `uplevel:` aimed at the line that called `ERB.new`,
+        // which is frame 0 of the live backtrace here.
         if let Some(warning) = warning {
-            crate::host::write_stderr(&format!("warning: {warning}\n"));
+            let mut kw = IndexMap::new();
+            kw.insert(RKey::Sym("uplevel".into()), Value::Int(0));
+            let kw = with_host(|h| {
+                let hash = h.new_hash(kw);
+                h.mark_kwargs(&hash);
+                hash
+            });
+            kernel_warn(&[new_str(warning), kw])?;
         }
         // A `coding:` magic comment goes through `Encoding.find`.
         let find_encoding = |name: &str| {
@@ -25348,11 +25404,9 @@ fn normalize_encoding_name(raw: &str) -> Option<String> {
     })
 }
 
-/// A best-effort `Thread::Backtrace::Location` for `caller_locations`. Carries
-/// path/lineno/label as ivars with attr-readers registered once, so
-/// `.path`/`.lineno`/`.label`/`.absolute_path`/`.base_label` resolve. Precise
-/// live stack frames aren't tracked outside `--dap`; callers use it for
-/// `module_eval` backtrace attribution only.
+/// A `Thread::Backtrace::Location` (`caller_locations`, `backtrace_locations`).
+/// Carries path/lineno/label as ivars with attr-readers registered once, so
+/// `.path`/`.lineno`/`.label`/`.absolute_path`/`.base_label` resolve.
 fn backtrace_location(path: &str, lineno: i64, label: &str) -> Value {
     let absolute = location_absolute_path(path);
     let base = location_base_label(label);
@@ -25378,6 +25432,223 @@ fn backtrace_location(path: &str, lineno: i64, label: &str) -> Value {
         h.set_ivar_of(&obj, "base_label", b);
         obj
     })
+}
+
+/// The frames `caller(start = 1, length = nil)` / `caller(range)` select from
+/// the live backtrace, or `None` (MRI's nil) when `start` is past its end.
+/// Ported from vm_backtrace.c `ec_backtrace_to_ary`: frame 0 is the line of
+/// the `caller` call itself, a Range is read by `rb_range_beg_len` with no
+/// error for an out-of-range start, and a zero length answers `[]` even when
+/// the start is out of range.
+fn caller_frames(args: &[Value]) -> Result<Option<Vec<crate::host::LiveFrame>>, String> {
+    let mut frames = crate::host::live_backtrace();
+    let size = frames.len() as i64;
+    let negative_level = |lev: i64| raise_exc("ArgumentError", &format!("negative level ({lev})"));
+    let (start, length) = match args {
+        [] => (1, None),
+        [level] | [level, Value::Undef] => match with_host(|h| h.as_range(level)) {
+            Some((lo, hi, excl)) => {
+                let mut beg = if lo == crate::host::RANGE_BEGINLESS {
+                    0
+                } else {
+                    lo
+                };
+                let (mut end, excl) = if hi == crate::host::RANGE_ENDLESS {
+                    (-1, false)
+                } else {
+                    (hi, excl)
+                };
+                if beg < 0 {
+                    beg += size;
+                    if beg < 0 {
+                        return Ok(None);
+                    }
+                }
+                if end < 0 {
+                    end += size;
+                }
+                if !excl {
+                    end += 1;
+                }
+                if beg > size {
+                    return Ok(None);
+                }
+                (beg, Some((end.min(size) - beg).max(0)))
+            }
+            None => {
+                let lev = as_i(level);
+                if lev < 0 {
+                    return Err(negative_level(lev));
+                }
+                (lev, None)
+            }
+        },
+        [level, n, ..] => {
+            let (lev, n) = (as_i(level), as_i(n));
+            if lev < 0 {
+                return Err(negative_level(lev));
+            }
+            if n < 0 {
+                return Err(raise_exc("ArgumentError", &format!("negative size ({n})")));
+            }
+            (lev, Some(n))
+        }
+    };
+    if length == Some(0) {
+        return Ok(Some(Vec::new()));
+    }
+    if start > size {
+        return Ok(None);
+    }
+    frames.drain(..start as usize);
+    if let Some(n) = length {
+        frames.truncate(n as usize);
+    }
+    Ok(Some(frames))
+}
+
+/// A category argument as `Warning[]` reads it: a known category's name.
+/// MRI's `rb_warning_category_from_name` — a Symbol is required, and one that
+/// names no category is an ArgumentError.
+fn warning_category(v: &Value) -> Result<String, String> {
+    let Some(name) = with_host(|h| h.as_symbol(v)) else {
+        let cls = with_host(|h| h.class_of(v));
+        return Err(raise_exc(
+            "TypeError",
+            &format!("wrong argument type {cls} (expected Symbol)"),
+        ));
+    };
+    if !crate::host::WARNING_CATEGORIES.contains(&name.as_str()) {
+        return Err(raise_exc(
+            "ArgumentError",
+            &format!("unknown category: {name}"),
+        ));
+    }
+    Ok(name)
+}
+
+/// `Kernel#warn(*msgs, uplevel: nil, category: nil)`, ported from MRI's
+/// warning.rb `Kernel#warn` and error.c `rb_warn_m`.
+///
+/// A category that is switched off (`Warning[:deprecated]` is false by
+/// default) prints nothing; so does a nil `$VERBOSE` (`-W0`) or no message.
+/// `uplevel: n` prefixes `path:line: warning: ` for the frame `n` levels above
+/// the `warn` call (0 is the `warn` line itself), or bare `warning: ` past the
+/// top of the stack. The text is assembled with `puts` rules and handed to
+/// `Warning.warn`, so a program that redefines that hook receives it.
+fn kernel_warn(args: &[Value]) -> Result<Value, String> {
+    let (msgs, kw) = match args.split_last() {
+        Some((last, rest)) if with_host(|h| h.is_kwargs(last)) => (rest, Some(last)),
+        _ => (args, None),
+    };
+    let opts = optional_kwargs(kw, &["uplevel", "category"])?;
+    let uplevel = opts[0].clone().filter(|v| !matches!(v, Value::Undef));
+    let category = match opts[1].clone().filter(|v| !matches!(v, Value::Undef)) {
+        None => None,
+        Some(v) => {
+            let sym = match with_host(|h| h.as_str(&v)) {
+                Some(s) => with_host(|h| h.new_symbol(&s)),
+                None if with_host(|h| h.as_symbol(&v)).is_some() => v,
+                None => {
+                    let cls = with_host(|h| h.class_of(&v));
+                    return Err(raise_exc(
+                        "TypeError",
+                        &format!("no implicit conversion of {cls} into Symbol"),
+                    ));
+                }
+            };
+            let name = warning_category(&sym)?;
+            if !crate::host::warning_enabled(&name) {
+                return Ok(Value::Undef);
+            }
+            Some(sym)
+        }
+    };
+    let verbose_nil = matches!(with_host(|h| h.get_global("VERBOSE")), Value::Undef);
+    if verbose_nil || msgs.is_empty() {
+        return Ok(Value::Undef);
+    }
+    let mut text = match &uplevel {
+        None => String::new(),
+        Some(level) => {
+            let lev = as_i(level);
+            if lev < 0 {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!("negative level ({lev})"),
+                ));
+            }
+            match crate::host::live_backtrace().get(lev as usize) {
+                Some(f) => format!("{}:{}: warning: ", f.path, f.line),
+                None => "warning: ".to_string(),
+            }
+        }
+    };
+    for v in msgs {
+        let items = with_host(|h| h.as_array(v)).unwrap_or_else(|| vec![v.clone()]);
+        for e in &items {
+            let s = with_host(|h| h.to_s(e));
+            text.push_str(&s);
+            if !s.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+    }
+    let mut hook_args = vec![new_str(text)];
+    if let Some(sym) = category {
+        let mut kw = IndexMap::new();
+        kw.insert(RKey::Sym("category".into()), sym);
+        hook_args.push(with_host(|h| {
+            let hash = h.new_hash(kw);
+            h.mark_kwargs(&hash);
+            hash
+        }));
+    }
+    dispatch_classref("Warning", "warn", &hook_args, None)?;
+    Ok(Value::Undef)
+}
+
+/// The `Warning` module's own methods (error.c): `[]`/`[]=` read and switch a
+/// category, `categories` lists them, and `warn(msg, category: nil)` — the
+/// hook `Kernel#warn` calls — writes `msg` to `$stderr`.
+fn dispatch_warning(name: &str, args: &[Value]) -> Result<Value, String> {
+    match (name, args) {
+        ("[]", [cat]) => Ok(Value::Bool(crate::host::warning_enabled(
+            &warning_category(cat)?,
+        ))),
+        ("[]=", [cat, on]) => {
+            let on = with_host(|h| h.truthy(on));
+            crate::host::set_warning_enabled(&warning_category(cat)?, on);
+            Ok(Value::Bool(on))
+        }
+        ("categories", []) => Ok(new_arr(
+            crate::host::WARNING_CATEGORIES
+                .iter()
+                .map(|c| with_host(|h| h.new_symbol(c)))
+                .collect(),
+        )),
+        ("warn", [msg, rest @ ..]) => {
+            let Some(text) = with_host(|h| h.as_str(msg)) else {
+                let cls = with_host(|h| h.class_of(msg));
+                return Err(raise_exc(
+                    "TypeError",
+                    &format!("wrong argument type {cls} (expected String)"),
+                ));
+            };
+            let kw = rest.first().filter(|v| with_host(|h| h.is_kwargs(v)));
+            if let Some(cat) = optional_kwargs(kw, &["category"])?.remove(0) {
+                if !matches!(cat, Value::Undef) {
+                    warning_category(&cat)?;
+                }
+            }
+            crate::host::write_stderr(&text);
+            Ok(Value::Undef)
+        }
+        _ => Err(raise_exc(
+            "NoMethodError",
+            &format!("undefined method '{name}' for module Warning"),
+        )),
+    }
 }
 
 /// A Location's `absolute_path`: the real path of its file, or nil for a
@@ -26372,15 +26643,26 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             let syms: Vec<Value> = names.iter().map(|n| h.new_symbol(n)).collect();
             h.new_array(syms)
         })),
-        // `caller` / `caller_locations` — the call stack. A precise live
-        // backtrace isn't tracked outside `--dap`, so return a best-effort single
-        // frame from the current file. activesupport uses this only for
-        // `module_eval` backtrace attribution (reads `.path`/`.lineno`).
-        "caller" => Ok(new_arr(vec![])),
-        "caller_locations" => {
-            let path = crate::host::current_file_path().unwrap_or_else(|| "(eval)".to_string());
-            Ok(new_arr(vec![backtrace_location(&path, 0, "<main>")]))
-        }
+        // `caller` / `caller_locations` — the live call stack (see
+        // `host::live_backtrace`), as frame Strings or Location objects.
+        "caller" => Ok(match caller_frames(args)? {
+            Some(frames) => new_arr(
+                frames
+                    .iter()
+                    .map(|f| new_str(format!("{}:{}:in '{}'", f.path, f.line, f.label)))
+                    .collect(),
+            ),
+            None => Value::Undef,
+        }),
+        "caller_locations" => Ok(match caller_frames(args)? {
+            Some(frames) => new_arr(
+                frames
+                    .iter()
+                    .map(|f| backtrace_location(&f.path, i64::from(f.line), &f.label))
+                    .collect(),
+            ),
+            None => Value::Undef,
+        }),
         "puts" => {
             if args.is_empty() {
                 crate::host::write_stdout("\n");
@@ -26968,26 +27250,7 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
                 &[("status", Value::Int(i64::from(code)))],
             ))
         }
-        "warn" => {
-            // `warn(*msgs)` writes each message (with a trailing newline) to
-            // $stderr and returns nil. A message that already ends in a newline
-            // is not doubled. Array args are flattened like `puts`.
-            // It goes through `$stderr`, so a reassigned one captures it, and
-            // the `uplevel:`/`category:` keyword hash is not a message.
-            let mut text = String::new();
-            for v in args.iter().filter(|v| !with_host(|h| h.is_kwargs(v))) {
-                let items = with_host(|h| h.as_array(v)).unwrap_or_else(|| vec![v.clone()]);
-                for e in &items {
-                    let s = with_host(|h| h.to_s(e));
-                    text.push_str(&s);
-                    if !s.ends_with('\n') {
-                        text.push('\n');
-                    }
-                }
-            }
-            crate::host::write_stderr(&text);
-            Ok(Value::Undef)
-        }
+        "warn" => kernel_warn(args),
         "abort" => {
             // `abort(msg)` writes `msg` to stderr, then raises `SystemExit` with
             // status 1 (its message `msg`, or "exit"), exactly as `exit(1)` would:

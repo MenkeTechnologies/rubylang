@@ -243,8 +243,8 @@ to `ruby` work unchanged.
 | `-I DIR` | Prepend `DIR` to `$LOAD_PATH` (repeatable; glued `-Idir` or detached). |
 | `-r LIB` | `require LIB` before the program runs (repeatable). |
 | `-c` | Check syntax only — print `Syntax OK`, do not run. |
-| `-w` / `-W[level]` | Warning level → `$VERBOSE`. No switch → `false`; `-W0` → `nil`; `-W1` → `false`; `-w`, `-W`, `-W2`…`-W7` → `true`. The level is scanned as octal, so `-W8`/`-W9` are not levels — the digit is re-read as its own (invalid) switch. Last switch wins, so `-w -W0` ends at `nil`. |
-| `-W:CATEGORY` | Select a warning category (`deprecated`, `experimental`, `performance`, `strict_unused_block`, each also with a `no-` prefix) instead of a level; `$VERBOSE` is untouched. An unknown category warns and runs. |
+| `-w` / `-W[level]` | Warning level → `$VERBOSE`. No switch → `false`; `-W0` → `nil`; `-W1` → `false`; `-w`, `-W`, `-W2`…`-W7` → `true`. The level is scanned as octal, so `-W8`/`-W9` are not levels — the digit is re-read as its own (invalid) switch. Last switch wins, so `-w -W0` ends at `nil`. The level also seeds `Warning[]`: `-W0` turns every category off, the default leaves only `experimental` on, and `-w` adds `deprecated`. |
+| `-W:CATEGORY` | Select a warning category (`deprecated`, `experimental`, `performance`, `strict_unused_block`, each also with a `no-` prefix) instead of a level; `$VERBOSE` is untouched. An unknown category warns and runs. Accepted but not yet applied: `Warning[]` keeps the level's defaults. |
 | `-d` / `--debug` | Set `$DEBUG`. |
 | `-S` | Search `$PATH` for the program file. |
 | `-v` | Print the version banner, then run any program — and run it verbosely (`$VERBOSE = true`), as `--verbose` does. |

@@ -166,9 +166,23 @@ fn an_unknown_trim_mode_warns_and_compiles_plainly() {
         .expect("spawn ruby");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "a1\n");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("warning: Invalid ERB trim mode: \"x\" (trim_mode: nil, 0, 1, 2, or String composed of '%' and/or '-', '>', '<>')"),
-        "stderr was: {err}"
+    // erb warns with `uplevel:`, so the line that called `ERB.new` leads.
+    assert_eq!(
+        err,
+        "-e:1: warning: Invalid ERB trim mode: \"x\" (trim_mode: nil, 0, 1, 2, or String composed of '%' and/or '-', '>', '<>')\n"
     );
     assert!(out.status.success());
+}
+
+#[test]
+fn the_positional_trim_mode_of_old_erb_is_an_arity_error() {
+    // erb 6 dropped `ERB.new(str, safe_level, trim_mode, eoutvar)`.
+    eq(
+        r#"begin; ERB.new("x", nil, "-"); rescue ArgumentError => e; e.message; end"#,
+        r#""wrong number of arguments (given 3, expected 1)""#,
+    );
+    eq(
+        r#"begin; ERB.new("x", 1); rescue ArgumentError => e; e.message; end"#,
+        r#""wrong number of arguments (given 2, expected 1)""#,
+    );
 }

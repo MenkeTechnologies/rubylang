@@ -1770,6 +1770,34 @@ Honest limitations of this surface:
   packed pair otherwise — so `hash.map(&->(k, v) { … })`, `hash.map(&->(kv) { … })`
   and `hash.map(&:first)` all bind correctly, which a single fixed yield shape
   cannot do now that lambdas are strict.
+- **`caller` / `caller_locations` / `warn(uplevel:)` read the live call stack.**
+  Every call op records its line as a live call site while its callee runs
+  (`host::enter_call_site`), so the stack of them is the backtrace MRI walks:
+  `caller(0)` lists each waiting method and block frame with its call line and
+  MRI label (`Object#b`, `K.s`, `block in <main>`, `<class:Foo>`), a built-in
+  that is yielding to a block is a frame of its own (`Array#each`,
+  `Integer#times`, `Kernel#loop`), and `start`/`length`/Range selection follows
+  `ec_backtrace_to_ary` (nil past the end, `[]` for a zero length, `negative
+  level`/`negative size` errors). A Fiber's backtrace begins at its block.
+  `warn` is ported from warning.rb / `rb_warn_m`: `uplevel: n` prefixes
+  `path:line: warning: ` for the frame `n` above the `warn` call, `category:`
+  is checked against `Warning[]` (`deprecated` is off unless `-w`; `-W0`
+  turns every category off and silences `warn`), and the text goes through
+  `Warning.warn`, so a redefined hook receives it. The `Warning` module answers
+  `[]`, `[]=`, `categories` and `warn` with MRI's TypeErrors/ArgumentErrors.
+  Still open: (1) a method defined in a required file reports the RUNNING
+  file's path, not its own, and a required file's top level is labelled
+  `<main>` rather than `<top (required)>` with no `Kernel#require` frame (the
+  same per-file model exception backtraces use); (2) a block run through an
+  Enumerator chain (`a.each_with_index.map { }`) names the outer call
+  (`Enumerable#map`) where MRI lists the inner iteration (`Array#each`,
+  `Enumerable#each_with_index`); (3) a built-in that reaches Ruby code other
+  than by yielding (`sort` calling a user `<=>`, `send`) has no frame, and
+  neither does `Kernel#eval` — an eval'd frame reports the file and the eval
+  string's own line rather than `(eval at FILE:LINE)`; (4) a multi-line call
+  reports the line its statement starts on; (5) `-W:deprecated` /
+  `-W:no-experimental` are accepted but do not yet switch the category;
+  (6) `Thread#backtrace` is not implemented.
 - **Exception hierarchy.** The builtin exception classes carry MRI's real tree,
   not a flat `X < Exception`: `ArgumentError`/`TypeError`/`RuntimeError`/… derive
   from `StandardError`, and the ones with an intermediate parent keep it
@@ -2039,12 +2067,12 @@ Honest limitations of this surface:
   broader access than MRI's default `new_toplevel_binding`. (2) MRI compiles the
   template as bytes (`String#b`) and `dump`s them, so its `#src` spells a
   non-ASCII character as `\xNN` escapes; rubylang keeps the character itself —
-  the rendered result is identical. (3) The invalid-trim-mode warning is printed
-  as `warning: …` without the `file:line:` prefix MRI's `uplevel:` adds.
-  (4) `#result_with_hash` binds arbitrary runtime values directly (no
-  serialization), so any object works as a template local. (5) Legacy positional
-  `safe_level`/`eoutvar` args to `ERB.new` are ignored; the deprecated positional
-  trim-mode (3rd arg) is still honored, where erb 6 raises `ArgumentError`.
+  the rendered result is identical. (3) `#result_with_hash` binds arbitrary
+  runtime values directly (no serialization), so any object works as a template
+  local. The invalid-trim-mode warning carries MRI's `file:line:` prefix (the
+  line that called `ERB.new`), and erb 6's signature is enforced: a second
+  positional argument (the old `safe_level, trim_mode, eoutvar`) is
+  `ArgumentError: wrong number of arguments (given 3, expected 1)`.
 - **`StringIO` (dependency-free).** `require "stringio"` is a no-op; the class is
   always available. `StringIO.new(initial = "")` is a String-backed IO: the
   buffer and read cursor live in the object's `buf`/`pos` ivars. `#string`

@@ -148,15 +148,11 @@ fn rubyopt_disabled(args: &[String]) -> bool {
     })
 }
 
-/// The warning categories `-W:` and `-W:no-` accept. An unrecognised one is a
-/// warning, not an error, and leaves the level alone. Verified against MRI
-/// 4.0.6: `-W:foo` prints `warning: unknown warning category: 'foo'` and runs.
-const WARNING_CATEGORIES: &[&str] = &[
-    "deprecated",
-    "experimental",
-    "performance",
-    "strict_unused_block",
-];
+// The warning categories `-W:` and `-W:no-` accept are MRI's (the list
+// `Warning.categories` answers). An unrecognised one is a warning, not an
+// error, and leaves the level alone. Verified against MRI 4.0.6: `-W:foo`
+// prints `warning: unknown warning category: 'foo'` and runs.
+use crate::host::WARNING_CATEGORIES;
 
 /// Short switches MRI accepts inside `RUBYOPT`. Every other switch is rejected
 /// there even though it is valid on the command line, because `RUBYOPT` is

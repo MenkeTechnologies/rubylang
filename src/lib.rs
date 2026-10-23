@@ -131,6 +131,7 @@ fn seed_verbosity(cfg: &RunConfig) {
         h.set_global("VERBOSE", verbose);
         h.set_global("DEBUG", Value::Bool(cfg.debug));
     });
+    host::reset_warning_categories(cfg.warn_level);
     compiler::set_default_frozen_string_literals(cfg.frozen_string_literal);
 }
 
