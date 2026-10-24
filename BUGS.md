@@ -1150,6 +1150,10 @@ Honest limitations of this surface:
 
 ## Runtime / methods
 
+- **`ObjectSpace._id2ref` inverts `object_id` — fixed.** It answered nil for
+  everything; now an odd id is its Integer, the `nil`/`true`/`false` ids their
+  objects, a class's id its class, a live heap id its object, and anything
+  else `RangeError: N is not an id value`.
 - **`Struct` / `Data` construction runs `initialize`.** `Klass.new` allocates
   and calls `initialize`, so a user override (and `super` into the generated
   one, with the current parameter values for a bare `super`) behaves as in MRI;
@@ -1504,7 +1508,10 @@ Honest limitations of this surface:
   generated class carries itself (`[]`, `members`, `keyword_init?`; `[]`, `new`,
   `members` for `Data`) are defined on it rather than on `Struct`/`Data`, so
   dumping `Struct.methods` never sees them and `src/arity_table.rs` has no row —
-  they are named explicitly in the method-existence check.
+  they are named explicitly in the method-existence check. The argument-count check
+  skips them too, so `P[1, 2]` is not held to `Struct#[]`'s one argument. Index
+  brackets take keyword arguments (`D[x: 1]`, `obj[k: v]`); in an index
+  ASSIGNMENT they are a SyntaxError, as in MRI.
 - **`Data.define` is strict about its members.** Every member is mandatory and no
   extra one is accepted, in either construction form: `P.new(1)` raises
   `ArgumentError: missing keyword: :y`, `P.new(1, 2, 3)` raises `wrong number of
@@ -1897,8 +1904,13 @@ Honest limitations of this surface:
   inverse is computed.
 - **Numeric conversions.** `Integer#to_r` / `Float#to_r` (the *exact* rational
   an f64 represents), `String#to_r` (leading `a/b` or decimal), `#to_c`
-  (`(n+0i)`), and `Float#rationalize([eps])` (simplest rational within a
-  tolerance) are supported, backed by `num-rational`. `nil.to_a`/`to_h` return
+  (`(n+0i)`), `Float#rationalize([eps])` and `Rational#rationalize([eps])` (the
+  simplest rational within a tolerance, MRI's continued-fraction walk) are
+  supported, backed by `num-rational`; `Integer#rationalize(eps)` is `n/1`.
+  `Complex` and `Rational` are class constants, both `Numeric`, with
+  `Complex.polar` (MRI's exact-zero and π, π/2 special cases),
+  `Complex.rectangular`/`rect` and `Complex::I`. `Integer#digits` takes a
+  radix of any width. `nil.to_a`/`to_h` return
   the empty collection. `Array#sum` (and `reduce(:+)`) stay exact for Rational,
   BigInt, String, and Array elements.
   `Kernel#Rational` takes the whole surface MRI takes — Integer, Float
@@ -1973,9 +1985,13 @@ Honest limitations of this surface:
    unpacks to a Bignum), the floats `D`/`d`/`E`/`G` (double) and `F`/`f`/`e`/`g`
    (single), `Z` (NUL-terminated string), `U` (UTF-8 code points, pack.c's
    one-to-six-byte form, with `utf8_to_uv`'s three decode refusals; a template
-   opening with `U` answers a UTF-8 string), `m` (base64, `m0` unbroken), `B`/`b`
-   (bit strings, MSB/LSB first), `w` (BER-compressed integers), `M`
-   (quoted-printable), `u` (uuencode), and the cursor moves `x`/`X`/`@`. A
+   opening with `U` answers a UTF-8 string), `m` (base64; `m0` unbroken, and
+   strict when decoding: whole quads, exact padding, else `invalid base64`),
+   `B`/`b` (bit strings, MSB/LSB first), `w` (BER-compressed integers), `M`
+   (quoted-printable, a port of pack.c `qpencode`), `u` (uuencode), and the
+   cursor moves `x`/`X`/`@` (`x`/`X` past either end is `x outside of string`
+   / `X outside of string`; `x*`/`X*` follow MRI). `unpack(fmt, offset:)` and
+   `pack(fmt, buffer:)` are supported. A
    template that asks for more elements than the array holds is `ArgumentError:
    too few arguments`, and an element of the wrong kind raises the same
    `TypeError` MRI raises (`["a"].pack("C")`, `[1].pack("a")`). Because strings

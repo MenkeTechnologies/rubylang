@@ -1911,6 +1911,15 @@ impl Compiler {
                 // `recv[i] = v` evaluates to `v` — never `[]=`'s return value
                 // (Ruby drops it). Evaluate operands into temps in source order,
                 // call `[]=`, discard its result, yield the RHS.
+                if idx.iter().any(|i| {
+                    matches!(i, Expr::KwArgs(_))
+                        || matches!(i, Expr::Splat(inner) if matches!(**inner, Expr::KwArgs(_)))
+                }) {
+                    return Err(format!(
+                        "line {}: keywords are not allowed in index assignment expressions",
+                        self.cur_line
+                    ));
+                }
                 let tr = self.eval_to_temp(b, recv)?;
                 if idx.iter().any(|i| matches!(i, Expr::Splat(_))) {
                     // A spread index (`a[*i] = v`) is `recv.[]=(*i, v)`: the

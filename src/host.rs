@@ -7118,6 +7118,19 @@ impl RubyHost {
         let (index, _) = self.class_object_ids.insert_full(name.to_string(), ());
         (1 << 40) + (index as i64) * 8
     }
+    /// The class or heap object whose `object_id` is `id`, if one is live.
+    pub fn object_for_id(&mut self, id: i64) -> Option<Value> {
+        if id >= 1 << 40 && id % 8 == 0 {
+            let index = ((id - (1 << 40)) / 8) as usize;
+            let name = self
+                .class_object_ids
+                .get_index(index)
+                .map(|(n, _)| n.clone())?;
+            return Some(self.class_ref(&name));
+        }
+        let slot = (id / 8).checked_sub(1)?;
+        (id % 8 == 0 && (slot as usize) < self.heap.len()).then_some(Value::Obj(slot as u32))
+    }
     /// Allocate an instance of `class`.
     pub fn new_object(&mut self, class: &str) -> Value {
         self.alloc(RObj::Object {
@@ -7276,7 +7289,12 @@ impl RubyHost {
         if actual == class || class == "Object" || class == "BasicObject" {
             return true;
         }
-        if class == "Numeric" && (actual == "Integer" || actual == "Float") {
+        if class == "Numeric"
+            && matches!(
+                actual.as_str(),
+                "Integer" | "Float" | "Rational" | "Complex"
+            )
+        {
             return true;
         }
         // `Class < Module` in MRI: a class reference is both a Class and a Module.
@@ -7492,7 +7510,7 @@ impl RubyHost {
             "Class" => own(&["Module"]),
             "Numeric" => own(&["Comparable"]),
             "Integer" | "Float" | "Rational" => own(&["Numeric", "Comparable"]),
-            "Complex" => own(&["Numeric"]),
+            "Complex" => own(&["Numeric", "Comparable"]),
             "String" | "Symbol" | "Time" | "Date" => own(&["Comparable"]),
             "DateTime" => own(&["Date", "Comparable"]),
             "Array" | "Hash" | "Range" | "Set" | "Struct" | "Enumerator" => own(&["Enumerable"]),
@@ -7715,6 +7733,8 @@ impl RubyHost {
             "Integer"
                 | "Float"
                 | "Numeric"
+                | "Rational"
+                | "Complex"
                 | "BigDecimal"
                 | "String"
                 | "Symbol"

@@ -412,7 +412,7 @@ end
 /// fresh VM before requires and the program.
 fn run_prelude() -> Result<(), String> {
     run_compiled(compile(PRELUDE)?)?;
-    builtins::install_file_constants();
+    builtins::install_native_constants();
     Ok(())
 }
 

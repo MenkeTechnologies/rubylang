@@ -8490,3 +8490,28 @@ rt { /é/ === "é".b }; rt { case "é".b; when /é/ then 1; end }; rt { /é/.mat
 # ── Lazy#each { } answers the source's each without stages, nil with one, the prior Lazy after each_slice ──
 p((1..3).lazy.each { }, [1, 2].lazy.each { }, [1, 2].lazy.map { _1 }.each { }, (1..3).lazy.each_slice(2).each { }, {a: 1}.lazy.each { })
 p(Enumerator.new { |y| y << 1; :gen }.lazy.each { }, [1, 2].each_slice(1).lazy.each { }, [1, 2].lazy.each, [1, 2].lazy.with_index.each { })
+#==#
+# ── Complex and Rational are classes: Complex.polar/rect, Complex::I, Numeric ancestry; rationalize; digits with a big radix ──
+p Complex, Rational, Complex.ancestors.take(3), 1i.is_a?(Numeric), Rational(1, 2).is_a?(Numeric), Complex === 1i, Complex.superclass
+p Complex.polar(2, 0), Complex.polar(2), Complex.polar(1, Math::PI), Complex.polar(2r, 0), Complex.polar(1.5, 1), (Complex.polar("a") rescue $!), Complex.rect(1, 2.5), Complex.rect(3), Complex::I, Complex.polar(3, Math::PI / 2), Complex.polar(2, 1)
+p Rational(1, 3).rationalize, Rational(333, 1000).rationalize(Rational(1, 100)), Rational(-333, 1000).rationalize(0.01), 3.rationalize(1), (2**70).rationalize(5), Rational(5, 7).rationalize(Rational(1, 1000))
+p 10.digits(2**70), (2**70).digits(2**64), (2**70).digits(1000), 0.digits(2**70), ((-(2**70)).digits rescue $!), (10.digits(-(2**70)) rescue $!)
+#==#
+# ── pack/unpack: qpencode M, strict m0, x/X bounds and stars, unpack offset:, pack buffer: ──
+p ["héllo=\n"].pack("M"), ["x\ty \n"].pack("M"), [""].pack("M"), ["ab"].pack("M2"), ["abcdef"].pack("M3"), ["a" * 80].pack("M")
+p ["aGVsbG8=", "aGVsbG8", "aGVs\nbG8=", "aGVsbA==", "aGVsbB==", "", "====", "YQ", "YWI="].map { |s| s.unpack1("m0") rescue :err }
+p ("ab".unpack("x5a") rescue $!), "ab".unpack("x*a"), [1].pack("Cx*").bytes, [1, 2].pack("CCX*").bytes, ("abc".unpack("aX*a") rescue $!), "abc".unpack("a2X*a"), ([1].pack("CX2") rescue $!)
+p "abcdef".unpack("@1a", offset: 2), "abc".unpack("a*", offset: 3), ("abc".unpack("a", offset: 4) rescue $!), ("abc".unpack("a", offset: -1) rescue $!), "abc".unpack1("a2", offset: 1)
+b = "xy".b; r = [65, 66].pack("C@4C", buffer: b); p r, r.equal?(b), r.encoding, [1].pack("C", buffer: +"é"), ([1].pack("C", buffer: 3) rescue $!), ([1].pack("C", buffer: "f".freeze) rescue $!)
+#==#
+# ── Struct/Data classes answer [] with any arity; index brackets take keyword arguments ──
+P2 = Struct.new(:x, :y); D2 = Data.define(:x); K2 = Struct.new(:x, keyword_init: true)
+p P2[1, 2], P2.[](3, 4), D2[1], D2[x: 2], K2[x: 1]
+class Ix; def [](*a, **k) = [a, k]; end; ix = Ix.new; z = 5; p ix[1, b: 2], ix[**{z: 3}], ix["s": 4], ix[1], ix[z:]
+#==#
+# ── a keyword argument in an index assignment is a SyntaxError ──
+h = {}; h[a: 1] = 2
+#==#
+# ── ObjectSpace._id2ref inverts object_id; respond_to? sees an active refinement ──
+x = "s"; p ObjectSpace._id2ref(x.object_id).equal?(x), ObjectSpace._id2ref(1.object_id), ObjectSpace._id2ref(nil.object_id), ObjectSpace._id2ref(true.object_id), ObjectSpace._id2ref(123456789), ObjectSpace._id2ref(String.object_id), (ObjectSpace._id2ref(10**9 * 8) rescue $!)
+module RfR; refine String do; def shout = upcase + "!"; end; end; p "b".respond_to?(:shout); using RfR; p "a".shout, "b".respond_to?(:shout), 1.respond_to?(:shout)

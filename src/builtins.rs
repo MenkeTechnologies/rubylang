@@ -2362,6 +2362,17 @@ fn check_builtin_arity(
     args: &[Value],
     block: Option<&Value>,
 ) -> Result<(), String> {
+    // The class methods `Struct.new`/`Data.define` give the classes they make
+    // (`P[1, 2]`, `P.members`) are on no built-in's table; the instance
+    // method of the same name (`Struct#[]`) is not theirs to check against.
+    if matches!(name, "[]" | "new" | "members" | "keyword_init?")
+        && with_host(|h| {
+            h.classref_name(recv)
+                .is_some_and(|c| h.struct_def(&c).is_some())
+        })
+    {
+        return Ok(());
+    }
     let Some(owner) = with_host(|h| h.builtin_owner(recv, name)) else {
         return Ok(());
     };
@@ -3363,6 +3374,10 @@ fn dispatch_resolved(
             {
                 return Ok(Value::Bool(true));
             }
+            // A method an active refinement adds answers too (MRI 4).
+            if with_host(|h| h.refinements_active() && h.find_refined_method(recv, &m).is_some()) {
+                return Ok(Value::Bool(true));
+            }
             // `Kernel#pretty_inspect` is defined by pp.rb, which loads on the
             // first `pp` or `require "pp"`.
             if m == "pretty_inspect" && !with_host(|h| h.builtin_lib_loaded("pp")) {
@@ -4272,7 +4287,7 @@ fn dispatch_classref(
             // to prune its cache; the cache simply never auto-prunes).
             "define_finalizer" => return Ok(args.first().cloned().unwrap_or(Value::Undef)),
             "undefine_finalizer" => return Ok(args.first().cloned().unwrap_or(Value::Undef)),
-            "_id2ref" => return Ok(Value::Undef),
+            "_id2ref" => return id2ref(args),
             // A capitalized name (`ObjectSpace::WeakMap`) is a nested constant /
             // class — fall through to the constant/nested-class resolution below.
             _ if name.chars().next().is_some_and(|c| c.is_uppercase()) => {}
@@ -4749,6 +4764,9 @@ fn dispatch_classref(
         }
     }
     // `Regexp` class methods: build/escape/union, and the last-match accessor.
+    if cls == "Complex" && matches!(name, "rectangular" | "rect" | "polar") {
+        return complex_class_method(name, args);
+    }
     if cls == "Regexp" {
         match name {
             "new" | "compile" => {
@@ -7316,6 +7334,37 @@ fn simplest_rational_within(f: f64, eps: f64) -> num_rational::BigRational {
     rat(n, d)
 }
 
+/// `nurat_rationalize_internal`: the simplest rational in `[a, b]`, by the
+/// continued-fraction walk MRI's `Rational#rationalize` does.
+fn simplest_rational_between(
+    mut a: num_rational::BigRational,
+    mut b: num_rational::BigRational,
+) -> num_rational::BigRational {
+    use num_bigint::BigInt;
+    use num_rational::BigRational;
+    let one = || BigRational::from(BigInt::from(1));
+    let (mut p0, mut p1) = (BigRational::from(BigInt::from(0)), one());
+    let (mut q0, mut q1) = (one(), BigRational::from(BigInt::from(0)));
+    loop {
+        let c = a.ceil();
+        if c < b {
+            let p = &c * &p1 + &p0;
+            let q = &c * &q1 + &q0;
+            return p / q;
+        }
+        let k = &c - one();
+        let p2 = &k * &p1 + &p0;
+        let q2 = &k * &q1 + &q0;
+        let t = (&b - &k).recip();
+        b = (&a - &k).recip();
+        a = t;
+        p0 = p1;
+        q0 = q1;
+        p1 = p2;
+        q1 = q2;
+    }
+}
+
 /// Parse the leading rational of a string for `String#to_r`: `"3/4"` → `3/4`,
 /// `"3.14"` → `157/50` (exact decimal), leading non-numeric text → `0/1`.
 fn string_to_rational(s: &str) -> num_rational::BigRational {
@@ -7824,10 +7873,13 @@ fn dispatch_bigint(
         //   $ ruby -e "p [(-(2**64)).bit_length, (-(2**64)).size]"
         //   [64, 9]
         "size" => Value::Int((b.bits().div_ceil(8) as i64).max(8)),
-        // `to_r` is `n/1` and `rationalize` (no eps) is the same exact value.
+        // `to_r` is `n/1`, and so is `rationalize` with or without an eps.
         // Both fall through to the Float-based generic arms otherwise, which
         // round the magnitude through an f64 and lose the low bits.
-        "to_r" | "rationalize" if args.is_empty() => {
+        "to_r" if args.is_empty() => {
+            with_host(|h| h.new_rational(num_rational::BigRational::from(b.clone())))
+        }
+        "rationalize" if args.len() <= 1 => {
             with_host(|h| h.new_rational(num_rational::BigRational::from(b.clone())))
         }
         // The square of the magnitude. The generic arm computes it in i128,
@@ -7845,8 +7897,11 @@ fn dispatch_bigint(
         "succ" | "next" => big(b + 1),
         "pred" => big(b - 1),
         "digits" => {
-            let base = num_bigint::BigInt::from(digits_radix(args)?);
-            let mut n = b.abs();
+            if b.is_negative() {
+                return Err(raise_exc("Math::DomainError", "out of domain"));
+            }
+            let base = digits_radix(args)?;
+            let mut n = b.clone();
             let mut out = Vec::new();
             if n.is_zero() {
                 out.push(Value::Int(0));
@@ -8491,6 +8546,13 @@ fn dispatch_number(
         },
         // `rationalize([eps])` finds the simplest rational within `eps` of the
         // value (default: the tightest interval that still round-trips the f64).
+        // An Integer is already exact: `rationalize(eps)` is `n/1` whatever
+        // the tolerance (`integer_rationalize`).
+        "rationalize" if matches!(recv, Value::Int(_)) && args.len() <= 1 => Ok(with_host(|h| {
+            h.new_rational(num_rational::BigRational::from(num_bigint::BigInt::from(
+                as_i(recv),
+            )))
+        })),
         "rationalize" => {
             let f = as_f(recv);
             let eps = match args.first() {
@@ -8777,7 +8839,10 @@ fn dispatch_number(
                 // Ruby raises for a negative receiver rather than using abs.
                 return Err(raise_exc("Math::DomainError", "out of domain"));
             }
-            let base = digits_radix(args)?;
+            // A radix past any fixnum leaves the receiver as its only digit.
+            let Some(base) = num_traits::ToPrimitive::to_i64(&digits_radix(args)?) else {
+                return Ok(new_arr(vec![Value::Int(n)]));
+            };
             let mut out = Vec::new();
             if n == 0 {
                 out.push(Value::Int(0));
@@ -10703,14 +10768,29 @@ fn dispatch_string_body(
         // `String#unpack(fmt)` / `#unpack1(fmt)` — the inverse of `Array#pack`.
         // The string is read as a byte sequence via the Latin-1 convention (each
         // codepoint's low byte), so a `pack`-produced binary string round-trips.
-        "unpack" => {
+        // `offset:` starts the read that many bytes in.
+        "unpack" | "unpack1" => {
             let fmt = arg_str(&args[0]);
-            Ok(new_arr(unpack_bytes(&string_byte_view(recv, &s), &fmt)?))
-        }
-        "unpack1" => {
-            let fmt = arg_str(&args[0]);
-            let out = unpack_bytes(&string_byte_view(recv, &s), &fmt)?;
-            Ok(out.into_iter().next().unwrap_or(Value::Undef))
+            let bytes = string_byte_view(recv, &s);
+            let start = match kw_opt(args, "offset") {
+                None => 0,
+                Some(v) => {
+                    let off = to_int(&v)?;
+                    if off < 0 {
+                        return Err(raise_exc("ArgumentError", "offset can't be negative"));
+                    }
+                    if off as usize > bytes.len() {
+                        return Err(raise_exc("ArgumentError", "offset outside of string"));
+                    }
+                    off as usize
+                }
+            };
+            let out = unpack_bytes_from(&bytes, &fmt, start)?;
+            Ok(if name == "unpack" {
+                new_arr(out)
+            } else {
+                out.into_iter().next().unwrap_or(Value::Undef)
+            })
         }
         // With a block, yield each byte and return self; without a block, yield
         // the bytes array so `.each_byte.to_a` works without a real Enumerator.
@@ -14415,6 +14495,23 @@ fn dispatch_array(
         // (see `pack_bytes`/`unpack_bytes`).
         "pack" => {
             let fmt = arg_str(&args[0]);
+            // `buffer:` appends to (and answers) that String, under its label.
+            if let Some(buf) = kw_opt(args, "buffer") {
+                if with_host(|h| h.as_str(&buf)).is_none() {
+                    return Err(raise_exc(
+                        "TypeError",
+                        &format!(
+                            "buffer must be String, not {}",
+                            with_host(|h| h.class_of(&buf))
+                        ),
+                    ));
+                }
+                frozen_guard(&buf, "<<", STRING_MUTATORS)?;
+                let start = with_host(|h| h.string_bytes(&buf));
+                let bytes = pack_bytes_into(&arr, &fmt, start)?;
+                store_bytes(&buf, bytes);
+                return Ok(buf);
+            }
             let bytes = pack_bytes(&arr, &fmt)?;
             // A template that OPENS with `U` answers a UTF-8 string
             // (`[233].pack("U")` is `"é"`), whatever follows it.
@@ -16692,6 +16789,26 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
     let rat = |v: num_rational::BigRational| with_host(|h| h.new_rational(v));
     match name {
         "numerator" => Ok(with_host(|h| h.new_bigint(r.numer().clone()))),
+        // `rationalize([eps])`: the simplest rational within `eps` (exact), the
+        // value itself without one.
+        "rationalize" => {
+            let Some(e) = args.first() else {
+                return Ok(recv.clone());
+            };
+            let eps = match with_host(|h| h.as_rational(e)) {
+                Some(q) => q.abs(),
+                None => num_rational::BigRational::from_float(as_f(e).abs())
+                    .unwrap_or_else(num_rational::BigRational::zero),
+            };
+            let neg = r.is_negative();
+            let mag = r.abs();
+            let (a, b) = (&mag - &eps, &mag + &eps);
+            if a == b {
+                return Ok(recv.clone());
+            }
+            let q = simplest_rational_between(a, b);
+            Ok(rat(if neg { -q } else { q }))
+        }
         "denominator" => Ok(with_host(|h| h.new_bigint(r.denom().clone()))),
         "to_f" => Ok(Value::Float(rational_to_f64(&r))),
         "to_i" | "to_int" => Ok(with_host(|h| h.new_bigint(r.to_integer()))),
@@ -19284,10 +19401,82 @@ fn dispatch_file_class(
     })
 }
 
-/// `File::Constants` members whose values are the platform's own (`open(2)`
-/// flags, `flock(2)` operations), installed natively so they match what the
-/// OS takes. IO includes the module, so `File::X` and `IO::X` name them too.
-pub(crate) fn install_file_constants() {
+/// `Complex.rectangular(re, im = 0)` / `Complex.polar(abs, arg = 0)` (complex.c
+/// `nucomp_s_new` / `f_complex_polar_real`). Both parts must be real.
+fn complex_class_method(name: &str, args: &[Value]) -> Result<Value, String> {
+    let real = |v: &Value| match v {
+        Value::Int(_) | Value::Float(_) => true,
+        _ => with_host(|h| matches!(h.class_of(v).as_str(), "Integer" | "Rational")),
+    };
+    if args.is_empty() || args.len() > 2 {
+        return Err(raise_exc(
+            "ArgumentError",
+            &format!(
+                "wrong number of arguments (given {}, expected 1..2)",
+                args.len()
+            ),
+        ));
+    }
+    if !args.iter().all(real) {
+        return Err(raise_exc("TypeError", "not a real"));
+    }
+    let x = args[0].clone();
+    if name != "polar" {
+        let y = args.get(1).cloned().unwrap_or(Value::Int(0));
+        return Ok(with_host(|h| h.new_complex(x, y)));
+    }
+    let zero = |v: &Value| with_host(|h| h.eq_values(v, &Value::Int(0)));
+    let y = args.get(1).cloned().unwrap_or(Value::Int(0));
+    if zero(&x) || zero(&y) {
+        return Ok(with_host(|h| h.new_complex(x, Value::Float(0.0))));
+    }
+    let mul = |a: &Value, f: f64| dispatch(a, "*", &[Value::Float(f)], None);
+    let (re, im) = match (&x, &y) {
+        (_, Value::Float(arg)) if *arg == std::f64::consts::PI => {
+            (dispatch(&x, "-@", &[], None)?, Value::Float(0.0))
+        }
+        (_, Value::Float(arg)) if *arg == std::f64::consts::FRAC_PI_2 => (Value::Float(0.0), x),
+        (_, Value::Float(arg)) if *arg == -std::f64::consts::FRAC_PI_2 => {
+            (Value::Float(0.0), dispatch(&x, "-@", &[], None)?)
+        }
+        (Value::Float(abs), Value::Float(arg)) => {
+            (Value::Float(abs * arg.cos()), Value::Float(abs * arg.sin()))
+        }
+        (_, Value::Float(arg)) => (mul(&x, arg.cos())?, mul(&x, arg.sin())?),
+        _ => {
+            let arg = match dispatch(&y, "to_f", &[], None)? {
+                Value::Float(f) => f,
+                _ => 0.0,
+            };
+            (mul(&x, arg.cos())?, mul(&x, arg.sin())?)
+        }
+    };
+    Ok(with_host(|h| h.new_complex(re, im)))
+}
+
+/// `ObjectSpace._id2ref(id)`: the inverse of `#object_id` — a Fixnum for an
+/// odd id, the singletons for theirs, a class, or the heap object the id
+/// numbers; anything else is a RangeError.
+fn id2ref(args: &[Value]) -> Result<Value, String> {
+    let id = to_int(args.first().unwrap_or(&Value::Undef))?;
+    match id {
+        0 => return Ok(Value::Bool(false)),
+        4 => return Ok(Value::Undef),
+        20 => return Ok(Value::Bool(true)),
+        _ if id & 1 == 1 => return Ok(Value::Int((id - 1) / 2)),
+        _ => {}
+    }
+    if let Some(v) = with_host(|h| h.object_for_id(id)) {
+        return Ok(v);
+    }
+    Err(raise_exc("RangeError", &format!("{id} is not an id value")))
+}
+
+/// Constants whose values only native code can make: the `File::Constants`
+/// members that are the platform's own (`open(2)` flags, `flock(2)`
+/// operations) — IO includes the module, so `File::X` and `IO::X` name them too
+/// — and `Complex::I`.
+pub(crate) fn install_native_constants() {
     let consts: [(&str, i64); 18] = [
         ("RDONLY", libc::O_RDONLY as i64),
         ("WRONLY", libc::O_WRONLY as i64),
@@ -19314,6 +19503,9 @@ pub(crate) fn install_file_constants() {
                 h.set_const(&format!("{ns}::{name}"), Value::Int(v));
             }
         }
+        // `Complex::I`, the imaginary unit.
+        let i = h.new_complex(Value::Int(0), Value::Int(1));
+        h.set_const("Complex::I", i);
     });
 }
 
@@ -31080,7 +31272,12 @@ fn pack_str_arg(items: &[Value], idx: usize) -> Result<Vec<u8>, String> {
 }
 
 fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
+    pack_bytes_into(items, fmt, Vec::new())
+}
+
+/// [`pack_bytes`] appending to `out` (`pack(fmt, buffer:)`), whose length is
+/// where `@` positions count from.
+fn pack_bytes_into(items: &[Value], fmt: &str, mut out: Vec<u8>) -> Result<Vec<u8>, String> {
     let mut idx = 0usize; // next array element to consume
     for d in parse_pack_template(fmt) {
         match d.kind {
@@ -31203,45 +31400,46 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
                     out.extend_from_slice(&groups);
                 }
             }
-            // Quoted-printable: printable ASCII passes through, everything else
-            // becomes `=XX`, and the result ends with a soft line break.
+            // Quoted-printable, a port of pack.c `qpencode`: printable ASCII,
+            // tab and newline pass through, anything else is `=XX`; a space or
+            // tab right before a newline gets a soft break of its own, a line
+            // longer than the count (72 for `M`/`M0`/`M1`) is broken with `=\n`,
+            // and output that does not end on a newline closes with one.
             'M' => {
                 let sbytes = pack_str_arg(items, idx)?;
                 idx += 1;
-                // The count is one LESS than the characters per line (`M2` wraps
-                // at 3), and `M0`/`M1`/a bare `M` mean the default 72. Empty
-                // input answers an empty string, not a lone soft break.
-                if sbytes.is_empty() {
-                    continue;
-                }
-                let width = match d.count.unwrap_or(0) {
+                let len = match d.count.unwrap_or(0) {
                     n if n <= 1 => 72,
-                    n => n + 1,
+                    n => n,
                 };
-                let mut col = 0usize;
+                let mut n = 0usize;
+                let mut prev: Option<u8> = None;
                 for &b in &sbytes {
-                    // The soft break is decided BEFORE the character, on the
-                    // column the previous one left behind — so a three-character
-                    // `=XX` escape is never split, and a line that ends exactly
-                    // at the width does not pick up a break it never needed.
-                    if col >= width {
-                        out.extend_from_slice(b"=\n");
-                        col = 0;
-                    }
-                    let piece = match b {
-                        b'\n' => {
-                            out.push(b'\n');
-                            col = 0;
-                            continue;
+                    if b > 126 || (b < 32 && b != b'\n' && b != b'\t') || b == b'=' {
+                        out.extend_from_slice(format!("={b:02X}").as_bytes());
+                        n += 3;
+                        prev = None;
+                    } else if b == b'\n' {
+                        if matches!(prev, Some(b' ' | b'\t')) {
+                            out.extend_from_slice(b"=\n");
                         }
-                        b'=' => "=3D".to_string(),
-                        0x20..=0x7e => (b as char).to_string(),
-                        _ => format!("={b:02X}"),
-                    };
-                    out.extend_from_slice(piece.as_bytes());
-                    col += piece.len();
+                        out.push(b'\n');
+                        n = 0;
+                        prev = Some(b);
+                    } else {
+                        out.push(b);
+                        n += 1;
+                        prev = Some(b);
+                    }
+                    if n > len {
+                        out.extend_from_slice(b"=\n");
+                        n = 0;
+                        prev = Some(b'\n');
+                    }
                 }
-                out.extend_from_slice(b"=\n");
+                if n > 0 {
+                    out.extend_from_slice(b"=\n");
+                }
             }
             // uuencode: a length character (`32 + n`, `0` spelled as a backtick)
             // then the 3-bytes-to-4-characters groups, per 45-byte line.
@@ -31401,14 +31599,17 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
             }
             // `xN` emits N null bytes; `XN` backs up N bytes. Neither consumes an
             // element.
+            // `x*` / `X*` move nothing; `X` cannot back up past the start.
             'x' => {
-                let n = d.count.unwrap_or(1);
+                let n = d.count.unwrap_or(0);
                 out.resize(out.len() + n, 0);
             }
             'X' => {
-                let n = d.count.unwrap_or(1);
-                let target = out.len().saturating_sub(n);
-                out.truncate(target);
+                let n = d.count.unwrap_or(0);
+                if n > out.len() {
+                    return Err(raise_exc("ArgumentError", "X outside of string"));
+                }
+                out.truncate(out.len() - n);
             }
             other => {
                 return Err(raise_exc(
@@ -31499,9 +31700,11 @@ fn unpack_str(s: String, enc: &'static str) -> Value {
 }
 
 /// `String#unpack` core: read `bytes` per the template into Ruby values.
-fn unpack_bytes(bytes: &[u8], fmt: &str) -> Result<Vec<Value>, String> {
+/// `String#unpack`, reading from byte `start` (`unpack(fmt, offset:)`); `@`
+/// positions still count from the start of the string.
+fn unpack_bytes_from(bytes: &[u8], fmt: &str, start: usize) -> Result<Vec<Value>, String> {
     let mut out = Vec::new();
-    let mut pos = 0usize;
+    let mut pos = start;
     for d in parse_pack_template(fmt) {
         match d.kind {
             // `U`: UTF-8 characters to code points. Running out of input ends
@@ -31577,13 +31780,17 @@ fn unpack_bytes(bytes: &[u8], fmt: &str) -> Result<Vec<Value>, String> {
                 out.push(unpack_str(bytes_to_binstr(&slice[..cut]), "ASCII-8BIT"));
             }
             // Base64 — one string element, whatever the line-break spelling.
+            // `m0` is RFC 4648 strict (whole quads, exact padding, no stray
+            // bits or characters); any other count skips what is not base64.
             'm' => {
-                let text = String::from_utf8_lossy(&bytes[pos..]).into_owned();
+                let decoded = if d.count == Some(0) {
+                    strict_base64_decode(&bytes[pos..])
+                        .ok_or_else(|| raise_exc("ArgumentError", "invalid base64"))?
+                } else {
+                    base64_decode_bytes(&String::from_utf8_lossy(&bytes[pos..]))
+                };
                 pos = bytes.len();
-                out.push(unpack_str(
-                    bytes_to_binstr(&base64_decode_bytes(&text)),
-                    "ASCII-8BIT",
-                ));
+                out.push(unpack_str(bytes_to_binstr(&decoded), "ASCII-8BIT"));
             }
             // Bit strings, the inverse of the `B`/`b` pack directives. The count
             // is a number of BITS (`*` = all of them).
@@ -31791,8 +31998,22 @@ fn unpack_bytes(bytes: &[u8], fmt: &str) -> Result<Vec<Value>, String> {
             }
             // Cursor moves, which produce no values: `x` skips forward, `X` backs
             // up, `@` seeks to an absolute offset.
-            'x' => pos = (pos + d.count.unwrap_or(1)).min(bytes.len()),
-            'X' => pos = pos.saturating_sub(d.count.unwrap_or(1)),
+            'x' => {
+                // `x*` skips what is left.
+                let skip = d.count.unwrap_or(bytes.len() - pos);
+                if pos + skip > bytes.len() {
+                    return Err(raise_exc("ArgumentError", "x outside of string"));
+                }
+                pos += skip;
+            }
+            // `X*` backs up by as many bytes as remain; never past the start.
+            'X' => {
+                let back = d.count.unwrap_or(bytes.len() - pos);
+                if back > pos {
+                    return Err(raise_exc("ArgumentError", "X outside of string"));
+                }
+                pos -= back;
+            }
             '@' => pos = d.count.unwrap_or(0).min(bytes.len()),
             'H' | 'h' => {
                 let rest = &bytes[pos.min(bytes.len())..];
@@ -34428,15 +34649,58 @@ fn struct_pos(members: &[String], key: &Value) -> Result<usize, String> {
 /// The radix argument of `Integer#digits` (default 10): an Integer that is at
 /// least 2. MRI reports a negative one as "negative radix" and 0/1 as
 /// "invalid radix N".
-fn digits_radix(args: &[Value]) -> Result<i64, String> {
-    let Some(v) = args.first() else {
-        return Ok(10);
+/// RFC 4648 base64 with no tolerance (`unpack("m0")`): whole 4-character
+/// groups, `=` only as the final group's padding, and padding bits that are
+/// zero. `None` for anything else.
+fn strict_base64_decode(s: &[u8]) -> Option<Vec<u8>> {
+    if s.len() % 4 != 0 {
+        return None;
+    }
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
     };
-    let base = to_int(v)?;
-    if base < 0 {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let quads = s.chunks(4).count();
+    for (i, q) in s.chunks(4).enumerate() {
+        let last = i + 1 == quads;
+        let pad = q.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return None;
+        }
+        let mut acc = 0u32;
+        for &c in &q[..4 - pad] {
+            acc = (acc << 6) | val(c)?;
+        }
+        match pad {
+            0 => out.extend_from_slice(&[(acc >> 16) as u8, (acc >> 8) as u8, acc as u8]),
+            1 if acc & 0x3 == 0 => out.extend_from_slice(&[(acc >> 10) as u8, (acc >> 2) as u8]),
+            2 if acc & 0xF == 0 => out.push((acc >> 4) as u8),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The radix of `Integer#digits` (10 by default), of any Integer width.
+fn digits_radix(args: &[Value]) -> Result<num_bigint::BigInt, String> {
+    let Some(v) = args.first() else {
+        return Ok(num_bigint::BigInt::from(10));
+    };
+    let base = match with_host(|h| h.as_bigint(v)) {
+        Some(b) if with_host(|h| h.class_of(v)) == "Integer" => b,
+        _ => num_bigint::BigInt::from(to_int(v)?),
+    };
+    if base < num_bigint::BigInt::from(0) {
         return Err(raise_exc("ArgumentError", "negative radix"));
     }
-    if base < 2 {
+    if base < num_bigint::BigInt::from(2) {
         return Err(raise_exc("ArgumentError", &format!("invalid radix {base}")));
     }
     Ok(base)

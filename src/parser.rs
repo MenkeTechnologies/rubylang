@@ -935,15 +935,19 @@ impl Parser {
                 // multi-line index / subscript), like inside a call paren.
                 self.skip_nl();
                 let mut idx = Vec::new();
+                // `D[x: 1]` passes keyword arguments as a call does.
+                let mut kwargs = Vec::new();
+                let mut kwsplats = Vec::new();
                 if !self.is_op("]") {
-                    idx.push(self.index_arg()?);
+                    self.index_arg_into(&mut idx, &mut kwargs, &mut kwsplats)?;
                     self.skip_nl();
                     while self.eat_op(",") {
                         self.skip_nl();
-                        idx.push(self.index_arg()?);
+                        self.index_arg_into(&mut idx, &mut kwargs, &mut kwsplats)?;
                         self.skip_nl();
                     }
                 }
+                Self::push_trailing_kwargs(&mut idx, kwargs, kwsplats);
                 self.expect_op("]")?;
                 e = Expr::Index(Box::new(e), idx);
             } else if self.is_op("::") && !self.cur_space() {
@@ -971,6 +975,34 @@ impl Parser {
     }
 
     /// One `[]` index argument, allowing a `*splat` (`Hash[*pairs]`, `a[*idx]`).
+    /// One `[…]` index argument: a `key: v` / `"key": v` / `**h` keyword
+    /// argument, or a positional one.
+    fn index_arg_into(
+        &mut self,
+        idx: &mut Vec<Expr>,
+        kwargs: &mut Vec<(Expr, Expr)>,
+        kwsplats: &mut Vec<Expr>,
+    ) -> Result<(), String> {
+        if self.eat_op("**") {
+            kwsplats.push(self.arg()?);
+        } else if let Some(key) = self.string_label()? {
+            let v = self.arg()?;
+            Self::push_kwarg(kwargs, kwsplats, key, v);
+        } else if let Some(key) = self.peek_label() {
+            self.advance();
+            self.advance();
+            let v = if self.label_value_omitted() {
+                Expr::Var(VarKind::Local, key.clone())
+            } else {
+                self.arg()?
+            };
+            Self::push_kwarg(kwargs, kwsplats, Expr::Symbol(key), v);
+        } else {
+            idx.push(self.index_arg()?);
+        }
+        Ok(())
+    }
+
     fn index_arg(&mut self) -> Result<Expr, String> {
         if self.eat_op("*") {
             Ok(Expr::Splat(Box::new(self.expr()?)))
