@@ -2861,6 +2861,21 @@ fn dispatch_resolved(
             return Ok(Value::Bool(with_host(|h| h.class_of(recv)) == cls));
         }
         "itself" => return Ok(recv.clone()),
+        // `display(port = $>)` (io.c `rb_obj_display`): `port.write(self)`,
+        // answering nil.
+        "display" if args.len() <= 1 => {
+            let port = match args.first() {
+                Some(p) => p.clone(),
+                None => with_host(|h| h.get_global("stdout")),
+            };
+            if matches!(port, Value::Undef) {
+                let text = dispatch(recv, "to_s", &[], None)?;
+                crate::host::write_stdout(&with_host(|h| h.to_s(&text)));
+            } else {
+                dispatch(&port, "write", std::slice::from_ref(recv), None)?;
+            }
+            return Ok(Value::Undef);
+        }
         // `freeze` records the receiver as frozen and returns it (Ruby freezes in
         // place; immutability is not enforced here but `frozen?` reports it).
         "freeze" => {
@@ -4028,6 +4043,18 @@ fn dispatch_bool(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Stri
         "=~" if matches!(recv, Value::Undef) => Ok(Value::Undef),
         "to_i" | "to_int" if matches!(recv, Value::Undef) => Ok(Value::Int(0)),
         "to_f" if matches!(recv, Value::Undef) => Ok(Value::Float(0.0)),
+        // `nil.to_r` / `nil.rationalize(eps = nil)` are `(0/1)` and `nil.to_c`
+        // is `(0+0i)` (nilclass.rb, complex.c `nilclass_to_c`).
+        "to_r" | "rationalize"
+            if matches!(recv, Value::Undef) && args.len() <= usize::from(name == "rationalize") =>
+        {
+            Ok(with_host(|h| {
+                h.new_rational(num_rational::BigRational::from_integer(0.into()))
+            }))
+        }
+        "to_c" if matches!(recv, Value::Undef) && args.is_empty() => {
+            Ok(with_host(|h| h.new_complex(Value::Int(0), Value::Int(0))))
+        }
         // A Kernel function (`require`/`require_relative`/`format`/`raise`/…) is a
         // private method of every object, `nil`/`true`/`false` included, so a call
         // reaching here (e.g. a bare call whose `self` is `nil`) resolves through
@@ -8593,6 +8620,12 @@ fn dispatch_number(
                     dispatch(&r, name, &[], None)
                 }
             }
+        }
+        "real?" | "real" | "conj" | "conjugate" | "imag" | "imaginary" | "rect" | "rectangular"
+        | "i"
+            if args.is_empty() =>
+        {
+            Ok(real_number_complex_view(recv, name))
         }
         // `Numeric#to_c` is `(n+0i)`.
         "to_c" => Ok(with_host(|h| h.new_complex(recv.clone(), Value::Int(0)))),
@@ -14237,6 +14270,47 @@ fn dispatch_array(
             };
             Ok(pos.map(|p| Value::Int(p as i64)).unwrap_or(Value::Undef))
         }
+        // `rfind(ifnone = nil) { |x| … }` (array.c `ary_rfind`): `find` from the
+        // last element backwards. The length is re-read after every yield, so a
+        // block that shrinks the array continues from the new end; with nothing
+        // found, `ifnone.call`. Block-less it is an Enumerator before the arity
+        // is checked, as `RETURN_ENUMERATOR` precedes `rb_check_arity`.
+        "rfind" => {
+            let Some(bl) = &block else {
+                return Ok(with_host(|h| h.new_enumerator_of(arr, name, recv.clone())));
+            };
+            if args.len() > 1 {
+                return Err(raise_exc(
+                    "ArgumentError",
+                    &format!(
+                        "wrong number of arguments (given {}, expected 0..1)",
+                        args.len()
+                    ),
+                ));
+            }
+            let mut idx = arr.len();
+            while idx > 0 {
+                idx -= 1;
+                let Some(x) = with_host(|h| h.array_at(recv, idx)).flatten() else {
+                    break;
+                };
+                let r = call_proc(bl, std::slice::from_ref(&x))?;
+                if has_pending_signal() {
+                    return Ok(Value::Undef);
+                }
+                if with_host(|h| h.truthy(&r)) {
+                    return Ok(x);
+                }
+                let len = with_host(|h| h.array_len(recv)).unwrap_or(0);
+                idx = idx.min(len);
+            }
+            match args.first() {
+                Some(ifnone) if !matches!(ifnone, Value::Undef) => {
+                    dispatch(ifnone, "call", &[], None)
+                }
+                _ => Ok(Value::Undef),
+            }
+        }
         // `bsearch_index` runs the identical search and answers the INDEX
         // instead of the element, so it delegates rather than repeating the
         // three-way block protocol.
@@ -16752,6 +16826,21 @@ fn dispatch_complex(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
     }
 }
 
+/// The `Numeric` methods that view a real number as a Complex with no
+/// imaginary part (numeric.c / complex.c): `real?` is true, `real` and
+/// `conj`/`conjugate` are the number itself, `imag`/`imaginary` are 0,
+/// `rect`/`rectangular` are `[self, 0]`, and `i` is `Complex(0, self)`.
+fn real_number_complex_view(recv: &Value, name: &str) -> Value {
+    match name {
+        "real?" => Value::Bool(true),
+        "real" | "conj" | "conjugate" => recv.clone(),
+        "imag" | "imaginary" => Value::Int(0),
+        "rect" | "rectangular" => new_arr(vec![recv.clone(), Value::Int(0)]),
+        "i" => with_host(|h| h.new_complex(Value::Int(0), recv.clone())),
+        _ => unreachable!("not a complex-view method: {name}"),
+    }
+}
+
 /// `Rational` methods. Arithmetic (`+`/`-`/`*`) arrives via the numeric hook;
 /// this handles `/`, `**`, queries, and conversions.
 fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
@@ -16873,6 +16962,12 @@ fn dispatch_rational(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
             ])),
         },
         "hash" => Ok(Value::Int(r.to_i64().unwrap_or(0))),
+        "real?" | "real" | "conj" | "conjugate" | "imag" | "imaginary" | "rect" | "rectangular"
+        | "i"
+            if args.is_empty() =>
+        {
+            Ok(real_number_complex_view(recv, name))
+        }
         "integer?" => Ok(Value::Bool(r.is_integer())),
         "to_c" => Ok(with_host(|h| h.new_complex(recv.clone(), Value::Int(0)))),
         // Rational takes `between?`/`clamp` from Comparable like every other
@@ -17975,6 +18070,9 @@ const ENUM_REINVOKE_METHODS: &[&str] = &[
     "find",
     "detect",
     "find_index",
+    "index",
+    "rindex",
+    "rfind",
     "take_while",
     "drop_while",
     "chunk_while",
@@ -18745,7 +18843,16 @@ fn enum_label(recv: &Value, meth: &str, args: &[Value]) -> String {
 fn unsized_enum_method(name: &str) -> bool {
     matches!(
         name,
-        "to_enum" | "enum_for" | "take_while" | "drop_while" | "find" | "detect" | "find_index"
+        "to_enum"
+            | "enum_for"
+            | "take_while"
+            | "drop_while"
+            | "find"
+            | "detect"
+            | "find_index"
+            | "index"
+            | "rindex"
+            | "rfind"
     )
 }
 
@@ -24083,6 +24190,30 @@ fn dispatch_hash_body(
             with_host(|h| h.set_hash(recv, kept));
             Ok(recv.clone())
         }
+        // `flatten(level = 1)` (hash.c `rb_hash_flatten`): the pairs laid end to
+        // end, `[k1, v1, k2, v2, …]`, which is already one level; a deeper
+        // `level` flattens the result `level - 1` more, a negative one fully,
+        // and 0 answers the unflattened `to_a`.
+        "flatten" if args.len() <= 1 => {
+            let level = match args.first() {
+                Some(v) => to_int(v)?,
+                None => 1,
+            };
+            let pairs: Vec<Value> = map
+                .iter()
+                .flat_map(|(k, v)| [with_host(|h| h.key_value(k)), v.clone()])
+                .collect();
+            if level == 0 {
+                return dispatch(recv, "to_a", &[], None);
+            }
+            if level == 1 {
+                return Ok(new_arr(pairs));
+            }
+            let ary = new_arr(pairs.clone());
+            let mut out = Vec::with_capacity(pairs.len());
+            flatten_depth_into(&ary, &pairs, level.max(0) - 1, &mut out, &mut Vec::new())?;
+            Ok(new_arr(out))
+        }
         "invert" => {
             let mut out = IndexMap::new();
             for (k, v) in &map {
@@ -24305,6 +24436,13 @@ fn dispatch_range(
         };
         let this = range_endpoints(recv).expect("dispatch_range receiver is a Range");
         return Ok(Value::Bool(range_overlap(this, other)?));
+    }
+    // `exclude_end?` (range.c `range_exclude_end_p`) is the flag every Range
+    // carries, whatever its endpoints are.
+    if name == "exclude_end?" && args.is_empty() {
+        if let Some((_, _, excl)) = range_endpoints(recv) {
+            return Ok(Value::Bool(excl));
+        }
     }
     // `minmax` is `[min, max]` of the receiver; the block form is Enumerable's.
     if name == "minmax" && args.is_empty() && block.is_none() {
@@ -31178,15 +31316,25 @@ fn do_require(args: &[Value], mode: ReqMode) -> Result<Value, String> {
         record_feature(&abs_str);
     }
 
-    let main = crate::load_merged(prog);
     let dir = abs
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     crate::host::push_file_dir(dir);
     // `__FILE__` inside a required file is that file's own (absolute) path.
+    // Pushed before the program is merged, so the methods and blocks it
+    // defines record this file as theirs.
     crate::host::push_file_path(abs_str.clone());
+    let main = crate::load_merged(prog);
+    // While the file runs, the `require` call is a frame of its own between
+    // the file's `<top (required)>` and the caller, as in MRI.
+    crate::host::mark_native_frame(match mode {
+        ReqMode::Require => "Kernel#require",
+        ReqMode::Relative => "Kernel#require_relative",
+        ReqMode::Load => "Kernel#load",
+    });
     let r = crate::host::run_required_main(main);
+    crate::host::clear_native_frame();
     crate::host::pop_file_dir();
     r?;
     Ok(Value::Bool(true))

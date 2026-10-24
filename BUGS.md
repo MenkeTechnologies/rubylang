@@ -1866,10 +1866,18 @@ Honest limitations of this surface:
   turns every category off and silences `warn`), and the text goes through
   `Warning.warn`, so a redefined hook receives it. The `Warning` module answers
   `[]`, `[]=`, `categories` and `warn` with MRI's TypeErrors/ArgumentErrors.
-  Still open: (1) a method defined in a required file reports the RUNNING
-  file's path, not its own, and a required file's top level is labelled
-  `<main>` rather than `<top (required)>` with no `Kernel#require` frame (the
-  same per-file model exception backtraces use); (2) a block run through an
+  A method or block body runs IN the file it was written in (`MethodDef::file`
+  / `ProcDef::file`, recorded when its program is merged), so its frames,
+  `__FILE__`, `require_relative` and `Method#source_location` name that file
+  whoever calls it; a required or loaded file's top level is `<top (required)>`
+  (`block in <top (required)>` for a block written there), with the
+  `Kernel#require` / `Kernel#require_relative` / `Kernel#load` call as a frame
+  of its own between it and the caller.
+  Still open: (1) a `LoadError` raised by `require_relative` itself has no
+  `Kernel#require_relative` frame 0 (MRI: `-e:1:in 'Kernel#require_relative':
+  cannot load such file`), and a call made from a class body reports a line
+  inside the body rather than the `class` line (MRI's
+  `<main>` frame under `<class:K>` is at line 1); (2) a block run through an
   Enumerator chain (`a.each_with_index.map { }`) names the outer call
   (`Enumerable#map`) where MRI lists the inner iteration (`Array#each`,
   `Enumerable#each_with_index`); (3) a built-in that reaches Ruby code other
@@ -1995,9 +2003,27 @@ Honest limitations of this surface:
   and `RangeError` for a Complex with an imaginary part). `Integer`, `Float`,
   `Rational`, `Complex`, `String`, `Array` and `Hash` check their argument count
   against the measured table and honour `exception: false`.
-- **Gap — `String#to_c` is not implemented.** `"12".to_c` raises
-  `NoMethodError`; MRI answers `(12+0i)`. `Integer#to_c` and `Float#to_c` are
-  present, so this is the String half only.
+- **The real-number Complex view and nil's conversions.** `Integer`, `Float`
+  and `Rational` answer `real?` (true), `real`/`conj`/`conjugate` (self),
+  `imag`/`imaginary` (0), `rect`/`rectangular` (`[self, 0]`) and `i`
+  (`Complex(0, self)`); `nil.to_r`/`nil.rationalize` are `(0/1)` and
+  `nil.to_c` is `(0+0i)`. `String#to_c` parses as MRI does.
+- **`Hash#flatten(level)`, `Range#exclude_end?`, `Kernel#display`, `Array#rfind`.**
+  Ported from `rb_hash_flatten`, `range_exclude_end_p`, `rb_obj_display` and
+  `ary_rfind` (which re-reads the length after each yield). A block-less
+  `index`, `rindex` or `rfind` Enumerator re-runs the method when a block is
+  attached, and its `size` is nil.
+- **Gap — core methods MRI 4.0 has that are still missing.** Found by calling
+  every `instance_methods(false)` entry of the core classes on a sample
+  receiver: `String#append_as_bytes`, `#scrub!`, `#unicode_normalize!`;
+  `Proc#binding`, `#ruby2_keywords`, `#source_location`;
+  `Set#compare_by_identity`/`?`; `Enumerator#next_values`/`#peek_values`;
+  `Regexp#timeout`, `Regexp#~`; on `Complex`, `real?`, `finite?`,
+  `infinite?`, `arg`/`angle`/`phase`, `polar`, `rationalize` and `to_c`.
+  The same sweep panics (index out of bounds) on `Class.new.class_eval` and
+  `Method#===` called with no argument instead of raising `ArgumentError`.
+  A block-less `rfind(ifnone)` Enumerator drops its argument: its `inspect`
+  shows none and re-attaching a block runs `rfind` without `ifnone`.
 - **`Time`** (`src/rtime.rs`, ported from MRI's `time.c` and `strftime.c`). A
   Time is an exact Rational number of epoch seconds plus the zone it is viewed
   in — UTC, the process's local zone, or a fixed offset — as MRI's

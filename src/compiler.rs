@@ -970,6 +970,7 @@ fn dummy_proc() -> ProcDef {
         chunk: ChunkBuilder::new().build(),
         arity: crate::ast::BlockArity::default(),
         block_depth: 1,
+        file: None,
     }
 }
 
@@ -1207,6 +1208,7 @@ impl Compiler {
             chunk: Arc::new(b.build()),
             slot_params: n_slot_params,
             line: saved_line,
+            file: None,
         })
     }
 
@@ -2817,6 +2819,7 @@ impl Compiler {
             chunk,
             arity,
             block_depth,
+            file: None,
         });
         Ok(id)
     }
@@ -3314,6 +3317,7 @@ impl Compiler {
             chunk: Arc::new(b.build()),
             slot_params: 0,
             line: self.cur_line,
+            file: None,
         }
     }
 
@@ -3340,6 +3344,7 @@ impl Compiler {
             chunk: Arc::new(b.build()),
             slot_params: 0,
             line: self.cur_line,
+            file: None,
         }
     }
 

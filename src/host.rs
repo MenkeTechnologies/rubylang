@@ -1385,6 +1385,12 @@ pub struct MethodDef {
     pub slot_params: u16,
     /// The line the definition starts on — `Method#source_location`'s.
     pub line: u32,
+    /// The file the definition was loaded from, set when its program is
+    /// merged onto the host (see [`RubyHost::load_program`]). While the body
+    /// runs this file is the current one, so `__FILE__`, `require_relative`
+    /// and every backtrace frame inside it name where the method was WRITTEN,
+    /// not the file that called it. `None` for a method no program carried.
+    pub file: Option<Arc<SourceFile>>,
 }
 
 /// Where a signature's positional parameters sit. Ruby fixes their order —
@@ -1452,6 +1458,8 @@ pub struct ProcDef {
     /// this LEXICAL count — it is where the block was written, not how deep the
     /// call got.
     pub block_depth: u32,
+    /// The file the block was written in — see [`MethodDef::file`].
+    pub file: Option<Arc<SourceFile>>,
 }
 
 /// One method activation (or the top level): its captured scope plus the args it
@@ -1530,9 +1538,10 @@ pub struct RubyHost {
     /// meets, and warns only when that changes it (see
     /// [`RubyHost::prepare_binary_regexp`]).
     binary_regexp_encodings: HashMap<u32, &'static str>,
-    /// The file each method definition was loaded from, by `MethodDef::chunk_id`
-    /// — `Method#source_location`'s path.
-    method_files: HashMap<u64, String>,
+    /// The `frame_id` of each required/loaded file's top level. MRI labels
+    /// that frame `<top (required)>`, and a block written there
+    /// `block in <top (required)>`, for as long as the block lives.
+    required_tops: HashSet<u64>,
     /// `Enumerator#feed` state by Enumerator heap id: the value waiting for
     /// the next resume, and (for a buffered Enumerator) what each element got.
     enum_feeds: HashMap<u32, (Option<Value>, Vec<Value>)>,
@@ -2155,6 +2164,37 @@ pub fn current_file_path() -> Option<String> {
     FILE_PATH_STACK.with(|s| s.borrow().last().cloned())
 }
 
+/// A source file a method or block body was written in: the path `__FILE__`
+/// reports there and the directory `require_relative` resolves against.
+pub struct SourceFile {
+    pub path: String,
+    pub dir: std::path::PathBuf,
+}
+
+/// Make `file` the current file while a body written there runs, as MRI's
+/// iseq carries its own path: a method defined in `lib.rb` and called from
+/// `main.rb` runs IN `lib.rb`. Pushes only when the body comes from a file
+/// other than the current one, so a same-file call (nearly every call) costs
+/// one comparison; answers whether it pushed, for [`leave_code_file`].
+fn enter_code_file(file: Option<&SourceFile>) -> bool {
+    let Some(f) = file else {
+        return false;
+    };
+    if FILE_PATH_STACK.with(|s| s.borrow().last().is_some_and(|top| *top == f.path)) {
+        return false;
+    }
+    push_file_dir(f.dir.clone());
+    push_file_path(f.path.clone());
+    true
+}
+
+/// Undo an [`enter_code_file`] that pushed.
+fn leave_code_file(pushed: bool) {
+    if pushed {
+        pop_file_dir();
+    }
+}
+
 /// Where a bare `def` should register while a `class_eval`/`instance_eval`
 /// target is active. `Instance` = an instance method on the class (class_eval),
 /// `ClassMethod` = a class/singleton method (`Klass.instance_eval`), `Singleton`
@@ -2480,7 +2520,7 @@ impl RubyHost {
             enum_feeds: HashMap::new(),
             binary_regexps: false,
             binary_regexp_encodings: HashMap::new(),
-            method_files: HashMap::new(),
+            required_tops: HashSet::new(),
             consts: IndexMap::new(),
             autoloads: IndexMap::new(),
             methods: IndexMap::new(),
@@ -2645,19 +2685,26 @@ impl RubyHost {
     /// before running main.
     pub fn load_program(
         &mut self,
-        methods: Vec<(String, MethodDef)>,
-        classes: Vec<(String, ClassDef)>,
+        mut methods: Vec<(String, MethodDef)>,
+        mut classes: Vec<(String, ClassDef)>,
         begins: Vec<BeginDef>,
-        procs: Vec<ProcDef>,
+        mut procs: Vec<ProcDef>,
     ) {
-        let file = current_file_path().unwrap_or_else(|| "-e".into());
-        let defs = methods.iter().map(|(_, d)| d).chain(
+        // Everything this program defines was written in the file now running.
+        let file = Some(Arc::new(SourceFile {
+            path: current_file_path().unwrap_or_else(|| "-e".into()),
+            dir: current_file_dir().unwrap_or_default(),
+        }));
+        let defs = methods.iter_mut().map(|(_, d)| d).chain(
             classes
-                .iter()
-                .flat_map(|(_, c)| c.methods.values().chain(c.class_methods.values())),
+                .iter_mut()
+                .flat_map(|(_, c)| c.methods.values_mut().chain(c.class_methods.values_mut())),
         );
         for def in defs {
-            self.method_files.insert(def.chunk_id, file.clone());
+            def.file = file.clone();
+        }
+        for p in &mut procs {
+            p.file = file.clone();
         }
         for (name, def) in methods {
             self.methods.insert(name, def);
@@ -4974,8 +5021,8 @@ impl RubyHost {
     ) -> Option<(String, u32)> {
         match self.resolve_method_shape(recv, name, unbound)? {
             MethodShape::Def { def, .. } => {
-                let file = self.method_files.get(&def.chunk_id)?;
-                Some((file.clone(), def.line))
+                let file = def.file.as_ref()?;
+                Some((file.path.clone(), def.line))
             }
             _ => None,
         }
@@ -8912,6 +8959,9 @@ impl RubyHost {
                 };
                 format!("{cls}{sep}{m}")
             }
+            None if scope.is_some_and(|s| self.required_tops.contains(&s.frame_id)) => {
+                "<top (required)>".into()
+            }
             None => "<main>".into(),
         }
     }
@@ -12077,9 +12127,13 @@ fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
 /// Run the block template `id`'s body. The chunk is fetched from the host only
 /// when no pooled VM already holds it, so a repeated block call copies nothing.
 pub fn run_proc_chunk(id: usize) -> Result<Value, String> {
-    run_chunk_pooled(ChunkId::Proc(id), &[], || {
+    let file = with_host(|h| h.procs[id].file.clone());
+    let pushed = enter_code_file(file.as_deref());
+    let r = run_chunk_pooled(ChunkId::Proc(id), &[], || {
         with_host(|h| h.procs[id].chunk.clone())
-    })
+    });
+    leave_code_file(pushed);
+    r
 }
 
 /// Run a method's body chunk, seeding the leading frame slots with the call's
@@ -12091,9 +12145,12 @@ fn run_method_chunk(def: &MethodDef, args: &[Value]) -> Result<Value, String> {
     let seed: Vec<Value> = (0..n)
         .map(|i| args.get(i).cloned().unwrap_or(Value::Undef))
         .collect();
-    run_chunk_pooled(ChunkId::Method(def.chunk_id), &seed, || {
+    let pushed = enter_code_file(def.file.as_deref());
+    let r = run_chunk_pooled(ChunkId::Method(def.chunk_id), &seed, || {
         (*def.chunk).clone()
-    })
+    });
+    leave_code_file(pushed);
+    r
 }
 
 /// Build the VM for `chunk`, seed its leading frame slots with `slot_seed`
@@ -12306,6 +12363,8 @@ pub fn run_at_exit_handlers() -> Option<i32> {
 /// `throw` just ends that file's evaluation).
 pub fn run_required_main(chunk: Chunk) -> Result<Value, String> {
     let saved_active = with_host(|h| {
+        let frame_id = next_frame_id();
+        h.required_tops.insert(frame_id);
         h.frames.push(Frame {
             scope: Scope {
                 // A required file always runs at the top level with `self` = the
@@ -12318,7 +12377,7 @@ pub fn run_required_main(chunk: Chunk) -> Result<Value, String> {
                 self_obj: Value::Obj(0),
                 method_name: None,
                 def_class: None,
-                frame_id: next_frame_id(),
+                frame_id,
             },
             args: Vec::new(),
             line: 0,
@@ -15599,6 +15658,10 @@ struct CallSite {
     /// callee turns out to be a built-in that yields, MRI shows the built-in
     /// as a frame of its own (`-e:1:in 'Array#each'`), labelled from these.
     yielder: Option<(Value, String)>,
+    /// The label of a built-in that is running Ruby code of its own while
+    /// this call waits on it (`Kernel#require_relative` running the required
+    /// file): MRI lists the built-in as a frame between the two.
+    native: Option<&'static str>,
 }
 
 thread_local! {
@@ -15623,6 +15686,7 @@ pub fn enter_call_site(line: u32, yielder: Option<(Value, String)>) -> usize {
             frames,
             blocks,
             yielder,
+            native: None,
         });
         depth
     })
@@ -15636,6 +15700,26 @@ pub fn raise_backtrace(line: u32) -> Vec<LiveFrame> {
     let stack = live_backtrace();
     leave_call_site(depth);
     stack
+}
+
+/// Name the built-in the innermost call site is waiting on (see
+/// `CallSite::native`) until [`clear_native_frame`]. Called by a built-in
+/// from inside its own call, so that site is the built-in's.
+pub fn mark_native_frame(label: &'static str) {
+    CALL_SITES.with(|s| {
+        if let Some(site) = s.borrow_mut().last_mut() {
+            site.native = Some(label);
+        }
+    });
+}
+
+/// Undo [`mark_native_frame`] once the built-in's Ruby code has finished.
+pub fn clear_native_frame() {
+    CALL_SITES.with(|s| {
+        if let Some(site) = s.borrow_mut().last_mut() {
+            site.native = None;
+        }
+    });
 }
 
 /// Drop the call site [`enter_call_site`] recorded at `depth` — and any a
@@ -15683,6 +15767,13 @@ pub fn live_backtrace() -> Vec<LiveFrame> {
                     path: path.clone(),
                     line: site.line,
                     label,
+                });
+            }
+            if let Some(label) = site.native {
+                out.push(LiveFrame {
+                    path: path.clone(),
+                    line: site.line,
+                    label: label.to_string(),
                 });
             }
             let label = with_host(|h| h.context_at(site.frames, site.blocks));

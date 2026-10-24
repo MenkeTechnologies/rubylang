@@ -8674,3 +8674,31 @@ t { [[1, 2].pack("C#x\nC"), [3].pack("C # comment"), "\x01\x02".unpack("C#c\nC")
 t { [[2**70 + 65].pack("C"), [2**64 + 1].pack("c"), [0, 127, 128, 16383, 2**70].pack("w*").bytes, [2**70].pack("w").unpack("w")] }
 t { [-1].pack("w") }; t { [nil].pack("f") }; t { ["1.5"].pack("d") }; t { [:s].pack("e") }
 t { [[nil].pack("p"), [nil].pack("P").bytes, [nil, nil].pack("p2").size, [Rational(3, 2)].pack("e").bytes] }
+#==#
+# ── Hash#flatten(level): the pairs end to end, flattened level - 1 more; 0 is to_a, negative is full ──
+def t; p yield; rescue => e; p e; end
+h = {a: [1, [2]], b: 3}
+p h.flatten, h.flatten(0), h.flatten(1), h.flatten(2), h.flatten(-1), h.flatten(1.9), {}.flatten, {[1] => 2}.flatten
+t { h.flatten("x") }; t { h.flatten(1, 2) }
+#==#
+# ── Range#exclude_end? for every endpoint kind ──
+p (1...3).exclude_end?, (1..3).exclude_end?, ("a"..."c").exclude_end?, (1.0..2).exclude_end?, (1...).exclude_end?, (..5).exclude_end?, (nil..nil).exclude_end?
+#==#
+# ── Kernel#display writes self to $stdout (or the port) and answers nil ──
+1.display; [1, "a"].display; nil.display; :s.display; puts
+require "stringio"; io = StringIO.new; p 3.5.display(io), io.string
+#==#
+# ── Array#rfind: last match, ifnone, length re-read after each yield; index/rindex/rfind Enumerators re-run with the block ──
+def t; p yield; rescue => e; p e; end
+p [1, 2, 3].rfind { _1 < 3 }, [1, 2, 3].rfind { _1 > 5 }, [1, 2, 3].rfind(proc { :none }) { _1 > 5 }
+p [1, 2, 3].rfind, [1, 2, 3].rfind.size, [1, 2, 3].rfind.each { _1 < 3 }
+a = [1, 2, 3, 4]; seen = []; p a.rfind { |x| seen << x; a.pop(2) if x == 4; false }, seen
+t { [1].rfind(1, 2) { } }
+p [1, 2, 3].index.each { _1 > 1 }, [1, 2, 3].rindex.each { _1 < 3 }, [1, 2].index.size, [1, 2].rindex.size
+#==#
+# ── nil.to_r / to_c / rationalize; the real-number Complex view (real? imag rect conj i) on Integer, Float, Bignum, Rational ──
+def t; p yield; rescue => e; p e; end
+p nil.to_r, nil.to_c, nil.rationalize, nil.rationalize(0.1)
+t { nil.to_r(1) }; t { nil.rationalize(1, 2) }
+p 5.real?, 5.imag, 5.imaginary, 5.real, 5.conj, 5.conjugate, 5.rect, 5.rectangular, 5.i, 2.5.i, 2.5.rect, 2.5.real?
+p Rational(1, 2).imag, Rational(1, 2).i, Rational(1, 2).rect, Rational(1, 2).real?, (2**70).imag, (2**70).rect, (2**70).i

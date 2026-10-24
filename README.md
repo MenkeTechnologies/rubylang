@@ -403,7 +403,10 @@ reassigned `$stdout`, bare `%(…)` strings, and `__END__` are all implemented. 
 handlers run last-registered first as the program ends (after an uncaught
 exception too), and an exception carries the backtrace its raise unwound
 through, rendered by `full_message(highlight:, order:)` as MRI prints it and
-read back as `Thread::Backtrace::Location`s by `backtrace_locations`. An
+read back as `Thread::Backtrace::Location`s by `backtrace_locations`; a
+method or block written in a required file reports that file and its own lines
+wherever it is called from, under `<top (required)>` and the `Kernel#require`
+/ `#require_relative` / `#load` frame that ran it. An
 object's `singleton_class` reflects what `extend` and `def obj.m` did to it
 (`ancestors`, `include?`, `instance_methods(false)`, `Method#owner`), and
 `Object#singleton_method`, `#public_method` and `Module#included_modules` are

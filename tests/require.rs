@@ -289,3 +289,95 @@ fn required_file_locals_do_not_leak() {
     assert!(ok, "stderr: {stderr}");
     assert_eq!(stdout, "1\n");
 }
+
+/// `stdout` with `dir` (as given and canonicalized) stripped from every path,
+/// so a backtrace reads `lib.rb:1:in …` wherever the temp dir lives.
+fn relative_to(dir: &Path, stdout: &str) -> String {
+    let canon = std::fs::canonicalize(dir).unwrap();
+    stdout
+        .replace(&format!("{}/", canon.display()), "")
+        .replace(&format!("{}/", dir.display()), "")
+}
+
+#[test]
+fn frames_inside_a_required_file_name_that_file_and_the_require_call() {
+    // MRI's view (ruby 4.0): the required file's top level is `<top (required)>`
+    // with the `Kernel#require_relative` call as a frame of its own below it,
+    // and a method or block written in the required file reports that file's
+    // path and its own lines whoever calls it. Reading the file from the
+    // running one put every such frame in `main.rb` at the caller's lines.
+    let dir = fresh_dir("frames");
+    write(
+        &dir,
+        "lib.rb",
+        "puts caller(0)\n\
+         [1].each { puts caller(0).first }\n\
+         def libm\n  caller(0)\nend\n\
+         def lib_raise = raise(ArgumentError, \"from lib\")\n\
+         def lib_file = File.basename(__FILE__)\n",
+    );
+    let main = write(
+        &dir,
+        "main.rb",
+        "require_relative \"lib\"\n\
+         def mm = libm\n\
+         puts mm\n\
+         begin\n  lib_raise\nrescue => e\n  puts e.backtrace\nend\n\
+         p method(:libm).source_location.then { |f, l| [File.basename(f), l] }\n\
+         puts lib_file\n",
+    );
+    let (stdout, stderr, ok) = run(&main);
+    assert!(ok, "stderr: {stderr}");
+    assert_eq!(
+        relative_to(&dir, &stdout),
+        "lib.rb:1:in '<top (required)>'\n\
+         main.rb:1:in 'Kernel#require_relative'\n\
+         main.rb:1:in '<main>'\n\
+         lib.rb:2:in 'block in <top (required)>'\n\
+         lib.rb:4:in 'Object#libm'\n\
+         main.rb:2:in 'Object#mm'\n\
+         main.rb:3:in '<main>'\n\
+         lib.rb:6:in 'Object#lib_raise'\n\
+         main.rb:5:in '<main>'\n\
+         [\"lib.rb\", 3]\n\
+         lib.rb\n"
+    );
+}
+
+#[test]
+fn require_relative_inside_a_required_method_resolves_against_its_own_file() {
+    // `require_relative` is relative to the file the CALL is written in, and a
+    // method body runs in the file that defined it: `load_inner`, written in
+    // `lib/loader.rb`, finds `lib/inner.rb` even though `main.rb` calls it from
+    // the directory above. Its frames show `Kernel#require` for a plain
+    // `require` and `Kernel#load` for `load`.
+    let dir = fresh_dir("relmethod");
+    write(
+        &dir,
+        "lib/loader.rb",
+        "def load_inner = require_relative(\"inner\")\n",
+    );
+    write(&dir, "lib/inner.rb", "puts caller(0).first(3)\n");
+    write(&dir, "plain.rb", "puts caller(0).first(2)\n");
+    let main = write(
+        &dir,
+        "main.rb",
+        "require_relative \"lib/loader\"\n\
+         load_inner\n\
+         $LOAD_PATH.unshift __dir__\n\
+         require \"plain\"\n\
+         load \"#{__dir__}/plain.rb\"\n",
+    );
+    let (stdout, stderr, ok) = run(&main);
+    assert!(ok, "stderr: {stderr}");
+    assert_eq!(
+        relative_to(&dir, &stdout),
+        "lib/inner.rb:1:in '<top (required)>'\n\
+         lib/loader.rb:1:in 'Kernel#require_relative'\n\
+         lib/loader.rb:1:in 'Object#load_inner'\n\
+         plain.rb:1:in '<top (required)>'\n\
+         main.rb:4:in 'Kernel#require'\n\
+         plain.rb:1:in '<top (required)>'\n\
+         main.rb:5:in 'Kernel#load'\n"
+    );
+}

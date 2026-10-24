@@ -403,6 +403,7 @@ fn m_from(
             chunk: std::sync::Arc::new(chunk),
             slot_params,
             line,
+            file: None,
         },
     )
 }
@@ -564,6 +565,7 @@ fn from_cprog(cp: CProg) -> Program {
                         locals,
                     },
                     block_depth,
+                    file: None,
                 },
             )
             .collect(),
