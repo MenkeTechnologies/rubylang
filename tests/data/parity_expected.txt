@@ -7899,3 +7899,103 @@ nil
 "#<Proc:X (lambda)>"
 "#<Proc:X>"
 true
+#==#
+16
+#<Encoding:BINARY (ASCII-8BIT)>
+["abc", nil]
+true
+["abc", nil]
+[nil]
+#<ArgumentError: no associated pointer>
+[]
+["h"]
+["hel"]
+["hello"]
+["hello"]
+[""]
+[]
+#<Encoding:BINARY (ASCII-8BIT)>
+#<Encoding:UTF-8>
+[]
+#<ArgumentError: too short buffer for P(2 for 3)>
+#<ArgumentError: too short buffer for P(0 for 1)>
+"\x00\x00\x00\x00\x00\x00\x00\x00"
+#<TypeError: no implicit conversion of Integer into String>
+#<ArgumentError: too few arguments>
+["abc"]
+#<ArgumentError: no associated pointer>
+[nil]
+1
+["ab", "cd"]
+#==#
+[:@a]
+1
+1
+[]
+true
+[:@b]
+[:@b]
+2
+[]
+[:@c]
+[:@c]
+1
+#==#
+false
+false
+true
+"litx"
+off: 
+append: [:deprecated] -e:7: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+
+upcase_bang_nochange: [:deprecated] -e:8: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+
+sub_bang_nomatch: [:deprecated] -e:9: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+
+freeze: 
+ivar_set: [:deprecated] -e:11: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+
+singleton_def: [:deprecated] -e:12: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+
+singleton_class: [:deprecated] -e:13: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+
+extend: [:deprecated] -e:14: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+
+dup: 
+clone: [:deprecated] -e:16: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+
+clone_unfreeze: 
+interp: 
+heredoc: [:deprecated] -e:19: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+
+percent_w: [:deprecated] -e:22: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+[:deprecated] -e:22: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+
+adjacent: [:deprecated] -e:23: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+
+bytes_literal: [:deprecated] -e:24: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+
+uplus: 
+string_new: 
+to_s: [:deprecated] -e:27: warning: literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)
+
+sym_to_s: [:deprecated] -e:28: warning: string returned by :abc.to_s will be frozen in the future
+[:deprecated] -e:28: warning: string returned by :a b.to_s will be frozen in the future
+[:deprecated] -e:28: warning: string returned by :s.to_s will be frozen in the future
+
+sym_name: true
+true
+false
+
+#==#
+true
+"q"
+"r"
+"1"
+""
+#<TypeError: can't convert B to String (B#to_s gives Integer)>
+#<TypeError: can't convert BS to String (BS#to_str gives Integer)>
+"sym"
+"[1, \"a\"]"
+"1.5"
+#<Encoding:BINARY (ASCII-8BIT)>

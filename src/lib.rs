@@ -90,6 +90,9 @@ pub struct RunConfig {
     /// `--enable`/`--disable-frozen-string-literal`: what a file with no
     /// `# frozen_string_literal:` comment compiles as. MRI's default is off.
     pub frozen_string_literal: bool,
+    /// Whether an `--enable`/`--disable-frozen-string-literal` switch was
+    /// given at all. Without one, a file with no comment chills its literals.
+    pub frozen_string_literal_switched: bool,
     /// Report a script that does not parse the way the `ruby` command does —
     /// `<script>: <message> (SyntaxError)` — rather than as the bare parser
     /// message an embedder gets.
@@ -106,6 +109,7 @@ impl Default for RunConfig {
             warn_level: DEFAULT_WARN_LEVEL,
             debug: false,
             frozen_string_literal: false,
+            frozen_string_literal_switched: false,
             report_syntax_errors: false,
         }
     }
@@ -135,6 +139,7 @@ fn seed_verbosity(cfg: &RunConfig) {
     });
     host::reset_warning_categories(cfg.warn_level);
     compiler::set_default_frozen_string_literals(cfg.frozen_string_literal);
+    compiler::set_default_chilled_string_literals(!cfg.frozen_string_literal_switched);
 }
 
 /// Compile a source string to a runnable program.
@@ -145,9 +150,13 @@ fn seed_verbosity(cfg: &RunConfig) {
 /// `--enable-frozen-string-literal`, a file whose comment says `false` still
 /// gets unfrozen literals.
 pub fn compile(src: &str) -> Result<compiler::Program, String> {
-    let frozen =
-        frozen_string_literal_comment(src).unwrap_or_else(compiler::default_frozen_string_literals);
+    let comment = frozen_string_literal_comment(src);
+    let frozen = comment.unwrap_or_else(compiler::default_frozen_string_literals);
     compiler::set_frozen_string_literals(frozen);
+    // Ruby 3.4+: with neither a comment nor a switch, literals are chilled.
+    compiler::set_chilled_string_literals(
+        comment.is_none() && compiler::default_chilled_string_literals(),
+    );
     let stmts = parser::parse(src)?;
     compiler::compile(&stmts, false)
 }

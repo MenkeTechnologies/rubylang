@@ -8786,3 +8786,55 @@ p q.source_location, ->(z) { z }.source_location, :upcase.to_proc.source_locatio
 o = Object.new; o.define_singleton_method(:z) { }; p o.method(:z).source_location
 h = ->(s) { s.inspect.sub(/0x\h+/, "X") }
 p h[q], h[lambda { }], h[:upcase.to_proc], h[:"a b".to_proc], h[proc { }.curry], h[lambda { }.curry], h[q >> q], q.to_s == q.inspect
+#==#
+# ── pack("p"/"P") of a String: an address unpack("p"/"P") hands back through the associates pack leaves (dup keeps them) ──
+def t; p yield; rescue => e; p e; end
+s = "abc"; pk = [s, nil].pack("pp"); p pk.size, pk.encoding, pk.unpack("pp"), pk.unpack1("p").equal?(s)
+t { pk.unpack("p*") }; t { ("\0" * 8).unpack("p") }; t { ("\1" * 8).unpack("p") }; t { "abc".unpack("p") }
+q = ["hello"].pack("P"); t { q.unpack("P") }; t { q.unpack("P3") }; t { q.unpack("P9") }; t { q.unpack("P*") }; t { q.unpack("P0") }; t { (q + "abc").unpack("x8P") }
+t { q.unpack("P")[0].encoding }; t { q.unpack("P9")[0].encoding }; t { q.unpack("P2")[0].unpack("P") }
+t { ["hi"].pack("P3") }; t { [""].pack("P*") }; t { [nil].pack("P") }; t { [1].pack("p") }; t { ["a"].pack("p2") }
+t { [s].pack("p").dup.unpack("p") }; t { ([s].pack("p") + "").unpack("p") }; t { pk.byteslice(8, 8).unpack("p") }
+t { [s, s].pack("pp").unpack("pp").map(&:object_id).uniq.size }; t { ["ab", "cd"].pack("p*").unpack("p*") }
+#==#
+# ── a built-in object's instance variables: listed by instance_variables, copied by dup/clone ──
+s = +"x"; s.instance_variable_set(:@a, 1); p s.instance_variables, s.dup.instance_variable_get(:@a), s.clone.instance_variable_get(:@a), (s + "").instance_variables, s.instance_variable_defined?(:@a)
+a = [1]; a.instance_variable_set(:@b, 2); p a.instance_variables, a.dup.instance_variables, a.clone.instance_variable_get(:@b), a.map { _1 }.instance_variables
+h = {}; h.instance_variable_set(:@c, 3); p h.dup.instance_variables, h.instance_variables
+d = s.dup; d.instance_variable_set(:@a, 9); p s.instance_variable_get(:@a)
+#==#
+# ── chilled string literals (Ruby 3.4+): not frozen, +@ copies, first change warns under Warning[:deprecated] (once), clone keeps the chill ──
+def Warning.warn(m, category: :none) = print("[#{category.inspect}] ", m)
+def t(label) = (print(label, ": "); yield; puts)
+s = "lit"; p s.frozen?, (+s).equal?(s), (-s).frozen?; s << "x"; p s
+t(:off) { a = "a"; a << "b" }
+Warning[:deprecated] = true
+t(:append) { a = "x"; a << "y"; a << "z" }
+t(:upcase_bang_nochange) { a = "X"; a.upcase! }
+t(:sub_bang_nomatch) { a = "t"; a.sub!("z", "") }
+t(:freeze) { a = "u"; a.freeze }
+t(:ivar_set) { a = "v"; a.instance_variable_set(:@a, 1) }
+t(:singleton_def) { a = "x"; def a.foo; end }
+t(:singleton_class) { a = "y"; a.singleton_class }
+t(:extend) { a = "z"; a.extend(Comparable) }
+t(:dup) { a = "a"; a.dup << "b" }
+t(:clone) { a = "b"; a.clone << "c" }
+t(:clone_unfreeze) { a = "b"; a.clone(freeze: false) << "c" }
+t(:interp) { a = "h#{1}"; a << "x" }
+t(:heredoc) { a = <<~E; a << "x" }
+  hd
+E
+t(:percent_w) { %w[a b].each { _1 << "!" } }
+t(:adjacent) { a = "a" "b"; a << "x" }
+t(:bytes_literal) { a = "\xff"; a << "x" }
+t(:uplus) { a = "a"; b = +a; b << "x" }
+t(:string_new) { a = String.new("abc"); a << "x" }
+t(:to_s) { a = "a"; a.to_s << "x" }
+t(:sym_to_s) { a = :abc.to_s; a << "x"; :"a b".to_s << "y"; String(:s) << "w" }
+t(:sym_name) { p :a.name.frozen?, :a.name.equal?(:a.name), :a.to_s.equal?(:a.to_s) }
+#==#
+# ── Kernel#String is rb_String: a String itself, then to_str, then the object's to_s; a non-String answer is a TypeError ──
+def t; p yield; rescue => e; p e; end
+class Q; def to_s = "q"; end; class R; def to_str = "r"; end; class B; def to_s = 5; end; class BS; def to_str = 6; end
+s = +"x"; t { String(s).equal?(s) }; t { String(Q.new) }; t { String(R.new) }; t { String(1) }; t { String(nil) }; t { String(B.new) }; t { String(BS.new) }; t { String(:sym) }; t { String([1, "a"]) }
+t { String(1.5) }; t { String("é".b).encoding }

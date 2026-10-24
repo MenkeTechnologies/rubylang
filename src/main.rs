@@ -85,6 +85,7 @@ fn run() -> ExitCode {
         warn_level: cli.warn_level,
         debug: cli.debug,
         frozen_string_literal: cli.frozen_string_literal,
+        frozen_string_literal_switched: cli.frozen_string_literal_switched,
         report_syntax_errors: true,
     };
 

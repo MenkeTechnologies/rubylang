@@ -146,6 +146,9 @@ pub mod ops {
     pub const GETCVAR: u16 = 41; // [name] -> class variable of self's class
     pub const SETCVAR: u16 = 42; // [name, value] -> set class variable
     pub const DEFINED_DESC: u16 = 43; // [kind, name] -> `defined?` description or nil
+                                      // A non-interpolated literal in a file with no `frozen_string_literal`
+                                      // comment (Ruby 3.4+): a chilled String, which warns on its first change.
+    pub const MKSTRC: u16 = 64; // [parts...] argc=n -> chilled heap String
     pub const DEFINE_SINGLETON: u16 = 44; // [recv, name, synth] -> :name; def obj.m / def Klass.m
     pub const DEFINE_METHOD_DYN: u16 = 45; // [name, synth] -> :name; def under active eval target
     pub const FIRE_HOOK: u16 = 46; // [module, hook, target] -> nil; inherited/included/extended/prepended
@@ -1790,6 +1793,20 @@ pub struct RubyHost {
     /// accessor silently drops the value and every request loses its execution
     /// state. `RObj::Object` keeps its own inline `ivars`; this covers the rest.
     obj_ivars: IndexMap<u32, IndexMap<String, Value>>,
+    /// The Strings a `pack("p")`/`("P")` result points at, by the result's heap
+    /// id — MRI's hidden `__associated__` ivar, which `unpack("p")` reads back
+    /// and `dup`/`clone` copy with the other instance variables.
+    pack_associates: HashMap<u32, Vec<Value>>,
+    /// The chilled Strings (Ruby 3.4+ literals), one bit per heap id: not
+    /// frozen, but the first change warns `literal string will be frozen in the
+    /// future` under `Warning[:deprecated]` and leaves an ordinary String.
+    chilled: Vec<u64>,
+    /// The chilled Strings `Symbol#to_s` made, by heap id, with the Symbol's
+    /// name: their warning reads `string returned by :sym.to_s will be frozen
+    /// in the future`.
+    chilled_symbol_strings: HashMap<u32, String>,
+    /// `Symbol#name`: one frozen String per Symbol, as MRI's fstring is.
+    symbol_names: HashMap<String, Value>,
     /// `alias_method`/`alias` mappings: class → alias name → target method name.
     method_aliases: IndexMap<String, IndexMap<String, String>>,
     /// For an alias whose target is a USER method (the body is copied under the
@@ -2618,6 +2635,10 @@ impl RubyHost {
             singleton_define_methods: IndexMap::new(),
             class_define_methods: IndexMap::new(),
             obj_ivars: IndexMap::new(),
+            pack_associates: HashMap::new(),
+            chilled: Vec::new(),
+            chilled_symbol_strings: HashMap::new(),
+            symbol_names: HashMap::new(),
             method_aliases: IndexMap::new(),
             alias_originals: IndexMap::new(),
             module_function_modules: std::collections::HashSet::new(),
@@ -2862,6 +2883,17 @@ impl RubyHost {
             Some(obj) => {
                 let copy = obj.clone();
                 let new = self.alloc(copy);
+                // `init_copy` copies the instance variables a built-in object
+                // keeps outside itself (`rb_copy_generic_ivar`), the hidden
+                // `pack("p")` associates among them.
+                if let (Value::Obj(src), Value::Obj(dst)) = (v, &new) {
+                    if let Some(iv) = self.obj_ivars.get(src).cloned() {
+                        self.obj_ivars.insert(*dst, iv);
+                    }
+                    if let Some(a) = self.pack_associates.get(src).cloned() {
+                        self.pack_associates.insert(*dst, a);
+                    }
+                }
                 // Preserve a native-backed builtin-subclass override (`class
                 // Params < Hash`): the copy must report the same class, or a
                 // `dup`/`merge` on a `Sinatra::IndifferentHash` degrades to a
@@ -8857,7 +8889,95 @@ impl RubyHost {
                 .get(cls)
                 .map(|m| m.keys().map(|k| format!("@{k}")).collect())
                 .unwrap_or_default(),
-            _ => Vec::new(),
+            // Any other heap object keeps its instance variables in the side
+            // table (`set_ivar_of`).
+            _ => match obj {
+                Value::Obj(i) => self
+                    .obj_ivars
+                    .get(i)
+                    .map(|m| m.keys().map(|k| format!("@{k}")).collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            },
+        }
+    }
+    /// The Strings `pack("p")` left `v` pointing at (see `pack_associates`).
+    pub fn pack_associates(&self, v: &Value) -> Option<Vec<Value>> {
+        match v {
+            Value::Obj(id) => self.pack_associates.get(id).cloned(),
+            _ => None,
+        }
+    }
+    /// Mark the String `v` chilled (see `chilled`).
+    pub fn mark_chilled(&mut self, v: &Value) {
+        if let Value::Obj(id) = v {
+            let (word, bit) = (*id as usize / 64, *id % 64);
+            if self.chilled.len() <= word {
+                self.chilled.resize(word + 1, 0);
+            }
+            self.chilled[word] |= 1 << bit;
+        }
+    }
+    /// Mark the String `v`, which `Symbol#to_s` answered for `sym`, chilled.
+    pub fn mark_chilled_symbol(&mut self, v: &Value, sym: &str) {
+        if let Value::Obj(id) = v {
+            self.chilled_symbol_strings.insert(*id, sym.to_string());
+        }
+    }
+    /// Whether `v` is a chilled String (a literal's or `Symbol#to_s`'s).
+    pub fn is_chilled(&self, v: &Value) -> bool {
+        self.chill_of(v).is_some()
+    }
+    /// What chilled `v`: `Some(None)` a literal, `Some(Some(sym))` the
+    /// `Symbol#to_s` of `sym`, `None` nothing.
+    pub fn chill_of(&self, v: &Value) -> Option<Option<String>> {
+        let Value::Obj(id) = v else {
+            return None;
+        };
+        if let Some(sym) = self.chilled_symbol_strings.get(id) {
+            return Some(Some(sym.clone()));
+        }
+        self.chilled
+            .get(*id as usize / 64)
+            .is_some_and(|w| w & (1 << (id % 64)) != 0)
+            .then_some(None)
+    }
+    /// Clear `v`'s chilled mark, answering what it was (see [`Self::chill_of`]):
+    /// what MRI's frozen check does to a chilled String it is about to change.
+    pub fn unchill(&mut self, v: &Value) -> Option<Option<String>> {
+        let was = self.chill_of(v)?;
+        if let Value::Obj(id) = v {
+            match was {
+                Some(_) => {
+                    self.chilled_symbol_strings.remove(id);
+                }
+                None => self.chilled[*id as usize / 64] &= !(1 << (id % 64)),
+            }
+        }
+        Some(was)
+    }
+    /// Give the copy `to` of a chilled String `from` the same chill.
+    pub fn copy_chill(&mut self, from: &Value, to: &Value) {
+        match self.chill_of(from) {
+            Some(Some(sym)) => self.mark_chilled_symbol(to, &sym),
+            Some(None) => self.mark_chilled(to),
+            None => {}
+        }
+    }
+    /// `Symbol#name`: the Symbol's one frozen name String.
+    pub fn symbol_name_string(&mut self, sym: &str) -> Value {
+        if let Some(v) = self.symbol_names.get(sym) {
+            return v.clone();
+        }
+        let v = self.new_string(sym.to_string());
+        self.freeze_value(&v);
+        self.symbol_names.insert(sym.to_string(), v.clone());
+        v
+    }
+    /// Record the Strings the packed String `v` points at.
+    pub fn set_pack_associates(&mut self, v: &Value, associates: Vec<Value>) {
+        if let Value::Obj(id) = v {
+            self.pack_associates.insert(*id, associates);
         }
     }
     /// Bind method parameters to the call arguments, honoring a single `*splat`

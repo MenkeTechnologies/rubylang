@@ -36,6 +36,9 @@ pub struct Cli {
     /// `all` and comma-list spellings): what a file with no
     /// `# frozen_string_literal:` comment compiles as. Last switch wins.
     pub frozen_string_literal: bool,
+    /// Whether any such switch was given: without one, a file with no comment
+    /// chills its literals (Ruby 3.4+).
+    pub frozen_string_literal_switched: bool,
     /// `-n` — wrap the program in `while gets; … end`.
     pub loop_n: bool,
     /// `-p` — like `-n` but print `$_` at the end of each iteration.
@@ -108,6 +111,7 @@ fn apply_feature(cli: &mut Cli, arg: &str, on: bool, switch: &str) {
         let feature = raw.trim().replace('-', "_");
         if feature == "all" {
             cli.frozen_string_literal = on;
+            cli.frozen_string_literal_switched = true;
             // `rubyopt` is deliberately NOT toggled by `all`: it is answered by
             // the pre-scan below, before this parser ever runs.
             continue;
@@ -121,6 +125,7 @@ fn apply_feature(cli: &mut Cli, arg: &str, on: bool, switch: &str) {
         }
         if feature == "frozen_string_literal" {
             cli.frozen_string_literal = on;
+            cli.frozen_string_literal_switched = true;
         }
         // Every other feature is accepted with no effect: rubylang has no
         // RubyGems to disable, no YJIT/ZJIT, and no did_you_mean/error_highlight

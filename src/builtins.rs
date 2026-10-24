@@ -46,6 +46,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::CALL_METHOD_BLK, b_call_method_blk);
     vm.register_builtin(ops::MKSTR, b_mkstr);
     vm.register_builtin(ops::MKSTRF, b_mkstrf);
+    vm.register_builtin(ops::MKSTRC, b_mkstrc);
     vm.register_builtin(ops::MKSYM, b_mksym);
     vm.register_builtin(ops::MKARRAY, b_mkarray);
     vm.register_builtin(ops::MKHASH, b_mkhash);
@@ -1161,6 +1162,9 @@ fn b_define_singleton(vm: &mut VM, _: u8) -> Value {
     let Some(def) = with_host(|h| h.method_def(&synth)) else {
         return abort(vm, format!("internal: missing method body '{synth}'"));
     };
+    if let Err(e) = at_call_site(vm, None, || unchill(&recv)) {
+        return abort(vm, e);
+    }
     // A frozen object's singleton class is frozen too: no method may be added.
     if with_host(|h| h.classref_name(&recv).is_none() && h.is_frozen(&recv)) {
         let (cls, insp) = with_host(|h| (h.class_of(&recv), h.inspect(&recv)));
@@ -1439,6 +1443,13 @@ fn b_mkstr(vm: &mut VM, argc: u8) -> Value {
 fn b_mkstrf(vm: &mut VM, argc: u8) -> Value {
     let s = b_mkstr(vm, argc);
     with_host(|h| h.freeze_value(&s));
+    s
+}
+/// A non-interpolated literal in a file with no `frozen_string_literal`
+/// comment and no switch: Ruby 3.4+'s chilled String.
+fn b_mkstrc(vm: &mut VM, argc: u8) -> Value {
+    let s = b_mkstr(vm, argc);
+    with_host(|h| h.mark_chilled(&s));
     s
 }
 fn b_mksym(vm: &mut VM, _: u8) -> Value {
@@ -2787,6 +2798,9 @@ fn dispatch_resolved(
                 // `nil.to_s` / `true.to_s` / `false.to_s` are frozen strings.
                 if matches!(recv, Value::Undef | Value::Bool(_)) {
                     h.freeze_value(&out);
+                } else if let Some(sym) = h.as_symbol(recv) {
+                    // Ruby 3.4+: `Symbol#to_s` answers a chilled String.
+                    h.mark_chilled_symbol(&out, &sym);
                 }
                 out
             }));
@@ -2953,8 +2967,10 @@ fn dispatch_resolved(
         // frozen (`buf = +""` under frozen_string_literal), else the receiver
         // itself; a no-op returning self for every other type (numbers included).
         "+@" if args.is_empty() => {
-            if with_host(|h| h.dispatch_class(recv)) == "String" && with_host(|h| h.is_frozen(recv))
-            {
+            // `str_uplus`: a frozen or chilled String answers a copy.
+            if with_host(|h| {
+                h.dispatch_class(recv) == "String" && (h.is_frozen(recv) || h.is_chilled(recv))
+            }) {
                 return Ok(with_host(|h| h.dup_value(recv)));
             }
             return Ok(recv.clone());
@@ -3023,6 +3039,10 @@ fn dispatch_resolved(
             run_copy_hook(&copy, recv, "initialize_clone")?;
             if freeze {
                 with_host(|h| h.freeze_value(&copy));
+            } else if freeze_opt.is_none() {
+                // A chilled String's clone is chilled too; `freeze: false`
+                // makes an ordinary one.
+                with_host(|h| h.copy_chill(recv, &copy));
             }
             return Ok(copy);
         }
@@ -3076,6 +3096,7 @@ fn dispatch_resolved(
                     &[("receiver", recv.clone())],
                 ));
             }
+            unchill(recv)?;
             let key = ivar_name_arg(&args[0])?;
             let val = args[1].clone();
             with_host(|h| h.set_ivar_of(recv, &key, val.clone()));
@@ -3322,6 +3343,7 @@ fn dispatch_resolved(
         // name is stable for the object's lifetime and unique between objects —
         // which is what lets `class << obj` reopen the SAME metaclass twice.
         "singleton_class" if args.is_empty() && with_host(|h| h.classref_name(recv)).is_none() => {
+            unchill(recv)?;
             return match recv {
                 Value::Undef => Ok(with_host(|h| h.class_ref("NilClass"))),
                 Value::Bool(b) => Ok(with_host(|h| {
@@ -3885,6 +3907,7 @@ fn dispatch_resolved(
         {
             // eval.c `rb_obj_extend`: the modules are applied LAST first, each
             // followed by its `extended` hook.
+            unchill(recv)?;
             if let Value::Obj(id) = recv {
                 for a in args.iter().rev() {
                     if let Some(mname) = with_host(|h| h.classref_name(a)) {
@@ -10205,8 +10228,10 @@ fn b_mkbstr(vm: &mut VM, argc: u8) -> Value {
         }
     }
     let s = with_host(|h| h.new_utf8_from_bytes(bytes));
-    if kinds.starts_with('F') {
-        with_host(|h| h.freeze_value(&s));
+    match kinds.chars().next() {
+        Some('F') => with_host(|h| h.freeze_value(&s)),
+        Some('C') => with_host(|h| h.mark_chilled(&s)),
+        _ => {}
     }
     s
 }
@@ -10495,6 +10520,25 @@ fn dispatch_string_bytes(
         // Appending to a byte String whose encoding the operand cannot change:
         // the same label, or ASCII. Anything that relabels goes the long way.
         ("<<", [arg]) => {
+            // Text onto text cannot change the encoding: append in place. The
+            // general path copies the receiver first, which made a loop of
+            // `buf << s` quadratic in the length of `buf`.
+            use crate::rstr::RStr;
+            let add = with_host(|h| match (h.rstr(recv), h.rstr(arg)) {
+                (Some(RStr::Text(_)), Some(RStr::Text(t))) => Some(t.clone()),
+                _ => None,
+            });
+            if let Some(add) = add {
+                if let Err(e) = frozen_guard(recv, name, STRING_MUTATORS) {
+                    return Some(Err(e));
+                }
+                with_host(|h| {
+                    if let Some(RStr::Text(t)) = h.rstr_mut(recv) {
+                        t.push_str(&add);
+                    }
+                });
+                return Some(Ok(recv.clone()));
+            }
             let (recv_enc, arg_bytes, arg_enc) = with_host(|h| {
                 Some((
                     h.string_encoding(recv)?,
@@ -10859,7 +10903,7 @@ fn dispatch_string_body(
                     off as usize
                 }
             };
-            let out = unpack_bytes_from(&bytes, &fmt, start)?;
+            let out = unpack_bytes_from(&bytes, &fmt, start, recv)?;
             Ok(if name == "unpack" {
                 new_arr(out)
             } else {
@@ -14625,11 +14669,16 @@ fn dispatch_array(
                 }
                 frozen_guard(&buf, "<<", STRING_MUTATORS)?;
                 let start = with_host(|h| h.string_bytes(&buf));
-                let bytes = pack_bytes_into(&arr, &fmt, start)?;
+                let mut associates = Vec::new();
+                let bytes = pack_bytes_into(&arr, &fmt, start, &mut associates)?;
                 store_bytes(&buf, bytes);
+                if !associates.is_empty() {
+                    with_host(|h| h.set_pack_associates(&buf, associates));
+                }
                 return Ok(buf);
             }
-            let bytes = pack_bytes(&arr, &fmt)?;
+            let mut associates = Vec::new();
+            let bytes = pack_bytes(&arr, &fmt, &mut associates)?;
             // A template that OPENS with `U` answers a UTF-8 string
             // (`[233].pack("U")` is `"é"`), whatever follows it.
             if fmt.trim_start().starts_with('U') {
@@ -14652,7 +14701,12 @@ fn dispatch_array(
                     .chars()
                     .all(|c| matches!(c, 'm' | 'M' | 'u') || c.is_ascii_digit() || c == '*');
             let enc = if text_only { "US-ASCII" } else { "ASCII-8BIT" };
-            with_host(|h| h.set_string_encoding(&s, enc));
+            with_host(|h| {
+                h.set_string_encoding(&s, enc);
+                if !associates.is_empty() {
+                    h.set_pack_associates(&s, associates);
+                }
+            });
             Ok(s)
         }
         "sort" | "sort!" => {
@@ -25440,7 +25494,14 @@ fn dispatch_str_range(
 fn dispatch_symbol(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     let s = with_host(|h| h.as_symbol(recv).unwrap_or_default());
     match name {
-        "to_s" | "id2name" | "name" => Ok(new_str(s)),
+        // Ruby 3.4+: `to_s` answers a chilled String, `name` the Symbol's one
+        // frozen String.
+        "to_s" | "id2name" => Ok(with_host(|h| {
+            let v = h.new_string(s.clone());
+            h.mark_chilled_symbol(&v, &s);
+            v
+        })),
+        "name" => Ok(with_host(|h| h.symbol_name_string(&s))),
         // A Symbol whose name is 7-bit is US-ASCII, as MRI interns it.
         "encoding" => Ok(encoding_object(if s.is_ascii() {
             "US-ASCII"
@@ -27533,10 +27594,30 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             }
             Ok(with_host(|h| h.new_complex(re, im)))
         }
-        "String" => Ok(with_host(|h| {
-            let s = h.to_s(&args[0]);
-            h.new_string(s)
-        })),
+        // object.c `rb_String`: a String is itself, then `to_str`
+        // (`rb_check_string_type`), then the object's `to_s` method; a
+        // conversion that answers a non-String is a TypeError naming it.
+        "String" => {
+            let v = &args[0];
+            if with_host(|h| h.as_str(v)).is_some() {
+                return Ok(v.clone());
+            }
+            let converted = |meth: &str| -> Result<Value, String> {
+                let r = dispatch(v, meth, &[], None)?;
+                if with_host(|h| h.as_str(&r)).is_some() {
+                    return Ok(r);
+                }
+                let (cls, got) = with_host(|h| (h.class_of(v), h.class_of(&r)));
+                Err(raise_exc(
+                    "TypeError",
+                    &format!("can't convert {cls} to String ({cls}#{meth} gives {got})"),
+                ))
+            };
+            if defines_own(v, "to_str") {
+                return converted("to_str");
+            }
+            converted("to_s")
+        }
         // The array a parallel assignment or a destructuring param unpacks a
         // single value as: MRI's `rb_check_array_type`, i.e. `to_ary` and
         // nothing else. An Array is itself; an object with its own `to_ary` is
@@ -31758,13 +31839,29 @@ fn pack_str_arg(items: &[Value], idx: usize) -> Result<Vec<u8>, String> {
     }
 }
 
-fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
-    pack_bytes_into(items, fmt, Vec::new())
+fn pack_bytes(items: &[Value], fmt: &str, associates: &mut Vec<Value>) -> Result<Vec<u8>, String> {
+    pack_bytes_into(items, fmt, Vec::new(), associates)
+}
+
+/// The address a `p`/`P` directive packs for the String `v`: a stand-in for
+/// MRI's `RSTRING_PTR`, distinct per String object and never NULL.
+fn pack_pointer(v: &Value) -> u64 {
+    match v {
+        Value::Obj(id) => crate::host::RubyHost::heap_address(*id),
+        _ => 0,
+    }
 }
 
 /// [`pack_bytes`] appending to `out` (`pack(fmt, buffer:)`), whose length is
-/// where `@` positions count from.
-fn pack_bytes_into(items: &[Value], fmt: &str, mut out: Vec<u8>) -> Result<Vec<u8>, String> {
+/// where `@` positions count from. Each String a `p`/`P` directive packs the
+/// address of is pushed onto `associates` — the list MRI keeps on the result
+/// so `unpack("p")` can hand the String back.
+fn pack_bytes_into(
+    items: &[Value],
+    fmt: &str,
+    mut out: Vec<u8>,
+    associates: &mut Vec<Value>,
+) -> Result<Vec<u8>, String> {
     let mut idx = 0usize; // next array element to consume
     for d in parse_pack_template(fmt)? {
         match d.kind {
@@ -31778,24 +31875,39 @@ fn pack_bytes_into(items: &[Value], fmt: &str, mut out: Vec<u8>) -> Result<Vec<u
                     idx += 1;
                 }
             }
-            // A pointer: only a NULL (`nil`) has a value rubylang can spell.
+            // pack.c `p`/`P`: the address of each String (NULL for nil), the
+            // String kept as an associate. `P`'s count is the length of the
+            // structure pointed to, checked against the String, and it packs
+            // one pointer.
             'p' | 'P' => {
-                let n = d.count.unwrap_or(items.len().saturating_sub(idx));
-                for _ in 0..n.max(usize::from(d.kind == 'P')) {
-                    match items.get(idx) {
-                        Some(Value::Undef) => out.extend_from_slice(&[0; 8]),
-                        Some(_) => {
+                let n = if d.kind == 'P' {
+                    if items.get(idx).is_some_and(|v| !matches!(v, Value::Undef)) {
+                        let have = pack_str_arg(items, idx)?.len();
+                        // `P*` is `P1` (pack.c gives `*` a length of 1 for `PMm`).
+                        let len = d.count.unwrap_or(1);
+                        if have < len {
                             return Err(raise_exc(
-                                "NotImplementedError",
-                                "pack('p') of a String's address is not supported",
-                            ))
+                                "ArgumentError",
+                                &format!("too short buffer for P({have} for {len})"),
+                            ));
                         }
-                        None => return Err(pack_too_few()),
                     }
+                    1
+                } else {
+                    d.count.unwrap_or(items.len().saturating_sub(idx))
+                };
+                for _ in 0..n {
+                    let from = items.get(idx).cloned().ok_or_else(pack_too_few)?;
+                    let addr = match &from {
+                        Value::Undef => 0,
+                        v => {
+                            pack_str_arg(items, idx)?;
+                            pack_pointer(v)
+                        }
+                    };
+                    associates.push(from);
+                    out.extend_from_slice(&addr.to_ne_bytes());
                     idx += 1;
-                    if d.kind == 'P' {
-                        break;
-                    }
                 }
             }
             // A string: `a` NUL-pads (and NUL is the truncation fill), `A` space-
@@ -32211,7 +32323,24 @@ fn unpack_str(s: String, enc: &'static str) -> Value {
 /// `String#unpack` core: read `bytes` per the template into Ruby values.
 /// `String#unpack`, reading from byte `start` (`unpack(fmt, offset:)`); `@`
 /// positions still count from the start of the string.
-fn unpack_bytes_from(bytes: &[u8], fmt: &str, start: usize) -> Result<Vec<Value>, String> {
+/// The String a packed pointer `t` names, from the associates `pack` left on
+/// the unpacked String `src` (pack.c `str_associated` / `associated_pointer`).
+fn associated_pointer(src: &Value, t: u64) -> Result<Value, String> {
+    let Some(associates) = with_host(|h| h.pack_associates(src)) else {
+        return Err(raise_exc("ArgumentError", "no associated pointer"));
+    };
+    associates
+        .into_iter()
+        .find(|v| with_host(|h| h.as_str(v)).is_some() && pack_pointer(v) == t)
+        .ok_or_else(|| raise_exc("ArgumentError", "non associated pointer"))
+}
+
+fn unpack_bytes_from(
+    bytes: &[u8],
+    fmt: &str,
+    start: usize,
+    src: &Value,
+) -> Result<Vec<Value>, String> {
     let mut out = Vec::new();
     let mut pos = start;
     for d in parse_pack_template(fmt)? {
@@ -32543,6 +32672,46 @@ fn unpack_bytes_from(bytes: &[u8], fmt: &str, start: usize) -> Result<Vec<Value>
                 pos += take.div_ceil(2);
                 out.push(unpack_str(s, "US-ASCII"));
             }
+            // pack.c `p`: each pointer is nil (NULL) or the associated String;
+            // `*` reads every whole pointer left.
+            'p' => {
+                let room = bytes.len().saturating_sub(pos) / 8;
+                for _ in 0..d.count.map_or(room, |n| n.min(room)) {
+                    let t = u64::from_ne_bytes(bytes[pos..pos + 8].try_into().expect("8 bytes"));
+                    pos += 8;
+                    out.push(if t == 0 {
+                        Value::Undef
+                    } else {
+                        associated_pointer(src, t)?
+                    });
+                }
+            }
+            // pack.c `P`: one pointer to a structure of the count's length —
+            // the associated String itself when it is no longer than that,
+            // else a new String of its first `len` bytes carrying the same
+            // associates. `*` is the bytes left.
+            'P' => {
+                if bytes.len().saturating_sub(pos) >= 8 {
+                    let len = d.count.unwrap_or(bytes.len() - pos);
+                    let t = u64::from_ne_bytes(bytes[pos..pos + 8].try_into().expect("8 bytes"));
+                    pos += 8;
+                    let mut tmp = Value::Undef;
+                    if t != 0 {
+                        tmp = associated_pointer(src, t)?;
+                        let b = with_host(|h| h.string_bytes(&tmp));
+                        if len < b.len() {
+                            let associates =
+                                with_host(|h| h.pack_associates(src)).unwrap_or_default();
+                            tmp = with_host(|h| {
+                                let v = h.new_byte_string(b[..len].to_vec(), "ASCII-8BIT");
+                                h.set_pack_associates(&v, associates);
+                                v
+                            });
+                        }
+                    }
+                    out.push(tmp);
+                }
+            }
             other => {
                 return Err(raise_exc(
                     "ArgumentError",
@@ -32846,7 +33015,10 @@ pub(crate) fn raise_exc_with(class: &str, msg: &str, fields: &[(&str, Value)]) -
 /// non-frozen dispatch is unaffected.
 fn frozen_guard(recv: &Value, name: &str, mutators: &[&str]) -> Result<(), String> {
     let is_mutator = (name.len() > 1 && name.ends_with('!')) || mutators.contains(&name);
-    if is_mutator && with_host(|h| h.is_frozen(recv)) {
+    if !is_mutator {
+        return Ok(());
+    }
+    if with_host(|h| h.is_frozen(recv)) {
         let (cls, insp) = with_host(|h| (h.class_of(recv).to_string(), h.inspect(recv)));
         return Err(raise_exc_with(
             "FrozenError",
@@ -32854,6 +33026,43 @@ fn frozen_guard(recv: &Value, name: &str, mutators: &[&str]) -> Result<(), Strin
             &[("receiver", recv.clone())],
         ));
     }
+    unchill(recv)
+}
+
+/// `rb_check_frozen` on a chilled String: clear the mark, and warn under
+/// `Warning[:deprecated]` (category `:deprecated`, through `Warning.warn`)
+/// that the literal — or `Symbol#to_s`'s String — will be frozen. The change
+/// itself goes ahead.
+fn unchill(recv: &Value) -> Result<(), String> {
+    let Some(chill) = with_host(|h| h.unchill(recv)) else {
+        return Ok(());
+    };
+    if !crate::host::warning_enabled("deprecated")
+        || matches!(with_host(|h| h.get_global("VERBOSE")), Value::Undef)
+    {
+        return Ok(());
+    }
+    let msg = match chill {
+        None => "literal string will be frozen in the future \
+                 (run with --debug-frozen-string-literal for more information)"
+            .to_string(),
+        Some(sym) => {
+            format!("string returned by :{sym}.to_s will be frozen in the future")
+        }
+    };
+    let text = match crate::host::live_backtrace().first() {
+        Some(f) => format!("{}:{}: warning: {msg}\n", f.path, f.line),
+        None => format!("warning: {msg}\n"),
+    };
+    let kw = with_host(|h| {
+        let sym = h.new_symbol("deprecated");
+        let mut map = IndexMap::new();
+        map.insert(RKey::Sym("category".into()), sym);
+        let hash = h.new_hash(map);
+        h.mark_kwargs(&hash);
+        hash
+    });
+    dispatch_classref("Warning", "warn", &[new_str(text), kw], None)?;
     Ok(())
 }
 

@@ -35,7 +35,11 @@ use std::path::PathBuf;
 /// static literal), and a `/…#{…}/o` literal probes `REGEX_ONCE` first. A 13
 /// chunk calls `MKREGEX` with two operands, which would now read the source as
 /// the flags.
-const SCHEMA: u64 = 14;
+///
+/// 14 -> 15: a non-interpolated literal in a file with no `frozen_string_literal`
+/// comment lowers to `MKSTRC` (a chilled String), and a byte-String literal's
+/// kinds may lead with `C`. A 14 chunk would build those as plain Strings.
+const SCHEMA: u64 = 15;
 
 /// The outer, rkyv-archived shard: the [`build_stamp`] of the binary that wrote
 /// it, then a flat list of (key, bincode-blob) entries.

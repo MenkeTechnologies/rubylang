@@ -26,6 +26,35 @@ thread_local! {
     /// non-interpolated literal freezes. Per-file: `crate::compile` sets it every
     /// call, and every `require` funnels through there, so each file gets its own.
     static FROZEN_STR_LITERALS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set beside it: whether the file's non-interpolated literals are CHILLED
+    /// (Ruby 3.4+) — no magic comment and no `--enable`/`--disable` switch.
+    static CHILLED_STR_LITERALS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the file currently being compiled chills its string literals.
+pub fn chilled_string_literals() -> bool {
+    CHILLED_STR_LITERALS.with(|c| c.get())
+}
+
+/// Set the chilled-string-literal flag for the next compilation (one file).
+pub fn set_chilled_string_literals(on: bool) {
+    CHILLED_STR_LITERALS.with(|c| c.set(on));
+}
+
+/// Whether the command line left literals in files without a magic comment
+/// chilled: true unless an `--enable`/`--disable-frozen-string-literal`
+/// switch decided them.
+static DEFAULT_CHILLED_STR_LITERALS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// The invocation-wide chilled default for files without a magic comment.
+pub fn default_chilled_string_literals() -> bool {
+    DEFAULT_CHILLED_STR_LITERALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the invocation-wide chilled default (false once a switch is given).
+pub fn set_default_chilled_string_literals(on: bool) {
+    DEFAULT_CHILLED_STR_LITERALS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether the file currently being compiled froze its string literals.
@@ -1379,10 +1408,10 @@ impl Compiler {
             }
             Expr::Str(parts) if parts.iter().any(|p| matches!(p, StrPart::Bytes(_))) => {
                 let all_literal = parts.iter().all(|p| !matches!(p, StrPart::Interp(_)));
-                let mut kinds = String::from(if frozen_string_literals() && all_literal {
-                    "F"
-                } else {
-                    "-"
+                let mut kinds = String::from(match (all_literal, frozen_string_literals()) {
+                    (true, true) => "F",
+                    (true, false) if chilled_string_literals() => "C",
+                    _ => "-",
                 });
                 for p in parts {
                     kinds.push(match p {
@@ -1412,12 +1441,13 @@ impl Compiler {
                     }
                 }
                 // Under `# frozen_string_literal: true`, a *non-interpolated*
-                // literal is frozen (MRI leaves interpolated strings mutable).
+                // literal is frozen (MRI leaves interpolated strings mutable);
+                // with no comment and no switch it is chilled.
                 let all_literal = parts.iter().all(|p| matches!(p, StrPart::Lit(_)));
-                let op = if frozen_string_literals() && all_literal {
-                    ops::MKSTRF
-                } else {
-                    ops::MKSTR
+                let op = match (all_literal, frozen_string_literals()) {
+                    (true, true) => ops::MKSTRF,
+                    (true, false) if chilled_string_literals() => ops::MKSTRC,
+                    _ => ops::MKSTR,
                 };
                 b.emit(Op::CallBuiltin(op, parts.len() as u8), 0);
             }
@@ -1632,7 +1662,7 @@ impl Compiler {
                         self.compile_expr(b, recv)?;
                         self.kstr(b, name);
                         self.kstr(b, &synth);
-                        b.emit(Op::CallBuiltin(ops::DEFINE_SINGLETON, 3), 0);
+                        b.emit(Op::CallBuiltin(ops::DEFINE_SINGLETON, 3), self.cur_line);
                     }
                     // `def self.m` in a runtime position (inside a conditional /
                     // loop, not the class body's top level where it is extracted
@@ -1645,7 +1675,7 @@ impl Compiler {
                         self.compile_expr(b, &Expr::SelfExpr)?;
                         self.kstr(b, name);
                         self.kstr(b, &synth);
-                        b.emit(Op::CallBuiltin(ops::DEFINE_SINGLETON, 3), 0);
+                        b.emit(Op::CallBuiltin(ops::DEFINE_SINGLETON, 3), self.cur_line);
                     }
                     // A plain `def`: hoisted as a top-level method (available
                     // before the line runs), plus a runtime `DEFINE_METHOD_DYN`
@@ -1687,7 +1717,7 @@ impl Compiler {
                         }
                         self.kstr(b, name);
                         self.kstr(b, &synth);
-                        b.emit(Op::CallBuiltin(ops::DEFINE_SINGLETON, 3), 0);
+                        b.emit(Op::CallBuiltin(ops::DEFINE_SINGLETON, 3), self.cur_line);
                         b.emit(Op::Pop, 0);
                     } else {
                         nondefs.push(s.clone());

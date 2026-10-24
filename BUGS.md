@@ -1213,9 +1213,26 @@ Honest limitations of this surface:
   `Array#to_a` are the receiver itself when its class is exactly String or
   Array (a subclass gets a plain copy, its encoding kept), and
   `Array#to_ary`/`deconstruct` always are. `Array` subclass construction
-  copies an Array argument (`MyA.new([1, 2])`). Residue: a chilled string
-  literal is not modelled, so `+"lit"` answers the literal itself where MRI
-  answers a copy.
+  copies an Array argument (`MyA.new([1, 2])`).
+- **Chilled string literals (Ruby 3.4+) — fixed.** In a file with no
+  `frozen_string_literal` comment and no `--enable`/`--disable` switch, a
+  non-interpolated literal (heredocs, `%w`, `%q`, adjacent literals and
+  byte literals included) is chilled, and so is `Symbol#to_s`'s answer: not
+  `frozen?`, but `+@` answers a copy, and the first change — every mutator,
+  `!` methods that change nothing included, `instance_variable_set`,
+  `singleton_class`, `def s.m`, `extend` — clears the chill and, under
+  `Warning[:deprecated]`, hands `Warning.warn` `literal string will be frozen
+  in the future (run with --debug-frozen-string-literal for more
+  information)` (or `string returned by :sym.to_s will be frozen in the
+  future`) with `category: :deprecated`. `clone` keeps the chill, `dup` and
+  `clone(freeze: false)` do not. `Symbol#name` is one frozen String per
+  Symbol. `Kernel#String` is `rb_String`: a String is itself, then `to_str`,
+  then the object's own `to_s` (it rendered with the internal `to_s`, so a
+  user `to_s` was ignored), and a non-String answer is `TypeError: can't
+  convert B to String (B#to_s gives Integer)`.
+- **`buf << str` is linear.** Appending text to text copied the whole
+  receiver first, so a loop building a String was quadratic (200 000
+  one-character appends: 13.98 s user before, 2.62 s after, debug build).
 - **`pack`/`unpack` and `%%` corners — fixed.** A `!`/`_` modifier makes
   `l`/`L` a native `long` (8 bytes) and is refused after any type but
   `sSiIlLqQjJ` (`'!' allowed only after types sSiIlLqQjJ`); `#` starts a
@@ -1223,8 +1240,18 @@ Honest limitations of this surface:
   compresses and expands a Bignum; a float directive given a non-number is
   `TypeError: can't convert String into Float`; `p`/`P` pack `nil` as a NULL
   pointer. A `%%` written with a flag, width or precision is `ArgumentError:
-  invalid format character - %`. Residue: `p`/`P` of a String raise
-  `NotImplementedError` (MRI packs its address).
+  invalid format character - %`. `p`/`P` of a String pack an address (a
+  stand-in for `RSTRING_PTR`, distinct per String) and keep the String as an
+  associate of the result, so `unpack("p")` answers that very String, `P`
+  with a shorter count a BINARY prefix of it, a NULL nil, and a String
+  without associates `ArgumentError: no associated pointer` (`dup` keeps
+  them, `+` does not); `P`'s count is checked against the String (`too short
+  buffer for P(2 for 3)`). Residue: the address does not move when the String
+  is later grown, where MRI's reallocated buffer makes the old pointer `non
+  associated`.
+- **A built-in object's instance variables — fixed.** A String, Array or
+  Hash given one lists it in `instance_variables` and `dup`/`clone` copy it
+  (`rb_copy_generic_ivar`); both answered as though it were absent.
 - **Comparable and Range read `<=>` as MRI does — fixed.** A `<=>` answering
   a Float, a Bignum or anything else goes through `rb_cmpint` (its sign, or
   `> 0`/`< 0` asked of it) in the operators, `==`, `between?`, `clamp` and
