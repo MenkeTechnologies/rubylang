@@ -25675,6 +25675,20 @@ fn warning_category(v: &Value) -> Result<String, String> {
     Ok(name)
 }
 
+/// `rb_warn`: `path:line: warning: msg` for the running line, handed to
+/// `Warning.warn` — nothing at all when `$VERBOSE` is nil.
+fn rb_warn(msg: &str) -> Result<(), String> {
+    if matches!(with_host(|h| h.get_global("VERBOSE")), Value::Undef) {
+        return Ok(());
+    }
+    let text = match crate::host::live_backtrace().first() {
+        Some(f) => format!("{}:{}: warning: {msg}\n", f.path, f.line),
+        None => format!("warning: {msg}\n"),
+    };
+    dispatch_classref("Warning", "warn", &[new_str(text)], None)?;
+    Ok(())
+}
+
 /// `Kernel#warn(*msgs, uplevel: nil, category: nil)`, ported from MRI's
 /// warning.rb `Kernel#warn` and error.c `rb_warn_m`.
 ///
@@ -26300,6 +26314,21 @@ fn regexp_match_compat(re: &Value, s: &Value) -> Result<(), String> {
     });
     let re_enc = regexp_encoding(&source, &flags);
     if re_enc == "US-ASCII" {
+        if flags.contains('n') {
+            let (ascii, str_enc) = with_host(|h| {
+                (
+                    h.str_bytes(s).is_some_and(<[u8]>::is_ascii),
+                    h.string_encoding(s)
+                        .filter(|e| *e != crate::host::BROKEN_UTF8)
+                        .unwrap_or("UTF-8"),
+                )
+            });
+            if with_host(|h| h.prepare_binary_regexp(re, str_enc, ascii)) {
+                rb_warn(&format!(
+                    "historical binary regexp match /.../n against {str_enc} string"
+                ))?;
+            }
+        }
         return Ok(());
     }
     let (ascii, str_enc) = with_host(|h| {

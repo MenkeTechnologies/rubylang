@@ -8570,3 +8570,12 @@ t { "a\xff".bytesplice(0, 1, "\xe3") }; t { "\xe3\x81\x82".bytesplice(1, 1, "x")
 t { "aあb".bytesplice(1, 3, "xyz", 1, 1) }; t { "aあb".bytesplice(1..3, "éx", 0..1) }; t { "ab".bytesplice(0, 1, "é", 1, 1) }
 t { "ab".bytesplice(0, 1) }; t { "ab".bytesplice(:a, "x") }; t { "ab".bytesplice(5, 1, "x") }; t { "ab".bytesplice(0, -1, "x") }
 t { s = "a\xff"; s.clear; [s, s.encoding, s.valid_encoding?] }
+#==#
+# ── a /…/n Regexp meeting a non-ASCII UTF-8 String warns, once per change of the encoding it was prepared for ──
+def Warning.warn(m, category: nil) = print("W:", m[/warning: .*/m])
+r = /a/n
+p r =~ "é", r =~ "é", r =~ "a".b, r =~ "é", r =~ "abc", "éa".scan(/a/n), "éa"[/a/n], "éa".gsub(/a/n, "b")
+p(/b/n.match?("é".force_encoding("ISO-8859-1")), /b/n =~ "é".b, /b/n =~ "abc")
+case "é" when /x/n then 1 end
+$VERBOSE = nil
+p(/c/n =~ "é")

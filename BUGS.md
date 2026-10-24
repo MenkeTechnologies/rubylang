@@ -1150,8 +1150,13 @@ Honest limitations of this surface:
   (`incompatible encoding regexp match (UTF-8 regexp with BINARY (ASCII-8BIT)
   string)`). `inspect` escapes unassigned codepoints (`"\u0378"`,
   `"\u{10FFFF}"`), going by the regex crate's Unicode tables, which may trail
-  MRI's Unicode 17. Residue: the warning MRI prints for a `/…/n` Regexp
-  matched against a non-ASCII UTF-8 String is not printed.
+  MRI's Unicode 17. A `/…/n` Regexp with an ASCII source warns `historical
+  binary regexp match /.../n against UTF-8 string` (or the String's other
+  encoding) when it meets a non-ASCII String, once per change of the encoding
+  it was last matched under, as MRI's `rb_reg_prepare_re` recompiles it.
+  Residue: a Regexp literal is a new object each time it is evaluated (MRI
+  makes one per literal, `3.times.map { /a/.object_id }.uniq.size` is 1), so
+  a `/…/n` literal inside a loop warns on every pass.
   `File.read` keeps a file's invalid bytes the same way, `File.binread(path,
   length, offset)` answers ASCII-8BIT, and `File.write`/`binwrite` write a
   String's bytes.

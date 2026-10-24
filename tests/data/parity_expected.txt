@@ -7492,3 +7492,23 @@ true
 #<IndexError: index 5 out of string>
 #<IndexError: negative length -1>
 ["", #<Encoding:UTF-8>, true]
+#==#
+W:warning: historical binary regexp match /.../n against UTF-8 string
+W:warning: historical binary regexp match /.../n against UTF-8 string
+W:warning: historical binary regexp match /.../n against UTF-8 string
+W:warning: historical binary regexp match /.../n against UTF-8 string
+W:warning: historical binary regexp match /.../n against UTF-8 string
+nil
+nil
+0
+nil
+0
+["a"]
+"a"
+"éb"
+W:warning: historical binary regexp match /.../n against ISO-8859-1 string
+false
+nil
+1
+W:warning: historical binary regexp match /.../n against UTF-8 string
+nil

@@ -1523,6 +1523,11 @@ pub struct RubyHost {
     /// Whether any `/…/n` Regexp exists — the cheap test that lets a UTF-8
     /// String's methods skip the binary-Regexp compatibility check.
     binary_regexps: bool,
+    /// The encoding each `/…/n` Regexp was last matched under, by heap id —
+    /// MRI's `rb_reg_prepare_re` recompiles such a Regexp for the String it
+    /// meets, and warns only when that changes it (see
+    /// [`RubyHost::prepare_binary_regexp`]).
+    binary_regexp_encodings: HashMap<u32, &'static str>,
     /// `Enumerator#feed` state by Enumerator heap id: the value waiting for
     /// the next resume, and (for a buffered Enumerator) what each element got.
     enum_feeds: HashMap<u32, (Option<Value>, Vec<Value>)>,
@@ -2469,6 +2474,7 @@ impl RubyHost {
             method_snapshots: HashMap::new(),
             enum_feeds: HashMap::new(),
             binary_regexps: false,
+            binary_regexp_encodings: HashMap::new(),
             consts: IndexMap::new(),
             autoloads: IndexMap::new(),
             methods: IndexMap::new(),
@@ -8982,6 +8988,31 @@ impl RubyHost {
     /// the common all-text program skip asking about each argument.
     pub fn any_tagged_strings(&self) -> bool {
         self.byte_strings
+    }
+    /// `rb_reg_prepare_enc` for a `/…/n` Regexp whose source is ASCII: move it
+    /// to the encoding of the String `str_enc` it is matched against, and
+    /// answer whether MRI warns about it — on the match that moves it from
+    /// another encoding to one that is not ASCII-8BIT, for a String that is
+    /// not ASCII. A Regexp keeps US-ASCII through ASCII-only Strings.
+    pub fn prepare_binary_regexp(
+        &mut self,
+        re: &Value,
+        str_enc: &'static str,
+        ascii: bool,
+    ) -> bool {
+        let Value::Obj(id) = re else {
+            return false;
+        };
+        let cur = self
+            .binary_regexp_encodings
+            .get(id)
+            .copied()
+            .unwrap_or("US-ASCII");
+        if cur == str_enc || (ascii && cur == "US-ASCII") {
+            return false;
+        }
+        self.binary_regexp_encodings.insert(*id, str_enc);
+        str_enc != "ASCII-8BIT" && !ascii
     }
     /// Whether a `/…/n` Regexp has been made (see `binary_regexps`).
     pub fn any_binary_regexps(&self) -> bool {
