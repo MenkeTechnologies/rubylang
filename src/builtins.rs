@@ -29966,7 +29966,8 @@ fn sprintf_bytes(
         // width (`*` = dynamic; a negative dynamic width means left-align)
         let mut width = 0usize;
         let mut width_digits = false;
-        if i < bytes.len() && bytes[i] == '*' {
+        let star_width = i < bytes.len() && bytes[i] == '*';
+        if star_width {
             i += 1;
             let w = as_i(&aster_arg!());
             if w < 0 {
@@ -30016,6 +30017,12 @@ fn sprintf_bytes(
         };
         i += 1;
         if conv == '%' {
+            // `%%` takes no flag, width or precision (sprintf.c: `flags !=
+            // FNONE`); a `%<name>` or `%N$` selector is not a flag.
+            if left || zero || plus || space || alt || width_digits || star_width || prec.is_some()
+            {
+                return Err(raise_exc("ArgumentError", "invalid format character - %"));
+            }
             out.push('%');
             continue;
         }
@@ -31379,14 +31386,37 @@ struct PackDir {
     count: Option<usize>,
     // Endianness modifier from a trailing `<` (little) / `>` (big); None = native.
     endian: Option<bool>,
+    /// A `!`/`_` native-size modifier: `l!`/`L!` are a C `long` (8 bytes).
+    native: bool,
 }
 
-/// Parse a pack/unpack template into directives, ignoring whitespace (MRI does).
-fn parse_pack_template(fmt: &str) -> Vec<PackDir> {
+impl PackDir {
+    /// The byte width of an integer directive (`s`, `l`, `q`, `i`, `j` and
+    /// their unsigned forms) on an LP64 platform.
+    fn int_width(&self) -> usize {
+        match self.kind {
+            's' | 'S' => 2,
+            'l' | 'L' if self.native => 8,
+            'l' | 'L' | 'i' | 'I' => 4,
+            _ => 8,
+        }
+    }
+}
+
+/// Parse a pack/unpack template into directives, ignoring whitespace and
+/// `#` comments (MRI does). A `!`/`_` modifier is refused after any type but
+/// the native-sized integers.
+fn parse_pack_template(fmt: &str) -> Result<Vec<PackDir>, String> {
     let mut dirs = Vec::new();
     let mut it = fmt.chars().peekable();
     while let Some(k) = it.next() {
         if k.is_whitespace() {
+            continue;
+        }
+        if k == '#' {
+            while it.peek().is_some_and(|&c| c != '\n') {
+                it.next();
+            }
             continue;
         }
         // Endianness (`<`/`>`) and native-size (`!`) modifiers may appear before
@@ -31394,6 +31424,7 @@ fn parse_pack_template(fmt: &str) -> Vec<PackDir> {
         // count, which is digits or `*`.
         let mut count = Some(1usize);
         let mut endian = None;
+        let mut native = false;
         loop {
             match it.peek().copied() {
                 Some('<') => {
@@ -31404,8 +31435,15 @@ fn parse_pack_template(fmt: &str) -> Vec<PackDir> {
                     it.next();
                     endian = Some(false);
                 }
-                Some('!') | Some('_') => {
+                Some(m @ ('!' | '_')) => {
                     it.next();
+                    if !"sSiIlLqQjJ".contains(k) {
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            &format!("'{m}' allowed only after types sSiIlLqQjJ"),
+                        ));
+                    }
+                    native = true;
                 }
                 Some('*') => {
                     it.next();
@@ -31430,9 +31468,38 @@ fn parse_pack_template(fmt: &str) -> Vec<PackDir> {
             kind: k,
             count,
             endian,
+            native,
         });
     }
-    dirs
+    Ok(dirs)
+}
+
+/// The low byte of an integer `pack` element (a Bignum's too).
+fn pack_low_u64(it: &Value) -> u64 {
+    match with_host(|h| h.as_bigint(it)) {
+        Some(b) => bigint_low_u64(&b),
+        None => as_i(it) as u64,
+    }
+}
+
+/// The element a float `pack` directive consumes (`rb_to_float`): a number,
+/// or MRI's `can't convert X into Float`.
+fn pack_float_arg(items: &[Value], idx: usize) -> Result<f64, String> {
+    let v = items.get(idx).ok_or_else(pack_too_few)?;
+    let numeric = matches!(v, Value::Int(_) | Value::Float(_))
+        || with_host(|h| h.as_bigint(v).is_some() || h.as_rational(v).is_some());
+    if !numeric {
+        let shown = match v {
+            Value::Undef => "nil".to_string(),
+            Value::Bool(b) => b.to_string(),
+            _ => with_host(|h| h.class_of(v).to_string()),
+        };
+        return Err(raise_exc(
+            "TypeError",
+            &format!("can't convert {shown} into Float"),
+        ));
+    }
+    Ok(as_f(v))
 }
 
 /// `Array#pack` core: consume `items` per the template, producing raw bytes.
@@ -31474,16 +31541,36 @@ fn pack_bytes(items: &[Value], fmt: &str) -> Result<Vec<u8>, String> {
 /// where `@` positions count from.
 fn pack_bytes_into(items: &[Value], fmt: &str, mut out: Vec<u8>) -> Result<Vec<u8>, String> {
     let mut idx = 0usize; // next array element to consume
-    for d in parse_pack_template(fmt) {
+    for d in parse_pack_template(fmt)? {
         match d.kind {
             // Integer bytes: C (unsigned) / c (signed) are identical at the byte
             // level. `*` consumes every remaining element.
             'C' | 'c' => {
                 let n = d.count.unwrap_or(items.len().saturating_sub(idx));
                 for _ in 0..n {
-                    let v = as_i(&pack_int_arg(items, idx)?);
+                    let v = pack_low_u64(&pack_int_arg(items, idx)?);
                     out.push((v & 0xff) as u8);
                     idx += 1;
+                }
+            }
+            // A pointer: only a NULL (`nil`) has a value rubylang can spell.
+            'p' | 'P' => {
+                let n = d.count.unwrap_or(items.len().saturating_sub(idx));
+                for _ in 0..n.max(usize::from(d.kind == 'P')) {
+                    match items.get(idx) {
+                        Some(Value::Undef) => out.extend_from_slice(&[0; 8]),
+                        Some(_) => {
+                            return Err(raise_exc(
+                                "NotImplementedError",
+                                "pack('p') of a String's address is not supported",
+                            ))
+                        }
+                        None => return Err(pack_too_few()),
+                    }
+                    idx += 1;
+                    if d.kind == 'P' {
+                        break;
+                    }
                 }
             }
             // A string: `a` NUL-pads (and NUL is the truncation fill), `A` space-
@@ -31577,20 +31664,26 @@ fn pack_bytes_into(items: &[Value], fmt: &str, mut out: Vec<u8>) -> Result<Vec<u
             'w' => {
                 let n = d.count.unwrap_or(items.len().saturating_sub(idx));
                 for _ in 0..n {
-                    let v = as_i(&pack_int_arg(items, idx)?);
+                    let it = pack_int_arg(items, idx)?;
                     idx += 1;
-                    if v < 0 {
+                    let v = match with_host(|h| h.as_bigint(&it)) {
+                        Some(b) => b,
+                        None => num_bigint::BigInt::from(as_i(&it)),
+                    };
+                    if v.sign() == num_bigint::Sign::Minus {
                         return Err(raise_exc(
                             "ArgumentError",
                             "can't compress negative numbers",
                         ));
                     }
-                    let mut groups = vec![(v & 0x7f) as u8];
-                    let mut rest = v >> 7;
-                    while rest > 0 {
-                        groups.push((rest & 0x7f) as u8 | 0x80);
-                        rest >>= 7;
-                    }
+                    // Base-128 digits, least significant first.
+                    let mut groups: Vec<u8> = v
+                        .to_radix_le(128)
+                        .1
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, d)| if i == 0 { d } else { d | 0x80 })
+                        .collect();
                     groups.reverse();
                     out.extend_from_slice(&groups);
                 }
@@ -31692,13 +31785,9 @@ fn pack_bytes_into(items: &[Value], fmt: &str, mut out: Vec<u8>) -> Result<Vec<u
             // Native-endian integers (little-endian on x86-64/aarch64): s/S 16-bit,
             // l/L 32-bit, q/Q 64-bit, i/I/j/J native word (modeled as 64-bit).
             's' | 'S' | 'l' | 'L' | 'q' | 'Q' | 'i' | 'I' | 'j' | 'J' => {
-                // `i`/`I` are a native `int` (4 bytes), not a native `long`;
-                // `j`/`J` are pointer-width (8).
-                let width = match d.kind {
-                    's' | 'S' => 2usize,
-                    'l' | 'L' | 'i' | 'I' => 4,
-                    _ => 8,
-                };
+                // `i`/`I` are a native `int` (4 bytes), `l!`/`L!` a native
+                // `long` (8); `j`/`J` are pointer-width (8).
+                let width = d.int_width();
                 let n = d.count.unwrap_or(items.len().saturating_sub(idx));
                 let big = d.endian == Some(false);
                 for _ in 0..n {
@@ -31726,7 +31815,7 @@ fn pack_bytes_into(items: &[Value], fmt: &str, mut out: Vec<u8>) -> Result<Vec<u
                 let big = matches!(d.kind, 'G' | 'g');
                 let n = d.count.unwrap_or(items.len().saturating_sub(idx));
                 for _ in 0..n {
-                    let f = as_f(&pack_int_arg(items, idx)?);
+                    let f = pack_float_arg(items, idx)?;
                     idx += 1;
                     if double {
                         let b = if big {
@@ -31900,7 +31989,7 @@ fn unpack_str(s: String, enc: &'static str) -> Value {
 fn unpack_bytes_from(bytes: &[u8], fmt: &str, start: usize) -> Result<Vec<Value>, String> {
     let mut out = Vec::new();
     let mut pos = start;
-    for d in parse_pack_template(fmt) {
+    for d in parse_pack_template(fmt)? {
         match d.kind {
             // `U`: UTF-8 characters to code points. Running out of input ends
             // the directive quietly — no trailing nil, unlike `C`.
@@ -32011,16 +32100,16 @@ fn unpack_bytes_from(bytes: &[u8], fmt: &str, start: usize) -> Result<Vec<Value>
                 let n = d.count.unwrap_or(usize::MAX);
                 let mut produced = 0;
                 while produced < n && pos < bytes.len() {
-                    let mut v: i64 = 0;
+                    let mut v = num_bigint::BigInt::from(0);
                     while pos < bytes.len() {
                         let b = bytes[pos];
                         pos += 1;
-                        v = (v << 7) | (b & 0x7f) as i64;
+                        v = (v << 7) | num_bigint::BigInt::from(b & 0x7f);
                         if b & 0x80 == 0 {
                             break;
                         }
                     }
-                    out.push(Value::Int(v));
+                    out.push(bigint_to_value(v));
                     produced += 1;
                 }
             }
@@ -32113,11 +32202,7 @@ fn unpack_bytes_from(bytes: &[u8], fmt: &str, start: usize) -> Result<Vec<Value>
             // lowercase is signed, uppercase unsigned; `<`/`>` pick the byte
             // order and native (little on every supported target) is the default.
             's' | 'S' | 'l' | 'L' | 'q' | 'Q' | 'i' | 'I' | 'j' | 'J' => {
-                let width = match d.kind {
-                    's' | 'S' => 2usize,
-                    'l' | 'L' | 'i' | 'I' => 4,
-                    _ => 8,
-                };
+                let width = d.int_width();
                 let signed = d.kind.is_lowercase();
                 let big = d.endian == Some(false);
                 let n = d.count.unwrap_or(usize::MAX);

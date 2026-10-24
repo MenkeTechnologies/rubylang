@@ -7623,3 +7623,23 @@ nil
 nil
 [[:opt, :i]]
 nil
+#==#
+#<ArgumentError: invalid format character - %>
+#<ArgumentError: invalid format character - %>
+#<ArgumentError: invalid format character - %>
+#<ArgumentError: invalid format character - %>
+#<ArgumentError: invalid format character - %>
+["%", "%", "%|    3"]
+#==#
+[2, 8, 4, 8, [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2], 8]
+[1, 18446744073709551615]
+#<ArgumentError: '!' allowed only after types sSiIlLqQjJ>
+#<ArgumentError: '!' allowed only after types sSiIlLqQjJ>
+#<ArgumentError: '_' allowed only after types sSiIlLqQjJ>
+["\x01\x02", "\x03", [1, 2]]
+["A", "\x01", [0, 127, 129, 0, 255, 127, 129, 128, 128, 128, 128, 128, 128, 128, 128, 128, 0], [1180591620717411303424]]
+#<ArgumentError: can't compress negative numbers>
+#<TypeError: can't convert nil into Float>
+#<TypeError: can't convert String into Float>
+#<TypeError: can't convert Symbol into Float>
+["\x00\x00\x00\x00\x00\x00\x00\x00", [0, 0, 0, 0, 0, 0, 0, 0], 16, [0, 0, 192, 63]]

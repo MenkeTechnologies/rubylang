@@ -1177,6 +1177,15 @@ Honest limitations of this surface:
 
 ## Runtime / methods
 
+- **`pack`/`unpack` and `%%` corners — fixed.** A `!`/`_` modifier makes
+  `l`/`L` a native `long` (8 bytes) and is refused after any type but
+  `sSiIlLqQjJ` (`'!' allowed only after types sSiIlLqQjJ`); `#` starts a
+  comment to the end of the line; `C`/`c` keep a Bignum's low byte; `w`
+  compresses and expands a Bignum; a float directive given a non-number is
+  `TypeError: can't convert String into Float`; `p`/`P` pack `nil` as a NULL
+  pointer. A `%%` written with a flag, width or precision is `ArgumentError:
+  invalid format character - %`. Residue: `p`/`P` of a String raise
+  `NotImplementedError` (MRI packs its address).
 - **Comparable and Range read `<=>` as MRI does — fixed.** A `<=>` answering
   a Float, a Bignum or anything else goes through `rb_cmpint` (its sign, or
   `> 0`/`< 0` asked of it) in the operators, `==`, `between?`, `clamp` and

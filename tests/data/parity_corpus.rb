@@ -8659,3 +8659,18 @@ p k.method(:m1) == k.method(:m1), k.method(:m1).eql?(k.method(:m1)), k.method(:m
 p C.instance_method(:mm) == D.instance_method(:mm), k.method(:m2).source_location, k.method(:x).source_location, 1.method(:+).source_location
 k2 = 5; t = 9; proc { |a, k2: 1| }.call(1); [1].each { |i; t| t = i }; proc { |a, **k2| }.call(1, z: 2)
 p k2, t, proc { |i; t| t }.call(1, 2), proc { |i; t| }.parameters, ->(x; y) { y }.call(1)
+#==#
+# ── a %% directive takes no flag, width or precision; a %<name> or %N$ selector is not one ──
+def t; p yield; rescue => e; p e; end
+t { "%5%" % [] }; t { "%-%" % [] }; t { "%.1%" % [] }; t { "%*%" % [3] }; t { "% %" % [] }
+t { ["%<a>%" % {a: 1}, "%1$%" % [1], "%%|%5d" % [3]] }
+#==#
+# ── pack/unpack: native-size !/_ modifiers, # comments, Bignum C and w, float conversion, NULL pointers ──
+def t; p yield; rescue => e; p e; end
+t { [[1].pack("s_").size, [1].pack("l!").size, [1].pack("i").size, [1].pack("L_").size, [1, 2].pack("L!>2").bytes, [1].pack("j!").size] }
+t { "\x00\x00\x00\x00\x00\x00\x00\x01".unpack("l!>") + [-1].pack("l!").unpack("L!") }
+t { [1].pack("C!") }; t { [1].pack("x!") }; t { [1].pack("a_") }
+t { [[1, 2].pack("C#x\nC"), [3].pack("C # comment"), "\x01\x02".unpack("C#c\nC")] }
+t { [[2**70 + 65].pack("C"), [2**64 + 1].pack("c"), [0, 127, 128, 16383, 2**70].pack("w*").bytes, [2**70].pack("w").unpack("w")] }
+t { [-1].pack("w") }; t { [nil].pack("f") }; t { ["1.5"].pack("d") }; t { [:s].pack("e") }
+t { [[nil].pack("p"), [nil].pack("P").bytes, [nil, nil].pack("p2").size, [Rational(3, 2)].pack("e").bytes] }
