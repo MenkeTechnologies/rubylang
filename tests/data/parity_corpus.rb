@@ -8702,3 +8702,12 @@ p nil.to_r, nil.to_c, nil.rationalize, nil.rationalize(0.1)
 t { nil.to_r(1) }; t { nil.rationalize(1, 2) }
 p 5.real?, 5.imag, 5.imaginary, 5.real, 5.conj, 5.conjugate, 5.rect, 5.rectangular, 5.i, 2.5.i, 2.5.rect, 2.5.real?
 p Rational(1, 2).imag, Rational(1, 2).i, Rational(1, 2).rect, Rational(1, 2).real?, (2**70).imag, (2**70).rect, (2**70).i
+#==#
+# ── String#to_s/to_str and Array#to_a/to_ary/deconstruct answer the receiver itself; a subclass gets a plain copy ──
+s = +"ab"; b = "é".b
+p s.to_s.equal?(s), s.to_str.equal?(s), b.to_s.equal?(b), b.to_s.encoding, "x\xff".to_s.valid_encoding?
+class MyS < String; end; m = MyS.new("x")
+p m.to_s.class, m.to_s.equal?(m), m.to_str.class, m.to_s
+a = [1]; p a.to_a.equal?(a), a.to_ary.equal?(a), a.entries.equal?(a), a.deconstruct.equal?(a)
+class MyA < Array; end; ma = MyA.new([1, 2])
+p ma, ma.to_a.class, ma.to_ary.class, ma.to_a.equal?(ma), ma.entries.class

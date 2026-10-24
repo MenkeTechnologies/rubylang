@@ -2718,6 +2718,20 @@ fn dispatch_resolved(
         "to_s" if args.is_empty() && is_container(recv) && reaches_user_inspect(recv, 0) => {
             return Ok(new_str(inspect_of(recv)?));
         }
+        // `String#to_s`/`to_str`: the receiver itself when its class is exactly
+        // String, else a String with its bytes and encoding.
+        "to_s" | "to_str" if args.is_empty() && with_host(|h| h.rstr(recv).is_some()) => {
+            return Ok(with_host(|h| {
+                if h.class_of(recv) == "String" {
+                    return recv.clone();
+                }
+                let content = h
+                    .rstr(recv)
+                    .cloned()
+                    .unwrap_or(crate::rstr::RStr::Text(String::new()));
+                h.new_rstr(content)
+            }));
+        }
         "to_s" if args.is_empty() => {
             return Ok(with_host(|h| {
                 let s = h.to_s(recv);
@@ -5450,6 +5464,15 @@ fn dispatch_classref(
                             let s = args.first().and_then(|a| h.as_str(a)).unwrap_or_default();
                             h.new_string(s)
                         }),
+                        // `Array.new(array)` copies it, as `Array.new(n)` does not.
+                        "Array"
+                            if args.len() == 1 && with_host(|h| h.as_array(&args[0])).is_some() =>
+                        {
+                            with_host(|h| {
+                                let items = h.as_array(&args[0]).unwrap_or_default();
+                                h.new_array(items)
+                            })
+                        }
                         "Array" => {
                             let n =
                                 args.first().map(to_int).transpose()?.unwrap_or(0).max(0) as usize;
@@ -14211,7 +14234,11 @@ fn dispatch_array(
             with_host(|h| h.set_array(recv, rev));
             Ok(recv.clone())
         }
-        "to_a" | "to_ary" | "entries" | "dup" | "clone" | "deconstruct" => Ok(new_arr(arr)),
+        // `to_a` is the receiver itself for an Array (a subclass's is a plain
+        // Array copy); `to_ary` and `deconstruct` always are.
+        "to_a" if with_host(|h| h.class_of(recv)) == "Array" => Ok(recv.clone()),
+        "to_ary" | "deconstruct" => Ok(recv.clone()),
+        "to_a" | "entries" | "dup" | "clone" => Ok(new_arr(arr)),
         // `member?` is Enumerable's spelling of `include?`, and Array answers
         // both. Only `include?` was wired up, so `[1,2,3].member?(2)` raised
         // NoMethodError where MRI answers true — even though Hash and Range

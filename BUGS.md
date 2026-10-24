@@ -1177,6 +1177,13 @@ Honest limitations of this surface:
 
 ## Runtime / methods
 
+- **Conversions answer the receiver — fixed.** `String#to_s`/`to_str` and
+  `Array#to_a` are the receiver itself when its class is exactly String or
+  Array (a subclass gets a plain copy, its encoding kept), and
+  `Array#to_ary`/`deconstruct` always are. `Array` subclass construction
+  copies an Array argument (`MyA.new([1, 2])`). Residue: a chilled string
+  literal is not modelled, so `+"lit"` answers the literal itself where MRI
+  answers a copy.
 - **`pack`/`unpack` and `%%` corners — fixed.** A `!`/`_` modifier makes
   `l`/`L` a native `long` (8 bytes) and is refused after any type but
   `sSiIlLqQjJ` (`'!' allowed only after types sSiIlLqQjJ`); `#` starts a

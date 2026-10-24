@@ -7706,3 +7706,22 @@ true
 0
 [1180591620717411303424, 0]
 (0+1180591620717411303424i)
+#==#
+true
+true
+true
+#<Encoding:BINARY (ASCII-8BIT)>
+false
+String
+false
+String
+"x"
+true
+true
+false
+true
+[1, 2]
+Array
+MyA
+false
+Array
