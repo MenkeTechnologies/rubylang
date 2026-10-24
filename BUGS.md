@@ -1148,9 +1148,11 @@ Honest limitations of this surface:
   encoding (non-ASCII, `/u`, binary `/\xNN/n`) matched against a String of
   another encoding holding non-ASCII raises `Encoding::CompatibilityError`
   (`incompatible encoding regexp match (UTF-8 regexp with BINARY (ASCII-8BIT)
-  string)`). `inspect` escapes unassigned codepoints (`"\u0378"`,
-  `"\u{10FFFF}"`), going by the regex crate's Unicode tables, which may trail
-  MRI's Unicode 17. A `/…/n` Regexp with an ASCII source warns `historical
+  string)`). `inspect` escapes exactly the code points MRI's `[[:print:]]`
+  refuses (controls, separators, unassigned code points: `"\u0378"`,
+  `"\u{10FFFF}"`), from a table dumped out of MRI itself
+  (`tools/gen_unicode_tables.rb`, Unicode 17.0.0), checked against every code
+  point. A `/…/n` Regexp with an ASCII source warns `historical
   binary regexp match /.../n against UTF-8 string` (or the String's other
   encoding) when it meets a non-ASCII String, once per change of the encoding
   it was last matched under, as MRI's `rb_reg_prepare_re` recompiles it.

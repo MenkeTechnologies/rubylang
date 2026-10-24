@@ -7512,3 +7512,7 @@ nil
 1
 W:warning: historical binary regexp match /.../n against UTF-8 string
 nil
+#==#
+"౜೜᫝⃁꟱𐥀𑭠𖺠𘴞𜳼"
+"\u0C5Bౝ\u1ADE\u20C2𐻆"
+"\u0378\u{E0080}\u{10FFFF}\uFDD0\u2028­​󠀁󰀀"

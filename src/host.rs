@@ -11384,13 +11384,6 @@ pub fn inspect_broken_utf8(bytes: &[u8]) -> String {
     }))
 }
 
-/// Whether `c` is unassigned in Unicode (General_Category `Cn`, which takes in
-/// the noncharacters) — what MRI's `inspect` escapes rather than prints.
-fn is_unassigned(c: char) -> bool {
-    static CN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    CN.get_or_init(|| regex::Regex::new(r"^\p{Cn}$").expect("valid class"))
-        .is_match(c.encode_utf8(&mut [0; 4]))
-}
 
 /// The inspect form of a UTF-8 String's characters, each `Ok(char)` or, for a
 /// byte that is not part of a valid sequence, `Err(byte)`.
@@ -11423,20 +11416,15 @@ fn inspect_units(units: impl Iterator<Item = Result<char, u8>>) -> String {
             '\u{0c}' => out.push_str("\\f"),
             '\r' => out.push_str("\\r"),
             '\u{1b}' => out.push_str("\\e"),
-            // Anything MRI does not consider printable is escaped as `\uXXXX`.
-            // That is the C0 controls and DEL, the C1 controls, and the line and
-            // paragraph separators — a raw U+2028 inside an inspect form would
-            // otherwise break the line it is printed on.
-            c if (c as u32) < 0x20 || matches!(c as u32, 0x7f..=0x9f | 0x2028 | 0x2029) => {
-                out.push_str(&format!("\\u{:04X}", c as u32));
-            }
-            // An unassigned codepoint (noncharacters included) is not printable
-            // either: `\uXXXX`, or `\u{X}` past the BMP.
-            c if !c.is_ascii() && is_unassigned(c) => {
-                if (c as u32) <= 0xFFFF {
-                    out.push_str(&format!("\\u{:04X}", c as u32));
+            // Anything MRI's `rb_enc_isprint` refuses, by its own Unicode
+            // tables — the controls, unassigned code points (noncharacters
+            // included), the line and paragraph separators — is escaped as
+            // `\uXXXX`, or `\u{X}` past the BMP.
+            c if !crate::unicode_tables::is_print(u32::from(c)) => {
+                if u32::from(c) <= 0xFFFF {
+                    out.push_str(&format!("\\u{:04X}", u32::from(c)));
                 } else {
-                    out.push_str(&format!("\\u{{{:X}}}", c as u32));
+                    out.push_str(&format!("\\u{{{:X}}}", u32::from(c)));
                 }
             }
             c => out.push(c),

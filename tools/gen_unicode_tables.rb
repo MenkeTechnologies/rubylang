@@ -14,12 +14,16 @@
 #
 #   ALPHA  [[:alpha:]]  ONIGENC_CTYPE_ALPHA — what `String#succ` counts as a letter
 #   DIGIT  [[:digit:]]  ONIGENC_CTYPE_DIGIT — what `String#succ` counts as a digit
+#   PRINT  [[:print:]]  ONIGENC_CTYPE_PRINT — what `String#inspect` shows as itself;
+#                       everything else (controls, unassigned code points,
+#                       separators) it escapes as \uXXXX
 
 abort "gen_unicode_tables.rb must run under MRI, not #{RUBY_ENGINE}" unless RUBY_ENGINE == "ruby"
 
 CLASSES = {
   "ALPHA" => /\A[[:alpha:]]\z/,
   "DIGIT" => /\A[[:digit:]]\z/,
+  "PRINT" => /\A[[:print:]]\z/,
 }
 
 # The inclusive code point ranges (surrogates excluded) whose character `re`
@@ -75,5 +79,10 @@ puts <<~RUST
   /// Whether MRI's `[[:digit:]]` matches the code point `c`.
   pub fn is_digit(c: u32) -> bool {
       in_table(DIGIT, c)
+  }
+
+  /// Whether MRI's `[[:print:]]` matches the code point `c`.
+  pub fn is_print(c: u32) -> bool {
+      in_table(PRINT, c)
   }
 RUST

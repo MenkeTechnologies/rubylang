@@ -8579,3 +8579,6 @@ p(/b/n.match?("é".force_encoding("ISO-8859-1")), /b/n =~ "é".b, /b/n =~ "abc")
 case "é" when /x/n then 1 end
 $VERBOSE = nil
 p(/c/n =~ "é")
+#==#
+# ── inspect escapes exactly what MRI's own Unicode 17 tables call unprintable ──
+p "౜೜᫝⃁꟱\u{10940}\u{11B60}\u{16EA0}\u{18D1E}\u{1CCFC}", "౛ౝ᫞⃂\u{10EC6}", "͸\u{E0080}\u{10FFFF}﷐ ­​\u{E0001}\u{F0000}"
