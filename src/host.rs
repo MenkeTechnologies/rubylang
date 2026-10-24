@@ -16,9 +16,12 @@
 
 use fusevm::{Chunk, NumOp, VMResult, Value, VM};
 use indexmap::IndexMap;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+
+pub use crate::rstr::{RStr, BROKEN_UTF8};
 
 use crate::intercepts::{self, Advice};
 
@@ -330,7 +333,7 @@ struct AncestryCache {
 
 #[derive(Debug, Clone)]
 pub enum RObj {
-    Str(String),
+    Str(RStr),
     Array(Vec<Value>),
     /// A Hash: its ordered entries, the value returned for a missing key
     /// (`Hash.new(0)` stores `Int(0)`; a plain `{}` stores `Undef`/nil), and an
@@ -750,11 +753,7 @@ pub enum ProcKind {
     /// un-advised. `usize` indexes the host's `around_stack`. Never escapes to
     /// user code as a normal proc.
     Around(usize),
-    /// The block a String method receives while it runs over a broken UTF-8
-    /// String's character view: it hands the user's block each String argument
-    /// as the bytes it stands for, and gives the method back the user's String
-    /// answer as character-view text (`crate::builtins::dispatch_broken_utf8`).
-    BrokenUnits(Box<Value>, UnitView),
+
     /// The block a block-less `gsub` Enumerator's iteration receives: the
     /// `next`-th call sets `$~` to the `next`-th match, then runs the user's
     /// block (`"a1b2".gsub(/\d/).map { $~.pre_match }`).
@@ -1562,14 +1561,10 @@ pub struct RubyHost {
     /// Exceptions whose backtrace was given as Strings by `set_backtrace`; they
     /// carry no locations, so `backtrace_locations` answers nil.
     string_backtraces: HashSet<u32>,
-    /// Heap ids of String objects whose encoding is NOT UTF-8, mapped to that
-    /// encoding's canonical name (`"ASCII-8BIT"`, `"US-ASCII"`). Sources are
-    /// `String#b`, `force_encoding`, `Integer#chr` and `Array#pack`. We store only
-    /// UTF-8 byte content; this side table records the encoding tag so `#encoding`
-    /// answers correctly, and so `#inspect` knows to escape bytes as `\\xNN` the way
-    /// MRI does for a non-UTF-8 string, without a representation change.
-    /// Absent = UTF-8 (the default).
-    string_encodings: HashMap<u32, &'static str>,
+    /// Whether any byte String (one carrying an encoding — see [`RStr`]) has
+    /// been made: the cheap test that lets an all-text program skip asking
+    /// each argument about its encoding.
+    byte_strings: bool,
     /// The one `Encoding` object per encoding, by canonical name, so
     /// `Encoding::UTF_8.equal?("a".encoding)` holds as in MRI.
     encoding_objects: HashMap<&'static str, Value>,
@@ -2488,7 +2483,7 @@ impl RubyHost {
             sealed_backtraces: HashSet::new(),
             exc_backtrace_locations: HashMap::new(),
             string_backtraces: HashSet::new(),
-            string_encodings: HashMap::new(),
+            byte_strings: false,
             encoding_objects: HashMap::new(),
             loaded_encodings: HashSet::new(),
             signal: None,
@@ -2776,14 +2771,6 @@ impl RubyHost {
                     if let Some(cls) = self.class_overrides.get(oid).cloned() {
                         self.set_class_override(&new, &cls);
                     }
-                    // A String's encoding is a side-table tag, not part of
-                    // `RObj::Str`, so it has to be copied explicitly — MRI's
-                    // `dup`/`clone` preserve it (`"a".b.dup.encoding` is
-                    // ASCII-8BIT), and without this the copy silently reverts to
-                    // the UTF-8 default.
-                    if let Some(enc) = self.string_encodings.get(oid).copied() {
-                        self.set_string_encoding(&new, enc);
-                    }
                 }
                 new
             }
@@ -2791,7 +2778,7 @@ impl RubyHost {
         }
     }
     pub fn new_string(&mut self, s: String) -> Value {
-        self.alloc(RObj::Str(s))
+        self.alloc(RObj::Str(RStr::Text(s)))
     }
     pub fn new_array(&mut self, items: Vec<Value>) -> Value {
         self.alloc(RObj::Array(items))
@@ -4007,7 +3994,7 @@ impl RubyHost {
                 | ProcKind::MethodCurried { .. }
                 | ProcKind::Composed { .. } => Some(-1),
                 ProcKind::Collect(_) | ProcKind::Around(_) => Some(1),
-                ProcKind::BrokenUnits(inner, _) => self.proc_arity(inner),
+
                 ProcKind::SetsMatch { inner, .. } => self.proc_arity(inner),
                 ProcKind::Normal => Some(
                     ArityFacts::of_block(
@@ -4064,7 +4051,6 @@ impl RubyHost {
                     | ProcKind::Composed { .. }
                     | ProcKind::Collect(_)
                     | ProcKind::Around(_)
-                    | ProcKind::BrokenUnits(..)
                     | ProcKind::SetsMatch { .. } => return Some(v.clone()),
                     ProcKind::Normal => match requested {
                         Some(n) => n,
@@ -4220,25 +4206,7 @@ impl RubyHost {
             _ => None,
         }
     }
-    /// Wrap `block` for a method running over a broken UTF-8 String's character
-    /// view (see [`ProcKind::BrokenUnits`]).
-    pub fn new_broken_units_block(&mut self, block: Value, view: UnitView) -> Value {
-        let is_lambda = matches!(
-            self.obj(&block),
-            Some(RObj::Proc {
-                is_lambda: true,
-                ..
-            })
-        );
-        let scope = self.cur_scope().clone();
-        self.alloc(RObj::Proc {
-            template: 0,
-            scope,
-            is_lambda,
-            kind: ProcKind::BrokenUnits(Box::new(block), view),
-            home: None,
-        })
-    }
+
     /// Reclaim the most recently opened collector buffer (LIFO with `new_enum_sink`).
     pub fn take_enum_sink(&mut self) -> Vec<Value> {
         self.enum_sinks.pop().unwrap_or_default()
@@ -5112,18 +5080,43 @@ impl RubyHost {
     /// into the interpreter and so cannot keep the host borrowed. A caller that
     /// finishes inside the borrow — one that only measures or scans the receiver
     /// — should use this and skip the copy.
-    pub fn str_ref<'a>(&'a self, v: &'a Value) -> Option<&'a str> {
+    pub fn str_ref<'a>(&'a self, v: &'a Value) -> Option<Cow<'a, str>> {
+        match self.obj(v) {
+            Some(RObj::Str(s)) => Some(s.view()),
+            _ => match v {
+                Value::Str(s) => Some(Cow::Borrowed(s)),
+                _ => None,
+            },
+        }
+    }
+    /// The String object `v`'s content, borrowed: its bytes and encoding.
+    pub fn rstr(&self, v: &Value) -> Option<&RStr> {
         match self.obj(v) {
             Some(RObj::Str(s)) => Some(s),
+            _ => None,
+        }
+    }
+    /// The String object `v`'s content, for an in-place change.
+    pub fn rstr_mut(&mut self, v: &Value) -> Option<&mut RStr> {
+        match self.obj_mut(v) {
+            Some(RObj::Str(s)) => Some(s),
+            _ => None,
+        }
+    }
+    /// The bytes of the String `v` (a heap String or an immediate one),
+    /// borrowed.
+    pub fn str_bytes<'a>(&'a self, v: &'a Value) -> Option<&'a [u8]> {
+        match self.obj(v) {
+            Some(RObj::Str(s)) => Some(s.bytes()),
             _ => match v {
-                Value::Str(s) => Some(s),
+                Value::Str(s) => Some(s.as_bytes()),
                 _ => None,
             },
         }
     }
     pub fn as_str(&self, v: &Value) -> Option<String> {
         match self.obj(v) {
-            Some(RObj::Str(s)) => Some(s.clone()),
+            Some(RObj::Str(s)) => Some(s.view().into_owned()),
             _ => match v {
                 Value::Str(s) => Some(s.to_string()),
                 _ => None,
@@ -5132,7 +5125,7 @@ impl RubyHost {
     }
     pub fn set_str(&mut self, v: &Value, s: String) {
         if let Some(RObj::Str(slot)) = self.obj_mut(v) {
-            *slot = s;
+            slot.set_view(s);
         }
     }
     pub fn as_hash(&self, v: &Value) -> Option<IndexMap<RKey, Value>> {
@@ -8893,26 +8886,25 @@ impl RubyHost {
             .or_default()
             .push(format!("{src}:{line}:in '{ctx}'"));
     }
-    /// Tag a String heap object with a non-UTF-8 encoding name. `name` must be
-    /// canonical (`"ASCII-8BIT"`, `"US-ASCII"`); UTF-8 is the untagged default,
-    /// so tagging it is spelled [`RubyHost::clear_string_encoding`] instead.
+    /// Label a String with the encoding `name`, which must be canonical
+    /// (`"ASCII-8BIT"`, `"US-ASCII"`, `"ISO-8859-1"`, or [`BROKEN_UTF8`]). A text
+    /// String is read as its Latin-1 view (see [`RStr::set_encoding`]); UTF-8
+    /// text is the unlabelled default, spelled [`RubyHost::clear_string_encoding`].
     pub fn set_string_encoding(&mut self, v: &Value, name: &'static str) {
-        if let Value::Obj(id) = v {
-            self.string_encodings.insert(*id, name);
+        if let Some(RObj::Str(s)) = self.obj_mut(v) {
+            s.set_encoding(name);
+            self.byte_strings = true;
         }
     }
-    /// Drop a String's encoding tag, returning it to the UTF-8 default.
+    /// Drop a String's encoding, its Latin-1 view becoming its UTF-8 text.
     pub fn clear_string_encoding(&mut self, v: &Value) {
-        if let Value::Obj(id) = v {
-            self.string_encodings.remove(id);
+        if let Some(RObj::Str(s)) = self.obj_mut(v) {
+            s.clear_encoding();
         }
     }
-    /// A String's recorded non-UTF-8 encoding name, or `None` for UTF-8.
+    /// A byte String's encoding name, or `None` for UTF-8 text.
     pub fn string_encoding(&self, v: &Value) -> Option<&'static str> {
-        match v {
-            Value::Obj(id) => self.string_encodings.get(id).copied(),
-            _ => None,
-        }
+        self.rstr(v).and_then(RStr::encoding)
     }
     /// The `Encoding` object for the encoding table row `info` — one per
     /// encoding for the life of the VM, as MRI keeps one per encoding index.
@@ -8943,45 +8935,53 @@ impl RubyHost {
     pub fn unmark_binary_string(&mut self, v: &Value) {
         self.clear_string_encoding(v);
     }
-    /// The bytes a String denotes: a tagged String's storage is one character
-    /// per byte, an untagged one is its own UTF-8 text.
+    /// The bytes a String holds (an empty vector for a non-String).
     pub fn string_bytes(&self, v: &Value) -> Vec<u8> {
-        let s = self.str_ref(v).unwrap_or("");
-        if self.string_encoding(v).is_some() {
-            crate::builtins::binstr_to_bytes(s)
-        } else {
-            s.as_bytes().to_vec()
+        self.str_bytes(v).unwrap_or_default().to_vec()
+    }
+    /// A new String holding `content`.
+    pub fn new_rstr(&mut self, content: RStr) -> Value {
+        self.byte_strings |= content.encoding().is_some();
+        self.alloc(RObj::Str(content))
+    }
+    /// A new String of `bytes` under the non-UTF-8 encoding `enc`.
+    pub fn new_byte_string(&mut self, bytes: Vec<u8>, enc: &'static str) -> Value {
+        if enc == BROKEN_UTF8 {
+            return self.new_utf8_from_bytes(bytes);
         }
+        self.new_rstr(RStr::Bytes(bytes, enc))
     }
     /// A UTF-8 String holding `bytes`: plain text when they are valid UTF-8,
     /// else a [`BROKEN_UTF8`] byte String.
     pub fn new_utf8_from_bytes(&mut self, bytes: Vec<u8>) -> Value {
-        match String::from_utf8(bytes) {
-            Ok(text) => self.new_string(text),
-            Err(e) => {
-                let v = self.new_string(crate::builtins::bytes_to_binstr(e.as_bytes()));
-                self.set_string_encoding(&v, BROKEN_UTF8);
-                v
-            }
+        self.new_rstr(RStr::from_utf8(bytes))
+    }
+    /// Replace the content of the String `v` outright, bytes and encoding.
+    pub fn set_rstr(&mut self, v: &Value, content: RStr) {
+        let byte_string = content.encoding().is_some();
+        if let Some(RObj::Str(slot)) = self.obj_mut(v) {
+            *slot = content;
         }
+        self.byte_strings |= byte_string;
+    }
+    /// Store `view` — the characters as the text String methods see them
+    /// (see [`RStr::view`]) — under the label `enc` (`None` for UTF-8 text).
+    pub fn set_str_as(&mut self, v: &Value, view: String, enc: Option<&'static str>) {
+        let content = match enc {
+            None => RStr::Text(view),
+            Some(BROKEN_UTF8) => RStr::from_utf8(crate::rstr::latin1_to_bytes(&view)),
+            Some(e) => RStr::Bytes(crate::rstr::latin1_to_bytes(&view), e),
+        };
+        self.set_rstr(v, content);
     }
     /// Re-store the UTF-8 String `v` as `bytes` (text when valid, else broken).
     pub fn set_utf8_bytes(&mut self, v: &Value, bytes: Vec<u8>) {
-        match String::from_utf8(bytes) {
-            Ok(text) => {
-                self.set_str(v, text);
-                self.clear_string_encoding(v);
-            }
-            Err(e) => {
-                self.set_str(v, crate::builtins::bytes_to_binstr(e.as_bytes()));
-                self.set_string_encoding(v, BROKEN_UTF8);
-            }
-        }
+        self.set_rstr(v, RStr::from_utf8(bytes));
     }
-    /// Whether any String carries an encoding tag at all — the cheap test that
-    /// lets the common all-text program skip asking about each argument.
+    /// Whether any byte String has been made at all — the cheap test that lets
+    /// the common all-text program skip asking about each argument.
     pub fn any_tagged_strings(&self) -> bool {
-        !self.string_encodings.is_empty()
+        self.byte_strings
     }
     /// Whether a `/…/n` Regexp has been made (see `binary_regexps`).
     pub fn any_binary_regexps(&self) -> bool {
@@ -9072,12 +9072,27 @@ impl RubyHost {
         src_ascii: bool,
         other: Option<&Value>,
     ) {
-        let decided = if !src_ascii {
+        let out_ascii = self.as_str(out).map(|s| s.is_ascii()).unwrap_or(true);
+        match self.decide_string_encoding(out_ascii, src, src_ascii, other) {
+            Some(enc) => self.set_string_encoding(out, enc),
+            None => self.clear_string_encoding(out),
+        }
+    }
+    /// The encoding [`RubyHost::inherit_string_encoding_with`] gives a result
+    /// whose content is ASCII-only exactly when `out_ascii`.
+    pub fn decide_string_encoding(
+        &self,
+        out_ascii: bool,
+        src: &Value,
+        src_ascii: bool,
+        other: Option<&Value>,
+    ) -> Option<&'static str> {
+        if !src_ascii {
             self.string_encoding(src)
         } else {
             let other_decides = match other {
                 Some(o) => !self.as_str(o).map(|s| s.is_ascii()).unwrap_or(true),
-                None => !self.as_str(out).map(|s| s.is_ascii()).unwrap_or(true),
+                None => !out_ascii,
             };
             match (other_decides, other) {
                 (true, Some(o)) => self.string_encoding(o),
@@ -9088,10 +9103,6 @@ impl RubyHost {
                 (true, None) => None,
                 (false, _) => self.string_encoding(src),
             }
-        };
-        match decided {
-            Some(enc) => self.set_string_encoding(out, enc),
-            None => self.clear_string_encoding(out),
         }
     }
     /// Format the pending (uncaught) exception in MRI's shape:
@@ -9299,7 +9310,7 @@ impl RubyHost {
             Value::Float(f) => fmt_float(*f),
             Value::Str(s) => s.to_string(),
             Value::Obj(_) => match self.obj(v).cloned() {
-                Some(RObj::Str(s)) => s,
+                Some(RObj::Str(s)) => s.view().into_owned(),
                 Some(RObj::Symbol(s)) => s,
                 Some(RObj::BigInt(b)) => b.to_string(),
                 Some(RObj::Rational(r)) => format!("{}/{}", r.numer(), r.denom()),
@@ -9518,13 +9529,9 @@ impl RubyHost {
                 // A string tagged with a non-UTF-8 encoding escapes by byte
                 // (`"\xFF"`), not by codepoint (`"ÿ"`) — MRI picks the
                 // form from the encoding, so `#inspect` has to consult the tag.
-                Some(RObj::Str(s)) if self.string_encoding(v) == Some(BROKEN_UTF8) => {
-                    let bytes = crate::builtins::binstr_to_bytes(&s);
-                    let view = UnitView::for_operands(&[&bytes], &[]);
-                    inspect_broken_utf8(&view.units(&bytes), view)
-                }
-                Some(RObj::Str(s)) if self.string_encoding(v).is_some() => inspect_string_bytes(&s),
-                Some(RObj::Str(s)) => inspect_string(&s),
+                Some(RObj::Str(RStr::Text(s))) => inspect_string(&s),
+                Some(RObj::Str(RStr::Bytes(b, BROKEN_UTF8))) => inspect_broken_utf8(&b),
+                Some(RObj::Str(s)) => inspect_string_bytes(&s.view()),
                 Some(RObj::Symbol(s)) => {
                     if plain_symbol_name(&s) {
                         format!(":{s}")
@@ -9969,9 +9976,9 @@ impl RubyHost {
             Value::Undef => RKey::Nil,
             Value::Str(s) => RKey::Str(s.to_string()),
             Value::Obj(_) => match self.obj(v) {
-                Some(RObj::Str(s)) => match self.string_encoding(v) {
-                    Some(enc) if !s.is_ascii() => RKey::ByteStr(s.clone(), enc),
-                    _ => RKey::Str(s.clone()),
+                Some(RObj::Str(s)) => match s.encoding() {
+                    Some(enc) if !s.bytes().is_ascii() => RKey::ByteStr(s.view().into_owned(), enc),
+                    _ => RKey::Str(s.view().into_owned()),
                 },
                 Some(RObj::Symbol(s)) => RKey::Sym(s.clone()),
                 Some(RObj::ClassRef(n)) => RKey::Class(n.clone()),
@@ -10418,7 +10425,7 @@ impl RubyHost {
             // `String + x` demands a String. `to_s`-ing the operand made
             // `"a" + 1` answer `"a1"` where Ruby raises a TypeError.
             (Some(RObj::Str(s)), Add) => {
-                let s = s.clone();
+                let s = s.view().into_owned();
                 // A broken UTF-8 operand joins another UTF-8 one by BYTES; the
                 // result is text again when the two halves complete each other.
                 if (self.is_broken_utf8(a) || self.is_broken_utf8(b))
@@ -10441,7 +10448,7 @@ impl RubyHost {
                 };
             }
             (Some(RObj::Str(s)), Mul) => {
-                let s = s.clone();
+                let s = s.view().into_owned();
                 // MRI REFUSES a negative repeat count rather than treating it as
                 // zero: `"x" * -1` is `ArgumentError: negative argument`.
                 let raw = self.to_int_operand(b)?;
@@ -10458,7 +10465,7 @@ impl RubyHost {
             }
             (Some(RObj::Str(s)), Lt | Gt | Le | Ge) => {
                 if let Some(RObj::Str(bs)) = self.obj(b) {
-                    return Ok(Value::Bool(cmp_ord(op, s.cmp(bs))));
+                    return Ok(Value::Bool(cmp_ord(op, s.view().cmp(&bs.view()))));
                 }
             }
             (Some(RObj::Array(mut xs)), Add) => {
@@ -11081,8 +11088,8 @@ impl RubyHost {
                     // (`rb_str_comparable`), so `255.chr == "ÿ"` and
                     // `"\xff" == "\xff".b` are both false.
                     (Some(RObj::Str(x)), Some(RObj::Str(y))) => {
-                        x == y
-                            && (x.is_ascii() || self.string_encoding(a) == self.string_encoding(b))
+                        x.bytes() == y.bytes()
+                            && (x.bytes().is_ascii() || x.encoding() == y.encoding())
                     }
                     (Some(RObj::Symbol(x)), Some(RObj::Symbol(y))) => x == y,
                     (Some(RObj::Array(x)), Some(RObj::Array(y))) => {
@@ -11334,99 +11341,16 @@ pub fn encoding_info(name: &str) -> Option<&'static crate::encoding_table::Encod
 }
 
 pub fn inspect_string(s: &str) -> String {
-    inspect_string_with(s, None)
+    inspect_units(s.chars().map(Ok))
 }
 
-/// `String#inspect` of a UTF-8 String whose bytes are not all UTF-8, given as
-/// its character view under `view`: the characters as `inspect_string` renders
-/// them, each invalid byte as `\xNN` (`"a\xFFé"`).
-pub fn inspect_broken_utf8(units: &str, view: UnitView) -> String {
-    inspect_string_with(units, Some(view))
-}
-
-/// The tag of a String MRI labels UTF-8 whose bytes are NOT valid UTF-8
-/// (`"\xff"`, `"\xff".b.force_encoding("UTF-8")`). Such a String keeps the
-/// byte storage every tagged String has (one character per byte); an untagged
-/// String is always valid UTF-8 text. Byte-oriented methods read the storage
-/// as any tagged String's; character methods see a [`UnitView`].
-pub const BROKEN_UTF8: &str = "UTF-8";
-
-/// The character view of UTF-8 bytes some of which are invalid, in which —
-/// as in MRI — every invalid byte is one character and every valid sequence is
-/// its character: the bytes as plain text, with invalid byte `NN` (always
-/// 0x80..=0xFF, ASCII is never invalid) parked at the codepoint `base + NN`.
-///
-/// The view has to be read back unambiguously, so `base` is chosen per use to
-/// be a 256-codepoint block that no character of any operand falls in
-/// ([`UnitView::for_operands`]): a genuine `U+10FFA0` in the string then stays
-/// a character, because the parking block is another one. A collision is only
-/// possible for operands holding a character in every one of the 4096
-/// supplementary blocks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UnitView {
-    base: u32,
-}
-
-impl UnitView {
-    /// A view whose parking block holds no character of `byte_operands` (as
-    /// UTF-8 bytes, invalid ones included) or `text_operands`.
-    pub fn for_operands(byte_operands: &[&[u8]], text_operands: &[&str]) -> Self {
-        let mut used = std::collections::HashSet::new();
-        let mut mark = |s: &str| {
-            for c in s.chars() {
-                let v = u32::from(c);
-                if v >= 0x1_0000 {
-                    used.insert(v & !0xFF);
-                }
-            }
-        };
-        for b in byte_operands {
-            for chunk in b.utf8_chunks() {
-                mark(chunk.valid());
-            }
-        }
-        for t in text_operands {
-            mark(t);
-        }
-        let base = (0x100..=0x10FF)
-            .rev()
-            .map(|block: u32| block << 8)
-            .find(|b| !used.contains(b))
-            .unwrap_or(0x10_FF00);
-        UnitView { base }
-    }
-    /// The character view of `bytes`.
-    pub fn units(self, bytes: &[u8]) -> String {
-        let mut out = String::with_capacity(bytes.len());
-        for chunk in bytes.utf8_chunks() {
-            out.push_str(chunk.valid());
-            out.extend(
-                chunk
-                    .invalid()
-                    .iter()
-                    .filter_map(|&b| char::from_u32(self.base + u32::from(b))),
-            );
-        }
-        out
-    }
-    /// The invalid byte a view character stands for.
-    pub fn byte(self, c: char) -> Option<u8> {
-        let v = u32::from(c);
-        (self.base + 0x80..=self.base + 0xFF)
-            .contains(&v)
-            .then(|| (v - self.base) as u8)
-    }
-    /// The bytes a view text denotes.
-    pub fn to_bytes(self, text: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(text.len());
-        for c in text.chars() {
-            match self.byte(c) {
-                Some(b) => out.push(b),
-                None => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
-            }
-        }
-        out
-    }
+/// `String#inspect` of UTF-8 bytes some of which are not UTF-8: the characters
+/// as `inspect_string` renders them, each invalid byte as `\xNN` (`"a\xFFé"`).
+pub fn inspect_broken_utf8(bytes: &[u8]) -> String {
+    inspect_units(bytes.utf8_chunks().flat_map(|chunk| {
+        let chars = chunk.valid().chars().map(Ok);
+        chars.chain(chunk.invalid().iter().map(|&b| Err(b)))
+    }))
 }
 
 /// Whether `c` is unassigned in Unicode (General_Category `Cn`, which takes in
@@ -11437,16 +11361,24 @@ fn is_unassigned(c: char) -> bool {
         .is_match(c.encode_utf8(&mut [0; 4]))
 }
 
-fn inspect_string_with(s: &str, view: Option<UnitView>) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
+/// The inspect form of a UTF-8 String's characters, each `Ok(char)` or, for a
+/// byte that is not part of a valid sequence, `Err(byte)`.
+fn inspect_units(units: impl Iterator<Item = Result<char, u8>>) -> String {
+    let mut out = String::from('"');
+    let mut units = units.peekable();
+    while let Some(unit) = units.next() {
+        let c = match unit {
+            Ok(c) => c,
+            Err(b) => {
+                out.push_str(&format!("\\x{b:02X}"));
+                continue;
+            }
+        };
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '#' => {
-                if matches!(chars.peek(), Some('{') | Some('@') | Some('$')) {
+                if matches!(units.peek(), Some(Ok('{' | '@' | '$'))) {
                     out.push_str("\\#");
                 } else {
                     out.push('#');
@@ -11466,12 +11398,6 @@ fn inspect_string_with(s: &str, view: Option<UnitView>) -> String {
             // otherwise break the line it is printed on.
             c if (c as u32) < 0x20 || matches!(c as u32, 0x7f..=0x9f | 0x2028 | 0x2029) => {
                 out.push_str(&format!("\\u{:04X}", c as u32));
-            }
-            c if view.and_then(|v| v.byte(c)).is_some() => {
-                out.push_str(&format!(
-                    "\\x{:02X}",
-                    view.and_then(|v| v.byte(c)).unwrap_or(0)
-                ));
             }
             // An unassigned codepoint (noncharacters included) is not printable
             // either: `\uXXXX`, or `\u{X}` past the BMP.
@@ -15023,14 +14949,7 @@ pub fn call_proc_self_ctx(
             });
             return call_proc(&inner, args);
         }
-        ProcKind::BrokenUnits(inner, view) => {
-            let mapped: Vec<Value> = args
-                .iter()
-                .map(|a| crate::builtins::bytes_of_units(a, 2, view))
-                .collect();
-            let r = call_proc(&inner, &mapped)?;
-            return Ok(crate::builtins::units_of_bytes(&r, 2, view));
-        }
+
         ProcKind::Around(idx) => {
             // A native around block: `yield` in an around handler re-runs the
             // intercepted method's original body once. Yield args are ignored —

@@ -8515,3 +8515,58 @@ h = {}; h[a: 1] = 2
 # ── ObjectSpace._id2ref inverts object_id; respond_to? sees an active refinement ──
 x = "s"; p ObjectSpace._id2ref(x.object_id).equal?(x), ObjectSpace._id2ref(1.object_id), ObjectSpace._id2ref(nil.object_id), ObjectSpace._id2ref(true.object_id), ObjectSpace._id2ref(123456789), ObjectSpace._id2ref(String.object_id), (ObjectSpace._id2ref(10**9 * 8) rescue $!)
 module RfR; refine String do; def shout = upcase + "!"; end; end; p "b".respond_to?(:shout); using RfR; p "a".shout, "b".respond_to?(:shout), 1.respond_to?(:shout)
+#==#
+# ── a broken UTF-8 String's character methods run over its bytes: MRI's walk-forward and step-back character rules ──
+def t; r = yield; p r; rescue => e; p e; end
+m = "a\xffé b\xe3\x81"
+t { [m.succ, "\xff\xff".succ, "zz\xff".succ, "a\xffz".succ, "\xe3\x81\x82\xff".succ, "ÿ\xff".succ, "9\xff".succ] }
+t { [m.ord, ("\xff".ord rescue $!), m.chr, "\xffa".chr, m.chop, "a\xe3\x81".chop, "\xe3\x81\x82\xe3".chop, "a\xff\r\n".chop] }
+t { [m[2], m[-1], m[1, 3], m[1..3], m[10], m["é"], m["\xff"], m[1...-1], m[7], m[7, 1], m[8, 1]] }
+t { s = m.dup; [s.slice!(1), s, s.slice!(1, 2), s, s.slice!("b"), s, s.slice!(9), s.slice!(1, 0), s.slice!(-1, 5), s] }
+t { s = m.dup; s[1] = "X"; s[2, 1] = "\xfe"; s[-1..] = "!"; s["X"] = "Y"; s }
+t { s = "a\xff"; [(s[5] = "x" rescue $!), (s["zz"] = "x" rescue $!), (s[1, -1] = "x" rescue $!), (s.insert(5, "x") rescue $!)] }
+t { [m.index("b"), m.index("b", 4), m.rindex("b"), m.index(""), m.rindex(""), m.index("a", -1), m.byteindex("b"), m.byterindex("é"), m.index("\x81"), "a\xffa\xff".rindex("a", 1)] }
+t { ["a\xffa".byteindex("a", 1), ("a\xe3\x81\x82".byteindex("a", 2) rescue $!), "a\xffa".byterindex("a"), ("a\xff" =~ /a/ rescue $!)] }
+t { [m.start_with?("a"), m.end_with?("\x81"), m.end_with?("\xe3\x81"), m.end_with?(" b\xe3\x81"), "\xe3\x81\x82".end_with?("\x82"), "\xe3\x81\x82".start_with?("\xe3\x81"), "x\xff".start_with?("x")] }
+t { [m.partition("b"), m.rpartition("é"), m.partition("zz"), m.delete_prefix("a\xff"), m.delete_suffix("\x81"), m.delete_suffix("b\xe3\x81")] }
+t { ["a\xff\n".chomp, "a\xff\r\n".chomp, "a\xffxy".chomp("xy"), "a\xff".chomp("\xff"), "a\xff\n\n".chomp(""), "\xe3\x81".chomp("\x81"), "x\xff".chomp(nil)] }
+t { ["a\xff\nb\n\xfe".lines, "a\xff\nb\n".lines(chomp: true), "a\xffxb\xffx".each_line("x").to_a, "a\xff\n\nb".lines(""), "a\xff".lines(nil), "a\xff\nb".lines("\xff")] }
+t { [m.sub("b", "B"), m.gsub("b") { |x| x.upcase }, m.gsub("é", "é" => "E"), m.sub("a", "\\0\\0"), m.gsub("", "-"), m.sub("b", "\xfe"), m.gsub("b").to_a] }
+t { "a\xffb".sub("b", "[\\0|\\`|\\'|\\\\|\\1]") }
+t { "a\xffb".sub("b", "\\k<x>") }
+t { "\xff".sub("\xff", "x") }
+t { [m.center(12, "\xfe"), m.ljust(10, "é"), m.rjust(9), m.center(3), "\xff".center(5, "ab"), "\xff".ljust(4, "\xe3\x81"), ("\xff".center(5, "") rescue $!)] }
+t { x = m.dup; [x + "x", x + "\xfe", "é" + x, x * 2, (x << "\x82"), x.concat("1", "\xfe"), x.prepend("\xfe"), x.insert(-1, "Z"), x.insert(2, "\xe3"), x.replace("\xab\xcd")] }
+t { [m <=> "a", m <=> "a\xff", "a\xff" <=> "a\xff".b, "\xff" <=> "é", m.casecmp("A\xffé B\xe3\x81"), "a\xff".casecmp("é"), m == m.dup, m.eql?(m.b)] }
+t { [m.lstrip, ("  \xff ".lstrip rescue $!), (" \xff ".rstrip rescue $!), "a\xff".upto("a\xff\x01").to_a.size, m.grapheme_clusters, "é\xff́\r\n\xe3\x81\x82́".grapheme_clusters] }
+t { [m.reverse, m.dup.reverse!, m.chars, m.each_char.to_a, m.length, m.crypt("ab"), m % [], "%s\xff" % "é"] }
+t { [("\xff" + 255.chr rescue $!), ("\xff" << 255.chr rescue $!), ("\xff".index(255.chr) rescue $!), "\xff" == 255.chr] }
+#==#
+# ── String#crypt reads the bytes of its receiver and its salt ──
+p "é".b.crypt("ab"), "\xff".crypt("ab"), ("ab".crypt("\xff") rescue $!), "é".crypt("ab") == "é".b.crypt("ab")
+#==#
+# ── a sub/gsub block or Hash answering invalid UTF-8 joins the result as bytes ──
+p "ab".gsub("b") { "\xff" }, "ab".sub(/b/) { "\xfe\xff" }, "ab".gsub(/b/, "b" => "\xff"), "ab".sub(/(b)/, "\xff\\1"), $~[0], "ab".gsub(/(?<x>b)/, "\\k<x>\xff")
+#==#
+# ── format / String#% keep the bytes of an invalid UTF-8 format or %s / %c operand, counting its characters ──
+p "%s" % "\xff", "x%sy" % ["\xffé"], "%-4s|" % "\xff", "%.1s|" % "\xff\xfe", format("\xff%s", "é"), format("%c", "\xffa"), "%5s|" % "\xe3\x81", "%{a}" % {a: "\xff"}
+#==#
+# ── String#replace takes the other String's encoding along with its bytes ──
+x = "ab".b; x.replace("é"); y = +"é"; y.replace(255.chr)
+p x, x.encoding, y, y.encoding, y.bytes
+#==#
+# ── byteindex / byterindex refuse an offset inside a character ──
+def t; p yield; rescue => e; p e; end
+t { "aあ".byteindex("a", 2) }; t { "aあ".byterindex("a", 2) }; t { "aあ".byteindex(/a/, 3) }
+p "aあa".byteindex("a", 4), "aあa".byterindex("a", 4), "aあa".byteindex("a", 1), "aあa".byterindex("a", 0)
+#==#
+# ── an ASCII-only binary String that takes on UTF-8 text keeps that text's characters ──
+x = "abc".b; x << "日"; y = "abc".b; y.concat("é", "日")
+p x, x.encoding, y, y.encoding, "日".b.length, "日".b.chars, "日".b.inspect
+#==#
+# ── bytesplice refuses a span whose ends fall inside a character ──
+def t; p yield; rescue => e; p e; end
+t { "a\xff".bytesplice(0, 1, "\xe3") }; t { "\xe3\x81\x82".bytesplice(1, 1, "x") }; t { "aあ".bytesplice(0..1, "x") }
+t { "aあb".bytesplice(1, 3, "xyz", 1, 1) }; t { "aあb".bytesplice(1..3, "éx", 0..1) }; t { "ab".bytesplice(0, 1, "é", 1, 1) }
+t { "ab".bytesplice(0, 1) }; t { "ab".bytesplice(:a, "x") }; t { "ab".bytesplice(5, 1, "x") }; t { "ab".bytesplice(0, -1, "x") }
+t { s = "a\xff"; s.clear; [s, s.encoding, s.valid_encoding?] }

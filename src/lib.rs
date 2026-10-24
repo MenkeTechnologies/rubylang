@@ -28,9 +28,11 @@ pub mod pp;
 pub mod private_builtins;
 pub mod random;
 pub mod repl;
+pub mod rstr;
 pub mod rtime;
 pub mod rust_ffi;
 pub mod tiers;
+pub mod unicode_tables;
 
 pub use fusevm::Value;
 

@@ -7414,3 +7414,81 @@ false
 "A!"
 true
 false
+#==#
+["a\xFFé c\xE3\x81", "\u0001\xFF\xFF", "aaa\xFF", "b\xFFa", "ぃ\xFF", "Ā\xFF", "10\xFF"]
+[97, #<ArgumentError: invalid byte sequence in UTF-8>, "a", "\xFF", "a\xFFé b", "a", "あ", "a\xFF"]
+["é", "\x81", "\xFFé ", "\xFFé ", nil, "é", nil, "\xFFé b\xE3", nil, "", nil]
+["\xFF", "a\xE3", "é ", "a\xE3", "b", "a\xE3", nil, "", "\x81", "a\xE3"]
+"aY\xFE b\xE3!"
+#<IndexError: index 5 out of string>
+[4, 4, 4, 0, 7, nil, 5, 2, nil, 0]
+[2, #<IndexError: offset 2 does not land on character boundary>, 2, #<ArgumentError: invalid byte sequence in UTF-8>]
+[true, false, true, true, false, false, true]
+[["a\xFFé ", "b", "\xE3\x81"], ["a\xFF", "é", " b\xE3\x81"], ["a\xFFé b\xE3\x81", "", ""], "é b\xE3\x81", "a\xFFé b\xE3\x81", "a\xFFé b\xE3\x81"]
+["a\xFF", "a\xFF", "a\xFF", "a\xFF", "a\xFF", "\xE3\x81", "x\xFF"]
+[["a\xFF\n", "b\n", "\xFE"], ["a\xFF", "b"], ["a\xFFx", "b\xFFx"], ["a\xFF\n\n", "b"], ["a\xFF"], ["a\xFF", "\nb"]]
+["a\xFFé B\xE3\x81", "a\xFFé B\xE3\x81", "a\xFFE b\xE3\x81", "aa\xFFé b\xE3\x81", "-a-\xFF-é- -b-\xE3\x81-", "a\xFFé \xFE\xE3\x81", ["b"]]
+"a\xFF[b|a\xFF||\\|]"
+#<IndexError: undefined group name reference: x>
+#<RegexpError: invalid multibyte character: /\xFF/>
+["\xFE\xFEa\xFFé b\xE3\x81\xFE\xFE\xFE", "a\xFFé b\xE3\x81ééé", "  a\xFFé b\xE3\x81", "a\xFFé b\xE3\x81", "ab\xFFab", "\xFF\xE3\x81\xE3", #<ArgumentError: zero width padding>]
+["a\xFFé b\xE3\x81x", "a\xFFé b\xE3\x81\xFE", "éa\xFFé b\xE3\x81", "a\xFFé b\xE3\x81a\xFFé b\xE3\x81", "\xAB\xCD", "\xAB\xCD", "\xAB\xCD", "\xAB\xCD", "\xAB\xCD", "\xAB\xCD"]
+[1, 1, 1, 1, 0, -1, true, false]
+["a\xFFé b\xE3\x81", #<ArgumentError: invalid byte sequence in UTF-8>, #<Encoding::CompatibilityError: invalid byte sequence in UTF-8>, 702, ["a", "\xFF", "é", " ", "b"], ["é", "\xFF", "́", "\r\n", "あ́"]]
+["\x81\xE3b é\xFFa", "\x81\xE3b é\xFFa", ["a", "\xFF", "é", " ", "b", "\xE3", "\x81"], ["a", "\xFF", "é", " ", "b", "\xE3", "\x81"], 7, "abdsMio1VfPDA", "a\xFFé b\xE3\x81", "é\xFF"]
+[#<Encoding::CompatibilityError: incompatible character encodings: UTF-8 and BINARY (ASCII-8BIT)>, #<Encoding::CompatibilityError: incompatible character encodings: UTF-8 and BINARY (ASCII-8BIT)>, #<Encoding::CompatibilityError: incompatible character encodings: UTF-8 and BINARY (ASCII-8BIT)>, false]
+#==#
+"abclsH8ttXiZ6"
+"abXipmD1IiqKQ"
+#<ArgumentError: salt too short (need >=2 bytes)>
+true
+#==#
+"a\xFF"
+"a\xFE\xFF"
+"a\xFF"
+"a\xFFb"
+"b"
+"ab\xFF"
+#==#
+"\xFF"
+"x\xFFéy"
+"\xFF   |"
+"\xFF|"
+"\xFFé"
+"\xFF"
+"   \xE3\x81|"
+"\xFF"
+#==#
+"é"
+#<Encoding:UTF-8>
+"\xFF"
+#<Encoding:BINARY (ASCII-8BIT)>
+[255]
+#==#
+#<IndexError: offset 2 does not land on character boundary>
+#<IndexError: offset 2 does not land on character boundary>
+#<IndexError: offset 3 does not land on character boundary>
+4
+4
+4
+0
+#==#
+"abc日"
+#<Encoding:UTF-8>
+"abcé日"
+#<Encoding:UTF-8>
+3
+["\xE6", "\x97", "\xA5"]
+"\"\\xE6\\x97\\xA5\""
+#==#
+"\xE3\xFF"
+#<IndexError: offset 1 does not land on character boundary>
+#<IndexError: offset 2 does not land on character boundary>
+"ayb"
+"aéb"
+#<IndexError: offset 1 does not land on character boundary>
+#<TypeError: wrong argument type Integer (expected Range)>
+#<TypeError: wrong argument type Symbol (expected Range)>
+#<IndexError: index 5 out of string>
+#<IndexError: negative length -1>
+["", #<Encoding:UTF-8>, true]

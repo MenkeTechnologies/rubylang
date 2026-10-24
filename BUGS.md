@@ -1109,12 +1109,19 @@ Honest limitations of this surface:
   string literal is built from bytes: a run spelling UTF-8 is its character
   (`"\xE3\x81\x82"` is `"あ"`), and bytes that are not UTF-8 make a UTF-8
   String holding invalid bytes, as MRI keeps them (`"\xff".valid_encoding?` is
-  false, `.bytes` is `[255]`). Such a String keeps one-character-per-byte
-  storage under a `UTF-8` label: its byte methods (`bytes`, `bytesize`,
-  `byteslice`, `getbyte`/`setbyte`, `b`, `force_encoding`, `unpack`, `hash`,
-  `==`) read bytes; its character methods see each invalid byte as one
-  character and each valid sequence as its character (`"a\xffé".length` is 3,
-  `chars`, `reverse`, `[]`, `index`, `center`, `each_char` with a block, …);
+  false, `.bytes` is `[255]`). A String IS its bytes plus their encoding
+  (`src/rstr.rs`: valid UTF-8 kept as text, every other String as raw bytes and
+  a label — nothing is smuggled through a codepoint), so its byte methods
+  (`bytes`, `bytesize`, `byteslice`, `bytesplice`, `getbyte`/`setbyte`, `b`,
+  `force_encoding`, `unpack`, `hash`, `==`) read bytes, and its character
+  methods are ports of `string.c` over Onigmo's UTF-8 primitives
+  (`src/builtins/utf8_bytes.rs`): counting forward each invalid byte is one
+  character (`"a\xffé".length` is 3, `chars`, `reverse`, `[]`, `slice!`, `[]=`,
+  `insert`, `center`), stepping back skips continuation bytes (`"a\xE3\x81".chop`
+  is `"a"`), a search hit must start on a character head (`end_with?`,
+  `delete_suffix`, `lines`, `index`/`rindex`/`byteindex`), and `succ`, `upto`,
+  `casecmp`, `<=>`, `lstrip`, `sub`/`gsub` with a String pattern,
+  `grapheme_clusters` and `%` follow MRI byte for byte;
   `inspect`/`dump` show invalid bytes as `\xNN`; `scrub` replaces them; and the
   methods MRI refuses on such a String raise as MRI does (`upcase` "input
   string invalid", `split`/`tr`/`count`/a Regexp match "invalid byte sequence in
@@ -1129,9 +1136,15 @@ Honest limitations of this surface:
   parsing, as MRI's SyntaxError "invalid symbol". The `ruby` command reports a script that
   does not parse as `<script>: <message> (SyntaxError)`. Output writes a
   String's bytes (`puts "\xff"` writes 0xFF; `IO#write` counts bytes).
-  The character view parks each invalid byte in a 256-codepoint block chosen
-  per operation to hold no character of any operand, so a genuine
-  `U+10FFA0` beside invalid bytes stays a character. A Regexp of fixed
+  A text String given such an argument joins it by bytes too (`"ab".sub("b",
+  "\xff")`, a `gsub` block answering one, `"%s" % "\xff"`), and the methods
+  that read the argument as characters refuse it (`count`, `tr`, `delete`,
+  `squeeze`, `split`). `byteindex`/`byterindex`/`bytesplice` refuse an offset
+  inside a character, on text as well. Residue: `$~` after a `sub`/`gsub` with
+  a String pattern on a broken receiver is `nil` (MRI's MatchData over invalid
+  bytes is not modelled); `append_as_bytes` is not implemented; any other
+  String method on a broken receiver raises `NotImplementedError` rather than
+  answering from a guess. A Regexp of fixed
   encoding (non-ASCII, `/u`, binary `/\xNN/n`) matched against a String of
   another encoding holding non-ASCII raises `Encoding::CompatibilityError`
   (`incompatible encoding regexp match (UTF-8 regexp with BINARY (ASCII-8BIT)

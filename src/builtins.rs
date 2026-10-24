@@ -9877,6 +9877,8 @@ extern "C" {
 
 // ---- String ---------------------------------------------------------------
 
+mod utf8_bytes;
+
 /// String methods whose result does NOT inherit the receiver's encoding.
 ///
 /// Everything else does, so this list is the exception set, measured against
@@ -9943,12 +9945,12 @@ fn propagate_string_encoding(v: &Value, enc: &'static str, may_upgrade: bool, de
 /// `String#…` dispatch, plus MRI's rule that a String method's result carries
 /// the receiver's encoding.
 ///
-/// The encoding lives in a side table keyed by heap id (see
-/// [`crate::host::RubyHost::string_encoding`]), so a method that builds a FRESH
-/// string — `dup`, `+`, `*`, `reverse`, `split`, `chars`, … — produces an
-/// untagged, therefore UTF-8, result unless the tag is copied across. Doing that
-/// here rather than at each of the hundreds of return sites keeps the rule in
-/// one place and applies it to every method at once.
+/// The text methods build their results as fresh UTF-8 Strings — `dup`, `+`,
+/// `*`, `reverse`, `split`, `chars`, … — so a byte String's result is UTF-8
+/// unless its encoding is copied across (see
+/// [`crate::host::RubyHost::string_encoding`]). Doing that here rather than at
+/// each of the hundreds of return sites keeps the rule in one place and
+/// applies it to every method at once.
 fn dispatch_string(
     recv: &Value,
     name: &str,
@@ -9968,6 +9970,9 @@ fn dispatch_string(
     if let Some(v) = dispatch_string_borrowed(recv, name, args) {
         return Ok(v);
     }
+    if let Some(r) = dispatch_string_bytes(recv, name, args) {
+        return r;
+    }
     // Almost every string is UTF-8, i.e. untagged, and has nothing to propagate.
     // That path is settled with ONE hash lookup and then runs the method
     // directly: the work below reads the receiver's content (a copy) and every
@@ -9981,13 +9986,20 @@ fn dispatch_string(
         {
             regexp_match_compat(&args[0], recv)?;
         }
+        // A byte offset must land between characters, which the text methods
+        // cannot see; the ports over bytes check it (`str_ensure_byte_pos`).
+        if matches!(name, "byteindex" | "byterindex" | "bytesplice") && !args.is_empty() {
+            let bytes = with_host(|h| h.string_bytes(recv));
+            if let Some(v) = utf8_bytes::dispatch(recv, bytes, name, args, None)? {
+                return Ok(v);
+            }
+        }
         // Text given a broken UTF-8 argument joins it by bytes.
         if !args.is_empty()
             && !BROKEN_UTF8_BYTE_METHODS.contains(&name)
             && with_host(|h| h.any_tagged_strings() && args.iter().any(|a| h.is_broken_utf8(a)))
         {
-            let bytes = with_host(|h| h.string_bytes(recv));
-            return dispatch_utf8_char_view(recv, bytes, name, args, block);
+            return dispatch_text_with_broken_argument(recv, name, args, block);
         }
         return dispatch_string_body(recv, name, args, block);
     };
@@ -10104,6 +10116,9 @@ fn b_mkbstr(vm: &mut VM, argc: u8) -> Value {
 /// storage, exactly as any tagged String does: they read or relabel bytes and
 /// never ask where a character ends.
 const BROKEN_UTF8_BYTE_METHODS: &[&str] = &[
+    "clear",
+    "dedup",
+    "undump",
     "bytes",
     "bytesize",
     "each_byte",
@@ -10153,7 +10168,9 @@ fn broken_utf8_refusal(name: &str, args: &[Value]) -> Option<String> {
     let invalid = || raise_exc("ArgumentError", "invalid byte sequence in UTF-8");
     match name {
         "upcase" | "downcase" | "capitalize" | "swapcase" | "upcase!" | "downcase!"
-        | "capitalize!" | "swapcase!" => Some(raise_exc("ArgumentError", "input string invalid")),
+        | "capitalize!" | "swapcase!" | "casecmp?" => {
+            Some(raise_exc("ArgumentError", "input string invalid"))
+        }
         "codepoints"
         | "each_codepoint"
         | "split"
@@ -10176,7 +10193,7 @@ fn broken_utf8_refusal(name: &str, args: &[Value]) -> Option<String> {
         {
             Some(invalid())
         }
-        "strip" | "strip!" | "lstrip" | "lstrip!" | "rstrip" | "rstrip!" => Some(raise_exc(
+        "strip" | "strip!" | "rstrip" | "rstrip!" => Some(raise_exc(
             "Encoding::CompatibilityError",
             "invalid byte sequence in UTF-8",
         )),
@@ -10184,11 +10201,10 @@ fn broken_utf8_refusal(name: &str, args: &[Value]) -> Option<String> {
     }
 }
 
-/// A broken UTF-8 String (see [`crate::host::BROKEN_UTF8`]): the methods that
-/// know the bytes are invalid, the byte methods on the storage, and every other
-/// method run over the character view ([`crate::host::UnitView`]) — each
-/// invalid byte one character, each valid sequence its character — with the
-/// String results and any change to the receiver mapped back to bytes.
+/// A broken UTF-8 String (see [`crate::host::BROKEN_UTF8`]): the methods MRI
+/// refuses on one, the methods that know the bytes are invalid, the byte
+/// methods (exact over the Latin-1 view, see [`crate::rstr`]), and every
+/// character method ported over the bytes in [`utf8_bytes`].
 fn dispatch_broken_utf8(
     recv: &Value,
     name: &str,
@@ -10222,175 +10238,61 @@ fn dispatch_broken_utf8(
         }
         "encode" | "encode!" => return encode_broken_utf8(recv, name, &bytes, args),
         "dump" => {
-            let view = crate::host::UnitView::for_operands(&[&bytes], &[]);
-            let units = view.units(&bytes);
-            return Ok(new_str(dump_string(
-                units.chars().map(|c| match view.byte(c) {
-                    Some(b) => DUMP_INVALID_BYTE | u32::from(b),
-                    None => u32::from(c),
-                }),
-                true,
-            )));
+            let units = bytes.utf8_chunks().flat_map(|chunk| {
+                let chars = chunk.valid().chars().map(u32::from);
+                chars.chain(
+                    chunk
+                        .invalid()
+                        .iter()
+                        .map(|&b| DUMP_INVALID_BYTE | u32::from(b)),
+                )
+            });
+            return Ok(new_str(dump_string(units, true)));
         }
         _ if BROKEN_UTF8_BYTE_METHODS.contains(&name) => {
             return dispatch_string_tagged(recv, name, args, block);
         }
         _ => {}
     }
-    dispatch_utf8_char_view(recv, bytes, name, args, block)
+    if let Some(v) = utf8_bytes::dispatch(recv, bytes, name, args, block.clone())? {
+        return Ok(v);
+    }
+    // What is left only compares, through `<=>`/`==`, which answer above.
+    if matches!(
+        name,
+        "between?" | "clamp" | "<=>" | "==" | "===" | "eql?" | "!="
+    ) {
+        return dispatch_string_tagged(recv, name, args, block);
+    }
+    Err(raise_exc(
+        "NotImplementedError",
+        &format!("String#{name} is not supported on a String whose bytes are not valid UTF-8"),
+    ))
 }
 
-/// A String method on UTF-8 bytes some of which are not UTF-8 — a broken
-/// receiver, or a text receiver given a broken argument (`"ab" << "\xff"`):
-/// it runs over the character view, each invalid byte one character, with the
-/// String results and any change to the receiver mapped back to bytes. The
-/// rules that hinge on a broken argument come first.
-fn dispatch_utf8_char_view(
+/// The text methods MRI refuses when an ARGUMENT is a broken UTF-8 String
+/// (they read it as characters): `"ab".count("\xff")`.
+const BROKEN_ARGUMENT_REFUSALS: &[&str] = &[
+    "count", "delete", "delete!", "squeeze", "squeeze!", "tr", "tr!", "tr_s", "tr_s!", "split",
+];
+
+/// A text String method given a broken UTF-8 argument: the methods that join
+/// or search by bytes run over the receiver's bytes ([`utf8_bytes`]), the
+/// character-class methods refuse, and the rest read the argument as usual.
+fn dispatch_text_with_broken_argument(
     recv: &Value,
-    bytes: Vec<u8>,
     name: &str,
     args: &[Value],
     block: Option<Value>,
 ) -> Result<Value, String> {
-    match name {
-        // A prefix/suffix test compares bytes, and the cut has to fall between
-        // characters: a broken argument matches the same bytes in the receiver
-        // (`"\xffa".start_with?("\xff")`), half a character does not.
-        "start_with?" | "end_with?"
-            if args.iter().all(|a| with_host(|h| h.as_str(a).is_some())) =>
-        {
-            let view = crate::host::UnitView::for_operands(&[&bytes], &[]);
-            let units = |b: &[u8]| view.units(b);
-            let whole = units(&bytes);
-            let hit = args.iter().any(|a| {
-                let p = with_host(|h| h.string_bytes(a));
-                if name == "start_with?" {
-                    bytes.starts_with(&p) && whole == units(&p) + &units(&bytes[p.len()..])
-                } else {
-                    bytes.ends_with(&p)
-                        && whole == units(&bytes[..bytes.len() - p.len()]) + &units(&p)
-                }
-            });
-            return Ok(Value::Bool(hit));
-        }
-        // A broken NEEDLE is never found (`rb_strseq_index` refuses a broken
-        // substring), and a broken String pattern cannot become a Regexp.
-        "include?" | "index" | "rindex" | "partition" | "rpartition" | "sub" | "gsub" | "sub!"
-        | "gsub!"
-            if args
-                .first()
-                .is_some_and(|a| with_host(|h| h.is_broken_utf8(a))) =>
-        {
-            let dup = || with_host(|h| h.new_utf8_from_bytes(bytes.clone()));
-            return match name {
-                "include?" => Ok(Value::Bool(false)),
-                "index" | "rindex" => Ok(Value::Undef),
-                "partition" => Ok(new_arr(vec![
-                    dup(),
-                    new_str(String::new()),
-                    new_str(String::new()),
-                ])),
-                "rpartition" => Ok(new_arr(vec![
-                    new_str(String::new()),
-                    new_str(String::new()),
-                    dup(),
-                ])),
-                _ => {
-                    let shown = with_host(|h| h.inspect(&args[0]));
-                    Err(raise_exc(
-                        "RegexpError",
-                        &format!(
-                            "invalid multibyte character: /{}/",
-                            &shown[1..shown.len() - 1]
-                        ),
-                    ))
-                }
-            };
-        }
-        _ => {}
+    if BROKEN_ARGUMENT_REFUSALS.contains(&name) {
+        return Err(raise_exc("ArgumentError", "invalid byte sequence in UTF-8"));
     }
-    // The parking block for invalid bytes avoids every character of the
-    // receiver and of the String arguments, so the view reads back exactly.
-    let operand_bytes: Vec<Vec<u8>> = args
-        .iter()
-        .filter(|a| with_host(|h| h.as_str(a).is_some()))
-        .map(|a| with_host(|h| h.string_bytes(a)))
-        .collect();
-    let mut operands: Vec<&[u8]> = vec![&bytes];
-    operands.extend(operand_bytes.iter().map(Vec::as_slice));
-    let unit_view = crate::host::UnitView::for_operands(&operands, &[]);
-    let units = unit_view.units(&bytes);
-    let view = new_str(units.clone());
-    let block = block.map(|b| with_host(|h| h.new_broken_units_block(b, unit_view)));
-    let args: Vec<Value> = args
-        .iter()
-        .map(|a| units_of_bytes(a, 1, unit_view))
-        .collect();
-    let out = dispatch_string(&view, name, &args, block)?;
-    // An Enumerator over the view iterates the receiver.
-    if with_host(|h| h.enum_source(&out)).is_some_and(|s| s == view) {
-        with_host(|h| h.set_enum_source(&out, recv.clone()));
+    let bytes = with_host(|h| h.string_bytes(recv));
+    match utf8_bytes::dispatch(recv, bytes, name, args, block.clone())? {
+        Some(v) => Ok(v),
+        None => dispatch_string_body(recv, name, args, block),
     }
-    // A method that changed its receiver changed the view: carry it back.
-    let after = with_host(|h| h.as_str(&view).unwrap_or_default());
-    if after != units {
-        frozen_guard(recv, name, STRING_MUTATORS)?;
-        with_host(|h| h.set_utf8_bytes(recv, unit_view.to_bytes(&after)));
-    }
-    if out == view {
-        return Ok(recv.clone());
-    }
-    Ok(bytes_of_units(&out, 2, unit_view))
-}
-
-/// A value computed over a broken String's character view, as the user sees
-/// it: each String in it (to `depth` Array levels) that holds a view character
-/// becomes a String of the bytes it stands for. Anything else is unchanged.
-pub(crate) fn bytes_of_units(v: &Value, depth: u8, view: crate::host::UnitView) -> Value {
-    if let Some(s) = with_host(|h| h.as_str(v).filter(|_| h.string_encoding(v).is_none())) {
-        if s.chars().any(|c| view.byte(c).is_some()) {
-            return with_host(|h| h.new_utf8_from_bytes(view.to_bytes(&s)));
-        }
-        return v.clone();
-    }
-    if depth > 0 {
-        if let Some(items) = with_host(|h| h.as_array(v)) {
-            return new_arr(
-                items
-                    .iter()
-                    .map(|x| bytes_of_units(x, depth - 1, view))
-                    .collect(),
-            );
-        }
-        if let Some(buf) = with_host(|h| h.enum_buf(v)) {
-            let mapped = buf
-                .iter()
-                .map(|x| bytes_of_units(x, depth - 1, view))
-                .collect();
-            with_host(|h| h.set_enum_buf(v, mapped));
-        }
-    }
-    v.clone()
-}
-
-/// The inverse of [`bytes_of_units`]: a user value handed back to a method
-/// running over a broken String's character view, with each broken String in
-/// it as view text.
-pub(crate) fn units_of_bytes(v: &Value, depth: u8, view: crate::host::UnitView) -> Value {
-    if with_host(|h| h.is_broken_utf8(v)) {
-        return new_str(view.units(&with_host(|h| h.string_bytes(v))));
-    }
-    if depth > 0 {
-        if let Some(items) = with_host(|h| h.as_array(v)) {
-            return new_arr(
-                items
-                    .iter()
-                    .map(|x| units_of_bytes(x, depth - 1, view))
-                    .collect(),
-            );
-        }
-    }
-    v.clone()
 }
 
 /// `String#scrub` over UTF-8 bytes: each maximal invalid subsequence becomes
@@ -10478,16 +10380,64 @@ fn encode_broken_utf8(
     let out = dispatch_string(&clean, "encode", &args[..1], None)?;
     if name == "encode!" {
         let (s, enc) = with_host(|h| (h.as_str(&out).unwrap_or_default(), h.string_encoding(&out)));
-        with_host(|h| {
-            h.set_str(recv, s);
-            match enc {
-                Some(e) => h.set_string_encoding(recv, e),
-                None => h.clear_string_encoding(recv),
-            }
-        });
+        with_host(|h| h.set_str_as(recv, s, enc));
         return Ok(recv.clone());
     }
     Ok(out)
+}
+
+/// The byte methods answered straight from a String's bytes, before any
+/// character view is built: on a long byte String, building the Latin-1 view
+/// costs more than the method itself. `None` leaves the call to the general
+/// path, which is also where every case these do not settle goes.
+fn dispatch_string_bytes(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    match (name, args) {
+        ("getbyte", [Value::Int(i)]) => with_host(|h| {
+            let b = h.str_bytes(recv)?;
+            let idx = if *i < 0 { *i + b.len() as i64 } else { *i };
+            Some(Ok(match usize::try_from(idx).ok().and_then(|k| b.get(k)) {
+                Some(&byte) => Value::Int(i64::from(byte)),
+                None => Value::Undef,
+            }))
+        }),
+        // Appending to a byte String whose encoding the operand cannot change:
+        // the same label, or ASCII. Anything that relabels goes the long way.
+        ("<<", [arg]) => {
+            let (recv_enc, arg_bytes, arg_enc) = with_host(|h| {
+                Some((
+                    h.string_encoding(recv)?,
+                    h.str_bytes(arg)?.to_vec(),
+                    h.string_encoding(arg),
+                ))
+            })?;
+            let same = arg_enc == Some(recv_enc)
+                || (recv_enc == crate::host::BROKEN_UTF8 && arg_enc.is_none());
+            if !(same || arg_bytes.is_ascii()) {
+                return None;
+            }
+            if let Err(e) = frozen_guard(recv, name, STRING_MUTATORS) {
+                return Some(Err(e));
+            }
+            with_host(|h| {
+                let Some(crate::rstr::RStr::Bytes(b, _)) = h.rstr_mut(recv) else {
+                    return;
+                };
+                b.extend_from_slice(&arg_bytes);
+                // A broken UTF-8 receiver can be completed by the bytes it is
+                // given (`"\xE3\x81" << "\x82"`).
+                if recv_enc == crate::host::BROKEN_UTF8 && !arg_bytes.is_ascii() {
+                    let bytes = std::mem::take(b);
+                    h.set_utf8_bytes(recv, bytes);
+                }
+            });
+            Some(Ok(recv.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// The String methods that can be answered from a BORROW of the receiver rather
@@ -10523,22 +10473,20 @@ fn dispatch_string_borrowed(recv: &Value, name: &str, args: &[Value]) -> Option<
         // A non-String receiver reaches `dispatch_string_body` only through a
         // path that reads it as empty; matching that keeps this total for the
         // names above, which is what lets them leave the big match.
-        // A broken UTF-8 String counts characters over its character view.
+        // A broken UTF-8 String counts its characters from its bytes.
         if matches!(name, "length" | "size") && h.is_broken_utf8(recv) {
             return None;
         }
-        let s = h.str_ref(recv).unwrap_or("");
+        let b = h.str_bytes(recv).unwrap_or_default();
         Some(match name {
-            "length" | "size" => Value::Int(s.chars().count() as i64),
-            // A byte string counts its characters (one per byte); see the
-            // byte-string representation invariant.
-            "bytesize" => Value::Int(if h.string_encoding(recv).is_some() {
-                s.chars().count() as i64
-            } else {
-                s.len() as i64
+            // A byte String's characters are its bytes; text counts chars.
+            "length" | "size" => Value::Int(match h.rstr(recv) {
+                Some(crate::rstr::RStr::Bytes(..)) => b.len() as i64,
+                _ => String::from_utf8_lossy(b).chars().count() as i64,
             }),
-            "empty?" => Value::Bool(s.is_empty()),
-            "ascii_only?" => Value::Bool(s.is_ascii()),
+            "bytesize" => Value::Int(b.len() as i64),
+            "empty?" => Value::Bool(b.is_empty()),
+            "ascii_only?" => Value::Bool(b.is_ascii()),
             _ => return None,
         })
     })
@@ -11085,12 +11033,9 @@ fn dispatch_string_body(
                 let dest = if name == "encode!" {
                     recv.clone()
                 } else {
-                    new_str(s.clone())
+                    new_str(String::new())
                 };
-                with_host(|h| match target {
-                    Some(e) => h.set_string_encoding(&dest, e),
-                    None => h.clear_string_encoding(&dest),
-                });
+                with_host(|h| h.set_str_as(&dest, s.clone(), target));
                 return Ok(dest);
             }
             let mut replaced = None;
@@ -11125,13 +11070,7 @@ fn dispatch_string_body(
             match replaced {
                 // Replacement already produced the target's own representation,
                 // so the label moves without the storage.
-                Some(content) => with_host(|h| {
-                    h.set_str(&dest, content);
-                    match target {
-                        Some(e) => h.set_string_encoding(&dest, e),
-                        None => h.clear_string_encoding(&dest),
-                    }
-                }),
+                Some(content) => with_host(|h| h.set_str_as(&dest, content, target)),
                 None => retag_string(&dest, &s, target),
             }
             Ok(dest)
@@ -11458,9 +11397,13 @@ fn dispatch_string_body(
                 .map_err(|e| raise_exc("RegexpError", &e.to_string()))?;
             regex_replace(&re, &s, &args[1..], &block, all, &args[0])
         }
+        // The receiver takes the other String's bytes AND its encoding.
         "replace" => {
-            let n = arg_str(&args[0]);
-            with_host(|h| h.set_str(recv, n));
+            let content = match with_host(|h| h.rstr(&args[0]).cloned()) {
+                Some(c) => c,
+                None => crate::rstr::RStr::Text(implicit_str(&args[0])?),
+            };
+            with_host(|h| h.set_rstr(recv, content));
             Ok(recv.clone())
         }
         // `+` demands a String; `to_s`-ing the operand made `"a" + 1` answer
@@ -11534,15 +11477,7 @@ fn dispatch_string_body(
         "%" => {
             // `"%d-%d" % [1, 2]` or `"%d" % 5`; a Hash operand feeds named
             // references `%<name>s` / `%{name}`.
-            if let Some(map) = with_host(|h| h.as_hash(&args[0])) {
-                // The Hash is BOTH the named source and the sole positional
-                // operand: `"%s" % {a: 1}` prints the Hash.
-                Ok(new_str(sprintf(&s, &args[..1], Some(&map))?))
-            } else {
-                let fargs =
-                    with_host(|h| h.as_array(&args[0])).unwrap_or_else(|| vec![args[0].clone()]);
-                Ok(new_str(sprintf(&s, &fargs, None)?))
-            }
+            string_format(s.as_bytes(), &args[0])
         }
         "ljust" => Ok(new_str(pad(
             &s,
@@ -11626,7 +11561,10 @@ fn dispatch_string_body(
             Some(c) => Ok(Value::Int(c as i64)),
             None => Err(raise_exc("ArgumentError", "empty string")),
         },
-        "crypt" => str_crypt(&s, args.first().unwrap_or(&Value::Undef)),
+        "crypt" => str_crypt(
+            &with_host(|h| h.string_bytes(recv)),
+            args.first().unwrap_or(&Value::Undef),
+        ),
         "chr" => Ok(new_str(
             s.chars().next().map(|c| c.to_string()).unwrap_or_default(),
         )),
@@ -12862,7 +12800,9 @@ fn regex_replace(
         (None, None, Some(v)) => Some(implicit_str(v)?),
         _ => None,
     };
-    let mut out = String::new();
+    // Bytes, not text: a block or Hash may answer a String whose bytes are
+    // not valid UTF-8, which joins the result as those bytes.
+    let mut out: Vec<u8> = Vec::new();
     let mut last = 0;
     let mut matched_any = false;
     for (count, caps) in ruby_matches(re, s).into_iter().enumerate() {
@@ -12871,21 +12811,21 @@ fn regex_replace(
         }
         matched_any = true;
         let m = caps.get(0).unwrap();
-        out.push_str(&s[last..m.start()]);
+        out.extend(&s.as_bytes()[last..m.start()]);
         // `$~`/`$1`.. are the current match for the block, and the LAST match
         // once the call returns, whatever the replacement form.
         set_match_globals(Some((&caps, s)), re, re_val);
         if let Some(bl) = block {
             let r = call_proc(bl, &[new_str(m.as_str().to_string())])?;
-            out.push_str(&with_host(|h| h.to_s(&r)));
+            out.extend(replacement_bytes(&r));
         } else if let Some(map) = hash {
             // `gsub(re, hash)`: each match is replaced by `hash[match]` through
             // `rb_hash_aref`, so a default or default proc answers a missing key.
             let matched = new_str(m.as_str().to_string());
             let v = dispatch(map, "[]", &[matched], None)?;
-            out.push_str(&with_host(|h| h.to_s(&v)));
+            out.extend(replacement_bytes(&v));
         } else if let Some(repl) = &repl {
-            out.push_str(&expand_backrefs(repl, &caps, re, s)?);
+            out.extend(expand_backrefs(repl, &caps, re, s)?.into_bytes());
         }
         last = m.end();
     }
@@ -12893,8 +12833,20 @@ fn regex_replace(
     if !matched_any {
         set_match_globals(None, re, re_val);
     }
-    out.push_str(&s[last..]);
-    Ok(new_str(out))
+    out.extend(&s.as_bytes()[last..]);
+    Ok(with_host(|h| h.new_utf8_from_bytes(out)))
+}
+
+/// What a `sub`/`gsub` block or Hash answer contributes: a broken UTF-8
+/// String its bytes, anything else its `to_s` text.
+fn replacement_bytes(v: &Value) -> Vec<u8> {
+    with_host(|h| {
+        if h.is_broken_utf8(v) {
+            h.string_bytes(v)
+        } else {
+            h.to_s(v).into_bytes()
+        }
+    })
 }
 
 /// Whether `exc.name` is one of error.c's readers that raise `no <name> is
@@ -13100,10 +13052,14 @@ extern "C" {
 /// platform's crypt(3) answers (traditional DES for a two-character salt; the
 /// `$id$` schemes where libcrypt supports them). crypt(3) returns a static
 /// buffer, so calls are serialized as MRI does without `crypt_r`.
-fn str_crypt(key: &str, salt: &Value) -> Result<Value, String> {
+fn str_crypt(key: &[u8], salt: &Value) -> Result<Value, String> {
     static CRYPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let salt = implicit_str(salt)?;
-    let sb = salt.as_bytes();
+    // Both are read as the BYTES they hold, not as text.
+    let salt = match with_host(|h| h.str_bytes(salt).map(<[u8]>::to_vec)) {
+        Some(b) => b,
+        None => implicit_str(salt)?.into_bytes(),
+    };
+    let sb = salt.as_slice();
     if sb.len() < 2 || sb[0] == 0 || sb[1] == 0 {
         return Err(raise_exc(
             "ArgumentError",
@@ -26348,7 +26304,7 @@ fn regexp_match_compat(re: &Value, s: &Value) -> Result<(), String> {
     }
     let (ascii, str_enc) = with_host(|h| {
         (
-            h.str_ref(s).is_some_and(str::is_ascii),
+            h.str_bytes(s).is_some_and(<[u8]>::is_ascii),
             h.string_encoding(s)
                 .filter(|e| *e != crate::host::BROKEN_UTF8)
                 .unwrap_or("UTF-8"),
@@ -27301,14 +27257,18 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             }
         }
         "format" | "sprintf" => {
-            let fmt = arg_str(&args[0]);
+            let fmt = if with_host(|h| h.is_broken_utf8(&args[0])) {
+                with_host(|h| h.string_bytes(&args[0]))
+            } else {
+                arg_str(&args[0]).into_bytes()
+            };
             // A lone trailing Hash supplies named references (`%<name>s`).
             if args.len() == 2 {
                 if let Some(map) = with_host(|h| h.as_hash(&args[1])) {
-                    return Ok(new_str(sprintf(&fmt, &args[1..], Some(&map))?));
+                    return sprintf_value(&fmt, &args[1..], Some(&map));
                 }
             }
-            Ok(new_str(sprintf(&fmt, &args[1..], None)?))
+            sprintf_value(&fmt, &args[1..], None)
         }
         "printf" if !args.is_empty() => {
             // `printf(fmt, *args)` writes the formatted string to stdout and
@@ -29614,8 +29574,54 @@ fn sprintf(
     args: &[Value],
     named: Option<&IndexMap<RKey, Value>>,
 ) -> Result<String, String> {
-    let bytes: Vec<char> = fmt.chars().collect();
-    let mut out = String::new();
+    let out = sprintf_bytes(fmt.as_bytes(), args, named)?;
+    Ok(String::from_utf8(out).unwrap_or_else(|e| bytes_to_binstr(e.as_bytes())))
+}
+
+/// `String#%`: the operand is the argument list when it is an Array, the
+/// source of named references (and the sole positional operand) when it is a
+/// Hash — `"%s" % {a: 1}` prints the Hash — and the one argument otherwise.
+fn string_format(fmt: &[u8], operand: &Value) -> Result<Value, String> {
+    if let Some(map) = with_host(|h| h.as_hash(operand)) {
+        return sprintf_value(fmt, std::slice::from_ref(operand), Some(&map));
+    }
+    let fargs = with_host(|h| h.as_array(operand)).unwrap_or_else(|| vec![operand.clone()]);
+    sprintf_value(fmt, &fargs, None)
+}
+
+/// `"…" % args` as a String: the bytes [`sprintf_bytes`] formats, which are
+/// not valid UTF-8 when the format or a `%s` operand was not.
+fn sprintf_value(
+    fmt: &[u8],
+    args: &[Value],
+    named: Option<&IndexMap<RKey, Value>>,
+) -> Result<Value, String> {
+    let out = sprintf_bytes(fmt, args, named)?;
+    Ok(with_host(|h| h.new_utf8_from_bytes(out)))
+}
+
+/// [`sprintf`] over the UTF-8 bytes of a format, producing bytes. A byte of
+/// the format that is not part of a valid character is literal text and is
+/// copied as itself; the parser sees it as U+FFFD, a character no directive
+/// is spelled with, while `raw` keeps the byte.
+fn sprintf_bytes(
+    fmt: &[u8],
+    args: &[Value],
+    named: Option<&IndexMap<RKey, Value>>,
+) -> Result<Vec<u8>, String> {
+    let mut bytes: Vec<char> = Vec::with_capacity(fmt.len());
+    let mut raw: Vec<Option<u8>> = Vec::with_capacity(fmt.len());
+    for chunk in fmt.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            bytes.push(c);
+            raw.push(None);
+        }
+        for &b in chunk.invalid() {
+            bytes.push('\u{FFFD}');
+            raw.push(Some(b));
+        }
+    }
+    let mut out = SprintfOut(Vec::with_capacity(fmt.len()));
     let mut i = 0;
     let mut ai = 0;
     // MRI's `posarg`, the state that keeps the three ways of naming an operand
@@ -29675,7 +29681,10 @@ fn sprintf(
         };
     while i < bytes.len() {
         if bytes[i] != '%' {
-            out.push(bytes[i]);
+            match raw[i] {
+                Some(b) => out.0.push(b),
+                None => out.push(bytes[i]),
+            }
             i += 1;
             continue;
         }
@@ -29696,7 +29705,8 @@ fn sprintf(
             if i < bytes.len() {
                 i += 1; // consume '}'
             }
-            out.push_str(&arg_str(&named_val(&nm, '{', '}', &mut posarg)?));
+            out.0
+                .extend(sprintf_s_bytes(&named_val(&nm, '{', '}', &mut posarg)?));
             continue;
         }
         // `%N$` positional argument selector (1-based): `%2$s` uses args[1] and
@@ -29957,6 +29967,27 @@ fn sprintf(
                 }
             };
 
+        // `%s` / `%c` of a String whose bytes are not valid UTF-8: its
+        // characters (`%c` the first), cut and padded by count.
+        if matches!(conv, 's' | 'c') && with_host(|h| h.is_broken_utf8(&arg)) {
+            let b = with_host(|h| h.string_bytes(&arg));
+            let starts = crate::rstr::utf8::char_starts(&b);
+            let all = starts.len() - 1;
+            let n = if conv == 'c' {
+                1
+            } else {
+                prec.map_or(all, |p| p.min(all))
+            };
+            let pad = width.saturating_sub(n);
+            if !left {
+                out.0.extend(std::iter::repeat(b' ').take(pad));
+            }
+            out.0.extend(&b[..starts[n]]);
+            if left {
+                out.0.extend(std::iter::repeat(b' ').take(pad));
+            }
+            continue;
+        }
         let body: String = match conv {
             'd' | 'i' | 'u' => {
                 use num_traits::Signed as _;
@@ -30164,7 +30195,36 @@ fn sprintf(
             out.push_str(&body);
         }
     }
-    Ok(out)
+    Ok(out.0)
+}
+
+/// The bytes `sprintf` builds, appended to as text or as raw bytes.
+struct SprintfOut(Vec<u8>);
+
+impl SprintfOut {
+    fn push(&mut self, c: char) {
+        self.0
+            .extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+    }
+    fn push_str(&mut self, s: &str) {
+        self.0.extend_from_slice(s.as_bytes());
+    }
+}
+
+impl Extend<char> for SprintfOut {
+    fn extend<I: IntoIterator<Item = char>>(&mut self, chars: I) {
+        for c in chars {
+            self.push(c);
+        }
+    }
+}
+
+/// What `%{name}` substitutes: a broken UTF-8 String's bytes, else `to_s`.
+fn sprintf_s_bytes(v: &Value) -> Vec<u8> {
+    if with_host(|h| h.is_broken_utf8(v)) {
+        return with_host(|h| h.string_bytes(v));
+    }
+    arg_str(v).into_bytes()
 }
 
 // ---- small value helpers --------------------------------------------------
@@ -30977,41 +31037,29 @@ fn do_require(args: &[Value], mode: ReqMode) -> Result<Value, String> {
 
 // ---- Byte strings, Array#pack / String#unpack ----------------------------
 //
-// THE BYTE-STRING REPRESENTATION INVARIANT
+// BYTE STRINGS
 //
-// `RObj::Str` is a Rust `String`, so it cannot hold the invalid UTF-8 that a
-// byte string generally is. A String tagged with a non-UTF-8 encoding (see
-// [`RubyHost::string_encoding`]) therefore stores ONE CHARACTER PER BYTE: byte
-// `NN` is the char `U+00NN`, the Latin-1 convention. A UTF-8 (untagged) String
-// stores text and denotes its own UTF-8 bytes.
+// A String's content is its bytes plus their encoding ([`crate::rstr::RStr`]).
+// The text String methods read a byte String through its LATIN-1 VIEW — byte
+// `NN` as the char `U+00NN` ([`crate::host::RubyHost::as_str`]) — which is
+// exact for a single-byte encoding, so `length`, `[]`, `chars`, `reverse`,
+// `index`, `split`, `==`, `hash` answer MRI's byte-oriented result unchanged:
+// in MRI a binary string's characters are its bytes too. Writing a view back
+// ([`crate::host::RubyHost::set_str`]) reads it the same way.
 //
-// The invariant is what makes the tag mean something rather than being a label:
-// under it a byte string's CHARACTER sequence IS its byte sequence, so every
-// character-oriented method — `length`, `[]`, `chars`, `reverse`, `index`,
-// `split`, `==`, `hash` — answers MRI's byte-oriented result for free, because
-// in MRI a binary string's characters are its bytes too.
-//
-// Every producer of a byte string establishes it and every consumer relies on
-// it, so the two must not drift apart:
-//
-//   producers  `Array#pack`, `Integer#chr`, `String#b`, `force_encoding` to a
-//              non-UTF-8 name — the last two TRANSCODE the receiver's UTF-8
-//              bytes into characters ([`text_to_byte_storage`])
-//   consumers  `#bytes`, `#bytesize`, `#each_byte`, `#getbyte`, `#setbyte`,
-//              `#byteslice`, `#unpack` — all read [`string_byte_view`], never
-//              the storage bytes directly
-//   exit       `force_encoding`/`encode!` back to UTF-8 reverses it
-//              ([`crate::host::RubyHost::set_utf8_bytes`])
+// Builders that make a view first and label it after (`Array#pack`,
+// `Integer#chr`, the encoding propagation in `dispatch_string`) rely on
+// labelling reading a text String as a view ([`crate::rstr::RStr::set_encoding`]).
+// Byte methods read [`string_byte_view`], the bytes themselves.
 //
 // Bytes MRI labels UTF-8 that are NOT valid UTF-8 (a `"\xff"` literal,
-// `force_encoding("UTF-8")` on arbitrary bytes, a `setbyte`) keep this byte
-// storage under the tag [`crate::host::BROKEN_UTF8`]; every untagged String is
-// valid text. Such a String answers its byte methods from the storage and its
-// character methods over a [`crate::host::UnitView`] — see
-// `dispatch_broken_utf8`.
+// `force_encoding("UTF-8")` on arbitrary bytes, a `setbyte`) are a
+// [`crate::host::BROKEN_UTF8`] String. Its byte methods read the bytes like any
+// byte String's; its character methods are ported over the bytes in
+// [`utf8_bytes`] — see `dispatch_broken_utf8`.
 
-/// The UTF-8 text `s` re-stored as a byte string (each UTF-8 byte becomes one
-/// character). The entry point to the byte-string representation invariant.
+/// The Latin-1 view of the UTF-8 text `s`'s bytes: what labelling `s` with a
+/// byte encoding reads it as.
 fn text_to_byte_storage(s: &str) -> String {
     bytes_to_binstr(s.as_bytes())
 }
@@ -31059,10 +31107,10 @@ fn retag_string(recv: &Value, s: &str, target: Option<&'static str>) {
 /// `propagate_string_encoding` cannot do this: it only ever SETS a tag, and the
 /// receiver here already carries the one that has to come off.
 fn append_in_place(recv: &Value, s: &str, other: &str, operand: Option<&Value>) {
-    let recv_ascii = s.is_ascii();
+    let joined = format!("{s}{other}");
     with_host(|h| {
-        h.set_str(recv, format!("{s}{other}"));
-        h.inherit_string_encoding_with(recv, recv, recv_ascii, operand);
+        let enc = h.decide_string_encoding(joined.is_ascii(), recv, s.is_ascii(), operand);
+        h.set_str_as(recv, joined, enc);
     });
 }
 
@@ -31150,17 +31198,14 @@ fn store_bytes(recv: &Value, bytes: Vec<u8>) {
     })
 }
 
+/// The bytes of the String `recv`, whose text view is `s`.
 fn string_byte_view(recv: &Value, s: &str) -> Vec<u8> {
-    if with_host(|h| h.string_encoding(recv)).is_some() {
-        binstr_to_bytes(s)
-    } else {
-        s.as_bytes().to_vec()
-    }
+    with_host(|h| h.str_bytes(recv).map(<[u8]>::to_vec)).unwrap_or_else(|| s.as_bytes().to_vec())
 }
 
-/// Encode a byte slice as a Latin-1 binary string (`byte b` -> `char U+00xx`).
+/// The Latin-1 view of `bytes` (see [`crate::rstr::bytes_to_latin1`]).
 pub(crate) fn bytes_to_binstr(bytes: &[u8]) -> String {
-    bytes.iter().map(|&b| b as char).collect()
+    crate::rstr::bytes_to_latin1(bytes)
 }
 
 /// The low 64 bits of an Integer, two's complement for a negative — what MRI's
@@ -31172,9 +31217,9 @@ fn bigint_low_u64(b: &num_bigint::BigInt) -> u64 {
     b.mod_floor(&modulus).to_u64().unwrap_or(0)
 }
 
-/// Decode a binary string to its byte sequence (each codepoint's low 8 bits).
+/// The bytes a Latin-1 view spells (see [`crate::rstr::latin1_to_bytes`]).
 pub(crate) fn binstr_to_bytes(s: &str) -> Vec<u8> {
-    s.chars().map(|c| (c as u32 & 0xff) as u8).collect()
+    crate::rstr::latin1_to_bytes(s)
 }
 
 /// A parsed pack/unpack directive: the type char and its count (`Some(n)`, or
