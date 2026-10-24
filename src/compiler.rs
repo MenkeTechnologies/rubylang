@@ -15,6 +15,11 @@ use crate::host::{ops, BeginDef, ClassDef, MethodDef, ProcDef, RescueDef, Visibi
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::sync::Arc;
 
+/// The parameter a generated `attr_writer` binds its value to. MRI's writer
+/// has no written parameter name (`[[:req]]`), so this one is never spelled
+/// by a program nor reported.
+pub const ATTR_WRITER_PARAM: &str = "__attr_value__";
+
 thread_local! {
     /// Set by `crate::compile` from the source's `# frozen_string_literal:` magic
     /// comment before each file compiles; read when lowering string literals so a
@@ -947,6 +952,17 @@ pub fn compile_at(stmts: &[Stmt], proc_base: usize, begin_base: usize) -> Result
     })
 }
 
+/// The names a block declares for itself beyond its positional parameters:
+/// its keyword parameters, its `**rest`, and its `|x; local|` block-locals.
+pub fn block_own_locals(arity: &crate::ast::BlockArity) -> impl Iterator<Item = String> + '_ {
+    arity
+        .kwnames
+        .iter()
+        .chain(&arity.kwsplat)
+        .chain(&arity.locals)
+        .cloned()
+}
+
 fn dummy_proc() -> ProcDef {
     ProcDef {
         params: vec![],
@@ -1190,6 +1206,7 @@ impl Compiler {
             kwreq,
             chunk: Arc::new(b.build()),
             slot_params: n_slot_params,
+            line: saved_line,
         })
     }
 
@@ -2785,6 +2802,7 @@ impl Compiler {
         // instead of the nil Ruby hoists it to.
         let mut frame = self.scope_locals.last().cloned().unwrap_or_default();
         frame.extend(params.iter().cloned());
+        frame.extend(block_own_locals(&arity));
         self.scope_locals.push(frame);
         // The block nesting `compile_proc` counted (at least 1: a `begin` body at
         // the top level is not a block, but its proc still carries a label depth).
@@ -2863,6 +2881,7 @@ impl Compiler {
                     singleton,
                     singleton_recv: None,
                 } => {
+                    self.cur_line = stmt.line;
                     let def = self.compile_method_named(name, params, body)?;
                     if *singleton {
                         class_methods.insert(name.clone(), def);
@@ -2911,6 +2930,7 @@ impl Compiler {
                     else {
                         unreachable!("guarded by the match arm above")
                     };
+                    self.cur_line = stmt.line;
                     let def = self.compile_method_named(name, params, body)?;
                     if *singleton {
                         class_methods.insert(name.clone(), def);
@@ -3006,6 +3026,7 @@ impl Compiler {
                     args,
                     ..
                 } if matches!(m.as_str(), "attr_accessor" | "attr_reader" | "attr_writer") => {
+                    self.cur_line = stmt.line;
                     for a in args {
                         if let Some(field) = sym_name(a) {
                             if m != "attr_writer" {
@@ -3292,6 +3313,7 @@ impl Compiler {
             kwreq: vec![],
             chunk: Arc::new(b.build()),
             slot_params: 0,
+            line: self.cur_line,
         }
     }
 
@@ -3300,13 +3322,13 @@ impl Compiler {
         let mut b = ChunkBuilder::new();
         let fidx = b.add_constant(Value::Str(Arc::new(field.to_string())));
         b.emit(Op::LoadConst(fidx), 0);
-        let vidx = b.add_constant(Value::Str(Arc::new("value".to_string())));
+        let vidx = b.add_constant(Value::Str(Arc::new(ATTR_WRITER_PARAM.to_string())));
         b.emit(Op::LoadConst(vidx), 0);
         b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
         b.emit(Op::CallBuiltin(ops::SETIVAR, 2), 0);
         MethodDef {
             chunk_id: crate::host::next_method_chunk_id(),
-            params: vec!["value".to_string()],
+            params: vec![ATTR_WRITER_PARAM.to_string()],
             splat: None,
             kwparams: vec![],
             kwsplat: None,
@@ -3317,6 +3339,7 @@ impl Compiler {
             kwreq: vec![],
             chunk: Arc::new(b.build()),
             slot_params: 0,
+            line: self.cur_line,
         }
     }
 

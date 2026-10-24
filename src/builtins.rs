@@ -2771,6 +2771,10 @@ fn dispatch_resolved(
         // (String/Integer/Symbol/nil/Hash/…) responds; gems key their own caches
         // on it (mustermann's EqualityMap). A user `hash` override wins via the
         // find_method_owner check above.
+        // A Method's `==`/`eql?`/`hash` compare definitions, not identity.
+        "==" | "eql?" | "hash" if with_host(|h| h.as_method(recv).is_some()) => {
+            return dispatch_method(recv, name, args, block);
+        }
         "hash" if args.is_empty() => return Ok(Value::Int(with_host(|h| h.value_hash(recv)))),
         // `to_json` on any value (a user class that defines its own wins via the
         // find_method_owner check above). Ignores the optional generator-state arg.
@@ -6994,23 +6998,7 @@ fn comparable_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<
     let spaceship = |other: &Value| -> Result<Option<i64>, String> {
         match dispatch(recv, "<=>", std::slice::from_ref(other), None)? {
             Value::Undef => Ok(None),
-            // MRI `rb_cmpint`: an Integer's sign; anything else is asked
-            // `> 0` then `< 0`, so a String result raises its own comparison
-            // error and a fractional Float keeps its sign.
-            Value::Int(n) => Ok(Some(n.signum())),
-            v => {
-                if let Some(b) = with_host(|h| h.as_bigint(&v)) {
-                    use num_traits::Signed as _;
-                    return Ok(Some(if b.is_negative() { -1 } else { 1 }));
-                }
-                let zero = [Value::Int(0)];
-                let gt = dispatch(&v, ">", &zero, None)?;
-                if with_host(|h| h.truthy(&gt)) {
-                    return Ok(Some(1));
-                }
-                let lt = dispatch(&v, "<", &zero, None)?;
-                Ok(Some(if with_host(|h| h.truthy(&lt)) { -1 } else { 0 }))
-            }
+            v => rb_cmpint(&v).map(Some),
         }
     };
     // Shares MRI's `rb_cmperr` rendering with the numeric ordering paths. It
@@ -7040,6 +7028,26 @@ fn comparable_method(recv: &Value, name: &str, args: &[Value]) -> Result<Option<
         "clamp" => comparable_clamp(recv, args).map(Some),
         _ => Ok(None),
     }
+}
+
+/// MRI `rb_cmpint` for a non-nil `<=>` answer: an Integer's sign; anything
+/// else is asked `> 0` then `< 0`, so a String answer raises its own
+/// comparison error and a fractional Float keeps its sign.
+fn rb_cmpint(v: &Value) -> Result<i64, String> {
+    if let Value::Int(n) = v {
+        return Ok(n.signum());
+    }
+    if let Some(b) = with_host(|h| h.as_bigint(v)) {
+        use num_traits::Signed as _;
+        return Ok(if b.is_negative() { -1 } else { 1 });
+    }
+    let zero = [Value::Int(0)];
+    let gt = dispatch(v, ">", &zero, None)?;
+    if with_host(|h| h.truthy(&gt)) {
+        return Ok(1);
+    }
+    let lt = dispatch(v, "<", &zero, None)?;
+    Ok(if with_host(|h| h.truthy(&lt)) { -1 } else { 0 })
 }
 
 /// Whether `class` gets `method` from a built-in mixin — `Comparable`'s
@@ -7783,7 +7791,7 @@ fn clamp_bounds(args: &[Value]) -> Result<(Option<Value>, Option<Value>), String
 fn cmp_int(a: &Value, b: &Value) -> Result<Option<std::cmp::Ordering>, String> {
     Ok(match dispatch(a, "<=>", std::slice::from_ref(b), None)? {
         Value::Undef => None,
-        v => Some(as_i(&v).cmp(&0)),
+        v => Some(rb_cmpint(&v)?.cmp(&0)),
     })
 }
 
@@ -8450,28 +8458,8 @@ fn dispatch_number(
                     }
                 }
                 if by != 0.0 && by.is_finite() {
-                    // Ruby's float-step count: floor((to-from)/by + err) + 1,
-                    // yielding `from + i*by` with the final value clamped to `to`.
-                    let mut err =
-                        (from.abs() + to.abs() + (to - from).abs()) / by.abs() * f64::EPSILON;
-                    if err > 0.5 {
-                        err = 0.5;
-                    }
-                    let n = ((to - from) / by + err).floor() + 1.0;
-                    let clamp = |i: f64| -> f64 {
-                        let d = i * by + from;
-                        if by >= 0.0 {
-                            if d > to {
-                                to
-                            } else {
-                                d
-                            }
-                        } else if d < to {
-                            to
-                        } else {
-                            d
-                        }
-                    };
+                    let n = float_step_size(from, to, by, false);
+                    let clamp = |i: f64| float_step_value(i, from, by, to);
                     if let Some(bl) = &block {
                         let mut i = 0.0f64;
                         while i < n {
@@ -24675,25 +24663,61 @@ fn float_range_step(lo: f64, hi: f64, excl: bool, by: f64) -> Vec<Value> {
     if by <= 0.0 || !by.is_finite() {
         return Vec::new();
     }
-    let mut err = (lo.abs() + hi.abs() + (hi - lo).abs()) / by.abs() * f64::EPSILON;
-    if err > 0.5 {
-        err = 0.5;
-    }
-    let n = ((hi - lo) / by + err).floor() + 1.0;
+    let n = float_step_size(lo, hi, by, excl);
     let mut out = Vec::new();
     let mut i = 0.0f64;
     while i < n {
-        let mut v = lo + i * by;
-        if v > hi {
-            v = hi;
-        }
-        if excl && v >= hi {
-            break;
-        }
-        out.push(Value::Float(v));
+        out.push(Value::Float(float_step_value(i, lo, by, hi)));
         i += 1.0;
     }
     out
+}
+
+/// `ruby_float_step_size`: how many values a Float step from `beg` toward
+/// `end` by `unit` yields, allowing for the error the division carries.
+fn float_step_size(beg: f64, end: f64, unit: f64, excl: bool) -> f64 {
+    if unit == 0.0 {
+        return f64::INFINITY;
+    }
+    if unit.is_infinite() {
+        let any = if unit > 0.0 { beg <= end } else { beg >= end };
+        return f64::from(u8::from(any));
+    }
+    let mut n = (end - beg) / unit;
+    let err = ((beg.abs() + end.abs() + (end - beg).abs()) / unit.abs() * f64::EPSILON).min(0.5);
+    if excl {
+        if n <= 0.0 {
+            return 0.0;
+        }
+        n = if n < 1.0 { 0.0 } else { (n - err).floor() };
+        let d = (n + 1.0) * unit + beg;
+        if (beg < end && d < end) || (beg > end && d > end) {
+            n += 1.0;
+        }
+    } else {
+        if n < 0.0 {
+            return 0.0;
+        }
+        n = (n + err).floor();
+        let d = (n + 1.0) * unit + beg;
+        if (beg < end && d <= end) || (beg > end && d >= end) {
+            n += 1.0;
+        }
+    }
+    n + 1.0
+}
+
+/// The `i`-th value `ruby_float_step` yields: `i*unit+beg`, clamped to `end`.
+/// The product and sum are FUSED, one rounding, as the reference's arm64
+/// build compiles that expression (`fmadd`) — so `1.0.step(2.0, 0.1)`'s
+/// eighth value is `1.7` rather than the twice-rounded `1.7000000000000002`.
+fn float_step_value(i: f64, beg: f64, unit: f64, end: f64) -> f64 {
+    let d = i.mul_add(unit, beg);
+    if (unit >= 0.0 && end < d) || (unit < 0.0 && d < end) {
+        end
+    } else {
+        d
+    }
 }
 
 /// Record that the materialized Enumerator `e` came from block-less
@@ -24869,7 +24893,7 @@ fn dispatch_obj_range(
         Ok(match r {
             Value::Int(n) => Some(n),
             Value::Undef => None,
-            other => Some(as_i(&other)),
+            other => Some(rb_cmpint(&other)?),
         })
     };
     // A Range whose endpoints are INTEGERS lands here whenever either of them
@@ -24948,16 +24972,7 @@ fn dispatch_obj_range(
         // MRI `range_size`: nil for a discrete (`succ`-able) begin, else
         // TypeError — a nil begin included.
         "size" if args.is_empty() && int_bounds.is_none() => {
-            // `discrete_object_p`: the begin has a `succ` — a written one on a
-            // user object, else the reference interpreter's own table.
-            let discrete = with_host(|h| match h.object_class(&lo) {
-                Some(cls) => {
-                    h.find_method_owner(&cls, "succ").is_some()
-                        || h.find_define_method(&cls, "succ").is_some()
-                }
-                None => h.builtin_owner(&lo, "succ").is_some(),
-            });
-            if !discrete || matches!(lo, Value::Undef) {
+            if !discrete_object_p(&lo) || matches!(lo, Value::Undef) {
                 let cls = with_host(|h| h.class_of(&lo));
                 return Err(raise_exc("TypeError", &format!("can't iterate from {cls}")));
             }
@@ -24999,6 +25014,14 @@ fn dispatch_obj_range(
         "begin" | "first" if args.is_empty() => return Ok(lo),
         "end" | "last" if args.is_empty() => return Ok(hi),
         "exclude_end?" => return Ok(Value::Bool(excl)),
+        // `range_include_internal`: `include?`/`member?` compare against the
+        // endpoints only for a linear (numeric, Time) or String endpoint; any
+        // other range is `Enumerable#include?` — a walk with `succ`, below.
+        "include?" | "member?"
+            if !args.is_empty()
+                && !(linear_object_p(&lo)
+                    || linear_object_p(&hi)
+                    || with_host(|h| h.as_str(&lo).is_some() || h.as_str(&hi).is_some())) => {}
         "include?" | "member?" | "cover?" | "===" if !args.is_empty() => {
             // A nil endpoint (`"a"..`, `.."m"`) leaves that side unbounded.
             let x = &args[0];
@@ -25045,6 +25068,11 @@ fn dispatch_obj_range(
     if matches!(lo, Value::Float(_)) {
         return Err(raise_exc("TypeError", "can't iterate from Float"));
     }
+    // `range_each`: only a `succ`-able begin can be walked.
+    if !discrete_object_p(&lo) {
+        let cls = with_host(|h| h.class_of(&lo));
+        return Err(raise_exc("TypeError", &format!("can't iterate from {cls}")));
+    }
     let mut elems = Vec::new();
     let mut cur = lo.clone();
     // Bound the walk so a pathological/huge object range can't hang the VM.
@@ -25063,6 +25091,30 @@ fn dispatch_obj_range(
     }
     let arr = new_arr(elems);
     enum_delegate(&arr, name, args, block)
+}
+
+/// `discrete_object_p`: `v` has a `succ` — a written one on a user object,
+/// else the reference interpreter's own table.
+fn discrete_object_p(v: &Value) -> bool {
+    with_host(|h| match h.object_class(v) {
+        Some(cls) => {
+            h.find_method_owner(&cls, "succ").is_some()
+                || h.find_define_method(&cls, "succ").is_some()
+        }
+        None => h.builtin_owner(v, "succ").is_some(),
+    })
+}
+
+/// `linear_object_p`: a number or a Time — an endpoint `Range#include?`
+/// compares against rather than walks.
+fn linear_object_p(v: &Value) -> bool {
+    matches!(v, Value::Int(_) | Value::Float(_))
+        || with_host(|h| {
+            h.as_bigint(v).is_some()
+                || h.as_rational(v).is_some()
+                || h.as_time(v).is_some()
+                || h.is_a(v, "Numeric")
+        })
 }
 
 fn dispatch_str_range(
@@ -25509,17 +25561,54 @@ fn dispatch_method(
         // `Method#original_name` — the name the method was DEFINED under: an
         // `alias`/`alias_method` name resolves to the method it copied.
         "original_name" => Ok(with_host(|h| {
-            let owner = h.method_owner(&mrecv, &mname, unbound);
-            let mut name = mname.clone();
-            // Bounded: an alias of an alias resolves step by step.
-            for _ in 0..64 {
-                match h.alias_original(&owner, &name) {
-                    Some(orig) if orig != name => name = orig,
-                    _ => break,
-                }
-            }
+            let name = h.method_original_name(&mrecv, &mname, unbound);
             h.new_symbol(&name)
         })),
+        "source_location" => Ok(
+            match with_host(|h| h.method_source_location(&mrecv, &mname, unbound)) {
+                Some((file, line)) => new_arr(vec![new_str(file), Value::Int(i64::from(line))]),
+                None => Value::Undef,
+            },
+        ),
+        // proc.c `method_eq`: the same kind of Method, the same receiver
+        // (identical) or class, and the same definition — an alias of it
+        // included.
+        "==" | "eql?" if args.len() == 1 => {
+            let Some((orecv, oname)) = with_host(|h| h.as_method(&args[0])) else {
+                return Ok(Value::Bool(false));
+            };
+            let same = with_host(|h| {
+                h.is_unbound_method(&args[0]) == unbound
+                    && (unbound || identical(&mrecv, &orecv))
+                    && h.method_owner(&mrecv, &mname, unbound)
+                        == h.method_owner(&orecv, &oname, unbound)
+                    && h.method_original_name(&mrecv, &mname, unbound)
+                        == h.method_original_name(&orecv, &oname, unbound)
+            });
+            Ok(Value::Bool(same))
+        }
+        // Consistent with `==`: the receiver's identity, the owner and the
+        // definition's name.
+        "hash" if args.is_empty() => {
+            use std::hash::{Hash, Hasher};
+            let mut st = std::collections::hash_map::DefaultHasher::new();
+            with_host(|h| {
+                if unbound {
+                    // Unbound: the definition alone, as `==` compares it.
+                } else if let Value::Obj(id) = &mrecv {
+                    id.hash(&mut st);
+                } else {
+                    h.inspect(&mrecv).hash(&mut st);
+                }
+                h.method_owner(&mrecv, &mname, unbound).hash(&mut st);
+                h.method_original_name(&mrecv, &mname, unbound)
+                    .hash(&mut st);
+            });
+            Ok(Value::Int(st.finish() as i64 >> 2))
+        }
+        "inspect" | "to_s" => Ok(new_str(with_host(|h| {
+            h.method_inspect(&mrecv, &mname, unbound)
+        }))),
         // An UnboundMethod has no receiver — its stored value is the class the
         // name was looked up on — so MRI defines `#receiver` on `Method` only.
         "receiver" if unbound => Err(raise_exc(
@@ -30654,6 +30743,11 @@ impl JsonParser {
 /// Uses fine-grained borrows so a user operator method can re-enter the VM.
 pub fn numeric_hook(op: fusevm::NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     use fusevm::NumOp::*;
+    // A Method compares its definition (`method_eq`), not its identity.
+    if matches!(op, Eq | Ne) && with_host(|h| h.as_method(a).is_some()) {
+        let r = dispatch_method(a, "==", std::slice::from_ref(b), None)?;
+        return Ok(Value::Bool(with_host(|h| h.truthy(&r)) == (op == Eq)));
+    }
     if let Some(cls) = with_host(|h| h.object_class(a)) {
         // Unary minus is the argless `-@` (`def -@`), not a binary op on `b`.
         if op == Neg && with_host(|h| h.find_method_owner(&cls, "-@")).is_some() {
@@ -30694,7 +30788,7 @@ pub fn numeric_hook(op: fusevm::NumOp, a: &Value, b: &Value) -> Result<Value, St
                     _ => Err(with_host(|h| h.cmp_failed(a, b))),
                 };
             }
-            let c = as_i(&cmp);
+            let c = rb_cmpint(&cmp)?;
             return Ok(Value::Bool(match op {
                 Lt => c < 0,
                 Gt => c > 0,
@@ -33284,7 +33378,7 @@ fn eq_fallback(recv: &Value, other: &Value) -> Result<bool, String> {
             return Ok(true);
         }
         let c = dispatch(recv, "<=>", std::slice::from_ref(other), None)?;
-        return Ok(!matches!(c, Value::Undef) && as_i(&c) == 0);
+        return Ok(!matches!(c, Value::Undef) && rb_cmpint(&c)? == 0);
     }
     if with_host(|h| h.as_array(recv).is_some() || h.as_hash(recv).is_some()) {
         return rb_equal_d(recv, other);

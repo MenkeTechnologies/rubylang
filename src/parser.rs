@@ -64,9 +64,14 @@ type BlockParams = (Vec<String>, Option<usize>, Vec<Expr>, BlockArity);
 /// call spreads them straight back out (`*rest`, `**kw`, `&blk`). The reserved
 /// `__fwd_*__` names follow the parser's existing sentinel convention
 /// (`__blkx__`, `__symargs__`) — chosen not to collide with real user locals.
-const FWD_REST: &str = "__fwd_rest__";
-const FWD_KW: &str = "__fwd_kw__";
-const FWD_BLK: &str = "__fwd_blk__";
+pub const FWD_REST: &str = "__fwd_rest__";
+pub const FWD_KW: &str = "__fwd_kw__";
+pub const FWD_BLK: &str = "__fwd_blk__";
+
+/// The names an anonymous block `**` / `&` parameter binds under (nothing can
+/// spell them), which `parameters` reports as MRI's `:**` / `:&`.
+pub const ANON_KWREST_PARAM: &str = "__anon_kwrest__";
+pub const ANON_BLOCK_PARAM: &str = "__anon_block__";
 
 pub struct Parser {
     toks: Vec<Token>,
@@ -1436,6 +1441,12 @@ impl Parser {
         if preludes.is_empty() {
             return body;
         }
+        // An empty body still answers nil, not the last prelude's value.
+        let body = if body.is_empty() {
+            vec![Stmt::from(Expr::Nil)]
+        } else {
+            body
+        };
         let mut out: Vec<Stmt> = preludes.into_iter().map(Stmt::from).collect();
         out.extend(body);
         out
@@ -1491,14 +1502,14 @@ impl Parser {
         Ok(acc.finish())
     }
 
-    /// The `; a, b` tail of a parameter list: explicit block-locals. They bind
-    /// like never-passed trailing positional params (nil, block-scoped), so they
-    /// join `params` but count toward neither `req` nor `opt`. `close` is the
-    /// token that ends the list (`|` for a block, `)` for a lambda).
+    /// The `; a, b` tail of a parameter list: explicit block-locals — fresh nil
+    /// locals of the block, never bound to an argument (see
+    /// `BlockArity::locals`). `close` is the token that ends the list (`|` for
+    /// a block, `)` for a lambda).
     fn block_locals(&mut self, acc: &mut ParamAcc, close: &str) -> Result<(), String> {
         while !self.is_op(close) {
             let name = self.ident_name()?;
-            acc.params.push(name);
+            acc.arity.locals.push(name);
             if !self.eat_op(",") {
                 break;
             }
@@ -1636,7 +1647,12 @@ impl Parser {
         // block capture instead, bound by the caller (nil when no block is passed),
         // keeping it out of positional binding.
         if self.eat_op("&") {
-            acc.arity.blockparam = Some(self.ident_name()?);
+            // Anonymous `{ |&| }` / `->(&) { }` binds nothing.
+            acc.arity.blockparam = Some(if self.param_list_continues() {
+                ANON_BLOCK_PARAM.to_string()
+            } else {
+                self.ident_name()?
+            });
             return Ok(());
         }
         // `**rest` — a keyword-splat collector (desugared from the trailing hash).
@@ -1646,7 +1662,12 @@ impl Parser {
                 acc.kwsplat = Some(NO_KEYWORDS_PARAM.to_string());
                 return Ok(());
             }
-            acc.kwsplat = Some(self.ident_name().unwrap_or_else(|_| "__kwrest".to_string()));
+            // Anonymous `{ |**| }` collects into a name nothing can read.
+            acc.kwsplat = Some(if self.param_list_continues() {
+                ANON_KWREST_PARAM.to_string()
+            } else {
+                self.ident_name()?
+            });
             return Ok(());
         }
         // A keyword param label may be a reserved word (`|in: 1|`).
@@ -1699,6 +1720,15 @@ impl Parser {
         }
         acc.params.push(name);
         Ok(())
+    }
+
+    /// Whether the token after a `*`/`**`/`&` sigil ends the parameter —
+    /// `,`, the closing `|` or `)`, or the line — leaving it anonymous.
+    fn param_list_continues(&self) -> bool {
+        self.is_op(",")
+            || self.is_op("|")
+            || self.is_op(")")
+            || matches!(self.peek(), Tok::Newline | Tok::Semicolon)
     }
 
     /// Parse a `(a, b, *rest, (c, d))` destructuring group. Returns a fresh temp

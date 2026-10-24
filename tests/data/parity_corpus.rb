@@ -8607,3 +8607,55 @@ k = Class.new(StandardError); p k.new("m").detailed_message, k.new("m").detailed
 class E8 < StandardError; def initialize; end; end
 class Foo; def initialize; @message = "x"; end; end
 p E8.new.to_s, E8.new.message, E8.new, "#{RuntimeError.new}", Foo.new.to_s.sub(/0x\h+/, "X")
+#==#
+# ── Comparable reads a non-Integer <=> answer through rb_cmpint; Range#include? walks a non-linear range ──
+def t; p yield; rescue => e; p e; end
+class Half; include Comparable; attr_reader :v; def initialize(v) = @v = v; def <=>(o) = (v - o.v) * 0.5; end
+class Wordy; include Comparable; def <=>(o) = "x"; end
+class Huge; include Comparable; def initialize(n) = @n = n; def <=>(o) = @n; end
+t { [Half.new(2) > Half.new(1), Half.new(1) == Half.new(1), Half.new(2) == Half.new(1), Half.new(2).between?(Half.new(1), Half.new(3)), Half.new(5).clamp(Half.new(1), Half.new(3)).v] }
+t { Wordy.new < Wordy.new }; t { Wordy.new == Wordy.new }; t { Wordy.new.between?(Wordy.new, Wordy.new) }
+t { [Huge.new(-2**70) < Huge.new(0), Huge.new(2**70) > Huge.new(0), Huge.new(2**70) == Huge.new(0), Huge.new(-0.1) <= Huge.new(1)] }
+class Step; include Comparable; attr_reader :v; def initialize(v) = @v = v; def <=>(o) = v <=> o.v; def succ = Step.new(v + 1); def ==(o) = o.is_a?(Step) && v == o.v; end
+t { (Half.new(1)..Half.new(3)).include?(Half.new(2)) }; t { (Half.new(1)..Half.new(3)).to_a }
+t { [(Half.new(1)..Half.new(3)) === Half.new(2), (Half.new(1)..Half.new(3)).cover?(Half.new(2)), (Step.new(1)..Step.new(3)).include?(Step.new(2)), (Step.new(1)...Step.new(3)).member?(Step.new(3))] }
+t { [(Time.at(0)..Time.at(10)).include?(Time.at(5)), (1..2**70).include?(2**69), (1.5..2.5).include?(2), (Rational(1, 2)..2).include?(1)] }
+#==#
+# ── Float steps follow ruby_float_step: its count rule and its fused i*unit+beg ──
+p 1.0.step(2.0, 0.1).to_a, 0.1.step(1, 0.3).to_a, 2.0.step(1.0, -0.3).to_a, 1.0.step(2.0, 0.1).size
+p (1.0..2.0).step(0.1).to_a, (1.0...2.0).step(0.1).to_a, (0.1..0.5).step(0.1).to_a, (0.0...1.0).step(0.2).to_a
+r = []; 0.0.step(1.0, 0.25) { |x| r << x }
+p r, 1.0.step(3.0, 0.7).to_a, (1.0..3.0).step(0.7).to_a, 10.0.step(9.0, -0.1).to_a.last(3), (0.0..1.0).step(1.0 / 3).to_a
+#==#
+# ── a String Hash key is the frozen copy the Hash stored ──
+s = +"k"; h = {s => 1}; s << "x"
+p h.keys, h.keys.first.frozen?, h.first[0].frozen?, h.map { |k, v| k.frozen? }, s.frozen?, h.each_key.map(&:frozen?)
+a = [+"x"]; g = {a => 1}
+p g.keys.first.first.frozen?, Hash[[[+"z", 1]]].keys[0].frozen?, {1 => 2}.keys
+#==#
+# ── Method/UnboundMethod: anonymous parameter names, attr_writer, define_method(method), inspect, ==, hash, source_location ──
+class K
+  def m3(*); end
+  def m4(**); end
+  def m5(...); end
+  def m7(&); end
+  def m8(*, **, &); end
+  def m2(a, b = 1, *r, c, d:, e: 2, **k, &blk); end
+  def m1(a); end
+  attr_accessor :x
+  define_method(:dm3, instance_method(:m1))
+  alias_method :m1a, :m1
+end
+k = K.new
+%i[m3 m4 m5 m7 m8 x x= dm3].each { |n| p [n, k.method(n).arity, k.method(n).parameters] }
+p proc { |*| }.parameters, lambda { |**| }.parameters, proc { |&| }.parameters, ->(&) {}.parameters, ->(*, **) {}.parameters
+p proc { |a, **k| }.call(1, b: 2), proc { |a, k: 1| }.call(1), proc { |(a, b)| }.call([1, 2]), lambda { |x, y: 2| }.call(1)
+p k.method(:m2), k.method(:x), k.method(:m1a), k.method(:m5), k.method(:m8), K.instance_method(:m7), 1.method(:+), [].method(:push)
+module M; def mm(a, *); end; end
+class C; include M; def self.cm(x = 1) = x; end
+class D < C; end
+p C.new.method(:mm), M.instance_method(:mm), C.method(:cm), D.method(:cm), C.method(:new), 1.method(:between?)
+p k.method(:m1) == k.method(:m1), k.method(:m1).eql?(k.method(:m1)), k.method(:m1).hash == k.method(:m1).hash, k.method(:m1) == K.new.method(:m1), k.method(:m1) == k.method(:m1a)
+p C.instance_method(:mm) == D.instance_method(:mm), k.method(:m2).source_location, k.method(:x).source_location, 1.method(:+).source_location
+k2 = 5; t = 9; proc { |a, k2: 1| }.call(1); [1].each { |i; t| t = i }; proc { |a, **k2| }.call(1, z: 2)
+p k2, t, proc { |i; t| t }.call(1, 2), proc { |i; t| }.parameters, ->(x; y) { y }.call(1)

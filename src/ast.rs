@@ -76,6 +76,9 @@ pub struct BlockArity {
     pub kwsplat: Option<String>,
     /// `&blk` capture parameter name, if any.
     pub blockparam: Option<String>,
+    /// The `|x; local|` block-locals: fresh nil locals of the block that take
+    /// no argument and leave a same-named enclosing local alone.
+    pub locals: Vec<String>,
 }
 
 /// A block literal attached to a method call (`do |x| … end` or `{ |x| … }`).

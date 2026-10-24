@@ -1383,6 +1383,8 @@ pub struct MethodDef {
     /// the dispatcher seeds those slots with the call's positional args before
     /// running the chunk. 0 = every param is host-bound as usual.
     pub slot_params: u16,
+    /// The line the definition starts on — `Method#source_location`'s.
+    pub line: u32,
 }
 
 /// Where a signature's positional parameters sit. Ruby fixes their order —
@@ -1528,6 +1530,9 @@ pub struct RubyHost {
     /// meets, and warns only when that changes it (see
     /// [`RubyHost::prepare_binary_regexp`]).
     binary_regexp_encodings: HashMap<u32, &'static str>,
+    /// The file each method definition was loaded from, by `MethodDef::chunk_id`
+    /// — `Method#source_location`'s path.
+    method_files: HashMap<u64, String>,
     /// `Enumerator#feed` state by Enumerator heap id: the value waiting for
     /// the next resume, and (for a buffered Enumerator) what each element got.
     enum_feeds: HashMap<u32, (Option<Value>, Vec<Value>)>,
@@ -2475,6 +2480,7 @@ impl RubyHost {
             enum_feeds: HashMap::new(),
             binary_regexps: false,
             binary_regexp_encodings: HashMap::new(),
+            method_files: HashMap::new(),
             consts: IndexMap::new(),
             autoloads: IndexMap::new(),
             methods: IndexMap::new(),
@@ -2644,6 +2650,15 @@ impl RubyHost {
         begins: Vec<BeginDef>,
         procs: Vec<ProcDef>,
     ) {
+        let file = current_file_path().unwrap_or_else(|| "-e".into());
+        let defs = methods.iter().map(|(_, d)| d).chain(
+            classes
+                .iter()
+                .flat_map(|(_, c)| c.methods.values().chain(c.class_methods.values())),
+        );
+        for def in defs {
+            self.method_files.insert(def.chunk_id, file.clone());
+        }
         for (name, def) in methods {
             self.methods.insert(name, def);
         }
@@ -4640,6 +4655,24 @@ impl RubyHost {
                         owner,
                     });
                 }
+                // `define_method(:m, method_object)` takes on that method's
+                // shape, owned where it was defined.
+                if let Some(RObj::Method {
+                    recv: target,
+                    name: target_name,
+                    unbound: target_unbound,
+                    ..
+                }) = self.obj(&p)
+                {
+                    let shape = self.resolve_method_shape(target, target_name, *target_unbound);
+                    return match shape {
+                        Some(MethodShape::Def { def, .. }) => Some(MethodShape::Def { def, owner }),
+                        Some(MethodShape::Block { template, .. }) => {
+                            Some(MethodShape::Block { template, owner })
+                        }
+                        other => other,
+                    };
+                }
             }
         }
         self.builtin_shape(recv, name, unbound)
@@ -4863,6 +4896,88 @@ impl RubyHost {
                 crate::arity_table::params_for(arity, params)
             }
             None => Vec::new(),
+        }
+    }
+    /// `Method#original_name`: the name the method was DEFINED under — an
+    /// `alias`/`alias_method` name resolves to the method it copied.
+    pub fn method_original_name(&self, recv: &Value, name: &str, unbound: bool) -> String {
+        let owner = self.method_owner(recv, name, unbound);
+        let mut current = name.to_string();
+        // Bounded: an alias of an alias resolves step by step.
+        for _ in 0..64 {
+            match self.alias_original(&owner, &current) {
+                Some(orig) if orig != current => current = orig,
+                _ => break,
+            }
+        }
+        current
+    }
+    /// Port of proc.c `method_inspect`: `#<Method: Recv(Owner)#name(orig)(params)
+    /// file:line>`, with a singleton method's receiver and a `.`.
+    pub fn method_inspect(&mut self, recv: &Value, name: &str, unbound: bool) -> String {
+        let tag = if unbound { "UnboundMethod" } else { "Method" };
+        let owner = self.method_owner(recv, name, unbound);
+        let mut out = format!("#<{tag}: ");
+        let mut sharp = "#";
+        if unbound {
+            out.push_str(&owner);
+        } else if let Some(cls) = self.classref_name(recv) {
+            // A class receiver: its own `def self.m` is `C.m`; anything else is
+            // found through its singleton class (`#<Class:C>(Class)#new`).
+            let singleton = format!("#<Class:{cls}>");
+            if owner == singleton {
+                out.push_str(&cls);
+                sharp = ".";
+            } else if let Some(attached) = RubyHost::metaclass_attached(&owner) {
+                // Inherited from a superclass's `def self.m`: `D(C).m`.
+                out.push_str(&format!("{cls}({attached})"));
+                sharp = ".";
+            } else {
+                out.push_str(&singleton);
+                out.push_str(&format!("({owner})"));
+            }
+        } else if self.singleton_class_name(recv).as_deref() == Some(owner.as_str()) {
+            let shown = self.inspect(recv);
+            out.push_str(&shown);
+            sharp = ".";
+        } else {
+            let mklass = self.class_of(recv).to_string();
+            out.push_str(&mklass);
+            if owner != mklass {
+                out.push_str(&format!("({owner})"));
+            }
+        }
+        out.push_str(sharp);
+        out.push_str(name);
+        let original = self.method_original_name(recv, name, unbound);
+        if original != name {
+            out.push_str(&format!("({original})"));
+        }
+        out.push('(');
+        out.push_str(&method_params_signature(
+            &self.method_parameters(recv, name, unbound),
+        ));
+        out.push(')');
+        if let Some((file, line)) = self.method_source_location(recv, name, unbound) {
+            out.push_str(&format!(" {file}:{line}"));
+        }
+        out.push('>');
+        out
+    }
+    /// `Method#source_location`: the file and line a Ruby definition starts
+    /// at, `None` for a built-in (or a definition whose file was not recorded).
+    pub fn method_source_location(
+        &self,
+        recv: &Value,
+        name: &str,
+        unbound: bool,
+    ) -> Option<(String, u32)> {
+        match self.resolve_method_shape(recv, name, unbound)? {
+            MethodShape::Def { def, .. } => {
+                let file = self.method_files.get(&def.chunk_id)?;
+                Some((file.clone(), def.line))
+            }
+            _ => None,
         }
     }
     /// `Proc#parameters`. Shaped like [`Self::method_parameters`], with one
@@ -5381,8 +5496,15 @@ impl RubyHost {
     pub fn value_to_key(&self, v: &Value) -> RKey {
         self.to_key(v)
     }
+    /// A Hash key as a value. A String key is the frozen copy MRI's
+    /// `rb_hash_key_str` stores in place of an unfrozen one, so it reads back
+    /// frozen (`{s => 1}.keys.first.frozen?` is true).
     pub fn key_value(&mut self, k: &RKey) -> Value {
-        self.key_to_value(k)
+        let v = self.key_to_value(k);
+        if matches!(k, RKey::Str(_) | RKey::ByteStr(..)) {
+            self.freeze_value(&v);
+        }
+        v
     }
 
     fn intern(&mut self, name: &str) -> Value {
@@ -9485,21 +9607,12 @@ impl RubyHost {
                 | Some(RObj::StepProc { .. })
                 | Some(RObj::ProduceProc { .. })
                 | Some(RObj::DeriveProc { .. }) => "#<Proc>".to_string(),
-                // MRI renders the DEFINING module, not the receiver's class, and
-                // tags an UnboundMethod as one. (MRI also appends the written
-                // parameter list and source location; rubylang retains neither.)
                 Some(RObj::Method {
                     recv,
                     name,
                     unbound,
                     ..
-                }) => {
-                    let tag = if unbound { "UnboundMethod" } else { "Method" };
-                    format!(
-                        "#<{tag}: {}#{name}>",
-                        self.method_owner(&recv, &name, unbound)
-                    )
-                }
+                }) => self.method_inspect(&recv, &name, unbound),
                 Some(RObj::Regexp { source, flags, .. }) => {
                     let on: String = "mix".chars().filter(|c| flags.contains(*c)).collect();
                     let off: String = "mix".chars().filter(|c| !flags.contains(*c)).collect();
@@ -11621,6 +11734,55 @@ fn as_int(v: &Value) -> Option<i64> {
 /// defaults, and everything after the splat is required again. `kwsplat` is the
 /// `**rest` name, or `Some("")` when the collector is present but its name was
 /// desugared away (a block's, which the parser rewrites into a capture param).
+/// The parameter list `method_inspect` writes from `Method#parameters`,
+/// MRI's quirks included: an anonymous `**` after another parameter eats the
+/// separator before it, and an anonymous `&` alone reads `...`.
+fn method_params_signature(params: &[(&'static str, Option<String>)]) -> String {
+    let is = |i: usize, kind: &str, name: &str| {
+        params
+            .get(i)
+            .is_some_and(|(k, n)| *k == kind && n.as_deref() == Some(name))
+    };
+    let forwarding =
+        params.len() == 3 && is(0, "rest", "*") && is(1, "keyrest", "**") && is(2, "block", "&");
+    let mut out = String::new();
+    for (i, (kind, name)) in params.iter().enumerate() {
+        let name = name.clone().unwrap_or_else(|| {
+            match *kind {
+                "req" | "opt" => "_",
+                "block" => "block",
+                "nokey" => "nil",
+                _ => "",
+            }
+            .to_string()
+        });
+        let cut_separator = |out: &mut String| {
+            let keep = out.len().saturating_sub(2);
+            out.truncate(keep);
+        };
+        match *kind {
+            "req" => out.push_str(&name),
+            "opt" => out.push_str(&format!("{name}=...")),
+            "keyreq" => out.push_str(&format!("{name}:")),
+            "key" => out.push_str(&format!("{name}: ...")),
+            "rest" if name == "*" => out.push_str(if forwarding { "..." } else { "*" }),
+            "rest" => out.push_str(&format!("*{name}")),
+            "keyrest" if name != "**" => out.push_str(&format!("**{name}")),
+            "keyrest" if i > 0 => cut_separator(&mut out),
+            "keyrest" => out.push_str("**"),
+            "block" if name == "&" && forwarding => cut_separator(&mut out),
+            "block" if name == "&" => out.push_str("..."),
+            "block" => out.push_str(&format!("&{name}")),
+            "nokey" => out.push_str("**nil"),
+            _ => {}
+        }
+        if i + 1 < params.len() {
+            out.push_str(", ");
+        }
+    }
+    out
+}
+
 fn written_params(
     params: &[String],
     shape: PositionalShape,
@@ -11636,7 +11798,7 @@ fn written_params(
     let opt_end = splat.unwrap_or(params.len().saturating_sub(post));
     let opt_start = opt_end.saturating_sub(opt);
     for (i, p) in params.iter().enumerate() {
-        let name = p.trim_start_matches('*').to_string();
+        let mut name = p.trim_start_matches('*').to_string();
         let kind = if Some(i) == splat {
             "rest"
         } else if (opt_start..opt_end).contains(&i) {
@@ -11655,8 +11817,13 @@ fn written_params(
         if name == "__excess" {
             continue;
         }
-        let written = (!name.starts_with("__destructure_")).then_some(name);
-        out.push((kind, written));
+        // An anonymous `*` (or the one `...` forwards through) is `:*`.
+        if kind == "rest" && (name.is_empty() || name == crate::parser::FWD_REST) {
+            name = "*".to_string();
+        }
+        let written =
+            !name.starts_with("__destructure_") && name != crate::compiler::ATTR_WRITER_PARAM;
+        out.push((kind, written.then_some(name)));
     }
     for k in kwnames {
         let kind = if kwreq.contains(k) { "keyreq" } else { "key" };
@@ -11667,11 +11834,19 @@ fn written_params(
             out.push(("nokey", None));
         } else {
             let name = ks.trim_start_matches('*');
-            out.push(("keyrest", (!name.is_empty()).then(|| name.to_string())));
+            let anon = name.is_empty()
+                || name == crate::parser::FWD_KW
+                || name == crate::parser::ANON_KWREST_PARAM
+                || name == "__kwrest";
+            out.push(("keyrest", Some(if anon { "**" } else { name }.to_string())));
         }
     }
     if let Some(bp) = blockparam {
-        out.push(("block", Some(bp.trim_start_matches('&').to_string())));
+        let name = bp.trim_start_matches('&');
+        let anon = name.is_empty()
+            || name == crate::parser::FWD_BLK
+            || name == crate::parser::ANON_BLOCK_PARAM;
+        out.push(("block", Some(if anon { "&" } else { name }.to_string())));
     }
     out
 }
@@ -15133,6 +15308,17 @@ pub fn call_proc_self_ctx(
     if let Some(bp) = &def.arity.blockparam {
         let v = passed_block.clone().unwrap_or(Value::Undef);
         child.lock().unwrap().vars.insert(bp.clone(), v);
+    }
+    // Its keyword parameters and block-locals are the block's own (nil until
+    // the keyword preludes assign them), so a same-named enclosing local is
+    // never written through them.
+    for name in crate::compiler::block_own_locals(&def.arity) {
+        child
+            .lock()
+            .unwrap()
+            .vars
+            .entry(name)
+            .or_insert(Value::Undef);
     }
     // The block's "home": the method activation it was defined in. A non-local
     // `return` from this block unwinds to that frame.

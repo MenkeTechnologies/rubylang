@@ -7543,3 +7543,83 @@ nil
 #<E8: E8>
 "RuntimeError"
 "#<Foo:X>"
+#==#
+[true, true, false, true, 3]
+#<ArgumentError: comparison of String with 0 failed>
+#<ArgumentError: comparison of String with 0 failed>
+#<ArgumentError: comparison of String with 0 failed>
+[true, true, false, true]
+#<TypeError: can't iterate from Half>
+#<TypeError: can't iterate from Half>
+[true, true, true, false]
+[true, true, true, true]
+#==#
+[1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9000000000000001, 2.0]
+[0.1, 0.4, 0.7, 1.0]
+[2.0, 1.7, 1.4, 1.1]
+11
+[1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9000000000000001, 2.0]
+[1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9000000000000001]
+[0.1, 0.2, 0.30000000000000004, 0.4, 0.5]
+[0.0, 0.2, 0.4, 0.6000000000000001, 0.8]
+[0.0, 0.25, 0.5, 0.75, 1.0]
+[1.0, 1.7, 2.4]
+[1.0, 1.7, 2.4]
+[9.2, 9.1, 9.0]
+[0.0, 0.3333333333333333, 0.6666666666666666, 1.0]
+#==#
+["k"]
+true
+true
+[true]
+false
+[true]
+false
+true
+[1]
+#==#
+[:m3, -1, [[:rest, :*]]]
+[:m4, -1, [[:keyrest, :**]]]
+[:m5, -1, [[:rest, :*], [:keyrest, :**], [:block, :&]]]
+[:m7, 0, [[:block, :&]]]
+[:m8, -1, [[:rest, :*], [:keyrest, :**], [:block, :&]]]
+[:x, 0, []]
+[:x=, 1, [[:req]]]
+[:dm3, 1, [[:req, :a]]]
+[[:rest, :*]]
+[[:keyrest, :**]]
+[[:block, :&]]
+[[:block, :&]]
+[[:rest, :*], [:keyrest, :**]]
+nil
+nil
+nil
+nil
+#<Method: K#m2(a, b=..., *r, c, d:, e: ..., **k, &blk) -e:8>
+#<Method: K#x() -e:10>
+#<Method: K#m1a(m1)(a) -e:9>
+#<Method: K#m5(...) -e:5>
+#<Method: K#m8(...) -e:7>
+#<UnboundMethod: K#m7(...) -e:6>
+#<Method: Integer#+(_)>
+#<Method: Array#push(*)>
+#<Method: C(M)#mm(a, *) -e:19>
+#<UnboundMethod: M#mm(a, *) -e:19>
+#<Method: C.cm(x=...) -e:20>
+#<Method: D(C).cm(x=...) -e:20>
+#<Method: #<Class:C>(Class)#new(*)>
+#<Method: Integer(Comparable)#between?(_, _)>
+true
+true
+true
+false
+true
+true
+["-e", 8]
+["-e", 10]
+nil
+5
+9
+nil
+[[:opt, :i]]
+nil

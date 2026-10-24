@@ -1177,6 +1177,44 @@ Honest limitations of this surface:
 
 ## Runtime / methods
 
+- **Comparable and Range read `<=>` as MRI does — fixed.** A `<=>` answering
+  a Float, a Bignum or anything else goes through `rb_cmpint` (its sign, or
+  `> 0`/`< 0` asked of it) in the operators, `==`, `between?`, `clamp` and
+  Range comparisons, where it was truncated to an Integer: `0.5` ranked as
+  equal and a String answer was not an error. `Range#include?`/`member?` on a
+  range whose endpoints are neither numbers, Times nor Strings walks it with
+  `succ` (`Enumerable#include?`), and walking a begin without `succ` is
+  `TypeError: can't iterate from K`.
+- **Float steps are `ruby_float_step` — fixed.** The count follows MRI's
+  rule (including the `(n + 1) * unit + beg` end check) and each value is
+  `i*unit+beg` computed FUSED, one rounding, as the reference's arm64 build
+  compiles it: `1.0.step(2.0, 0.1)` has `1.7` and `1.9000000000000001`,
+  `0.1.step(1, 0.3)` ends at `1.0`. An x86-64 MRI built without FMA rounds
+  twice and differs in the last digit.
+- **A String Hash key reads back as the frozen copy — fixed.**
+  `{s => 1}.keys.first.frozen?` is true (`rb_hash_key_str`).
+- **Parameters, Method objects and block scoping — fixed.** Anonymous `*`,
+  `**`, `&` and `...` report `:*`, `:**`, `:&` (`[[:rest, :*], [:keyrest,
+  :**], [:block, :&]]`), and `{ |**| }`, `{ |&| }`, `->(&) { }` parse; an
+  `attr_writer` reports `[[:req]]`; `define_method(:m, method)` takes that
+  method's arity and parameters. `Method#inspect`/`UnboundMethod#inspect` are
+  proc.c's `method_inspect` (`#<Method: C(M)#m(a, b=..., *r, k:, &blk)
+  file:line>`, `D(C).cm`, `#<Class:C>(Class)#new(*)`, `m1a(m1)`, MRI's `(...)`
+  quirks), `Method#source_location` answers a Ruby definition's file and line,
+  and `Method#==`/`eql?`/`hash` compare the definition (an alias included)
+  and receiver, not the object. A block's keyword parameters, `**rest` and
+  `|x; local|` block-locals are its own: they no longer overwrite a
+  same-named enclosing local, a block-local no longer takes a surplus
+  argument, and a block whose body is empty answers nil rather than its
+  keyword prelude's value. Residue: a `define_method` block has no
+  `source_location`, so its `inspect` carries no location.
+- **Known divergences left as they are.** `sort`/`sort_by` keep ties in
+  order (a stable sort); MRI's order of ties is its host libc's `qsort_r`
+  (BSD's on macOS, glibc's on Linux) and differs between the two, so there is
+  no single answer to match. `Hash#rehash` cannot see a mutated Array key's
+  new hash, because keys are stored as their value at insertion.
+  `singleton_class.prepend(M)` does not put `M` ahead of the object's
+  singleton methods.
 - **`ObjectSpace._id2ref` inverts `object_id` — fixed.** It answered nil for
   everything; now an odd id is its Integer, the `nil`/`true`/`false` ids their
   objects, a class's id its class, a live heap id its object, and anything

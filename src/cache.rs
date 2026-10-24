@@ -25,7 +25,11 @@ use std::path::PathBuf;
 ///
 /// 10 -> 11: a rescue clause carries no `binding`; `=> target` is lowered to an
 /// assignment from `$!` at the head of the clause body instead.
-const SCHEMA: u64 = 12;
+///
+/// 12 -> 13: a `MethodDef` carries the `line` its definition starts on, for
+/// `Method#source_location`, and a `ProcDef`'s arity its `|x; local|`
+/// block-locals, which are no longer parameters.
+const SCHEMA: u64 = 13;
 
 /// The outer, rkyv-archived shard: the [`build_stamp`] of the binary that wrote
 /// it, then a flat list of (key, bincode-blob) entries.
@@ -59,6 +63,7 @@ type CMethod = (
     Vec<String>,
     Chunk,
     u16,
+    u32,
 );
 /// (name, superclass, methods, includes, prepends, extends, class methods,
 /// is_module, non-public method visibilities). `is_module` records `module M`
@@ -97,6 +102,8 @@ type CProc = (
     // `ProcDef::block_depth` — the lexical block nesting MRI's
     // `block (N levels) in X` frame label counts.
     u32,
+    // `BlockArity::locals` — the `|x; local|` block-locals.
+    Vec<String>,
 );
 
 /// The inner, serde/bincode form of a compiled program. Tuples keep the shape
@@ -360,10 +367,25 @@ fn m_to(name: &str, m: &MethodDef) -> CMethod {
         m.kwreq.clone(),
         (*m.chunk).clone(),
         m.slot_params,
+        m.line,
     )
 }
 fn m_from(
-    (name, params, splat, kwparams, kwsplat, blockparam, req, opt, post, kwreq, chunk, slot_params): CMethod,
+    (
+        name,
+        params,
+        splat,
+        kwparams,
+        kwsplat,
+        blockparam,
+        req,
+        opt,
+        post,
+        kwreq,
+        chunk,
+        slot_params,
+        line,
+    ): CMethod,
 ) -> (String, MethodDef) {
     (
         name,
@@ -380,6 +402,7 @@ fn m_from(
             kwreq,
             chunk: std::sync::Arc::new(chunk),
             slot_params,
+            line,
         },
     )
 }
@@ -438,6 +461,7 @@ fn to_cprog(prog: &Program) -> CProg {
                     p.arity.kwsplat.clone(),
                     p.arity.blockparam.clone(),
                     p.block_depth,
+                    p.arity.locals.clone(),
                 )
             })
             .collect(),
@@ -525,6 +549,7 @@ fn from_cprog(cp: CProg) -> Program {
                     kwsplat,
                     blockparam,
                     block_depth,
+                    locals,
                 )| ProcDef {
                     params,
                     splat,
@@ -536,6 +561,7 @@ fn from_cprog(cp: CProg) -> Program {
                         kwreq,
                         kwsplat,
                         blockparam,
+                        locals,
                     },
                     block_depth,
                 },
