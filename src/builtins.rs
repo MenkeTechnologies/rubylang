@@ -14,7 +14,7 @@ use crate::host::{
     call_instance_method, call_method, call_proc, current_block, has_pending_signal,
     raise_signal_break, raise_signal_next, raise_signal_redo, raise_signal_retry,
     raise_signal_return, raise_signal_throw, take_break, take_throw, with_host, Derive, GenSize,
-    RKey, RubyHost,
+    MatchPart, RKey, RubyHost,
 };
 use fusevm::{Value, VM};
 use indexmap::IndexMap;
@@ -53,6 +53,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::MKPROC, b_mkproc);
     vm.register_builtin(ops::MKLAMBDA, b_mklambda);
     vm.register_builtin(ops::MKREGEX, b_mkregex);
+    vm.register_builtin(ops::REGEX_ONCE, b_regex_once);
     vm.register_builtin(ops::YIELD, b_yield);
     vm.register_builtin(ops::TRUTHY, b_truthy);
     vm.register_builtin(ops::INDEX_GET, b_index_get);
@@ -1567,15 +1568,37 @@ fn b_mklambda(vm: &mut VM, _: u8) -> Value {
     with_host(|h| h.new_lambda(id))
 }
 fn b_mkregex(vm: &mut VM, _: u8) -> Value {
+    // A positive site is a literal MRI makes one Regexp for (see
+    // `compiler::assign_regex_sites`): built on its first run, then reused.
+    let site = match vm.pop() {
+        Value::Int(n) if n > 0 => Some(n),
+        _ => None,
+    };
     let flags = name_of(&vm.pop());
     let source = name_of(&vm.pop());
+    if let Some(re) = site.and_then(|n| with_host(|h| h.regex_site(n))) {
+        return re;
+    }
     match with_host(|h| h.new_regex(&source, &flags)) {
         // A Regexp literal is frozen (`Regexp.new` is not).
         Ok(v) => {
-            with_host(|h| h.freeze_value(&v));
+            with_host(|h| {
+                h.freeze_value(&v);
+                if let Some(n) = site {
+                    h.set_regex_site(n, v.clone());
+                }
+            });
             v
         }
         Err(e) => abort(vm, e),
+    }
+}
+/// `REGEX_ONCE`: the Regexp a `/…#{…}/o` site built on its first run, or nil
+/// (its interpolation then runs, and `MKREGEX` keeps the result).
+fn b_regex_once(vm: &mut VM, _: u8) -> Value {
+    match vm.pop() {
+        Value::Int(n) if n > 0 => with_host(|h| h.regex_site(n)).unwrap_or(Value::Undef),
+        _ => Value::Undef,
     }
 }
 fn b_yield(vm: &mut VM, argc: u8) -> Value {
@@ -9948,6 +9971,7 @@ extern "C" {
 
 // ---- String ---------------------------------------------------------------
 
+mod tr_table;
 mod utf8_bytes;
 
 /// String methods whose result does NOT inherit the receiver's encoding.
@@ -10030,6 +10054,10 @@ fn dispatch_string(
 ) -> Result<Value, String> {
     if let Some(args) = int_index_args(name, args) {
         return dispatch_string(recv, name, &args, block);
+    }
+    // The character-selector methods read every encoding's bytes alike.
+    if let Some(r) = tr_table::dispatch(recv, name, args) {
+        return r;
     }
     // The borrowed names answer from a BORROW and return an Int or a Bool, so
     // nothing below can change their answer: `propagate_string_encoding` only
@@ -10245,18 +10273,13 @@ fn broken_utf8_refusal(name: &str, args: &[Value]) -> Option<String> {
         "codepoints"
         | "each_codepoint"
         | "split"
-        | "squeeze"
-        | "squeeze!"
         | "unicode_normalize"
         | "unicode_normalize!"
         | "unicode_normalized?"
         | "tr"
         | "tr!"
         | "tr_s"
-        | "tr_s!"
-        | "delete"
-        | "delete!"
-        | "count" => Some(invalid()),
+        | "tr_s!" => Some(invalid()),
         "=~" | "match" | "match?" | "scan" => Some(invalid()),
         "sub" | "gsub" | "sub!" | "gsub!" | "index" | "rindex" | "partition" | "rpartition"
         | "start_with?" | "slice" | "slice!" | "[]"
@@ -10264,10 +10287,6 @@ fn broken_utf8_refusal(name: &str, args: &[Value]) -> Option<String> {
         {
             Some(invalid())
         }
-        "strip" | "strip!" | "rstrip" | "rstrip!" => Some(raise_exc(
-            "Encoding::CompatibilityError",
-            "invalid byte sequence in UTF-8",
-        )),
         _ => None,
     }
 }
@@ -10343,9 +10362,7 @@ fn dispatch_broken_utf8(
 
 /// The text methods MRI refuses when an ARGUMENT is a broken UTF-8 String
 /// (they read it as characters): `"ab".count("\xff")`.
-const BROKEN_ARGUMENT_REFUSALS: &[&str] = &[
-    "count", "delete", "delete!", "squeeze", "squeeze!", "tr", "tr!", "tr_s", "tr_s!", "split",
-];
+const BROKEN_ARGUMENT_REFUSALS: &[&str] = &["tr", "tr!", "tr_s", "tr_s!", "split"];
 
 /// A text String method given a broken UTF-8 argument: the methods that join
 /// or search by bytes run over the receiver's bytes ([`utf8_bytes`]), the
@@ -10507,8 +10524,46 @@ fn dispatch_string_bytes(
             });
             Some(Ok(recv.clone()))
         }
+        ("append_as_bytes", _) => Some(append_as_bytes(recv, args)),
         _ => None,
     }
+}
+
+/// `rb_str_append_as_bytes`: every argument is checked first (a String, or an
+/// Integer whose low byte is taken), then their bytes are appended with no
+/// encoding negotiation. The receiver keeps its encoding; a UTF-8 one is
+/// re-read, so it may become broken or be completed.
+fn append_as_bytes(recv: &Value, args: &[Value]) -> Result<Value, String> {
+    let mut add = Vec::new();
+    for a in args {
+        if let Value::Int(i) = a {
+            add.push((i & 0xff) as u8);
+        } else if let Some(big) = with_host(|h| h.as_bigint(a)) {
+            let low = big & num_bigint::BigInt::from(0xff);
+            add.push(u8::try_from(low).expect("masked to one byte"));
+        } else if let Some(b) = with_host(|h| h.str_bytes(a).map(<[u8]>::to_vec)) {
+            add.extend(b);
+        } else {
+            let cls = with_host(|h| h.class_of(a).to_string());
+            return Err(raise_exc(
+                "TypeError",
+                &format!("wrong argument type {cls} (expected String or Integer)"),
+            ));
+        }
+    }
+    frozen_guard(recv, "append_as_bytes", &["append_as_bytes"])?;
+    with_host(|h| {
+        let enc = h.string_encoding(recv);
+        let mut bytes = h.string_bytes(recv);
+        bytes.extend(add);
+        match enc {
+            Some(e) if e != crate::host::BROKEN_UTF8 => {
+                h.set_rstr(recv, crate::rstr::RStr::Bytes(bytes, e));
+            }
+            _ => h.set_utf8_bytes(recv, bytes),
+        }
+    });
+    Ok(recv.clone())
 }
 
 /// The String methods that can be answered from a BORROW of the receiver rather
@@ -10584,8 +10639,8 @@ fn dispatch_string_body(
         // result back into the receiver, and return self — or nil when nothing
         // changed (Ruby's String mutator convention).
         "gsub!" | "sub!" | "upcase!" | "downcase!" | "capitalize!" | "swapcase!" | "strip!"
-        | "lstrip!" | "rstrip!" | "chomp!" | "chop!" | "reverse!" | "squeeze!" | "tr!"
-        | "tr_s!" | "delete!" | "delete_prefix!" | "delete_suffix!" => {
+        | "lstrip!" | "rstrip!" | "chomp!" | "chop!" | "reverse!" | "tr!" | "tr_s!"
+        | "delete_prefix!" | "delete_suffix!" => {
             let base = name.strip_suffix('!').unwrap();
             let result = dispatch_string(recv, base, args, block)?;
             let new = with_host(|h| h.as_str(&result).unwrap_or_default());
@@ -11223,10 +11278,6 @@ fn dispatch_string_body(
                 .collect();
             Ok(new_str(out))
         }
-        "delete" => {
-            let m = char_matcher(args);
-            Ok(new_str(s.chars().filter(|&c| !m(c)).collect()))
-        }
         // `delete_prefix`/`delete_suffix` strip one exact leading/trailing match
         // (no globbing); a non-match returns an unchanged copy (MRI:
         // `"hello".delete_prefix("hel")`→`"lo"`, `.delete_suffix("xyz")`→`"hello"`).
@@ -11237,24 +11288,6 @@ fn dispatch_string_body(
         "delete_suffix" => {
             let p = arg_str(&args[0]);
             Ok(new_str(s.strip_suffix(&p).unwrap_or(&s).to_string()))
-        }
-        "count" => {
-            let m = char_matcher(args);
-            Ok(Value::Int(s.chars().filter(|&c| m(c)).count() as i64))
-        }
-        "squeeze" => {
-            let m = char_matcher(args);
-            let all = args.is_empty();
-            let mut prev: Option<char> = None;
-            let mut out = String::new();
-            for c in s.chars() {
-                if Some(c) == prev && (all || m(c)) {
-                    continue;
-                }
-                out.push(c);
-                prev = Some(c);
-            }
-            Ok(new_str(out))
         }
         "to_i" => {
             let base = args.first().map(to_int).transpose()?.unwrap_or(10);
@@ -12459,8 +12492,14 @@ fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value,
             }
             Ok(groups.get(idx as usize).map(strv).unwrap_or(Value::Undef))
         }
-        "pre_match" => Ok(new_str(pre)),
-        "post_match" => Ok(new_str(post)),
+        "pre_match" | "post_match" => {
+            let part = if name == "pre_match" {
+                MatchPart::Pre
+            } else {
+                MatchPart::Post
+            };
+            Ok(with_host(|h| h.matchdata_text(recv, part)).unwrap_or_default())
+        }
         // `#regexp` — the pattern the match ran against, retained on the
         // MatchData when it was built. This used to answer nil unconditionally,
         // which is a legal MatchData shape nowhere in MRI.
@@ -12496,15 +12535,17 @@ fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value,
                 });
             };
             let whole = groups.first().and_then(|o| o.clone()).unwrap_or_default();
-            let subject = format!("{pre}{whole}{post}");
+            let subject = with_host(|h| h.matchdata_subject(recv))
+                .unwrap_or_else(|| format!("{pre}{whole}{post}").into_bytes());
             let in_bytes = name.starts_with("byte");
-            // A byte offset is a valid char boundary here, so counting the
-            // characters before it is the conversion.
+            // A byte offset is on a character head here, so counting the
+            // characters before it is the conversion (`rb_enc_strlen`: an
+            // invalid byte of a broken subject is one character).
             let at = |b: usize| -> i64 {
                 if in_bytes {
                     b as i64
                 } else {
-                    subject[..b].chars().count() as i64
+                    crate::rstr::utf8::strlen(&subject[..b]) as i64
                 }
             };
             Ok(match name {
@@ -12527,9 +12568,13 @@ fn dispatch_matchdata(recv: &Value, name: &str, args: &[Value]) -> Result<Value,
         // `#string` — the entire subject the match ran against: the text before
         // the match, the whole match, and the text after. mustermann's
         // `Match#initialize` captures it via `match.string`.
+        // MRI keeps the subject as a frozen copy (`rb_str_new4` in
+        // `rb_reg_search_set_match`, `rb_str_new_frozen_String` in
+        // `rb_pat_search0`), so it answers frozen.
         "string" => {
-            let matched = groups.first().and_then(|o| o.clone()).unwrap_or_default();
-            Ok(new_str(format!("{pre}{matched}{post}")))
+            let s = with_host(|h| h.matchdata_text(recv, MatchPart::Subject)).unwrap_or_default();
+            with_host(|h| h.freeze_value(&s));
+            Ok(s)
         }
         "to_a" => Ok(new_arr(groups.iter().map(strv).collect())),
         "captures" => Ok(new_arr(groups.iter().skip(1).map(strv).collect())),
@@ -25490,6 +25535,7 @@ fn dispatch_proc(
             // rest: `lambda?` is true and `arity` is -2.
             "lambda?" => Ok(Value::Bool(true)),
             "arity" => Ok(Value::Int(-2)),
+            "source_location" => Ok(Value::Undef),
             ">>" | "<<" => compose(recv, name, args, true),
             _ => Err(no_method_error(recv, name)),
         };
@@ -25510,6 +25556,10 @@ fn dispatch_proc(
             })))
         }
         "lambda?" => Ok(Value::Bool(with_host(|h| h.proc_is_lambda(recv)))),
+        "source_location" => Ok(match with_host(|h| h.proc_source_location(recv)) {
+            Some((file, line)) => new_arr(vec![new_str(file), Value::Int(i64::from(line))]),
+            None => Value::Undef,
+        }),
         // `to_proc` on a Proc is the identity.
         "to_proc" => Ok(recv.clone()),
         // `Proc#===` invokes the proc, so a lambda works as a `case/when` guard.

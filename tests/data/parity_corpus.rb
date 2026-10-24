@@ -8711,3 +8711,78 @@ p m.to_s.class, m.to_s.equal?(m), m.to_str.class, m.to_s
 a = [1]; p a.to_a.equal?(a), a.to_ary.equal?(a), a.entries.equal?(a), a.deconstruct.equal?(a)
 class MyA < Array; end; ma = MyA.new([1, 2])
 p ma, ma.to_a.class, ma.to_ary.class, ma.to_a.equal?(ma), ma.entries.class
+#==#
+# ── $~ after a String-pattern sub/gsub on a broken-UTF-8 receiver is MRI's MatchData over its bytes; MatchData#string is frozen ──
+s = "a\xffb\xfeb"
+s.sub("b", "c"); m = $~
+p m, m.begin(0), m.end(0), m.offset(0), m.byteoffset(0), m.pre_match, m.post_match, m.string, m.string.frozen?, m.to_a, $`, $', $&
+s.gsub("b", "c"); p $~, $~.begin(0), $`, $'
+s.gsub("b") { p [$~, $`, $']; "z" }
+p s.sub("b") { $~ }, s.sub("b", Hash.new { |_, k| "#{k}#{$`.bytesize}" })
+t = s.dup; p t.sub!("zz", "c"), $~, t.gsub!("b", "B"), $~, $~.pre_match
+p s.gsub("b").map { $`.bytesize }, $~
+"ab".sub("b", "c"); p $~.string.frozen?; "ab" =~ /b/; p $~.string.frozen?, $~.pre_match.frozen?
+#==#
+# ── String#append_as_bytes: Strings and Integer low bytes appended raw, the receiver's encoding kept, types checked before frozen ──
+def t; p yield; rescue => e; p e; end
+x = +""; t { x.append_as_bytes("é", 255, 0x101, -1, 2**70 + 65, -(2**70), "\xff") }; p x.encoding, x.bytes, x.valid_encoding?
+y = "é".b; t { y.append_as_bytes("é") }; p y.encoding
+z = +"ab"; t { z.append_as_bytes }; t { z.append_as_bytes(1.5) }; t { z.append_as_bytes(:s) }; p z
+t { "lit".freeze.append_as_bytes(1.5) }; t { "lit".freeze.append_as_bytes("x") }; t { "lit".freeze.append_as_bytes }
+w = "a\xE3\x81".dup; t { w.append_as_bytes(0x82) }; p w.valid_encoding?, w.length
+v = "é".force_encoding("US-ASCII"); t { v.append_as_bytes(65) }; p v.encoding
+class S < String; end; p S.new("a").append_as_bytes(98).class, String.instance_method(:append_as_bytes).arity
+#==#
+# ── strip/lstrip/rstrip(!) take character selectors; broken receivers decode from the front and refuse from the back ──
+def t; p yield; rescue => e; p e; end
+t { "xxabxx".strip("x") }; t { "01234abc56789".strip("0-9", "^4-6") }; t { "01234abc56789".lstrip("0-9", "^4-6") }; t { "01234abc56789".rstrip("0-9", "^4-6") }
+t { "  ab ".lstrip(" a") }; t { "aé".lstrip("a-z") }; t { "\0 ab\0 ".strip("") }; t { "ab".strip("z-a") }; t { "ab".strip("\xff") }; t { "".strip(1) }; t { "ab".lstrip(nil) }
+t { "--a--".dup.strip!("-") }; t { "a".dup.strip!("-") }; t { "--a".dup.rstrip!("-") }; t { "ab".freeze.strip!("x") }; t { "ab".freeze.strip!(1) }
+t { "é".b.strip("\xC3".b) }; t { "é".b.strip("\xC3") }; t { "ééa".strip("é") }; t { "€a€".strip("^a") }
+t { "  \xff ".strip }; t { "a\xff ".strip }; t { "  \xff ".strip(" ") }; t { "a\xff".strip("b") }; t { "a\xff".strip(1) }; t { "  \xff ".dup.strip! }
+t { "  \xff ".dup.lstrip!(" ") }; t { "  a\xff ".dup.lstrip!(" ") }; t { "a\xff".lstrip("\xff") }; t { "\xff".rstrip("x") }; t { " \xff".lstrip }; t { " \xff".rstrip }
+u = "  a\xff ".force_encoding("US-ASCII"); t { u.lstrip }; t { u.lstrip("a ") }; t { u.strip }; t { u.rstrip("x") }
+#==#
+# ── count/delete/squeeze read MRI's tr tables: intersected selectors, ^ negation, ranges above 255, escapes, invalid ranges, argument checks ──
+def t; p yield; rescue => e; p e; end
+t { "hello world".count("lo", "o") }; t { "héllo".count("^é") }; t { "abc".count("a-c", "^b") }
+t { "aé€😀".count("Ā-\u{10FFFF}") }; t { "aé€😀".count("^Ā-\u{10FFFF}") }; t { "aé€😀".count("^€", "^😀") }; t { "aé€😀".count("€😀", "^😀") }; t { "aé€😀".delete("^€😀", "€") }
+t { "a-b".count("a\\-") }; t { "a-b".count("-") }; t { "a\\b".count("\\") }; t { "abc".delete("a-") }; t { "abc".delete("-c") }; t { "ab^".delete("^") }; t { "ab^".delete("^^") }
+t { "ab".count("z-a") }; t { "ab".count("é-a") }; t { "αβγ".delete("γ-α") }; t { "ab".count(1) }; t { "ab".count("\xff") }; t { "a\xffb".count("b") }; t { "a\xffb".count(1) }; t { "ab\xff".count("a") }
+t { "hello".dup.delete!("z") }; t { "hello".freeze.delete!(1) }; t { "hello".freeze.delete!("z") }; t { "".freeze.delete!("a") }; t { "a".delete }
+t { "aaabbbccc".squeeze("a-b") }; t { "aaabbbccc".squeeze("^a") }; t { "ééé".squeeze }; t { "aa\xff\xff".squeeze }; t { "\xff\xffaa".squeeze("a") }; t { "aaa".dup.squeeze!("b") }
+t { "aa".freeze.squeeze!(1) }; t { "".freeze.squeeze! }; t { "ab".b.squeeze("é") }; t { "\xff\xff".b.squeeze }; t { "éé".b.squeeze("\xA9".b) }; t { "zz€€".squeeze("^z") }
+s = "a\xff".force_encoding("US-ASCII"); t { s.count("a") }; t { s.squeeze }; t { s.delete("q") }
+#==#
+# ── a Regexp literal's interpolation sees the method's locals from inside a block (slot analysis reads /…#{x}…/) ──
+y = 5; b = [1].map { /a#{y}/ }; p b; c = nil; [1].each { c = /z#{y}/ }; p c
+def m1; v = 3; [1].map { /#{v}-#{v += 1}/ } + [v]; end; p m1
+def m2; [1].each { /#{w = 9}/ }; defined?(w); end; p m2
+#==#
+# ── one Regexp per static literal site, one per /…#{…}/o site after its first run (interpolation not re-run); others are new each time ──
+x = 0; a = 3.times.map { /a#{x += 1}/o }; p a, x, a.map(&:object_id).uniq.size
+p 3.times.map { /b/.object_id }.uniq.size, 2.times.map { /a#{1}/.object_id }.uniq.size, 2.times.map { [/f/, /f/].map(&:object_id).uniq.size }
+def m = /q/; p m.equal?(m), /q/.equal?(/q/), m.frozen?
+def n(v) = /#{v}/o; p n(1), n(2), 2.times.map { eval("/e/").object_id }.uniq.size
+def Warning.warn(m, category: nil) = print("W:", m[/warning: .*/m])
+3.times { "é" =~ /a/n }
+#==#
+# ── Proc#source_location / define_method bodies: the line the block literal opens on; Proc#inspect is rb_block_to_s ──
+class C
+  define_method(:a) { 1 }
+  define_method(:b,
+    proc { |x| x })
+  pr = lambda do |y|
+    y
+  end
+  define_method(:c, pr)
+  define_method(:d, instance_method(:a))
+end
+p C.instance_method(:a).source_location, C.instance_method(:b).source_location, C.instance_method(:c).source_location, C.instance_method(:d).source_location
+p C.new.method(:a), C.instance_method(:c)
+q = proc do
+end
+p q.source_location, ->(z) { z }.source_location, :upcase.to_proc.source_location, proc { }.curry.source_location, (q >> q).source_location
+o = Object.new; o.define_singleton_method(:z) { }; p o.method(:z).source_location
+h = ->(s) { s.inspect.sub(/0x\h+/, "X") }
+p h[q], h[lambda { }], h[:upcase.to_proc], h[:"a b".to_proc], h[proc { }.curry], h[lambda { }.curry], h[q >> q], q.to_s == q.inspect

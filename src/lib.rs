@@ -456,6 +456,7 @@ fn end_program(r: Result<Value, String>) -> Result<Value, String> {
 pub fn load_merged(mut prog: compiler::Program) -> fusevm::Chunk {
     let (proc_off, begin_off) = host::with_host(|h| h.program_offsets());
     compiler::rebase_program(&mut prog, proc_off, begin_off);
+    compiler::assign_regex_sites(&mut prog);
     let compiler::Program {
         main,
         methods,

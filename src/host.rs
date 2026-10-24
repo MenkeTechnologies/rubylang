@@ -137,7 +137,7 @@ pub mod ops {
     pub const MKARGS: u16 = 32; // [arrays...] argc=n -> concatenated array (splat)
     pub const CALL_ARR: u16 = 33; // [name, args_array] -> self call, args spread
     pub const CALL_METHOD_ARR: u16 = 34; // [recv, name, args_array] -> method call
-    pub const MKREGEX: u16 = 35; // [source, flags] -> Regexp
+    pub const MKREGEX: u16 = 35; // [source, flags, site] -> Regexp
     pub const MKLAMBDA: u16 = 36; // [proc_id] -> Proc (lambda? == true)
     pub const SIG_RETRY: u16 = 37; // [v] -> restart the enclosing begin body
     pub const NO_MATCH: u16 = 38; // [subj] -> raise NoMatchingPatternError
@@ -189,6 +189,8 @@ pub mod ops {
                                      // operand spells each part's kind (`L` text, `B` bytes in one-char-per-
                                      // byte storage, `I` an interpolated value), led by `F` when it is frozen.
     pub const MKBSTR: u16 = 62; // [kinds, parts...] -> heap String
+                                // The Regexp a `/…#{…}/o` literal site built on its first run, or nil.
+    pub const REGEX_ONCE: u16 = 63; // [site] -> Regexp | nil
 }
 
 /// Sentinel bounds for beginless (`..hi`) and endless (`lo..`) ranges, carried
@@ -329,6 +331,17 @@ pub struct ArithSeq {
 struct AncestryCache {
     gen: u64,
     chains: std::collections::HashMap<(String, bool), Arc<Vec<String>>>,
+}
+
+/// Which text around a match `RubyHost::matchdata_text` answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchPart {
+    /// `#pre_match` and its global.
+    Pre,
+    /// `#post_match` and its global.
+    Post,
+    /// `#string`: the whole subject.
+    Subject,
 }
 
 #[derive(Debug, Clone)]
@@ -527,6 +540,11 @@ pub enum RObj {
         /// was produced by an internally-built pattern with no Ruby-level
         /// Regexp object behind it.
         regexp: Value,
+        /// The subject's bytes when they are not valid UTF-8 (a String-pattern
+        /// `sub`/`gsub` on a broken receiver). `pre`/`post` cannot hold them, so
+        /// the text around the match and the character offsets are read from
+        /// here, as MRI reads them from the MatchData's own `str`.
+        subject: Option<Vec<u8>>,
     },
     /// A concrete `Enumerator`: the yielded values already materialized into a
     /// buffer, plus an external-iteration cursor. Returned by block-less
@@ -862,8 +880,9 @@ pub struct RescueDef {
 /// The compiled engine for a Ruby pattern, built once per distinct
 /// `(source, flags)` and shared by every Regexp value made from it.
 ///
-/// A regex LITERAL is compiled at every evaluation — `Expr::Regex` lowers to
-/// `MKREGEX`, which is an ordinary op inside whatever loop encloses it — so
+/// An interpolated regex literal is compiled at every evaluation — `Expr::Regex`
+/// lowers to `MKREGEX`, an ordinary op inside whatever loop encloses it — and
+/// before literal sites kept their Regexp, so was a static one: so
 /// `s =~ /\A[\w.]+@[\w.]+\z/` inside a 50 000-iteration loop parsed and
 /// compiled that pattern 50 000 times. A `sample` profile of exactly that loop
 /// was almost entirely `regex_syntax::ast::parse`, `regex_automata` NFA
@@ -872,9 +891,10 @@ pub struct RescueDef {
 ///
 /// Two things the cache must not break:
 ///
-/// * **The Regexp value stays fresh.** Only the engine is shared, and it is
+/// * **The Regexp value stays per object.** Only the engine is shared, and it is
 ///   immutable and holds no per-match state (`$~` and friends live on the host).
-///   Each evaluation still allocates its own `RObj::Regexp`, so `#source`,
+///   Whether an evaluation allocates a new `RObj::Regexp` is decided by its
+///   literal site (`RubyHost::regex_sites`), never by this cache, so `#source`,
 ///   `#options`, identity and freezing are unaffected.
 /// * **An invalid pattern raises EVERY time.** The compile ERROR is cached
 ///   beside the engine, so the second evaluation of a bad pattern raises exactly
@@ -1458,6 +1478,9 @@ pub struct ProcDef {
     /// this LEXICAL count — it is where the block was written, not how deep the
     /// call got.
     pub block_depth: u32,
+    /// The line the block literal opens on, for `Proc#source_location` (0 for
+    /// a body no literal wrote: a `begin` clause, a synthesized block).
+    pub line: u32,
     /// The file the block was written in — see [`MethodDef::file`].
     pub file: Option<Arc<SourceFile>>,
 }
@@ -1538,6 +1561,12 @@ pub struct RubyHost {
     /// meets, and warns only when that changes it (see
     /// [`RubyHost::prepare_binary_regexp`]).
     binary_regexp_encodings: HashMap<u32, &'static str>,
+    /// The one Regexp of each literal site that has run, by the site id
+    /// `compiler::assign_regex_sites` gave it: a static literal is one object,
+    /// as MRI makes it once at compile time (so a `/…/n` literal in a loop
+    /// warns once, and `equal?` holds across evaluations), and so is a
+    /// `/…#{…}/o` literal after its first run.
+    regex_sites: HashMap<i64, Value>,
     /// The `frame_id` of each required/loaded file's top level. MRI labels
     /// that frame `<top (required)>`, and a block written there
     /// `block in <top (required)>`, for as long as the block lives.
@@ -2364,7 +2393,8 @@ pub fn eval_in_place(src: &str) -> Result<Value, String> {
     let syntax = |e: String| crate::builtins::raise_exc("SyntaxError", &e);
     let stmts = crate::parser::parse(src).map_err(syntax)?;
     let (proc_base, begin_base) = with_host(|h| (h.procs.len(), h.begins.len()));
-    let prog = crate::compiler::compile_at(&stmts, proc_base, begin_base).map_err(syntax)?;
+    let mut prog = crate::compiler::compile_at(&stmts, proc_base, begin_base).map_err(syntax)?;
+    crate::compiler::assign_regex_sites(&mut prog);
     let main = prog.main;
     // A `def` at the top level of the eval'd source belongs to the active eval
     // target — `C.class_eval("def m; … end")` defines `m` on C, not as a global
@@ -2520,6 +2550,7 @@ impl RubyHost {
             enum_feeds: HashMap::new(),
             binary_regexps: false,
             binary_regexp_encodings: HashMap::new(),
+            regex_sites: HashMap::new(),
             required_tops: HashSet::new(),
             consts: IndexMap::new(),
             autoloads: IndexMap::new(),
@@ -4006,7 +4037,78 @@ impl RubyHost {
             pre,
             post,
             regexp,
+            subject: None,
         })
+    }
+    /// The MatchData `rb_backref_set_string` leaves for a String pattern found
+    /// at `[beg, end)` in a subject whose bytes are not valid UTF-8: its one
+    /// group is the pattern's text, and the subject is kept as bytes.
+    pub fn new_string_matchdata_bytes(
+        &mut self,
+        subject: &[u8],
+        (beg, end): (usize, usize),
+        pattern: Value,
+    ) -> Value {
+        let lossy = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        self.alloc(RObj::MatchData {
+            groups: vec![Some(lossy(&subject[beg..end]))],
+            names: Vec::new(),
+            offsets: vec![Some((beg, end))],
+            pre: lossy(&subject[..beg]),
+            post: lossy(&subject[end..]),
+            regexp: pattern,
+            subject: Some(subject.to_vec()),
+        })
+    }
+    /// The text before or after the whole match of a MatchData, or its whole
+    /// subject, as a String value: from the subject's bytes when they are not
+    /// valid UTF-8, else from the text kept at the match.
+    pub fn matchdata_text(&mut self, v: &Value, part: MatchPart) -> Option<Value> {
+        let Some(RObj::MatchData {
+            groups,
+            offsets,
+            pre,
+            post,
+            subject,
+            ..
+        }) = self.obj(v)
+        else {
+            return None;
+        };
+        let bytes = match subject {
+            Some(b) => {
+                let (beg, end) = offsets.first().copied().flatten().unwrap_or((0, 0));
+                match part {
+                    MatchPart::Pre => b[..beg].to_vec(),
+                    MatchPart::Post => b[end..].to_vec(),
+                    MatchPart::Subject => b.clone(),
+                }
+            }
+            None => match part {
+                MatchPart::Pre => pre.clone().into_bytes(),
+                MatchPart::Post => post.clone().into_bytes(),
+                MatchPart::Subject => {
+                    let whole = groups.first().cloned().flatten().unwrap_or_default();
+                    format!("{pre}{whole}{post}").into_bytes()
+                }
+            },
+        };
+        Some(self.new_utf8_from_bytes(bytes))
+    }
+    /// The Regexp literal site `site` built, if it has run (see `regex_sites`).
+    pub fn regex_site(&self, site: i64) -> Option<Value> {
+        self.regex_sites.get(&site).cloned()
+    }
+    /// Keep `re` as the one Regexp of literal site `site`.
+    pub fn set_regex_site(&mut self, site: i64, re: Value) {
+        self.regex_sites.insert(site, re);
+    }
+    /// The bytes of a MatchData's subject when they are not valid UTF-8.
+    pub fn matchdata_subject(&self, v: &Value) -> Option<Vec<u8>> {
+        match self.obj(v) {
+            Some(RObj::MatchData { subject, .. }) => subject.clone(),
+            _ => None,
+        }
     }
 
     /// Create a proc capturing the currently-active scope (shared by `Rc`).
@@ -4631,6 +4733,23 @@ impl RubyHost {
                 });
             }
         }
+        // A `define_singleton_method` body, owned by the object's singleton class.
+        if let (false, Some(p)) = (unbound, self.find_singleton_define_method(recv, name)) {
+            if let (
+                Some(RObj::Proc {
+                    template,
+                    kind: ProcKind::Normal,
+                    ..
+                }),
+                Some(owner),
+            ) = (self.obj(&p), self.singleton_class_name(recv))
+            {
+                return Some(MethodShape::Block {
+                    template: *template,
+                    owner,
+                });
+            }
+        }
         if let Some(cls) = self.object_class(recv) {
             if let Some((def, owner)) = self.find_method_owner(&cls, name) {
                 return Some(MethodShape::Def {
@@ -5024,8 +5143,32 @@ impl RubyHost {
                 let file = def.file.as_ref()?;
                 Some((file.path.clone(), def.line))
             }
+            // A `define_method` body is where its block literal was written.
+            MethodShape::Block { template, .. } => self.template_source_location(template),
             _ => None,
         }
+    }
+    /// `Proc#source_location`: where the block literal was written. A proc no
+    /// literal wrote (`Symbol#to_proc`, a curried or composed proc) has none.
+    pub fn proc_source_location(&self, v: &Value) -> Option<(String, u32)> {
+        match self.obj(v)? {
+            RObj::Proc {
+                template,
+                kind: ProcKind::Normal,
+                ..
+            } => self.template_source_location(*template),
+            RObj::Proc {
+                kind: ProcKind::SetsMatch { inner, .. },
+                ..
+            } => self.proc_source_location(inner),
+            _ => None,
+        }
+    }
+    /// The file and line of proc template `template`'s literal.
+    fn template_source_location(&self, template: usize) -> Option<(String, u32)> {
+        let def = self.procs.get(template)?;
+        let file = def.file.as_ref()?;
+        (def.line > 0).then(|| (file.path.clone(), def.line))
     }
     /// `Proc#parameters`. Shaped like [`Self::method_parameters`], with one
     /// difference the reference is explicit about: a NON-lambda proc reports its
@@ -5756,13 +5899,19 @@ impl RubyHost {
         if name == "~" {
             return Some(md);
         }
-        let Some((groups, _, pre, post)) = self.as_matchdata(&md) else {
+        let part = match name {
+            "`" => Some(MatchPart::Pre),
+            "'" => Some(MatchPart::Post),
+            _ => None,
+        };
+        if let Some(part) = part {
+            return Some(self.matchdata_text(&md, part).unwrap_or(Value::Undef));
+        }
+        let Some((groups, ..)) = self.as_matchdata(&md) else {
             return Some(Value::Undef);
         };
         let text = match name {
             "&" => groups.first().cloned().flatten(),
-            "`" => Some(pre),
-            "'" => Some(post),
             "+" => groups.iter().skip(1).rev().find_map(|g| g.clone()),
             _ => name
                 .parse::<usize>()
@@ -9649,14 +9798,31 @@ impl RubyHost {
                 }
                 Some(RObj::Array(items)) => self.inspect_array(&items),
                 Some(RObj::Hash { map, .. }) => self.inspect_hash(&map),
-                Some(RObj::Proc { .. })
-                | Some(RObj::SymProc(_))
-                | Some(RObj::CycleProc(_))
+                // proc.c `rb_block_to_s`: the address, then where a block
+                // literal was written or `(&:sym)` for `Symbol#to_proc`, and
+                // ` (lambda)` for a lambda.
+                Some(RObj::Proc { is_lambda, .. }) => {
+                    let at = match self.proc_source_location(v) {
+                        Some((file, line)) => format!(" {file}:{line}"),
+                        None => String::new(),
+                    };
+                    let lambda = if is_lambda { " (lambda)" } else { "" };
+                    format!("#<Proc:{}{at}{lambda}>", self.object_address(v))
+                }
+                Some(RObj::SymProc(s)) => {
+                    let sym = if plain_symbol_name(&s) {
+                        format!(":{s}")
+                    } else {
+                        format!(":{}", inspect_string(&s))
+                    };
+                    format!("#<Proc:{}(&{sym}) (lambda)>", self.object_address(v))
+                }
+                Some(RObj::CycleProc(_))
                 | Some(RObj::RaiseProc { .. })
                 | Some(RObj::SeqProc(_))
                 | Some(RObj::StepProc { .. })
                 | Some(RObj::ProduceProc { .. })
-                | Some(RObj::DeriveProc { .. }) => "#<Proc>".to_string(),
+                | Some(RObj::DeriveProc { .. }) => format!("#<Proc:{}>", self.object_address(v)),
                 Some(RObj::Method {
                     recv,
                     name,

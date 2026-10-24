@@ -225,6 +225,16 @@ fn slot_scan(body: &[Stmt]) -> (std::collections::HashSet<String>, bool) {
     (caps, disq)
 }
 
+/// The `/…#{…}/` interpolation of a Regexp literal as the String expression it
+/// compiles to, so the walkers over a body see the locals it names (`None`
+/// for a static pattern).
+fn regex_interp_expr(source: &str) -> Option<Expr> {
+    if !(source.contains("#{") || crate::parser::has_sigil_interp(source)) {
+        return None;
+    }
+    crate::parser::scan_interp(source).ok().map(Expr::Str)
+}
+
 fn slot_scan_block(b: &Block, caps: &mut std::collections::HashSet<String>, disq: &mut bool) {
     // A block body is a closure: every local it names is shared with the parent.
     for s in &b.body {
@@ -250,6 +260,11 @@ fn slot_scan_expr(
     in_closure: bool,
 ) {
     match e {
+        Expr::Regex(src, _) => {
+            if let Some(x) = regex_interp_expr(src) {
+                slot_scan_expr(&x, caps, disq, in_closure);
+            }
+        }
         Expr::Var(VarKind::Local, n) => {
             if in_closure {
                 caps.insert(n.clone());
@@ -262,7 +277,6 @@ fn slot_scan_expr(
         | Expr::Float(_)
         | Expr::Symbol(_)
         | Expr::SelfExpr
-        | Expr::Regex(_, _)
         | Expr::Retry
         | Expr::Redo
         | Expr::Var(_, _) => {}
@@ -550,6 +564,11 @@ fn for_locals_body(body: &[Stmt], out: &mut Vec<String>) {
 
 fn for_locals_expr(e: &Expr, out: &mut Vec<String>) {
     match e {
+        Expr::Regex(src, _) => {
+            if let Some(x) = regex_interp_expr(src) {
+                for_locals_expr(&x, out);
+            }
+        }
         Expr::Assign(t, v) => {
             for_locals_target(t, out);
             for_locals_expr(v, out);
@@ -682,6 +701,11 @@ fn for_locals_expr(e: &Expr, out: &mut Vec<String>) {
 
 fn collect_plain_assigns(e: &Expr, out: &mut Vec<String>) {
     match e {
+        Expr::Regex(src, _) => {
+            if let Some(x) = regex_interp_expr(src) {
+                collect_plain_assigns(&x, out);
+            }
+        }
         Expr::Assign(t, v) => {
             if let Expr::Var(VarKind::Local, n) = &**t {
                 if !out.iter().any(|x| x == n) {
@@ -697,7 +721,6 @@ fn collect_plain_assigns(e: &Expr, out: &mut Vec<String>) {
         | Expr::Float(_)
         | Expr::Symbol(_)
         | Expr::SelfExpr
-        | Expr::Regex(_, _)
         | Expr::Retry
         | Expr::Redo
         | Expr::Var(_, _) => {}
@@ -919,6 +942,78 @@ fn rebase_chunk(chunk: &mut Chunk, proc_off: usize, begin_off: usize) {
     }
 }
 
+/// The site operand of a static Regexp literal before `assign_regex_sites`.
+const REGEX_SITE_STATIC: i64 = -1;
+/// The site operand of a `/…#{…}/o` literal (its `REGEX_ONCE` probe and its
+/// `MKREGEX`) before `assign_regex_sites`.
+const REGEX_SITE_ONCE: i64 = -2;
+
+/// The next Regexp literal site id. Process-wide, so two programs loaded into
+/// one process (a `require`, an `eval`) never share a site, whatever ids their
+/// compilations (or the bytecode cache) started from.
+static NEXT_REGEX_SITE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+/// Give every Regexp literal site of a program about to be loaded its own id:
+/// the `LoadInt` before each `CallBuiltin(MKREGEX, 3)` / `(REGEX_ONCE, 1)`.
+/// A static literal gets a fresh id; a `/…/o` literal's probe and its build
+/// share one. The runtime keeps one Regexp per id; a site left unassigned
+/// (negative) or interpolated (0) builds a new Regexp every time.
+pub fn assign_regex_sites(prog: &mut Program) {
+    assign_chunk_regex_sites(&mut prog.main);
+    for (_, m) in &mut prog.methods {
+        assign_chunk_regex_sites(Arc::make_mut(&mut m.chunk));
+    }
+    for (_, c) in &mut prog.classes {
+        for (_, m) in c.methods.iter_mut().chain(c.class_methods.iter_mut()) {
+            assign_chunk_regex_sites(Arc::make_mut(&mut m.chunk));
+        }
+    }
+    for p in &mut prog.procs {
+        assign_chunk_regex_sites(&mut p.chunk);
+    }
+}
+
+fn assign_chunk_regex_sites(chunk: &mut Chunk) {
+    use std::sync::atomic::Ordering;
+    let mut open_once = Vec::new();
+    let mut changed = false;
+    for i in 1..chunk.ops.len() {
+        let Op::CallBuiltin(id, argc) = chunk.ops[i] else {
+            continue;
+        };
+        let Op::LoadInt(site) = &mut chunk.ops[i - 1] else {
+            continue;
+        };
+        let fresh = || NEXT_REGEX_SITE.fetch_add(1, Ordering::Relaxed);
+        match (id, argc, *site) {
+            (ops::REGEX_ONCE, 1, REGEX_SITE_ONCE) => {
+                let n = fresh();
+                open_once.push(n);
+                *site = n;
+            }
+            (ops::MKREGEX, 3, REGEX_SITE_ONCE) => match open_once.pop() {
+                Some(n) => *site = n,
+                None => continue,
+            },
+            (ops::MKREGEX, 3, REGEX_SITE_STATIC) => *site = fresh(),
+            _ => continue,
+        }
+        changed = true;
+    }
+    for sub in &mut chunk.sub_chunks {
+        assign_chunk_regex_sites(sub);
+    }
+    if changed {
+        // The op hash is the JIT-cache key; see `rebase_chunk`.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        chunk.ops.hash(&mut h);
+        chunk.constants.hash(&mut h);
+        chunk.op_hash = h.finish();
+    }
+}
+
 /// Compile a program whose `proc`/`begin` template ids start at the given bases,
 /// returning only the newly-emitted procs/begins. Used by `eval` so a string
 /// compiled into an already-running host references the host's proc/begin tables
@@ -970,6 +1065,7 @@ fn dummy_proc() -> ProcDef {
         chunk: ChunkBuilder::new().build(),
         arity: crate::ast::BlockArity::default(),
         block_depth: 1,
+        line: 0,
         file: None,
     }
 }
@@ -1372,14 +1468,41 @@ impl Compiler {
                 // `/…#{expr}…/` — build the pattern string at runtime by compiling
                 // the interpolation like a double-quoted string, then compile the
                 // Regexp. A static pattern (no `#{`) pushes the source directly.
-                if source.contains("#{") || crate::parser::has_sigil_interp(source) {
+                //
+                // MRI makes ONE Regexp per static literal, when it compiles it,
+                // and one per `/…#{…}/o` literal, the first time it runs (the
+                // interpolation is not evaluated again); every other
+                // interpolated literal is a new Regexp each time. The site
+                // operand says which (see `assign_regex_sites`).
+                let interp = source.contains("#{") || crate::parser::has_sigil_interp(source);
+                let once = interp && flags.contains('o');
+                let mut skip = None;
+                if once {
+                    b.emit(Op::LoadInt(REGEX_SITE_ONCE), 0);
+                    b.emit(Op::CallBuiltin(ops::REGEX_ONCE, 1), 0);
+                    b.emit(Op::Dup, 0);
+                    b.emit(Op::RubyTruthy, 0);
+                    skip = Some(b.emit(Op::JumpIfTrue(0), 0));
+                    b.emit(Op::Pop, 0);
+                }
+                if interp {
                     let parts = crate::parser::scan_interp(source)?;
                     self.compile_expr(b, &Expr::Str(parts))?;
                 } else {
                     self.kstr(b, source);
                 }
                 self.kstr(b, flags);
-                b.emit(Op::CallBuiltin(ops::MKREGEX, 2), 0);
+                let site = match (interp, once) {
+                    (false, _) => REGEX_SITE_STATIC,
+                    (true, true) => REGEX_SITE_ONCE,
+                    (true, false) => 0,
+                };
+                b.emit(Op::LoadInt(site), 0);
+                b.emit(Op::CallBuiltin(ops::MKREGEX, 3), 0);
+                if let Some(j) = skip {
+                    let end = b.current_pos();
+                    b.patch_jump(j, end);
+                }
             }
             // The trailing keyword hash of a call: build it, then TAG it, so
             // `bind_params` can tell it from a Hash written positionally.
@@ -1592,6 +1715,7 @@ impl Compiler {
                             splat: None,
                             body: nondefs,
                             arity: None,
+                            line: 0,
                         }),
                     };
                     self.compile_expr(b, &call)?;
@@ -2443,6 +2567,7 @@ impl Compiler {
             splat: None,
             body: inner,
             arity: None,
+            line: 0,
         };
         let call = Expr::Call {
             recv: Some(Box::new(iter.clone())),
@@ -2578,6 +2703,7 @@ impl Compiler {
                             }
                             .into()],
                             arity: None,
+                            line: 0,
                         }),
                     };
                     self.compile_expr(b, &any)?;
@@ -2743,6 +2869,7 @@ impl Compiler {
             &block.params,
             block.splat,
             block.arity.clone(),
+            block.line,
         );
         self.block_depth -= 1;
         self.redo_ok = saved_redo;
@@ -2779,7 +2906,7 @@ impl Compiler {
         params: &[String],
         splat: Option<usize>,
     ) -> Result<usize, String> {
-        self.compile_proc_body_arity(body, params, splat, None)
+        self.compile_proc_body_arity(body, params, splat, None, 0)
     }
 
     /// As [`compile_proc_body`], with the written parameter shape a lambda is
@@ -2791,6 +2918,7 @@ impl Compiler {
         params: &[String],
         splat: Option<usize>,
         arity: Option<crate::ast::BlockArity>,
+        line: u32,
     ) -> Result<usize, String> {
         let arity = arity.unwrap_or_else(|| crate::ast::BlockArity {
             req: params.len().saturating_sub(splat.is_some() as usize) as u16,
@@ -2819,6 +2947,7 @@ impl Compiler {
             chunk,
             arity,
             block_depth,
+            line,
             file: None,
         });
         Ok(id)
@@ -3185,6 +3314,7 @@ impl Compiler {
                                     splat: None,
                                     body: sc_nondefs,
                                     arity: None,
+                                    line: 0,
                                 }),
                             }
                             .into(),
@@ -4004,6 +4134,7 @@ fn lower_find_pattern(elems: &[Pattern], subj: &Expr) -> (Expr, Vec<Expr>) {
             splat: None,
             body: vec![scan.into()],
             arity: None,
+            line: 0,
         }),
     };
     let found = Expr::Begin {

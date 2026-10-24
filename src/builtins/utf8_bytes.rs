@@ -142,10 +142,6 @@ pub(super) fn dispatch(
             None => return Ok(None),
         },
         ("grapheme_clusters" | "each_grapheme_cluster", 0) => graphemes(&r, name, block)?,
-        ("lstrip" | "lstrip!", 0) => {
-            let n = lstrip_offset(&r.b)?;
-            trimmed(&r, name, n, r.b.len())
-        }
         _ => return Ok(None),
     }))
 }
@@ -367,24 +363,6 @@ fn trimmed(r: &Recv, name: &str, from: usize, to: usize) -> Value {
     }
     store(r.v, cut);
     r.v.clone()
-}
-
-/// `lstrip_offset`: leading whitespace and NULs; reading an invalid sequence
-/// is an error.
-fn lstrip_offset(b: &[u8]) -> Result<usize, String> {
-    let mut s = 0;
-    while s < b.len() {
-        let utf8::Mbc::Found(n) = utf8::precise(&b[s..]) else {
-            return Err(invalid_byte_sequence());
-        };
-        let c = b[s];
-        let space = n == 1 && (c == 0 || c == b' ' || (b'\t'..=b'\r').contains(&c));
-        if !space {
-            break;
-        }
-        s += n;
-    }
-    Ok(s)
 }
 
 /// `rb_str_enumerate_grapheme_clusters`: the valid runs cluster as text and
@@ -1329,19 +1307,39 @@ fn sub(r: &Recv, name: &str, args: &[Value], block: Option<Value>) -> Result<Val
         }
         string_hits(b, &p, all)
     };
+    // A String pattern's match is `rb_backref_set_string`'s MatchData over
+    // the receiver's bytes; a Regexp's `$~` was set by `regexp_hits`.
+    let string_md = |hit: &Hit| {
+        let span = hit.groups[0].expect("group 0 always matches");
+        with_host(|h| h.new_string_matchdata_bytes(b, span, pat.clone()))
+    };
     // A block-less `gsub(pattern)` is the Enumerator of what each match
-    // would hand a block.
+    // would hand a block, each element carrying its `$~`.
     if all && args.len() == 1 && block.is_none() {
         let items = hits.iter().map(|hit| match0(b, pat, hit)).collect();
-        return Ok(with_host(|h| h.new_enumerator_of(items, name, r.v.clone())));
+        let e = with_host(|h| h.new_enumerator_of(items, name, r.v.clone()));
+        if !is_regexp(pat) {
+            let mds = hits.iter().map(string_md).collect();
+            with_host(|h| h.set_enum_matches(&e, mds));
+        }
+        return Ok(e);
     }
     if hits.is_empty() {
+        if !is_regexp(pat) {
+            with_host(|h| h.set_global("~", Value::Undef));
+        }
         return Ok(if bang { Value::Undef } else { out(b.clone()) });
     }
     let mut dest = Vec::with_capacity(b.len());
     let mut offset = 0;
-    for hit in &hits {
+    for (i, hit) in hits.iter().enumerate() {
         let (beg0, end0) = hit.groups[0].expect("group 0 always matches");
+        // MRI sets `$~` before each replacement is computed; only a block or
+        // a Hash (its default proc) can see any but the last.
+        if !is_regexp(pat) && (block.is_some() || hash.is_some() || i + 1 == hits.len()) {
+            let md = string_md(hit);
+            with_host(|h| h.set_global("~", md));
+        }
         let val = if let Some(bl) = &block {
             as_string_bytes(&call_proc(bl, &[match0(b, pat, hit)])?)?
         } else if let Some(h) = &hash {

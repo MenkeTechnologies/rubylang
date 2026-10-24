@@ -1208,6 +1208,7 @@ impl Parser {
                     Expr::BlockPass(Box::new(Expr::Var(VarKind::Local, FWD_BLK.into()))).into(),
                 ],
                 arity: None,
+                line: 0,
             });
             return Ok(());
         }
@@ -1268,6 +1269,7 @@ impl Parser {
                         Expr::BlockPass(Box::new(Expr::Var(VarKind::Local, "&".into()))).into(),
                     ],
                     arity: None,
+                    line: 0,
                 });
                 return Ok(());
             }
@@ -1300,6 +1302,7 @@ impl Parser {
                     splat: Some(0),
                     body: vec![call.into()],
                     arity: None,
+                    line: 0,
                 });
                 return Ok(());
             }
@@ -1312,6 +1315,7 @@ impl Parser {
                 splat: None,
                 body: vec![Expr::BlockPass(Box::new(e)).into()],
                 arity: None,
+                line: 0,
             });
             return Ok(());
         }
@@ -1352,6 +1356,7 @@ impl Parser {
     fn maybe_block(&mut self) -> Result<Option<Block>, String> {
         // Inside a loop/case condition a `do` binds to the enclosing keyword, not
         // to a call in the condition — leave it for the loop parser to consume.
+        let line = self.line();
         if !self.no_do_block && self.eat_kw("do") {
             let (mut params, splat, preludes, mut arity) = self.block_params()?;
             let track = params.is_empty() && splat.is_none();
@@ -1390,6 +1395,7 @@ impl Parser {
                 splat,
                 body,
                 arity: Some(arity),
+                line,
             }));
         }
         if self.is_op("{") {
@@ -1430,6 +1436,7 @@ impl Parser {
                 splat,
                 body,
                 arity: Some(arity),
+                line,
             }));
         }
         Ok(None)
@@ -1595,6 +1602,7 @@ impl Parser {
                     }
                     .into()],
                     arity: None,
+                    line: 0,
                 }),
             };
             let value = Expr::If {
@@ -2743,6 +2751,7 @@ impl Parser {
                         splat: None,
                         body,
                         arity: None,
+                        line: 0,
                     };
                     let call = match e {
                         Expr::Call {
@@ -3262,6 +3271,7 @@ impl Parser {
 
     /// `->(params) { body }` / `-> { body }` / `->(x) do … end` — a lambda.
     fn lambda_lit(&mut self) -> Result<Expr, String> {
+        let line = self.line();
         self.expect_op("->")?;
         let mut acc = ParamAcc::default();
         let mut had_parens = false;
@@ -3310,6 +3320,7 @@ impl Parser {
                 splat,
                 body,
                 arity: Some(arity),
+                line,
             }))
         } else {
             Ok(Expr::Lambda(block))

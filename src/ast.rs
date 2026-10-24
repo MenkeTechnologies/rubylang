@@ -92,6 +92,9 @@ pub struct Block {
     /// The written parameter shape. `None` for a compiler/parser-synthesized
     /// block, whose params are all plain and required.
     pub arity: Option<BlockArity>,
+    /// The line the literal opens on (its `{`, `do` or `->`), for
+    /// `Proc#source_location`; 0 for a synthesized block, which has none.
+    pub line: u32,
 }
 
 /// A Ruby expression.

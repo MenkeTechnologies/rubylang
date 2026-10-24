@@ -29,7 +29,13 @@ use std::path::PathBuf;
 /// 12 -> 13: a `MethodDef` carries the `line` its definition starts on, for
 /// `Method#source_location`, and a `ProcDef`'s arity its `|x; local|`
 /// block-locals, which are no longer parameters.
-const SCHEMA: u64 = 13;
+///
+/// 13 -> 14: a `ProcDef` carries the `line` its literal opens on, for
+/// `Proc#source_location`. And `MKREGEX` takes a third operand, the literal's site (one Regexp per
+/// static literal), and a `/…#{…}/o` literal probes `REGEX_ONCE` first. A 13
+/// chunk calls `MKREGEX` with two operands, which would now read the source as
+/// the flags.
+const SCHEMA: u64 = 14;
 
 /// The outer, rkyv-archived shard: the [`build_stamp`] of the binary that wrote
 /// it, then a flat list of (key, bincode-blob) entries.
@@ -104,6 +110,8 @@ type CProc = (
     u32,
     // `BlockArity::locals` — the `|x; local|` block-locals.
     Vec<String>,
+    // `ProcDef::line` — the line the literal opens on.
+    u32,
 );
 
 /// The inner, serde/bincode form of a compiled program. Tuples keep the shape
@@ -463,6 +471,7 @@ fn to_cprog(prog: &Program) -> CProg {
                     p.arity.blockparam.clone(),
                     p.block_depth,
                     p.arity.locals.clone(),
+                    p.line,
                 )
             })
             .collect(),
@@ -551,6 +560,7 @@ fn from_cprog(cp: CProg) -> Program {
                     blockparam,
                     block_depth,
                     locals,
+                    line,
                 )| ProcDef {
                     params,
                     splat,
@@ -565,6 +575,7 @@ fn from_cprog(cp: CProg) -> Program {
                         locals,
                     },
                     block_depth,
+                    line,
                     file: None,
                 },
             )

@@ -7725,3 +7725,177 @@ Array
 MyA
 false
 Array
+#==#
+#<MatchData: b>
+2
+3
+[2, 3]
+[2, 3]
+"a\xFF"
+"\xFEb"
+"a\xFFb\xFEb"
+true
+["b"]
+"a\xFF"
+"\xFEb"
+"b"
+#<MatchData: b>
+4
+"a\xFFb\xFE"
+""
+[#<MatchData: b>, "a\xFF", "\xFEb"]
+[#<MatchData: b>, "a\xFFb\xFE", ""]
+"a\xFFb\xFEb"
+"a\xFFb2\xFEb"
+nil
+nil
+"a\xFFB\xFEB"
+#<MatchData: b>
+"a\xFFb\xFE"
+[2, 4]
+#<MatchData: b>
+true
+true
+false
+#==#
+"é\xFF\u0001\xFFA\u0000\xFF"
+#<Encoding:UTF-8>
+[195, 169, 255, 1, 255, 65, 0, 255]
+false
+"\xC3\xA9\xC3\xA9"
+#<Encoding:BINARY (ASCII-8BIT)>
+"ab"
+#<TypeError: wrong argument type Float (expected String or Integer)>
+#<TypeError: wrong argument type Symbol (expected String or Integer)>
+"ab"
+#<TypeError: wrong argument type Float (expected String or Integer)>
+#<FrozenError: can't modify frozen String: "lit">
+#<FrozenError: can't modify frozen String: "lit">
+"aあ"
+true
+2
+"\xC3\xA9A"
+#<Encoding:US-ASCII>
+S
+-1
+#==#
+"ab"
+"4abc56"
+"4abc56789"
+"01234abc56"
+"b "
+"é"
+"\u0000 ab\u0000 "
+#<ArgumentError: invalid range "z-a" in string transliteration>
+#<ArgumentError: invalid byte sequence in UTF-8>
+#<TypeError: no implicit conversion of Integer into String>
+#<TypeError: no implicit conversion of nil into String>
+"a"
+nil
+nil
+#<FrozenError: can't modify frozen String: "ab">
+#<FrozenError: can't modify frozen String: "ab">
+"\xA9"
+#<Encoding::CompatibilityError: incompatible character encodings: BINARY (ASCII-8BIT) and UTF-8>
+"a"
+"a"
+#<ArgumentError: invalid byte sequence in UTF-8>
+#<Encoding::CompatibilityError: invalid byte sequence in UTF-8>
+#<ArgumentError: invalid byte sequence in UTF-8>
+#<Encoding::CompatibilityError: invalid byte sequence in UTF-8>
+#<TypeError: no implicit conversion of Integer into String>
+#<ArgumentError: invalid byte sequence in UTF-8>
+#<ArgumentError: invalid byte sequence in UTF-8>
+"a\xFF "
+#<ArgumentError: invalid byte sequence in UTF-8>
+#<Encoding::CompatibilityError: invalid byte sequence in UTF-8>
+#<ArgumentError: invalid byte sequence in UTF-8>
+#<Encoding::CompatibilityError: invalid byte sequence in UTF-8>
+"a\xFF "
+#<ArgumentError: invalid byte sequence in US-ASCII>
+#<Encoding::CompatibilityError: invalid byte sequence in US-ASCII>
+#<Encoding::CompatibilityError: invalid byte sequence in US-ASCII>
+#==#
+2
+4
+2
+2
+2
+2
+1
+"aé€😀"
+2
+1
+1
+"bc"
+"ab"
+"ab"
+"^"
+#<ArgumentError: invalid range "z-a" in string transliteration>
+#<ArgumentError: invalid range in string transliteration>
+#<ArgumentError: invalid range in string transliteration>
+#<TypeError: no implicit conversion of Integer into String>
+#<ArgumentError: invalid byte sequence in UTF-8>
+#<ArgumentError: invalid byte sequence in UTF-8>
+#<TypeError: no implicit conversion of Integer into String>
+#<ArgumentError: invalid byte sequence in UTF-8>
+nil
+#<TypeError: no implicit conversion of Integer into String>
+#<FrozenError: can't modify frozen String: "hello">
+nil
+#<ArgumentError: wrong number of arguments (given 0, expected 1+)>
+"abccc"
+"aaabc"
+"é"
+#<ArgumentError: invalid byte sequence in UTF-8>
+#<ArgumentError: invalid byte sequence in UTF-8>
+nil
+#<TypeError: no implicit conversion of Integer into String>
+#<FrozenError: can't modify frozen String: "">
+"ab"
+"\xFF"
+"\xC3\xA9\xC3\xA9"
+"zz€"
+#<ArgumentError: invalid byte sequence in US-ASCII>
+"a\xFF"
+#<ArgumentError: invalid byte sequence in US-ASCII>
+#==#
+[/a5/]
+/z5/
+[/3-4/, 4]
+nil
+#==#
+[/a1/, /a1/, /a1/]
+1
+1
+1
+2
+[2, 2]
+true
+false
+true
+/1/
+/1/
+2
+W:warning: historical binary regexp match /.../n against UTF-8 string
+#==#
+["-e", 3]
+["-e", 5]
+["-e", 6]
+["-e", 3]
+#<Method: C#a() -e:3>
+#<UnboundMethod: C#c(y) -e:6>
+["-e", 14]
+["-e", 16]
+nil
+nil
+nil
+["-e", 17]
+"#<Proc:X -e:14>"
+"#<Proc:X -e:19 (lambda)>"
+"#<Proc:X(&:upcase) (lambda)>"
+"#<Proc:X(&:\"a b\") (lambda)>"
+"#<Proc:X>"
+"#<Proc:X (lambda)>"
+"#<Proc:X>"
+true

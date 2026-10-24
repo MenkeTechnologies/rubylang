@@ -1127,12 +1127,12 @@ Honest limitations of this surface:
   `insert`, `center`), stepping back skips continuation bytes (`"a\xE3\x81".chop`
   is `"a"`), a search hit must start on a character head (`end_with?`,
   `delete_suffix`, `lines`, `index`/`rindex`/`byteindex`), and `succ`, `upto`,
-  `casecmp`, `<=>`, `lstrip`, `sub`/`gsub` with a String pattern,
-  `grapheme_clusters` and `%` follow MRI byte for byte;
+  `casecmp`, `<=>`, `sub`/`gsub` with a String pattern, `grapheme_clusters`
+  and `%` follow MRI byte for byte;
   `inspect`/`dump` show invalid bytes as `\xNN`; `scrub` replaces them; and the
   methods MRI refuses on such a String raise as MRI does (`upcase` "input
-  string invalid", `split`/`tr`/`count`/a Regexp match "invalid byte sequence in
-  UTF-8", `strip` CompatibilityError, `to_sym` EncodingError). A broken String
+  string invalid", `split`/`tr`/a Regexp match "invalid byte sequence in
+  UTF-8", `to_sym` EncodingError). A broken String
   joins text by bytes (`+`, `<<`, interpolation), and a broken needle is never
   found (`include?` false, `index` nil). `force_encoding("UTF-8")` on bytes,
   `setbyte`, `bytesplice` and `undump` produce one rather than replacing bytes
@@ -1147,11 +1147,18 @@ Honest limitations of this surface:
   "\xff")`, a `gsub` block answering one, `"%s" % "\xff"`), and the methods
   that read the argument as characters refuse it (`count`, `tr`, `delete`,
   `squeeze`, `split`). `byteindex`/`byterindex`/`bytesplice` refuse an offset
-  inside a character, on text as well. Residue: `$~` after a `sub`/`gsub` with
-  a String pattern on a broken receiver is `nil` (MRI's MatchData over invalid
-  bytes is not modelled); `append_as_bytes` is not implemented; any other
-  String method on a broken receiver raises `NotImplementedError` rather than
-  answering from a guess. A Regexp of fixed
+  inside a character, on text as well. A `sub`/`gsub` with a String pattern on
+  a broken receiver leaves `$~` as MRI's `rb_backref_set_string` MatchData
+  over the receiver's bytes (`pre_match`, `post_match`, `string`, `$``, `$'`,
+  and character offsets counting each invalid byte as one), set before each
+  block or Hash replacement and on each element of a block-less `gsub`
+  Enumerator, nil after a miss; `MatchData#string` is frozen, as MRI keeps the
+  subject. `append_as_bytes` (`rb_str_append_as_bytes`) appends Strings and
+  Integer low bytes raw, keeping the receiver's encoding, its arguments checked
+  before the frozen check. Every String method on a broken receiver is ported
+  or refused as MRI refuses it; none raises `NotImplementedError` (swept by
+  calling each of MRI's `String.instance_methods(false)` on four broken
+  receivers with seven argument shapes). A Regexp of fixed
   encoding (non-ASCII, `/u`, binary `/\xNN/n`) matched against a String of
   another encoding holding non-ASCII raises `Encoding::CompatibilityError`
   (`incompatible encoding regexp match (UTF-8 regexp with BINARY (ASCII-8BIT)
@@ -1163,9 +1170,13 @@ Honest limitations of this surface:
   binary regexp match /.../n against UTF-8 string` (or the String's other
   encoding) when it meets a non-ASCII String, once per change of the encoding
   it was last matched under, as MRI's `rb_reg_prepare_re` recompiles it.
-  Residue: a Regexp literal is a new object each time it is evaluated (MRI
-  makes one per literal, `3.times.map { /a/.object_id }.uniq.size` is 1), so
-  a `/…/n` literal inside a loop warns on every pass.
+  A static Regexp literal is ONE object per literal site, as MRI makes it at
+  compile time (`3.times.map { /a/.object_id }.uniq.size` is 1, so a `/…/n`
+  literal inside a loop warns once), and a `/…#{…}/o` literal is one object
+  after its first run, whose interpolation is not evaluated again; any other
+  interpolated literal is a new Regexp each time. `compiler::assign_regex_sites`
+  numbers the sites as a program is loaded, so a `require`d file or an `eval`
+  never shares one.
   `File.read` keeps a file's invalid bytes the same way, `File.binread(path,
   length, offset)` answers ASCII-8BIT, and `File.write`/`binwrite` write a
   String's bytes.
@@ -1177,6 +1188,27 @@ Honest limitations of this surface:
 
 ## Runtime / methods
 
+- **Character selectors are MRI's tr tables — fixed.** `count`, `delete`(`!`),
+  `squeeze`(`!`) and `strip`/`lstrip`/`rstrip`(`!`) given selectors are ports
+  of `tr_setup_table`/`trnext`/`tr_find` and their `string.c` loops
+  (`src/builtins/tr_table.rs`), over the receiver's bytes in every encoding:
+  selectors intersect, `^` negates, ranges above U+00FF go through the
+  `del`/`nodel` hashes, `\\` escapes, `"z-a"` is `ArgumentError: invalid range
+  "z-a" in string transliteration`, a non-String selector is `TypeError` and an
+  incompatible one `Encoding::CompatibilityError`, in MRI's order against the
+  frozen check (`strip!` checks it first, `delete!`/`squeeze!` after reading
+  the selectors). Ruby 4.0's `strip(*selectors)` family was missing
+  outright. A String invalid in its encoding (broken UTF-8, US-ASCII with a
+  high byte) raises `invalid byte sequence` exactly where MRI's loop first
+  decodes one, and `rstrip`/`strip` refuse it with
+  `Encoding::CompatibilityError` after the left side is stripped. Residue:
+  `"".delete` with no selector is `""` in MRI (its empty-receiver return
+  precedes `rb_check_arity`) and an arity error here, because the measured
+  arity table (`tools/gen_arity_table.rb`) records `delete` as `1+`.
+- **A Regexp literal's interpolation is seen by the local-slot analysis —
+  fixed.** `y = 5; [1].map { /a#{y}/ }` answered `[/a/]`: the walkers deciding
+  which locals a block captures skipped `/…#{…}/`, so `y` went into a frame
+  slot the block could not read.
 - **Conversions answer the receiver — fixed.** `String#to_s`/`to_str` and
   `Array#to_a` are the receiver itself when its class is exactly String or
   Array (a subclass gets a plain copy, its encoding kept), and
@@ -1222,8 +1254,12 @@ Honest limitations of this surface:
   `|x; local|` block-locals are its own: they no longer overwrite a
   same-named enclosing local, a block-local no longer takes a surplus
   argument, and a block whose body is empty answers nil rather than its
-  keyword prelude's value. Residue: a `define_method` block has no
-  `source_location`, so its `inspect` carries no location.
+  keyword prelude's value. `Proc#source_location` is the file and the line
+  the block literal opens on (its `{`, `do` or `->`; nil for `Symbol#to_proc`
+  and for curried or composed procs), and a `define_method` or
+  `define_singleton_method` body reports it as the method's location, so its
+  `inspect` carries it. `Proc#inspect` is `rb_block_to_s`: `#<Proc:0x…
+  file:line>`, `(&:sym)` for a Symbol proc, ` (lambda)` for a lambda.
 - **Known divergences left as they are.** `sort`/`sort_by` keep ties in
   order (a stable sort); MRI's order of ties is its host libc's `qsort_r`
   (BSD's on macOS, glibc's on Linux) and differs between the two, so there is
@@ -2022,8 +2058,8 @@ Honest limitations of this surface:
   attached, and its `size` is nil.
 - **Gap — core methods MRI 4.0 has that are still missing.** Found by calling
   every `instance_methods(false)` entry of the core classes on a sample
-  receiver: `String#append_as_bytes`, `#scrub!`, `#unicode_normalize!`;
-  `Proc#binding`, `#ruby2_keywords`, `#source_location`;
+  receiver: `String#scrub!`, `#unicode_normalize!`;
+  `Proc#binding`, `#ruby2_keywords`;
   `Set#compare_by_identity`/`?`; `Enumerator#next_values`/`#peek_values`;
   `Regexp#timeout`, `Regexp#~`; on `Complex`, `real?`, `finite?`,
   `infinite?`, `arg`/`angle`/`phase`, `polar`, `rationalize` and `to_c`.
