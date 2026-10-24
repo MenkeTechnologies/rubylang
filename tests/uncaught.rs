@@ -183,9 +183,16 @@ fn a_block_frame_is_named_block_in_its_enclosing_context() {
 /// these pin the whole string: the line is what regressed and the rest is what
 /// must not move with it.
 ///
-/// The frame is still `<main>` where MRI names the builtin that raised
-/// (`Integer#/`, and a `from` line for the caller). That gap is separate and is
-/// recorded in BUGS.md; a USER method's frame is already named, which
+/// The innermost frame is the built-in that raised, at the operator's line,
+/// with the caller as a `from` line (tab-indented) — MRI 4.0.8's report:
+///
+/// ```console
+/// $ /opt/homebrew/opt/ruby/bin/ruby -e 'p 1/0'
+/// -e:1:in 'Integer#/': divided by 0 (ZeroDivisionError)
+///     from -e:1:in '<main>'
+/// ```
+///
+/// A USER method's frame is named too, which
 /// `raise_inside_method_has_backtrace_from_line` pins and the last case here
 /// re-checks for the operator path.
 #[test]
@@ -194,28 +201,28 @@ fn an_operator_that_raises_reports_its_own_line() {
     assert!(!ok);
     assert_eq!(
         stderr,
-        "-e:1:in '<main>': divided by 0 (ZeroDivisionError)\n"
+        "-e:1:in 'Integer#/': divided by 0 (ZeroDivisionError)\n\tfrom -e:1:in '<main>'\n"
     );
 
     let (stderr, ok) = run_e("# a\n# b\np 1/0");
     assert!(!ok);
     assert_eq!(
         stderr,
-        "-e:3:in '<main>': divided by 0 (ZeroDivisionError)\n"
+        "-e:3:in 'Integer#/': divided by 0 (ZeroDivisionError)\n\tfrom -e:3:in '<main>'\n"
     );
 
     let (stderr, ok) = run_e("# a\np 1 % 0");
     assert!(!ok);
     assert_eq!(
         stderr,
-        "-e:2:in '<main>': divided by 0 (ZeroDivisionError)\n"
+        "-e:2:in 'Integer#%': divided by 0 (ZeroDivisionError)\n\tfrom -e:2:in '<main>'\n"
     );
 
     let (stderr, ok) = run_e("# a\np 10 ** 10 ** 10");
     assert!(!ok);
     assert_eq!(
         stderr,
-        "-e:2:in '<main>': exponent is too large (ArgumentError)\n"
+        "-e:2:in 'Integer#**': exponent is too large (ArgumentError)\n\tfrom -e:2:in '<main>'\n"
     );
 
     // Inside a method the operator's line is the body's, and the `from` line is
@@ -224,7 +231,7 @@ fn an_operator_that_raises_reports_its_own_line() {
     assert!(!ok);
     assert_eq!(
         stderr,
-        "-e:3:in 'Object#f': divided by 0 (ZeroDivisionError)\n\tfrom -e:5:in '<main>'\n"
+        "-e:3:in 'Integer#/': divided by 0 (ZeroDivisionError)\n\tfrom -e:3:in 'Object#f'\n\tfrom -e:5:in '<main>'\n"
     );
 }
 
