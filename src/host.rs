@@ -10997,6 +10997,7 @@ impl RubyHost {
                         .collect();
                     return Ok(self.new_array(kept));
                 }
+                return Err(self.no_conversion(b, "Array"));
             }
             // `Array * String` is `join`; `Array * Integer` repeats. Anything
             // else converts with `to_int` and so is a TypeError.
@@ -12530,6 +12531,7 @@ fn run_chunk_pooled(
             // exception without passing through a builtin's `abort`, so its
             // innermost frame (the op's line) is recorded here.
             VMResult::Error(e) => {
+                let native = take_native_raise_frame();
                 if with_host(|h| h.has_pending_exc()) {
                     let line = vm
                         .chunk
@@ -12539,7 +12541,15 @@ fn run_chunk_pooled(
                         .unwrap_or(0);
                     let src = current_file_path().unwrap_or_else(|| "-e".into());
                     if with_host(|h| h.pending_exc_needs_backtrace()) {
-                        let stack = raise_backtrace(line);
+                        let mut stack = raise_backtrace(line);
+                        if let (Some(label), Some(top)) = (native, stack.first()) {
+                            let frame = LiveFrame {
+                                path: top.path.clone(),
+                                line: top.line,
+                                label,
+                            };
+                            stack.insert(0, frame);
+                        }
                         with_host(|h| h.record_raise_backtrace(stack));
                     } else {
                         with_host(|h| h.record_backtrace_frame(&src, line));
@@ -15976,6 +15986,21 @@ pub fn enter_call_site(line: u32, yielder: Option<(Value, String)>) -> usize {
         });
         depth
     })
+}
+
+thread_local! {
+    /// The core method a native operator op ran into when it raised (`String#+`
+    /// for `"a" + 1`), for the backtrace the failed op records.
+    static NATIVE_RAISE_FRAME: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Note (or clear) the core method a failing native operator raised in.
+pub fn set_native_raise_frame(label: Option<String>) {
+    NATIVE_RAISE_FRAME.with(|f| *f.borrow_mut() = label);
+}
+
+fn take_native_raise_frame() -> Option<String> {
+    NATIVE_RAISE_FRAME.with(|f| f.borrow_mut().take())
 }
 
 /// The backtrace of a raise at `line`: the live stack with the raising op as

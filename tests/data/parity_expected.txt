@@ -7999,3 +7999,49 @@ true
 "[1, \"a\"]"
 "1.5"
 #<Encoding:BINARY (ASCII-8BIT)>
+#==#
+[ZeroDivisionError, ["-e:3:in 'Integer#/'", "-e:3:in 'Object#m'", "-e:4:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:4:in '<main>'"]]
+[IndexError, ["-e:4:in 'Array#fetch'", "-e:4:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:4:in '<main>'"]]
+[ArgumentError, ["-e:4:in 'Kernel#Integer'", "-e:4:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:4:in '<main>'"]]
+[KeyError, ["-e:4:in 'Hash#fetch'", "-e:4:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:4:in '<main>'"]]
+[TypeError, ["-e:4:in 'String#+'", "-e:4:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:4:in '<main>'"]]
+[TypeError, ["-e:4:in 'Integer#+'", "-e:4:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:4:in '<main>'"]]
+[NoMethodError, ["-e:4:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:4:in '<main>'"]]
+[RuntimeError, ["-e:4:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:4:in '<main>'"]]
+[Math::DomainError, ["-e:5:in 'Integer.sqrt'", "-e:5:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:5:in '<main>'"]]
+[ArgumentError, ["-e:5:in 'Kernel#Float'", "-e:5:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:5:in '<main>'"]]
+[ArgumentError, ["-e:5:in 'Array#first'", "-e:5:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:5:in '<main>'"]]
+[RuntimeError, ["-e:5:in 'block (2 levels) in <main>'", "-e:5:in 'Array#fetch'", "-e:5:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:5:in '<main>'"]]
+[ArgumentError, ["-e:5:in 'Integer#fdiv'", "-e:5:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:5:in '<main>'"]]
+[ArgumentError, ["-e:5:in 'Comparable#clamp'", "-e:5:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:5:in '<main>'"]]
+[ArgumentError, ["-e:5:in 'String#center'", "-e:5:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:5:in '<main>'"]]
+[SystemExit, ["-e:6:in 'Kernel#exit'", "-e:6:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:6:in '<main>'"]]
+[UncaughtThrowError, ["-e:6:in 'Kernel#throw'", "-e:6:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:6:in '<main>'"]]
+[NoMethodError, ["-e:6:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:6:in '<main>'"]]
+[ArgumentError, ["-e:6:in 'Integer#<'", "-e:6:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:6:in '<main>'"]]
+[ArgumentError, ["-e:6:in 'String#*'", "-e:6:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:6:in '<main>'"]]
+[TypeError, ["-e:6:in 'Integer#**'", "-e:6:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:6:in '<main>'"]]
+[TypeError, ["-e:6:in 'Float#/'", "-e:6:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:6:in '<main>'"]]
+[ArgumentError, ["-e:6:in 'Array#pack'", "-e:6:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:6:in '<main>'"]]
+[IndexError, ["-e:7:in 'Array#fetch'", "-e:7:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:7:in '<main>'"]]
+[IndexError, ["-e:7:in 'Array#fetch'", "-e:7:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:7:in '<main>'"]]
+[IndexError, ["-e:7:in 'Array#fetch'", "-e:7:in 'Kernel#public_send'", "-e:7:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:7:in '<main>'"]]
+[TypeError, ["-e:7:in 'Integer#+'", "-e:7:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:7:in '<main>'"]]
+[Math::DomainError, ["-e:7:in 'Integer.sqrt'", "-e:7:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:7:in '<main>'"]]
+[IndexError, ["-e:8:in 'Array#fetch'", "-e:8:in 'block (2 levels) in <main>'", "-e:8:in 'Kernel#loop'", "-e:8:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:8:in '<main>'"]]
+[RuntimeError, ["-e:8:in 'block (2 levels) in <main>'", "-e:8:in 'Integer#times'", "-e:8:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:8:in '<main>'"]]
+[TypeError, ["-e:8:in 'Array#-'", "-e:8:in 'block in <main>'", "-e:2:in 'Object#t'", "-e:8:in '<main>'"]]
+["Array#fetch", "<main>"]
+#==#
+#<TypeError: no implicit conversion of Integer into Array>
+#<TypeError: no implicit conversion of Integer into Array>
+#<TypeError: no implicit conversion of Integer into Array>
+#<TypeError: no implicit conversion of Integer into Array>
+#<TypeError: no implicit conversion of Integer into Array>
+#<TypeError: no implicit conversion of Integer into Array>
+#<TypeError: no implicit conversion of Integer into Array>
+#<TypeError: no implicit conversion of nil into Array>
+[3]
+[4]
+[3, 4]
+#<TypeError: can't convert Object to Array (Object#to_ary gives Integer)>

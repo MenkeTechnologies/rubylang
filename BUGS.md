@@ -424,9 +424,20 @@ class, equal message, equal backtrace.
   its class name to `to_s` (`#<RuntimeError: RuntimeError>`); an anonymous
   class is left out of `detailed_message`; and `full_message` of an exception
   never raised is prefixed with where it was called (`-e:1:in 'full_message': `).
-  Residue: a built-in that RAISES is not a frame of its own (MRI's
-  `-e:1:in 'Integer#/'` above the caller), and ErrorHighlight's source
-  snippet is never appended (see the `ErrorHighlight` entry below).
+  A core method that raises is a frame of its own at its caller's line, as
+  MRI lists it (`-e:1:in 'Integer#/'`, `'Array#fetch'`, `'Kernel#Integer'`,
+  `'Integer.sqrt'`, `'String#+'` for a native `"a" + 1`): only for a method
+  the reference defines, so a NoMethodError has none; `raise` has none;
+  `send` shows the method it sent and `public_send` itself above that. A
+  built-in that answered a bare error is given its exception object at the
+  call, so it carries a backtrace (`1.send(:+, "a")`'s was nil). Residue: a
+  core method called BY a core method is not a frame (`[1, 2].sum("")` lacks
+  MRI's `'String#+'` above `'Array#sum'`, `Comparable#clamp` under
+  `bind_call`, `Array#each` under `Enumerable#sort_by`); `Klass.new` adds
+  neither MRI's `'Klass#initialize'` nor `'Klass.new'`; a `&:sym` block is a
+  `'Proc#call'` and a `block (2 levels)` frame where MRI has only the method
+  it calls; and ErrorHighlight's source snippet is never appended (see the
+  `ErrorHighlight` entry below).
 - **`Exception#backtrace_locations` — fixed.** It was always `[]`. It answers a
   `Thread::Backtrace::Location` per recorded frame, the same Array on each
   read, with MRI's `label`, `base_label` (the method name inside a block or
@@ -1188,6 +1199,12 @@ Honest limitations of this surface:
 
 ## Runtime / methods
 
+- **Array `&` `|` `-` and `intersection`/`union`/`difference` convert their
+  operands — fixed.** Each is `rb_to_array_type`'d (`to_ary`, which must
+  answer an Array); anything else is `TypeError: no implicit conversion of
+  Integer into Array`. A non-Array used to count as an empty Array, and a
+  native `[3] - 4` was a NoMethodError. Residue: a native `-` with a `to_ary`
+  object operand is that TypeError where MRI converts it.
 - **Character selectors are MRI's tr tables — fixed.** `count`, `delete`(`!`),
   `squeeze`(`!`) and `strip`/`lstrip`/`rstrip`(`!`) given selectors are ports
   of `tr_setup_table`/`trnext`/`tr_find` and their `string.c` loops

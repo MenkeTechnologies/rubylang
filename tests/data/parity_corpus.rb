@@ -8838,3 +8838,19 @@ def t; p yield; rescue => e; p e; end
 class Q; def to_s = "q"; end; class R; def to_str = "r"; end; class B; def to_s = 5; end; class BS; def to_str = 6; end
 s = +"x"; t { String(s).equal?(s) }; t { String(Q.new) }; t { String(R.new) }; t { String(1) }; t { String(nil) }; t { String(B.new) }; t { String(BS.new) }; t { String(:sym) }; t { String([1, "a"]) }
 t { String(1.5) }; t { String("é".b).encoding }
+#==#
+# ── a core method that raises is a backtrace frame of its own at its caller's line (Integer#/, Array#fetch, Kernel#Integer, String#+ …) ──
+def t; yield; rescue Exception => e; p [e.class, e.backtrace]; end
+def m(x) = x / 0
+t { m(1) }; t { [].fetch(1) }; t { Integer("zz") }; t { {}.fetch(:a) }; t { "a" + 1 }; t { 1 + "a" }; t { nil + 1 }; t { raise "x" }
+t { Integer.sqrt(-1) }; t { Float("x") }; t { [].first(-1) }; t { [].fetch(1) { raise "in" } }; t { 1.fdiv }; t { 5.clamp(3, 1) }; t { "abc".center }
+t { exit 3 }; t { throw :x }; t { :s.unknown }; t { 1 < "a" }; t { "a" * -1 }; t { 2 ** "x" }; t { 10.0 / "a" }; t { [1].pack("U*q") }
+t { [].send(:fetch, 9) }; t { [].__send__(:fetch, 9) }; t { [].public_send(:fetch, 9) }; t { 1.send(:+, "a") }; t { Integer.send(:sqrt, -1) }
+t { loop { [].fetch(1) } }; t { 3.times { raise "q" } }; t { [3] - 4 }
+begin; [1].fetch(7); rescue => e; p e.backtrace_locations.map(&:label); end
+#==#
+# ── Array & | - and intersection/union/difference convert each operand with to_ary; anything else is a TypeError ──
+def t; p yield; rescue => e; p e; end
+t { [3] - 4 }; t { [3] & 4 }; t { [3] | 4 }; t { [3] + 4 }; t { [3].difference(4) }; t { [3].union(4) }; t { [3].intersection([3], 4) }; t { [3] - nil }
+o = Object.new; def o.to_ary = [3]; t { [3, 4] & o }; t { [3, 4].difference(o) }; t { [3, 4].union(o) }
+b = Object.new; def b.to_ary = 5; t { [3] & b }

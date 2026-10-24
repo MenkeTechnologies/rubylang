@@ -272,7 +272,10 @@ fn b_call_arr(vm: &mut VM, _: u8) -> Value {
     let arr = vm.pop();
     let name = name_of(&vm.pop());
     let args = with_host(|h| h.as_array(&arr).unwrap_or_default());
-    match at_call_site(vm, None, || dispatch_call(&name, &args, None)) {
+    let this = with_host(|h| h.current_self());
+    match at_call_site(vm, None, || {
+        with_builtin_frame(&this, &name, &args, dispatch_call(&name, &args, None))
+    }) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
@@ -303,7 +306,10 @@ fn b_call_arr_blk(vm: &mut VM, _: u8) -> Value {
     let site = block
         .as_ref()
         .map(|_| (with_host(|h| h.current_self()), name.as_str()));
-    let out = at_call_site(vm, site, || dispatch_call(&name, &args, block));
+    let this = with_host(|h| h.current_self());
+    let out = at_call_site(vm, site, || {
+        with_builtin_frame(&this, &name, &args, dispatch_call(&name, &args, block))
+    });
     crate::host::leave_block_home(home);
     match out {
         Ok(v) => finish_block_call(vm, owns, v),
@@ -327,7 +333,9 @@ fn b_call_method_arr_blk(vm: &mut VM, _: u8) -> Value {
         .then(|| crate::host::enter_block_home(block.as_ref()))
         .flatten();
     let site = block.as_ref().map(|_| (recv.clone(), name.as_str()));
-    let out = at_call_site(vm, site, || dispatch(&recv, &name, &args, block));
+    let out = at_call_site(vm, site, || {
+        with_builtin_frame(&recv, &name, &args, dispatch(&recv, &name, &args, block))
+    });
     crate::host::leave_block_home(home);
     match out {
         Ok(v) => finish_block_call(vm, owns, v),
@@ -344,7 +352,9 @@ fn b_call_method_arr(vm: &mut VM, _: u8) -> Value {
     if let Err(e) = check_visibility(&recv, &name) {
         return abort(vm, e);
     }
-    match at_call_site(vm, None, || dispatch(&recv, &name, &args, None)) {
+    match at_call_site(vm, None, || {
+        with_builtin_frame(&recv, &name, &args, dispatch(&recv, &name, &args, None))
+    }) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
@@ -549,6 +559,77 @@ fn at_call_site<T>(vm: &VM, yielder: Option<(Value, &str)>, call: impl FnOnce() 
     let out = call();
     crate::host::leave_call_site(depth);
     out
+}
+
+/// A call's result, after giving a built-in that raised on its own its frame
+/// in the backtrace (see [`builtin_raise_frame`]). Runs inside the call's
+/// `at_call_site`, so the stack it reads ends at the calling op.
+fn with_builtin_frame<T>(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    out: Result<T, String>,
+) -> Result<T, String> {
+    // A built-in that answered a bare `Err(msg)` raised an exception all the
+    // same; give it its object now (as `rescue` would, by the message), so it
+    // carries the backtrace of where it was raised rather than none.
+    let out = match out {
+        Err(e) if !has_pending_signal() && !with_host(|h| h.has_pending_exc()) => {
+            let class = crate::host::infer_exc_class(&e);
+            Err(if class == "NoMethodError" {
+                raise_exc_with(&class, &e, &[("receiver", recv.clone())])
+            } else {
+                raise_exc(&class, &e)
+            })
+        }
+        other => other,
+    };
+    if out.is_err() && with_host(|h| h.pending_exc_needs_backtrace()) {
+        let labels = builtin_raise_labels(recv, name, args);
+        if !labels.is_empty() {
+            let mut stack = crate::host::live_backtrace();
+            if let Some(top) = stack.first() {
+                let (path, line) = (top.path.clone(), top.line);
+                let frames = labels.into_iter().map(|label| crate::host::LiveFrame {
+                    path: path.clone(),
+                    line,
+                    label,
+                });
+                stack.splice(0..0, frames);
+                with_host(|h| h.record_raise_backtrace(stack));
+            }
+        }
+    }
+    out
+}
+
+/// MRI lists the core method that raised as the innermost frame, at its
+/// caller's line (`-e:1:in 'Integer#/'`, `'Array#fetch'`, `'Kernel#Integer'`),
+/// innermost first. Only for a method the reference defines (an undefined one
+/// is a NoMethodError with no such frame). `raise` leaves no frame and `send`
+/// none of its own — the method it sent does — while `public_send` is a frame
+/// above the method it sent. `new` is left out: MRI's frames there are the
+/// class's `initialize` and `Class#new` under the class's name.
+fn builtin_raise_labels(recv: &Value, name: &str, args: &[Value]) -> Vec<String> {
+    match name {
+        "raise" | "fail" | "new" => Vec::new(),
+        "send" | "__send__" | "public_send" => {
+            let Some((target, rest)) = args.split_first() else {
+                return Vec::new();
+            };
+            let mut labels = builtin_raise_labels(recv, &name_of(target), rest);
+            if name == "public_send" && !labels.is_empty() {
+                labels.push(with_host(|h| h.builtin_frame_label(recv, name)));
+            }
+            labels
+        }
+        _ => with_host(|h| match h.resolve_method_shape(recv, name, false) {
+            Some(crate::host::MethodShape::Builtin { .. }) => {
+                vec![h.builtin_frame_label(recv, name)]
+            }
+            _ => Vec::new(),
+        }),
+    }
 }
 
 fn name_of(v: &Value) -> String {
@@ -1359,7 +1440,10 @@ fn b_fire_hook(vm: &mut VM, _: u8) -> Value {
 fn b_call(vm: &mut VM, argc: u8) -> Value {
     let mut vals = pop_n(vm, argc as usize);
     let name = name_of(&vals.remove(0));
-    match at_call_site(vm, None, || dispatch_call(&name, &vals, None)) {
+    let this = with_host(|h| h.current_self());
+    match at_call_site(vm, None, || {
+        with_builtin_frame(&this, &name, &vals, dispatch_call(&name, &vals, None))
+    }) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
@@ -1375,7 +1459,10 @@ fn b_call_blk(vm: &mut VM, argc: u8) -> Value {
     let site = block
         .as_ref()
         .map(|_| (with_host(|h| h.current_self()), name.as_str()));
-    let out = at_call_site(vm, site, || dispatch_call(&name, &vals, block));
+    let this = with_host(|h| h.current_self());
+    let out = at_call_site(vm, site, || {
+        with_builtin_frame(&this, &name, &vals, dispatch_call(&name, &vals, block))
+    });
     crate::host::leave_block_home(home);
     match out {
         Ok(v) => finish_block_call(vm, owns, v),
@@ -1389,7 +1476,9 @@ fn b_call_method(vm: &mut VM, argc: u8) -> Value {
     if let Err(e) = check_visibility(&recv, &name) {
         return abort(vm, e);
     }
-    match at_call_site(vm, None, || dispatch(&recv, &name, &vals, None)) {
+    match at_call_site(vm, None, || {
+        with_builtin_frame(&recv, &name, &vals, dispatch(&recv, &name, &vals, None))
+    }) {
         Ok(v) => propagate(vm, v),
         Err(e) => abort(vm, e),
     }
@@ -1407,7 +1496,9 @@ fn b_call_method_blk(vm: &mut VM, argc: u8) -> Value {
         .then(|| crate::host::enter_block_home(block.as_ref()))
         .flatten();
     let site = block.as_ref().map(|_| (recv.clone(), name.as_str()));
-    let out = at_call_site(vm, site, || dispatch(&recv, &name, &vals, block));
+    let out = at_call_site(vm, site, || {
+        with_builtin_frame(&recv, &name, &vals, dispatch(&recv, &name, &vals, block))
+    });
     crate::host::leave_block_home(home);
     match out {
         Ok(v) => finish_block_call(vm, owns, v),
@@ -1646,7 +1737,9 @@ fn b_tostr(vm: &mut VM, _: u8) -> Value {
 fn b_index_get(vm: &mut VM, argc: u8) -> Value {
     let mut vals = pop_n(vm, argc as usize);
     let recv = vals.remove(0);
-    match at_call_site(vm, None, || dispatch(&recv, "[]", &vals, None)) {
+    match at_call_site(vm, None, || {
+        with_builtin_frame(&recv, "[]", &vals, dispatch(&recv, "[]", &vals, None))
+    }) {
         Ok(v) => v,
         Err(e) => abort(vm, e),
     }
@@ -1654,7 +1747,9 @@ fn b_index_get(vm: &mut VM, argc: u8) -> Value {
 fn b_index_set(vm: &mut VM, argc: u8) -> Value {
     let mut vals = pop_n(vm, argc as usize);
     let recv = vals.remove(0);
-    match at_call_site(vm, None, || dispatch(&recv, "[]=", &vals, None)) {
+    match at_call_site(vm, None, || {
+        with_builtin_frame(&recv, "[]=", &vals, dispatch(&recv, "[]=", &vals, None))
+    }) {
         Ok(v) => v,
         Err(e) => abort(vm, e),
     }
@@ -13715,6 +13810,26 @@ fn char_matcher(args: &[Value]) -> impl Fn(char) -> bool {
     move |c| parsed.iter().all(|(neg, set)| *neg != set.contains(&c))
 }
 
+/// `rb_to_array_type`: an Array's elements, or what an object's own `to_ary`
+/// answers (which must be an Array); anything else is a TypeError.
+fn to_array_type(v: &Value) -> Result<Vec<Value>, String> {
+    if let Some(items) = with_host(|h| h.as_array(v)) {
+        return Ok(items);
+    }
+    if defines_own(v, "to_ary") {
+        let r = dispatch(v, "to_ary", &[], None)?;
+        if let Some(items) = with_host(|h| h.as_array(&r)) {
+            return Ok(items);
+        }
+        let (cls, got) = with_host(|h| (h.class_of(v), h.class_of(&r)));
+        return Err(raise_exc(
+            "TypeError",
+            &format!("can't convert {cls} to Array ({cls}#to_ary gives {got})"),
+        ));
+    }
+    Err(conv_error(v, "Array"))
+}
+
 fn pad_str(args: &[Value]) -> Result<String, String> {
     let p = args.get(1).map(arg_str).unwrap_or_else(|| " ".to_string());
     if p.is_empty() {
@@ -14201,10 +14316,12 @@ fn dispatch_array(
             if args.is_empty() && matches!(name, "&" | "|" | "-") {
                 return Err(no_method_error(recv, name));
             }
-            let others: Vec<Vec<Value>> = args
-                .iter()
-                .map(|a| with_host(|h| h.as_array(a).unwrap_or_default()))
-                .collect();
+            // Each operand is `to_ary`'d (`rb_to_array_type`); anything else
+            // is a TypeError, where it used to count as an empty Array.
+            let mut others: Vec<Vec<Value>> = Vec::with_capacity(args.len());
+            for a in args {
+                others.push(to_array_type(a)?);
+            }
             let out = match name {
                 "&" | "intersection" => dedup_keep(
                     arr.iter()
@@ -31045,6 +31162,26 @@ impl JsonParser {
 /// Comparable `<=>`; otherwise it defers to the host's String/Array semantics.
 /// Uses fine-grained borrows so a user operator method can re-enter the VM.
 pub fn numeric_hook(op: fusevm::NumOp, a: &Value, b: &Value) -> Result<Value, String> {
+    let out = numeric_hook_dispatch(op, a, b);
+    // A core operator that raised on its own (`"a" + 1`) is a frame of its own
+    // in MRI's backtrace; the op that failed adds it (see `run_chunk_pooled`).
+    if out.is_err() {
+        let name = num_op_method(op);
+        let label = with_host(|h| {
+            if name.is_empty() || !h.pending_exc_needs_backtrace() {
+                return None;
+            }
+            match h.resolve_method_shape(a, name, false)? {
+                crate::host::MethodShape::Builtin { .. } => Some(h.builtin_frame_label(a, name)),
+                _ => None,
+            }
+        });
+        crate::host::set_native_raise_frame(label);
+    }
+    out
+}
+
+fn numeric_hook_dispatch(op: fusevm::NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     use fusevm::NumOp::*;
     // A Method compares its definition (`method_eq`), not its identity.
     if matches!(op, Eq | Ne) && with_host(|h| h.as_method(a).is_some()) {
