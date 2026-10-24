@@ -8892,6 +8892,31 @@ impl RubyHost {
             .or_default()
             .push(format!("{src}:{line}:in '{ctx}'"));
     }
+    /// Whether the pending exception is being raised now — it has no
+    /// backtrace yet, so the stack it is raised from is still to be taken.
+    pub fn pending_exc_needs_backtrace(&self) -> bool {
+        match self.pending_exc {
+            Some(Value::Obj(id)) => {
+                !self.sealed_backtraces.contains(&id) && !self.exc_backtraces.contains_key(&id)
+            }
+            _ => false,
+        }
+    }
+    /// Give the pending exception the backtrace of the stack it was raised
+    /// from — every frame, as MRI's `rb_ec_backtrace_object` takes it at the
+    /// raise, not just the frames the unwind will pass on its way to a
+    /// `rescue`. `stack` is [`raise_backtrace`]'s.
+    pub fn record_raise_backtrace(&mut self, stack: Vec<LiveFrame>) {
+        let Some(Value::Obj(id)) = self.pending_exc else {
+            return;
+        };
+        let frames = stack
+            .into_iter()
+            .map(|f| format!("{}:{}:in '{}'", f.path, f.line, f.label))
+            .collect();
+        self.exc_backtraces.insert(id, frames);
+        self.sealed_backtraces.insert(id);
+    }
     /// Label a String with the encoding `name`, which must be canonical
     /// (`"ASCII-8BIT"`, `"US-ASCII"`, `"ISO-8859-1"`, or [`BROKEN_UTF8`]). A text
     /// String is read as its Latin-1 view (see [`RStr::set_encoding`]); UTF-8
@@ -9516,15 +9541,17 @@ impl RubyHost {
                             })
                             .collect();
                         self.struct_inspect(&class, &parts)
-                    } else {
+                    } else if self.is_exception_class(&class) {
+                        // `exc_to_s`: the message, or the class name without one.
                         match ivars.get("message") {
+                            Some(Value::Undef) | None => class,
                             Some(m) => self.to_s(&m.clone()),
-                            // `Kernel#to_s`: `#<Foo:0x…>`, never the ivars.
-                            None if self.is_plain_object(&class) => {
-                                format!("#<{class}:{}>", self.object_address(v))
-                            }
-                            None => format!("#<{class}>"),
                         }
+                    } else if self.is_plain_object(&class) {
+                        // `Kernel#to_s`: `#<Foo:0x…>`, never the ivars.
+                        format!("#<{class}:{}>", self.object_address(v))
+                    } else {
+                        format!("#<{class}>")
                     }
                 }
                 None => "nil".to_string(),
@@ -9678,9 +9705,11 @@ impl RubyHost {
                 // multi-line one is inspected (and loses the space) so the form
                 // stays on one line.
                 Some(RObj::Object { class, ivars }) if self.is_exception_class(&class) => {
+                    // No message is the class name (`exc_to_s`), so
+                    // `RuntimeError.new` is `#<RuntimeError: RuntimeError>`.
                     let msg = match ivars.get("message") {
+                        Some(Value::Undef) | None => class.clone(),
                         Some(m) => self.to_s(&m.clone()),
-                        None => class.clone(),
                     };
                     if msg.is_empty() {
                         class
@@ -11384,7 +11413,6 @@ pub fn inspect_broken_utf8(bytes: &[u8]) -> String {
     }))
 }
 
-
 /// The inspect form of a UTF-8 String's characters, each `Ok(char)` or, for a
 /// byte that is not part of a valid sequence, `Err(byte)`.
 fn inspect_units(units: impl Iterator<Item = Result<char, u8>>) -> String {
@@ -11992,7 +12020,12 @@ fn run_chunk_pooled(
                         .copied()
                         .unwrap_or(0);
                     let src = current_file_path().unwrap_or_else(|| "-e".into());
-                    with_host(|h| h.record_backtrace_frame(&src, line));
+                    if with_host(|h| h.pending_exc_needs_backtrace()) {
+                        let stack = raise_backtrace(line);
+                        with_host(|h| h.record_raise_backtrace(stack));
+                    } else {
+                        with_host(|h| h.record_backtrace_frame(&src, line));
+                    }
                 }
                 Err(e)
             }
@@ -12985,6 +13018,44 @@ pub fn call_super_blk(
                 Ok(_) => return r,
                 Err(e) if !e.starts_with("undefined method") => return r,
                 _ => {}
+            }
+        }
+        // `super` from a Ruby override of an Exception method (`message`,
+        // `to_s`, `detailed_message`, `full_message`, …) reaches the built-in.
+        if crate::builtins::is_exception_class(&recv_class) {
+            let args = explicit_args.clone().unwrap_or_else(|| cur_args.clone());
+            let block = match block_override.clone() {
+                Some(b) => Some(b),
+                None => with_host(|h| h.cur_scope().block.clone()),
+            };
+            let r = crate::builtins::dispatch_object_native(
+                &self_obj,
+                &recv_class,
+                &method,
+                &args,
+                block,
+            );
+            match &r {
+                Ok(_) => return r,
+                Err(e) if !e.starts_with("undefined method") => return r,
+                // Not a built-in after all: drop the NoMethodError the miss
+                // raised, so the fallbacks below report their own answer.
+                _ => {
+                    with_host(|h| h.take_pending_exc());
+                }
+            }
+            // `Exception#inspect` (`exc_inspect`): the class and `to_s`.
+            if method == "inspect" {
+                let s = crate::builtins::dispatch(&self_obj, "to_s", &[], None)?;
+                let msg = with_host(|h| h.to_s(&s));
+                let shown = if msg.is_empty() {
+                    recv_class.clone()
+                } else if msg.contains('\n') {
+                    format!("#<{recv_class}:{}>", inspect_string(&msg))
+                } else {
+                    format!("#<{recv_class}: {msg}>")
+                };
+                return Ok(with_host(|h| h.new_string(shown)));
             }
         }
         // `super` reaching an alias whose target is a native method: `alias
@@ -15369,6 +15440,16 @@ pub fn enter_call_site(line: u32, yielder: Option<(Value, String)>) -> usize {
         });
         depth
     })
+}
+
+/// The backtrace of a raise at `line`: the live stack with the raising op as
+/// its frame 0, so a built-in yielding to the raising block shows as the
+/// frame above it (`Array#each`), as it does for `caller(0)`.
+pub fn raise_backtrace(line: u32) -> Vec<LiveFrame> {
+    let depth = enter_call_site(line, None);
+    let stack = live_backtrace();
+    leave_call_site(depth);
+    stack
 }
 
 /// Drop the call site [`enter_call_site`] recorded at `depth` — and any a

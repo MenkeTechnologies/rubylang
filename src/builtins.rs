@@ -517,7 +517,12 @@ fn abort(vm: &mut VM, e: String) -> Value {
     // arrive innermost-first as the error unwinds through each chunk's `abort`.
     let line = op_line(vm);
     let src = crate::host::current_file_path().unwrap_or_else(|| "-e".into());
-    with_host(|h| h.record_backtrace_frame(&src, line));
+    if with_host(|h| h.pending_exc_needs_backtrace()) {
+        let stack = crate::host::raise_backtrace(line);
+        with_host(|h| h.record_raise_backtrace(stack));
+    } else {
+        with_host(|h| h.record_backtrace_frame(&src, line));
+    }
     with_host(|h| h.error = Some(e));
     vm.ip = vm.chunk.ops.len();
     Value::Undef
@@ -1102,7 +1107,7 @@ fn errno_table() -> &'static [(i32, &'static str)] {
 }
 /// Whether `cls` is an exception class — a builtin one, or a user class whose
 /// superclass chain reaches a builtin exception (e.g. `class MyErr < StandardError`).
-fn is_exception_class(cls: &str) -> bool {
+pub(crate) fn is_exception_class(cls: &str) -> bool {
     if is_builtin_exception(cls) {
         return true;
     }
@@ -6568,6 +6573,20 @@ fn dispatch_object(
     if let Some(nat) = with_host(|h| h.native_kernel_alias(cls, name)) {
         return kernel(&nat, args, block);
     }
+    dispatch_object_native(recv, cls, name, args, block)
+}
+
+/// The methods an object answers natively — the built-in classes' and
+/// modules' (Struct, Comparable, Exception, …) — with every user method
+/// skipped: what [`dispatch_object`] reaches once no Ruby definition answers,
+/// and what `super` from a Ruby override of one reaches.
+pub(crate) fn dispatch_object_native(
+    recv: &Value,
+    cls: &str,
+    name: &str,
+    args: &[Value],
+    block: Option<Value>,
+) -> Result<Value, String> {
     // Struct instance methods (accessors, ==, to_a/to_h, members, [], each, …).
     if let Some((members, _)) = with_host(|h| h.struct_def(cls)) {
         if let Some(r) = struct_method(recv, cls, &members, name, args, &block)? {
@@ -6860,7 +6879,15 @@ fn dispatch_object(
             let mut out = String::new();
             let (head, callers) = match frames.split_first() {
                 Some((first, rest)) => (format!("{first}: "), rest),
-                None => (String::new(), &[][..]),
+                // No backtrace: `error_pos` names where `full_message` was
+                // called, in the method's own name.
+                None => (
+                    crate::host::live_backtrace()
+                        .first()
+                        .map(|f| format!("{}:{}:in 'full_message': ", f.path, f.line))
+                        .unwrap_or_default(),
+                    &[][..],
+                ),
             };
             if bottom && !frames.is_empty() {
                 out.push_str(if highlight {
@@ -33465,10 +33492,13 @@ fn exc_detailed_message(recv: &Value, cls: &str, highlight: bool) -> Result<Stri
         Some((f, t)) => (f, Some(t)),
         None => (msg.as_str(), None),
     };
-    let mut out = if highlight {
-        format!("\x1b[1m{first} (\x1b[1;4m{cls}\x1b[m\x1b[1m)\x1b[m")
-    } else {
-        format!("{first} ({cls})")
+    // An anonymous class (`#<Class:0x…>`) is left out of the decoration — and
+    // under highlight so is the reset that would follow it, as in MRI.
+    let mut out = match (highlight, cls.starts_with('#')) {
+        (true, false) => format!("\x1b[1m{first} (\x1b[1;4m{cls}\x1b[m\x1b[1m)\x1b[m"),
+        (true, true) => format!("\x1b[1m{first}"),
+        (false, false) => format!("{first} ({cls})"),
+        (false, true) => first.to_string(),
     };
     if let Some(tail) = tail.filter(|t| !t.is_empty()) {
         out.push('\n');

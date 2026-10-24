@@ -7516,3 +7516,30 @@ nil
 "౜೜᫝⃁꟱𐥀𑭠𖺠𘴞𜳼"
 "\u0C5Bౝ\u1ADE\u20C2𐻆"
 "\u0378\u{E0080}\u{10FFFF}\uFDD0\u2028­​󠀁󰀀"
+#==#
+["-e:2:in 'Object#bt1'", "-e:5:in '<main>'"]
+["-e:6:in 'block (2 levels) in <main>'", "-e:6:in 'Integer#times'", "-e:6:in 'block in <main>'", "-e:6:in 'Array#each'", "-e:6:in '<main>'"]
+[[2, "Object#bt1", "bt1"], [7, "block in <main>", "<main>"], [3, "Object#wrap", "wrap"], [7, "<main>", "<main>"]]
+"-e:2:in 'Object#bt1': z (RuntimeError)\n\tfrom -e:8:in 'block (2 levels) in <main>'\n\tfrom -e:8:in 'Array#map'\n\tfrom -e:8:in 'block in <main>'\n\tfrom -e:3:in 'Object#wrap'\n\tfrom -e:8:in '<main>'\n"
+2
+#==#
+"M(x)"
+"S(x)"
+"#<E2: S(x)>"
+"D(x (E3))"
+"I(#<E4: x>)"
+"I(#<E4: E4>)"
+"F(-e:6:in 'full_message': x (E5)\n)"
+"-e:8:in '<main>': D(q (E3))\n"
+"#<RuntimeError: RuntimeError>"
+"#<RuntimeError: RuntimeError>"
+"StandardError"
+"-e:9:in 'full_message': b (RuntimeError)\n"
+"m"
+"\e[1mm"
+"\e[1ma\n\e[1mb\e[m"
+"E8"
+"E8"
+#<E8: E8>
+"RuntimeError"
+"#<Foo:X>"

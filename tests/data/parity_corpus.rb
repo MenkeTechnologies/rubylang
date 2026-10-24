@@ -8582,3 +8582,28 @@ p(/c/n =~ "é")
 #==#
 # ── inspect escapes exactly what MRI's own Unicode 17 tables call unprintable ──
 p "౜೜᫝⃁꟱\u{10940}\u{11B60}\u{16EA0}\u{18D1E}\u{1CCFC}", "౛ౝ᫞⃂\u{10EC6}", "͸\u{E0080}\u{10FFFF}﷐ ­​\u{E0001}\u{F0000}"
+#==#
+# ── an exception's backtrace is the whole stack at the raise, built-ins yielding to blocks included ──
+def bt1 = raise("z")
+def wrap = yield
+r = []
+r << (begin; bt1; rescue => e; e.backtrace; end)
+r << (begin; [1].each { 2.times { raise "q" } }; rescue => e; e.backtrace; end)
+r << (begin; wrap { bt1 }; rescue => e; e.backtrace_locations.map { |l| [l.lineno, l.label, l.base_label] }; end)
+r << (begin; wrap { [3].map { bt1 } }; rescue => e; e.full_message(highlight: false); end)
+r << (begin; begin; bt1; rescue => e; raise; end; rescue => e2; e2.backtrace.size; end)
+r.each { |x| p x }
+#==#
+# ── super from an override reaches Exception's own message/to_s/inspect/detailed_message/full_message ──
+class E1 < StandardError; def message = "M(#{super})"; end
+class E2 < StandardError; def to_s = "S(#{super})"; end
+class E3 < StandardError; def detailed_message(highlight: false, **) = "D(#{super})"; end
+class E4 < StandardError; def inspect = "I(#{super})"; end
+class E5 < StandardError; def full_message(**) = "F(#{super})"; end
+p E1.new("x").message, E2.new("x").message, E2.new("x").inspect, E3.new("x").detailed_message, E4.new("x").inspect, E4.new.inspect
+p E5.new("x").full_message(highlight: false), (begin; raise E3, "q"; rescue => e; e.full_message(highlight: false); end)
+p RuntimeError.new.inspect, RuntimeError.new(nil).inspect, StandardError.new("").inspect, RuntimeError.new("b").full_message(highlight: false)
+k = Class.new(StandardError); p k.new("m").detailed_message, k.new("m").detailed_message(highlight: true), k.new("a\nb").detailed_message(highlight: true)
+class E8 < StandardError; def initialize; end; end
+class Foo; def initialize; @message = "x"; end; end
+p E8.new.to_s, E8.new.message, E8.new, "#{RuntimeError.new}", Foo.new.to_s.sub(/0x\h+/, "X")

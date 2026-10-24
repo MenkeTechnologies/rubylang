@@ -416,10 +416,17 @@ class, equal message, equal backtrace.
   ignores an unknown keyword as taking keywords). Pinned by
   `tests/eval.rs::full_message_renders_the_uncaught_report` and
   `tests/uncaught.rs::a_reraised_exception_keeps_its_first_backtrace`.
-  Residue: the frames list only Ruby frames — MRI also lists the builtin a
-  block ran under (`from -e:1:in 'Array#each'`) and the frames above the
-  rescue; and ErrorHighlight's source snippet is never appended (see the
-  `ErrorHighlight` entry below).
+  The backtrace is the whole stack at the raise, taken from the live call
+  stack `caller` reads: the frames above the `rescue` and a built-in yielding
+  to the raising block (`from -e:1:in 'Array#each'`) are listed. `super` from a
+  Ruby override of `message`, `to_s`, `inspect`, `detailed_message` or
+  `full_message` reaches Exception's own; an exception without a message is
+  its class name to `to_s` (`#<RuntimeError: RuntimeError>`); an anonymous
+  class is left out of `detailed_message`; and `full_message` of an exception
+  never raised is prefixed with where it was called (`-e:1:in 'full_message': `).
+  Residue: a built-in that RAISES is not a frame of its own (MRI's
+  `-e:1:in 'Integer#/'` above the caller), and ErrorHighlight's source
+  snippet is never appended (see the `ErrorHighlight` entry below).
 - **`Exception#backtrace_locations` — fixed.** It was always `[]`. It answers a
   `Thread::Backtrace::Location` per recorded frame, the same Array on each
   read, with MRI's `label`, `base_label` (the method name inside a block or
