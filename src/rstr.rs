@@ -143,9 +143,9 @@ pub fn utf8_units(bytes: &[u8]) -> impl Iterator<Item = &[u8]> + '_ {
 /// from (`enc/utf_8.c`, `regenc.c`, `encoding.c`). Every position is a byte
 /// offset into `b`. Two notions of "where a character starts" coexist in MRI
 /// and both are needed: walking FORWARD from the start splits an invalid
-/// sequence into one-byte characters ([`mbclen`]), while stepping BACK from a
+/// sequence into one-byte characters ([`mbclen`](utf8::mbclen)), while stepping BACK from a
 /// position skips continuation bytes to the nearest lead byte
-/// ([`left_head`]) — so `"\xE3\x81".chop` drops both bytes while its `length`
+/// ([`left_head`](utf8::left_head)) — so `"\xE3\x81".chop` drops both bytes while its `length`
 /// is 2.
 pub mod utf8 {
     /// `ONIGENC_PRECISE_MBC_ENC_LEN`: what the bytes at the start of `b` are.
