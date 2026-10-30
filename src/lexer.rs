@@ -869,7 +869,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     b'Q' => Tok::Str(body, true),
                     b's' => Tok::Symbol(body),
                     b'x' => {
-                        push_xstring(&mut out, Tok::Str(body, true), line, core::mem::take(&mut sp));
+                        push_xstring(
+                            &mut out,
+                            Tok::Str(body, true),
+                            line,
+                            core::mem::take(&mut sp),
+                        );
                         continue;
                     }
                     _ => {
@@ -1343,7 +1348,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 // Emit a placeholder Str token (filled at end of line) and record
                 // the pending heredoc. A `` <<`CMD` `` heredoc is a command string.
                 if quote == Some(b'`') {
-                    push_xstring(&mut out, Tok::Str(String::new(), true), line, core::mem::take(&mut sp));
+                    push_xstring(
+                        &mut out,
+                        Tok::Str(String::new(), true),
+                        line,
+                        core::mem::take(&mut sp),
+                    );
                     // `tok_idx` below must name the Str, not the closing `)`.
                     let close = out.pop().expect("push_xstring pushed `)`");
                     pending.push(Heredoc {

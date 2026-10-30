@@ -24,12 +24,16 @@ fn run(src: &str) -> String {
 #[test]
 fn backticks_capture_stdout_and_set_last_status() {
     assert_eq!(
-        run("p $?; x = `echo hi`; p x, $?.class, $?.success?, $?.exitstatus, $?.exited?, \
-             $?.signaled?, $?.to_i"),
+        run(
+            "p $?; x = `echo hi`; p x, $?.class, $?.success?, $?.exitstatus, $?.exited?, \
+             $?.signaled?, $?.to_i"
+        ),
         "nil\n\"hi\\n\"\nProcess::Status\ntrue\n0\ntrue\nfalse\n0\n"
     );
     assert_eq!(
-        run(r#"p `printf "a b"; exit 3`, $?.exitstatus, $?.success?, $?.to_i, $?.to_s.sub(/\d+/, "N"), $?.inspect.sub(/\d+/, "N")"#),
+        run(
+            r#"p `printf "a b"; exit 3`, $?.exitstatus, $?.success?, $?.to_i, $?.to_s.sub(/\d+/, "N"), $?.inspect.sub(/\d+/, "N")"#
+        ),
         "\"a b\"\n3\nfalse\n768\n\"pid N exit 3\"\n\"#<Process::Status: pid N exit 3>\"\n"
     );
 }
@@ -40,7 +44,10 @@ fn percent_x_and_backtick_heredoc_are_command_strings() {
         run("v = 5; p %x(echo #{v}), %x{printf a}"),
         "\"5\\n\"\n\"a\"\n"
     );
-    assert_eq!(run("s = <<~`CMD`\n  echo heredoc\nCMD\np s"), "\"heredoc\\n\"\n");
+    assert_eq!(
+        run("s = <<~`CMD`\n  echo heredoc\nCMD\np s"),
+        "\"heredoc\\n\"\n"
+    );
 }
 
 #[test]
@@ -60,7 +67,9 @@ fn a_program_that_cannot_run_is_enoent_for_backticks_and_nil_for_system() {
         "#<Errno::ENOENT: No such file or directory - nonexistent_cmd_zz>\n127\n"
     );
     assert_eq!(
-        run(r#"p system("true"), system("false"), system("exit 4"), $?.exitstatus, system("nonexistent_cmd_zz"), $?.exitstatus, system("")"#),
+        run(
+            r#"p system("true"), system("false"), system("exit 4"), $?.exitstatus, system("nonexistent_cmd_zz"), $?.exitstatus, system("")"#
+        ),
         "true\nfalse\nfalse\n4\nnil\n127\nnil\n"
     );
 }
@@ -72,7 +81,9 @@ fn system_inherits_stdout_in_order_and_takes_env_argv_and_chdir() {
         "before\nfrom-child\nafter\n"
     );
     assert_eq!(
-        run(r#"p system("echo", "a  b", "c"), system({"ZV" => "q"}, "echo $ZV"), system("pwd", chdir: "/")"#),
+        run(
+            r#"p system("echo", "a  b", "c"), system({"ZV" => "q"}, "echo $ZV"), system("pwd", chdir: "/")"#
+        ),
         "a  b c\nq\n/\ntrue\ntrue\ntrue\n"
     );
 }
@@ -80,7 +91,9 @@ fn system_inherits_stdout_in_order_and_takes_env_argv_and_chdir() {
 #[test]
 fn a_signalled_child_reports_its_signal() {
     assert_eq!(
-        run(r#"`kill -TERM $$`; p $?.signaled?, $?.termsig, $?.exitstatus, $?.success?, $?.inspect.sub(/\d+/, "N")"#),
+        run(
+            r#"`kill -TERM $$`; p $?.signaled?, $?.termsig, $?.exitstatus, $?.success?, $?.inspect.sub(/\d+/, "N")"#
+        ),
         "true\n15\nnil\nnil\n\"#<Process::Status: pid N SIGTERM (signal 15)>\"\n"
     );
 }
@@ -88,7 +101,9 @@ fn a_signalled_child_reports_its_signal() {
 #[test]
 fn system_argument_and_exception_errors() {
     assert_eq!(
-        run(r#"p((system("nonexistent_cmd_zz", exception: true) rescue $!), (system("false", exception: true) rescue $!), (system("true", foo: 1) rescue $!), (system(1) rescue $!), (system rescue $!))"#),
+        run(
+            r#"p((system("nonexistent_cmd_zz", exception: true) rescue $!), (system("false", exception: true) rescue $!), (system("true", foo: 1) rescue $!), (system(1) rescue $!), (system rescue $!))"#
+        ),
         "#<Errno::ENOENT: No such file or directory - nonexistent_cmd_zz>\n\
          #<RuntimeError: Command failed with exit 1: false>\n\
          #<ArgumentError: wrong exec option symbol: foo>\n\
@@ -100,8 +115,10 @@ fn system_argument_and_exception_errors() {
 #[test]
 fn process_status_has_no_new_and_last_status_is_dollar_question() {
     assert_eq!(
-        run("p((Process::Status.new rescue $!.class), Process.last_status); `true`; \
-             p Process.last_status.equal?($?)"),
+        run(
+            "p((Process::Status.new rescue $!.class), Process.last_status); `true`; \
+             p Process.last_status.equal?($?)"
+        ),
         "NoMethodError\nnil\ntrue\n"
     );
 }
@@ -117,7 +134,9 @@ fn command_bytes_and_output_bytes_pass_through_unchanged() {
 #[test]
 fn sleep_validates_its_interval() {
     assert_eq!(
-        run(r#"p sleep(0), (sleep(-1) rescue $!), (sleep("1") rescue $!), (sleep(true) rescue $!), (sleep(1, 2) rescue $!), (sleep(Float::NAN) rescue $!)"#),
+        run(
+            r#"p sleep(0), (sleep(-1) rescue $!), (sleep("1") rescue $!), (sleep(true) rescue $!), (sleep(1, 2) rescue $!), (sleep(Float::NAN) rescue $!)"#
+        ),
         "0\n#<ArgumentError: time interval must not be negative>\n\
          #<TypeError: can't convert String into time interval>\n\
          #<TypeError: can't convert TrueClass into time interval>\n\
@@ -136,8 +155,10 @@ fn sleep_actually_suspends() {
 #[test]
 fn io_sync_is_a_per_stream_flag() {
     assert_eq!(
-        run("p $stdout.sync, $stderr.sync, $stdin.sync; $stdout.sync = true; \
-             p $stdout.sync, $stdout.fsync, ($stdout.sync = nil), $stdout.sync"),
+        run(
+            "p $stdout.sync, $stderr.sync, $stdin.sync; $stdout.sync = true; \
+             p $stdout.sync, $stdout.fsync, ($stdout.sync = nil), $stdout.sync"
+        ),
         "false\ntrue\nfalse\ntrue\n0\nnil\nfalse\n"
     );
 }

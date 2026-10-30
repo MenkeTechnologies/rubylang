@@ -272,7 +272,10 @@ fn regex_literal_local_names(source: &str, flags: &str) -> Vec<String> {
             .next()
             .is_some_and(|c| c == '_' || c.is_ascii_lowercase() || !c.is_ascii());
         let local_rest = chars.all(|c| c == '_' || c.is_ascii_alphanumeric() || !c.is_ascii());
-        if local_start && local_rest && !crate::lexer::KEYWORDS.contains(&name.as_str()) && !names.contains(&name)
+        if local_start
+            && local_rest
+            && !crate::lexer::KEYWORDS.contains(&name.as_str())
+            && !names.contains(&name)
         {
             names.push(name);
         }

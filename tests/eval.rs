@@ -11261,23 +11261,35 @@ fn regex_literal_match_assigns_named_groups_to_locals() {
         r#"["2024", "05"]"#,
     );
     // An unmatched optional group binds nil; the expression keeps its value.
-    eq(r#"r = /(?<a>x)(?<b>y)?/ =~ "zx"; [r, a, b]"#, r#"[1, "x", nil]"#);
+    eq(
+        r#"r = /(?<a>x)(?<b>y)?/ =~ "zx"; [r, a, b]"#,
+        r#"[1, "x", nil]"#,
+    );
     // A failed match still declares and nils the local.
     eq(r#"/(?<a>q)/ =~ "zz"; a"#, "nil");
-    eq(r#"[1, 2].map { |i| /(?<got>\d)/ =~ i.to_s; got }"#, r#"["1", "2"]"#);
+    eq(
+        r#"[1, 2].map { |i| /(?<got>\d)/ =~ i.to_s; got }"#,
+        r#"["1", "2"]"#,
+    );
     eq(r#"/(?<n>a)|(?<n>b)/ =~ "b"; n"#, r#""b""#);
     // Only a static literal on the LEFT assigns, and only names that spell a
     // local variable (not a constant, not a keyword).
     eq(r#"x = "k"; /(?<v>#{x})/ =~ "k"; defined?(v)"#, "nil");
     eq(r#""ab" =~ /(?<z>a)/; defined?(z)"#, "nil");
-    eq(r#"/(?<Up>a)(?<if>b)/ =~ "ab"; [defined?(Up), $~[:if]]"#, r#"[nil, "b"]"#);
+    eq(
+        r#"/(?<Up>a)(?<if>b)/ =~ "ab"; [defined?(Up), $~[:if]]"#,
+        r#"[nil, "b"]"#,
+    );
     eq(r#"/(?<q>a)/ !~ "a""#, "false");
     eq(r#"/(?<é>b)/ =~ "b"; é"#, r#""b""#);
 }
 
 #[test]
 fn non_ascii_identifiers_lex_as_names() {
-    eq("café = 1; π = 2; [café + π, :Ωmega, {clé: 1}]", "[3, :Ωmega, {clé: 1}]");
+    eq(
+        "café = 1; π = 2; [café + π, :Ωmega, {clé: 1}]",
+        "[3, :Ωmega, {clé: 1}]",
+    );
     eq("Ä = 3; [Ä, defined?(Ä)]", r#"[3, "constant"]"#);
     eq("@ñ = 4; $ü = 5; [@ñ, $ü]", "[4, 5]");
 }

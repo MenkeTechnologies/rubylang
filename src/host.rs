@@ -6892,7 +6892,9 @@ impl RubyHost {
             if !all {
                 break;
             }
-            let Some(def) = self.classes.get(&c) else { break };
+            let Some(def) = self.classes.get(&c) else {
+                break;
+            };
             for m in &def.extends {
                 let module = self.resolve_module_name(m, &c);
                 names.extend(self.instance_method_names_vis(

@@ -27287,7 +27287,11 @@ fn wait_status_message(raw: i32) -> String {
     if libc::WIFSTOPPED(raw) {
         format!(" stopped {}", sig_text(libc::WSTOPSIG(raw)))
     } else if libc::WIFSIGNALED(raw) {
-        let core = if libc::WCOREDUMP(raw) { " (core dumped)" } else { "" };
+        let core = if libc::WCOREDUMP(raw) {
+            " (core dumped)"
+        } else {
+            ""
+        };
         format!(" {}{core}", sig_text(libc::WTERMSIG(raw)))
     } else {
         format!(" exit {}", libc::WEXITSTATUS(raw))
@@ -27401,7 +27405,10 @@ impl ProcessCommand {
                 "wrong number of arguments (given 0, expected 1+)",
             ));
         }
-        let strs = args.iter().map(command_arg).collect::<Result<Vec<_>, _>>()?;
+        let strs = args
+            .iter()
+            .map(command_arg)
+            .collect::<Result<Vec<_>, _>>()?;
         let (argv, shell) = if strs.len() == 1 {
             use std::os::unix::ffi::{OsStrExt, OsStringExt};
             let bytes = strs[0].as_bytes();
@@ -27465,13 +27472,16 @@ fn needs_shell(line: &[u8]) -> bool {
     const META: &[u8] = b"*?{}[]<>()~&|\\$;'`\"\n#";
     const SHELL_WORDS: &[&str] = &[
         "case", "do", "done", "elif", "else", "esac", "fi", "for", "if", "in", "then", "until",
-        "while", "!", ".", ":", "break", "continue", "eval", "exec", "exit", "export",
-        "readonly", "return", "set", "shift", "times", "trap", "unset",
+        "while", "!", ".", ":", "break", "continue", "eval", "exec", "exit", "export", "readonly",
+        "return", "set", "shift", "times", "trap", "unset",
     ];
     if line.iter().any(|b| META.contains(b)) {
         return true;
     }
-    let first = line.split(u8::is_ascii_whitespace).next().unwrap_or_default();
+    let first = line
+        .split(u8::is_ascii_whitespace)
+        .next()
+        .unwrap_or_default();
     first.contains(&b'=') || SHELL_WORDS.iter().any(|w| w.as_bytes() == first)
 }
 
@@ -27487,7 +27497,10 @@ fn kernel_backtick(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err(raise_exc(
             "ArgumentError",
-            &format!("wrong number of arguments (given {}, expected 1)", args.len()),
+            &format!(
+                "wrong number of arguments (given {}, expected 1)",
+                args.len()
+            ),
         ));
     }
     let pc = ProcessCommand::parse(args)?;
@@ -27542,7 +27555,10 @@ fn kernel_system(args: &[Value]) -> Result<Value, String> {
         None => {
             set_exec_failed_status();
             return if pc.exception {
-                Err(exec_error("", &std::io::Error::from_raw_os_error(libc::ENOENT)))
+                Err(exec_error(
+                    "",
+                    &std::io::Error::from_raw_os_error(libc::ENOENT),
+                ))
             } else {
                 Ok(Value::Undef)
             };
@@ -27577,7 +27593,10 @@ fn kernel_sleep(args: &[Value]) -> Result<Value, String> {
     if args.len() > 1 {
         return Err(raise_exc(
             "ArgumentError",
-            &format!("wrong number of arguments (given {}, expected 0..1)", args.len()),
+            &format!(
+                "wrong number of arguments (given {}, expected 0..1)",
+                args.len()
+            ),
         ));
     }
     let secs = match args.first() {
@@ -27607,7 +27626,10 @@ fn kernel_sleep(args: &[Value]) -> Result<Value, String> {
         return Err(raise_exc("RangeError", "NaN out of Time range"));
     }
     if secs < 0.0 {
-        return Err(raise_exc("ArgumentError", "time interval must not be negative"));
+        return Err(raise_exc(
+            "ArgumentError",
+            "time interval must not be negative",
+        ));
     }
     let wall_secs = || {
         std::time::SystemTime::now()
@@ -27615,7 +27637,9 @@ fn kernel_sleep(args: &[Value]) -> Result<Value, String> {
             .map_or(0, |d| d.as_secs() as i64)
     };
     let beg = wall_secs();
-    std::thread::sleep(std::time::Duration::from_secs_f64(secs.min(u32::MAX as f64)));
+    std::thread::sleep(std::time::Duration::from_secs_f64(
+        secs.min(u32::MAX as f64),
+    ));
     Ok(Value::Int(wall_secs() - beg))
 }
 
