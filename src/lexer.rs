@@ -71,7 +71,19 @@ impl fmt::Display for Tok {
     }
 }
 
-const KEYWORDS: &[&str] = &[
+/// Whether byte `c` can start an identifier. MRI's `is_identchar` counts every
+/// non-ASCII byte as an identifier character (`café = 1`, `:Ωmega`, `@ñ`), so a
+/// UTF-8 lead or continuation byte never ends or rejects a name.
+fn ident_start(c: u8) -> bool {
+    c.is_ascii_alphabetic() || c == b'_' || !c.is_ascii()
+}
+
+/// Whether byte `c` can continue an identifier (see [`ident_start`]).
+fn ident_byte(c: u8) -> bool {
+    ident_start(c) || c.is_ascii_digit()
+}
+
+pub(crate) const KEYWORDS: &[&str] = &[
     "def", "end", "if", "elsif", "else", "unless", "while", "until", "for", "in", "do", "return",
     "break", "next", "yield", "then", "case", "when", "nil", "true", "false", "and", "or", "not",
     "class", "module", "begin", "rescue", "ensure", "self", "super", "retry", "redo", "alias",
@@ -571,9 +583,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     }
                 }
             }
-            b'"' | b'\'' => {
+            // A backtick is a command string unless it names the `` ` `` method
+            // (`def `(c)`, `obj.`(c)`).
+            b'"' | b'\'' | b'`' if c != b'`' || !method_name_pos(&out) => {
                 let quote = c;
-                let dq = quote == b'"';
+                let dq = quote != b'\'';
                 i += 1;
                 let mut s = String::new();
                 loop {
@@ -738,6 +752,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     s.push_str(&src[i..i + clen]);
                     i += clen;
                 }
+                if quote == b'`' {
+                    push_xstring(&mut out, Tok::Str(s, true), line, core::mem::take(&mut sp));
+                    continue;
+                }
                 out.push(Token {
                     kind: Tok::Str(s, dq),
                     line,
@@ -752,7 +770,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     i += 1;
                 }
                 let start = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                while i < b.len() && ident_byte(b[i]) {
                     i += 1;
                 }
                 let name = src[start..i].to_string();
@@ -793,7 +811,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 {
                     i += 1;
                 } else {
-                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    while i < b.len() && ident_byte(b[i]) {
                         i += 1;
                     }
                 }
@@ -809,7 +827,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             // `<>` nesting. `%q` is single-quoted (no interpolation), `%Q` is
             // double-quoted, `%r` is a Regexp, `%s` is a Symbol.
             b'%' if i + 2 < b.len()
-                && matches!(b[i + 1], b'q' | b'Q' | b'r' | b's')
+                && matches!(b[i + 1], b'q' | b'Q' | b'r' | b's' | b'x')
                 && !b[i + 2].is_ascii_alphanumeric()
                 && !matches!(b[i + 2], b' ' | b'\t' | b'\n' | b'=')
                 && !method_name_pos(&out) =>
@@ -850,6 +868,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     b'q' => Tok::Str(body, false),
                     b'Q' => Tok::Str(body, true),
                     b's' => Tok::Symbol(body),
+                    b'x' => {
+                        push_xstring(&mut out, Tok::Str(body, true), line, core::mem::take(&mut sp));
+                        continue;
+                    }
                     _ => {
                         // `%r{…}` — collect trailing regex flags.
                         let fstart = i;
@@ -1138,8 +1160,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 });
             }
             b':' if i + 1 < b.len()
-                && (b[i + 1].is_ascii_alphabetic()
-                    || b[i + 1] == b'_'
+                && (ident_start(b[i + 1])
                     || b[i + 1] == b'@'
                     || b[i + 1] == b'$')
                 // A `:` glued to the right of a value (`x:true`, `key:String`) is a
@@ -1159,7 +1180,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 if i < b.len() && b[i] == b'$' {
                     i += 1;
                 }
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                while i < b.len() && ident_byte(b[i]) {
                     i += 1;
                 }
                 // allow trailing ? / ! on symbol/method names, or a single `=` for
@@ -1191,9 +1212,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             {
                 break;
             }
-            _ if c.is_ascii_alphabetic() || c == b'_' => {
+            _ if ident_start(c) => {
                 let start = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                while i < b.len() && ident_byte(b[i]) {
                     i += 1;
                 }
                 // Method-name suffixes `?` and `!`, with MRI's one condition on
@@ -1215,7 +1236,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 let word = &src[start..i];
                 let kind = if KEYWORDS.contains(&word) {
                     Tok::Keyword(word.to_string())
-                } else if word.as_bytes()[0].is_ascii_uppercase() {
+                } else if word.chars().next().is_some_and(char::is_uppercase) {
                     Tok::Const(word.to_string())
                 } else {
                     Tok::Ident(word.to_string())
@@ -1320,7 +1341,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     }
                 }
                 // Emit a placeholder Str token (filled at end of line) and record
-                // the pending heredoc.
+                // the pending heredoc. A `` <<`CMD` `` heredoc is a command string.
+                if quote == Some(b'`') {
+                    push_xstring(&mut out, Tok::Str(String::new(), true), line, core::mem::take(&mut sp));
+                    // `tok_idx` below must name the Str, not the closing `)`.
+                    let close = out.pop().expect("push_xstring pushed `)`");
+                    pending.push(Heredoc {
+                        delim,
+                        squiggly,
+                        indent_term: squiggly || dash,
+                        interp,
+                        tok_idx: out.len() - 1,
+                    });
+                    out.push(close);
+                    i = j;
+                    continue;
+                }
                 out.push(Token {
                     kind: Tok::Str(String::new(), interp),
                     line,
@@ -1386,7 +1422,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     match c {
                         b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'<' | b'>' | b'!' | b'&'
                         | b'|' | b'^' | b'~' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b','
-                        | b'.' | b':' | b'?' => &src[i..i + 1],
+                        | b'.' | b':' | b'?' | b'`' => &src[i..i + 1],
                         other => {
                             return Err(format!(
                                 "unexpected character '{}' at line {line}",
@@ -1420,6 +1456,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
 /// True in a method-name position — right after `def`, or after a `.`/`::`/`&.`
 /// call dot — where an operator char (`/`, `%`, …) is a method name, not the
 /// start of a regex / percent-literal (`def /(o)`, `def %(o)`, `x./(y)`).
+/// A command string (`` `cmd` ``, `%x(cmd)`, `` <<`CMD` ``) is a call of the
+/// `` ` `` method on self with the interpolated string (parse.y `NODE_XSTR`), so
+/// it is lexed as exactly that call, `` `(str) ``, and a user `` def ` ``
+/// overrides it as in MRI.
+fn push_xstring(out: &mut Vec<Token>, body: Tok, line: u32, space: bool) {
+    let tok = |kind, space| Token { kind, line, space };
+    out.push(tok(Tok::Ident("`".to_string()), space));
+    out.push(tok(Tok::Op("(".to_string()), false));
+    out.push(tok(body, false));
+    out.push(tok(Tok::Op(")".to_string()), false));
+}
+
 fn method_name_pos(out: &[Token]) -> bool {
     match out
         .iter()

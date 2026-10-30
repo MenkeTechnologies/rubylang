@@ -936,7 +936,11 @@ Implemented and verified against the reference `ruby`:
 - **`singleton_methods`.** Lists the names defined on the object alone
   (`def obj.m`, `class << obj`, `define_singleton_method`); on a class or module
   it lists that class's own class methods, since a class's singleton methods ARE
-  its class methods. Returned sorted.
+  its class methods, and with the default `all = true` also the methods of
+  every module it was `extend`ed with and every superclass's class methods; a
+  `private_class_method` is left out. Returned sorted. Residue: on a plain
+  object, `singleton_methods(false)` still includes methods from `extend`ed
+  modules, which MRI omits.
 - **Constant reflection.** `const_get` / `const_set` / `const_defined?` /
   `constants` on any class or module ref, including builtin class names
   (`Object.const_get(:String)`). `const_get`/`const_set`/`const_defined?`
@@ -1355,8 +1359,7 @@ Honest limitations of this surface:
     raises `ArgumentError: unknown encoding name - …`. Still open: string
     CONTENT is only modelled as UTF-8, ASCII-8BIT or US-ASCII, so
     `"x".force_encoding("EUC-JP").encoding` answers UTF-8 where MRI answers
-    EUC-JP; `Encoding.new` / `#dup` succeed where MRI raises; `:é` is not a
-    lexable symbol; and `Object#to_s` / `Proc#inspect` report UTF-8 where MRI answers
+    EUC-JP; `Encoding.new` / `#dup` succeed where MRI raises; and `Object#to_s` / `Proc#inspect` report UTF-8 where MRI answers
     ASCII-8BIT (`nil`, `Integer`, `Symbol`, `Float`, `Class` and the Array/Hash/
     Range forms built from them already answer US-ASCII).
   - **`String#dump` / `#undump` — fixed.** Ported from MRI's `rb_str_dump` and
@@ -1366,8 +1369,37 @@ Honest limitations of this surface:
     `.force_encoding("…")` epilogue, and the receiver's encoding carried to
     the result. An undumped byte run that is not UTF-8 is kept as bytes, and
     `"\xff".b.dump` is `"\xFF"`.
-  - `Kernel#system`, backticks and `%x` do not exist, so a `<<~`CMD`` heredoc
-    cannot run.
+  - **Command execution — implemented.** `` `cmd` ``, `%x(cmd)` and a
+    `` <<~`CMD` `` heredoc lex as a call of the `` ` `` method on self (so a
+    user `` def ` `` overrides them, as in MRI), and `Kernel#system` takes an
+    env Hash, a single shell line or a program plus arguments, and the
+    `exception:` and `chdir:` options. A one-string command goes through
+    `/bin/sh -c` only when `rb_exec_fillarg` would (a metacharacter, a leading
+    `NAME=`, a reserved word or special builtin first); otherwise it is exec'd
+    directly, so a missing program is `Errno::ENOENT` for backticks and `nil`
+    for `system`, with `$?.exitstatus` 127. `$?` / `Process.last_status` is a
+    `Process::Status` decoding the raw wait status (`exitstatus`, `success?`,
+    `signaled?`, `termsig`, `to_i`, `inspect`). Still open: `exec`, `spawn`,
+    `Process.wait`, `IO.popen`, `Open3`, and the redirection options
+    (`out:`/`err:`/`in:` raise `NotImplementedError`). `Process::Status`
+    instances expose their state as `@__pid`/`@__status`/`@__message` through
+    `instance_variables`, where MRI shows none.
+  - **Identifiers may be non-ASCII — fixed.** Every byte >= 0x80 is an
+    identifier character (MRI's `is_identchar`), so `café = 1`, `:Ωmega`,
+    `@ñ`, `$ü` and the label `clé:` lex, and a name starting with a non-ASCII
+    uppercase letter (`Ä`) is a constant.
+  - **`sleep` sleeps — fixed.** It was a no-op answering 0. It now suspends for
+    the interval, answers the wall-clock seconds that ticked over
+    (`time(0) - beg`, as `rb_f_sleep` does), sleeps forever with no argument or
+    nil, and raises MRI's errors for a negative, NaN or non-numeric interval.
+  - **Named captures assign locals — fixed.** `/(?<name>…)/ =~ str` with a
+    static regex literal on the left binds each named group that spells a local
+    variable (nil on a miss). Residue: MRI declares the locals at PARSE time,
+    so `p(x) if /(?<x>.)/ =~ s` is a NameError there; here the condition is
+    compiled first and the body sees `x`.
+  - **`IO#sync` — fixed.** `sync` answered the IO itself; it is now the flag
+    (`true` for `$stderr` and sockets, `false` otherwise until `sync=` sets
+    it), and `fsync` answers 0.
   - Methods redefined under the same name later in a file, and classes reopened
     inside a block, are hoisted at compile time, so every earlier call sees the
     last definition.

@@ -257,6 +257,29 @@ fn slot_scan(body: &[Stmt]) -> (std::collections::HashSet<String>, bool) {
 /// The `/…#{…}/` interpolation of a Regexp literal as the String expression it
 /// compiles to, so the walkers over a body see the locals it names (`None`
 /// for a static pattern).
+/// The named groups of a static regex literal that `=~` assigns to locals:
+/// each distinct name that is a valid local-variable identifier, in pattern
+/// order. Empty for an interpolated literal (MRI assigns nothing then) or a
+/// pattern that does not compile (the match itself raises).
+fn regex_literal_local_names(source: &str, flags: &str) -> Vec<String> {
+    if source.contains("#{") || crate::parser::has_sigil_interp(source) {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = Vec::new();
+    for name in crate::host::regex_group_names(source, flags) {
+        let mut chars = name.chars();
+        let local_start = chars
+            .next()
+            .is_some_and(|c| c == '_' || c.is_ascii_lowercase() || !c.is_ascii());
+        let local_rest = chars.all(|c| c == '_' || c.is_ascii_alphanumeric() || !c.is_ascii());
+        if local_start && local_rest && !crate::lexer::KEYWORDS.contains(&name.as_str()) && !names.contains(&name)
+        {
+            names.push(name);
+        }
+    }
+    names
+}
+
 fn regex_interp_expr(source: &str) -> Option<Expr> {
     if !(source.contains("#{") || crate::parser::has_sigil_interp(source)) {
         return None;
@@ -2319,6 +2342,40 @@ impl Compiler {
         Ok(())
     }
 
+    /// `/(?<name>…)/ =~ expr` with a static regex LITERAL on the left: after
+    /// the match, every named group that spells a local variable is assigned
+    /// to that local — the group's text on a match, nil on a miss (parse.y's
+    /// `reg_named_capture_assign`). The expression still yields the `=~`
+    /// result. An interpolated literal, or the regex on the right, assigns
+    /// nothing, as in MRI.
+    fn compile_named_capture_match(
+        &mut self,
+        b: &mut ChunkBuilder,
+        l: &Expr,
+        r: &Expr,
+        names: &[String],
+    ) -> Result<(), String> {
+        self.compile_expr(b, l)?;
+        self.kstr(b, "=~");
+        self.compile_expr(b, r)?;
+        b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), self.cur_line);
+        let last_match = || Expr::Var(VarKind::Global, "~".into());
+        for name in names {
+            // `$~ && $~[:name]`: nil when the match failed.
+            let group = Expr::Binary(
+                BinOp::And,
+                Box::new(last_match()),
+                Box::new(Expr::Index(
+                    Box::new(last_match()),
+                    vec![Expr::Symbol(name.clone())],
+                )),
+            );
+            self.compile_assign(b, &Expr::Var(VarKind::Local, name.clone()), &group)?;
+            b.emit(Op::Pop, 0);
+        }
+        Ok(())
+    }
+
     fn compile_binary(
         &mut self,
         b: &mut ChunkBuilder,
@@ -2326,6 +2383,14 @@ impl Compiler {
         l: &Expr,
         r: &Expr,
     ) -> Result<(), String> {
+        if op == BinOp::Match {
+            if let Expr::Regex(source, flags) = l {
+                let names = regex_literal_local_names(source, flags);
+                if !names.is_empty() {
+                    return self.compile_named_capture_match(b, l, r, &names);
+                }
+            }
+        }
         // Short-circuit operators keep the operand values (Ruby semantics).
         if op == BinOp::And || op == BinOp::Or {
             self.compile_expr(b, l)?;

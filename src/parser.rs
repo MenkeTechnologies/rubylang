@@ -3535,6 +3535,7 @@ fn is_operator_method(op: &str) -> bool {
             | "-@"
             | "+@"
             | "~@"
+            | "`"
     )
 }
 

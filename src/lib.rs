@@ -336,6 +336,24 @@ module Process
   CLOCK_PROCESS_CPUTIME_ID = 2
   CLOCK_THREAD_CPUTIME_ID = 3
   CLOCK_MONOTONIC_RAW = 4
+
+  # `$?` after `system` / backticks. Built natively (`set_last_status`) with the
+  # raw wait status in `@__status`; the readers decode it as process.c does.
+  class Status
+    def pid; @__pid; end
+    def to_i; @__status; end
+    def exited?; @__status & 0x7f == 0; end
+    def exitstatus; exited? ? (@__status >> 8) & 0xff : nil; end
+    def success?; exited? ? exitstatus == 0 : nil; end
+    def stopped?; @__status & 0xff == 0x7f; end
+    def stopsig; stopped? ? (@__status >> 8) & 0xff : nil; end
+    def signaled?; !exited? && !stopped?; end
+    def termsig; signaled? ? @__status & 0x7f : nil; end
+    def coredump?; signaled? && @__status & 0x80 != 0; end
+    def ==(other); equal?(other) || @__status == other; end
+    def to_s; @__message; end
+    def inspect; '#<Process::Status: ' + @__message + ">"; end
+  end
 end
 
 module RbConfig

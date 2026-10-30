@@ -1005,6 +1005,14 @@ fn compiled_regex(
 /// where MRI answers `0`. Every inline flag group is rewritten, so `(?m)`,
 /// `(?im:…)` and the `(?-mix:…)` that `Regexp#to_s` emits all keep their Ruby
 /// meaning.
+/// The named groups of a Ruby pattern, in pattern order (duplicates kept).
+/// Empty when the pattern does not compile.
+pub fn regex_group_names(source: &str, flags: &str) -> Vec<String> {
+    fancy_regex::Regex::new(&ruby_regex_to_fancy(source, flags.contains('x')))
+        .map(|re| re.capture_names().flatten().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 fn ruby_regex_to_fancy(source: &str, extended: bool) -> String {
     let decoded = decode_regex_byte_escapes(source);
     let source = decoded.as_ref();
@@ -1722,6 +1730,9 @@ pub struct RubyHost {
     enum_labels: std::collections::HashMap<u32, String>,
     /// `IO#lineno` per `io_handles` index.
     io_linenos: std::collections::HashMap<u32, i64>,
+    /// `IO#sync=` overrides per `io_handles` index; absent means the stream's
+    /// default (see [`io_sync`]).
+    io_syncs: std::collections::HashMap<u32, bool>,
     struct_counter: u32,
     /// `refine Target do … end` definitions: the refining module → its
     /// `(target class, refinement class)` pairs. A refinement's methods live in
@@ -2617,6 +2628,7 @@ impl RubyHost {
             enum_size_fns: std::collections::HashMap::new(),
             enum_labels: std::collections::HashMap::new(),
             io_linenos: std::collections::HashMap::new(),
+            io_syncs: std::collections::HashMap::new(),
             struct_counter: 0,
             refinement_defs: IndexMap::new(),
             active_refinements: Vec::new(),
@@ -5015,7 +5027,7 @@ impl RubyHost {
             // A `respond_to_missing?`-backed Method is owned by `CLASS_OF(recv)`
             // (proc.c `mnew_missing`): the singleton class once the object has
             // singleton methods, its class otherwise.
-            None if !unbound && !self.singleton_method_names(recv).is_empty() => self
+            None if !unbound && !self.singleton_method_names(recv, true).is_empty() => self
                 .singleton_class_name(recv)
                 .unwrap_or_else(|| self.dispatch_class(recv)),
             // A runtime `attr_*` (via `send`/`class_eval`, or on an anonymous
@@ -6820,7 +6832,7 @@ impl RubyHost {
     /// A plain object contributes its `def obj.m` / `class << obj` methods plus
     /// any `define_singleton_method` block; a class or module contributes its
     /// class methods (`def self.m`), which ARE its singleton methods in MRI.
-    pub fn singleton_method_names(&self, v: &Value) -> Vec<String> {
+    pub fn singleton_method_names(&self, v: &Value, all: bool) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         if let Value::Obj(id) = v {
             if let Some(m) = self.singleton_methods.get(id) {
@@ -6848,12 +6860,7 @@ impl RubyHost {
             }
         }
         if let Some(cls) = self.classref_name(v) {
-            if let Some(def) = self.classes.get(&cls) {
-                names.extend(def.class_methods.keys().cloned());
-            }
-            if let Some(m) = self.class_define_methods.get(&cls) {
-                names.extend(m.keys().cloned());
-            }
+            self.class_singleton_method_names(&cls, all, &mut names);
         }
         // A class body that runs a block is stored as a synthetic
         // `__class_body__N` class method; like every `__`-prefixed internal
@@ -6862,6 +6869,40 @@ impl RubyHost {
         names.sort();
         names.dedup();
         names
+    }
+    /// The class methods `Module#singleton_methods` lists for `cls`: its own
+    /// (`def self.m`, `define_singleton_method`), and with `all` also the
+    /// public/protected instance methods of every module it was extended with
+    /// and, for a class, every superclass's singleton methods — the singleton
+    /// class's ancestry up to the first non-singleton, as MRI walks it.
+    fn class_singleton_method_names(&self, cls: &str, all: bool, names: &mut Vec<String>) {
+        let mut cur = Some(cls.to_string());
+        while let Some(c) = cur {
+            if let Some(def) = self.classes.get(&c) {
+                names.extend(
+                    def.class_methods
+                        .keys()
+                        .filter(|k| def.class_visibility.get(*k) != Some(&Visibility::Private))
+                        .cloned(),
+                );
+            }
+            if let Some(m) = self.class_define_methods.get(&c) {
+                names.extend(m.keys().cloned());
+            }
+            if !all {
+                break;
+            }
+            let Some(def) = self.classes.get(&c) else { break };
+            for m in &def.extends {
+                let module = self.resolve_module_name(m, &c);
+                names.extend(self.instance_method_names_vis(
+                    &module,
+                    true,
+                    &[Visibility::Public, Visibility::Protected],
+                ));
+            }
+            cur = self.superclass_of(&c).filter(|s| s != &c);
+        }
     }
     /// Whether class `cls` itself has class method `name` — `def self.m`,
     /// `define_singleton_method`, or a module it was extended with — not one
@@ -14875,6 +14916,28 @@ pub fn io_lineno(v: &Value) -> i64 {
 pub fn io_set_lineno(v: &Value, n: i64) {
     if let Some(id) = io_id(v) {
         with_host(|h| h.io_linenos.insert(id, n));
+    }
+}
+
+/// `IO#sync`: the sync-mode flag. Until `sync=` sets it, MRI answers `true`
+/// for `$stderr` and for sockets (both are opened unbuffered) and `false` for
+/// `$stdout`, `$stdin` and files.
+pub fn io_sync(v: &Value) -> bool {
+    let Some(id) = io_id(v) else { return false };
+    with_host(|h| {
+        h.io_syncs.get(&id).copied().unwrap_or_else(|| {
+            matches!(
+                h.io_handles.get(id as usize),
+                Some(IoCell::Stderr | IoCell::TcpStream { .. } | IoCell::TcpListener { .. })
+            )
+        })
+    })
+}
+
+/// `IO#sync=`: record the sync-mode flag.
+pub fn io_set_sync(v: &Value, on: bool) {
+    if let Some(id) = io_id(v) {
+        with_host(|h| h.io_syncs.insert(id, on));
     }
 }
 

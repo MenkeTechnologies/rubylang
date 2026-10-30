@@ -121,6 +121,8 @@ pub(crate) fn is_kernel_function(name: &str) -> bool {
             | "printf"
             | "putc"
             | "sleep"
+            | "`"
+            | "system"
             | "rand"
             | "srand"
             | "catch"
@@ -3468,9 +3470,10 @@ fn dispatch_resolved(
         // module, its class methods. Sorted, as MRI's are not, so callers sort;
         // sorting here is a superset-safe determinism the corpus relies on.
         "singleton_methods" if args.is_empty() || matches!(args.first(), Some(Value::Bool(_))) => {
+            let all = !matches!(args.first(), Some(Value::Bool(false)));
             return Ok(with_host(|h| {
                 let syms: Vec<Value> = h
-                    .singleton_method_names(recv)
+                    .singleton_method_names(recv, all)
                     .iter()
                     .map(|n| h.new_symbol(n))
                     .collect();
@@ -4930,6 +4933,7 @@ fn dispatch_classref(
             "pid" => return Ok(Value::Int(std::process::id() as i64)),
             "ppid" => return Ok(Value::Int(unsafe { libc::getppid() } as i64)),
             "clock_gettime" => return process_clock_gettime(args),
+            "last_status" => return Ok(with_host(|h| h.get_global("?"))),
             _ => {}
         }
     }
@@ -5442,12 +5446,18 @@ fn dispatch_classref(
         {
             Ok(with_host(|h| h.new_object(cls)))
         }
-        // Integer, Float, Symbol, nil, true and false have no `new`; neither does
-        // a module (only `Module.new` itself is a constructor).
+        // Integer, Float, Symbol, nil, true, false and Process::Status have no
+        // `new`; neither does a module (only `Module.new` itself is a constructor).
         "new"
             if matches!(
                 cls,
-                "Integer" | "Float" | "Symbol" | "NilClass" | "TrueClass" | "FalseClass"
+                "Integer"
+                    | "Float"
+                    | "Symbol"
+                    | "NilClass"
+                    | "TrueClass"
+                    | "FalseClass"
+                    | "Process::Status"
             ) || (cls != "Module" && with_host(|h| h.is_module_name(cls))) =>
         {
             let recv = with_host(|h| h.class_ref(cls));
@@ -19910,6 +19920,13 @@ fn file_open_with(io: Value, block: Option<Value>) -> Result<Value, String> {
 /// et al.).
 /// One UTF-8 character from a `File` (`IO#getc`), nil at end of file. A byte
 /// that cannot start a character is answered on its own.
+/// `IO#sync=`: store the truthiness of the argument and answer the argument.
+fn io_sync_assign(recv: &Value, args: &[Value]) -> Result<Value, String> {
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    crate::host::io_set_sync(recv, with_host(|h| h.truthy(&v)));
+    Ok(v)
+}
+
 fn io_read_char(recv: &Value) -> Result<Option<Value>, String> {
     let first = crate::host::io_read_bytes(recv, 1).map_err(|e| io_err(&e))?;
     let Some(&b0) = first.first() else {
@@ -20157,11 +20174,17 @@ fn dispatch_io(
             Ok(Value::Undef)
         }
         "closed?" => Ok(Value::Bool(crate::host::io_closed(recv))),
-        "flush" | "sync" | "fsync" => {
+        "flush" => {
             crate::host::io_flush(recv).map_err(|e| io_err(&e))?;
             Ok(recv.clone())
         }
-        "sync=" => Ok(args.first().cloned().unwrap_or(Value::Undef)),
+        // MRI's `fsync` flushes and answers 0.
+        "fsync" => {
+            crate::host::io_flush(recv).map_err(|e| io_err(&e))?;
+            Ok(Value::Int(0))
+        }
+        "sync" => Ok(Value::Bool(crate::host::io_sync(recv))),
+        "sync=" => io_sync_assign(recv, args),
         "inspect" | "to_s" => Ok(new_str(with_host(|h| h.to_s(recv)))),
         _ => Err(no_method_error(recv, name)),
     }
@@ -20243,6 +20266,8 @@ fn dispatch_tcp_server(
         "accept_nonblock" => crate::host::tcp_accept(recv).map_err(|e| socket_err(&e)),
         "addr" | "local_address" => crate::host::tcp_addr(recv, false).map_err(|e| io_err(&e)),
         "listen" => Ok(Value::Int(0)),
+        "sync" => Ok(Value::Bool(crate::host::io_sync(recv))),
+        "sync=" => io_sync_assign(recv, args),
         "close" => {
             crate::host::tcp_close(recv).map_err(|e| io_err(&e))?;
             Ok(Value::Undef)
@@ -20338,8 +20363,10 @@ fn dispatch_tcp_socket(
         }
         "addr" | "local_address" => crate::host::tcp_addr(recv, false).map_err(|e| io_err(&e)),
         "peeraddr" | "remote_address" => crate::host::tcp_addr(recv, true).map_err(|e| io_err(&e)),
-        "flush" | "sync" | "fsync" => Ok(recv.clone()),
-        "sync=" => Ok(args.first().cloned().unwrap_or(Value::Undef)),
+        "flush" => Ok(recv.clone()),
+        "fsync" => Ok(Value::Int(0)),
+        "sync" => Ok(Value::Bool(crate::host::io_sync(recv))),
+        "sync=" => io_sync_assign(recv, args),
         "close" | "close_write" | "close_read" => {
             crate::host::tcp_close(recv).map_err(|e| io_err(&e))?;
             Ok(Value::Undef)
@@ -27213,6 +27240,385 @@ fn split_exception_kwarg(args: &[Value]) -> (Vec<Value>, bool) {
     }
 }
 
+/// The signal names `Process::Status#inspect` spells (`SIGTERM`), keyed by the
+/// platform's own numbers (they differ between Linux and macOS).
+fn signal_name(sig: i32) -> Option<&'static str> {
+    const TABLE: &[(i32, &str)] = &[
+        (libc::SIGHUP, "HUP"),
+        (libc::SIGINT, "INT"),
+        (libc::SIGQUIT, "QUIT"),
+        (libc::SIGILL, "ILL"),
+        (libc::SIGTRAP, "TRAP"),
+        (libc::SIGABRT, "ABRT"),
+        (libc::SIGBUS, "BUS"),
+        (libc::SIGFPE, "FPE"),
+        (libc::SIGKILL, "KILL"),
+        (libc::SIGUSR1, "USR1"),
+        (libc::SIGSEGV, "SEGV"),
+        (libc::SIGUSR2, "USR2"),
+        (libc::SIGPIPE, "PIPE"),
+        (libc::SIGALRM, "ALRM"),
+        (libc::SIGTERM, "TERM"),
+        (libc::SIGCHLD, "CHLD"),
+        (libc::SIGCONT, "CONT"),
+        (libc::SIGSTOP, "STOP"),
+        (libc::SIGTSTP, "TSTP"),
+        (libc::SIGTTIN, "TTIN"),
+        (libc::SIGTTOU, "TTOU"),
+        (libc::SIGURG, "URG"),
+        (libc::SIGXCPU, "XCPU"),
+        (libc::SIGXFSZ, "XFSZ"),
+        (libc::SIGVTALRM, "VTALRM"),
+        (libc::SIGPROF, "PROF"),
+        (libc::SIGWINCH, "WINCH"),
+        (libc::SIGIO, "IO"),
+        (libc::SIGSYS, "SYS"),
+    ];
+    TABLE.iter().find(|(n, _)| *n == sig).map(|(_, s)| *s)
+}
+
+/// `pst_message` without its `pid N` prefix: ` exit 3`, ` SIGTERM (signal 15)`,
+/// ` stopped SIGSTOP (signal 17)`, from a raw wait status.
+fn wait_status_message(raw: i32) -> String {
+    let sig_text = |sig: i32| match signal_name(sig) {
+        Some(name) => format!("SIG{name} (signal {sig})"),
+        None => format!("signal {sig}"),
+    };
+    if libc::WIFSTOPPED(raw) {
+        format!(" stopped {}", sig_text(libc::WSTOPSIG(raw)))
+    } else if libc::WIFSIGNALED(raw) {
+        let core = if libc::WCOREDUMP(raw) { " (core dumped)" } else { "" };
+        format!(" {}{core}", sig_text(libc::WTERMSIG(raw)))
+    } else {
+        format!(" exit {}", libc::WEXITSTATUS(raw))
+    }
+}
+
+/// Record a finished child as `$?`, a `Process::Status` (the class is declared
+/// in the prelude; its readers decode `@__status`, the raw wait status).
+fn set_last_status(pid: u32, raw: i32) {
+    with_host(|h| {
+        let st = h.new_object("Process::Status");
+        h.set_ivar_of(&st, "__pid", Value::Int(i64::from(pid)));
+        h.set_ivar_of(&st, "__status", Value::Int(i64::from(raw)));
+        let text = format!("pid {pid}{}", wait_status_message(raw));
+        let text = h.new_string(text);
+        h.set_ivar_of(&st, "__message", text);
+        h.set_global("?", st);
+    });
+}
+
+/// A String argument of a process call, as the exact bytes the OS receives,
+/// or MRI's implicit-conversion TypeError.
+fn command_arg(v: &Value) -> Result<std::ffi::OsString, String> {
+    use std::os::unix::ffi::OsStringExt;
+    match with_host(|h| h.as_str(v).map(|_| h.string_bytes(v))) {
+        Some(bytes) => Ok(std::ffi::OsString::from_vec(bytes)),
+        None => Err(raise_exc(
+            "TypeError",
+            &format!("no implicit conversion of {} into String", type_name_for(v)),
+        )),
+    }
+}
+
+/// The Errno exception for a command that could not be executed:
+/// `No such file or directory - prog`.
+fn exec_error(prog: &str, e: &std::io::Error) -> String {
+    let code = e.raw_os_error().unwrap_or(libc::ENOENT);
+    raise_exc_with(
+        errno_class(code).unwrap_or("SystemCallError"),
+        &format!("{} - {prog}", strerror_text(code)),
+        &[("errno", Value::Int(i64::from(code)))],
+    )
+}
+
+/// A parsed `system` / `` ` `` command: environment changes, the program and
+/// its arguments, and the options `system` honours.
+struct ProcessCommand {
+    env: Vec<(String, Option<std::ffi::OsString>)>,
+    /// The program and its arguments. One element holding the whole line when
+    /// it goes through `/bin/sh -c`.
+    argv: Vec<std::ffi::OsString>,
+    shell: bool,
+    chdir: Option<std::ffi::OsString>,
+    exception: bool,
+}
+
+impl ProcessCommand {
+    /// Parse `[env,] command... [, options]` (process.c `rb_exec_getargs`).
+    /// A single command string runs through `/bin/sh -c` only when it needs a
+    /// shell — a metacharacter, a leading `NAME=value`, or a shell reserved word
+    /// or special builtin first (`rb_exec_fillarg`); otherwise it is split on
+    /// whitespace and executed directly, so a missing program is ENOENT, not
+    /// sh's exit 127.
+    fn parse(args: &[Value]) -> Result<Self, String> {
+        let mut args = args;
+        let mut env = Vec::new();
+        if let Some(map) = args.first().and_then(|a| with_host(|h| h.as_hash(a))) {
+            for (k, v) in map {
+                let key = match k {
+                    crate::host::RKey::Str(s) | crate::host::RKey::ByteStr(s, _) => s,
+                    _ => return Err(raise_exc("TypeError", "no implicit conversion into String")),
+                };
+                let val = match v {
+                    Value::Undef => None,
+                    v => Some(command_arg(&v)?),
+                };
+                env.push((key, val));
+            }
+            args = &args[1..];
+        }
+        let mut chdir = None;
+        let mut exception = false;
+        if let Some(map) = args.last().and_then(|a| with_host(|h| h.as_hash(a))) {
+            for (k, v) in map {
+                let crate::host::RKey::Sym(key) = k else {
+                    return Err(raise_exc("TypeError", "no implicit conversion into String"));
+                };
+                match key.as_str() {
+                    "exception" => exception = with_host(|h| h.truthy(&v)),
+                    "chdir" => chdir = Some(command_arg(&v)?),
+                    "in" | "out" | "err" | "umask" | "pgroup" | "unsetenv_others"
+                    | "close_others" | "rlimit_core" | "new_pgroup" => {
+                        return Err(raise_exc(
+                            "NotImplementedError",
+                            &format!("exec option :{key} is not supported"),
+                        ))
+                    }
+                    _ => {
+                        return Err(raise_exc(
+                            "ArgumentError",
+                            &format!("wrong exec option symbol: {key}"),
+                        ))
+                    }
+                }
+            }
+            args = &args[..args.len() - 1];
+        }
+        if args.is_empty() {
+            return Err(raise_exc(
+                "ArgumentError",
+                "wrong number of arguments (given 0, expected 1+)",
+            ));
+        }
+        let strs = args.iter().map(command_arg).collect::<Result<Vec<_>, _>>()?;
+        let (argv, shell) = if strs.len() == 1 {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            let bytes = strs[0].as_bytes();
+            let line = &bytes[bytes.iter().take_while(|b| b.is_ascii_whitespace()).count()..];
+            if needs_shell(line) {
+                (vec![std::ffi::OsString::from_vec(line.to_vec())], true)
+            } else {
+                let words = line
+                    .split(u8::is_ascii_whitespace)
+                    .filter(|w| !w.is_empty())
+                    .map(|w| std::ffi::OsString::from_vec(w.to_vec()));
+                (words.collect(), false)
+            }
+        } else {
+            (strs, false)
+        };
+        Ok(Self {
+            env,
+            argv,
+            shell,
+            chdir,
+            exception,
+        })
+    }
+
+    /// The program name an exec failure reports.
+    fn prog(&self) -> String {
+        self.argv
+            .first()
+            .map_or_else(String::new, |p| p.to_string_lossy().into_owned())
+    }
+
+    /// The `std::process::Command` for this line, or `None` when there is no
+    /// program to run (an empty command string).
+    fn build(&self) -> Option<std::process::Command> {
+        let mut cmd = if self.shell {
+            let mut c = std::process::Command::new("/bin/sh");
+            c.arg("-c").arg(&self.argv[0]);
+            c
+        } else {
+            let (prog, rest) = self.argv.split_first()?;
+            let mut c = std::process::Command::new(prog);
+            c.args(rest);
+            c
+        };
+        for (k, v) in &self.env {
+            match v {
+                Some(v) => cmd.env(k, v),
+                None => cmd.env_remove(k),
+            };
+        }
+        if let Some(dir) = &self.chdir {
+            cmd.current_dir(dir);
+        }
+        Some(cmd)
+    }
+}
+
+/// Whether a one-string command must go through `/bin/sh` (`rb_exec_fillarg`).
+fn needs_shell(line: &[u8]) -> bool {
+    const META: &[u8] = b"*?{}[]<>()~&|\\$;'`\"\n#";
+    const SHELL_WORDS: &[&str] = &[
+        "case", "do", "done", "elif", "else", "esac", "fi", "for", "if", "in", "then", "until",
+        "while", "!", ".", ":", "break", "continue", "eval", "exec", "exit", "export",
+        "readonly", "return", "set", "shift", "times", "trap", "unset",
+    ];
+    if line.iter().any(|b| META.contains(b)) {
+        return true;
+    }
+    let first = line.split(u8::is_ascii_whitespace).next().unwrap_or_default();
+    first.contains(&b'=') || SHELL_WORDS.iter().any(|w| w.as_bytes() == first)
+}
+
+/// Record the outcome of a command that could not be executed at all: MRI's
+/// forked child exits 127 when its `exec` fails.
+fn set_exec_failed_status() {
+    set_last_status(0, 127 << 8);
+}
+
+/// `` Kernel#` `` (also `%x(…)` and `` <<`CMD` ``): run the command with stdin
+/// and stderr inherited, answer its standard output, and set `$?`.
+fn kernel_backtick(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(raise_exc(
+            "ArgumentError",
+            &format!("wrong number of arguments (given {}, expected 1)", args.len()),
+        ));
+    }
+    let pc = ProcessCommand::parse(args)?;
+    let spawned = pc.build().map(|mut cmd| {
+        cmd.stdin(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+    });
+    let child = match spawned {
+        Some(Ok(child)) => child,
+        Some(Err(e)) => {
+            set_exec_failed_status();
+            return Err(exec_error(&pc.prog(), &e));
+        }
+        None => {
+            set_exec_failed_status();
+            let e = std::io::Error::from_raw_os_error(libc::ENOENT);
+            return Err(exec_error("", &e));
+        }
+    };
+    let pid = child.id();
+    let out = child
+        .wait_with_output()
+        .map_err(|e| exec_error(&pc.prog(), &e))?;
+    use std::os::unix::process::ExitStatusExt;
+    set_last_status(pid, out.status.into_raw());
+    Ok(with_host(|h| h.new_utf8_from_bytes(out.stdout)))
+}
+
+/// `Kernel#system`: run the command with all three streams inherited. Answers
+/// true for exit 0, false for any other finish, nil when it could not run; with
+/// `exception: true` the last two raise instead.
+fn kernel_system(args: &[Value]) -> Result<Value, String> {
+    let pc = ProcessCommand::parse(args)?;
+    let status = match pc.build().map(|mut cmd| cmd.spawn()) {
+        Some(Ok(mut child)) => {
+            let pid = child.id();
+            let status = child.wait().map_err(|e| exec_error(&pc.prog(), &e))?;
+            use std::os::unix::process::ExitStatusExt;
+            set_last_status(pid, status.into_raw());
+            status
+        }
+        Some(Err(e)) => {
+            set_exec_failed_status();
+            return if pc.exception {
+                Err(exec_error(&pc.prog(), &e))
+            } else {
+                Ok(Value::Undef)
+            };
+        }
+        None => {
+            set_exec_failed_status();
+            return if pc.exception {
+                Err(exec_error("", &std::io::Error::from_raw_os_error(libc::ENOENT)))
+            } else {
+                Ok(Value::Undef)
+            };
+        }
+    };
+    if status.success() {
+        return Ok(Value::Bool(true));
+    }
+    if pc.exception {
+        use std::os::unix::process::ExitStatusExt;
+        let line = args
+            .iter()
+            .filter_map(|a| with_host(|h| h.as_str(a)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(raise_exc(
+            "RuntimeError",
+            &format!(
+                "Command failed with{}: {line}",
+                wait_status_message(status.into_raw())
+            ),
+        ));
+    }
+    Ok(Value::Bool(false))
+}
+
+/// `Kernel#sleep`: suspend the thread for the interval, answering the whole
+/// wall-clock seconds that ticked over meanwhile — `rb_f_sleep` answers
+/// `time(0) - beg`, so `sleep(0.2)` can answer 1 across a second boundary.
+/// No argument, or nil, sleeps forever.
+fn kernel_sleep(args: &[Value]) -> Result<Value, String> {
+    if args.len() > 1 {
+        return Err(raise_exc(
+            "ArgumentError",
+            &format!("wrong number of arguments (given {}, expected 0..1)", args.len()),
+        ));
+    }
+    let secs = match args.first() {
+        None | Some(Value::Undef) => loop {
+            std::thread::park();
+        },
+        Some(Value::Int(n)) => *n as f64,
+        Some(Value::Float(f)) => *f,
+        Some(v) => match with_host(|h| {
+            h.as_rational(v)
+                .map(|r| rational_to_f64(&r))
+                .or_else(|| h.as_bigint(v).map(|b| bigint_to_f64(&b)))
+        }) {
+            Some(f) => f,
+            None => {
+                return Err(raise_exc(
+                    "TypeError",
+                    &format!(
+                        "can't convert {} into time interval",
+                        with_host(|h| h.class_of(v))
+                    ),
+                ))
+            }
+        },
+    };
+    if secs.is_nan() {
+        return Err(raise_exc("RangeError", "NaN out of Time range"));
+    }
+    if secs < 0.0 {
+        return Err(raise_exc("ArgumentError", "time interval must not be negative"));
+    }
+    let wall_secs = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64)
+    };
+    let beg = wall_secs();
+    std::thread::sleep(std::time::Duration::from_secs_f64(secs.min(u32::MAX as f64)));
+    Ok(Value::Int(wall_secs() - beg))
+}
+
 fn kernel(name: &str, args: &[Value], block: Option<Value>) -> Result<Value, String> {
     // Only the conversion functions are gated: they are the arms that index
     // `args[0]` unconditionally, and the rest of this surface is reached by
@@ -27575,7 +27981,9 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             Err(message)
         }
         "rand" => kernel_rand(args),
-        "sleep" => Ok(Value::Int(0)),
+        "sleep" => kernel_sleep(args),
+        "`" => kernel_backtick(args),
+        "system" => kernel_system(args),
         "srand" => random_srand(args),
         "Integer" => {
             // `Integer(str, base=0)` / `Integer(numeric)`. A base is only valid
