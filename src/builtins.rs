@@ -28384,6 +28384,12 @@ fn kernel_convert(name: &str, args: &[Value], block: Option<Value>) -> Result<Va
             // catch it. Reaching the top uncaught is what actually ends the
             // process, with this status — see `host::run_main`.
             if name == "exit!" {
+                // Embedded (output captured): unwind out of the run without
+                // running `ensure`/`rescue`, which is what `process::exit`
+                // gives the standalone binary. `run_program` catches it.
+                if with_host(|h| h.capturing()) {
+                    std::panic::resume_unwind(Box::new(crate::embed::ExitNow(code)));
+                }
                 std::process::exit(code);
             }
             Err(raise_exc_with(
@@ -29683,7 +29689,7 @@ fn openstruct_method(
 
 fn read_line() -> Value {
     let mut s = String::new();
-    match std::io::stdin().read_line(&mut s) {
+    match with_host(|h| h.stdin.read_line(&mut s)) {
         Ok(0) => Value::Undef,
         Ok(_) => new_str(s),
         Err(_) => Value::Undef,

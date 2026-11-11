@@ -16,6 +16,7 @@ pub mod cache;
 pub mod cli;
 pub mod compiler;
 pub mod dap;
+pub mod embed;
 pub mod encoding_table;
 pub mod erb;
 pub mod host;
@@ -34,6 +35,7 @@ pub mod rust_ffi;
 pub mod tiers;
 pub mod unicode_tables;
 
+pub use embed::run_program;
 pub use fusevm::Value;
 
 /// The MRI language level rubylang targets — the value reported as `RUBY_VERSION`
@@ -274,7 +276,17 @@ pub fn eval_str_cfg(src: &str, cfg: &RunConfig) -> Result<Value, String> {
 /// assert_eq!(out, "HI\n");
 /// ```
 pub fn eval_str_captured(src: &str, globals: &[(&str, &str)]) -> (Result<Value, String>, String) {
+    eval_captured(src, globals, host::StdinSource::Process)
+}
+
+/// [`eval_str_captured`] with the program's standard input read from `stdin`.
+pub(crate) fn eval_captured(
+    src: &str,
+    globals: &[(&str, &str)],
+    stdin: host::StdinSource,
+) -> (Result<Value, String>, String) {
     host::reset_host();
+    host::with_host(|h| h.stdin = stdin);
     let result = host::with_gvl(|| {
         let cwd = std::env::current_dir().unwrap_or_default();
         host::with_host(|h| h.init_load_path(&cwd.to_string_lossy()));

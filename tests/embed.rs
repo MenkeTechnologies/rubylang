@@ -83,3 +83,61 @@ fn a_second_runs_blocks_do_not_reuse_the_first_runs_bodies() {
     assert!(second.is_ok(), "{second:?}");
     assert_eq!(out2, "[1, 2]\n");
 }
+
+// `run_program(src, input)`: the uniform embedding entry point.
+
+#[test]
+fn run_program_captures_stdout() {
+    assert_eq!(
+        rubylang::run_program("puts 'hello'", "").unwrap(),
+        "hello\n"
+    );
+}
+
+/// `input` is the program's stdin for every read path: `gets` (Kernel, line by
+/// line), then `$stdin.read` (the rest), and `nil` at EOF.
+#[test]
+fn run_program_feeds_input_as_stdin() {
+    let src = "a = gets\nrest = $stdin.read\np gets\nputs a.upcase\nputs rest.reverse";
+    assert_eq!(
+        rubylang::run_program(src, "one\ntwo\n").unwrap(),
+        "nil\nONE\n\nowt\n"
+    );
+}
+
+/// An uncaught exception and a nonzero `exit` are errors; `exit 0` after output
+/// is success with that output, and `exit!` skips `ensure` without ending the
+/// process (this test would not finish if it did).
+#[test]
+fn run_program_errors_and_exit_status() {
+    let raised = rubylang::run_program("raise 'boom'", "").unwrap_err();
+    assert!(raised.contains("boom (RuntimeError)"), "{raised}");
+    assert_eq!(
+        rubylang::run_program("puts 1\nexit 3", "").unwrap_err(),
+        "exit status 3"
+    );
+    assert_eq!(
+        rubylang::run_program("puts 1\nexit\nputs 2", "").unwrap(),
+        "1\n"
+    );
+    assert_eq!(
+        rubylang::run_program("begin\n  puts 1\n  exit!(0)\nensure\n  puts 2\nend", "").unwrap(),
+        "1\n"
+    );
+    assert!(rubylang::run_program("def (", "").is_err());
+}
+
+/// Concurrent runs each see their own stdin and return only their own output.
+#[test]
+fn run_program_concurrent_runs_do_not_mix() {
+    let src = "n = gets.to_i\n200.times { |i| puts n + i }";
+    let runs: Vec<_> = [1000, 5000]
+        .into_iter()
+        .map(|n| std::thread::spawn(move || (n, rubylang::run_program(src, &format!("{n}\n")))))
+        .collect();
+    for run in runs {
+        let (n, out) = run.join().unwrap();
+        let want: String = (0..200).map(|i| format!("{}\n", n + i)).collect();
+        assert_eq!(out.unwrap(), want);
+    }
+}

@@ -1876,6 +1876,12 @@ pub struct RubyHost {
     /// `puts` cannot corrupt its display. `None` (the default) is the ordinary
     /// standalone `ruby` behaviour.
     capture: Option<String>,
+    /// The program's standard input; see [`StdinSource`].
+    pub stdin: StdinSource,
+    /// The status an `exit`/`exit!`/`abort` ended the program with while output
+    /// was captured. An embedded run must not end the process, so `run_main`
+    /// records the status here and returns instead of calling `process::exit`.
+    pub exit_status: Option<i32>,
     /// Heap ids of the containers whose `to_s`/`inspect` rendering is currently
     /// on the stack. A container that (directly or through a cycle) holds
     /// itself would otherwise recurse until the native stack overflows and the
@@ -1909,6 +1915,40 @@ pub struct FiddleLib(libloading::os::unix::Library);
 /// execution in `RubyHost::db_execute` never touches `Value`/the heap (which
 /// would require a second `&mut self` borrow while the connection is borrowed).
 pub type SqlVal = rusqlite::types::Value;
+
+/// Where the program's standard input comes from. Every `$stdin`/`STDIN` read,
+/// and `Kernel#gets`, goes through the host's one `StdinSource`: the process
+/// stdin for the `ruby` binary, or a fixed buffer an embedder feeds in.
+pub enum StdinSource {
+    Process,
+    Fed(std::io::Cursor<Vec<u8>>),
+}
+
+impl std::io::Read for StdinSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            StdinSource::Process => std::io::stdin().read(buf),
+            StdinSource::Fed(c) => c.read(buf),
+        }
+    }
+}
+
+impl StdinSource {
+    /// One line including its `\n` (empty at EOF).
+    pub fn read_line(&mut self, line: &mut String) -> std::io::Result<usize> {
+        use std::io::BufRead;
+        match self {
+            StdinSource::Process => std::io::stdin().read_line(line),
+            StdinSource::Fed(c) => c.read_line(line),
+        }
+    }
+
+    /// Whether this is a terminal (`IO#tty?`); a fed buffer never is.
+    pub fn is_terminal(&self) -> bool {
+        use std::io::IsTerminal;
+        matches!(self, StdinSource::Process) && std::io::stdin().is_terminal()
+    }
+}
 
 /// One live `IO`/`File` object, indexed by `RObj::IoHandle.id`. The three
 /// standard streams are represented structurally (they route to the process
@@ -2621,6 +2661,8 @@ impl RubyHost {
             fiddle_libs: Vec::new(),
             fiddle_mem: Vec::new(),
             capture: None,
+            stdin: StdinSource::Process,
+            exit_status: None,
             struct_defs: IndexMap::new(),
             data_classes: std::collections::HashSet::new(),
             embedded_stdlib_loaded: std::collections::HashSet::new(),
@@ -12636,6 +12678,11 @@ pub fn run_main(chunk: Chunk) -> Result<Value, String> {
         if let Some(code) = with_host(|h| h.pending_system_exit()) {
             with_host(|h| h.pending_exc = None);
             let code = run_at_exit_handlers().unwrap_or(code);
+            // Embedded (output captured): the run ends here, not the process.
+            if with_host(|h| h.capturing()) {
+                with_host(|h| h.exit_status = Some(code));
+                return r;
+            }
             // Buffered output written before the `exit` has to reach the
             // terminal: `process::exit` runs no destructors.
             use std::io::Write;
@@ -14742,7 +14789,7 @@ pub fn io_fd_info(v: &Value) -> Result<(i64, bool), String> {
     use std::io::IsTerminal;
     let id = io_id(v).ok_or("not an IO")?;
     with_host(|h| match h.io_handles.get(id as usize) {
-        Some(IoCell::Stdin) => Ok((0, std::io::stdin().is_terminal())),
+        Some(IoCell::Stdin) => Ok((0, h.stdin.is_terminal())),
         Some(IoCell::Stdout) => Ok((1, std::io::stdout().is_terminal())),
         Some(IoCell::Stderr) => Ok((2, std::io::stderr().is_terminal())),
         Some(IoCell::File { file: Some(f), .. }) => {
@@ -14868,9 +14915,7 @@ pub fn io_read_all(v: &Value) -> Result<String, String> {
             }
             Some(IoCell::File { file: None, .. }) => Err("closed stream".to_string()),
             Some(IoCell::Stdin) => {
-                std::io::stdin()
-                    .read_to_string(&mut s)
-                    .map_err(|e| e.to_string())?;
+                h.stdin.read_to_string(&mut s).map_err(|e| e.to_string())?;
                 Ok(s)
             }
             Some(IoCell::Stdout) | Some(IoCell::Stderr) => {
@@ -14955,7 +15000,7 @@ pub fn io_gets(v: &Value) -> Result<Value, String> {
             let n = match h.io_handles.get_mut(id as usize) {
                 Some(IoCell::File { file: Some(f), .. }) => f.read(&mut one),
                 Some(IoCell::File { file: None, .. }) => return Err("closed stream".to_string()),
-                Some(IoCell::Stdin) => std::io::stdin().read(&mut one),
+                Some(IoCell::Stdin) => h.stdin.read(&mut one),
                 Some(IoCell::Stdout) | Some(IoCell::Stderr) => {
                     return Err("not opened for reading".to_string())
                 }

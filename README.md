@@ -129,6 +129,25 @@ puts sum                                   # => 10
 puts({ a: 1, b: 2 }.merge({ c: 3 }).keys.length)   # => 3
 ```
 
+### Embedding
+
+```rust
+pub fn run_program(src: &str, input: &str) -> Result<String, String>
+```
+
+Runs `src` as a complete program on a fresh interpreter (its own thread and
+host per call, so calls from several threads never share state or output).
+`input` is what `gets` and `$stdin`/`STDIN` reads see; everything written to
+`$stdout`/`$stderr` is returned and nothing reaches the process stdout. A syntax
+error, an uncaught exception, or `exit`/`exit!`/`abort` with a nonzero status
+is `Err`; `exit 0` returns `Ok` with the output so far. The process never exits.
+
+```rust
+let out = rubylang::run_program("puts gets.upcase", "hi\n")?;
+assert_eq!(out, "HI\n");
+assert!(rubylang::run_program("raise 'boom'", "").is_err());
+```
+
 ---
 
 ## [0x03] LANGUAGE FEATURES
