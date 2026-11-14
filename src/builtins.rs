@@ -36590,6 +36590,20 @@ fn recv_ref(name: &str) -> Value {
     with_host(|h| h.class_ref(name))
 }
 
+/// `str_casecmp`: `-1`/`0`/`1` comparing byte by byte with only the ASCII
+/// letters folded (`TOLOWER`), a shorter prefix ordering first. MRI's
+/// multibyte branch reduces to this for UTF-8, whose lead byte fixes a
+/// character's length, so equal lead bytes mean equal lengths.
+fn ascii_casecmp(a: &[u8], b: &[u8]) -> i64 {
+    for (x, y) in a.iter().zip(b) {
+        let (x, y) = (x.to_ascii_lowercase(), y.to_ascii_lowercase());
+        if x != y {
+            return if x < y { -1 } else { 1 };
+        }
+    }
+    a.len().cmp(&b.len()) as i64
+}
+
 #[cfg(test)]
 mod polar_pi_tests {
     use super::sincos_pi;
@@ -36618,18 +36632,4 @@ mod polar_pi_tests {
             assert!((s - rs).abs() < 1e-14 && (c - rc).abs() < 1e-14, "x={x}");
         }
     }
-}
-
-/// `str_casecmp`: `-1`/`0`/`1` comparing byte by byte with only the ASCII
-/// letters folded (`TOLOWER`), a shorter prefix ordering first. MRI's
-/// multibyte branch reduces to this for UTF-8, whose lead byte fixes a
-/// character's length, so equal lead bytes mean equal lengths.
-fn ascii_casecmp(a: &[u8], b: &[u8]) -> i64 {
-    for (x, y) in a.iter().zip(b) {
-        let (x, y) = (x.to_ascii_lowercase(), y.to_ascii_lowercase());
-        if x != y {
-            return if x < y { -1 } else { 1 };
-        }
-    }
-    a.len().cmp(&b.len()) as i64
 }
