@@ -12073,11 +12073,58 @@ pub fn inspect_string_bytes(s: &str) -> String {
 /// Rust's `{:e}` already emits the shortest representation that round-trips, so
 /// the digits are read off it and the exponent shifted by one (`{:e}` puts the
 /// point after the first digit, `decpt` puts it before them all).
+///
+/// The two disagree only when two shortest strings both round-trip and sit
+/// EXACTLY as far from the value: `{:e}` rounds that tie up, while `dtoa`'s
+/// final "round off last digit" step (`j == 0 && dig & 1` bumps) keeps the
+/// even last digit. `1e15 + 0.25` (exactly `…000.25`) is `1000000000000000.2`
+/// in MRI, not `.3`.
 fn dtoa_shortest(f: f64) -> (String, i32) {
     let s = format!("{:e}", f.abs());
     let (mant, exp) = s.split_once('e').unwrap_or((s.as_str(), "0"));
     let decpt = exp.parse::<i32>().unwrap_or(0) + 1;
-    (mant.chars().filter(|c| *c != '.').collect(), decpt)
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    (dtoa_tie_to_even(f.abs(), digits, decpt), decpt)
+}
+
+/// Given the shortest round-tripping `digits` (point at `decpt`) for `f >= 0`,
+/// swap an odd last digit for its even neighbour when that neighbour has the
+/// same length, also round-trips, and is exactly as close to `f`.
+fn dtoa_tie_to_even(f: f64, digits: String, decpt: i32) -> String {
+    use num_bigint::BigInt;
+    use num_rational::BigRational;
+    use num_traits::Signed as _;
+    let last = digits.as_bytes()[digits.len() - 1];
+    if (last - b'0') % 2 == 0 || !f.is_finite() {
+        return digits;
+    }
+    let scale = decpt - digits.len() as i32;
+    // The even neighbours differ from `digits` in the last digit only (an odd
+    // digit never carries), so they are cheap to build; most do not even
+    // round-trip, which rules a tie out before any exact arithmetic.
+    let head = &digits[..digits.len() - 1];
+    let Some(alt) = [last - 1, last + 1]
+        .map(|b| format!("{head}{}", b as char))
+        .into_iter()
+        .find(|alt| format!("{alt}e{scale}").parse::<f64>() == Ok(f))
+    else {
+        return digits;
+    };
+    let exact = BigRational::from_float(f).unwrap();
+    let value_of = |s: &str| {
+        let d: BigInt = s.parse().unwrap();
+        let ten = BigInt::from(10).pow(scale.unsigned_abs());
+        if scale >= 0 {
+            BigRational::from(d * ten)
+        } else {
+            BigRational::new(d, ten)
+        }
+    };
+    if (value_of(&alt) - &exact).abs() == (value_of(&digits) - &exact).abs() {
+        alt
+    } else {
+        digits
+    }
 }
 
 /// `Float#to_s`, ported from MRI `flo_to_s` (numeric.c).

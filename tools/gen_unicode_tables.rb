@@ -17,6 +17,9 @@
 #   PRINT  [[:print:]]  ONIGENC_CTYPE_PRINT — what `String#inspect` shows as itself;
 #                       everything else (controls, unassigned code points,
 #                       separators) it escapes as \uXXXX
+#
+# FOLD maps each code point whose full case folding is not itself to the
+# folded string, as `String#downcase(:fold)` (and so `casecmp?`) answers it.
 
 abort "gen_unicode_tables.rb must run under MRI, not #{RUBY_ENGINE}" unless RUBY_ENGINE == "ruby"
 
@@ -56,6 +59,23 @@ CLASSES.each do |name, re|
   puts "];"
   puts
 end
+
+# Every code point whose `downcase(:fold)` differs from itself, with its fold.
+fold = (0..0x10FFFF).filter_map do |c|
+  next if (0xD800..0xDFFF).cover?(c)
+  s = c.chr("UTF-8")
+  f = s.downcase(:fold)
+  [c, f] unless f == s
+end
+puts "/// Full Unicode case folding in MRI: each code point whose"
+puts "/// `downcase(:fold)` is not itself, with the folded string, sorted."
+puts "pub const FOLD: &[(u32, &str)] = &["
+fold.each do |c, f|
+  lit = f.each_char.map { |ch| ch.match?(/\A[a-z0-9]\z/) ? ch : "\\u{#{ch.ord.to_s(16).upcase}}" }.join
+  puts "    (0x#{c.to_s(16).upcase}, \"#{lit}\"),"
+end
+puts "];"
+puts
 puts <<~RUST
   fn in_table(table: &[(u32, u32)], c: u32) -> bool {
       table
@@ -84,5 +104,13 @@ puts <<~RUST
   /// Whether MRI's `[[:print:]]` matches the code point `c`.
   pub fn is_print(c: u32) -> bool {
       in_table(PRINT, c)
+  }
+
+  /// The full case folding of `c` (`String#downcase(:fold)`), or `None` when
+  /// `c` folds to itself.
+  pub fn fold(c: u32) -> Option<&'static str> {
+      FOLD.binary_search_by_key(&c, |&(k, _)| k)
+          .ok()
+          .map(|i| FOLD[i].1)
   }
 RUST

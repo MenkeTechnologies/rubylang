@@ -1152,7 +1152,10 @@ Honest limitations of this surface:
   found (`include?` false, `index` nil). `force_encoding("UTF-8")` on bytes,
   `setbyte`, `bytesplice` and `undump` produce one rather than replacing bytes
   with U+FFFD. ISO-8859-1 is a byte encoding beside ASCII-8BIT, so
-  `"\xC3\xA9".force_encoding("ISO-8859-1").encode("UTF-8")` is `"Ã©"`. A Regexp's
+  `"\xC3\xA9".force_encoding("ISO-8859-1").encode("UTF-8")` is `"Ã©"`. Open: a
+  wide target (`encode("UTF-16LE")`, `"UTF-16"`, `"UTF-32LE"`) keeps the UTF-8
+  bytes under the new label, so `"ab".encode("UTF-16LE").bytes` is `[97, 98]`
+  where MRI answers `[97, 0, 98, 0]`. A Regexp's
   `\xHH` runs are bytes too: `/\xC3\xA9/ =~ "é"` is 0. A symbol literal or a
   quoted label spelling invalid bytes (`:"\xff"`, `"\xff": 1`) is refused while
   parsing, as MRI's SyntaxError "invalid symbol". The `ruby` command reports a script that
@@ -2492,6 +2495,10 @@ class-level one-shot `hexdigest`/`digest`/`base64digest`.
   `IO#putc`/`Kernel#putc`, `IO#fileno`/`#to_i` and `IO#tty?`/`#isatty` exist.
   Residue: `putc` of a byte above 0x7F writes U+FFFD, since program output is
   UTF-8 text.
+- **`$stdout` buffering — open.** MRI buffers `$stdout` when it is not a
+  tty and flushes it on `Kernel#p`, `flush` and exit, so with
+  `2>&1` a `$stderr.puts` lands BEFORE earlier `puts` output still in the
+  buffer. rubylang interleaves the two streams in program order.
 
 Backed by `std::fs`/`std::io`, verified method-by-method against the reference
 `ruby`. The `std::fs::File` is stored in a host side table (`io_handles`),

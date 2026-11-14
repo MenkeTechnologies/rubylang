@@ -7528,46 +7528,102 @@ fn as_f(v: &Value) -> f64 {
     }
 }
 
-/// The default tolerance for `Float#rationalize` with no argument: half the gap
-/// to the adjacent representable f64, so the result is the simplest rational
-/// that still rounds back to `f`.
-fn default_rationalize_eps(f: f64) -> f64 {
-    if f == 0.0 || !f.is_finite() {
-        return 0.0;
+/// `float_decode_internal`: `f` as `mant * 2**n` with `mant` the 53-bit
+/// integer `ldexp(frexp(f), DBL_MANT_DIG)`. `f` must be finite and non-negative.
+fn float_decode(f: f64) -> (num_bigint::BigInt, i64) {
+    let bits = f.to_bits();
+    let raw_exp = ((bits >> 52) & 0x7ff) as i64;
+    let frac = bits & ((1u64 << 52) - 1);
+    if raw_exp == 0 && frac == 0 {
+        return (num_bigint::BigInt::from(0), 0);
     }
-    let next = f64::from_bits(f.to_bits() + 1);
-    (next - f).abs() * 0.5
+    // A subnormal has no hidden bit; frexp normalizes it, so shift the
+    // mantissa up to 53 significant bits and lower the exponent to match.
+    let (mut mant, mut n) = if raw_exp == 0 {
+        (frac, -1074)
+    } else {
+        (frac | (1u64 << 52), raw_exp - 1075)
+    };
+    while mant < (1u64 << 52) {
+        mant <<= 1;
+        n -= 1;
+    }
+    (num_bigint::BigInt::from(mant), n)
 }
 
-/// The simplest rational within `eps` of `f` (the fraction with the smallest
-/// denominator in `[f - eps, f + eps]`), via the continued-fraction / mediant
-/// search Ruby uses for `rationalize`.
-fn simplest_rational_within(f: f64, eps: f64) -> num_rational::BigRational {
+/// `rb_flt_rationalize`: `Float#rationalize` with no argument, for a
+/// non-negative `f`. The interval is `[(2m-1)/2**(1-n), (2m+1)/2**(1-n)]`,
+/// half a unit in the last place on either side, searched exactly.
+fn flt_rationalize(f: f64) -> Result<num_rational::BigRational, String> {
     use num_bigint::BigInt;
-    let rat = |n: i128, d: i128| num_rational::BigRational::new(BigInt::from(n), BigInt::from(d));
-    if eps == 0.0 || !f.is_finite() {
-        return num_rational::BigRational::from_float(f).unwrap_or_else(|| rat(0, 1));
+    use num_rational::BigRational;
+    if !f.is_finite() {
+        return rational_arg(&Value::Float(f));
     }
-    if f < 0.0 {
-        return -simplest_rational_within(-f, eps);
+    let (mant, n) = float_decode(f);
+    if mant == BigInt::from(0) || n >= 0 {
+        return Ok(BigRational::from(mant << n.max(0) as usize));
     }
-    // Simplest fraction in the closed interval [lo, hi], with 0 <= lo <= hi.
-    fn simplest(lo: f64, hi: f64) -> (i128, i128) {
-        let fl = lo.floor();
-        if fl >= lo {
-            // `lo` is an integer — it is the simplest value in the interval.
-            return (fl as i128, 1);
+    let den = BigInt::from(1) << (1 - n) as usize;
+    let twice = &mant * 2;
+    let a = BigRational::new(&twice - 1, den.clone());
+    let b = BigRational::new(&twice + 1, den);
+    Ok(simplest_rational_between(a, b))
+}
+
+/// `rb_flt_rationalize_with_prec`: `Float#rationalize(eps)` for a
+/// non-negative `f`. `f - |eps|` and `f + |eps|` are Float arithmetic, so
+/// `nurat_rationalize_internal` walks Float bounds: `ceil` answers an
+/// Integer, `b - k` is a Float, and the reciprocal is `1.quo(x)`.
+fn flt_rationalize_with_prec(f: f64, eps: f64) -> Result<num_rational::BigRational, String> {
+    use num_bigint::BigInt;
+    use num_rational::BigRational;
+    use num_traits::{FromPrimitive as _, ToPrimitive as _};
+    let (mut a, mut b) = (f - eps, f + eps);
+    if a == b {
+        return rational_arg(&Value::Float(f));
+    }
+    // `Integer < Float`, compared exactly as `rb_integer_float_lt` does.
+    let int_lt_float = |c: &BigInt, x: f64| -> bool {
+        if x.is_nan() {
+            false
+        } else if x.is_infinite() {
+            x > 0.0
+        } else {
+            BigRational::from(c.clone()) < BigRational::from_float(x).unwrap()
         }
-        if fl < hi.floor() || hi.floor() >= hi {
-            // An integer (fl + 1) lies within (lo, hi].
-            return (fl as i128 + 1, 1);
+    };
+    let (mut p0, mut p1) = (BigInt::from(0), BigInt::from(1));
+    let (mut q0, mut q1) = (BigInt::from(1), BigInt::from(0));
+    loop {
+        // `Float#ceil` of a non-finite bound raises, as MRI's `f_ceil` does.
+        let c = BigInt::from_f64(a.ceil()).ok_or_else(|| {
+            raise_exc(
+                "FloatDomainError",
+                if a.is_nan() {
+                    "NaN"
+                } else if a > 0.0 {
+                    "Infinity"
+                } else {
+                    "-Infinity"
+                },
+            )
+        })?;
+        if int_lt_float(&c, b) {
+            return Ok(BigRational::new(&c * &p1 + &p0, &c * &q1 + &q0));
         }
-        // Recurse on the reciprocal of the fractional interval.
-        let (n, d) = simplest(1.0 / (hi - fl), 1.0 / (lo - fl));
-        (fl as i128 * n + d, n)
+        let k: BigInt = &c - 1;
+        let p2 = &k * &p1 + &p0;
+        let q2 = &k * &q1 + &q0;
+        let kf = k.to_f64().unwrap_or(f64::INFINITY);
+        let t = 1.0 / (b - kf);
+        b = 1.0 / (a - kf);
+        a = t;
+        p0 = p1;
+        q0 = q1;
+        p1 = p2;
+        q1 = q2;
     }
-    let (n, d) = simplest(f - eps, f + eps);
-    rat(n, d)
 }
 
 /// `nurat_rationalize_internal`: the simplest rational in `[a, b]`, by the
@@ -8760,8 +8816,9 @@ fn dispatch_number(
             },
             _ => Ok(recv.clone()),
         },
-        // `rationalize([eps])` finds the simplest rational within `eps` of the
-        // value (default: the tightest interval that still round-trips the f64).
+        // `rationalize([eps])` (`float_rationalize`): the simplest rational in
+        // `[|f| - |eps|, |f| + |eps|]` (half an ulp each side without `eps`),
+        // negated back for a negative receiver.
         // An Integer is already exact: `rationalize(eps)` is `n/1` whatever
         // the tolerance (`integer_rationalize`).
         "rationalize" if matches!(recv, Value::Int(_)) && args.len() <= 1 => Ok(with_host(|h| {
@@ -8770,13 +8827,16 @@ fn dispatch_number(
             )))
         })),
         "rationalize" => {
-            let f = as_f(recv);
-            let eps = match args.first() {
-                Some(v) => as_f(v).abs(),
-                None => default_rationalize_eps(f),
+            let Value::Float(f) = recv else {
+                // A Bignum is already exact.
+                return Ok(with_host(|h| h.new_rational(h.as_rational(recv).unwrap())));
             };
-            let r = simplest_rational_within(f, eps);
-            Ok(with_host(|h| h.new_rational(r)))
+            let mag = f.abs();
+            let r = match args.first() {
+                Some(v) => flt_rationalize_with_prec(mag, as_f(v).abs())?,
+                None => flt_rationalize(mag)?,
+            };
+            Ok(with_host(|h| h.new_rational(if *f < 0.0 { -r } else { r })))
         }
         // `Integer#numerator` is self and its denominator 1; a Float goes
         // through the EXACT rational its bits represent, exactly as `to_r`
@@ -10819,31 +10879,44 @@ fn dispatch_string_body(
         }
         // The `:ascii` option restricts case conversion to the ASCII letters,
         // leaving non-ASCII code points (ß, ü, …) untouched.
-        "upcase" => Ok(new_str(if is_ascii_case_opt(args) {
-            s.to_ascii_uppercase()
-        } else {
-            s.chars()
-                .map(|c| case_up(c, is_turkic_case_opt(args)))
-                .collect()
-        })),
-        "downcase" => Ok(new_str(if is_ascii_case_opt(args) {
-            s.to_ascii_lowercase()
-        } else {
-            downcase_str(&s, is_turkic_case_opt(args))
-        })),
+        "upcase" => {
+            let o = case_options(args, false)?;
+            Ok(new_str(if o.ascii {
+                s.to_ascii_uppercase()
+            } else {
+                s.chars().map(|c| case_up(c, o.turkic)).collect()
+            }))
+        }
+        "downcase" => {
+            let o = case_options(args, true)?;
+            Ok(new_str(if o.ascii {
+                s.to_ascii_lowercase()
+            } else if o.fold {
+                fold_str(&s)
+            } else {
+                downcase_str(&s, o.turkic)
+            }))
+        }
         // A titlecase digraph (`ǅ`) swaps to its lower half then upper half
         // (`dŽ`), as Onigmo's case folding does.
         "swapcase" => {
-            let turkic = is_turkic_case_opt(args);
+            let o = case_options(args, false)?;
             let out: String = s
                 .chars()
                 .map(|c| {
-                    if let Some(pair) = titlecase_swap(c) {
+                    if o.ascii {
+                        if c.is_ascii_uppercase() {
+                            c.to_ascii_lowercase()
+                        } else {
+                            c.to_ascii_uppercase()
+                        }
+                        .to_string()
+                    } else if let Some(pair) = titlecase_swap(c) {
                         pair.to_string()
                     } else if c.is_uppercase() {
-                        case_down(c, turkic)
+                        case_down(c, o.turkic)
                     } else if c.is_lowercase() {
-                        case_up(c, turkic)
+                        case_up(c, o.turkic)
                     } else {
                         c.to_string()
                     }
@@ -10853,12 +10926,15 @@ fn dispatch_string_body(
         }
         // The first character goes to TITLECASE (`ǆ` → `ǅ`, not `Ǆ`).
         "capitalize" => {
-            let turkic = is_turkic_case_opt(args);
+            let o = case_options(args, false)?;
             let mut c = s.chars();
             let out = match c.next() {
+                Some(f) if o.ascii => {
+                    f.to_ascii_uppercase().to_string() + &c.as_str().to_ascii_lowercase()
+                }
                 Some(f) => {
-                    let head = titlecase(f).map_or_else(|| case_up(f, turkic), String::from);
-                    head + &downcase_str(c.as_str(), turkic)
+                    let head = titlecase(f).map_or_else(|| case_up(f, o.turkic), String::from);
+                    head + &downcase_str(c.as_str(), o.turkic)
                 }
                 None => String::new(),
             };
@@ -11884,11 +11960,30 @@ fn dispatch_string_body(
             let Some(o) = with_host(|h| h.as_str(&args[0])) else {
                 return Ok(Value::Undef);
             };
-            let (a, b) = (s.to_lowercase(), o.to_lowercase());
+            // Both start with `rb_enc_compatible`: two Strings whose non-ASCII
+            // content is in different encodings are incomparable (nil).
+            if with_host(|h| h.check_encoding_compatible(recv, &args[0])).is_err() {
+                return Ok(Value::Undef);
+            }
+            let (a, b) = with_host(|h| (h.string_bytes(recv), h.string_bytes(&args[0])));
+            // `str_casecmp_p` compares the full case foldings — Unicode's for
+            // UTF-8, ASCII letters only for BINARY and US-ASCII, whose Onigmo
+            // tables fold nothing else. `str_casecmp` folds ASCII letters
+            // only and compares every other character by its bytes, so
+            // `"É".casecmp("é")` is -1.
             Ok(if name == "casecmp?" {
-                Value::Bool(a == b)
+                // Each side folds under its OWN encoding, then the bytes compare.
+                let folded = |v: &Value, bytes: Vec<u8>, text: &str| {
+                    let enc = with_host(|h| h.string_encoding(v));
+                    if matches!(enc, Some("ASCII-8BIT" | "US-ASCII")) {
+                        bytes.to_ascii_lowercase()
+                    } else {
+                        fold_str(text).into_bytes()
+                    }
+                };
+                Value::Bool(folded(recv, a, &s) == folded(&args[0], b, &o))
             } else {
-                Value::Int(a.cmp(&b) as i64)
+                Value::Int(ascii_casecmp(&a, &b))
             })
         }
         // `tr_s`: translate like `tr`, then squeeze runs of chars that were
@@ -13684,20 +13779,68 @@ fn parse_char_selector(spec: &str) -> (bool, std::collections::HashSet<char>) {
     (negated, set)
 }
 
-/// Expand a `tr`/`tr_s` character spec into an ordered list of chars, honouring
-/// `a-z` ranges, `\`-escapes, and (when `allow_neg`) a leading `^` negation.
-/// Unlike `parse_char_selector` this preserves order for positional mapping.
-/// Whether a case method was passed the `:ascii` option (`"x".upcase(:ascii)`).
-fn is_ascii_case_opt(args: &[Value]) -> bool {
-    args.first()
-        .and_then(|v| with_host(|h| h.as_symbol(v)))
-        .is_some_and(|s| s == "ascii")
+/// The options a case mapper (`upcase`/`downcase`/`capitalize`/`swapcase`)
+/// was given, validated as MRI's `check_case_options` does.
+struct CaseOpts {
+    ascii: bool,
+    turkic: bool,
+    fold: bool,
 }
 
-/// Whether a case-mapping call passed `:turkic` (dotted/dotless i).
-fn is_turkic_case_opt(args: &[Value]) -> bool {
-    args.iter()
-        .any(|v| with_host(|h| h.as_symbol(v)).is_some_and(|s| s == "turkic"))
+/// `check_case_options`: at most two options, and two only as `:turkic` with
+/// `:lithuanian` (either order); otherwise exactly one of `:ascii`,
+/// `:turkic`, `:lithuanian`, or — for `downcase` alone — `:fold`. A
+/// non-Symbol is an invalid option, never converted.
+fn case_options(args: &[Value], downcase: bool) -> Result<CaseOpts, String> {
+    let arg_err = |m: &str| raise_exc("ArgumentError", m);
+    let sym = |i: usize| with_host(|h| h.as_symbol(&args[i]));
+    let mut o = CaseOpts {
+        ascii: false,
+        turkic: false,
+        fold: false,
+    };
+    if args.is_empty() {
+        return Ok(o);
+    }
+    if args.len() > 2 {
+        return Err(arg_err("too many options"));
+    }
+    let first = sym(0);
+    match first.as_deref() {
+        Some(a @ ("turkic" | "lithuanian")) => {
+            o.turkic = a == "turkic";
+            if args.len() == 2 {
+                let other = if a == "turkic" {
+                    "lithuanian"
+                } else {
+                    "turkic"
+                };
+                if sym(1).as_deref() != Some(other) {
+                    return Err(arg_err("invalid second option"));
+                }
+                o.turkic = true;
+            }
+        }
+        _ if args.len() > 1 => return Err(arg_err("too many options")),
+        Some("ascii") => o.ascii = true,
+        Some("fold") if downcase => o.fold = true,
+        Some("fold") => return Err(arg_err("option :fold only allowed for downcasing")),
+        _ => return Err(arg_err("invalid option")),
+    }
+    Ok(o)
+}
+
+/// `s` under full Unicode case folding (`downcase(:fold)`), per MRI's own
+/// folding table.
+fn fold_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match crate::unicode_tables::fold(u32::from(c)) {
+            Some(f) => out.push_str(f),
+            None => out.push(c),
+        }
+    }
+    out
 }
 
 /// `c` upcased, with the Turkic `i` → `İ` when asked.
@@ -13759,6 +13902,9 @@ fn titlecase_swap(c: char) -> Option<&'static str> {
     }
 }
 
+/// Expand a `tr`/`tr_s` character spec into an ordered list of chars, honouring
+/// `a-z` ranges, `\`-escapes, and (when `allow_neg`) a leading `^` negation.
+/// Unlike `parse_char_selector` this preserves order for positional mapping.
 fn expand_tr_spec(spec: &str, allow_neg: bool) -> Result<(bool, Vec<char>), String> {
     let chars: Vec<char> = spec.chars().collect();
     let mut i = 0;
@@ -36472,4 +36618,18 @@ mod polar_pi_tests {
             assert!((s - rs).abs() < 1e-14 && (c - rc).abs() < 1e-14, "x={x}");
         }
     }
+}
+
+/// `str_casecmp`: `-1`/`0`/`1` comparing byte by byte with only the ASCII
+/// letters folded (`TOLOWER`), a shorter prefix ordering first. MRI's
+/// multibyte branch reduces to this for UTF-8, whose lead byte fixes a
+/// character's length, so equal lead bytes mean equal lengths.
+fn ascii_casecmp(a: &[u8], b: &[u8]) -> i64 {
+    for (x, y) in a.iter().zip(b) {
+        let (x, y) = (x.to_ascii_lowercase(), y.to_ascii_lowercase());
+        if x != y {
+            return if x < y { -1 } else { 1 };
+        }
+    }
+    a.len().cmp(&b.len()) as i64
 }

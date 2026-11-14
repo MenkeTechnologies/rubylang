@@ -11308,3 +11308,78 @@ fn class_singleton_methods_include_extended_and_inherited() {
         "[:x]",
     );
 }
+
+#[test]
+fn float_rationalize_ports_rb_flt_rationalize() {
+    // No eps: half an ulp either side of the exact value, searched exactly
+    // (it used to search in f64 with i128 convergents and overflow).
+    eq(
+        "[0.75.rationalize, -0.3.rationalize, 1e-300.rationalize.denominator.to_s.size, \
+          (2.0**60).rationalize, 1e20.rationalize, 0.0.rationalize]",
+        "[(3/4), (-3/10), 300, (1152921504606846976/1), (100000000000000000000/1), (0/1)]",
+    );
+    // With eps: `flt - |eps|` and `flt + |eps|` are Float bounds; an eps too
+    // small to move them gives the exact `to_r`.
+    eq(
+        "[1.333.rationalize(0.01), 0.1.rationalize(1e-20), \
+          3.14159.rationalize(Rational(1, 100)), -1.5.rationalize(0.1), 1e20.rationalize(0.5)]",
+        "[(4/3), (3602879701896397/36028797018963968), (22/7), (-3/2), (100000000000000000000/1)]",
+    );
+    raises(
+        "Float::INFINITY.rationalize",
+        "FloatDomainError",
+        "Infinity",
+    );
+    raises("Float::NAN.rationalize(0.1)", "FloatDomainError", "NaN");
+}
+
+#[test]
+fn casecmp_folds_ascii_and_casecmp_p_folds_unicode() {
+    eq(
+        r#"["straße".casecmp?("STRASSE"), "ﬃ".casecmp?("FFI"), "Σ".casecmp?("ς"),
+            "ss".b.casecmp?("ß"), "\xC9".b.casecmp?("\xE9".b), "\xC9".b.casecmp?("é")]"#,
+        "[true, true, true, true, false, nil]",
+    );
+    eq(
+        r#"["É".casecmp("é"), "aÉ".casecmp("AÉ"), "[".casecmp("a"), "abc".casecmp("AB"),
+            "\xC9".b.casecmp("\xE9".b)]"#,
+        "[-1, 0, -1, 1, -1]",
+    );
+}
+
+#[test]
+fn case_mapping_options_follow_check_case_options() {
+    eq(
+        r#"["ΣΑΣ ß ﬃ".downcase(:fold), "ÉaB".swapcase(:ascii), "éaB".capitalize(:ascii),
+            "IB".downcase(:lithuanian, :turkic)]"#,
+        r#"["σασ ss ffi", "ÉAb", "éab", "ıb"]"#,
+    );
+    raises(
+        r#""AB".upcase(:fold)"#,
+        "ArgumentError",
+        "option :fold only allowed for downcasing",
+    );
+    raises(
+        r#""AB".downcase(:fold, :ascii)"#,
+        "ArgumentError",
+        "too many options",
+    );
+    raises(
+        r#""AB".downcase(:turkic, :ascii)"#,
+        "ArgumentError",
+        "invalid second option",
+    );
+    raises(
+        r#""AB".downcase("ascii")"#,
+        "ArgumentError",
+        "invalid option",
+    );
+}
+
+#[test]
+fn float_to_s_breaks_shortest_digit_ties_to_even() {
+    eq(
+        "[1e15 + 0.25, 1e15 + 0.75, 1e15 + 1.25, (1e15 + 0.25).to_s, 2.5e-323, 0.1 + 0.2]",
+        r#"[1000000000000000.2, 1000000000000000.8, 1000000000000001.2, "1000000000000000.2", 2.5e-323, 0.30000000000000004]"#,
+    );
+}
