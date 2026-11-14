@@ -255,18 +255,18 @@ pub unsafe extern "C" fn fusevm_aot_register_builtins(vm: *mut fusevm::VM) {
     crate::host::with_host(|h| h.load_program(methods, classes, begins, procs));
 }
 
-/// Locate the rubylang runtime rlib and the deps dir holding fusevm + transitive
+/// Locate the rubylang runtime rlib and the dirs holding fusevm + transitive
 /// rlibs, relative to the running `ruby` binary (`.../target/<profile>/ruby` →
-/// `librubylang.rlib` + `deps/` in the same dir). Returns an error a linked
-/// standalone binary can't be produced without these (e.g. an installed `ruby`
-/// stripped of the build tree).
-fn locate_runtime() -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+/// `librubylang.rlib` in the same dir). Cargo up to 1.99 puts every dependency
+/// rlib in `deps/`; from 1.100 each unit has its own `build/<package>/<hash>/out/`,
+/// so both are searched. Returns an error a linked standalone binary can't be
+/// produced without these (e.g. an installed `ruby` stripped of the build tree).
+fn locate_runtime() -> Result<(std::path::PathBuf, Vec<std::path::PathBuf>), String> {
     let exe = std::env::current_exe().map_err(|e| format!("aot: current_exe: {e}"))?;
     let dir = exe
         .parent()
         .ok_or("aot: cannot find target dir next to the ruby binary")?;
     let rlib = dir.join("librubylang.rlib");
-    let deps = dir.join("deps");
     if !rlib.exists() {
         return Err(format!(
             "aot: rubylang rlib not found at {} — --build --native needs the \
@@ -274,6 +274,21 @@ fn locate_runtime() -> Result<(std::path::PathBuf, std::path::PathBuf), String> 
             rlib.display()
         ));
     }
+    let subdirs = |d: &std::path::Path| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(d)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut deps = vec![dir.join("deps")];
+    for package in subdirs(&dir.join("build")) {
+        deps.extend(subdirs(&package).into_iter().map(|unit| unit.join("out")));
+    }
+    deps.retain(|d| d.is_dir());
     Ok((rlib, deps))
 }
 
@@ -413,8 +428,8 @@ pub fn build_native(file: &str) -> Result<String, String> {
     std::fs::write(&frontend, &frontend_src)
         .map_err(|e| format!("aot: write {}: {e}", frontend.display()))?;
 
-    // 5. link: rustc compiles the frontend against the rubylang rlib (+ deps dir
-    // for fusevm & transitive rlibs) and folds in `app.o`.
+    // 5. link: rustc compiles the frontend against the rubylang rlib (+ the dirs
+    // holding fusevm & transitive rlibs) and folds in `app.o`.
     let (rlib, deps) = locate_runtime()?;
     let status = std::process::Command::new("rustc")
         .arg("--edition")
@@ -422,8 +437,10 @@ pub fn build_native(file: &str) -> Result<String, String> {
         .arg(&frontend)
         .arg("--extern")
         .arg(format!("rubylang={}", rlib.display()))
-        .arg("-L")
-        .arg(format!("dependency={}", deps.display()))
+        .args(
+            deps.iter()
+                .flat_map(|d| ["-L".to_string(), format!("dependency={}", d.display())]),
+        )
         .arg("-C")
         .arg(format!("link-arg={}", obj.display()))
         // cranelift-object doesn't stamp a Mach-O platform load command; the
